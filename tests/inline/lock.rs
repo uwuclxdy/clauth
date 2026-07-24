@@ -77,6 +77,13 @@ fn same_thread_reentrancy_does_not_deadlock() {
 fn poison_recovery_after_panicking_closure() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    // Sandbox-pinned for the same reason as `cross_thread_with_state_lock_
+    // serializes` above: without holding the sandbox lock, a concurrently
+    // running sandboxed test can swap the process-global home override between
+    // this test's acquire and its recovery asserts, so the two flocks resolve
+    // to DIFFERENT files (observed as a rare parallel-run flake, 2026-07-16).
+    let _home = crate::testutil::HomeSandbox::new();
+
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         let _guard = StateLock::acquire().expect("acquire before panic");
         panic!("closure blew up while holding the state lock");

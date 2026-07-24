@@ -60,6 +60,8 @@ fn canceled_usage() -> UsageInfo {
 fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInfo>) -> Profile {
     use std::collections::BTreeMap;
     Profile {
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -4524,3 +4526,239 @@ fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
         "a serving-sink active stays parked free regardless of its override"
     );
 }
+
+// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
+
+// CDX-1 T1b tolerance layer: a stray codex member hand-edited into the
+// persisted claude chain must never become a walk candidate. The edit
+// surfaces reject NEW cross-harness members; this covers existing files —
+// the walk would otherwise hand `switch_profile` a profile with no claude
+// credentials.
+#[test]
+fn snapshot_chain_skips_stray_codex_members() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(50.0)),
+            profile_with_util("cdx", Some(95.0), Some(10.0)),
+            profile_with_util("b", Some(95.0), Some(20.0)),
+        ],
+        "a",
+    );
+    config.find_mut("cdx").unwrap().harness = crate::profile::Harness::Codex;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let names: Vec<&str> = snap.chain.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["a", "b"],
+        "the codex member must be invisible to the walk"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CDX-4: the codex chain walk (snapshot + next_codex_auto_switch_target)
+// ---------------------------------------------------------------------------
+
+fn codex_member(name: &str) -> ChainMember {
+    ChainMember {
+        name: name.to_string(),
+        threshold: DEFAULT_THRESHOLD,
+        last_resort: false,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+        max_spend: 0.0,
+    }
+}
+
+fn codex_snapshot(active: &str, members: &[&str]) -> CodexChainSnapshot {
+    CodexChainSnapshot {
+        active: active.to_string(),
+        chain: members.iter().map(|n| codex_member(n)).collect(),
+        broken: Vec::new(),
+        weekly_pct: 98.0,
+        leased: Vec::new(),
+        loginless: Vec::new(),
+    }
+}
+
+#[test]
+fn codex_walk_fires_only_on_an_exhausted_active() {
+    let snap = codex_snapshot("a", &["a", "b"]);
+    // Healthy active → stay put.
+    let store = store_with_utils(&[("a", 40.0), ("b", 10.0)]);
+    assert_eq!(next_codex_auto_switch_target(&snap, &store), None);
+    // Exhausted active + viable sibling → switch.
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
+    assert_eq!(
+        next_codex_auto_switch_target(&snap, &store),
+        Some("b".to_string())
+    );
+}
+
+#[test]
+fn codex_walk_treats_lapsed_windows_and_missing_data_as_viable() {
+    let snap = codex_snapshot("a", &["a", "b", "c"]);
+    // b: stale-high but LAPSED window (resets_at passed ⇒ reset ⇒ viable);
+    // c: no store entry at all (never measured ⇒ viable). b wins by order.
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", usage_info(Some(window(100.0, Some(expired_reset()))))),
+    ]);
+    assert_eq!(
+        next_codex_auto_switch_target(&snap, &store),
+        Some("b".to_string())
+    );
+}
+
+#[test]
+fn codex_walk_skips_broken_leased_and_loginless_members() {
+    let mut snap = codex_snapshot("a", &["a", "b", "c", "d", "e"]);
+    snap.broken.push("b".to_string());
+    snap.leased.push("c".to_string());
+    snap.loginless.push("d".to_string());
+    let store = store_with_utils(&[("a", 100.0)]);
+    assert_eq!(
+        next_codex_auto_switch_target(&snap, &store),
+        Some("e".to_string()),
+        "only the installable member is picked"
+    );
+}
+
+#[test]
+fn codex_limiter_verdict_drives_the_switch_and_clears_on_reset() {
+    let snap = codex_snapshot("a", &["a", "b"]);
+    // The limiter said "primary" and the 5h window hasn't reset: exhausted
+    // even at a LOW percent (the verdict outranks the heuristic).
+    let mut blocked = usage_info(Some(window(30.0, Some(live_reset()))));
+    blocked.codex_rate_limit_reached = Some("primary".to_string());
+    let store = store_with_infos(vec![("a", blocked), ("b", usage_info(None))]);
+    assert_eq!(
+        next_codex_auto_switch_target(&snap, &store),
+        Some("b".to_string())
+    );
+
+    // Same verdict but the named window has lapsed → verdict expired.
+    let mut lapsed = usage_info(Some(window(30.0, Some(expired_reset()))));
+    lapsed.codex_rate_limit_reached = Some("primary".to_string());
+    let store = store_with_infos(vec![("a", lapsed), ("b", usage_info(None))]);
+    assert_eq!(next_codex_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn codex_limiter_verdict_blocks_a_candidate_too() {
+    let snap = codex_snapshot("a", &["a", "b", "c"]);
+    let mut b_blocked = usage_info(Some(window(10.0, Some(live_reset()))));
+    b_blocked.codex_rate_limit_reached = Some("primary".to_string());
+    let store = store_with_infos(vec![
+        ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
+        ("b", b_blocked),
+    ]);
+    assert_eq!(
+        next_codex_auto_switch_target(&snap, &store),
+        Some("c".to_string()),
+        "a limiter-blocked sibling is walked around"
+    );
+}
+
+#[test]
+fn codex_walk_last_resort_pass_and_one_migration_rule() {
+    // Everything exhausted; the last_resort member is still accepted…
+    let mut snap = codex_snapshot("a", &["a", "b"]);
+    snap.chain[1].last_resort = true;
+    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
+    assert_eq!(
+        next_codex_auto_switch_target(&snap, &store),
+        Some("b".to_string())
+    );
+    // …but never FROM a last-resort active (no sink ping-pong).
+    let mut snap = codex_snapshot("b", &["a", "b"]);
+    snap.chain[0].last_resort = true;
+    snap.chain[1].last_resort = true;
+    let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
+    assert_eq!(next_codex_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn codex_walk_degenerate_shapes_do_nothing() {
+    // Chain of one: nowhere to go.
+    let snap = codex_snapshot("a", &["a"]);
+    let store = store_with_utils(&[("a", 100.0)]);
+    assert_eq!(next_codex_auto_switch_target(&snap, &store), None);
+    // Active outside the chain (post-snapshot mutation guard).
+    let snap = codex_snapshot("zz", &["a", "b"]);
+    assert_eq!(next_codex_auto_switch_target(&snap, &store), None);
+}
+
+#[test]
+fn snapshot_codex_chain_rejects_degenerate_markers() {
+    use crate::profile::{AppConfig, AppState, Harness};
+    let mk = |names: &[(&str, Harness)], active: Option<&str>, chain: &[&str]| {
+        let profiles = names
+            .iter()
+            .map(|(n, h)| {
+                let mut p = crate::testutil::blank_profile(n);
+                p.harness = *h;
+                p
+            })
+            .collect();
+        AppConfig {
+            state: AppState {
+                profiles: names.iter().map(|(n, _)| (*n).into()).collect(),
+                active_codex_profile: active.map(Into::into),
+                codex_fallback_chain: chain.iter().map(|n| (*n).into()).collect(),
+                ..Default::default()
+            },
+            profiles,
+        }
+    };
+    // Healthy shape snapshots.
+    let ok = mk(
+        &[("x", Harness::Codex), ("y", Harness::Codex)],
+        Some("x"),
+        &["x", "y"],
+    );
+    let snap = snapshot_codex_chain(&ok).expect("snapshot");
+    assert_eq!(snap.active, "x");
+    assert_eq!(snap.chain.len(), 2);
+
+    // No active marker.
+    assert!(snapshot_codex_chain(&mk(&[("x", Harness::Codex)], None, &["x"])).is_none());
+    // Active names a CLAUDE profile (hand-edited state).
+    assert!(snapshot_codex_chain(&mk(&[("x", Harness::Claude)], Some("x"), &["x"])).is_none());
+    // Active names a deleted profile.
+    assert!(snapshot_codex_chain(&mk(&[("y", Harness::Codex)], Some("gone"), &["gone"])).is_none());
+    // Active not a chain member.
+    assert!(
+        snapshot_codex_chain(&mk(
+            &[("x", Harness::Codex), ("y", Harness::Codex)],
+            Some("x"),
+            &["y"]
+        ))
+        .is_none()
+    );
+    // A stray claude member in the chain is skipped, never a candidate.
+    let stray = mk(
+        &[
+            ("x", Harness::Codex),
+            ("c", Harness::Claude),
+            ("y", Harness::Codex),
+        ],
+        Some("x"),
+        &["x", "c", "y"],
+    );
+    let snap = snapshot_codex_chain(&stray).expect("snapshot");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["x", "y"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SCW-1: per-model weekly windows ("7d fable") in the chain walk.
+// Live shape that motivated it (2026-07-18): a member at 7d 65% / 5h 0% but
+// "7d fable" 100% — the aggregate-only walk called it the healthiest target
+// and stranded every fable session landed on it.
+// ---------------------------------------------------------------------------

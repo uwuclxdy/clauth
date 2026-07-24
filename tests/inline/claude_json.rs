@@ -398,3 +398,72 @@ fn strip_home_oauth_account_skips_missing_file() {
 
     assert!(!path.exists(), "a missing file must never be created");
 }
+
+// ── live_oauth_account_uuid: CC's own record of the live login's account ────
+
+#[test]
+fn live_oauth_account_uuid_reads_the_home_record() {
+    let home = crate::testutil::HomeSandbox::new();
+    let path = home.home().join(".claude.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "oauthAccount": { "accountUuid": " uuid-1 ", "emailAddress": "a@b.c" },
+            "userID": "x"
+        }))
+        .expect("ser"),
+    )
+    .expect("write");
+    assert_eq!(home_oauth_account_uuid().as_deref(), Some("uuid-1"));
+}
+
+#[test]
+fn live_oauth_account_pair_reads_both_halves_from_one_snapshot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = crate::profile::home_dir().unwrap().join(".claude.json");
+    std::fs::write(
+        &path,
+        r#"{"oauthAccount":{"accountUuid":"uuid-1","emailAddress":"me@example.com"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        live_oauth_account_pair(),
+        Some(("uuid-1".to_string(), Some("me@example.com".to_string()))),
+    );
+    // Email absent/blank → uuid still anchors, email half is None.
+    std::fs::write(
+        &path,
+        r#"{"oauthAccount":{"accountUuid":"uuid-1","emailAddress":"  "}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        live_oauth_account_pair(),
+        Some(("uuid-1".to_string(), None))
+    );
+    // No uuid → no identity at all, whatever the email says.
+    std::fs::write(
+        &path,
+        r#"{"oauthAccount":{"emailAddress":"me@example.com"}}"#,
+    )
+    .unwrap();
+    assert_eq!(live_oauth_account_pair(), None);
+}
+
+#[test]
+fn live_oauth_account_uuid_absent_or_blank_reads_none() {
+    let home = crate::testutil::HomeSandbox::new();
+    // No file at all (a fresh sandbox).
+    assert_eq!(home_oauth_account_uuid(), None);
+    // File without the block (clauth strips it on switch — issue #17).
+    let path = home.home().join(".claude.json");
+    std::fs::write(&path, br#"{"userID":"x"}"#).expect("write");
+    assert_eq!(home_oauth_account_uuid(), None);
+    // Present but blank uuid is shape drift, never an identity.
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({ "oauthAccount": { "accountUuid": "  " } }))
+            .expect("ser"),
+    )
+    .expect("write");
+    assert_eq!(home_oauth_account_uuid(), None);
+}

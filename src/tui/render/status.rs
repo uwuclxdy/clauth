@@ -26,7 +26,11 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // Each incident renders two rows (title + phase pill) in the list.
+    // Each incident renders two rows (title + phase pill) in the list. On desktop
+    // this is the house `selector_width | Min(20)` horizontal split (upstream's
+    // layout); on narrow/phone widths it stacks selector-above-detail — both the
+    // fork's narrow-TUI behavior and upstream's desktop layout live in
+    // `master_detail`.
     let (list, detail) = master_detail(area, app.status.incidents.len() * 2);
 
     draw_incident_list(frame, list, app);

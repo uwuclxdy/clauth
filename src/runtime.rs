@@ -165,6 +165,211 @@ pub(crate) fn live_sessions_at(sessions: &Path) -> usize {
         .count()
 }
 
+/// The CDX-1b codex lease dir — `codex-sessions/<pid>-<n>` flock files, the
+/// exact claude pattern in a harness-suffixed dir so flavors never collide.
+pub(crate) fn codex_sessions_dir(name: &str) -> Result<PathBuf> {
+    profile_subpath(name, "codex-sessions")
+}
+
+/// True iff the profile has a live `clauth start` codex session. Its isolated
+/// `CODEX_HOME` carries the profile's refresh chain while it runs, so this
+/// gates the CDX-3 standby refresh, the switch/capture installers, and the
+/// CDX-4 walk (PLAN.md §0.14 two-carrier refusals). Missing dir = idle.
+pub(crate) fn has_live_codex_session(name: &str) -> bool {
+    codex_sessions_dir(name)
+        .map(|d| live_sessions_at(&d) > 0)
+        .unwrap_or(false)
+}
+
+/// The profile's isolated `CODEX_HOME` tree (CDX-1b §0.14): `auth.json` =
+/// the profile's chain (seeded from the store at acquire), `config.toml` a
+/// COPY of the operator's, `sessions/` codex-created and isolated.
+pub(crate) fn codex_home_dir(name: &str) -> Result<PathBuf> {
+    profile_subpath(name, "codex-home")
+}
+
+/// Codex adopt-back cadence. Far looser than the claude 1s watchdog: nothing
+/// reads the isolated home but codex itself, and the only job here is bounding
+/// how much chain rotation a SIGKILL could strand (the final Drop sync covers
+/// clean exits).
+const CODEX_WATCHDOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One-directional adopt-back: isolated `codex-home/auth.json` → profile
+/// store, when the bytes differ. The session process OWNS the store slot for
+/// its profile while running (capture/switch refuse leased profiles), so this
+/// is the only writer. Unparseable bytes are skipped (a half-written refresh
+/// — the next tick sees the finished file); a missing file is a quiet no-op.
+fn sync_codex_home_to_store(name: &str, codex_home: &Path) -> Result<()> {
+    let path = codex_home.join("auth.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+    };
+    if crate::codex::CodexAuthFile::parse(&bytes).is_err() {
+        return Ok(());
+    }
+    if crate::codex::read_profile_auth(name)?.as_deref() == Some(&bytes[..]) {
+        return Ok(());
+    }
+    crate::codex::write_profile_auth(name, &bytes)
+}
+
+/// Live-session guard for a codex profile — the CDX-1b sibling of
+/// [`ProfileRuntime`], radically simpler (no symlinks, no LinkMode, no
+/// settings merge): the tree is three entries and the watchdog is a one-way
+/// adopt-back. On drop: final sync, pid-file release, teardown when last.
+pub(crate) struct CodexRuntime {
+    codex_home: PathBuf,
+    pid_file: PathBuf,
+    sessions: PathBuf,
+    name: String,
+    _pid_lock: File,
+    watchdog_signal: Option<Sender<()>>,
+    watchdog_handle: Option<JoinHandle<()>>,
+}
+
+impl CodexRuntime {
+    /// Acquire a codex session runtime for `name` (a codex-harness profile —
+    /// the caller dispatched on harness). Refusals implement the §0.14
+    /// two-carrier rules; the `RotationGuard` window makes the stamp atomic
+    /// against a concurrent standby refresh, exactly like the claude acquire.
+    pub(crate) fn acquire(name: &str) -> Result<Self> {
+        let stored = crate::codex::read_profile_auth(name)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "profile '{name}' has no stored codex login — capture one with \
+                 `clauth login {name} --codex` first"
+            )
+        })?;
+        match crate::codex::store_mode() {
+            mode if mode.is_file() => {}
+            crate::codex::StoreMode::Other(mode) => anyhow::bail!(
+                "codex stores credentials in '{mode}' mode (cli_auth_credentials_store) — an \
+                 isolated CODEX_HOME would be ignored; clauth supports only the default 'file' \
+                 mode"
+            ),
+            crate::codex::StoreMode::File => unreachable!("is_file() covered above"),
+        }
+
+        let codex_home = codex_home_dir(name)?;
+        let sessions = codex_sessions_dir(name)?;
+        let seq = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+        let pid_file = sessions.join(format!("{}-{seq}", std::process::id()));
+
+        // Same discipline as ProfileRuntime::acquire: the rotation guard is
+        // held across the stamp window so a standby refresh can't spend this
+        // chain mid-acquire; once the PID flock exists, the refresh's in-guard
+        // lease re-check sees the session and skips.
+        let _rotation_guard = RotationGuard::acquire(name)?;
+
+        let pid_lock = with_state_lock(|| {
+            // Two-carrier refusal, under the same lock a switch install holds:
+            // if this profile's account IS the live login, codex in the shared
+            // home already carries the chain — an isolated copy would fork it
+            // (refresh_token_reused kill).
+            let stored_id = crate::codex::CodexAuthFile::parse(&stored)
+                .ok()
+                .and_then(|a| a.account_id());
+            if let (Some(stored_id), Ok(Some(live_bytes))) = (stored_id, crate::codex::read_live())
+                && let Ok(live) = crate::codex::CodexAuthFile::parse(&live_bytes)
+                && live.account_id().as_deref() == Some(stored_id.as_str())
+            {
+                anyhow::bail!(
+                    "profile '{name}' is the LIVE codex login — its chain already runs in the \
+                     shared ~/.codex; use plain `codex`, or switch the live login away first"
+                );
+            }
+
+            std::fs::create_dir_all(&sessions)
+                .with_context(|| format!("failed to create {}", sessions.display()))?;
+            let active = prune_stale_sessions(&sessions)?;
+            if active == 0 && codex_home.symlink_metadata().is_ok() {
+                std::fs::remove_dir_all(&codex_home)
+                    .with_context(|| format!("failed to clear {}", codex_home.display()))?;
+            }
+            std::fs::create_dir_all(&codex_home)
+                .with_context(|| format!("failed to create {}", codex_home.display()))?;
+            if active == 0 {
+                atomic_write_600(&codex_home.join("auth.json"), &stored)
+                    .context("failed to seed the isolated auth.json")?;
+                // COPY (never symlink) the operator's config so model/trust
+                // settings carry over while codex's own config writes stay
+                // isolated (PLAN.md §0.14 — an in-place write through a
+                // symlink would mutate the real ~/.codex/config.toml).
+                let real_config = crate::codex::codex_dir()?.join("config.toml");
+                if real_config.exists() {
+                    std::fs::copy(&real_config, codex_home.join("config.toml"))
+                        .context("failed to copy config.toml into the isolated home")?;
+                }
+            }
+            let file = open_pid_file(&pid_file)
+                .with_context(|| format!("failed to open {}", pid_file.display()))?;
+            file.lock()
+                .with_context(|| format!("failed to lock {}", pid_file.display()))?;
+            Ok::<_, anyhow::Error>(file)
+        })?;
+
+        let (tx, rx) = channel::<()>();
+        let watchdog_home = codex_home.clone();
+        let watchdog_name = name.to_string();
+        #[allow(clippy::expect_used, reason = "thread spawn failure is unrecoverable")]
+        let watchdog_handle = thread::Builder::new()
+            .name(format!("clauth-cdx-wdog-{name}"))
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(CODEX_WATCHDOG_INTERVAL)
+                {
+                    if let Err(e) = sync_codex_home_to_store(&watchdog_name, &watchdog_home) {
+                        logline!("clauth: codex watchdog sync failed: {e}");
+                    }
+                }
+            })
+            .expect("failed to spawn codex watchdog thread");
+
+        Ok(Self {
+            codex_home,
+            pid_file,
+            sessions,
+            name: name.to_string(),
+            _pid_lock: pid_lock,
+            watchdog_signal: Some(tx),
+            watchdog_handle: Some(watchdog_handle),
+        })
+    }
+
+    pub(crate) fn codex_home(&self) -> &Path {
+        &self.codex_home
+    }
+}
+
+impl Drop for CodexRuntime {
+    fn drop(&mut self) {
+        drop(self.watchdog_signal.take());
+        if let Some(h) = self.watchdog_handle.take() {
+            let _ = h.join();
+        }
+        // Final adopt-back: the session's last chain rotation reaches the
+        // store even though the tree is about to be torn down.
+        if let Err(e) = sync_codex_home_to_store(&self.name, &self.codex_home) {
+            logline!("clauth: codex final sync failed: {e}");
+        }
+        if let Err(e) = with_state_lock(|| {
+            if let Err(e) = std::fs::remove_file(&self.pid_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                logline!("clauth: remove codex pid file failed: {e}");
+            }
+            let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
+            if still_active == 0 {
+                let _ = std::fs::remove_dir_all(&self.codex_home);
+                let _ = std::fs::remove_dir(&self.sessions);
+            }
+            Ok::<_, anyhow::Error>(())
+        }) {
+            logline!("clauth: codex drop cleanup failed: {e}");
+        }
+    }
+}
+
 /// Best-effort sweep removing runtime trees whose owning session died without
 /// running teardown (SIGKILL/crash leaves `runtime/` + a stale `sessions/<pid>`).
 /// Safe at any entry point: each removal re-checks liveness under the state lock
@@ -184,7 +389,40 @@ pub(crate) fn gc_stale_runtimes() {
         for iso in SESSION_ISOLATIONS {
             let _ = gc_one_runtime(&name, iso);
         }
+        let _ = gc_one_codex_runtime(&name);
     }
+}
+
+/// Public entry to [`gc_one_codex_runtime`] for one profile — the standby
+/// refresh calls this BEFORE spending a parked chain so a SIGKILLed isolated
+/// session's fresher chain is adopted back into the store first (else the
+/// store's stale token gets spent and reuse-killed; review MED). Best-effort:
+/// a failure just leaves the tree for the next sweep.
+pub(crate) fn gc_one_codex_runtime_public(name: &str) {
+    if let Err(e) = gc_one_codex_runtime(name) {
+        logline!("clauth: codex runtime adopt-back for '{name}' failed: {e}");
+    }
+}
+
+/// CDX-1b flavor of [`gc_one_runtime`]: a `codex-home/` whose owning session
+/// died without teardown. Adopt the stranded auth.json back FIRST — a SIGKILL
+/// between two watchdog ticks may have left the freshest chain only here.
+fn gc_one_codex_runtime(name: &str) -> Result<()> {
+    let codex_home = codex_home_dir(name)?;
+    if codex_home.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    let sessions = codex_sessions_dir(name)?;
+    with_state_lock(|| {
+        if prune_stale_sessions(&sessions).unwrap_or(0) == 0 {
+            if let Err(e) = sync_codex_home_to_store(name, &codex_home) {
+                logline!("clauth: codex gc adopt-back failed for '{name}': {e}");
+            }
+            let _ = std::fs::remove_dir_all(&codex_home);
+            let _ = std::fs::remove_dir(&sessions);
+        }
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 fn gc_one_runtime(name: &str, isolation: Isolation) -> Result<()> {
@@ -210,10 +448,6 @@ fn gc_one_runtime(name: &str, isolation: Isolation) -> Result<()> {
 /// [`has_live_session`], which also counts shared sessions) and on the projects
 /// dir existing, so a shared-only or not-yet-written runtime is skipped.
 /// Fail-soft: an unreadable profiles root or entry is skipped, never an error.
-#[allow(
-    dead_code,
-    reason = "consumed by the session index (src/sessions.rs), wired into a surface in a later phase"
-)]
 pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(root) = profiles_root_dir() else {
         return Vec::new();
@@ -241,6 +475,12 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
 }
 
 fn canonical_credentials(name: &str) -> Result<PathBuf> {
+    // CLA-FEED: arm a feed profile's sidecar BEFORE resolving the source —
+    // a session launched inside an arming window (flag on, sidecar not yet
+    // fed) would otherwise copy the rotating pair, and the daemon's later
+    // rotations (feed-exempted from the live-session bail only for ARMED
+    // sidecars) could still race a hand-armed state. Best-effort by design.
+    crate::claude::arm_feed_from_disk(name);
     // CLA-SPLIT: a `clauth start` session runs on what a switch would install —
     // the static session token when the profile has one. The rotating usage
     // pair in `credentials.json` must never be handed to a session (it would
@@ -298,6 +538,41 @@ impl RotationGuard {
         // trip, before `config` and the state flock are ever taken.
         let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
         Ok(Self { _file: file, _rank })
+    }
+}
+
+/// Non-blocking probe of the per-profile rotation lock (CDX-3 §0.9). The
+/// codex switch/capture installers run under the state flock, where a
+/// blocking [`RotationGuard::acquire`] would invert the Rotation-outermost
+/// rank — but a try-lock can never block, so it cannot participate in a
+/// deadlock cycle, and it deliberately carries NO `RankGuard` (the rank
+/// system exists to prevent blocking cycles; a failed probe simply reports
+/// "a standby refresh holds this chain right now"). Holding the returned
+/// probe keeps a standby refresh of the same profile blocked (its blocking
+/// acquire waits) until the install window closes.
+#[must_use]
+pub(crate) struct RotationProbe {
+    _file: File,
+}
+
+impl RotationProbe {
+    /// `Ok(None)` when another holder (standby refresh, session acquire, or
+    /// claude rotation) currently owns the profile's rotation lock.
+    pub(crate) fn try_acquire(name: &str) -> Result<Option<Self>> {
+        let path = rotation_lock_path(name)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let file =
+            open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(anyhow::Error::from(e).context(format!("failed to probe {}", path.display())))
+            }
+        }
     }
 }
 
@@ -829,6 +1104,7 @@ fn write_merged_settings(
         Err(_) => true,
     };
     if needs_write {
+        // TECH-9 #16: runtime settings.json can embed a third-party api_key — 0o600.
         atomic_write_600(&settings_dst, merged).context("failed to write runtime settings.json")?;
     }
     Ok(())

@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -18,6 +19,7 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         fallback_threshold: Some(80.0),
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -470,7 +472,7 @@ fn capture_name_caret_follows_edit_position() {
             credentials: None,
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            identity: crate::actions::CaptureIdentity::LiveLogin,
         }),
         input,
         from_divergence: false,
@@ -915,6 +917,7 @@ fn tokens_models_view_empty_filter_names_the_filter() {
 /// off `auth_broken`, so the chip tests need no live windows.
 fn bare(name: &str) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -924,6 +927,7 @@ fn bare(name: &str) -> Profile {
         fallback_threshold: Some(95.0),
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

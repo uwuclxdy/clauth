@@ -1,4 +1,4 @@
-//! In-place log-trim tests. No supervisor, no real ~/.clauth — a
+//! In-place log-trim tests (TECH-12 / #39). No launchd, no real ~/.clauth — a
 //! plain tempfile stands in for `daemon.log`.
 
 #![allow(clippy::unwrap_used)]

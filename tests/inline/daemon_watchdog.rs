@@ -1,4 +1,4 @@
-//! Anti-wedge watchdog decision (`watchdog_check`).
+//! TECH-3 — anti-wedge watchdog decision (`watchdog_check`).
 //!
 //! Pure tests of the abort decision: `on_stall` is injected as a flag so the
 //! stall path is asserted without a real `std::process::abort()`. The production

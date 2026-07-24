@@ -187,6 +187,33 @@ fn updates_enabled_when_env_is_other_value() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// FORK build gate (TECH-2): the fork has no release pipeline, so the upstream
+// self-updater must never download-and-replace this binary — doing so would
+// swap in an upstream build without the daemon/keychain features.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fork_build_never_self_replaces_even_off_cargo() {
+    // `false` is the non-cargo path — the one that WOULD download_and_replace on
+    // upstream. A fork build refuses it, so download_and_replace is unreachable.
+    assert!(
+        !should_self_replace(false),
+        "fork build must not self-replace even on the non-cargo path"
+    );
+    // A cargo install never self-replaces either (upgrade via `cargo install`).
+    assert!(!should_self_replace(true));
+}
+
+#[test]
+fn fork_build_spawn_returns_none() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    assert!(
+        spawn(tx).is_none(),
+        "a fork build never starts the background update thread"
+    );
+}
+
 /// The real opt-out check: with the env var set, `spawn` must short-circuit and
 /// do no work, so the receiver never sees an `UpdateEvent`.  With the env set,
 /// `spawn` returns before spawning a thread, so there is no network I/O and the

@@ -51,6 +51,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::poll::run_polling_loop;
+use crate::pricing::PriceTable;
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 // ── Refresh cadence ─────────────────────────────────────────────────────────
@@ -645,6 +646,212 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
     let mut out: Vec<PeriodModel> = map.into_values().collect();
     out.sort_unstable_by_key(|m| std::cmp::Reverse(m.in_out));
     out
+}
+
+// ── tokens.json snapshot (daemon → ccsbar) ────────────────────────────────────
+
+/// Schema version of the `~/.clauth/tokens.json` feed (TOK-3). This is the ONE
+/// place the version lives — `build_tokens_snapshot` embeds it. Bump only when a
+/// reader must branch on the change; additive fields keep the version, exactly
+/// like `daemon::status_json::SCHEMA_VERSION` (ccsbar decodes missing fields as
+/// absent rather than failing).
+pub(crate) const TOKENS_SCHEMA_VERSION: u32 = 1;
+
+/// Per-period model-row cap for the feed. Rows past this fold into one "others"
+/// bucket so the menu-bar payload stays compact no matter how many model ids the
+/// machine's history sprawls across.
+const SNAPSHOT_MODEL_ROWS: usize = 8;
+
+/// Build the `~/.clauth/tokens.json` body — a compact machine-wide token-usage
+/// snapshot for the ccsbar menu-bar app, assembled from the same [`TokenStats`]
+/// the Tokens tab renders and (optionally) the live [`PriceTable`]. This is the
+/// single assembly path shared by the daemon feed and any future in-TUI writer,
+/// so the two cannot drift.
+///
+/// Pure over its inputs except for the `generated_at` wall-clock stamp (same
+/// `epoch_secs_to_iso` style `status.json` uses). `today` is the `YYYY-MM-DD`
+/// the week/month windows are cut against — passed in (via [`today_date`]), not
+/// read from the clock here, so period selection stays deterministic and
+/// testable.
+///
+/// Four lenses are published, each a `PERIOD` (see [`period_json`]):
+/// - `today` ← `stats.today` (the live [`DaySummary`]); `None` (idle today)
+///   emits an all-zero, `complete` period so every lens is always present.
+/// - `week` / `month` ← the current calendar bucket ([`current_bucket_bounds`])
+///   aggregated over `stats.daily_models` ([`period_models`]).
+/// - `lifetime` ← [`group_models`] over `stats.models`, with `from`/`to` null;
+///   its split sums equal `stats.total_*` by construction (grouping
+///   redistributes, never drops), so it matches the lifetime card.
+pub(crate) fn build_tokens_snapshot(
+    stats: &TokenStats,
+    prices: Option<&PriceTable>,
+    today: &str,
+) -> serde_json::Value {
+    let today_rows: Vec<PeriodModel> = stats
+        .today
+        .as_ref()
+        .map(|t| t.models.iter().map(PeriodModel::from_full).collect())
+        .unwrap_or_default();
+
+    let (week_from, week_to) = current_bucket_bounds(today, Bucket::Week);
+    let week_rows = period_models(&stats.daily_models, &week_from, &week_to);
+
+    let (month_from, month_to) = current_bucket_bounds(today, Bucket::Month);
+    let month_rows = period_models(&stats.daily_models, &month_from, &month_to);
+
+    let lifetime_rows: Vec<PeriodModel> = group_models(&stats.models)
+        .iter()
+        .map(PeriodModel::from_full)
+        .collect();
+
+    serde_json::json!({
+        "schema": TOKENS_SCHEMA_VERSION,
+        "generated_at": epoch_secs_to_iso(now_epoch_secs()),
+        "clauth_version": env!("CARGO_PKG_VERSION"),
+        "topped_up_through": stats.topped_up_through.as_deref(),
+        "periods": {
+            "today": period_json(Some(today), Some(today), today_rows, prices),
+            "week": period_json(Some(&week_from), Some(&week_to), week_rows, prices),
+            "month": period_json(Some(&month_from), Some(&month_to), month_rows, prices),
+            "lifetime": period_json(None, None, lifetime_rows, prices),
+        },
+    })
+}
+
+/// Serialize one `PERIOD` for [`build_tokens_snapshot`]. `rows` are the period's
+/// per-model aggregates (DESC by in+out); they are capped to
+/// [`SNAPSHOT_MODEL_ROWS`] with the tail folded into a trailing "others" row.
+///
+/// The period token totals sum the row *splits*, so `input`/`output`/`cache_*`
+/// (and `total`) are a **floor** whenever any row's split is incomplete — a day
+/// in range published only its combined in+out, no per-model split. `in_out`
+/// sums the always-known combined metric instead, so it stays authoritative;
+/// `complete` flags when the two bases diverge (it is `false` iff any row's
+/// split is incomplete).
+///
+/// Cost is priced per model and summed, always counting cache tokens (API
+/// semantics — never a blended rate). `cost_usd` is `null` with no price table;
+/// `cost_is_floor` is `true` when the split is incomplete OR a model carrying
+/// tokens has no matching rate, so the renderer can show `$X+`.
+fn period_json(
+    from: Option<&str>,
+    to: Option<&str>,
+    rows: Vec<PeriodModel>,
+    prices: Option<&PriceTable>,
+) -> serde_json::Value {
+    let rows = cap_model_rows(rows, SNAPSHOT_MODEL_ROWS);
+    let complete = rows.iter().all(|m| m.split_complete);
+
+    let mut input = 0u64;
+    let mut output = 0u64;
+    let mut cache_read = 0u64;
+    let mut cache_create = 0u64;
+    let mut in_out = 0u64;
+    for m in &rows {
+        input = input.saturating_add(m.split.input);
+        output = output.saturating_add(m.split.output);
+        cache_read = cache_read.saturating_add(m.split.cache_read);
+        cache_create = cache_create.saturating_add(m.split.cache_create);
+        in_out = in_out.saturating_add(m.in_out);
+    }
+    let total = input
+        .saturating_add(output)
+        .saturating_add(cache_read)
+        .saturating_add(cache_create);
+
+    // Cost + floor. With no table, cost is null and the floor mark is moot
+    // (nothing to qualify). With a table, sum the per-model costs; a model with
+    // tokens but no rate (unpriced), or an incomplete split, makes it a floor.
+    let (cost_usd, cost_is_floor) = match prices {
+        None => (serde_json::Value::Null, false),
+        Some(p) => {
+            let mut cost = 0.0f64;
+            let mut unpriced = false;
+            for m in &rows {
+                match p.cost(&m.split) {
+                    Some(c) => cost += c,
+                    None if m.in_out > 0 || m.split.total() > 0 => unpriced = true,
+                    None => {}
+                }
+            }
+            (serde_json::json!(cost), unpriced || !complete)
+        }
+    };
+
+    let models: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "model": m.model,
+                "display": model_display_name(&m.model),
+                "input": m.split.input,
+                "output": m.split.output,
+                "cache_read": m.split.cache_read,
+                "cache_create": m.split.cache_create,
+                "in_out": m.in_out,
+                "split_complete": m.split_complete,
+                "cost_usd": prices.and_then(|p| p.cost(&m.split)),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "from": from,
+        "to": to,
+        "input": input,
+        "output": output,
+        "cache_read": cache_read,
+        "cache_create": cache_create,
+        "in_out": in_out,
+        "total": total,
+        "complete": complete,
+        "cost_usd": cost_usd,
+        "cost_is_floor": cost_is_floor,
+        "models": models,
+    })
+}
+
+/// Cap a period's rows at `max`, folding the overflow — plus any pre-existing
+/// "others" row (the lifetime lens's [`group_models`] fold) — into a single
+/// trailing "others" bucket. Guarantees at most `max` rows and never two
+/// "others". `rows` are assumed DESC by in+out; the kept prefix preserves that
+/// order and "others" trails as the catch-all. Folding sums both the split
+/// buckets and the always-known `in_out`, and the fold is incomplete if any
+/// folded row was, so the period aggregates over the capped rows are unchanged.
+fn cap_model_rows(rows: Vec<PeriodModel>, max: usize) -> Vec<PeriodModel> {
+    if rows.len() <= max {
+        return rows;
+    }
+    let mut kept: Vec<PeriodModel> = Vec::with_capacity(max);
+    let mut others = PeriodModel {
+        model: "others".to_owned(),
+        in_out: 0,
+        split: ModelTokens {
+            model: "others".to_owned(),
+            ..Default::default()
+        },
+        split_complete: true,
+    };
+    for m in rows {
+        // Reserve the final slot for "others": keep the first `max - 1`
+        // individual rows, fold everything after — and any row already named
+        // "others" — into the trailing bucket.
+        if m.model != "others" && kept.len() < max - 1 {
+            kept.push(m);
+        } else {
+            others.in_out = others.in_out.saturating_add(m.in_out);
+            others.split.input = others.split.input.saturating_add(m.split.input);
+            others.split.output = others.split.output.saturating_add(m.split.output);
+            others.split.cache_read = others.split.cache_read.saturating_add(m.split.cache_read);
+            others.split.cache_create = others
+                .split
+                .cache_create
+                .saturating_add(m.split.cache_create);
+            others.split_complete = others.split_complete && m.split_complete;
+        }
+    }
+    kept.push(others);
+    kept
 }
 
 // ── Recent transcript top-up ─────────────────────────────────────────────────

@@ -48,6 +48,10 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // `master_detail` is the fork's responsive split: on desktop it is the
+    // upstream `selector_width(area.width) | Min(20)` horizontal layout, and on
+    // phone widths it stacks selector-above-detail (narrow-TUI). Keeping the
+    // helper preserves both upstream's desktop split and the fork's narrow mode.
     let (selector, detail) = master_detail(area, chain_items(app).len());
 
     let chain_focused = app.fallback_focus == FallbackFocus::Chain;
@@ -235,6 +239,11 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         (
             FallbackRow::Threshold,
             app.fallback_threshold_draft.as_ref(),
+            0usize,
+        ),
+        (
+            FallbackRow::WeeklyAt,
+            app.fallback_weekly_draft.as_ref(),
             0usize,
         ),
         // `+ 1` for the leading `$`, which sits before the buffer.
@@ -507,8 +516,8 @@ fn member_detail(
         let selected = focused && i == cursor;
         let row_editing = match *row {
             FallbackRow::Threshold => editing,
-            FallbackRow::MaxSpend => max_spend_editing,
             FallbackRow::WeeklyAt => weekly_editing,
+            FallbackRow::MaxSpend => max_spend_editing,
             _ => None,
         };
         let line = detail_row(

@@ -993,3 +993,280 @@ fn today_hours_track_todays_messages() {
     assert_eq!(t.hours[3], 1);
     assert_eq!(t.hours.iter().sum::<u64>(), 3);
 }
+
+// ── 7. tokens.json snapshot builder (TOK-3) ──────────────────────────────────
+//
+// Every case here exercises the PURE builder — no worker thread, no disk. The
+// fixture `today` is 2026-07-09 (a thursday), so week starts 2026-07-06 and month
+// starts 2026-07-01, matching the bucketing tests above.
+
+use crate::pricing::{ModelRate, PriceTable};
+
+/// `PriceTable` from `(id, input, output, cache_read, cache_write)` per-token rows.
+fn price_table(rows: &[(&str, f64, f64, f64, f64)]) -> PriceTable {
+    let mut rates = std::collections::HashMap::new();
+    for &(id, input, output, cache_read, cache_write) in rows {
+        rates.insert(
+            id.to_owned(),
+            ModelRate {
+                input,
+                output,
+                cache_read,
+                cache_write,
+            },
+        );
+    }
+    PriceTable::from_rates(rates)
+}
+
+fn mt(model: &str, input: u64, output: u64, cache_read: u64, cache_create: u64) -> ModelTokens {
+    ModelTokens {
+        model: model.to_owned(),
+        input,
+        output,
+        cache_read,
+        cache_create,
+    }
+}
+
+#[test]
+fn snapshot_has_schema_version_and_all_four_periods() {
+    let stats = TokenStats::default();
+    let snap = build_tokens_snapshot(&stats, None, "2026-07-09");
+
+    assert_eq!(snap["schema"], 1);
+    assert!(snap["generated_at"].is_string());
+    assert!(snap["clauth_version"].is_string());
+    assert!(snap["topped_up_through"].is_null());
+
+    let periods = &snap["periods"];
+    for lens in ["today", "week", "month", "lifetime"] {
+        assert!(periods[lens].is_object(), "missing period {lens}");
+    }
+    // today is a single day; lifetime is unbounded; week/month are the current bucket.
+    assert_eq!(periods["today"]["from"], "2026-07-09");
+    assert_eq!(periods["today"]["to"], "2026-07-09");
+    assert!(periods["lifetime"]["from"].is_null());
+    assert!(periods["lifetime"]["to"].is_null());
+    assert_eq!(periods["week"]["from"], "2026-07-06");
+    assert_eq!(periods["week"]["to"], "2026-07-09");
+    assert_eq!(periods["month"]["from"], "2026-07-01");
+    assert_eq!(periods["month"]["to"], "2026-07-09");
+}
+
+#[test]
+fn week_and_month_windows_filter_daily_models() {
+    let daily_models = vec![
+        // Before the month → in neither window.
+        day_model(
+            "2026-06-30",
+            "claude-opus-4",
+            999,
+            Some(mt("claude-opus-4", 500, 499, 0, 0)),
+        ),
+        // In the month, before the week → month only.
+        day_model(
+            "2026-07-02",
+            "claude-opus-4",
+            50,
+            Some(mt("claude-opus-4", 30, 20, 0, 0)),
+        ),
+        // In the current week → both windows.
+        day_model(
+            "2026-07-07",
+            "claude-opus-4",
+            100,
+            Some(mt("claude-opus-4", 60, 40, 0, 0)),
+        ),
+    ];
+    let stats = TokenStats {
+        daily_models,
+        ..Default::default()
+    };
+    let snap = build_tokens_snapshot(&stats, None, "2026-07-09");
+
+    let week = &snap["periods"]["week"];
+    assert_eq!(week["in_out"], 100);
+    assert_eq!(week["input"], 60);
+    assert_eq!(week["output"], 40);
+    assert_eq!(week["complete"], true);
+
+    let month = &snap["periods"]["month"];
+    assert_eq!(month["in_out"], 150); // 100 + 50
+    assert_eq!(month["input"], 90); // 60 + 30
+    assert_eq!(month["output"], 60); // 40 + 20
+}
+
+#[test]
+fn incomplete_split_marks_period_and_cost_as_floor() {
+    let daily_models = vec![
+        // Full split (transcript-derived).
+        day_model(
+            "2026-07-07",
+            "claude-opus-4",
+            100,
+            Some(mt("claude-opus-4", 60, 40, 0, 0)),
+        ),
+        // in+out only (stats-cache day) — no split → floors the period.
+        day_model("2026-07-08", "gpt-5", 30, None),
+    ];
+    let stats = TokenStats {
+        daily_models,
+        ..Default::default()
+    };
+    let prices = price_table(&[
+        ("claude-opus-4", 1e-6, 2e-6, 0.0, 0.0),
+        ("gpt-5", 1e-6, 2e-6, 0.0, 0.0),
+    ]);
+    let snap = build_tokens_snapshot(&stats, Some(&prices), "2026-07-09");
+
+    let week = &snap["periods"]["week"];
+    assert_eq!(week["in_out"], 130); // always-known combined metric
+    assert_eq!(week["input"], 60); // only the split-bearing row contributes
+    assert_eq!(week["complete"], false);
+    assert_eq!(week["cost_is_floor"], true);
+    // Cost sums only the known split: 60*1e-6 + 40*2e-6 = 1.4e-4.
+    let cost = week["cost_usd"].as_f64().expect("cost present");
+    assert!((cost - 1.4e-4).abs() < 1e-12, "got {cost}");
+}
+
+#[test]
+fn unpriced_model_with_tokens_marks_cost_floor() {
+    let today = DaySummary {
+        date: "2026-07-09".into(),
+        models: vec![mt("claude-opus-4", 100, 0, 0, 0), mt("gpt-5", 50, 0, 0, 0)],
+        ..Default::default()
+    };
+    let stats = TokenStats {
+        today: Some(today),
+        ..Default::default()
+    };
+    let prices = price_table(&[("claude-opus-4", 1e-6, 2e-6, 0.0, 0.0)]);
+    let snap = build_tokens_snapshot(&stats, Some(&prices), "2026-07-09");
+
+    let t = &snap["periods"]["today"];
+    // Splits are full — the period is complete; only pricing is missing.
+    assert_eq!(t["complete"], true);
+    assert_eq!(t["cost_is_floor"], true); // gpt-5 carries tokens with no rate
+    let cost = t["cost_usd"].as_f64().expect("cost");
+    assert!((cost - 1e-4).abs() < 1e-12, "got {cost}"); // 100 * 1e-6, opus only
+
+    let models = t["models"].as_array().expect("models");
+    let opus = models
+        .iter()
+        .find(|m| m["model"] == "claude-opus-4")
+        .expect("opus row");
+    let gpt = models
+        .iter()
+        .find(|m| m["model"] == "gpt-5")
+        .expect("gpt row");
+    assert!(opus["cost_usd"].as_f64().is_some());
+    assert!(gpt["cost_usd"].is_null());
+}
+
+#[test]
+fn caps_period_at_eight_rows_folding_the_tail_into_others() {
+    // 10 distinct claude models → group_models keeps all individual (no fold),
+    // then the 8-row cap folds the smallest 3 into one trailing "others".
+    let models: Vec<ModelTokens> = (0..10)
+        .map(|i| mt(&format!("claude-m{i}"), (10 - i as u64) * 100, 0, 0, 0))
+        .collect();
+    let stats = TokenStats {
+        total_input: models.iter().map(|m| m.input).sum(),
+        models,
+        ..Default::default()
+    };
+    let snap = build_tokens_snapshot(&stats, None, "2026-07-09");
+
+    let life = &snap["periods"]["lifetime"];
+    let rows = life["models"].as_array().expect("models");
+    assert_eq!(rows.len(), 8, "capped to 8 rows");
+    assert_eq!(
+        rows.iter().filter(|m| m["model"] == "others").count(),
+        1,
+        "exactly one others row"
+    );
+    assert_eq!(rows.last().unwrap()["model"], "others", "others trails");
+    // Folded tail = m7 + m8 + m9 = 300 + 200 + 100.
+    assert_eq!(rows.last().unwrap()["in_out"], 600);
+    // The fold preserves the period total: 1000 + 900 + … + 100 = 5500.
+    assert_eq!(life["in_out"], 5500);
+}
+
+#[test]
+fn today_none_emits_a_zero_complete_period() {
+    let stats = TokenStats::default(); // today: None
+    let prices = price_table(&[("claude-opus-4", 1e-6, 2e-6, 0.0, 0.0)]);
+    let snap = build_tokens_snapshot(&stats, Some(&prices), "2026-07-09");
+
+    let t = &snap["periods"]["today"];
+    assert_eq!(t["in_out"], 0);
+    assert_eq!(t["total"], 0);
+    assert_eq!(t["input"], 0);
+    assert_eq!(t["complete"], true);
+    // Price table present → an explicit 0.0, not null; nothing unpriced → not a floor.
+    assert_eq!(t["cost_usd"].as_f64(), Some(0.0));
+    assert_eq!(t["cost_is_floor"], false);
+    assert!(t["models"].as_array().expect("models").is_empty());
+    assert_eq!(t["from"], "2026-07-09");
+    assert_eq!(t["to"], "2026-07-09");
+}
+
+#[test]
+fn cost_is_null_without_a_price_table() {
+    let today = DaySummary {
+        date: "2026-07-09".into(),
+        models: vec![mt("claude-opus-4", 100, 50, 0, 0)],
+        ..Default::default()
+    };
+    let stats = TokenStats {
+        today: Some(today),
+        ..Default::default()
+    };
+    let snap = build_tokens_snapshot(&stats, None, "2026-07-09");
+
+    for lens in ["today", "week", "month", "lifetime"] {
+        assert!(
+            snap["periods"][lens]["cost_usd"].is_null(),
+            "{lens} cost should be null with no price table"
+        );
+        assert_eq!(snap["periods"][lens]["cost_is_floor"], false);
+    }
+    let m = &snap["periods"]["today"]["models"][0];
+    assert!(m["cost_usd"].is_null());
+    // Display name mapping is wired through the builder.
+    assert_eq!(m["display"], "opus 4");
+}
+
+#[test]
+fn lifetime_totals_and_cost_count_cache() {
+    let stats = TokenStats {
+        total_input: 1_000_000,
+        total_output: 1_000_000,
+        total_cache_read: 1_000_000,
+        total_cache_create: 1_000_000,
+        models: vec![mt(
+            "claude-opus-4",
+            1_000_000,
+            1_000_000,
+            1_000_000,
+            1_000_000,
+        )],
+        ..Default::default()
+    };
+    let prices = price_table(&[("claude-opus-4", 1e-6, 2e-6, 1e-7, 1.25e-6)]);
+    let snap = build_tokens_snapshot(&stats, Some(&prices), "2026-07-09");
+
+    let life = &snap["periods"]["lifetime"];
+    assert_eq!(life["input"], 1_000_000);
+    assert_eq!(life["output"], 1_000_000);
+    assert_eq!(life["cache_read"], 1_000_000);
+    assert_eq!(life["cache_create"], 1_000_000);
+    assert_eq!(life["in_out"], 2_000_000);
+    assert_eq!(life["total"], 4_000_000);
+    assert_eq!(life["complete"], true);
+    assert_eq!(life["cost_is_floor"], false);
+    // Cache always counts: 1.0 + 2.0 + 0.10 + 1.25 = 4.35.
+    let cost = life["cost_usd"].as_f64().expect("cost");
+    assert!((cost - 4.35).abs() < 1e-9, "got {cost}");
+}

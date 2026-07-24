@@ -60,6 +60,8 @@ fn cell_is_always_exactly_width() {
 
 fn cue_profile(status: Option<FetchStatus>) -> Profile {
     Profile {
+        harness: crate::profile::Harness::Claude,
+        session_feed: false,
         name: "p".into(),
         base_url: None,
         api_key: None,
@@ -499,3 +501,19 @@ fn stale_window_fades_only_fill_and_percent() {
         "reset suffix unchanged"
     );
 }
+
+// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
+
+// CDX-1 T8: the kind column is the harness tag for codex profiles.
+#[test]
+fn account_type_label_tags_codex_profiles() {
+    let mut p = crate::testutil::blank_profile("cdx");
+    p.harness = crate::profile::Harness::Codex;
+    assert_eq!(account_type_label(&p), "Codex");
+}
+
+// ── Reset display (issue #39) ───────────────────────────────────────────────
+//
+// `clock_text` and the three compositions are pure, so these pin exact strings
+// without depending on the box's timezone. The zone lookup itself
+// (`local_clock`) is a single chrono call over them.

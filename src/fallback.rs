@@ -385,7 +385,7 @@ pub(crate) fn is_canceled(profile: &Profile) -> bool {
 /// Sole caller is the scheduler-side [`is_exhausted_active_from_usage`] — the
 /// UI-thread [`is_exhausted_active`] takes its rate as a parameter instead so
 /// the render pass never triggers this disk read under the config guard.
-fn burn_rate_for_profile(name: &str, window: &UsageWindow) -> Option<f64> {
+pub(crate) fn burn_rate_for_profile(name: &str, window: &UsageWindow) -> Option<f64> {
     let history = crate::profile::load_usage_history(name);
     let pair = ("5h", window);
     crate::usage::compute_burn_rates_from_history(
@@ -744,9 +744,6 @@ pub(crate) struct ChainMember {
     /// decoupled from `threshold` (issue #8 follow-up: a threshold no longer
     /// doubles as a sink marker).
     pub(crate) last_resort: bool,
-    /// Mirrors `Profile::max_auto_spend` in dollars, `0` when unset — the
-    /// member's own ceiling on unattended pay-as-you-go spending.
-    pub(crate) max_spend: f64,
     /// The member's resolved SOFT weekly line ([`member_weekly_line`]:
     /// `weekly_threshold` override else the chain-wide line; the hard cap
     /// when its `check_weekly` gate is off). Snapshot-folded so the lock-free
@@ -757,6 +754,9 @@ pub(crate) struct ChainMember {
     /// Mirrors `Profile::check_scoped` — whether per-model weekly windows
     /// (e.g. "7d fable") keep this member out of rotation.
     pub(crate) check_scoped: bool,
+    /// Mirrors `Profile::max_auto_spend` in dollars, `0` when unset — the
+    /// member's own ceiling on unattended pay-as-you-go spending.
+    pub(crate) max_spend: f64,
 }
 
 /// In-memory snapshot of the fields `next_auto_switch_target` needs: active
@@ -827,6 +827,13 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     let weekly_pct = config.state.weekly_switch_threshold_pct();
     let chain = chain
         .iter()
+        .filter(|name| {
+            // CDX-1 T1b tolerance: a stray codex member (hand-edited into an
+            // existing profiles.toml — the edit surfaces reject new ones) must
+            // never become a walk candidate. Silent here (this runs every
+            // tick); the rejection with a message lives in `fallback_config`.
+            !config.find(name).is_some_and(|p| p.is_codex())
+        })
         // A disabled NON-active member is invisible to the scheduler-side walk
         // (`next_auto_switch_target`) — dropped here rather than carried as a
         // `ChainMember` flag, so the freshness pass built from `.chain` below
@@ -847,7 +854,6 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
                 name: name.to_string(),
                 threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
                 last_resort: profile.is_some_and(|p| p.last_resort),
-                max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
                 weekly_line: profile
                     .map(|p| member_weekly_line(p, weekly_pct))
                     .unwrap_or(weekly_pct),
@@ -855,6 +861,7 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
                     .map(|p| member_scoped_line(p, weekly_pct))
                     .unwrap_or(weekly_pct),
                 check_scoped: profile.is_none_or(|p| p.check_scoped),
+                max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
             }
         })
         .collect();
@@ -1131,8 +1138,8 @@ pub(crate) fn next_target(
     // since this picker is also exercised on a healthy active. The ACTIVE
     // check is burn-aware (issue #8 follow-up b) so this agrees with
     // `next_auto_switch_target`'s scheduler-side gate; the candidate walk
-    // above stays on the static `is_exhausted`. Weekly-wise Off keys on the
-    // HARD cap ([`WEEKLY_HARD_BLOCK_PCT`]), not the soft line: a soft-blocked
+    // above stays on the static `is_exhausted`. Weekly-wise `Off` keys on the
+    // HARD cap (`WEEKLY_HARD_BLOCK_PCT`), not the soft line: a soft-blocked
     // active with real weekly room left stays put instead of signing every
     // running claude out over the tail it could still spend.
     //
@@ -1244,6 +1251,9 @@ fn next_auto_switch_target_with_usage(
     // not a snapshot flag — unlike `broken`/`kick_rejected` it needs no separate
     // channel.
     let active_canceled = is_canceled_from_usage(&active.name, usage);
+    // Judged at the active's own folded SOFT line (SCW-2) — the healthy-active
+    // early return lives below the walk defs, so the scoped active trigger can
+    // still hop a per-model-blocked healthy active.
     let active_exhausted = is_exhausted_active_from_usage(
         active,
         snapshot.burn_aware,
@@ -1254,6 +1264,8 @@ fn next_auto_switch_target_with_usage(
         snapshot.burn_horizon_cap_ms,
     );
 
+    // Skip the active slot and any auth-broken member (AUTH-1) — the broken
+    // exclusion covers the headroom pass AND the 100%-sink pass below.
     let skip = |i: usize| {
         snapshot.chain[i].name == active.name
             || snapshot.broken.iter().any(|b| b == &snapshot.chain[i].name)
@@ -1530,6 +1542,195 @@ pub(crate) fn auto_switch_if_needed(
         }
         Ok(Some(action))
     })
+}
+
+// ---------------------------------------------------------------------------
+// CDX-4: the codex chain walk (PLAN.md §0.15) — session-boundary auto-switch
+// off the passive signal. Reuses the claude walk's shapes where they map
+// (ChainMember, wrapped scan order, the store-side exhaustion predicate,
+// last_resort's one-migration rule) and drops the gates that don't: no
+// decision_fresh (passive data self-invalidates via resets_at, and
+// used_percent is monotone within a window so a stale read only
+// UNDER-reports), no kick_rejected (no kicks), no `Off` action (logging the
+// live codex out serves nothing — an exhausted account just errors).
+// ---------------------------------------------------------------------------
+
+/// Snapshot for the codex scan, built under the config lock by
+/// [`snapshot_codex_chain`]; `leased`/`loginless` are IO-derived and filled by
+/// the caller AFTER the lock drops (the `kick_rejected` pattern).
+#[derive(Debug, Clone)]
+pub(crate) struct CodexChainSnapshot {
+    pub(crate) active: String,
+    pub(crate) chain: Vec<ChainMember>,
+    pub(crate) broken: Vec<String>,
+    pub(crate) weekly_pct: f64,
+    /// Members with a live isolated `clauth start` session — their chain
+    /// lives in that session's CODEX_HOME (§0.14); installing the store
+    /// snapshot would fork it. Walked around like `broken`.
+    pub(crate) leased: Vec<String>,
+    /// Members with no stored codex login — nothing to install.
+    pub(crate) loginless: Vec<String>,
+}
+
+/// Snapshot the codex chain out of `AppConfig`. `None` for every degenerate
+/// marker the scan must not act on: no codex active, an active that names a
+/// deleted or claude profile (hand-edited state), an active outside the
+/// chain, or an empty chain. Stray non-codex chain members are silently
+/// skipped, mirroring `snapshot_chain`'s T1b tolerance.
+pub(crate) fn snapshot_codex_chain(config: &AppConfig) -> Option<CodexChainSnapshot> {
+    let active = config.state.active_codex_profile.as_deref()?.to_string();
+    if !config.find(&active).is_some_and(|p| p.is_codex()) {
+        return None;
+    }
+    let chain = &config.state.codex_fallback_chain;
+    if !chain.iter().any(|n| n.as_str() == active) {
+        return None;
+    }
+    let chain: Vec<ChainMember> = chain
+        .iter()
+        .filter(|name| config.find(name).is_some_and(|p| p.is_codex()))
+        .map(|name| {
+            let profile = config.find(name);
+            ChainMember {
+                name: name.to_string(),
+                threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
+                last_resort: profile.is_some_and(|p| p.last_resort),
+                // Inert for codex members: the codex walk judges through its
+                // own limiter/threshold fns, never these claude-weekly lines
+                // or the claude spend passes.
+                weekly_line: WEEKLY_HARD_BLOCK_PCT,
+                scoped_line: WEEKLY_HARD_BLOCK_PCT,
+                check_scoped: false,
+                max_spend: 0.0,
+            }
+        })
+        .collect();
+    Some(CodexChainSnapshot {
+        active,
+        chain,
+        broken: config
+            .state
+            .auth_broken
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        weekly_pct: config.state.weekly_switch_threshold_pct(),
+        leased: Vec::new(),
+        loginless: Vec::new(),
+    })
+}
+
+/// Codex's own limiter verdict, cross-checked against the named window's
+/// `resets_at` (§0.16): `rate_limit_reached_type` says WHICH window rejected
+/// the last request, and the verdict stands only while that window hasn't
+/// reset. An unrecognized window name is checked against both windows —
+/// trust the verdict while either could still be in force, self-clearing at
+/// the later reset (never a permanent wedge).
+fn codex_limiter_blocked(info: &crate::usage::UsageInfo, now_secs: i64) -> bool {
+    match info.codex_rate_limit_reached.as_deref() {
+        Some("primary") => crate::usage::five_hour_live(info, now_secs),
+        Some("secondary") => crate::usage::seven_day_live(info, now_secs),
+        Some(_) => {
+            crate::usage::five_hour_live(info, now_secs)
+                || crate::usage::seven_day_live(info, now_secs)
+        }
+        None => false,
+    }
+}
+
+/// Whether one codex `UsageInfo` snapshot reads as exhausted at `threshold`:
+/// the shared percent shape (weekly line, or live 5h window over threshold)
+/// OR codex's own limiter verdict. The pure core shared by the store walk and
+/// the CDX-5 proxy's per-account cache check.
+pub(crate) fn codex_info_exhausted_at(
+    info: &crate::usage::UsageInfo,
+    now_secs: i64,
+    threshold: f64,
+    weekly_pct: f64,
+) -> bool {
+    codex_limiter_blocked(info, now_secs)
+        || weekly_blocked_info(info, now_secs, weekly_pct)
+        || (crate::usage::five_hour_live(info, now_secs)
+            && info
+                .five_hour
+                .as_ref()
+                .is_some_and(|w| w.utilization >= threshold))
+}
+
+/// [`codex_info_exhausted_at`] at the DEFAULT threshold — the CDX-5 proxy's
+/// availability check (it has no per-member threshold snapshot).
+pub(crate) fn codex_info_exhausted(
+    info: &crate::usage::UsageInfo,
+    now_secs: i64,
+    weekly_pct: f64,
+) -> bool {
+    codex_info_exhausted_at(info, now_secs, DEFAULT_THRESHOLD, weekly_pct)
+}
+
+/// Store-side exhaustion for one codex profile. A poisoned store lock fails
+/// safe to "not exhausted", same as the claude side.
+fn codex_exhausted_from_store(
+    name: &str,
+    threshold: f64,
+    store: &UsageStore,
+    weekly_pct: f64,
+) -> bool {
+    let now = now_epoch_secs();
+    match store.lock() {
+        Ok(s) => s
+            .get(name)
+            .is_some_and(|info| codex_info_exhausted_at(info, now, threshold, weekly_pct)),
+        Err(_) => false,
+    }
+}
+
+/// The codex scan's decision: the next chain member to install, or `None`.
+/// Fires only when the ACTIVE codex profile is exhausted (percent shape or
+/// limiter verdict); candidates must be installable (not broken / leased /
+/// loginless) and not exhausted themselves — a member with no data, or whose
+/// cached windows have lapsed (`resets_at` passed ⇒ reset), is viable. Then
+/// the `last_resort` pass under the same one-migration rule as the claude
+/// walk. No `Off` arm by design (module note above).
+pub(crate) fn next_codex_auto_switch_target(
+    snapshot: &CodexChainSnapshot,
+    store: &UsageStore,
+) -> Option<String> {
+    let active_idx = snapshot
+        .chain
+        .iter()
+        .position(|m| m.name == snapshot.active)?;
+    let len = snapshot.chain.len();
+
+    let active = &snapshot.chain[active_idx];
+    let active_broken = snapshot.broken.iter().any(|b| b == &active.name);
+    if !active_broken
+        && !codex_exhausted_from_store(&active.name, active.threshold, store, snapshot.weekly_pct)
+    {
+        return None;
+    }
+
+    let skip = |i: usize| {
+        let m = &snapshot.chain[i];
+        m.name == snapshot.active
+            || snapshot.broken.iter().any(|b| b == &m.name)
+            || snapshot.leased.iter().any(|l| l == &m.name)
+            || snapshot.loginless.iter().any(|l| l == &m.name)
+    };
+    let pick = walk_chain(active_idx, len, &skip, &|i| {
+        let m = &snapshot.chain[i];
+        !codex_exhausted_from_store(&m.name, m.threshold, store, snapshot.weekly_pct)
+    });
+    if let Some(i) = pick {
+        return Some(snapshot.chain[i].name.clone());
+    }
+
+    // Last resort: accepted even while exhausted — but never from a
+    // last-resort active (two sinks migrating to each other gains nothing).
+    if active.last_resort {
+        return None;
+    }
+    walk_chain(active_idx, len, &skip, &|i| snapshot.chain[i].last_resort)
+        .map(|i| snapshot.chain[i].name.clone())
 }
 
 #[cfg(test)]

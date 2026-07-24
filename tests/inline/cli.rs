@@ -1140,3 +1140,77 @@ mod api_key_helper_tests {
         dispatch_api_key("ghost-profile").expect_err("missing profile must fail closed");
     }
 }
+
+// ── Fork flags: --new / --codex / --browser, and the fork verbs ─────────────
+
+/// `--new` pins race-proof CREATE semantics for non-TTY callers; position-free
+/// like every clap flag.
+#[test]
+fn login_new_flag_in_any_position() {
+    assert!(login(&["login", "--new", "acme"]).new_only);
+    assert!(login(&["login", "acme", "--new"]).new_only);
+    assert!(!login(&["login", "acme"]).new_only);
+}
+
+/// `--codex` captures the live codex login; `--browser` only modifies it
+/// (mints via PKCE instead of capturing).
+#[test]
+fn login_codex_flag_and_its_browser_modifier() {
+    let a = login(&["login", "work", "--codex"]);
+    assert!(a.codex);
+    assert!(!a.browser);
+    let b = login(&["login", "work", "--codex", "--browser"]);
+    assert!(b.codex && b.browser);
+}
+
+/// Bare `--browser` is a usage error, not a synonym for the (always-browser)
+/// claude login — the error names what it requires.
+#[test]
+fn login_bare_browser_is_refused() {
+    let err = parse(&["login", "acme", "--browser"]).expect_err("bare --browser must be refused");
+    assert_eq!(err.exit_code(), 2);
+    assert!(
+        err.to_string().contains("--codex"),
+        "the error must name the required flag, got: {err}"
+    );
+}
+
+/// The codex capture takes the live login verbatim — the claude-shaped flags
+/// have no meaning there, and the sidecar capture is a different login again.
+#[test]
+fn login_codex_excludes_claude_shaped_flags() {
+    for args in [
+        ["login", "work", "--codex", "--model", "opus"].as_slice(),
+        ["login", "work", "--codex", "--base-url", "https://x"].as_slice(),
+        ["login", "work", "--codex", "--api-key", "sk-x"].as_slice(),
+        ["login", "work", "--codex", "--setup-token"].as_slice(),
+    ] {
+        assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+}
+
+/// `--codex --new` composes: a race-proof CREATE of a codex profile.
+#[test]
+fn login_codex_composes_with_new() {
+    let a = login(&["login", "work", "--codex", "--new"]);
+    assert!(a.codex && a.new_only);
+}
+
+/// The fork verbs parse: `feed`/`proxy`/`fallback` capture their rest verbatim
+/// (each has its own grammar downstream), `doctor` is bare.
+#[test]
+fn fork_verbs_capture_their_rest_verbatim() {
+    let Command::Feed { rest } = command(&["feed", "acme", "on"]) else {
+        panic!("feed must parse");
+    };
+    assert_eq!(rest, ["acme", "on"]);
+    let Command::Proxy { rest } = command(&["proxy", "--port", "4517"]) else {
+        panic!("proxy must parse");
+    };
+    assert_eq!(rest, ["--port", "4517"]);
+    let Command::Fallback { rest } = command(&["fallback", "threshold", "acme", "90"]) else {
+        panic!("fallback must parse");
+    };
+    assert_eq!(rest, ["threshold", "acme", "90"]);
+    assert!(matches!(command(&["doctor"]), Command::Doctor));
+}

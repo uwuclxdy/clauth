@@ -240,8 +240,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         && matches!(
             fallback_hint(app),
             FallbackHint::DetailThresholdEdit
-                | FallbackHint::DetailMaxSpendEdit
                 | FallbackHint::DetailWeeklyAtEdit
+                | FallbackHint::DetailMaxSpendEdit
                 | FallbackHint::DetailRemoveArmed
         ))
         || (app.tab == Tab::Config && app.refresh_interval_draft.is_some()));

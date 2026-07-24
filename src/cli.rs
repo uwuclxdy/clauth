@@ -119,9 +119,12 @@ pub(crate) enum Command {
     /// Resume a session under a chosen profile
     ///
     /// Prompts on a TTY, defaulting to the session's last-ran profile (the
-    /// active profile when that is unknown).
+    /// active profile when that is unknown). A KNOWN codex profile name
+    /// instead switches the codex login and runs `codex resume --last` — the
+    /// latest conversation continues under the new account (CDX-1c
+    /// carryover).
     Resume {
-        /// Session id, or `latest`.
+        /// Session id, `latest`, or a codex profile name.
         target: String,
         /// Resume under this profile instead of prompting.
         #[arg(long, value_name = "NAME")]
@@ -171,6 +174,44 @@ pub(crate) enum Command {
         #[arg(long)]
         disabled: bool,
     },
+
+    /// Edit the auto-switch fallback chains
+    ///
+    /// `clauth fallback list | add|remove|up|down <profile> | threshold
+    /// <profile> <pct> | last-resort <profile> on|off`. Membership ops route by
+    /// the profile's harness (claude chain vs codex chain).
+    Fallback {
+        /// Subcommand and its args, parsed by the fallback grammar.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+
+    /// Feed a profile's session token from its clauth-private usage chain
+    ///
+    /// `clauth feed <profile> on|off`. On: full-scope bearers, so plan-gated
+    /// models work in sessions. Off: restore the static long-lived mint.
+    Feed {
+        /// `<profile> on|off`, parsed by the feed grammar.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+
+    /// Run the codex injection proxy for in-session codex account fallback
+    ///
+    /// Point codex at it (`clauth proxy --print-config`): a mid-conversation
+    /// 429 rotates to the next chain account and replays before codex sees a
+    /// byte.
+    Proxy {
+        /// Proxy flags (`--port N`, `--print-config`), parsed by the proxy
+        /// grammar.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        rest: Vec<String>,
+    },
+
+    /// Read-only health check of the daemon + macOS wiring
+    ///
+    /// LaunchAgent, lock, socket, Keychain grant, version skew.
+    Doctor,
 
     /// Run the stdio MCP server (claude code launches this)
     Mcp,
@@ -293,6 +334,20 @@ pub(crate) struct LoginArgs {
     /// model id.
     #[arg(long, value_name = "ID")]
     pub(crate) model: Option<String>,
+    /// Refuse to re-authenticate an existing profile — the race-proof CREATE
+    /// for non-TTY callers (a menu-bar app never sees the confirm prompt).
+    #[arg(long = "new", conflicts_with = "setup_token")]
+    pub(crate) new_only: bool,
+    /// Capture the live ~/.codex/auth.json (OpenAI Codex CLI) into a
+    /// codex-harness profile instead of a browser OAuth login. Exclusive with
+    /// the claude-shaped flags.
+    #[arg(long, conflicts_with_all = ["base_url", "api_key", "model", "setup_token"])]
+    pub(crate) codex: bool,
+    /// With --codex only: mint a NEW codex login via the PKCE loopback flow
+    /// straight into the profile store, never touching the live
+    /// ~/.codex/auth.json.
+    #[arg(long, requires = "codex")]
+    pub(crate) browser: bool,
 }
 
 impl LoginArgs {

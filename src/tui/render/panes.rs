@@ -175,6 +175,15 @@ pub(super) fn pill(label: String, label_style: Style) -> Vec<Span<'static>> {
     ]
 }
 
+/// `[ active ]` — the active-account marker on the usage tab's plan row,
+/// [`pill`] pre-bound to the accent-bold label.
+pub(super) fn active_pill() -> Vec<Span<'static>> {
+    pill(
+        "active".to_string(),
+        theme::accent().add_modifier(Modifier::BOLD),
+    )
+}
+
 pub(super) fn picker_row(
     selected: bool,
     focused: bool,

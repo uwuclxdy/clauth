@@ -53,8 +53,13 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// HTTP connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// HTTP response-receive timeout.
-const RECV_TIMEOUT: Duration = Duration::from_secs(15);
+/// HTTP response-receive timeout. In ureq 3 this deadline keeps counting
+/// through the BODY read (pinned by the proxy's timeout-semantics tests), so
+/// it must cover the whole ~1.5 MiB feed on a slow link, not just the
+/// headers — 15 s needed ≥100 KB/s sustained and truncated the fetch on
+/// throttled connections (timeout-sweep 2026-07-18). Background thread; a
+/// longer bound costs nothing.
+const RECV_TIMEOUT: Duration = Duration::from_secs(60);
 /// Hard cap on the response body. The real feed is ~1.5 MiB; 8 MiB is generous
 /// headroom while still bounding a hostile / runaway response.
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;

@@ -68,6 +68,11 @@ pub(super) fn cue_style(cue: Option<Color>, resting: Style) -> Style {
 }
 
 pub(super) fn account_type_label(profile: &Profile) -> String {
+    // The harness tag: a codex profile's kind column names its CLI, so the
+    // accounts list reads at a glance which rows switch which tool (CDX-1 T8).
+    if profile.is_codex() {
+        return "Codex".to_string();
+    }
     if !profile.is_oauth() {
         return "API".to_string();
     }

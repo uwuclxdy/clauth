@@ -5,12 +5,12 @@
 <h1 align="center">Claude Code multi-account manager & MCP Plugin</h1>
 
 <p align="center">
-  <a href="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml"><img src="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg" alt="Release build status" /></a>
-  <a href="https://crates.io/crates/clauth"><img src="https://shields.uwuclxdy.dev/github/v/release/uwuclxdy/clauth?sort=semver&logo=rust&label=version&color=orange" alt="latest version" /></a>
-  <a href="https://github.com/uwuclxdy/clauth/releases"><img src="https://shields.uwuclxdy.dev/github/downloads/uwuclxdy/clauth/total?label=downloads&color=blue" alt="GitHub release downloads" /></a>
-  <img src="https://shields.uwuclxdy.dev/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-2b90d9" alt="Linux, macOS, Windows" />
-  <a href="LICENSE"><img src="https://shields.uwuclxdy.dev/badge/license-MIT-green" alt="MIT license" /></a>
+  <a href="https://github.com/xingfanxia/clauth/actions/workflows/ci.yml"><img src="https://github.com/xingfanxia/clauth/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status" /></a>
+  <img src="https://img.shields.io/badge/platform-macOS-2b90d9" alt="macOS" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license" /></a>
 </p>
+
+<p align="center"><em>macOS-focused fork — real Keychain account switching, browser-OAuth login, and a headless auto-switch daemon + <code>status.json</code> feed for a menu-bar app. Forked from the upstream <code>clauth</code> TUI (see the <code>upstream</code> git remote and LICENSE).</em></p>
 
 <p align="center">
   <a href="#features">Features</a> ·
@@ -38,6 +38,27 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 ![clauth TUI demo: switching Claude Code accounts with live usage bars](media/demo.gif)
 
+### The signature move: hot-swap a login under a live session
+
+On macOS this fork's headline trick rests on one non-obvious fact: a running
+`claude` re-reads its login from **one macOS Keychain item** (`Claude Code-credentials`)
+on *every request*. So rewriting that one item hot-swaps the active account
+underneath a live session — no restart, no re-login. The `clauth daemon` does it
+automatically when the active account's 5-hour window fills:
+
+<p align="center">
+  <img src="media/hot-swap.gif" width="640" alt="hot-swap animation — the daemon rewrites one Keychain item at 95%, the next request picks up the new account" />
+</p>
+
+<p align="center">
+  <img src="media/infographic-hotswap.jpg" width="640" alt="how the macOS Keychain hot-swap works" />
+</p>
+
+Pair it with **[ccsbar](https://github.com/xingfanxia/ccsbar)** (Claude Code
+Switcher Bar), the native menu-bar companion that reads this daemon's
+`status.json` feed and makes the next switch visible before it fires. Full
+write-up: [I Taught My Claude Accounts to Rotate Themselves](https://blog.ax0x.ai/hot-swapping-claude-logins).
+
 > Font is kinda off on the recording, I promise it looks better than this.
 
 ## Features
@@ -48,13 +69,15 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 ### Switch accounts
 
 - **One-key switching**: pick a profile, <kbd>⏎</kbd>, confirm. Or `clauth <profile>` straight from the shell.
-- **Log in an account**: `clauth login <profile> [--model <id>]` opens your browser for a real Claude Code OAuth login (the same PKCE flow Claude Code uses) and writes the minted tokens straight into a new profile, without touching the session you're already logged into. Pass an existing profile name to re-authenticate it in place; clauth asks to confirm before replacing that profile's saved login. Works identically on every desktop platform (Linux, macOS, Windows), unlike running Claude Code's own `/login`, which on macOS lands only in a per-config-dir Keychain item and leaves the profile empty. `--model` sets the profile's default model (a preset alias or a full model id). Pass `--base-url <url>` and `--api-key <key>` instead to add or rotate an API-key account (DeepSeek, Z.ai, any Anthropic-compatible endpoint) with no browser. Any value a flag omits is prompted; the key is read echo-off so it stays out of shell history. Pass `--setup-token` to capture a `claude setup-token` mint instead: the pasted token (echo-off, or piped on stdin) becomes the profile's long-lived `session-token.json`, so its sessions run on a static ~1-year login that never races clauth's token refresher — the Setup tab then shows a `token` row counting down to the re-mint (`--yes` replaces an existing one unprompted). The split engages only for a genuinely long-lived token (no refresh token in the sidecar) — a mis-filled rotating pair is ignored, called out on the card, and switches keep installing the normal credentials.
-- **Delete an account**: `clauth delete <profile> [--yes|-y] [--force]` removes a profile and all its credentials (OAuth tokens or API key, caches, the on-disk profile dir; a deleted active account is also unwired from live `~/.claude`). Confirms `[y/N]` on a TTY unless `--yes` (`-y`). Delete is irreversible, so a non-TTY run must pass `--yes`; it never deletes unprompted. A profile with a live `clauth start` session is refused unless you pass `--force` (`--yes` alone will not override it).
+- **Log in an account**: `clauth login <profile> [--model <id>]` opens your browser for a real Claude Code OAuth login (the same PKCE flow Claude Code uses) and writes the minted tokens straight into a new profile, without touching the session you're already logged into. Pass an existing profile name to re-authenticate it in place; clauth asks to confirm before replacing that profile's saved login (a reauth also clears the profile's auth-broken quarantine). Works identically on every desktop platform (Linux, macOS, Windows), unlike running Claude Code's own `/login`, which on macOS lands only in a per-config-dir Keychain item and leaves the profile empty. `--model` sets the profile's default model (a preset alias or a full model id). Pass `--base-url <url>` and `--api-key <key>` instead to add or rotate an API-key account (DeepSeek, Z.ai, any Anthropic-compatible endpoint) with no browser. Any value a flag omits is prompted; the key is read echo-off so it stays out of shell history. Pass `--setup-token` to capture a `claude setup-token` mint instead: the pasted token (echo-off, or piped on stdin) becomes the profile's long-lived `session-token.json`, so its sessions run on a static ~1-year login that never races clauth's token refresher — the Setup tab then shows a `token` row counting down to the re-mint (`--yes` replaces an existing one unprompted). The split engages only for a genuinely long-lived token (no refresh token in the sidecar) — a mis-filled rotating pair is ignored, called out on the card, and switches keep installing the normal credentials. `--new` refuses to touch an existing profile — the race-proof create for non-TTY callers like a menu-bar app, which never see the confirm prompt.
+- **Delete an account**: `clauth delete <profile> [--yes|-y] [--force]` removes a profile and all its credentials (OAuth tokens or API key, caches, the on-disk profile dir; a deleted active account is also unwired from live `~/.claude`; a deleted profile also leaves the fallback chain and the auth-broken quarantine). Confirms `[y/N]` on a TTY unless `--yes` (`-y`). Delete is irreversible, so a non-TTY run must pass `--yes`; it never deletes unprompted. A profile with a live `clauth start` session is refused unless you pass `--force` (`--yes` alone will not override it).
 - **Account-change detection**: if Claude Code logged into a different account while clauth was closed, you get a `[Y/n]` prompt before stored tokens are overwritten.
 - **Non-destructive**: a switch touches only the API keys and the profile's declared `env` block in `settings.json`. Nothing else moves.
 - **Isolated launch**: `clauth start [--isolated] <profile> [claude args...]` runs `claude` in a per-profile `CLAUDE_CONFIG_DIR` (symlink mirror; copies on Windows without symlink privilege), so account identity and billing caches never leak between profiles. Add `--isolated` for a clean session that keeps the account's auth but drops your global `CLAUDE.md` memory, plugins, and hooks, for headless or blind runs (run it in an empty directory to skip project memory too).
 - **Status-line aware**: `clauth which [--json]` prints which profile owns the loaded `credentials.json`, and with `--json` adds its plan tier.
 - **Per-profile model routing**: each account can carry its own model overrides on the Setup tab (a default model plus per-tier opus / sonnet / haiku / subagent ids), so a switch or `clauth start` pins which models that account drives.
+- **Codex accounts too (CDX-1)**: `clauth login <profile> --codex` captures the live `~/.codex/auth.json` (OpenAI Codex CLI) into a codex-harness profile — whole-file, byte-verbatim, so fields clauth doesn't model survive round-trips — and `clauth <profile>` switches codex accounts with the same verb as claude ones. Switches are loss-free (a rotated outgoing chain is adopted back first; an unrecognized live login is archived to `~/.clauth/quarantine/`, never destroyed) and take effect for **new** codex sessions (a running codex keeps its in-memory account; codex has no Keychain-style live re-read to hot-swap through — that's the file-swap ceiling, see `docs/codex-support/`). The daemon follows codex's own token refreshes back into the profile store, the TUI tags codex rows with their plan + email (parsed locally from the stored JWTs — zero network), `clauth doctor` gains a codex check, and the claude and codex active slots are fully independent: switching one never touches the other. Codex usage is never polled from any backend; identity and plan come from the tokens you already hold.
+- **Codex, the rest of the ladder (CDX-3/1b/4/5)**: `clauth login <profile> --codex --browser` mints a *new* codex login via the PKCE flow straight into the store (the live login is untouched). The daemon keeps parked codex chains alive with a standby refresh (single-writer, so codex's single-use refresh tokens never trip reuse-detection). `clauth start <codex-profile>` runs `codex` in an isolated `CODEX_HOME` on that account. `clauth fallback add <codex-profile>` builds a codex auto-switch chain that rotates at session boundary when the active codex account is spent (the two harnesses' chains are independent). And **`clauth proxy`** is the opt-in localhost injection proxy — point codex at it (`clauth proxy --print-config`) and a mid-conversation 429 rotates to the next chain account and replays *before codex sees a byte*: true in-session fallback, the same seamlessness the claude side gets from the Keychain. The proxy strips codex's own identity headers and injects the selected account's, forwards SSE verbatim, and feeds per-account usage from the response headers — still never polling any usage backend.
 - **Shell completions**: `clauth completions install [shell]` wires up bash, zsh, or fish.
 
 ### Monitor usage
@@ -71,9 +94,9 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 ### Automate & stay safe
 
-- **Automatic token refresh**: OAuth refresh tokens are single-use, so rotation stays lazy: a stale access token rotates the moment a usage query 401s. Because a dead login often surfaces as an HTTP 429 rather than a 401, a 429 on an already clock-expired token still chases the refresh, so a revoked token is *seen* rather than masked behind stale cached usage forever. A refresh that fails terminally quarantines the account as `auth_broken`: it is excluded from every fallback-chain walk and refused as a switch target (installing a dead token would sign out every running `claude`), until `clauth login <name>`, or any later successful refresh, clears it. The **active** account on macOS shares its single-use chain with the running `claude`, and whoever refreshes first revokes the other side, so clauth never bets on winning that race. When Claude Code rotates first, clauth **adopts** CC's fresher pair from its file mirror (identity-guarded: a login belonging to a different account is never captured unattended) instead of spending a revoked refresh token; when clauth rotates, it mirrors the fresh pair straight into the Keychain so the running `claude` never lapses (rotation coherence, #1). An opt-in **preemptive rotation** toggle (Config tab, off by default) rotates the active account a few poll intervals ahead of expiry, which makes adopt events rarer. It is a convenience, not a correctness mechanism. <kbd>t</kbd> force-rotates every account.
-- **Auto-switch on exhaustion**: opt accounts into an ordered fallback chain. When the active one crosses its 5h threshold (95% default), clauth hops to the next member with headroom. Headroom means BOTH windows: past the weekly line (7d, default 98%, tunable on the Config tab — and per-account via the Fallback tab's **weekly at** override, which keeps the Config-tab value as the chain-wide default) an account counts as exhausted, and the active one switches away while there is still room to land the hop (topping out the week bricks an account for days, not hours). The walk never picks such a member (one marked last resort still accepts, as the chain's parking spot) nor "recovers" it on a 5h rollover. Per-model weekly windows (e.g. "7d fable") gate the same way: an account whose scoped week is past the line stays out of rotation — a session of the capped model landed there would strand, and the walk can't know which model the next session runs. Both checks are per-account toggles on the Fallback tab: flip an account's **scoped gate** off to keep rotating to it for other models, or its **weekly gate** off to ignore the soft weekly line there (the 100% hard cap always blocks). An opt-in burn-aware mode (Config tab) switches on projected usage instead: heavy burn hops early, light burn rides closer to 100% before moving. An opt-in **allow extra usage** lets a spent chain fall back to an account's pay-as-you-go billing rather than stopping: it needs the Config-tab toggle *and* a per-account `max spend` ceiling (Fallback tab, $0 and off by default) *and* billing actually enabled on that account, so nothing is ever spent by default, and an account with subscription quota left always wins over one that costs money. The ceiling is a real cap, not just a gate on starting: once an account has spent it, clauth stops using that account, parking on your last resort if you named one and otherwise switching off. That halt is its own `extra usage spent` setting rather than `quota spent`, since staying put costs nothing when quota runs out and costs money when a budget does. Runs in the TUI, or unattended via `clauth daemon` with the TUI closed. A dead login is a switch trigger too: an active account flagged `auth_broken` can never report fresh usage again, so the daemon walks to the next healthy member instead of wedging on the corpse. Wrap-off (halt everything) still keys on real usage exhaustion only, never on the flag alone.
-- **Headless daemon + status feed**: `clauth daemon` runs the usage-refresh + auto-switch loop with no TUI, writing `~/.clauth/status.json` (atomic, `0600`, schema-versioned, additive evolution; the read contract lives in [wiki/daemon.md](wiki/daemon.md)) each tick for external readers like a menu-bar app. `clauth status --json` prints the same shape on demand, no daemon required. A single-instance lock keeps two daemons from double-firing: a second `clauth daemon` exits on the spot by default, so a spawner that fires repeatedly can't pile up idle daemons. `clauth daemon --status` answers "is one already up?" (exit 0/1) without starting anything; `--standby` instead parks and takes over when the first dies (for a launchd/systemd unit paired with a manual run); `--replace` terminates the running daemon and takes over, for an in-place upgrade. An anti-wedge watchdog aborts a stuck loop for a clean supervisor restart, and a TUI opened alongside detects the daemon (singleton-lock + feed-freshness probe, re-checked every tick) and stands its own refresher down (one fetcher, one rotation writer, one switch decision-maker), re-arming within a tick of the daemon exiting.
+- **Automatic token refresh**: OAuth refresh tokens are single-use, so rotation stays lazy: a stale access token rotates the moment a usage query 401s. Because a dead login often surfaces as an HTTP 429 rather than a 401, a 429 on an already clock-expired token still chases the refresh, so a revoked token is *seen* rather than masked behind stale cached usage forever. A refresh that fails terminally quarantines the account as `auth_broken` — excluded from every fallback-chain walk and refused as a switch target (installing a dead token would sign out every running `claude`) — until `clauth login <name>`, or any later successful refresh, clears it. The **active** account on macOS shares its single-use chain with the running `claude`, and whoever refreshes first revokes the other side — so clauth never bets on winning that race. When Claude Code rotates first, clauth **adopts** CC's fresher pair from its file mirror (identity-guarded: a login belonging to a different account is never captured unattended) instead of spending a revoked refresh token; when clauth rotates, it mirrors the fresh pair straight into the Keychain so the running `claude` never lapses (rotation coherence, #1). A diverged live login the endpoint **confirms dead** (identity probe rejected AND the refresh endpoint answers `invalid_grant`) is reclaimed automatically — the active profile's stored chain takes the live slot back, signing running sessions back in; a dead pair protects nothing, and parking it on a TUI decision wedged every switch while `claude` sat at "Login expired" (RESCUE-1, observed 2026-07-14). A pair the probe finds still alive is rotated back in place instead — never destroyed, never captured. An opt-in **preemptive rotation** toggle (Config tab, off by default) additionally rotates the active account a few poll intervals ahead of expiry — an optimization that makes adopt events rarer, not a correctness mechanism. <kbd>t</kbd> force-rotates every account.
+- **Auto-switch on exhaustion**: opt accounts into an ordered fallback chain. When the active one crosses its 5h threshold (95% default), clauth hops to the next member with headroom. Headroom means BOTH windows: past the weekly line (7d, default 98%, tunable on the Config tab / `set_weekly_threshold` on the daemon socket — and per-account via the Fallback tab's **weekly at** override, which keeps the chain-wide value as the default) an account counts as exhausted — the active one switches away while there is still room to land the hop (topping out the week bricks an account for days, not hours), and the walk never picks such a member (one marked last resort still accepts, as the chain's parking spot) nor "recovers" it on a 5h rollover. Per-model weekly windows (e.g. "7d fable") gate the same way: an account whose scoped week is past the line stays out of rotation — a session of the capped model landed there would strand, and the walk can't know which model the next session runs. Both checks are per-account toggles on the Fallback tab: flip an account's **scoped gate** off to keep rotating to it for other models, or its **weekly gate** off to ignore the soft weekly line there (the 100% hard cap always blocks). An opt-in burn-aware mode (Config tab) switches on projected usage instead: heavy burn hops early, light burn rides closer to 100% before moving. An opt-in **allow extra usage** lets a spent chain fall back to an account's pay-as-you-go billing rather than stopping: it needs the Config-tab toggle *and* a per-account `max spend` ceiling (Fallback tab, $0 and off by default) *and* billing actually enabled on that account, so nothing is ever spent by default, and an account with subscription quota left always wins over one that costs money. The ceiling is a real cap, not just a gate on starting: once an account has spent it, clauth stops using that account, parking on your last resort if you named one and otherwise switching off. That halt is its own `extra usage spent` setting rather than `quota spent`, since staying put costs nothing when quota runs out and costs money when a budget does. Runs in the TUI, or unattended via `clauth daemon` with the TUI closed. A stuck active is a switch trigger too: an account flagged `auth_broken` (dead login), or one whose `/usage` polls stay 429'd past the retry cap (a deep-slot stuck rate limit, surfaced as `stale` in the feed), can never return a fresh read — so rather than wedging on it the daemon distrusts the frozen numbers and walks to the next healthy member. The dead-login case walks unconditionally (the login is gone); the stuck-rate-limit case still requires the last-known usage to be genuinely spent, so a throttle blip with real headroom left stays put. Meanwhile wrap-off (halt everything) keys on REAL exhaustion only: the 5h/burn limit or the 100% weekly HARD cap, never the 98% soft switch line and never the flag alone. Switching early to a sibling buys headroom safety, but signing every running session out early buys nothing, so a merely soft-blocked active with weekly room left keeps its sessions until the week is genuinely spent.
+- **Headless daemon + status feed**: `clauth daemon` runs the usage-refresh + auto-switch loop with no TUI, writing `~/.clauth/status.json` (atomic, `0600`, schema-versioned, additive evolution; the read contract lives in [wiki/daemon.md](wiki/daemon.md)) and serving `~/.clauth/clauthd.sock` for a menu-bar app — snapshot / switch / refresh, plus fallback-chain configuration (`fallback_add` / `fallback_remove` / `fallback_move` / `set_threshold` / `set_last_resort` / `set_wrap_off` / `set_weekly_threshold`) and profile `rename`. The feed also publishes the daemon's own next-move `forecast` — the same chain-walk the switch decision runs, published as a *projection* ("where the chain would go next") so the menu bar renders one source of truth instead of re-deriving the walk client-side; the live decision itself additionally gates on the active account's fetch freshness and exhaustion (or its dead login, or a deep-slot stuck rate limit it distrusts) before acting. `clauth status --json` prints the same snapshot on demand. Install it at login with `dist/macos/daemon-install.sh` (macOS LaunchAgent). A single-instance lock keeps two daemons from double-firing: a second `clauth daemon` exits on the spot by default, so a spawner that fires repeatedly can't pile up idle daemons. `clauth daemon --status` answers "is one already up?" (exit 0/1) without starting anything; `--standby` instead parks and takes over when the first dies (for a launchd/systemd unit paired with a manual run); `--replace` terminates the running daemon and takes over, for an in-place upgrade. An anti-wedge watchdog aborts a stuck loop for a clean supervisor restart. The native macOS companion **[ccsbar](https://github.com/xingfanxia/ccsbar)** consumes this feed — an inspect-first account list with live 5h / 7d / Fable usage bars, the auto-switch forecast ("Watching X — would switch to Y at 95%"), and one-click switching (reads `status.json`, drives `clauthd.sock`). A TUI opened alongside the daemon detects it (singleton-lock + feed-freshness probe, re-checked every tick) and stands its own refresher down — one fetcher, one rotation writer, one switch decision-maker — re-arming within a tick of the daemon exiting.
 - **Multi-instance safe**: state writes serialize through a file lock, each instance reloads on external changes, HTTP runs off the UI thread.
 - **In-app help**: <kbd>?</kbd> opens a keybinding reference scoped to the current tab.
 
@@ -94,30 +117,35 @@ flowchart LR
 
 ## Install
 
-Supported platforms: Linux, macOS, Windows (Git Bash / MSYS2).
+This fork targets **macOS** (the Keychain switching, browser-OAuth login, and
+daemon are macOS features). It ships **no prebuilt release binaries** and is
+**not** published to crates.io under this name — build it from source. Do **not**
+run `cargo install clauth`: that pulls the upstream crate without any of the
+fork's features.
 
-**Via cargo** (recommended):
-
-```bash
-cargo install clauth
-```
-
-**Via install script** (no Rust toolchain required; `--nocargo` forces a binary download):
+**Build & install from this checkout:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash
-```
-
-**Build from source:**
-
-```bash
-git clone https://github.com/uwuclxdy/clauth
+git clone https://github.com/xingfanxia/clauth
 cd clauth
-cargo build --release
-# binary at ./target/release/clauth
+./install.sh          # cargo install --path . --locked  → ~/.cargo/bin/clauth
 ```
 
-Binary installs update themselves in the background; cargo installs upgrade with `cargo install clauth`. Every install and update path verifies a checksum and a signature before it runs; `CLAUTH_NO_UPDATE=1` turns updates off. Details in [SECURITY.md](SECURITY.md).
+Or build without installing:
+
+```bash
+cargo build --release   # binary at ./target/release/clauth
+```
+
+The macOS menu-bar auto-switch daemon installs as a login LaunchAgent:
+
+```bash
+dist/macos/daemon-install.sh
+```
+
+This fork's binary does **not** self-update (it has no release pipeline; the
+upstream self-updater is disabled so it can never replace the fork with an
+upstream build). Rebuild from source to upgrade. Details in [SECURITY.md](SECURITY.md).
 
 On first launch, clauth offers to install shell completions. It asks before touching your shell rc, and `CLAUTH_NO_COMPLETIONS=1` skips it. Re-run any time with `clauth completions install [shell]`.
 
@@ -256,7 +284,7 @@ The **Fallback** tab holds an ordered chain of profiles clauth hops between when
 clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Add this repo as a plugin marketplace in Claude Code, then install the `clauth` plugin:
 
 ```
-/plugin marketplace add uwuclxdy/clauth
+/plugin marketplace add xingfanxia/clauth
 /plugin install clauth@clauth
 ```
 

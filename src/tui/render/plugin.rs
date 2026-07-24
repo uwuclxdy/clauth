@@ -25,6 +25,10 @@ use super::panes::{draw_scrollbar, empty_state, master_detail, section_box};
 use crate::format::truncate;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    // `master_detail` owns the selector|detail split: desktop uses upstream's
+    // house contract (`selector_width` + `Min(20)`), narrow terminals stack the
+    // panes instead of shrinking the detail to ~13 cells. Delegating keeps the
+    // 0.12.0 layout intent while preserving the fork's phone adaptation.
     let (selector, detail) = master_detail(area, app.plugin.row_count());
 
     draw_selector(frame, selector, app);

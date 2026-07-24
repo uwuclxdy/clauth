@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -17,6 +18,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -38,6 +40,7 @@ fn oauth_profile(name: &str, five_hour_pct: f64) -> Profile {
 
 fn provider_profile(name: &str) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("key".to_string()),
@@ -47,6 +50,7 @@ fn provider_profile(name: &str) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

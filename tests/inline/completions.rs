@@ -12,6 +12,46 @@ fn print_script_supports_bash_zsh_fish() {
     }
 }
 
+/// Drift guard (TECH-14 #23): every user-facing top-level subcommand must appear
+/// as a first-token completion in ALL three shells. Add a `clauth <verb>` dispatch
+/// arm in main.rs without updating completions and this fails. (Hidden/internal
+/// arms — `mcp`, `mcp-await-job`, `__complete` — are intentionally excluded.)
+#[test]
+fn completions_cover_every_user_facing_subcommand() {
+    let subcommands = [
+        "start",
+        "login",
+        "which",
+        "status",
+        "daemon",
+        "doctor",
+        "completions",
+    ];
+    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+        for sub in subcommands {
+            assert!(
+                script.contains(sub),
+                "{shell} completions must mention the `{sub}` subcommand",
+            );
+        }
+    }
+}
+
+/// The `login` description must reflect reality — browser OAuth, NOT the stale
+/// "via claude /login" (clauth runs its own PKCE flow; CC's `/login` on macOS
+/// lands only in a per-config-dir Keychain item and leaves the profile empty).
+#[test]
+fn login_completion_description_is_the_browser_oauth_reality() {
+    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+        assert!(
+            !script.contains("claude /login"),
+            "{shell} completions must not describe login as `claude /login`",
+        );
+    }
+    assert!(ZSH.contains("browser OAuth"));
+    assert!(FISH.contains("browser OAuth"));
+}
+
 /// Every shell's script must offer `--isolated` under the `start` subcommand —
 /// it's a documented `clauth start` flag (`main.rs`) and was previously uncovered.
 #[test]
@@ -48,7 +88,10 @@ fn every_shell_completes_start_isolated_flag() {
 #[test]
 fn every_shell_completes_login_setup_token_flag() {
     let cases = [
-        (BASH, "--base-url --api-key --setup-token"),
+        (
+            BASH,
+            "--base-url --api-key --model --new --codex --browser --setup-token",
+        ),
         (ZSH, "'--setup-token[capture a claude setup-token"),
         (FISH, "__fish_seen_subcommand_from login\" -a --setup-token"),
     ];

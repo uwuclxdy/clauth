@@ -138,7 +138,10 @@ impl StateLock {
 
         if guard.is_none() {
             let dir = clauth_dir()?;
+            // TECH-9 #13: 0o700 (was create_dir_all → umask 0o755).
             crate::profile::mkdir_700(&dir).context("failed to create ~/.clauth")?;
+            // upstream 0.12.0: owner-only (0o600) lock file via open_state_file,
+            // which subsumes the fork's read/write/create/truncate(false) open.
             let file = crate::profile::open_state_file(&dir.join(LOCK_FILENAME))
                 .context("failed to open clauth state lock file")?;
             // On timeout `guard` drops here, releasing THREAD_LOCK with the slot

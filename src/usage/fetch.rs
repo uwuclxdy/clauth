@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
 use crate::profile_cache::{
-    ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache, remove_profile_cache,
-    write_profile_cache,
+    ACCOUNT_EMAIL_CACHE_FILE, ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE,
+    load_profile_cache, remove_profile_cache, write_profile_cache,
 };
 
 use super::scheduler::{ActivityStore, ProfileActivity, mark_activity};
@@ -385,6 +385,13 @@ pub(crate) struct UsageInfo {
     pub(crate) extra_usage: Option<ExtraUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spend: Option<SpendInfo>,
+    /// CDX-4 §0.16: codex's own limiter verdict (`rate_limit_reached_type`
+    /// from the session-JSONL snapshot — e.g. `primary`/`secondary`). Codex
+    /// profiles only; claude fetch paths never set it. Carried HERE so the
+    /// one struct that already flows cache → store → status.json feeds the
+    /// codex chain scan, the status serializer, and ccu with a single source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_rate_limit_reached: Option<String>,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -681,6 +688,10 @@ struct RawProfile {
 struct RawProfileAccount {
     #[serde(default)]
     uuid: Option<String>,
+    /// The account's email — operator-readable identity half (the live
+    /// response uses `email`; the alias tolerates snake_case drift).
+    #[serde(default, alias = "email_address")]
+    email: Option<String>,
     #[serde(default)]
     has_claude_max: bool,
     #[serde(default)]
@@ -1037,6 +1048,8 @@ fn assemble_usage(
                 window_dollars: windows.window_dollars,
                 extra_usage: raw.extra_usage,
                 spend,
+                // Anthropic leg: the codex passive reader is the only writer.
+                codex_rate_limit_reached: None,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
@@ -1098,8 +1111,31 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
     else {
         return;
     };
-    if load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE).is_none() {
+    let cached_uuid = load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE);
+    if cached_uuid.is_none() {
+        // An email surviving WITHOUT its uuid half predates this anchor (a
+        // torn drop) and may describe the previous account — drop it before
+        // seeding, so the pair is rebuilt whole from this one response.
+        crate::profile_cache::drop_cache_file(name, crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE);
         write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
+    }
+    // The email half rides the same response, same write-if-missing rule —
+    // but ONLY when the uuid half agrees with this response (absent = just
+    // seeded above). A cached uuid that differs means the anchor deliberately
+    // still describes another account than the store (the CAP guard's
+    // refuse-and-heal state); seeding a fresh email under it would split the
+    // pair across two accounts.
+    let uuid_agrees = cached_uuid.as_deref().is_none_or(|c| c.trim() == uuid);
+    if uuid_agrees
+        && let Some(email) = profile
+            .account
+            .as_ref()
+            .and_then(|a| a.email.as_deref())
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+        && load_profile_cache::<String>(name, ACCOUNT_EMAIL_CACHE_FILE).is_none()
+    {
+        write_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE, &email.to_string());
     }
 }
 
@@ -1184,28 +1220,98 @@ pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&str>) {
     write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
 }
 
-/// The account uuid `access_token` authenticates as, via `/api/oauth/profile`
-/// — the identity anchor for adopting a live-session rotation
-/// (`oauth::try_adopt_live_rotation`): two tokens belong to the same account
-/// iff their uuids match. Best-effort `None` on any failure (network, 401,
-/// shape drift) — callers must treat that as "identity unproven" and refuse.
-pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
-    let text = get_json(
+/// The account identity a freshly minted token authenticates as: the uuid
+/// (machine half — what the adopt gate and same-account tripwire compare) and
+/// the email when the response carries one (operator half — what the UIs show
+/// and error messages name).
+#[derive(Debug, Clone)]
+pub(crate) struct AccountIdentity {
+    pub(crate) uuid: String,
+    pub(crate) email: Option<String>,
+}
+
+/// Outcome of asking `/api/oauth/profile` who an access token belongs to,
+/// split so a caller can tell "the endpoint rejected the token itself" from
+/// "the probe proves nothing". [`fetch_account_identity`]'s `Option` collapses
+/// the two — fine for adopt gates (either way: identity unproven, refuse) but
+/// not for the daemon's dead-login rescue (RESCUE-1), which may only reclaim
+/// the live slot when the endpoint CONFIRMS the login is dead.
+#[derive(Debug)]
+pub(crate) enum IdentityProbe {
+    /// The token authenticates as this account.
+    Proven(AccountIdentity),
+    /// The endpoint rejected the token itself (401): it is dead. A 403 stays
+    /// [`IdentityProbe::Indeterminate`] — a WAF/geo block answers 403 for live
+    /// tokens too (the same caution as `oauth::refresh_rejection_is_terminal`).
+    Rejected,
+    /// Transport failure, throttle, 5xx, or a response whose shape carried no
+    /// identity — proves nothing about the token either way.
+    Indeterminate,
+}
+
+/// The account identity `access_token` authenticates as, via
+/// `/api/oauth/profile`, preserving the rejected-vs-unproven split.
+pub(crate) fn probe_account_identity(access_token: &str) -> IdentityProbe {
+    classify_identity_response(get_json(
         PROFILE_ENDPOINT,
         access_token,
         None,
         "identity",
         AuthClient::Profile,
-    )
-    .ok()?;
-    serde_json::from_str::<RawProfile>(&text)
-        .ok()?
-        .account?
+    ))
+}
+
+/// [`probe_account_identity`]'s classification, pure so its truth table is
+/// pinned offline (`identity_probe_classification_truth_table`) — this split
+/// is the reclaim-vs-retry safety hinge of the dead-login rescue, and a drift
+/// that mapped any transient failure to `Rejected` would point the destructive
+/// reclaim at a login that is merely unreachable. ONLY a 401 rejects; a
+/// present-but-blank uuid is shape drift, not an identity — two blanks
+/// comparing equal must never prove two tokens are the same account.
+fn classify_identity_response(response: std::result::Result<String, FetchError>) -> IdentityProbe {
+    let text = match response {
+        Ok(text) => text,
+        Err(FetchError::Status(401)) => return IdentityProbe::Rejected,
+        Err(_) => return IdentityProbe::Indeterminate,
+    };
+    let Some(account) = serde_json::from_str::<RawProfile>(&text)
+        .ok()
+        .and_then(|p| p.account)
+    else {
+        return IdentityProbe::Indeterminate;
+    };
+    let Some(uuid) = account
         .uuid
-        // A present-but-blank uuid is shape drift, not an identity — two
-        // blanks comparing equal must never prove two tokens are the same
-        // account (the None contract above).
-        .filter(|u| !u.trim().is_empty())
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+    else {
+        return IdentityProbe::Indeterminate;
+    };
+    let email = account
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string);
+    IdentityProbe::Proven(AccountIdentity { uuid, email })
+}
+
+/// [`probe_account_identity`] collapsed to the adopt-gate shape: best-effort
+/// `None` on any failure (network, 401, shape drift) — callers must treat that
+/// as "identity unproven" and refuse.
+pub(crate) fn fetch_account_identity(access_token: &str) -> Option<AccountIdentity> {
+    match probe_account_identity(access_token) {
+        IdentityProbe::Proven(id) => Some(id),
+        IdentityProbe::Rejected | IdentityProbe::Indeterminate => None,
+    }
+}
+
+/// [`fetch_account_identity`] narrowed to the uuid — the adopt-gate callers'
+/// shape (`oauth::try_adopt_live_rotation` closures).
+pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
+    fetch_account_identity(access_token).map(|id| id.uuid)
 }
 
 pub(crate) fn now_ms() -> u64 {

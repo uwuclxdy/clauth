@@ -75,10 +75,25 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    // Non-blocking divergence banner: one warning line above the table, in
+    // place of the modal that used to lock the whole TUI at startup. The
+    // rest of the screen (usage, tabs, actions) stays fully usable.
+    let banner = app.divergence_pending.as_ref().map(divergence_banner);
+    let inner = match banner {
+        Some(line) => {
+            let [banner_area, rest_area] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+            frame.render_widget(Paragraph::new(line).style(theme::base()), banner_area);
+            rest_area
+        }
+        None => inner,
+    };
+
     let [header_area, list_area] =
         Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
 
-    let widths = OverviewWidths::new(list_area.width, app);
+    let emails = overview_emails(app);
+    let widths = OverviewWidths::new(list_area.width, app, emails.iter().any(Option::is_some));
     let header = overview_header(&widths);
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
@@ -91,7 +106,8 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|(row, item)| match item {
             MainItemKind::Profile(idx) => {
                 let selected = row == sel;
-                let line = render_overview_row(app, *idx, &widths, selected, focused);
+                let email = emails.get(*idx).and_then(|e| e.as_deref());
+                let line = render_overview_row(app, *idx, &widths, selected, focused, email);
                 ListItem::new(select_line(line, selected, focused, width))
             }
         })
@@ -107,17 +123,130 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_scrollbar(frame, list_area, total, state.offset(), viewport);
 }
 
+/// Ticks between anchor-cache reloads: ~2s at the 80ms tick. Emails change
+/// only on login / the hourly backfill, so staleness is invisible; the gate
+/// bounds the overview's disk IO to zero between reloads instead of one read
+/// per OAuth profile per frame.
+const EMAIL_RELOAD_TICKS: u64 = 25;
+
+/// Cached account emails by profile index (the identity anchor's readable
+/// half, OAuth-only — the same file the Setup tab's `account` row reads),
+/// served from `App::overview_emails` and reloaded at most every
+/// [`EMAIL_RELOAD_TICKS`]. Names snapshot under the config lock; cache-file
+/// reads after release; the email mutex is never held across either.
+fn overview_emails(app: &App) -> Vec<Option<String>> {
+    // Names snapshot (index-ordered) under a short config guard.
+    let names: Vec<(String, bool, bool)> = app
+        .config()
+        .profiles
+        .iter()
+        .map(|p| (p.name.to_string(), p.is_oauth(), p.is_codex()))
+        .collect();
+
+    let fresh = app
+        .overview_emails
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|(stamp, _)| app.tick_count.wrapping_sub(*stamp) < EMAIL_RELOAD_TICKS);
+    let by_name = match fresh {
+        Some((_, map)) => map,
+        None => {
+            let map: std::collections::HashMap<String, Option<String>> = names
+                .iter()
+                .map(|(name, is_oauth, is_codex)| {
+                    // Codex identity lives in the stored auth.json JWTs, not
+                    // the claude-side anchor caches (CDX-1 T8).
+                    let email = if *is_codex {
+                        crate::codex::read_profile_auth(name)
+                            .ok()
+                            .flatten()
+                            .and_then(|b| crate::codex::CodexAuthFile::parse(&b).ok())
+                            .and_then(|a| a.email())
+                    } else {
+                        is_oauth
+                            .then(|| {
+                                crate::profile_cache::load_profile_cache::<String>(
+                                    name,
+                                    crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+                                )
+                            })
+                            .flatten()
+                    };
+                    (name.clone(), email)
+                })
+                .collect();
+            if let Ok(mut g) = app.overview_emails.lock() {
+                *g = Some((app.tick_count, map.clone()));
+            }
+            map
+        }
+    };
+    names
+        .into_iter()
+        .map(|(name, _, _)| by_name.get(&name).cloned().flatten())
+        .collect()
+}
+
+/// The one-line divergence warning. Sibling identified → say whose login it
+/// is; unknown → the generic mismatch. Both end in the `d` affordance.
+fn divergence_banner(notice: &super::super::app::DivergenceNotice) -> Line<'static> {
+    let mut spans = vec![Span::styled("\u{26a0} ", theme::warning())];
+    match &notice.sibling {
+        Some(owner) => {
+            spans.push(Span::styled("live login is ", theme::warning()));
+            spans.push(Span::styled(
+                format!("'{owner}'"),
+                Style::default().fg(theme::accent_color()).bold(),
+            ));
+            spans.push(Span::styled(
+                format!(" — not the active '{}'", notice.active),
+                theme::warning(),
+            ));
+        }
+        None => {
+            spans.push(Span::styled(
+                format!("live login no longer matches '{}'", notice.active),
+                theme::warning(),
+            ));
+        }
+    }
+    spans.push(Span::styled("  ·  press ", theme::dim()));
+    spans.push(Span::styled(
+        "d",
+        Style::default().fg(theme::accent_color()).bold(),
+    ));
+    spans.push(Span::styled(" to resolve", theme::dim()));
+    Line::from(spans)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct OverviewWidths {
     name: usize,
     kind: usize,
     five_hour: usize,
     seven_day: usize,
+    /// Fallback-chain position column (fork codex UX: `chain_summary`'s
+    /// "route" cell); 0 when the terminal is too narrow.
+    route: usize,
+    /// Account-email column (the identity anchor's readable half). Carved
+    /// purely from the width left over once every other column is at full
+    /// size, so layouts without it are unchanged; 0 when no profile has a
+    /// cached email or the terminal is too narrow.
+    account: usize,
     gap: usize,
 }
 
+/// Fixed 2-space separator before the account column (outside the elastic
+/// `gap` math — the column is spare-carved, not part of the shrink cascade).
+const ACCOUNT_GAP: usize = 2;
+/// Below this the truncated email stops being recognizable — skip the column.
+const ACCOUNT_MIN: usize = 12;
+/// Longest useful email column; spare beyond this widens gaps as before.
+const ACCOUNT_MAX: usize = 26;
+
 impl OverviewWidths {
-    fn new(width: u16, app: &App) -> Self {
+    fn new(width: u16, app: &App, has_email: bool) -> Self {
         let total = width as usize;
         let max_name = app
             .config()
@@ -151,9 +280,18 @@ impl OverviewWidths {
         } else {
             0
         };
+        let mut route = if total >= 88 {
+            13
+        } else if total >= 68 {
+            9
+        } else {
+            0
+        };
         let gap_min = 2;
-        while fixed_overview_width(name, kind, five_hour, seven_day, gap_min) > total {
-            if seven_day >= 17 {
+        while fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min) > total {
+            if route > 0 {
+                route = 0;
+            } else if seven_day >= 17 {
                 seven_day = 5;
             } else if seven_day > 0 {
                 seven_day = 0;
@@ -182,7 +320,7 @@ impl OverviewWidths {
             const CLOCK_COLS: usize = 10;
             let slack = |five: usize, seven: usize| {
                 total.saturating_sub(
-                    fixed_overview_width(name, kind, five, seven, gap_min) + TIMER_SLOT,
+                    fixed_overview_width(name, kind, five, seven, route, gap_min) + TIMER_SLOT,
                 )
             };
             if five_hour == 26 {
@@ -193,20 +331,36 @@ impl OverviewWidths {
             }
         }
 
-        let base = fixed_overview_width(name, kind, five_hour, seven_day, gap_min);
-        let column_count = 3 + usize::from(seven_day > 0);
-        let gap_slots = column_count.saturating_sub(1).max(1);
+        let base = fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min);
         // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
-        // widening gaps from that undercounted figure overflows the row at
-        // narrow widths and clips the tail of the 5h column. Widen from the
-        // real leftover instead.
-        let gap = (gap_min + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(gap_min, 8);
+        // the carve must work from REAL spare or the granted row overflows
+        // and clips the 5h column at boundary widths.
+        let mut spare = total.saturating_sub(base + TIMER_SLOT);
+        // Account column: takes precedence over gap widening (information over
+        // whitespace), but only from genuine spare — never shrinks a column.
+        let account = if has_email && spare >= ACCOUNT_GAP + ACCOUNT_MIN {
+            (spare - ACCOUNT_GAP).min(ACCOUNT_MAX)
+        } else {
+            0
+        };
+        let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
+        let gap_slots = column_count.saturating_sub(1).max(1);
+        if account > 0 {
+            spare -= ACCOUNT_GAP + account;
+        }
+        // Gap widening from the REAL leftover (same `spare` base as the
+        // carve; upstream's landed fix widens from the identical
+        // `total - base - TIMER_SLOT` figure — the fork's differs only by
+        // first deducting the email column above).
+        let gap = (gap_min + spare / gap_slots).clamp(gap_min, 8);
 
         Self {
             name,
             kind,
             five_hour,
             seven_day,
+            route,
+            account,
             gap,
         }
     }
@@ -217,14 +371,15 @@ fn fixed_overview_width(
     kind: usize,
     five_hour: usize,
     seven_day: usize,
+    route: usize,
     gap: usize,
 ) -> usize {
-    let column_count = 3 + usize::from(seven_day > 0);
+    let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
     // 2 = cursor prefix. Timer slot is in the gap before 5h, not a column.
     // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    4 + name + kind + five_hour + seven_day + standard_gaps * gap + narrow
+    4 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
 }
 
 fn overview_header(widths: &OverviewWidths) -> Line<'static> {
@@ -233,6 +388,10 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(Span::styled(fixed("account", widths.name), theme::label()));
     spans.push(gap(widths));
     spans.push(Span::styled(fixed("type", widths.kind), theme::label()));
+    if widths.account > 0 {
+        spans.push(Span::raw(" ".repeat(ACCOUNT_GAP)));
+        spans.push(Span::styled(fixed("email", widths.account), theme::label()));
+    }
     spans.push(narrow_gap(widths));
     // Blank TIMER_SLOT keeps the label aligned over the bar.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
@@ -247,6 +406,10 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
             theme::label(),
         ));
     }
+    if widths.route > 0 {
+        spans.push(gap(widths));
+        spans.push(Span::styled(fixed("route", widths.route), theme::label()));
+    }
     Line::from(spans)
 }
 
@@ -256,13 +419,20 @@ fn render_overview_row(
     widths: &OverviewWidths,
     selected: bool,
     focused: bool,
+    email: Option<&str>,
 ) -> Line<'static> {
     let cfg = app.config();
     let Some(profile) = cfg.profiles.get(idx) else {
         return Line::from("");
     };
 
-    let active = cfg.is_active(&profile.name);
+    // Per-slot active truth: a codex profile lights up on the codex slot, a
+    // claude profile on the claude slot — the two are independent (CDX-1).
+    let active = if profile.is_codex() {
+        cfg.is_active_codex(&profile.name)
+    } else {
+        cfg.is_active(&profile.name)
+    };
     let disabled = profile.is_disabled();
     let name_str = profile.name.to_string();
     // Overview rows only: the refresh countdown carries the profile's
@@ -389,6 +559,20 @@ fn render_overview_row(
     } else {
         spans.push(Span::styled(fixed(&label, widths.kind), theme::dim()));
     }
+    if widths.account > 0 {
+        spans.push(Span::raw(" ".repeat(ACCOUNT_GAP)));
+        // Em-dash = "OAuth, anchor not seeded yet" (pending). Api-key /
+        // provider profiles categorically have no account email — blank,
+        // matching every other surface's omit-when-inapplicable.
+        let (text, style) = match email {
+            Some(e) => (e, theme::dim()),
+            None if profile.is_oauth() => ("—", theme::faint()),
+            None => ("", theme::faint()),
+        };
+        // Disabled flatten covers the fork email cell's faint dash too.
+        let style = if disabled { theme::dim() } else { style };
+        spans.push(Span::styled(fixed(text, widths.account), style));
+    }
     spans.push(narrow_gap(widths));
     spans.push(timer_span);
     // Bracketed bars ([███░░░]) for overview account rows only; brackets stay
@@ -451,8 +635,49 @@ fn render_overview_row(
         spans.extend(seven_spans);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
+    if widths.route > 0 {
+        spans.push(gap(widths));
+        let (chain, chain_style) = chain_summary(&cfg, profile);
+        // The disabled flatten covers the fork route cell too — a disabled row
+        // reads as one flat dim line, headroom hues and the faint dash included.
+        let chain_style = if disabled { theme::dim() } else { chain_style };
+        spans.push(Span::styled(fixed(&chain, widths.route), chain_style));
+    }
 
     Line::from(spans)
+}
+
+/// The route cell: this profile's fallback-chain slot (`#N @ threshold%`),
+/// colored by 5h headroom against that threshold; `—` for non-members.
+fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
+    let Some(position) = cfg
+        .state
+        .fallback_chain
+        .iter()
+        .position(|n| n == &profile.name)
+    else {
+        return ("—".to_string(), theme::faint());
+    };
+    let threshold = threshold_for(profile);
+    let pct = profile
+        .usage
+        .as_ref()
+        .and_then(|u| u.five_hour.as_ref())
+        .map(|w| w.utilization)
+        .unwrap_or(0.0);
+    // Green/yellow/red headroom against the member's threshold (crossing =
+    // rotate) — inlined from the retired `format::health_color`.
+    let color = if pct >= threshold {
+        theme::danger_color()
+    } else if pct >= threshold * 0.8 {
+        theme::warning_color()
+    } else {
+        theme::success_color()
+    };
+    (
+        format!("#{} @ {threshold:.0}%", position + 1),
+        Style::default().fg(color),
+    )
 }
 
 /// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their

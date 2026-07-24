@@ -183,7 +183,14 @@ past `delegate` calls; \
                 };
                 serde_json::json!({
                     "name": name,
-                    "active": config.is_active(name),
+                    // Per-slot truth (CDX-1): a codex profile reports the
+                    // codex slot, a claude profile the claude slot.
+                    "active": if p.is_codex() {
+                        config.is_active_codex(name)
+                    } else {
+                        config.is_active(name)
+                    },
+                    "harness": if p.is_codex() { "codex" } else { "claude" },
                     "provider": provider_label(p),
                     "base_url": p.base_url,
                     "tier": tier_label(p),
@@ -1036,8 +1043,18 @@ fn build_instructions() -> String {
 }
 
 pub(crate) fn serve() -> Result<()> {
-    crate::runtime::gc_stale_runtimes();
-    jobs::gc(now_ms());
+    // Housekeeping OFF the startup path (timeout-sweep 2026-07-18): the
+    // initialize reply must come promptly — the TUI's MCP probe
+    // (`plugin_probe::mcp_boots`) budgets 3 s, while `gc_stale_runtimes` can
+    // legitimately run long (it deletes crashed sessions' ISOLATED runtime
+    // trees — multi-GB `~/.claude` copies). Running gc synchronously here made
+    // the probe kill a healthy server and report MCP as broken. Both sweeps
+    // are lock-guarded and documented safe at any entry point, so a detached
+    // thread alongside the server is fine.
+    std::thread::spawn(|| {
+        crate::runtime::gc_stale_runtimes();
+        jobs::gc(now_ms());
+    });
     // rmcp's service loop arms a Tokio timer (needs `enable_time`), so a bare
     // current-thread runtime panics right after the initialize reply. `enable_all`
     // also turns on the I/O driver, covering a future transport that polls a real

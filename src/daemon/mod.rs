@@ -5,28 +5,44 @@
 //!   1. execute any auto-switch the scheduler queued (`pending_switch` /
 //!      `pending_switch_off`) — this is what makes unattended auto-switch work
 //!      with the TUI closed, the operator's core requirement;
-//!   2. rewrite `~/.clauth/status.json` atomically (the external read feed);
+//!   2. rewrite `~/.clauth/status.json` atomically (the menu-bar read format);
 //!   3. pick up external config changes (a new `clauth login`, a TUI edit).
 //!
 //! The scheduler already persists `usage_cache.json` inside `apply_outcome`, so
 //! the daemon and the TUI share one cache. A single-instance advisory lock keeps
 //! two schedulers from double-firing.
 
+// The control socket is a unix-domain socket (`std::os::unix::net`); it does not
+// exist on Windows. Gating it keeps `cargo check --target *-windows-*` (and the
+// release build) green — the daemon runs its scheduler + status.json there
+// without a socket.
 pub(crate) mod log_rotate;
 mod probe;
+#[cfg(unix)]
+mod socket;
 mod status_json;
 mod tick;
+// TOK-3 tokens.json feed. Gated out of `cfg(test)`: it detaches loader threads
+// whose atomic writes would outlive a test's `HOME_OVERRIDE` and hit the real
+// `~/.clauth`/`~/.claude` (same rationale as the TUI's `app.rs` token wiring).
+// The normal build clippy/`cargo build` check still compiles it.
+#[cfg(not(test))]
+mod tokens_snapshot;
 mod types;
+mod waker;
 
 use probe::{Claim, DaemonLock, StandbySlot, claim_singleton};
 /// The single-fetcher lease + the header dot's daemon presence/health probe
 /// (dual-scheduler dedup, #27).
 pub(crate) use probe::{DaemonHealth, FetchLease, daemon_health};
+/// The `status.json` schema version, re-exported so `clauth doctor` can compare
+/// it against the daemon's on-disk value (version/schema skew check, TECH-12).
+pub(crate) use status_json::SCHEMA_VERSION;
 /// Small daemon state types + the backoff schedule, re-exported so callers keep
-/// referencing them as `super::…` after the extraction.
-pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
+/// referencing them as `super::…` / `crate::daemon::…` after the extraction.
+pub(crate) use types::{ConfigOp, LastError, LastSwitch, SwitchBackoff, switch_backoff_ms};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,10 +51,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::claude::link_profile_credentials;
-use crate::lockorder::RankedMutex;
+use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{
-    AppConfig, ConfigHandle, ReloadFingerprint, atomic_write_600, clauth_dir, load_config,
+    AppConfig, ConfigHandle, ReloadFingerprint, atomic_write_600_fast, clauth_dir, load_config,
     mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
@@ -46,18 +62,25 @@ use crate::usage::{
     PendingSwitchOff, PollStreaks, RefetchQueue, StatusStore, SuppressedGenericStore,
     ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore, TokenList, UsageStore,
     bootstrap_fetch, bootstrap_third_party, collect_oauth_seed_names, collect_third_party_entries,
-    collect_tokens, spawn_refresher,
+    collect_tokens, select_switch_winner, spawn_refresher,
 };
 use status_json::{LiveSignals, build_status};
+
+/// Queue of pending [`ConfigOp`]s. Standalone leaf lock (see [`rank::PendingConfigOps`]):
+/// the socket pushes; the main loop drains into a `Vec` and releases before it
+/// takes `config`.
+pub(crate) type PendingConfigOps = Arc<RankedMutex<Vec<ConfigOp>, rank::PendingConfigOps>>;
 
 /// Main-loop cadence. The scheduler ticks on its own 1s timer; this loop only
 /// executes queued switches/config edits and rewrites `status.json`, so 1s is plenty.
 const TICK: Duration = Duration::from_secs(1);
 /// How often (in `TICK`s) the run loop checks `daemon.log` for size-capping
-/// ~5 min at the 1s tick — rare enough to be free, frequent enough to
+/// (TECH-12). ~5 min at the 1s tick — rare enough to be free, frequent enough to
 /// bound a busy log.
 const LOG_ROTATE_EVERY_TICKS: u64 = 300;
 const STATUS_FILE: &str = "status.json";
+#[cfg(unix)]
+const SOCK_FILE: &str = "clauthd.sock";
 const LOCK_FILE: &str = "clauthd.lock";
 /// The live daemon's pid, an UNLOCKED peer of [`LOCK_FILE`]. Kept out of the
 /// lock file itself because Windows locks are mandatory (`LockFileEx`): a
@@ -108,15 +131,17 @@ fn watchdog_check(last_tick_ms: u64, now_ms: u64, deadline_ms: u64, on_stall: im
     }
 }
 
-/// Tighten an existing `~/.clauth` tree on boot, before `load_config` runs its
-/// own walk. `mkdir_700` only sets the mode on dirs it CREATES; a tree from an
-/// older build or created under a permissive umask can be 0o755
-/// (world-traversable → world-readable `daemon.log`, enumerable account names).
-/// Delegates to [`crate::profile::enforce_clauth_perms`] for the whole tree
-/// (dirs → 0o700, files → 0o600, symlinks skipped), which also covers the
-/// launchd-created `daemon.log`: launchd opens it (`StandardErrorPath`) at the
-/// umask (~0o644) before `exec`, and the already-open fd keeps appending to the
-/// now-0o600 inode. Best-effort — a chmod failure never stops the daemon.
+/// Tighten an existing `~/.clauth` tree on boot (TECH-9 #13), before
+/// `load_config` runs its own walk. `mkdir_700` only sets the mode on dirs it
+/// CREATES; a tree from an older build or created by the CLI under a permissive
+/// umask can be 0o755 (world-traversable → world-readable `daemon.log`,
+/// enumerable account names). Delegates to [`crate::profile::enforce_clauth_perms`]
+/// for the whole tree (dirs → 0o700, files → 0o600, symlinks skipped), which also
+/// covers the launchd-created `daemon.log`: launchd opens it (`StandardErrorPath`)
+/// at the process umask (~0o644) before `exec`, so this tightens it to the `0o600`
+/// SECURITY.md pledges (it can echo a config-parse error carrying a `config.toml`
+/// api_key snippet); the already-open launchd fd keeps appending to the now-0o600
+/// inode. Best-effort — a chmod failure never stops the daemon.
 fn migrate_clauth_perms_700(dir: &std::path::Path) {
     crate::profile::enforce_clauth_perms(dir);
 }
@@ -322,7 +347,7 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// wedges every headless switch behind a TUI decision about nothing while
 /// running sessions sit at "Login expired" (observed 2026-07-15). An
 /// unreadable/torn live file still defers — it may be a CC write in progress.
-/// The shell / first-login / clauth-symlink exemptions all live in
+/// The shell / first-login / stored-login exemptions all live in
 /// [`crate::claude::live_diverged_and_unsaved`]; a read that errors outright
 /// maps to `false` (proceed) here.
 fn active_diverged_unsaved(active: &str) -> bool {
@@ -330,8 +355,8 @@ fn active_diverged_unsaved(active: &str) -> bool {
 }
 
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
-/// state. Only the main thread touches `self`; the scheduler holds `Arc` clones
-/// of the individual stores.
+/// state. Only the main thread touches `self`; the scheduler and any socket
+/// thread hold `Arc` clones of the individual stores.
 struct Daemon {
     config: ConfigHandle,
     usage_tokens: TokenList,
@@ -344,6 +369,7 @@ struct Daemon {
     poll_streaks: PollStreaks,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
+    pending_config_ops: PendingConfigOps,
     refetch_queue: RefetchQueue,
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
@@ -355,20 +381,97 @@ struct Daemon {
     /// reloads its own write.
     last_reload_fp: ReloadFingerprint,
     /// Epoch-ms of the last completed main-loop tick — the watchdog's liveness
-    /// signal. `0` until the first tick completes.
+    /// signal (TECH-3). `0` until the first tick completes.
     heartbeat: Arc<AtomicU64>,
-    /// Backoff/dedup state for a persistently-failing switch: a target stuck on
-    /// a transient failure retries on a widening schedule instead of 1/tick,
-    /// and re-logs only when the target or reason changes.
-    switch_backoff: Option<SwitchBackoff>,
+    /// Last switch skip/failure reason, surfaced in `status.json` (TECH-6). Sticky
+    /// (kept with its timestamp until a newer reason replaces it) so a transient
+    /// stall is still visible after it clears. Main-thread-only.
+    last_error: Option<LastError>,
+    /// Last executed switch, surfaced in `status.json` (TECH-8). Main-thread-only.
+    last_switch: Option<LastSwitch>,
+    /// Backoff/dedup state for a persistently-failing switch (TECH-8),
+    /// keyed BY HARNESS (CDX-4 review MED): the drain attempts one winner per
+    /// harness per tick, so a single shared slot ping-ponged between a stuck
+    /// claude target and a stuck codex target — each tick the non-slot target
+    /// bypassed its `not_before` gate and re-logged, re-arming the 1/tick
+    /// storm this backoff exists to kill. One slot per harness keeps them
+    /// independent.
+    switch_backoff: std::collections::HashMap<crate::profile::Harness, SwitchBackoff>,
+    /// Fingerprint of the last live login `follow_live_login` examined and
+    /// could not act on (PROVEN-foreign owner). Skips per-tick re-examination
+    /// — and re-arms the moment the live login changes. Deliberately NOT set
+    /// for probe failures, capture failures, or rescue retries (RESCUE-1/2b):
+    /// memoizing a transient outage against the login was how one bad probe
+    /// wedged the daemon for good. Main-thread-only; persisted across
+    /// restarts via [`FollowState`].
+    follow_memo: Option<u64>,
+    /// Epoch-ms before which `follow_live_login`'s NETWORK tier (identity
+    /// probe + dead-login rescue) stays quiet — the timed-retry half of the
+    /// memo split above. `0` = free to probe. Main-thread-only; persisted
+    /// across restarts via [`FollowState`] so a respawn can't void the
+    /// anti-rotation-storm window.
+    follow_retry_at: u64,
+    /// Fingerprint of the last duplicate-login set `warn_duplicate_logins`
+    /// named (CAP-1 tripwire) — one warning per distinct set, not per tick.
+    /// Main-thread-only.
+    dup_memo: Option<u64>,
+    /// Dedup for `codex_follow_live`'s log-only states (foreign / anchorless /
+    /// unparseable live codex login) — one line per distinct live state, not
+    /// per tick. NOT persisted: unlike the claude memo, the codex follow does
+    /// no network and burns nothing, so a restart re-logging one line is
+    /// harmless. Main-thread-only.
+    codex_follow_memo: Option<u64>,
     /// Count of ACTUAL failure-log emissions (post-dedup) — the observable proof a
-    /// stuck switch isn't logging 1/tick. Read by tests.
+    /// stuck switch isn't logging 1/tick (TECH-8). Read by tests.
     switch_failure_logs: u64,
     status_path: PathBuf,
+    /// Wakes the main loop the instant a socket op is enqueued so switches/config
+    /// edits/refreshes apply in well under a tick instead of waiting out the ~1s
+    /// sleep. Shared with the socket thread via `SocketHandles`.
+    waker: Arc<waker::TickWaker>,
+}
+
+/// The durable half of the follow/rescue backoff (RESCUE-2b): `follow_memo` +
+/// `follow_retry_at` survive a daemon restart, so a respawn (launchd
+/// KeepAlive, `pkill` deploys, crash loops) can't void the 30-min anti-storm
+/// window and re-spend a single-use refresh token per boot. Values are a
+/// token-hash and an epoch-ms instant — no secrets.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FollowState {
+    memo: Option<u64>,
+    retry_at: u64,
+}
+
+fn follow_state_path() -> Option<PathBuf> {
+    crate::profile::clauth_dir()
+        .ok()
+        .map(|d| d.join("daemon-follow.json"))
+}
+
+fn load_follow_state() -> FollowState {
+    follow_state_path()
+        .filter(|p| p.exists())
+        .and_then(|p| crate::profile::read_json_file(&p).ok())
+        .unwrap_or_default()
+}
+
+/// Best-effort persist, on change only. A failure degrades to the old
+/// in-memory-only behavior (backoff lost on restart) — loud, not fatal.
+fn save_follow_state(state: FollowState) {
+    let Some(path) = follow_state_path() else {
+        return;
+    };
+    let result = serde_json::to_vec(&state)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| crate::profile::atomic_write_600(&path, bytes));
+    if let Err(e) = result {
+        logline!("clauth daemon: could not persist follow state: {e}");
+    }
 }
 
 impl Daemon {
     fn new(config: AppConfig, status_path: PathBuf) -> Self {
+        let follow = load_follow_state();
         let usage_tokens: TokenList = Arc::new(RankedMutex::new(collect_tokens(&config)));
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
             collect_third_party_entries(&config.profiles),
@@ -384,22 +487,30 @@ impl Daemon {
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
             poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
-            pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+            pending_switch: Arc::new(RankedMutex::new(VecDeque::new())),
             pending_switch_off: Arc::new(RankedMutex::new(false)),
+            pending_config_ops: Arc::new(RankedMutex::new(Vec::new())),
             refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
             third_party_tokens,
             third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
             third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-            // Never set by the daemon: process exit IS its shutdown (a
-            // supervisor restarts crashes; the singleton flock releases on
+            // Never set by the daemon: process exit IS its shutdown (launchd
+            // KeepAlive restarts crashes; the singleton flock releases on
             // exit). The flag exists for `spawn_refresher`'s contract — its
             // real writer is the TUI's quit path.
             shutting_down: Arc::new(AtomicBool::new(false)),
             last_reload_fp: reload_fingerprint(),
             heartbeat: Arc::new(AtomicU64::new(0)),
-            switch_backoff: None,
+            last_error: None,
+            last_switch: None,
+            switch_backoff: std::collections::HashMap::new(),
+            follow_memo: follow.memo,
+            follow_retry_at: follow.retry_at,
+            dup_memo: None,
+            codex_follow_memo: None,
             switch_failure_logs: 0,
             status_path,
+            waker: Arc::new(waker::TickWaker::default()),
         }
     }
 
@@ -449,7 +560,54 @@ impl Daemon {
             interval,
         );
         self.spawn_scheduler();
+        self.spawn_socket();
+        self.spawn_tokens_feed();
     }
+
+    /// Launch the `~/.clauth/tokens.json` feed (TOK-3) beside `status.json`.
+    /// Resolves both home-relative dirs HERE (main thread) so the detached
+    /// loader/pricing/consumer threads never re-resolve `home_dir()`. A dir that
+    /// fails to resolve simply skips the feed — token usage is auxiliary and must
+    /// never block the scheduler/socket.
+    #[cfg(not(test))]
+    fn spawn_tokens_feed(&self) {
+        let (Ok(clauth_dir), Ok(claude_dir)) =
+            (crate::profile::clauth_dir(), crate::profile::claude_dir())
+        else {
+            return;
+        };
+        tokens_snapshot::spawn_tokens_feed(clauth_dir, claude_dir);
+    }
+
+    /// No token feed under `cfg(test)`: the detached loader threads would outlive
+    /// a test's `HOME_OVERRIDE` and their atomic writes would then resolve the
+    /// real `~/.clauth`/`~/.claude` (same reason the TUI skips its token/pricing
+    /// wiring under test).
+    #[cfg(test)]
+    fn spawn_tokens_feed(&self) {}
+
+    /// Launch the control-socket listener (`clauthd.sock`) beside `status.json`.
+    #[cfg(unix)]
+    fn spawn_socket(&self) {
+        let sock_path = self.status_path.with_file_name(SOCK_FILE);
+        socket::spawn(
+            sock_path,
+            self.status_path.clone(),
+            socket::SocketHandles {
+                config: Arc::clone(&self.config),
+                pending_switch: Arc::clone(&self.pending_switch),
+                pending_config_ops: Arc::clone(&self.pending_config_ops),
+                refetch_queue: Arc::clone(&self.refetch_queue),
+                waker: Arc::clone(&self.waker),
+            },
+        );
+    }
+
+    /// No control socket on non-unix targets — the daemon still refreshes usage,
+    /// auto-switches, and writes `status.json`; only the interactive socket
+    /// (snapshot/switch/refresh) is unavailable.
+    #[cfg(not(unix))]
+    fn spawn_socket(&self) {}
 
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
     /// TUI's `start_scheduler` makes). The suppressed-generic set is daemon-local.
@@ -489,20 +647,20 @@ impl Daemon {
         );
     }
 
-    /// Main loop. Writes an initial `status.json` immediately (so a reader that
+    /// Main loop. Writes an initial `status.json` immediately (so a menu bar that
     /// attaches before the first fetch has something to read), then each tick
     /// reloads external config changes, executes queued switches, and rewrites
     /// `status.json`. Runs until the process is killed.
     fn run(&mut self) {
         self.write_status();
         // Stamp the first heartbeat before the watchdog starts so it never trips
-        // on the zero-heartbeat boot window, then spawn it.
+        // on the zero-heartbeat boot window, then spawn it (TECH-3).
         self.heartbeat
             .store(crate::usage::now_ms(), Ordering::Relaxed);
         self.spawn_watchdog();
         // daemon.log lives beside status.json; cap it on a ~5-min cadence (and at
         // boot, tick 0) so a pre-fix crash-loop log or a busy period can't grow it
-        // unbounded. The check is a cheap stat that no-ops well
+        // unbounded (TECH-12 / #39). The check is a cheap stat that no-ops well
         // under the cap.
         let log_path = self.status_path.with_file_name("daemon.log");
         let mut ticks: u64 = 0;
@@ -514,7 +672,10 @@ impl Daemon {
                     log_rotate::LOG_KEEP_BYTES,
                 );
             }
-            std::thread::sleep(TICK);
+            // Wait out the tick interval, but wake the instant a socket op is
+            // enqueued so switches/config edits/refreshes land in well under a tick
+            // (the timeout still fires the periodic usage-refresh tick).
+            self.waker.wait(TICK);
             self.tick();
             self.heartbeat
                 .store(crate::usage::now_ms(), Ordering::Relaxed);
@@ -522,7 +683,7 @@ impl Daemon {
         }
     }
 
-    /// Spawn the anti-wedge watchdog. It observes the main loop's tick
+    /// Spawn the anti-wedge watchdog (TECH-3). It observes the main loop's tick
     /// heartbeat and `std::process::abort`s if a tick hasn't completed within
     /// [`WATCHDOG_DEADLINE`] — launchd's `KeepAlive{SuccessfulExit=false}` then
     /// restarts the daemon. This is the backstop for the deadline-free
@@ -586,27 +747,33 @@ impl Daemon {
         // deep-slot stuck RateLimited). Lower rank than config, like the stores
         // above — snapshot + release before the config lock. Projected to the 429
         // axis on purpose: `stale` is contracted as a stuck THROTTLE
-        // (`wiki/daemon.md`), so a refresh-fail streak must not leak into it.
+        // (`docs/ccsbar/DESIGN.md`), so a refresh-fail streak must not leak into it.
         let streaks_snap: HashMap<String, u32> = self
             .poll_streaks
             .lock()
             .map(|m| m.iter().map(|(k, v)| (k.clone(), v.rate_limit)).collect())
             .unwrap_or_default();
-        // The in-flight switch target (accepted, not yet applied), so the UI
-        // shows in-flight truth instead of a timing heuristic. Snapshot + release
-        // before the config lock, like the freshness stores above. The set holds
-        // at most one scheduler target in practice (`scan_auto_switch` skips
-        // while one is pending); `min` keeps the snapshot deterministic anyway.
+        // AUTH-2: the in-flight switch target (accepted, not yet applied) — the
+        // winner the next drain will attempt (TECH-6 precedence), so the UI shows
+        // in-flight truth instead of a timing heuristic. Snapshot + release before
+        // the config lock, like the freshness stores above.
         let pending_snap: Option<String> = self
             .pending_switch
             .lock()
             .ok()
-            .and_then(|q| q.iter().min().cloned());
+            .and_then(|q| select_switch_winner(&q))
+            .map(|e| e.target);
+        let last_error_snap = self
+            .last_error
+            .as_ref()
+            .map(|e| (e.at_ms, e.message.as_str()));
         let live = LiveSignals {
             status: &status_snap,
             next_refresh: &next_snap,
             streaks: &streaks_snap,
             pending_switch: pending_snap.as_deref(),
+            last_error: last_error_snap,
+            last_switch: self.last_switch.as_ref(),
         };
         let cfg_snap = {
             #[allow(
@@ -620,7 +787,7 @@ impl Daemon {
         let body = build_status(&cfg_snap, interval, Some(&live), false);
         match serde_json::to_vec_pretty(&body) {
             Ok(json) => {
-                if let Err(e) = atomic_write_600(&self.status_path, &json) {
+                if let Err(e) = atomic_write_600_fast(&self.status_path, &json) {
                     logline!("clauth daemon: failed to write status.json: {e}");
                 }
             }

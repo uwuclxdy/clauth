@@ -19,6 +19,13 @@ fn raw_profile(uuid: Option<&str>) -> RawProfile {
     serde_json::from_str(&text).expect("fixture profile parses")
 }
 
+fn raw_profile_with_email(uuid: &str, email: &str) -> RawProfile {
+    serde_json::from_str(&format!(
+        r#"{{"account":{{"uuid":"{uuid}","email":"{email}"}}}}"#
+    ))
+    .expect("fixture profile parses")
+}
+
 // ── windows_maxed: the `refresh_spent_accounts` fetch-skip predicate ─────────
 
 fn window(util: f64, resets_at: &str) -> UsageWindow {
@@ -139,6 +146,64 @@ fn identity_anchor_backfills_only_when_missing() {
         load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
         Some("uuid-live"),
         "a present anchor is never overwritten by the ride-along"
+    );
+}
+
+/// The email half seeds only as a coherent PAIR with the uuid: fresh seeds
+/// land both from one response; a disagreeing cached uuid blocks the email;
+/// and a torn-drop survivor (email without uuid) is dropped and rebuilt whole.
+#[test]
+fn identity_email_seeds_stay_coherent_with_the_uuid() {
+    use crate::profile_cache::{
+        ACCOUNT_EMAIL_CACHE_FILE, ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Fresh seed: both halves land together.
+    seed_identity_anchor(
+        "acme",
+        &raw_profile_with_email("uuid-live", "live@example.com"),
+    );
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_EMAIL_CACHE_FILE).as_deref(),
+        Some("live@example.com"),
+    );
+
+    // A response for a DIFFERENT account (anchor deliberately kept — the CAP
+    // refuse-and-heal state) must not swap the email under the old uuid.
+    seed_identity_anchor(
+        "acme",
+        &raw_profile_with_email("uuid-other", "other@example.com"),
+    );
+    assert_eq!(
+        load_profile_cache::<String>("acme", ACCOUNT_EMAIL_CACHE_FILE).as_deref(),
+        Some("live@example.com"),
+        "a disagreeing uuid blocks the email ride-along",
+    );
+
+    // Torn-drop survivor: email present, uuid absent. The email predates the
+    // anchor and may describe the previous account — the seed drops it and
+    // rebuilds the pair whole from one response.
+    let _ = std::fs::remove_file(
+        crate::profile_cache::profile_cache_path("torn", ACCOUNT_ID_CACHE_FILE).unwrap(),
+    );
+    write_profile_cache(
+        "torn",
+        ACCOUNT_EMAIL_CACHE_FILE,
+        &"stale@example.com".to_string(),
+    );
+    seed_identity_anchor(
+        "torn",
+        &raw_profile_with_email("uuid-new", "new@example.com"),
+    );
+    assert_eq!(
+        load_profile_cache::<String>("torn", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        Some("uuid-new"),
+    );
+    assert_eq!(
+        load_profile_cache::<String>("torn", ACCOUNT_EMAIL_CACHE_FILE).as_deref(),
+        Some("new@example.com"),
+        "a predating email never survives a fresh uuid seed",
     );
 }
 
@@ -1274,6 +1339,88 @@ fn non_2xx_arrives_as_ok_so_the_status_branches_stay_reachable() {
          ureq's default would collapse it into Err(StatusCode) -> Network",
     );
     assert_eq!(response.status().as_u16(), 401);
+}
+
+// ── RESCUE-1: identity-probe classification truth table ──────────────────────
+//
+// `classify_identity_response` is the reclaim-vs-retry safety hinge: ONLY a
+// 401 may read as "the token itself is dead" (eligible for the destructive
+// live-slot reclaim); every transient/ambiguous outcome must stay
+// Indeterminate (retry, touch nothing). A drift that widened Rejected would
+// point the reclaim at logins that are merely unreachable.
+
+#[test]
+fn identity_probe_classification_truth_table() {
+    use super::IdentityProbe as P;
+    let ok = |body: &str| classify_identity_response(Ok(body.to_string()));
+
+    // The one and only Rejected: an endpoint 401.
+    assert!(matches!(
+        classify_identity_response(Err(FetchError::Status(401))),
+        P::Rejected
+    ));
+
+    // Everything else that can go wrong proves nothing.
+    assert!(
+        matches!(
+            classify_identity_response(Err(FetchError::Status(403))),
+            P::Indeterminate
+        ),
+        "403 is the WAF/geo shape — must never read as a dead token"
+    );
+    for status in [400, 404, 429, 500, 503] {
+        assert!(matches!(
+            classify_identity_response(Err(FetchError::Status(status))),
+            P::Indeterminate
+        ));
+    }
+    assert!(matches!(
+        classify_identity_response(Err(FetchError::Network)),
+        P::Indeterminate
+    ));
+    assert!(matches!(
+        classify_identity_response(Err(FetchError::RateLimited {
+            retry_after: None,
+            plan: None
+        })),
+        P::Indeterminate
+    ));
+    assert!(
+        matches!(
+            classify_identity_response(Err(FetchError::Parse)),
+            P::Indeterminate
+        ),
+        "a transport-level parse failure proves nothing about the token"
+    );
+
+    // Body-shape drift proves nothing either.
+    assert!(matches!(ok("not json"), P::Indeterminate));
+    assert!(matches!(ok("{}"), P::Indeterminate), "no account block");
+    assert!(matches!(ok(r#"{"account":{}}"#), P::Indeterminate));
+    assert!(
+        matches!(ok(r#"{"account":{"uuid":"   "}}"#), P::Indeterminate),
+        "a blank uuid is shape drift, never an identity"
+    );
+
+    // The happy shape proves the account, email riding along when present.
+    match ok(r#"{"account":{"uuid":" uuid-1 ","email":" a@b.c "}}"#) {
+        P::Proven(id) => {
+            assert_eq!(id.uuid, "uuid-1", "uuid is trimmed");
+            assert_eq!(id.email.as_deref(), Some("a@b.c"), "email is trimmed");
+        }
+        other => panic!("expected Proven, got {other:?}"),
+    }
+    match ok(r#"{"account":{"uuid":"uuid-2"}}"#) {
+        P::Proven(id) => assert_eq!(id.email, None, "email independently optional"),
+        other => panic!("expected Proven, got {other:?}"),
+    }
+    match ok(r#"{"account":{"uuid":"uuid-3","email":"   "}}"#) {
+        P::Proven(id) => assert_eq!(
+            id.email, None,
+            "a whitespace-only email is blank-filtered, not surfaced"
+        ),
+        other => panic!("expected Proven, got {other:?}"),
+    }
 }
 
 // ── humanize_duration: seconds under 5 min ───────────────────────────────────

@@ -1,6 +1,5 @@
-//! `~/.clauth/status.json` serializer — the daemon's published feed, and the
-//! shape `clauth status --json` prints (one code path builds both, so they
-//! cannot drift). Contract: wiki/daemon.md.
+//! `~/.clauth/status.json` serializer — the canonical read format for the
+//! menu-bar app (`ccsbar`) and `clauth status --json`.
 //!
 //! Usage windows/tier come from the on-disk `usage_cache.json` (written by the
 //! scheduler), so this is process-independent: it returns the last-persisted
@@ -48,6 +47,13 @@ pub(crate) struct LiveSignals<'a> {
     /// `pending_switch`), so a reader can show in-flight truth instead of a
     /// timing heuristic. `None` for the single-shot `status --json` (no daemon).
     pub(crate) pending_switch: Option<&'a str>,
+    /// TECH-6: the last drain skip/failure reason `(at_ms, message)`, so a tap
+    /// that can't land immediately is observable. `None` for the single-shot
+    /// `status --json` (no daemon has drained anything) and until the first skip.
+    pub(crate) last_error: Option<(u64, &'a str)>,
+    /// TECH-8: the last executed switch (the hero event). `None` for the single-shot
+    /// `status --json` and until the daemon executes its first switch.
+    pub(crate) last_switch: Option<&'a super::LastSwitch>,
 }
 
 fn fetch_status_str(s: FetchStatus) -> &'static str {
@@ -69,16 +75,99 @@ fn iso_from_ms(ms: u64) -> String {
 /// rotate away from). `position` is 1-based.
 fn fallback_json(config: &AppConfig, p: &Profile) -> Option<serde_json::Value> {
     let name = p.name.as_str();
-    let pos = config
-        .state
-        .fallback_chain
-        .iter()
-        .position(|n| n.as_str() == name)?;
+    // CDX-4 C4: a profile's fallback block reads against ITS harness's chain
+    // — position within that chain, armed against that harness's active slot.
+    let (chain, armed) = if p.is_codex() {
+        (
+            &config.state.codex_fallback_chain,
+            config.is_active_codex(name),
+        )
+    } else {
+        (&config.state.fallback_chain, config.is_active(name))
+    };
+    let pos = chain.iter().position(|n| n.as_str() == name)?;
     Some(serde_json::json!({
         "position": pos + 1,
         "threshold": crate::fallback::threshold_for(p),
-        "armed": config.is_active(name),
+        "armed": armed,
+        // Additive (schema stays 1): the exclusive last-resort mark — this member
+        // is accepted by the walk's sink pass even while exhausted.
+        "last_resort": p.last_resort,
+        // Additive (SCW-2/WKO): the per-account usage gates and weekly-line
+        // override, so a client can render/edit the same per-member controls
+        // the Fallback tab carries (`set_check_weekly` / `set_check_scoped` /
+        // `set_member_weekly` on the socket). `weekly_threshold` is null when
+        // the member follows the chain-wide line.
+        "check_weekly": p.check_weekly,
+        "check_scoped": p.check_scoped,
+        "weekly_threshold": p.weekly_threshold,
     }))
+}
+
+/// The daemon's OWN next-move forecast, computed by the same
+/// [`crate::fallback::next_target`] walk the switch decision runs — so the
+/// menu-bar app renders the daemon's own walk instead of mirroring the
+/// walk logic client-side. Additive (schema stays 1). Drift-proof by
+/// construction: when upstream changed the walk semantics (burn-aware active
+/// check, exclusive `last_resort` sinks — 2026-07), a client-side mirror
+/// silently lagged; a published forecast cannot.
+///
+/// `action` is `"switch"` (with `to`), `"off"` (wrap-off would halt every
+/// account), or `"none"` (nothing viable / no chain). The burn rate feeding the
+/// wrap-off decision is sourced exactly like the scheduler sources it — the
+/// cached 5h window plus on-disk history — and only when burn-aware switching
+/// is on (it is unused otherwise, so the extra reads are skipped).
+///
+/// This is a PROJECTION of the walk's pick — "where the chain would go" — not
+/// a statement that a switch is due this tick: the live decision
+/// (`scan_auto_switch`) additionally gates on the active's fetch freshness and
+/// exhaustion (or its auth-broken flag, AUTH-4) before acting. A healthy
+/// active with a viable sibling therefore publishes `switch` here while the
+/// scheduler correctly stays put; readers must render it as "would switch to
+/// X", never as "switching now".
+fn forecast_json(config: &AppConfig) -> serde_json::Value {
+    // `next_target` judges members through `Profile.usage`, which only the TUI
+    // thread populates (`apply_usage`) — in the daemon it is None for every
+    // profile, so the un-hydrated walk saw universal headroom and forecast the
+    // first non-active member even when its week was spent (observed
+    // 2026-07-08: the forecast pointed at a 7d=100 account the real switch
+    // decision correctly refuses). Hydrate a snapshot from the same
+    // per-profile disk caches the scheduler persists on every fetch — the
+    // exact source this status.json's own `windows` field is built from, so
+    // the forecast and the numbers beside it cannot disagree.
+    let hydrated = AppConfig {
+        state: config.state.clone(),
+        profiles: config
+            .profiles
+            .iter()
+            .map(|p| {
+                let mut p = p.clone();
+                if p.usage.is_none() {
+                    p.usage = load_profile_cache::<UsageInfo>(p.name.as_str(), USAGE_CACHE_FILE);
+                }
+                p
+            })
+            .collect(),
+    };
+    let config = &hydrated;
+    let rate = config
+        .state
+        .burn_aware_switching
+        .then(|| {
+            let active = config.state.active_profile.as_deref()?;
+            let window = load_profile_cache::<UsageInfo>(active, USAGE_CACHE_FILE)?.five_hour?;
+            crate::fallback::burn_rate_for_profile(active, &window)
+        })
+        .flatten();
+    match crate::fallback::next_target(config, rate) {
+        Some(crate::fallback::SwitchAction::To(name)) => {
+            serde_json::json!({ "action": "switch", "to": name })
+        }
+        Some(crate::fallback::SwitchAction::Off) => {
+            serde_json::json!({ "action": "off", "to": null })
+        }
+        None => serde_json::json!({ "action": "none", "to": null }),
+    }
 }
 
 /// Per-profile auth health for `status.json`. `broken` (last refresh rejected
@@ -135,12 +224,12 @@ pub(crate) fn build_status(
             };
             let mtime_ms = profile_cache_mtime_ms(name, cache_file);
 
-            // fetch_status: the live store when a daemon is running, else
-            // derive from cache freshness (Fresh within one interval, else
-            // Cached). The live store only carries the OAuth leg's outcomes,
-            // so a name missing from it (api-key profiles, a just-started
-            // daemon) falls back to the same derivation rather than reading
-            // as never-fetched; null = no cache at all.
+            // fetch_status: the live store when a daemon is running, else derive
+            // from cache freshness (Fresh within one interval, else Cached; a
+            // profile with no cache at all reports null — never fetched). The
+            // live store only carries the OAuth leg's outcomes, so a name
+            // missing from it (api-key profiles, a just-started daemon) falls
+            // back to the same mtime derivation instead of reading null.
             let derived_status = || {
                 mtime_ms.map(|mt| {
                     if now.saturating_sub(mt) < interval_ms {
@@ -196,7 +285,7 @@ pub(crate) fn build_status(
 
             // Structured third-party balance isn't carried by ThirdPartyStats
             // (it lives in free-text `rows`); expose only the availability flag
-            // for now — enough for a reader's red/green reachability dot.
+            // for now — the menu bar shows a red/green dot. Balance deferred.
             let third_party = if p.is_third_party() {
                 load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
                     .map(|s| serde_json::json!({ "available": s.is_available }))
@@ -204,14 +293,87 @@ pub(crate) fn build_status(
                 None
             };
 
+            // CDX-1 T7: parse the stored codex snapshot once — identity, plan
+            // and expiry all live in its JWTs (zero network). None for claude
+            // profiles and for a codex profile with no captured login yet.
+            let codex_auth = p
+                .is_codex()
+                .then(|| crate::codex::read_profile_auth(name).ok().flatten())
+                .flatten()
+                .and_then(|bytes| crate::codex::CodexAuthFile::parse(&bytes).ok());
+            // Pinned ccsbar contract (docs/ccsbar/DESIGN.md): when the stored
+            // snapshot was last captured/adopted — file mtime, codex-only.
+            let codex_snapshot_ms: Option<u64> = p
+                .is_codex()
+                .then(|| {
+                    let path = crate::codex::profile_auth_path(name).ok()?;
+                    let mtime = std::fs::metadata(path).ok()?.modified().ok()?;
+                    let ms = mtime.duration_since(std::time::UNIX_EPOCH).ok()?;
+                    Some(ms.as_millis() as u64)
+                })
+                .flatten();
+
             serde_json::json!({
                 "name": name,
-                "active": config.is_active(name),
+                // One coherent boolean per profile: a codex profile reports the
+                // codex-slot truth, a claude profile the claude-slot truth. The
+                // two slots are independent (docs/codex-support/PLAN.md §0.1).
+                "active": if p.is_codex() {
+                    config.is_active_codex(name)
+                } else {
+                    config.is_active(name)
+                },
+                // Additive (schema stays 1): which CLI this profile's
+                // credentials belong to. Absent in pre-CDX writers — readers
+                // default to "claude".
+                "harness": if p.is_codex() { "codex" } else { "claude" },
+                // Additive (CLA-FEED): the session-token feed — the sidecar's
+                // hours-scale countdown is routine maintenance while true
+                // (daemon re-stamps on rotation), a dying credential while
+                // false. Readers (ccsbar) key their token-row rendering off
+                // this so a fed token never displays as an expiring mint.
+                "session_feed": p.session_feed,
                 "provider": provider_label(p),
                 "base_url": p.base_url,
                 "tier": tier_label(p),
+                // Additive (schema stays 1): the account email this profile's
+                // login last authenticated as (identity-anchor email half,
+                // backfilled by the /profile fetch) — lets readers show WHICH
+                // account a profile holds, so a wrong-account capture is
+                // visible at a glance instead of via forensics. OAuth-only,
+                // matching the TUI's gate: an OAuth→API conversion keeps the
+                // cached anchor, and that stale email must not surface.
+                "account_email": if p.is_codex() {
+                    // Codex identity comes from the stored id_token claims,
+                    // not the claude-side profile_cache anchors.
+                    codex_auth.as_ref().and_then(|a| a.email())
+                } else {
+                    p.is_oauth().then(|| {
+                        crate::profile_cache::load_profile_cache::<String>(
+                            name,
+                            crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+                        )
+                    }).flatten()
+                },
                 "has_live_session": crate::runtime::has_live_session(name),
-                "auth_status": auth_status_str(config, p, now as i64),
+                "auth_status": if p.is_codex() {
+                    // Same value set as the claude leg (schema stays 1):
+                    // broken = quarantined, expiring = stored access token
+                    // past its JWT exp, else ok.
+                    if config.is_auth_broken(name) {
+                        "broken"
+                    } else if codex_auth
+                        .as_ref()
+                        .and_then(|a| a.access_token_exp_ms())
+                        .is_some_and(|exp| now as i64 >= exp)
+                    {
+                        "expiring"
+                    } else {
+                        "ok"
+                    }
+                } else {
+                    auth_status_str(config, p, now as i64)
+                },
                 "fetch_status": fetch_status,
                 // Additive (schema stays 1): true when the daemon distrusts this
                 // reading as a deep-slot stuck RateLimited — readers dim it / show
@@ -225,6 +387,20 @@ pub(crate) fn build_status(
                 "fallback": fallback_json(config, p),
                 "windows": windows_json(name),
                 "third_party": third_party,
+                // Additive, codex-only (null on claude profiles): when the
+                // stored snapshot was last captured/adopted. ccsbar
+                // decodeIfPresent — pinned in docs/ccsbar/DESIGN.md.
+                "codex_snapshot_at": codex_snapshot_ms.map(iso_from_ms),
+                // Additive, codex-only (CDX-4 §0.16): codex's own limiter
+                // verdict — which window (`primary`/`secondary`) rejected the
+                // last request, from the session-log snapshot. Readers
+                // cross-check the named window's resets_at (a lapsed window
+                // clears the badge). Null on claude profiles and when no
+                // verdict is recorded.
+                "codex_rate_limit_reached": p.is_codex().then(|| {
+                    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+                        .and_then(|u| u.codex_rate_limit_reached)
+                }).flatten(),
             })
         })
         .collect();
@@ -232,10 +408,56 @@ pub(crate) fn build_status(
     serde_json::json!({
         "schema": SCHEMA_VERSION,
         "generated_at": iso_from_ms(now),
+        // TECH-8: additive version + last-switch event (schema stays 1). Version is
+        // always present (daemon + single-shot) so CLI↔daemon skew is detectable.
+        "clauth_version": env!("CARGO_PKG_VERSION"),
+        "last_switch": live.and_then(|s| s.last_switch).map(|ls| serde_json::json!({
+            "from": ls.from,
+            "to": ls.to,
+            "at": iso_from_ms(ls.at_ms),
+            "trigger": ls.trigger,
+        })),
         "active_profile": config.state.active_profile.as_deref(),
+        // Additive (schema stays 1): the codex-harness active slot — which
+        // profile's chain lives in ~/.codex/auth.json. Independent of
+        // active_profile (claude); null on claude-only installs.
+        "active_codex_profile": config.state.active_codex_profile.as_deref(),
         "pending_switch": live.and_then(|s| s.pending_switch),
+        // TECH-6: additive (schema stays 1 — ccsbar decodeIfPresent). Always
+        // present so readers can `has("last_error")`; null until a drain records one.
+        "last_error": live.and_then(|s| s.last_error).map(|(at, message)| serde_json::json!({
+            "at": iso_from_ms(at),
+            "message": message,
+        })),
+        // Wire key stays "wrap_off" (ccsbar reads it); the Rust field followed
+        // upstream's switch_off_when_spent rename.
         "wrap_off": config.state.switch_off_when_spent,
+        "weekly_switch_threshold": config.state.weekly_switch_threshold_pct(),
+        // Additive (schema stays 1): whether the ACTIVE-side switch decision
+        // projects on burn rate (issue #8-b upstream) instead of the static
+        // threshold — readers rendering "would switch at N%" need to know.
+        "burn_aware": config.state.burn_aware_switching,
+        // Additive (schema stays 1): the daemon's own next-move forecast — the
+        // single source of truth for every "would switch to X" string.
+        "forecast": forecast_json(config),
         "refresh_interval_ms": interval_ms,
+        // Ordered fallback-chain member names — the auto-switch order. Per-profile
+        // `fallback.position`/`threshold`/`armed` carry the same order, but the flat
+        // list lets the menu bar render the chain without sorting.
+        "fallback_chain": config
+            .state
+            .fallback_chain
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>(),
+        // Additive (schema stays 1): the CODEX chain, same shape (CDX-4).
+        // Empty on codex-less installs; readers decodeIfPresent.
+        "codex_fallback_chain": config
+            .state
+            .codex_fallback_chain
+            .iter()
+            .map(|n| n.as_str())
+            .collect::<Vec<_>>(),
         "profiles": profiles,
     })
 }

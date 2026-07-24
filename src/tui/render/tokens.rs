@@ -463,7 +463,7 @@ fn dash_rects(area: Rect) -> DashRects {
     // are the abundant resource there; a short terminal clips the trailing
     // charts (hour/activity) rather than crushing every card.
     if super::panes::narrow(area.width) {
-        let rows = Layout::vertical([
+        let rows: [Rect; 7] = Layout::vertical([
             Constraint::Length(6), // today / this week / this month
             Constraint::Length(6), // total
             Constraint::Length(4), // trend (compact)
@@ -472,7 +472,7 @@ fn dash_rects(area: Rect) -> DashRects {
             Constraint::Length(9), // hour of day (24 buckets fit 45 cols)
             Constraint::Min(0),    // activity takes whatever is left
         ])
-        .split(area);
+        .areas(area);
         return DashRects {
             first: rows[0],
             total: rows[1],
@@ -1230,6 +1230,10 @@ fn kv_accent(label: &str, value: String) -> Line<'static> {
 
 fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let grouped = token_period_models(app);
+    // The master-detail split lives in `master_detail`: its desktop branch is
+    // the upstream `selector_width(area.width) | Min(20)` horizontal split, and
+    // it adds the fork's narrow (phone-width) stacked variant. Passing
+    // `grouped.len()` lets the narrow selector size to its row count.
     let (selector, detail) = master_detail(area, grouped.len());
     let cols = [selector, detail];
     let sel = app.token_model_cursor.min(grouped.len().saturating_sub(1));

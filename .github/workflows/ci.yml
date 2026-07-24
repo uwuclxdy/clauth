@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [mommy]
+    branches: [mommy, main]
     paths-ignore:
       - "**/*.md"
       - wiki/**
@@ -110,6 +110,23 @@ jobs:
           path: |
             target/release/clauth
             target/release/clauth.exe
+
+  # Windows cross-compile smoke test (fork adds unix-only surfaces — the control
+  # socket is cfg-gated; this proves the daemon still builds on Windows so the
+  # release build can't regress). Compile-only: no -D warnings (the gated socket
+  # leaves Windows-only dead-code warnings that are expected).
+  windows-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - name: install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: cargo check (windows-gnu)
+        run: cargo check --target x86_64-pc-windows-gnu
 
   deny:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}

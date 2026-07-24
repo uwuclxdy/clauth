@@ -490,7 +490,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     };
 
     // Comfortable horizon: a plain accent value, no pill, one line.
-    let comfy = session_token_lines(&S::LongLived(Some(now + 340 * day)), now, w);
+    let comfy = session_token_lines(&S::LongLived(Some(now + 340 * day)), false, now, w);
     assert_eq!(comfy.len(), 1);
     let comfy_t = text(&comfy);
     assert!(comfy_t.contains("token"), "{comfy_t}");
@@ -502,7 +502,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&comfy, theme::accent()));
 
     // Last 30 days: a WARNING pill, still one line, no fix.
-    let soon = session_token_lines(&S::LongLived(Some(now + 12 * day)), now, w);
+    let soon = session_token_lines(&S::LongLived(Some(now + 12 * day)), false, now, w);
     assert_eq!(soon.len(), 1);
     assert!(
         text(&soon).contains("[ expires in ~12d ]"),
@@ -512,7 +512,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&soon, theme::warning()), "last 30 days warn");
 
     // Expired: DANGER pill + a `└` re-mint fix line.
-    let dead = session_token_lines(&S::LongLived(Some(now - day)), now, w);
+    let dead = session_token_lines(&S::LongLived(Some(now - day)), false, now, w);
     assert_eq!(dead.len(), 2, "expired = pill + fix line");
     let dead_t = text(&dead);
     assert!(dead_t.contains("[ expired ]"), "{dead_t}");
@@ -524,7 +524,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
 
     // Expired within the last 24h: truncating division gives 0 days; it must
     // read as expired, not "~0d / warning".
-    let just_dead = session_token_lines(&S::LongLived(Some(now - day / 2)), now, w);
+    let just_dead = session_token_lines(&S::LongLived(Some(now - day / 2)), false, now, w);
     let just_dead_t = text(&just_dead);
     assert!(
         just_dead_t.contains("[ expired ]"),
@@ -536,7 +536,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Unstamped long-lived: a plain accent value.
-    let unstamped = session_token_lines(&S::LongLived(None), now, w);
+    let unstamped = session_token_lines(&S::LongLived(None), false, now, w);
     assert_eq!(unstamped.len(), 1);
     assert!(
         text(&unstamped).contains("no recorded expiry"),
@@ -545,7 +545,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Mis-filled (rotating pair): DANGER pill + fix, split disengaged.
-    let misfilled = session_token_lines(&S::NotLongLived, now, w);
+    let misfilled = session_token_lines(&S::NotLongLived, false, now, w);
     assert_eq!(misfilled.len(), 2, "mis-filled = pill + fix line");
     let mis_t = text(&misfilled);
     assert!(mis_t.contains("[ mis-filled ]"), "{mis_t}");

@@ -19,7 +19,7 @@ use crate::lockorder::RankedMutex;
 use crate::oauth;
 use crate::profile::{
     AppConfig, ClaudeCredentials, DivergenceChoice, ModelSettings, Profile, profile_dir,
-    save_app_state, save_profile,
+    save_app_state, save_profile, update_app_state,
 };
 use crate::providers::Provider;
 use crate::spinner::Spinner;
@@ -42,6 +42,37 @@ pub(crate) fn validate_profile_name(
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '@' | '+'));
     if !valid_chars || trimmed.starts_with('.') {
         bail!("name: letters, digits and - _ . @ + only, and can't start with '.'");
+    }
+    // Reserved: these bare single tokens are `clauth` subcommands (`clauth
+    // daemon`, `clauth status`, `clauth doctor`, ...) — including the two hidden
+    // internal ones (`__complete`, `mcp-await-job`). `clauth <reserved>` runs
+    // the subcommand, never a switch (see the dispatch in main.rs), so a profile
+    // with one of these names would be permanently unreachable by `clauth
+    // <name>` — refuse it at creation across every path (CLI login, TUI
+    // create/rename, daemon socket rename, fallback-config rename all funnel
+    // through here). Case-insensitive: names are matched case-insensitively for
+    // dedup below, and the case-sensitive dispatch would otherwise let `Daemon`
+    // switch while `daemon` runs the daemon — a footgun, not a feature.
+    // (`completions` is NOT reserved: bare `clauth completions` falls through to
+    // a switch.)
+    const RESERVED: &[&str] = &[
+        "daemon",
+        "status",
+        "doctor",
+        "which",
+        "start",
+        "login",
+        "delete",
+        "fallback",
+        "proxy",
+        "resume",
+        "run",
+        "mcp",
+        "__complete",
+        "mcp-await-job",
+    ];
+    if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(trimmed)) {
+        bail!("name '{trimmed}' is reserved for the `clauth {trimmed}` command; pick another");
     }
     if existing
         .iter()
@@ -75,6 +106,13 @@ fn ensure_switch_target_ok(config: &AppConfig, name: &str) -> Result<()> {
     let Some(profile) = config.find(name) else {
         bail!("profile '{name}' not found");
     };
+    // CDX-1: every claude switch primitive funnels through here, so a codex
+    // target can never reach the claude link/Keychain machinery (it has no
+    // credentials.json to link — the harness dispatch belongs to callers, this
+    // is the backstop).
+    if profile.is_codex() {
+        bail!("profile '{name}' is a codex profile — it switches via the codex path");
+    }
     if profile.is_disabled() {
         bail!("'{name}': account is disabled, run `clauth enable {name}`");
     }
@@ -259,6 +297,25 @@ pub(crate) fn switch_profile_noninteractive(
         Option<&str>,
     ) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>,
 ) -> Result<(Option<String>, String)> {
+    // CDX-1 T6: harness dispatch — a codex target takes the codex path; the
+    // AUTH-1 OAuth gate and claude divergence machinery below don't apply to
+    // it. Every noninteractive caller (MCP today) is an explicit user
+    // decision, so a foreign live login is archived (User-origin semantics)
+    // rather than wedging the tool on a refusal.
+    {
+        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        let cfg = &mut *config.lock().expect("config mutex poisoned");
+        if cfg.find(target).is_some_and(|p| p.is_codex()) {
+            let previous = cfg
+                .state
+                .active_codex_profile
+                .as_deref()
+                .map(str::to_string);
+            codex_switch_profile(cfg, target, ForeignLivePolicy::Archive)?;
+            return Ok((previous, target.to_string()));
+        }
+    }
+
     let (previous, target_disabled) = {
         #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         let cfg = config.lock().expect("config mutex poisoned");
@@ -344,7 +401,10 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
         // stale identity block is just as wrong once creds are cleared.
         crate::claude_json::strip_home_oauth_account()?;
         config.state.active_profile = None;
-        save_app_state(&config.state)
+        // TECH-7: merge the active_profile=None delta into the latest on-disk state
+        // so a concurrent `clauth login` that appended a profile is preserved.
+        update_app_state(|s| s.active_profile = None)?;
+        Ok(())
     })
 }
 
@@ -364,7 +424,12 @@ fn finish_switch(config: &mut AppConfig, name: &str) -> Result<()> {
     // the wrong account until its next `/login`.
     crate::claude_json::strip_home_oauth_account()?;
     config.state.active_profile = Some(name.into());
-    save_app_state(&config.state)
+    // TECH-7: persist only the active_profile delta, merged into the latest on-disk
+    // state, so a concurrent `clauth login` that appended a profile is not orphaned
+    // by this switch's blind rewrite (finding #1).
+    let active = config.state.active_profile.clone();
+    update_app_state(move |s| s.active_profile = active)?;
+    Ok(())
 }
 
 pub(crate) fn edit_profile_endpoint(
@@ -374,6 +439,13 @@ pub(crate) fn edit_profile_endpoint(
     api_key: Option<String>,
 ) -> Result<()> {
     with_state_lock(|| {
+        // CDX-1 harness immutability: an endpoint (base_url + api_key) is a
+        // claude-shaped credential — writing one onto a codex profile would
+        // set `provider`/`is_third_party()` and re-enter the excluded fetch
+        // legs (same class as the overwrite_captured_profile backstop).
+        if config.find(name).is_some_and(|p| p.is_codex()) {
+            bail!("profile '{name}' is a codex profile — it has no Anthropic endpoint to edit");
+        }
         let profile = config.find_mut(name).context("profile not found")?;
         let old_api_key = profile.api_key.clone();
         profile.base_url = base_url;
@@ -738,19 +810,32 @@ pub(crate) fn find_matching_oauth_profile<'a>(
         .map(|p| p.name.as_str())
 }
 
+/// CAP-2: where a snapshot's credentials CAME FROM, which decides how the
+/// captured profile's identity anchor (`account_id.json`) is written. The
+/// 2026-07-12 incident follow-up: `clauth login` probed the fresh token's real
+/// account, then the capture blindly re-anchored from the LIVE login's hint —
+/// an account the minted tokens have nothing to do with — leaving a
+/// store/anchor split the adopt gate would later trust.
+#[derive(Debug, Clone)]
+pub(crate) enum CaptureIdentity {
+    /// Browser-minted and probed: the caller asked the API which account the
+    /// fresh token belongs to — anchor to exactly that identity.
+    Known(crate::usage::AccountIdentity),
+    /// The snapshot's bytes were read from the live login, so the live
+    /// account hint (`refresh_account_anchor`) describes the same login.
+    LiveLogin,
+    /// Browser-minted but unprobed (TUI re-login flow): no trustworthy
+    /// identity in hand — drop any stale anchor and let the usage fetcher's
+    /// first-fetch backfill seed the truth.
+    Unknown,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct CaptureSnapshot {
     pub(crate) credentials: Option<ClaudeCredentials>,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
-    /// The account uuid an interactive login's own `/profile` probe saw these
-    /// credentials authenticate as. Travels with the snapshot so whichever
-    /// function COMMITS it seeds the identity anchor — including the paths that
-    /// park the snapshot in a confirm modal first. `None` for a snapshot with no
-    /// proven identity (a probe failure, or [`capture_snapshot`] reading live
-    /// credentials off disk); that seeds nothing and leaves any existing anchor
-    /// alone, exactly as before.
-    pub(crate) account_uuid: Option<String>,
+    pub(crate) identity: CaptureIdentity,
 }
 
 pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
@@ -760,9 +845,78 @@ pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
         credentials,
         base_url,
         api_key,
-        // Read off disk, not from a login — this snapshot proves no identity.
-        account_uuid: None,
+        identity: CaptureIdentity::LiveLogin,
     })
+}
+
+/// Write the identity anchor for a just-captured login per the snapshot's
+/// provenance (see [`CaptureIdentity`]).
+fn anchor_captured_login(name: &str, identity: &CaptureIdentity) {
+    use crate::profile_cache::{
+        ACCOUNT_EMAIL_CACHE_FILE, ACCOUNT_ID_CACHE_FILE, write_profile_cache,
+    };
+    match identity {
+        CaptureIdentity::Known(id) => {
+            write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &id.uuid);
+            match &id.email {
+                Some(email) => write_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE, email),
+                // No email in the probe: drop any stale one rather than let
+                // the pair describe two accounts (backfill re-seeds).
+                None => {
+                    if let Some(p) =
+                        crate::profile_cache::profile_cache_path(name, ACCOUNT_EMAIL_CACHE_FILE)
+                    {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+            }
+        }
+        CaptureIdentity::LiveLogin => crate::profile_cache::refresh_account_anchor(name),
+        CaptureIdentity::Unknown => crate::profile_cache::drop_account_anchor(name),
+    }
+}
+
+/// CAP-3 (same-account dedup): the profile — other than `exclude` — whose
+/// identity anchor already names `identity`'s account. Uuid equality is
+/// authoritative; a cached-email match (case-insensitive) catches profiles
+/// whose uuid anchor hasn't been backfilled yet. `clauth login` refuses when
+/// this returns a sibling: storing one account under two profiles makes them
+/// double-poll it into a rate-limit pin (the 2026-07-12 incident, both times).
+pub(crate) fn account_owner(
+    config: &AppConfig,
+    identity: &crate::usage::AccountIdentity,
+    exclude: &str,
+) -> Option<String> {
+    use crate::profile_cache::{
+        ACCOUNT_EMAIL_CACHE_FILE, ACCOUNT_ID_CACHE_FILE, load_profile_cache,
+    };
+    let anchor_matches = |name: &str| -> bool {
+        let uuid_match =
+            load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE).is_some_and(|u| {
+                let u = u.trim();
+                !u.is_empty() && u == identity.uuid
+            });
+        let email_match = identity.email.as_deref().is_some_and(|e| {
+            load_profile_cache::<String>(name, ACCOUNT_EMAIL_CACHE_FILE).is_some_and(|c| {
+                let c = c.trim();
+                !c.is_empty() && c.eq_ignore_ascii_case(e)
+            })
+        });
+        uuid_match || email_match
+    };
+    // Re-minting the account `exclude` ALREADY holds is a refresh, never a
+    // new duplicate — even when a sibling anomalously holds it too. Refusing
+    // that case would wedge the double-hold recovery in BOTH directions
+    // (each profile's re-login names the other).
+    if anchor_matches(exclude) {
+        return None;
+    }
+    config
+        .profiles
+        .iter()
+        .filter(|p| p.name.as_str() != exclude)
+        .find(|p| anchor_matches(p.name.as_str()))
+        .map(|p| p.name.as_str().to_string())
 }
 
 pub(crate) fn capture_into_profile(
@@ -774,28 +928,62 @@ pub(crate) fn capture_into_profile(
         credentials,
         base_url,
         api_key,
-        account_uuid,
+        identity,
     } = snapshot;
-    let seed_name = name.clone();
     with_state_lock(|| {
         let mut profile = Profile::new(name.clone(), base_url, api_key);
         profile.credentials = credentials;
         save_profile(&profile)?;
+        // CAP-1: anchor the new profile to the login it just captured, so the
+        // identity-guarded adopt/follow paths can vouch for it immediately —
+        // sourced per the snapshot's provenance (CAP-2).
+        if profile.credentials.is_some() {
+            anchor_captured_login(&name, &identity);
+        }
         config.add(profile);
         // AUTH-1: a fresh login/capture clears any stale auth-broken quarantine
-        // for this name (e.g. a delete-then-relogin of a revoked account).
+        // for this name (e.g. delete-then-relogin of a revoked account).
         config.set_auth_broken(&name, false);
 
-        if config.state.active_profile.is_none() {
+        // TECH-7: merge only THIS profile's delta into the latest on-disk state —
+        // add its name, clear its auth-broken quarantine, and adopt it as active
+        // ONLY if no profile is active on disk. Deciding against disk (not the
+        // possibly-stale in-memory snapshot) means a concurrent daemon auto-switch's
+        // `active_profile` is never clobbered by this login's blind rewrite.
+        let name_owned = name.clone();
+        let mut adopted_active = false;
+        let merged = update_app_state(|s| {
+            if !s.profiles.iter().any(|p| p.as_str() == name_owned) {
+                s.profiles.push(name_owned.as_str().into());
+            }
+            s.auth_broken.retain(|n| n.as_str() != name_owned);
+            if s.active_profile.is_none() {
+                s.active_profile = Some(name_owned.as_str().into());
+                adopted_active = true;
+            }
+        })?;
+        // Make the fresh tokens LIVE when this capture targets the active account.
+        // Two cases:
+        //  - adopted_active: disk had no active and we just adopted this profile → link
+        //    its creds (non-force; a foreign live file is protected by the guard).
+        //  - RE-AUTH of the already-active profile (`clauth login <active>`): the live
+        //    `.credentials.json` is this profile's OWN now-stale Keychain mirror, so it
+        //    DIFFERS from the fresh tokens and the non-force guard would refuse. Force
+        //    the relink — which on macOS rewrites the Keychain — so a running `claude`
+        //    stops reading the dead token ("Not logged in · run /login"). Without this,
+        //    a re-auth updated the profile + file but never the Keychain, leaving the
+        //    live session broken.
+        let active_is_this = merged.active_profile.as_deref() == Some(name.as_str());
+        if adopted_active {
             link_profile_credentials(&name)?;
-            config.state.active_profile = Some(name.into());
+        } else if active_is_this {
+            force_link_profile_credentials(&name)?;
         }
-        save_app_state(&config.state)
-    })?;
-    // Only once the credentials are committed, and only here — no caller seeds
-    // its own anchor, so no caller can forget to.
-    crate::usage::seed_login_anchor(&seed_name, account_uuid.as_deref());
-    Ok(())
+        // Adopt the merged active-profile truth (a concurrent switch wins; our
+        // adoption only applied when disk had none).
+        config.state.active_profile = merged.active_profile;
+        Ok(())
+    })
 }
 
 /// Create a fresh OAuth profile from an in-memory minted login — the Setup
@@ -855,11 +1043,20 @@ pub(crate) fn overwrite_captured_profile(
     name: &str,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
+    // CDX-1 writer-level backstop: claude-shaped credentials must never land
+    // in a codex profile (harness immutability — the corrupt hybrid would
+    // also re-enter the Anthropic fetch legs). The CLI errors earlier with a
+    // friendlier message; this guard covers every other caller.
+    if config.find(name).is_some_and(|p| p.is_codex()) {
+        bail!(
+            "profile '{name}' is a codex profile — re-auth it with `clauth login {name} --codex`"
+        );
+    }
     let CaptureSnapshot {
         credentials,
         base_url,
         api_key,
-        account_uuid,
+        identity,
     } = snapshot;
     with_state_lock(|| {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
@@ -875,6 +1072,7 @@ pub(crate) fn overwrite_captured_profile(
         profile.fetch_status = None;
         profile.third_party_usage = None;
         save_profile(profile)?;
+        let captured_login = profile.credentials.is_some();
 
         for file in [
             crate::profile_cache::USAGE_CACHE_FILE,
@@ -882,6 +1080,16 @@ pub(crate) fn overwrite_captured_profile(
             crate::throughput::THROUGHPUT_CACHE_FILE,
         ] {
             crate::profile_cache::remove_profile_cache(name, file);
+        }
+
+        // CAP-1: the capture may have changed which ACCOUNT this profile holds
+        // — the identity anchor moves with the store (and drops for a
+        // third-party capture that stores no OAuth login), sourced per the
+        // snapshot's provenance (CAP-2).
+        if captured_login {
+            anchor_captured_login(name, &identity);
+        } else {
+            crate::profile_cache::drop_account_anchor(name);
         }
 
         // A disabled profile's creds are still captured above (the operator
@@ -911,11 +1119,23 @@ pub(crate) fn overwrite_captured_profile(
             let prev_env_keys: Vec<String> = profile.env.keys().cloned().collect();
             apply_profile_to_claude_settings(profile, &prev_env_keys)?;
         }
-        // AUTH-1: re-authenticating an existing profile (`clauth login <name>`) is
-        // the documented recovery for a revoked login — clear its quarantine.
-        // Pinned by `reauth_overwrite_clears_broken_flag`.
+        // AUTH-1: the re-login replaced the dead credential chain — the whole
+        // point of the reauth — so lift the profile's auth-broken quarantine,
+        // exactly like the fresh-capture path (`capture_into_profile`) does.
+        // Left set, the flag keeps the just-relogged account excluded from
+        // every chain walk and keeps the "login expired" banner up.
         config.set_auth_broken(name, false);
-        save_app_state(&config.state)
+        save_app_state(&config.state)?;
+        // A daemon poll racing this reauth can still be spending the OLD
+        // (dead) token; its terminal failure re-marks the quarantine after
+        // the blind save above (TECH-7 lost-update surface). Re-apply the
+        // clear as a narrow delta against the LATEST disk state so the fresh
+        // login wins that race instead of waiting a self-heal round-trip.
+        let name_owned = name.to_string();
+        config.state = update_app_state(|s| {
+            s.auth_broken.retain(|n| n.as_str() != name_owned);
+        })?;
+        Ok(())
     })?;
     // Outside the closure — see `rename_profile` on the rank order. Skipped when
     // the swap fails, which is imprecise rather than atomic: a failure after
@@ -924,13 +1144,6 @@ pub(crate) fn overwrite_captured_profile(
     // tick racing the gap between the flock release and this expire spends the
     // stale stamp once or loses a fresh one and re-pulls once.
     crate::usage::expire_profile_ttl(name);
-    // Same commit-or-nothing rule for the identity: only credentials this profile
-    // now actually holds may be vouched for by its anchor. The same
-    // failure-after-`save_profile` window is NOT bounded here the way the stamp's
-    // is: the anchor would keep proving the old account against the new pair, and
-    // `seed_identity_anchor`'s ride-along is write-if-missing, so nothing corrects
-    // it until the next successful login.
-    crate::usage::seed_login_anchor(name, account_uuid.as_deref());
     Ok(())
 }
 
@@ -1018,6 +1231,402 @@ pub(crate) fn reorder_profile(config: &mut AppConfig, from: usize, to: usize) ->
     })
 }
 
+// ---- Codex harness actions (CDX-1 T3/T4) ------------------------------------
+//
+// The codex siblings of capture/switch. Deliberately simpler than the claude
+// set: no Keychain, no symlink — the live file `~/.codex/auth.json` is
+// compared by content (account_id anchor) and every store/install copies raw
+// bytes whole-file (docs/codex-support/PLAN.md §0.3–0.5). All mutations run
+// under `with_state_lock` (re-entrant), the same lock the daemon's follow and
+// drain paths hold, so a switch (store→live) can never interleave with an
+// adopt-back tick (live→store).
+
+/// What the caller decided about a FOREIGN live login (one no stored codex
+/// profile anchors) standing in the way of a switch. A user decision archives
+/// it to quarantine (loss-free) and proceeds; automation refuses and leaves it
+/// alone — the same split RESCUE-2 established on the claude side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ForeignLivePolicy {
+    Refuse,
+    Archive,
+}
+
+/// What a codex switch did, for the caller's messaging.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CodexSwitchReport {
+    /// The outgoing live login was adopted back into this profile's store
+    /// (codex had rotated the chain; the snapshot was stale).
+    pub(crate) adopted_back: Option<String>,
+    /// A foreign/unparseable live login was archived here before the install.
+    pub(crate) archived: Option<std::path::PathBuf>,
+}
+
+/// Codex logout (CDX-1 T8): drop `name`'s stored codex-auth.json and, when it
+/// held the codex active slot, clear the marker. Never touches the live file
+/// — a running codex login is codex's own to keep; the profile shell (env,
+/// chain slot, settings) survives for a later re-capture.
+pub(crate) fn codex_clear_profile_auth(config: &mut AppConfig, name: &str) -> Result<()> {
+    with_state_lock(|| {
+        ensure_codex_profile(config, name)?;
+        let path = crate::codex::profile_auth_path(name)?;
+        if path.exists() {
+            std::fs::remove_file(&path).context("failed to remove codex-auth.json")?;
+        }
+        if config.is_active_codex(name) {
+            let cleared = name.to_string();
+            config.state = update_app_state(move |s| {
+                if s.active_codex_profile.as_deref() == Some(cleared.as_str()) {
+                    s.active_codex_profile = None;
+                }
+            })?;
+        }
+        Ok(())
+    })
+}
+
+/// True when the live `~/.codex/auth.json` holds a real login that matches no
+/// stored codex profile's account — the state a switch cannot displace without
+/// an explicit decision. Missing/shell/unparseable live files answer `false`
+/// (the switch handles those without user input).
+pub(crate) fn codex_live_is_foreign(config: &AppConfig) -> Result<bool> {
+    let Some(bytes) = crate::codex::read_live()? else {
+        return Ok(false);
+    };
+    let Ok(live) = crate::codex::CodexAuthFile::parse(&bytes) else {
+        return Ok(false);
+    };
+    if !live.has_login() {
+        return Ok(false);
+    }
+    let candidates = codex_candidates(config);
+    Ok(crate::codex::live_owner(
+        &live,
+        candidates.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
+    )
+    .is_none())
+}
+
+/// The codex-harness profiles that hold a stored login, with their raw bytes.
+fn codex_candidates(config: &AppConfig) -> Vec<(String, Vec<u8>)> {
+    config
+        .profiles
+        .iter()
+        .filter(|p| p.is_codex())
+        .filter_map(|p| {
+            let bytes = crate::codex::read_profile_auth(&p.name).ok().flatten()?;
+            Some((p.name.to_string(), bytes))
+        })
+        .collect()
+}
+
+/// The codex profiles whose stored chain clauth EXCLUSIVELY holds — the only
+/// chains the CDX-3 standby refresh may spend (PLAN.md §0.9: single-use
+/// refresh tokens; a second consumer kills the chain). Excluded: the live
+/// owner (codex itself advances that chain; the follow's adopt-back keeps our
+/// snapshot fresh), profiles with a live isolated codex session (the isolated
+/// `CODEX_HOME` carries theirs), `auth_broken` profiles (dead chain), and
+/// anything without a stored refresh token. Returns `(name, stored bytes)` so
+/// the caller's due-check needn't re-read. Callers re-derive this INSIDE the
+/// per-profile `RotationGuard` before spending — a switch/capture landing
+/// between snapshot and spend must flip the answer.
+pub(crate) fn codex_standby_candidates(config: &AppConfig) -> Vec<(String, Vec<u8>)> {
+    let candidates = codex_candidates(config);
+    let live_owner: Option<String> = crate::codex::read_live()
+        .ok()
+        .flatten()
+        .and_then(|bytes| crate::codex::CodexAuthFile::parse(&bytes).ok())
+        .and_then(|live| {
+            crate::codex::live_owner(
+                &live,
+                candidates.iter().map(|(n, b)| (n.as_str(), b.as_slice())),
+            )
+        });
+    candidates
+        .into_iter()
+        .filter(|(name, bytes)| {
+            if live_owner.as_deref() == Some(name.as_str()) {
+                return false;
+            }
+            if config.is_auth_broken(name) {
+                return false;
+            }
+            if crate::runtime::has_live_codex_session(name) {
+                return false;
+            }
+            crate::codex::CodexAuthFile::parse(bytes).is_ok_and(|a| a.refresh_token().is_some())
+        })
+        .collect()
+}
+
+/// The OTHER codex profile (if any) already anchoring `account_id` — the
+/// CAP-3 dedup shared by capture and the browser login; `exempt` is the
+/// profile being (re-)authed, which is a refresh, not a dup.
+fn codex_account_owner_elsewhere(
+    config: &AppConfig,
+    exempt: &str,
+    account_id: &str,
+) -> Option<String> {
+    codex_candidates(config)
+        .iter()
+        .filter(|(n, _)| n != exempt)
+        .find(|(_, stored)| {
+            crate::codex::CodexAuthFile::parse(stored)
+                .ok()
+                .and_then(|s| s.account_id())
+                .as_deref()
+                == Some(account_id)
+        })
+        .map(|(n, _)| n.clone())
+}
+
+fn ensure_codex_file_store() -> Result<()> {
+    match crate::codex::store_mode() {
+        mode if mode.is_file() => Ok(()),
+        crate::codex::StoreMode::Other(mode) => bail!(
+            "codex stores credentials in '{mode}' mode (cli_auth_credentials_store in \
+             ~/.codex/config.toml) — clauth supports only the default 'file' mode"
+        ),
+        crate::codex::StoreMode::File => unreachable!("is_file() covered above"),
+    }
+}
+
+fn ensure_codex_profile(config: &AppConfig, name: &str) -> Result<()> {
+    let Some(profile) = config.find(name) else {
+        bail!("profile '{name}' not found");
+    };
+    if !profile.is_codex() {
+        bail!("profile '{name}' is a claude profile — it switches via the claude path");
+    }
+    Ok(())
+}
+
+/// Capture the live `~/.codex/auth.json` into `name` — create the profile, or
+/// re-auth an existing codex profile in place. The captured login is live by
+/// definition, so `active_codex_profile` always lands on `name`.
+pub(crate) fn codex_capture_into_profile(config: &mut AppConfig, name: &str) -> Result<()> {
+    with_state_lock(|| {
+        // CDX-3 §0.9: a standby refresh may hold this profile's rotation lock
+        // across its HTTP window. A blocking acquire here would invert the
+        // Rotation-outermost rank (we may already hold the state flock), so
+        // probe instead — busy means "its chain is being advanced right now".
+        let _rotation_probe =
+            crate::runtime::RotationProbe::try_acquire(name)?.ok_or_else(|| {
+                anyhow::anyhow!("a token refresh for '{name}' is in flight — retry in a moment")
+            })?;
+        // CDX-1b §0.14: an isolated session's watchdog owns this store slot
+        // while it runs (it adopts the session's rotations back); a capture
+        // overwriting it concurrently would interleave two writers.
+        if crate::runtime::has_live_codex_session(name) {
+            bail!(
+                "profile '{name}' is running via `clauth start` — exit that session before \
+                 re-capturing it"
+            );
+        }
+        ensure_codex_file_store()?;
+        let bytes = crate::codex::read_live()?
+            .ok_or_else(|| anyhow::anyhow!("no live codex login — run `codex login` first"))?;
+        let live = crate::codex::CodexAuthFile::parse(&bytes)
+            .context("live ~/.codex/auth.json is unparseable")?;
+        if !live.has_login() {
+            bail!("the live codex login is a logged-out shell — run `codex login` first");
+        }
+        // CAP-3 sibling: one account under two codex profiles would make the
+        // eventual chain walk (CDX-4) treat one login as two lanes. The
+        // profile being re-authed is exempt (that is a refresh, not a dup).
+        if let Some(live_id) = live.account_id()
+            && let Some(owner) = codex_account_owner_elsewhere(config, name, &live_id)
+        {
+            bail!("profile '{owner}' already holds this codex account — re-auth it instead");
+        }
+
+        codex_install_login_locked(config, name, &bytes, true)
+    })
+}
+
+/// Store a validated codex login into `name` — the shared tail of capture and
+/// the browser PKCE login. Caller holds the state lock, has probed the
+/// rotation lock, and has run the entry-point checks (lease, CAP-3 dedup,
+/// and capture's live-file store-mode gate). `set_active` flips the codex
+/// active slot (true for capture — the captured login IS the live one; false
+/// for the browser login — the live file was never touched). A successful
+/// install always clears `auth_broken`: a fresh chain is the heal (mirrors
+/// the claude re-login path).
+fn codex_install_login_locked(
+    config: &mut AppConfig,
+    name: &str,
+    bytes: &[u8],
+    set_active: bool,
+) -> Result<()> {
+    match config.find(name) {
+        Some(existing) if existing.is_codex() => {
+            // Re-auth in place: keep env/models/chain position, swap bytes.
+            crate::codex::write_profile_auth(name, bytes)?;
+        }
+        Some(_) => bail!(
+            "profile '{name}' is a claude profile — a profile never converts across \
+             harnesses; pick a new name"
+        ),
+        None => {
+            validate_profile_name(name, &config.names(), None)?;
+            let mut profile = Profile::new(name.to_string(), None, None);
+            profile.harness = crate::profile::Harness::Codex;
+            save_profile(&profile)?;
+            crate::codex::write_profile_auth(name, bytes)?;
+            config.add(profile);
+        }
+    }
+    config.set_auth_broken(name, false);
+
+    // TECH-7: merge only this install's delta into the latest on-disk state.
+    // Wholesale re-sync: `merged` is the freshest on-disk state plus this
+    // delta; partial copy-back would leave the caller's snapshot stale
+    // against a concurrent writer (same rationale as the claude follow).
+    let name_owned = name.to_string();
+    config.state = update_app_state(move |s| {
+        if !s.profiles.iter().any(|p| p.as_str() == name_owned) {
+            s.profiles.push(name_owned.as_str().into());
+        }
+        if set_active {
+            s.active_codex_profile = Some(name_owned.as_str().into());
+        }
+        s.auth_broken.retain(|n| n.as_str() != name_owned);
+    })?;
+    Ok(())
+}
+
+/// Store a browser-PKCE-minted codex login into `name` (CDX-3 R5). Unlike
+/// capture this NEVER reads or affects the live `~/.codex/auth.json` or the
+/// codex active slot — the snapshot goes straight to the profile store, ready
+/// for a later switch. Same dedup/lease/probe discipline as capture.
+pub(crate) fn codex_store_browser_login(
+    config: &mut AppConfig,
+    name: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    with_state_lock(|| {
+        let _rotation_probe =
+            crate::runtime::RotationProbe::try_acquire(name)?.ok_or_else(|| {
+                anyhow::anyhow!("a token refresh for '{name}' is in flight — retry in a moment")
+            })?;
+        if crate::runtime::has_live_codex_session(name) {
+            bail!(
+                "profile '{name}' is running via `clauth start` — exit that session before \
+                 re-authenticating it"
+            );
+        }
+        let minted = crate::codex::CodexAuthFile::parse(bytes)
+            .context("the minted login snapshot is unparseable")?;
+        if !minted.has_login() {
+            bail!("the minted login snapshot holds no tokens");
+        }
+        // CAP-3 sibling (same rule as capture): one account under two codex
+        // profiles would make the chain walk treat one login as two lanes.
+        if let Some(minted_id) = minted.account_id()
+            && let Some(owner) = codex_account_owner_elsewhere(config, name, &minted_id)
+        {
+            bail!("profile '{owner}' already holds this codex account — re-auth it instead");
+        }
+        codex_install_login_locked(config, name, bytes, false)
+    })
+}
+
+/// Switch the live codex login to `target`'s stored chain (session-boundary
+/// semantics — a running codex keeps its in-memory account until its next
+/// refresh boundary; the swap takes effect for NEW sessions). Loss-free by
+/// construction: an outgoing login owned by a stored profile is adopted back
+/// first; a foreign one is archived or refused per `on_foreign`.
+pub(crate) fn codex_switch_profile(
+    config: &mut AppConfig,
+    target: &str,
+    on_foreign: ForeignLivePolicy,
+) -> Result<CodexSwitchReport> {
+    with_state_lock(|| {
+        ensure_codex_profile(config, target)?;
+        if config.is_auth_broken(target) {
+            bail!("profile '{target}' is quarantined after a permanent auth failure");
+        }
+        // CDX-3 §0.9: never install a chain a standby refresh is mid-flight on
+        // (the store bytes are about to be superseded). Non-blocking probe —
+        // see the capture path for the rank rationale; the daemon drain
+        // converts this error into its retry backoff.
+        let _rotation_probe =
+            crate::runtime::RotationProbe::try_acquire(target)?.ok_or_else(|| {
+                anyhow::anyhow!("a token refresh for '{target}' is in flight — retry in a moment")
+            })?;
+        // CDX-1b §0.14: a live isolated session carries this profile's chain
+        // in its own CODEX_HOME — installing the store snapshot to the shared
+        // home would fork the chain (two carriers → refresh_token_reused).
+        if crate::runtime::has_live_codex_session(target) {
+            bail!(
+                "profile '{target}' is running via `clauth start` — its login lives in that \
+                 session's isolated home; exit the session before switching to it"
+            );
+        }
+        ensure_codex_file_store()?;
+        let stored = crate::codex::read_profile_auth(target)?.ok_or_else(|| {
+            anyhow::anyhow!("profile '{target}' has no stored codex login — capture one first")
+        })?;
+
+        let mut report = CodexSwitchReport::default();
+        match crate::codex::read_live()? {
+            None => {}
+            Some(live_bytes) => match crate::codex::CodexAuthFile::parse(&live_bytes) {
+                Err(_) => {
+                    // Unparseable bytes might still be a half-written login:
+                    // quarantine them rather than destroy them.
+                    report.archived = Some(crate::codex::archive_live_auth("unparseable")?);
+                }
+                Ok(live) if !live.has_login() => {} // logged-out shell: nothing to protect
+                Ok(live) => {
+                    let owner = crate::codex::live_owner(
+                        &live,
+                        codex_candidates(config)
+                            .iter()
+                            .map(|(n, b)| (n.as_str(), b.as_slice())),
+                    );
+                    match owner {
+                        Some(owner) => {
+                            if crate::codex::read_profile_auth(&owner)?.as_deref()
+                                != Some(&live_bytes[..])
+                            {
+                                // codex rotated the chain since our snapshot —
+                                // the live file is the truth, adopt it back.
+                                crate::codex::write_profile_auth(&owner, &live_bytes)?;
+                                report.adopted_back = Some(owner.clone());
+                            }
+                            if owner == target {
+                                // The live login already IS the target's chain
+                                // (now freshly adopted). Installing the older
+                                // snapshot over it would roll the chain back.
+                                config.state = update_app_state(|s| {
+                                    s.active_codex_profile = Some(target.into());
+                                })?;
+                                return Ok(report);
+                            }
+                        }
+                        None => match on_foreign {
+                            ForeignLivePolicy::Refuse => bail!(
+                                "the live codex login matches no stored profile — capture it \
+                                 with `clauth login <name> --codex` or switch with an explicit \
+                                 discard"
+                            ),
+                            ForeignLivePolicy::Archive => {
+                                report.archived = Some(crate::codex::archive_live_auth("foreign")?);
+                            }
+                        },
+                    }
+                }
+            },
+        }
+
+        crate::codex::write_live(&stored)?;
+        config.state = update_app_state(|s| {
+            s.active_codex_profile = Some(target.into());
+        })?;
+        Ok(report)
+    })
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/actions.rs"]
 mod tests;
@@ -1025,3 +1634,7 @@ mod tests;
 #[cfg(test)]
 #[path = "../tests/inline/mcp_switch.rs"]
 mod tests_mcp_switch;
+
+#[cfg(test)]
+#[path = "../tests/inline/codex_actions.rs"]
+mod tests_codex;

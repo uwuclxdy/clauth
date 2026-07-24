@@ -1,4 +1,4 @@
-//! In-place trim of the daemon's supervisor-redirected log.
+//! In-place trim of the daemon's launchd-redirected log (TECH-12 / finding #39).
 //!
 //! `~/.clauth/daemon.log` is opened by **launchd** (`StandardErrorPath`) with an
 //! `O_APPEND` fd that launchd holds for the daemon's whole lifetime and never

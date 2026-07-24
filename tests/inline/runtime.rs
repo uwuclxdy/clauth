@@ -1916,11 +1916,11 @@ fn has_live_session_sees_isolated_session() {
         assert!(has_live_session("iso"), "isolated live session counts");
         assert_eq!(live_session_count("iso"), 1);
         drop(file);
-        // The probe is deliberately fail-alive (any try_lock I/O error reads
-        // as "alive" — see `is_session_alive`), so transient errors under a
+        // The probe is deliberately fail-alive (any try_lock I/O error reads as
+        // "alive" — see `is_session_alive`), so transient errors under a
         // parallel suite run (fd pressure) can flip readings for a while. Poll
-        // generously; only a PERSISTENT "alive" after the lock holder dropped
-        // is a regression (flaked once under the full suite, 2026-07-12).
+        // generously — 2s still flaked under the full suite (2026-07-12); only
+        // a PERSISTENT "alive" after the lock holder dropped is a regression.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while has_live_session("iso") && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -2028,4 +2028,198 @@ fn guard_home_project_settings_appends_setting_sources_only_at_home() {
         in_project.get_args().next().is_none(),
         "a normal project cwd must keep reading its own project settings"
     );
+}
+
+// ---------------------------------------------------------------------------
+// CDX-1b: CodexRuntime — isolated CODEX_HOME with lease + adopt-back
+// ---------------------------------------------------------------------------
+
+mod codex_runtime {
+    use super::super::*;
+    use crate::testutil::HomeSandbox;
+
+    fn codex_auth(access: &str, account: &str) -> Vec<u8> {
+        serde_json::json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "access_token": access,
+                "refresh_token": format!("rt-{access}"),
+                "account_id": account,
+            },
+            "unmodeled": { "keep": 1 },
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    fn seed(name: &str, account: &str) {
+        let mut p = crate::testutil::blank_profile(name);
+        p.harness = crate::profile::Harness::Codex;
+        crate::profile::save_profile(&p).unwrap();
+        crate::codex::write_profile_auth(name, &codex_auth("at-seed", account)).unwrap();
+    }
+
+    #[test]
+    fn acquire_builds_the_isolated_home_and_holds_a_lease() {
+        let sandbox = HomeSandbox::new();
+        seed("cdx-iso", "acct-iso");
+        // A real operator config.toml must be COPIED into the home.
+        let codex_dir = sandbox.home().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(codex_dir.join("config.toml"), "model = \"gpt-5.6\"\n").unwrap();
+
+        let runtime = CodexRuntime::acquire("cdx-iso").expect("acquire");
+        let home = runtime.codex_home().to_path_buf();
+        assert_eq!(
+            std::fs::read(home.join("auth.json")).unwrap(),
+            codex_auth("at-seed", "acct-iso"),
+            "auth.json seeded verbatim from the store"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join("config.toml")).unwrap(),
+            "model = \"gpt-5.6\"\n"
+        );
+        assert!(
+            !home.join("config.toml").is_symlink(),
+            "config.toml is a COPY — codex's own config writes stay isolated"
+        );
+        assert!(
+            has_live_codex_session("cdx-iso"),
+            "lease held while running"
+        );
+
+        drop(runtime);
+        assert!(!has_live_codex_session("cdx-iso"));
+        assert!(
+            home.symlink_metadata().is_err(),
+            "last session tears the tree down"
+        );
+    }
+
+    #[test]
+    fn acquire_refuses_the_live_owner_and_loginless_profiles() {
+        let _sandbox = HomeSandbox::new();
+        seed("cdx-live", "acct-live");
+        crate::codex::write_live(&codex_auth("at-live-rotated", "acct-live")).unwrap();
+        let Err(err) = CodexRuntime::acquire("cdx-live") else {
+            panic!("live owner must be refused")
+        };
+        assert!(err.to_string().contains("LIVE codex login"), "{err}");
+
+        let mut p = crate::testutil::blank_profile("cdx-empty");
+        p.harness = crate::profile::Harness::Codex;
+        crate::profile::save_profile(&p).unwrap();
+        let Err(err) = CodexRuntime::acquire("cdx-empty") else {
+            panic!("loginless profile must be refused")
+        };
+        assert!(err.to_string().contains("no stored codex login"), "{err}");
+    }
+
+    #[test]
+    fn acquire_refuses_a_non_file_store_mode() {
+        let sandbox = HomeSandbox::new();
+        seed("cdx-keyring", "acct-k");
+        let codex_dir = sandbox.home().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("config.toml"),
+            "cli_auth_credentials_store = \"keyring\"\n",
+        )
+        .unwrap();
+        let Err(err) = CodexRuntime::acquire("cdx-keyring") else {
+            panic!("keyring store mode must be refused")
+        };
+        assert!(err.to_string().contains("keyring"), "{err}");
+    }
+
+    #[test]
+    fn watchdog_sync_adopts_a_rotated_chain_back_but_skips_torn_writes() {
+        let _sandbox = HomeSandbox::new();
+        seed("cdx-sync", "acct-sync");
+        let runtime = CodexRuntime::acquire("cdx-sync").expect("acquire");
+        let home = runtime.codex_home().to_path_buf();
+
+        // codex rotates its chain inside the isolated home…
+        let rotated = codex_auth("at-rotated", "acct-sync");
+        std::fs::write(home.join("auth.json"), &rotated).unwrap();
+        sync_codex_home_to_store("cdx-sync", &home).expect("sync");
+        assert_eq!(
+            crate::codex::read_profile_auth("cdx-sync")
+                .unwrap()
+                .as_deref(),
+            Some(&rotated[..]),
+            "rotation adopted back into the store"
+        );
+
+        // …a half-written file is left alone until it parses.
+        std::fs::write(home.join("auth.json"), b"{\"tokens\":{").unwrap();
+        sync_codex_home_to_store("cdx-sync", &home).expect("sync tolerates torn bytes");
+        assert_eq!(
+            crate::codex::read_profile_auth("cdx-sync")
+                .unwrap()
+                .as_deref(),
+            Some(&rotated[..]),
+            "torn bytes never reach the store"
+        );
+    }
+
+    #[test]
+    fn drop_runs_a_final_adopt_back_before_teardown() {
+        let _sandbox = HomeSandbox::new();
+        seed("cdx-final", "acct-final");
+        let runtime = CodexRuntime::acquire("cdx-final").expect("acquire");
+        let rotated = codex_auth("at-last-rotation", "acct-final");
+        std::fs::write(runtime.codex_home().join("auth.json"), &rotated).unwrap();
+        drop(runtime);
+        assert_eq!(
+            crate::codex::read_profile_auth("cdx-final")
+                .unwrap()
+                .as_deref(),
+            Some(&rotated[..]),
+            "the last rotation survives the teardown"
+        );
+    }
+
+    #[test]
+    fn sibling_acquire_never_reseeds_a_live_home() {
+        let _sandbox = HomeSandbox::new();
+        seed("cdx-sib", "acct-sib");
+        let first = CodexRuntime::acquire("cdx-sib").expect("first");
+        let rotated = codex_auth("at-rotated-live", "acct-sib");
+        std::fs::write(first.codex_home().join("auth.json"), &rotated).unwrap();
+
+        let second = CodexRuntime::acquire("cdx-sib").expect("sibling");
+        assert_eq!(
+            std::fs::read(second.codex_home().join("auth.json")).unwrap(),
+            rotated,
+            "a sibling shares the live tree — reseeding would roll the chain back"
+        );
+        drop(second);
+        assert!(
+            first.codex_home().join("auth.json").exists(),
+            "tree survives while a session remains"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn gc_adopts_back_then_removes_a_stranded_home() {
+        let _sandbox = HomeSandbox::new();
+        seed("cdx-crash", "acct-crash");
+        // Simulate a SIGKILLed session: tree exists, no live lease.
+        let home = codex_home_dir("cdx-crash").unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let stranded = codex_auth("at-stranded", "acct-crash");
+        std::fs::write(home.join("auth.json"), &stranded).unwrap();
+
+        gc_stale_runtimes();
+        assert_eq!(
+            crate::codex::read_profile_auth("cdx-crash")
+                .unwrap()
+                .as_deref(),
+            Some(&stranded[..]),
+            "gc adopts the stranded chain back before removing the tree"
+        );
+        assert!(home.symlink_metadata().is_err(), "stranded tree removed");
+    }
 }

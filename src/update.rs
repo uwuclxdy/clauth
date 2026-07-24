@@ -13,6 +13,16 @@ const API_URL: &str = "https://api.github.com/repos/uwuclxdy/clauth/releases/lat
 /// Env var: set to `1` to disable all background update work.
 const NO_UPDATE_ENV: &str = "CLAUTH_NO_UPDATE";
 
+/// This is the macOS fork (`xingfanxia/clauth`), which has **no release
+/// pipeline**. The upstream self-updater ([`API_URL`] → `download_and_replace`)
+/// would fetch `uwuclxdy/clauth`'s latest release — a newer version number
+/// (0.7.2 > this 0.7.1) built WITHOUT the daemon/keychain features — and
+/// self-replace this binary with it, silently deleting the whole fork. So the
+/// updater is disabled at the source: [`spawn`] returns `None` and
+/// [`should_self_replace`] is always `false`. Retargeting [`API_URL`] to the
+/// fork is deliberately NOT done — the fork ships no signed release assets.
+const FORK_BUILD: bool = true;
+
 /// Pinned minisign public key (base64 — the key line of `minisign.pub`, WITHOUT
 /// the `untrusted comment:` header). When set, every self-update verifies a
 /// detached minisign signature over `sha256sums.txt` against this key BEFORE
@@ -61,6 +71,10 @@ pub(crate) fn updates_enabled() -> bool {
 /// Spawn a background update check; applies if self-replaceable, toasts result.
 /// Returns a `JoinHandle` for clean shutdown, or `None` when updates are disabled.
 pub(crate) fn spawn(tx: Sender<UpdateEvent>) -> Option<JoinHandle<()>> {
+    // Fork builds have no release pipeline — never run the upstream self-updater.
+    if FORK_BUILD {
+        return None;
+    }
     if !updates_enabled() {
         return None;
     }
@@ -88,7 +102,10 @@ fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {
         let _ = tx.send(UpdateEvent::Available(version));
         return Ok(());
     };
-    if is_cargo_installed() {
+    // A fork build (no release pipeline) or a cargo install must never
+    // self-replace — notify only. Backstop; `spawn` already returns `None` for
+    // fork builds, so `try_update` isn't reached in production.
+    if !should_self_replace(is_cargo_installed()) {
         let _ = tx.send(UpdateEvent::Available(version));
         return Ok(());
     }
@@ -107,6 +124,14 @@ fn try_update(tx: &Sender<UpdateEvent>) -> anyhow::Result<()> {
     download_and_replace(&url, &sums_url, asset)?;
     let _ = tx.send(UpdateEvent::Installed(version));
     Ok(())
+}
+
+/// Whether this build may download-and-replace its own binary from a GitHub
+/// release. A **fork build** never may (no release pipeline — see [`FORK_BUILD`]);
+/// a **cargo install** never may (upgrade with `cargo install`). Pure so the
+/// contract is unit-testable without the network.
+fn should_self_replace(is_cargo_installed: bool) -> bool {
+    !FORK_BUILD && !is_cargo_installed
 }
 
 /// Build the `sha256sums.txt` URL from `asset_url` by replacing the asset filename.
@@ -202,6 +227,13 @@ fn verify_sums_signature(
 }
 
 fn make_agent() -> ureq::Agent {
+    // CAUTION if FORK_BUILD is ever flipped back on: in ureq 3
+    // `timeout_recv_response` keeps counting through the BODY read (pinned by
+    // the proxy's timeout-semantics tests) — 30 s over the multi-MB release
+    // binary aborts the download below ~340 KB/s. Dead code today (spawn()
+    // short-circuits on FORK_BUILD), but re-enabling self-update must size
+    // this for the full asset at worst-case throughput, or stream with the
+    // proxy's terminal-detection approach (timeout-sweep 2026-07-18).
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(5)))
         .timeout_recv_response(Some(Duration::from_secs(30)))

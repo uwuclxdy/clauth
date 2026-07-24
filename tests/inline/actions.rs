@@ -128,10 +128,10 @@ fn switch_replaces_active_account_mirror_without_refusing() {
 /// `switch_profile` to a name with no profile must bail BEFORE any side
 /// effect. Pre-fix the existence check lived in `finish_switch` — LAST in the
 /// sequence — so `force_link_profile_credentials` had already torn down the
-/// live `.credentials.json` for a ghost target (a profile deleted by
-/// `clauth delete` while a queued auto-switch — e.g. a daemon's pending
-/// switch — MCP switch, or CLI switch still held its name), destroying the
-/// live login even though the switch itself failed.
+/// live `.credentials.json` for a ghost target (a deleted profile still queued
+/// in a daemon's pending-switch), and a retry then misread the missing live
+/// file as "logged out", nulling the ACTIVE profile's stored credentials
+/// (2026-07-12 review, HIGH).
 #[test]
 fn switch_to_a_missing_profile_bails_before_touching_the_live_link() {
     let _home = HomeSandbox::new();
@@ -512,6 +512,155 @@ fn auto_switch_if_needed_keeps_a_scoped_blocked_sink_parked() {
 }
 
 #[test]
+fn reauth_capture_upserts_existing_profile_and_clears_broken_flag() {
+    // AUTH-3 reauth: `clauth login <existing>` captures fresh tokens INTO the existing
+    // profile. It must OVERWRITE (not append a duplicate — `config.add` upserts) and
+    // clear the auth-broken quarantine so the account is usable again.
+    let _home = HomeSandbox::new();
+
+    let oauth = |access: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let mut stale = Profile::new("xfx".to_string(), None, None);
+    stale.credentials = Some(oauth("stale-access"));
+    crate::profile::save_profile(&stale).expect("save profile");
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![stale],
+    };
+    config.state.profiles.push("xfx".into());
+    config.state.active_profile = Some("xfx".into());
+    config.set_auth_broken("xfx", true);
+    // Persist the active profile so the capture takes the RE-AUTH path (disk already
+    // has this profile active), which force-relinks the fresh creds live.
+    crate::profile::save_app_state(&config.state).expect("seed disk state");
+    assert!(config.is_auth_broken("xfx"), "precondition: quarantined");
+
+    capture_into_profile(
+        &mut config,
+        "xfx".to_string(),
+        CaptureSnapshot {
+            credentials: Some(oauth("fresh-access")),
+            base_url: None,
+            api_key: None,
+            identity: crate::actions::CaptureIdentity::LiveLogin,
+        },
+    )
+    .expect("re-auth capture");
+
+    // Upsert, not append: exactly one profile named xfx in BOTH lists.
+    assert_eq!(
+        config.profiles.iter().filter(|p| p.name == "xfx").count(),
+        1,
+        "no duplicate Profile after re-auth"
+    );
+    assert_eq!(
+        config
+            .state
+            .profiles
+            .iter()
+            .filter(|n| n.as_str() == "xfx")
+            .count(),
+        1,
+        "no duplicate name in state.profiles"
+    );
+    // Fresh creds landed, quarantine cleared.
+    let access = config
+        .profiles
+        .iter()
+        .find(|p| p.name == "xfx")
+        .and_then(|p| p.credentials.as_ref())
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+        .map(|o| o.access_token.as_str());
+    assert_eq!(access, Some("fresh-access"), "credentials overwritten");
+    assert!(
+        !config.is_auth_broken("xfx"),
+        "auth-broken quarantine cleared"
+    );
+}
+
+#[test]
+fn reauth_of_the_active_account_force_relinks_the_stale_mirror() {
+    // The bug behind "Not logged in · run /login" after a re-auth: `clauth login
+    // <active>` captured fresh tokens into the profile + file but NEVER re-linked the
+    // live credential (on macOS the Keychain), so a running `claude` kept reading the
+    // dead token. The live `.credentials.json` on macOS is a regular-FILE mirror that
+    // differs from the fresh tokens, so the non-force link would REFUSE — the fix
+    // force-relinks. (Keychain is disabled under test, so this asserts the file/symlink
+    // half; the macOS Keychain write rides the same `force_link_profile_credentials`.)
+    let _home = HomeSandbox::new();
+
+    let oauth = |access: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: access.to_string(),
+            refresh_token: Some(format!("{access}-refresh")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    // Active profile "xfx" whose STORED creds are already the fresh ones (capture will
+    // save fresh into the profile), but whose LIVE mirror is the OLD dead token.
+    let mut xfx = Profile::new("xfx".to_string(), None, None);
+    xfx.credentials = Some(oauth("old-dead"));
+    crate::profile::save_profile(&xfx).expect("save profile");
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![xfx],
+    };
+    config.state.profiles.push("xfx".into());
+    config.state.active_profile = Some("xfx".into());
+    crate::profile::save_app_state(&config.state).expect("seed disk state");
+
+    // The live file: a plain regular file holding the OLD token (what CC mirrored from
+    // the Keychain) — DIFFERENT from the fresh tokens capture is about to store.
+    let live = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+    std::fs::write(&live, serde_json::to_vec(&oauth("old-dead")).unwrap()).unwrap();
+
+    capture_into_profile(
+        &mut config,
+        "xfx".to_string(),
+        CaptureSnapshot {
+            credentials: Some(oauth("fresh-live")),
+            base_url: None,
+            api_key: None,
+            identity: crate::actions::CaptureIdentity::LiveLogin,
+        },
+    )
+    .expect("re-auth capture force-relinks even though the live mirror diverged");
+
+    // The live credential now resolves to xfx's FRESH stored creds — the force-relink
+    // replaced the stale mirror (a non-force link would have bailed "live file differs").
+    assert_eq!(
+        crate::claude::classify_credentials_link("xfx").expect("classify"),
+        crate::claude::LinkState::LinkedTo,
+        "the live credential is relinked to the re-authed profile",
+    );
+    let live_bytes = std::fs::read(&live).unwrap();
+    let live_creds: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&live_bytes).unwrap();
+    assert_eq!(
+        live_creds
+            .claude_ai_oauth
+            .map(|o| o.access_token)
+            .as_deref(),
+        Some("fresh-live"),
+        "the live login carries the fresh token, not the dead one",
+    );
+}
+
+#[test]
 fn edit_profile_env_persists_to_config_toml() {
     let _home = HomeSandbox::new();
     let mut config = acct_config();
@@ -639,6 +788,46 @@ fn validate_profile_name_accepts_email_rejects_path_chars() {
     }
 }
 
+/// Profiles named exactly after a `clauth` subcommand are permanently
+/// unreachable by `clauth <name>` (the subcommand dispatch shadows the switch),
+/// so creation refuses them — case-insensitively, since a `Daemon` profile
+/// would switch while `daemon` runs the daemon.
+#[test]
+fn validate_profile_name_rejects_reserved_subcommand_names() {
+    for name in [
+        "daemon",
+        "status",
+        "doctor",
+        "which",
+        "start",
+        "login",
+        "delete",
+        "resume",
+        "run",
+        "mcp",
+        "__complete",
+        "mcp-await-job",
+        "Daemon",
+        "STATUS",
+        "Doctor",
+    ] {
+        let err = validate_profile_name(name, &[], None)
+            .expect_err("reserved subcommand name must be refused");
+        assert!(
+            err.to_string().contains("reserved"),
+            "{name} rejected for the wrong reason: {err}"
+        );
+    }
+    // `completions` is NOT reserved — bare `clauth completions` falls through to
+    // a switch — and ordinary names still pass.
+    for name in ["completions", "work", "daemon-2", "my-daemon", "personal"] {
+        assert!(
+            validate_profile_name(name, &[], None).is_ok(),
+            "{name} wrongly rejected"
+        );
+    }
+}
+
 // ── capture-name collision overwrite (issue #7) ────────────────────────────
 
 /// Overwriting an existing profile on a capture-name collision must mutate it
@@ -709,7 +898,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         }),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        identity: crate::actions::CaptureIdentity::LiveLogin,
     };
 
     overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite in place");
@@ -899,7 +1088,12 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
         }),
         base_url: None,
         api_key: None,
-        account_uuid: account_uuid.map(str::to_string),
+        identity: account_uuid.map_or(crate::actions::CaptureIdentity::Unknown, |u| {
+            crate::actions::CaptureIdentity::Known(crate::usage::AccountIdentity {
+                uuid: u.to_string(),
+                email: None,
+            })
+        }),
     }
 }
 
@@ -944,23 +1138,26 @@ fn capture_into_profile_anchors_the_account_it_committed() {
 }
 
 #[test]
-fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
+fn a_snapshot_with_no_proven_identity_drops_the_stale_anchor() {
     let _home = HomeSandbox::new();
     let target = Profile::new("unproven".to_string(), None, None);
     save_profile(&target).expect("save target");
     let mut config = inactive_config(target);
     crate::usage::seed_login_anchor("unproven", Some("uuid-existing"));
 
-    // `capture_snapshot()` reads live creds off disk and proves no identity; a
-    // failed login probe reports none either. Neither may mint OR clear an anchor
-    // — a `None` stays the silent no-op it has always been.
+    // CAP-1/CAP-2: the anchor must move with the store. An overwrite whose
+    // identity is unproven may have swapped a DIFFERENT account onto the name;
+    // keeping the old anchor would let it vouch for credentials it may not
+    // match (the 2026-07-12 mis-routing). Refuse-and-heal: drop it and let the
+    // hourly `/profile` backfill re-seed the truth.
     overwrite_captured_profile(&mut config, "unproven", login_snapshot("new", None))
         .expect("overwrite in place");
 
     assert_eq!(
-        anchor_of("unproven").as_deref(),
-        Some("uuid-existing"),
-        "an unproven swap must not clear a live anchor"
+        anchor_of("unproven"),
+        None,
+        "an unproven swap drops the stale anchor rather than letting it vouch \
+         for credentials it may not match"
     );
 }
 
@@ -977,7 +1174,7 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
             credentials: None,
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("new-api-key".to_string()),
-            account_uuid: None,
+            identity: crate::actions::CaptureIdentity::Unknown,
         },
     )
     .expect("overwrite in place");
@@ -1076,7 +1273,7 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
         }),
         base_url: None,
         api_key: None,
-        account_uuid: None,
+        identity: crate::actions::CaptureIdentity::LiveLogin,
     };
     overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite");
 
@@ -1129,7 +1326,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         credentials: None,
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        identity: crate::actions::CaptureIdentity::LiveLogin,
     };
     overwrite_captured_profile(&mut config, "acme", snapshot).expect("overwrite active profile");
 
@@ -1847,7 +2044,7 @@ fn reauth_overwrite_clears_broken_flag() {
             credentials: Some(oauth_creds("fresh-access")),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            identity: crate::actions::CaptureIdentity::Unknown,
         },
     )
     .expect("re-auth overwrite");
@@ -1948,6 +2145,8 @@ mod identify_live_login_owner {
         std::fs::write(&live, serde_json::to_vec(c).expect("ser")).expect("write");
     }
 
+    /// Tier 1: exact token equality — the live file IS a profile's stored
+    /// credential (stale mirror / half-landed switch).
     fn home_claude_json() -> std::path::PathBuf {
         crate::profile::home_dir().unwrap().join(".claude.json")
     }
@@ -1986,6 +2185,37 @@ mod identify_live_login_owner {
         );
     }
 
+    /// Tier 2: Claude Code's own `~/.claude.json` identity record against a
+    /// profile's cached anchor — a CC re-login where every token is new.
+    #[test]
+    fn claude_json_uuid_matches_a_profile_anchor() {
+        let home = HomeSandbox::new();
+        let cfg = config_with(vec![
+            ("a", creds("at-a", "rt-a")),
+            ("b", creds("at-b", "rt-b")),
+        ]);
+        write_live(&creds("at-brand-new", "rt-brand-new"));
+        crate::profile_cache::write_profile_cache(
+            "b",
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &"uuid-b".to_string(),
+        );
+        std::fs::write(
+            home.home().join(".claude.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "oauthAccount": { "accountUuid": "uuid-b" }
+            }))
+            .expect("ser"),
+        )
+        .expect("write claude.json");
+        assert_eq!(
+            crate::actions::identify_live_login_owner(&cfg).as_deref(),
+            Some("b")
+        );
+    }
+
+    /// No token match and no uuid record → unknown; a blank anchor must
+    /// never match a blank uuid.
     /// No token match → unknown; a genuinely foreign account (no anchor on the
     /// live identity either) identifies nobody.
     #[test]
@@ -2099,4 +2329,283 @@ mod identify_live_login_owner {
             "an unparseable file caught mid-write by CC must be left untouched",
         );
     }
+}
+
+// ── CAP-1: sanctioned captures move the identity anchor with the store ───────
+
+mod capture_anchor_coherence {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile};
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
+    use crate::testutil::HomeSandbox;
+
+    fn creds(access: &str, refresh: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }
+    }
+
+    fn config_with_profile(name: &str) -> AppConfig {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(creds("old-access", "old-refresh"));
+        crate::profile::save_profile(&p).expect("save profile");
+        AppConfig {
+            state: AppState {
+                profiles: vec![p.name.clone()],
+                active_profile: Some(name.into()),
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        }
+    }
+
+    fn snapshot(c: ClaudeCredentials) -> crate::actions::CaptureSnapshot {
+        crate::actions::CaptureSnapshot {
+            credentials: Some(c),
+            base_url: None,
+            api_key: None,
+            identity: crate::actions::CaptureIdentity::LiveLogin,
+        }
+    }
+
+    /// A sanctioned overwrite may change which ACCOUNT the profile holds — the
+    /// anchor must follow the captured login (from CC's `~/.claude.json`
+    /// hint), never keep describing the pre-capture account. The stale-anchor
+    /// split-brain is how 'ax-backup' polled 'ax-main''s account on 2026-07-12.
+    #[test]
+    fn overwrite_capture_moves_the_identity_anchor() {
+        let _home = HomeSandbox::new();
+        let mut cfg = config_with_profile("p");
+        write_profile_cache("p", ACCOUNT_ID_CACHE_FILE, &"uuid-old".to_string());
+        std::fs::write(
+            crate::profile::home_dir()
+                .expect("home")
+                .join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"uuid-new","emailAddress":"new@example.com"}}"#,
+        )
+        .expect("write claude.json");
+
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            "p",
+            snapshot(creds("new-access", "new-refresh")),
+        )
+        .expect("overwrite");
+
+        let anchor: Option<String> = load_profile_cache("p", ACCOUNT_ID_CACHE_FILE);
+        assert_eq!(
+            anchor.as_deref(),
+            Some("uuid-new"),
+            "the anchor moves with the captured login",
+        );
+        let email: Option<String> =
+            load_profile_cache("p", crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE);
+        assert_eq!(
+            email.as_deref(),
+            Some("new@example.com"),
+            "the email half moves in lockstep with the uuid",
+        );
+    }
+
+    /// With no local identity hint the stale anchor is DROPPED, not kept: a
+    /// missing anchor makes the identity-guarded paths refuse (and the hourly
+    /// /profile fetch re-backfills it), while a wrong one re-routes them.
+    #[test]
+    fn overwrite_capture_drops_a_stale_anchor_without_hint() {
+        let _home = HomeSandbox::new();
+        let mut cfg = config_with_profile("p");
+        write_profile_cache("p", ACCOUNT_ID_CACHE_FILE, &"uuid-old".to_string());
+
+        crate::actions::overwrite_captured_profile(
+            &mut cfg,
+            "p",
+            snapshot(creds("new-access", "new-refresh")),
+        )
+        .expect("overwrite");
+
+        let anchor: Option<String> = load_profile_cache("p", ACCOUNT_ID_CACHE_FILE);
+        assert_eq!(anchor, None, "no hint → the stale anchor is dropped");
+    }
+
+    /// CAP-2 regression (2026-07-12 pollution): a browser-minted login KNOWS
+    /// its account (probed with the fresh token) — the capture must anchor to
+    /// THAT uuid even when CC's live hint names an unrelated account (whatever
+    /// login happened to be live during `clauth login <other>`).
+    #[test]
+    fn browser_mint_anchor_beats_the_live_hint() {
+        let _home = HomeSandbox::new();
+        let mut cfg = config_with_profile("p");
+        write_profile_cache("p", ACCOUNT_ID_CACHE_FILE, &"uuid-old".to_string());
+        // A live login for a DIFFERENT account exists — the trap.
+        std::fs::write(
+            crate::profile::home_dir()
+                .expect("home")
+                .join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"uuid-unrelated-live"}}"#,
+        )
+        .expect("write claude.json");
+
+        let mut snap = snapshot(creds("minted-access", "minted-refresh"));
+        snap.identity = crate::actions::CaptureIdentity::Known(crate::usage::AccountIdentity {
+            uuid: "uuid-probed".to_string(),
+            email: Some("probed@example.com".to_string()),
+        });
+        crate::actions::overwrite_captured_profile(&mut cfg, "p", snap).expect("overwrite");
+
+        let anchor: Option<String> = load_profile_cache("p", ACCOUNT_ID_CACHE_FILE);
+        assert_eq!(
+            anchor.as_deref(),
+            Some("uuid-probed"),
+            "the probed identity wins over the unrelated live hint",
+        );
+        let email: Option<String> =
+            load_profile_cache("p", crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE);
+        assert_eq!(
+            email.as_deref(),
+            Some("probed@example.com"),
+            "the probed email is anchored alongside the uuid",
+        );
+    }
+
+    /// CAP-2: an UNPROBED browser mint (TUI re-login flow) must not guess from
+    /// the live hint — the stale anchor is dropped and the usage fetcher's
+    /// backfill seeds the truth on first fetch.
+    #[test]
+    fn unprobed_mint_drops_the_anchor_despite_a_live_hint() {
+        let _home = HomeSandbox::new();
+        let mut cfg = config_with_profile("p");
+        write_profile_cache("p", ACCOUNT_ID_CACHE_FILE, &"uuid-old".to_string());
+        std::fs::write(
+            crate::profile::home_dir()
+                .expect("home")
+                .join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"uuid-unrelated-live"}}"#,
+        )
+        .expect("write claude.json");
+
+        let mut snap = snapshot(creds("minted-access", "minted-refresh"));
+        snap.identity = crate::actions::CaptureIdentity::Unknown;
+        crate::actions::overwrite_captured_profile(&mut cfg, "p", snap).expect("overwrite");
+
+        let anchor: Option<String> = load_profile_cache("p", ACCOUNT_ID_CACHE_FILE);
+        assert_eq!(
+            anchor, None,
+            "no probed identity → drop rather than mis-anchor from the live hint",
+        );
+    }
+
+    /// CAP-2: `capture_into_profile` (fresh profile) takes the probed identity
+    /// the same way — `clauth login <new-name>` anchors to the minted account.
+    #[test]
+    fn fresh_capture_anchors_to_the_probed_identity() {
+        let _home = HomeSandbox::new();
+        let mut cfg = AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        };
+        std::fs::write(
+            crate::profile::home_dir()
+                .expect("home")
+                .join(".claude.json"),
+            r#"{"oauthAccount":{"accountUuid":"uuid-unrelated-live"}}"#,
+        )
+        .expect("write claude.json");
+
+        let mut snap = snapshot(creds("minted-access", "minted-refresh"));
+        snap.identity = crate::actions::CaptureIdentity::Known(crate::usage::AccountIdentity {
+            uuid: "uuid-probed".to_string(),
+            email: Some("probed@example.com".to_string()),
+        });
+        crate::actions::capture_into_profile(&mut cfg, "fresh".to_string(), snap).expect("capture");
+
+        let anchor: Option<String> = load_profile_cache("fresh", ACCOUNT_ID_CACHE_FILE);
+        assert_eq!(anchor.as_deref(), Some("uuid-probed"));
+    }
+
+    /// CAP-3: `account_owner` names the sibling already holding an account —
+    /// by uuid (authoritative) or by cached email (case-insensitive fallback
+    /// for a profile whose uuid anchor hasn't backfilled) — and never names
+    /// the profile being (re-)logged-in itself.
+    #[test]
+    fn account_owner_names_the_sibling_holding_the_account() {
+        use crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE;
+        let _home = HomeSandbox::new();
+        let mut cfg = config_with_profile("a");
+        let mut b = Profile::new("b".to_string(), None, None);
+        b.credentials = Some(creds("b-access", "b-refresh"));
+        crate::profile::save_profile(&b).expect("save b");
+        cfg.profiles.push(b);
+        write_profile_cache("a", ACCOUNT_ID_CACHE_FILE, &"uuid-1".to_string());
+        write_profile_cache("a", ACCOUNT_EMAIL_CACHE_FILE, &"a@example.com".to_string());
+        // b has only the email half — the uuid anchor hasn't backfilled yet.
+        write_profile_cache("b", ACCOUNT_EMAIL_CACHE_FILE, &"b@example.com".to_string());
+
+        let id = |uuid: &str, email: Option<&str>| crate::usage::AccountIdentity {
+            uuid: uuid.to_string(),
+            email: email.map(str::to_string),
+        };
+        assert_eq!(
+            crate::actions::account_owner(&cfg, &id("uuid-1", Some("x@y")), "new"),
+            Some("a".to_string()),
+            "uuid match names the holder",
+        );
+        assert_eq!(
+            crate::actions::account_owner(&cfg, &id("uuid-9", Some("B@EXAMPLE.com")), "new"),
+            Some("b".to_string()),
+            "email-only match is case-insensitive",
+        );
+        assert_eq!(
+            crate::actions::account_owner(&cfg, &id("uuid-1", Some("a@example.com")), "a"),
+            None,
+            "re-logging the holder itself is a refresh, not a duplicate",
+        );
+        assert_eq!(
+            crate::actions::account_owner(&cfg, &id("uuid-9", Some("c@example.com")), "new"),
+            None,
+            "an unheld account is storable",
+        );
+        // Double-hold recovery: with BOTH profiles anomalously anchored to the
+        // same account, re-minting it for either one is a refresh — refusing
+        // would wedge the recovery in both directions (each names the other).
+        write_profile_cache("b", ACCOUNT_ID_CACHE_FILE, &"uuid-1".to_string());
+        assert_eq!(
+            crate::actions::account_owner(&cfg, &id("uuid-1", None), "a"),
+            None,
+            "refreshing one half of an existing double-hold is allowed",
+        );
+        assert_eq!(
+            crate::actions::account_owner(&cfg, &id("uuid-1", None), "new"),
+            Some("a".to_string()),
+            "a THIRD profile minting the doubled account is still refused",
+        );
+    }
+}
+
+// CDX-1 re-verify gap: the endpoint editor is a claude-shaped credential
+// writer too — it must refuse a codex target (writing base_url/api_key would
+// set `provider` and re-enter the excluded fetch legs).
+#[test]
+fn edit_profile_endpoint_refuses_a_codex_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut cdx = crate::testutil::blank_profile("cdx-a");
+    cdx.harness = crate::profile::Harness::Codex;
+    let mut cfg = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![cdx],
+    };
+    let err = edit_profile_endpoint(
+        &mut cfg,
+        "cdx-a",
+        Some("https://api.anthropic.com".into()),
+        Some("sk-claude".into()),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("codex profile"), "{err}");
+    let p = cfg.find("cdx-a").unwrap();
+    assert!(p.base_url.is_none() && p.api_key.is_none() && p.provider.is_none());
 }

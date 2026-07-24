@@ -84,6 +84,7 @@ impl Drop for TierSandbox {
 /// they assert on.
 pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
     crate::profile::Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -93,6 +94,7 @@ pub(crate) fn blank_profile(name: &str) -> crate::profile::Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -133,6 +135,34 @@ pub(crate) fn env_overrides(cmd: &Command) -> HashMap<String, Option<String>> {
             )
         })
         .collect()
+}
+
+/// Unpadded base64url encoder (test fixtures only) — the single home for the
+/// fake-JWT building the codex tests share, so the three test modules can't
+/// drift apart on the encoding.
+pub(crate) fn b64url_nopad(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let mut acc: u32 = 0;
+        for (i, &b) in chunk.iter().enumerate() {
+            acc |= (b as u32) << (16 - 8 * i);
+        }
+        for i in 0..(chunk.len() * 8).div_ceil(6) {
+            out.push(ALPHABET[((acc >> (18 - 6 * i)) & 0x3f) as usize] as char);
+        }
+    }
+    out
+}
+
+/// A fake, unsigned JWT carrying `claims` — NEVER a real token. Shape matches
+/// what `codex::auth::jwt_claims` decodes (header.payload.signature).
+pub(crate) fn fake_jwt(claims: &serde_json::Value) -> String {
+    format!(
+        "{}.{}.fake-sig",
+        b64url_nopad(br#"{"alg":"RS256","typ":"JWT"}"#),
+        b64url_nopad(claims.to_string().as_bytes())
+    )
 }
 
 /// Every path under `root` breaking the owner-only invariant clauth holds over

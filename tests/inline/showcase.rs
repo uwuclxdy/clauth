@@ -283,6 +283,7 @@ fn oauth_profile(
         })
         .collect();
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -292,6 +293,7 @@ fn oauth_profile(
         fallback_threshold,
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -309,6 +311,7 @@ fn oauth_profile(
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
+            codex_rate_limit_reached: None,
         }),
         fetch_status,
         provider: None,
@@ -318,6 +321,7 @@ fn oauth_profile(
 
 fn api_profile(name: &str) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some(
@@ -329,6 +333,7 @@ fn api_profile(name: &str) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
@@ -344,6 +349,7 @@ fn api_profile(name: &str) -> Profile {
 
 fn failed_profile(name: &str) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -353,6 +359,7 @@ fn failed_profile(name: &str) -> Profile {
         fallback_threshold: Some(90.0),
         weekly_threshold: None,
         last_resort: false,
+        session_feed: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,

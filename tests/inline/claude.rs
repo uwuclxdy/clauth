@@ -1410,3 +1410,534 @@ fn a_clauth_symlink_under_a_flipped_install_source_is_not_unsaved() {
         "a dangling clauth symlink is a store slot, not an unsaved login"
     );
 }
+
+// ── Fork-only: CAP-1 identity capture, RESCUE write-back, CLA-FEED ──────────
+
+/// A live login belonging to a different account (Diverged) is never captured
+/// by the unattended snapshot — the outgoing profile keeps its own chain. This
+/// is the incident shape of 2026-07-12: a running claude wrote a sibling's
+/// rotated pair into the live mirror, and the capture window between classify
+/// and write copied it into the wrong profile's store.
+#[cfg(unix)]
+#[test]
+fn snapshot_never_captures_a_foreign_live_login() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "active",
+        creds("own-access", Some("own-refresh")),
+        creds("foreign-access", Some("foreign-refresh")),
+    );
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("stored parse");
+    assert_eq!(
+        stored.access_token(),
+        Some("own-access"),
+        "a diverged live login must never overwrite the stored identity",
+    );
+}
+
+/// Equal access token ⇒ same rotation state: the snapshot refreshes the store
+/// with exactly the bytes it examined (CC rewrites the mirror with identical
+/// tokens but sometimes fresher metadata, e.g. `subscription_type`).
+#[cfg(unix)]
+#[test]
+fn snapshot_refreshes_the_store_when_live_token_matches() {
+    let _home = HomeSandbox::new();
+    let mut live = creds("same-access", Some("same-refresh"));
+    live.claude_ai_oauth
+        .as_mut()
+        .expect("oauth")
+        .subscription_type = Some("max".into());
+    let mut config =
+        seed_relogin_scenario("active", creds("same-access", Some("same-refresh")), live);
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("stored parse");
+    assert_eq!(
+        stored
+            .claude_ai_oauth
+            .as_ref()
+            .and_then(|o| o.subscription_type.as_deref()),
+        Some("max"),
+        "an equal-token live snapshot carries the live metadata into the store",
+    );
+}
+
+/// A completed first login adopts the bytes the check saw AND anchors the
+/// profile's identity to the login just captured (from CC's own
+/// `~/.claude.json` hint), so the identity-guarded adopt/follow paths can
+/// vouch for the profile immediately.
+#[cfg(unix)]
+#[test]
+fn first_login_adopt_anchors_the_profile() {
+    let _home = HomeSandbox::new();
+    let home = crate::profile::home_dir().expect("home");
+    std::fs::write(
+        home.join(".claude.json"),
+        r#"{"oauthAccount":{"accountUuid":"uuid-first-login"}}"#,
+    )
+    .expect("write claude.json");
+
+    let live_path = claude_credentials_path().expect("creds path");
+    std::fs::create_dir_all(live_path.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(&creds("fresh-access", Some("fresh-refresh"))).expect("ser"),
+    )
+    .expect("write live");
+
+    let profile = crate::profile::Profile::new("newbie".to_string(), None, None);
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.active_profile = Some("newbie".into());
+    config.state.profiles = vec!["newbie".into()];
+
+    snapshot_active_credentials(&mut config).expect("snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("newbie")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("stored parse");
+    assert_eq!(stored.access_token(), Some("fresh-access"));
+    let anchor: Option<String> = crate::profile_cache::load_profile_cache(
+        "newbie",
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+    );
+    assert_eq!(
+        anchor.as_deref(),
+        Some("uuid-first-login"),
+        "the adopt anchors the profile to the captured login's identity",
+    );
+}
+
+// ── RESCUE-2c: write_live_oauth_pair's in-lock supersede guards ───────────────
+
+fn rotated_pair() -> crate::oauth::TokenResponse {
+    crate::oauth::TokenResponse {
+        access_token: "at-rotated".to_string(),
+        refresh_token: "rt-rotated".to_string(),
+        expires_in: 28_800,
+        scope: None,
+    }
+}
+
+/// A fresh CC login landing between the caller's judgment and the write-back
+/// must survive: the stale expected-fingerprint makes the write a benign
+/// `Superseded` no-op instead of clobbering the fresh login.
+#[cfg(unix)]
+#[test]
+fn write_back_supersedes_when_the_live_fingerprint_moved() {
+    let _home = HomeSandbox::new();
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("at-corpse", Some("rt-corpse"))).expect("ser"),
+    )
+    .expect("write corpse");
+    let corpse_fingerprint = live_credentials_fingerprint();
+
+    // A fresh login lands before the write-back.
+    fs::write(
+        &live,
+        serde_json::to_vec(&creds("at-fresh", Some("rt-fresh"))).expect("ser"),
+    )
+    .expect("write fresh");
+
+    let outcome = write_live_oauth_pair(&rotated_pair(), corpse_fingerprint).expect("write back");
+    assert_eq!(outcome, LiveWriteBack::Superseded);
+    let survived: ClaudeCredentials = crate::profile::read_json_file(&live).expect("read");
+    assert_eq!(
+        survived.access_token(),
+        Some("at-fresh"),
+        "the freshly landed login must never be clobbered"
+    );
+}
+
+/// A profile's own store taking the slot (symlink) mid-rescue is the same
+/// benign supersede — NOT an error (the old behavior surfaced it as a scary
+/// "its chain is lost; re-login" message for what loses nothing).
+#[cfg(unix)]
+#[test]
+fn write_back_supersedes_when_the_live_path_became_a_symlink() {
+    let _home = HomeSandbox::new();
+    let mut _config = seed_relogin_scenario(
+        "active",
+        creds("stored-access", Some("stored-refresh")),
+        creds("relogin-access", Some("relogin-refresh")),
+    );
+    let fingerprint = live_credentials_fingerprint();
+    force_link_profile_credentials("active").expect("relink");
+
+    let outcome = write_live_oauth_pair(&rotated_pair(), fingerprint).expect("write back");
+    assert_eq!(outcome, LiveWriteBack::Superseded);
+    assert_eq!(
+        classify_credentials_link("active").expect("classify"),
+        LinkState::LinkedTo,
+        "the profile's symlink is left untouched"
+    );
+    // The profile's stored chain was not corrupted by the unowned pair.
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("active")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(stored.access_token(), Some("stored-access"));
+}
+
+/// The happy path still writes surgically: tokens + expiry replaced, every
+/// foreign top-level key (mcpOAuth) preserved.
+#[cfg(unix)]
+#[test]
+fn write_back_writes_in_place_and_preserves_foreign_keys() {
+    let _home = HomeSandbox::new();
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+    fs::write(
+        &live,
+        serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": { "accessToken": "at-corpse", "refreshToken": "rt-corpse" },
+            "mcpOAuth": { "some-server": { "accessToken": "mcp-tok" } },
+        }))
+        .expect("ser"),
+    )
+    .expect("write corpse");
+    let fingerprint = live_credentials_fingerprint();
+
+    let outcome = write_live_oauth_pair(&rotated_pair(), fingerprint).expect("write back");
+    assert_eq!(outcome, LiveWriteBack::Written);
+    let root: serde_json::Value = crate::profile::read_json_file(&live).expect("read");
+    assert_eq!(root["claudeAiOauth"]["accessToken"], "at-rotated");
+    assert_eq!(root["claudeAiOauth"]["refreshToken"], "rt-rotated");
+    assert_eq!(
+        root["mcpOAuth"]["some-server"]["accessToken"], "mcp-tok",
+        "foreign top-level keys must survive the surgical write"
+    );
+}
+
+/// RESCUE-2 archive retention: the quarantine keeps the newest 20 copies and
+/// prunes older ones; same-millisecond archives never overwrite each other
+/// (the per-process sequence uniquifies names).
+#[cfg(unix)]
+#[test]
+fn quarantine_archive_prunes_to_the_newest_twenty() {
+    let _home = HomeSandbox::new();
+    let live = crate::profile::claude_dir()
+        .expect("dir")
+        .join(".credentials.json");
+    fs::create_dir_all(live.parent().expect("parent")).expect("mkdir");
+
+    for i in 0..25 {
+        fs::write(
+            &live,
+            serde_json::to_vec(&creds(&format!("at-foreign-{i:02}"), Some("rt"))).expect("ser"),
+        )
+        .expect("write live");
+        archive_live_credentials("victim").expect("archive");
+    }
+
+    let dir = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("quarantine");
+    let mut archived: Vec<_> = fs::read_dir(&dir)
+        .expect("read quarantine")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    archived.sort();
+    assert_eq!(archived.len(), 20, "retention keeps exactly the newest 20");
+    let newest = fs::read_to_string(archived.last().expect("newest")).expect("read newest");
+    assert!(
+        newest.contains("at-foreign-24"),
+        "the newest archive holds the last-archived login"
+    );
+    let oldest = fs::read_to_string(archived.first().expect("oldest")).expect("read oldest");
+    assert!(
+        oldest.contains("at-foreign-05"),
+        "pruning removed the five oldest archives"
+    );
+}
+
+// ── apiKeyHelper for api-key profiles ─────────────────────────────────────────
+//
+// `build_claude_settings_json` swaps `env.ANTHROPIC_AUTH_TOKEN` for CC's
+// top-level `apiKeyHelper` when a profile carries an api_key, so the raw key
+// leaves the settings.json `env` block and the spawned CC process's env. CC
+// runs the helper per request and sends its stdout as both `X-Api-Key` and
+// `Authorization: Bearer` (see `docs/internals.md`).
+
+/// The FORCE path is guarded too: a session-side re-login left a rotating
+/// pair in the live slot and the operator confirmed Overwrite (or the CLI
+/// reconciled switch fired). For a session-token profile that capture must be
+/// a no-op — the confirmed Overwrite must not be the one path that can
+/// destroy the clauth-private usage pair.
+#[test]
+fn force_snapshot_never_clobbers_a_session_token_profiles_usage_pair() {
+    let _home = HomeSandbox::new();
+    let mut config = seed_relogin_scenario(
+        "split",
+        creds("usage-access", Some("usage-refresh")),
+        creds("relogin-access", Some("relogin-refresh")),
+    );
+    fill_session_token_by_hand("split", "oat-access");
+
+    force_snapshot_active_credentials(&mut config).expect("force snapshot");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(
+        &crate::profile::profile_dir("split")
+            .expect("dir")
+            .join("credentials.json"),
+    )
+    .expect("read stored");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("usage-refresh"),
+        "the confirmed Overwrite must leave the usage OAuth pair untouched",
+    );
+    assert_eq!(
+        config
+            .find("split")
+            .and_then(|p| p.credentials.as_ref())
+            .and_then(|c| c.refresh_token()),
+        Some("usage-refresh"),
+        "the in-memory store must keep the usage pair too",
+    );
+}
+
+/// The fed sidecar carries the chain's access token, real expiry, scopes, and
+/// subscriptionType — and NEVER a refresh token, so the classifier stays
+/// LongLived and every split guard keeps working unmodified.
+#[test]
+fn feed_session_token_writes_a_refreshless_long_lived_shape() {
+    let _home = HomeSandbox::new();
+    let name = "feed-shape";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let exp = crate::usage::now_ms() as i64 + 8 * 3_600_000;
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-chain".to_string(),
+            refresh_token: Some("rt-chain".to_string()),
+            expires_at: Some(exp),
+            scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let status = session_token_status(name).expect("sidecar");
+    assert_eq!(status, SessionTokenStatus::LongLived(Some(exp)));
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    let oauth = creds.claude_ai_oauth.expect("oauth");
+    assert_eq!(oauth.access_token, "at-chain");
+    assert!(
+        oauth.refresh_token.is_none(),
+        "the pair never reaches the sidecar"
+    );
+    assert_eq!(oauth.subscription_type.as_deref(), Some("max"));
+    assert_eq!(
+        oauth.scopes.as_deref(),
+        Some(&["user:profile".to_string(), "user:inference".to_string()][..])
+    );
+}
+
+/// First feed preserves a genuine mint exactly once; later feeds leave the
+/// backup alone, and a fed (hours-horizon) sidecar is never mistaken for one.
+#[test]
+fn first_feed_preserves_the_mint_once_and_only_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-preserve";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let fed = |token: &str| OAuthToken {
+        access_token: token.to_string(),
+        refresh_token: None,
+        expires_at: Some(now + 8 * 3_600_000),
+        scopes: None,
+        subscription_type: Some("max".into()),
+    };
+    feed_session_token(name, &fed("at-1")).expect("feed 1");
+    feed_session_token(name, &fed("at-2")).expect("feed 2");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(dir.join("session-token.static.json")).expect("backup exists"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-genuine-mint-value-1234567890"),
+        "the backup is the ORIGINAL mint, not a fed value"
+    );
+
+    // A fed sidecar with the backup consumed is never re-preserved as a mint
+    // (subscriptionType + hours horizon both disqualify it).
+    std::fs::remove_file(dir.join("session-token.static.json")).expect("consume");
+    feed_session_token(name, &fed("at-3")).expect("feed 3");
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "a fed value must never become the degrade fallback"
+    );
+}
+
+/// Restore round-trip: the mint comes back byte-identical, the backup is
+/// consumed, and a second restore is a no-op `false`.
+#[test]
+fn restore_static_mint_round_trip() {
+    let _home = HomeSandbox::new();
+    let name = "feed-restore";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    assert!(restore_static_mint(name).expect("restore"));
+    assert_eq!(
+        std::fs::read(dir.join("session-token.json")).expect("sidecar"),
+        mint_bytes,
+        "mint restored byte-identical"
+    );
+    assert!(
+        !restore_static_mint(name).expect("second restore"),
+        "backup consumed"
+    );
+}
+
+/// `write_session_token_with_backup` stamps the fresh mint into the sidecar
+/// AND the degrade backup from the same bytes (one flock section — the
+/// re-mint-on-a-feed-profile path, immune to a concurrent rotation feed
+/// landing between a write and a read-back).
+#[test]
+fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-remint";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint 1");
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint 1");
+    write_session_token_with_backup(name, "sk-ant-oat01-fresher-mint-value-0987654321", now)
+        .expect("re-mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let sidecar = std::fs::read(dir.join("session-token.json")).expect("sidecar");
+    let backup = std::fs::read(dir.join("session-token.static.json")).expect("backup");
+    assert_eq!(sidecar, backup, "one mint, two byte-identical copies");
+    let parsed: ClaudeCredentials = serde_json::from_slice(&backup).expect("parse");
+    assert_eq!(
+        parsed.access_token(),
+        Some("sk-ant-oat01-fresher-mint-value-0987654321"),
+        "the FRESH mint is the degrade fallback now"
+    );
+}
+
+/// A feed profile's mis-filled sidecar heals when a backup exists: evidence
+/// lands in quarantine, the mint comes back, the backup is consumed. Without
+/// a backup nothing is touched (`Ok(false)` — the disengaged-vanilla posture).
+#[test]
+fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "feed-heal";
+    std::fs::create_dir_all(crate::profile::profile_dir(name).expect("dir")).expect("mkdir");
+    let now = crate::usage::now_ms() as i64;
+    write_session_token(name, "sk-ant-oat01-genuine-mint-value-1234567890", now).expect("mint");
+    let dir = crate::profile::profile_dir(name).expect("dir");
+    let mint_bytes = std::fs::read(dir.join("session-token.json")).expect("mint bytes");
+    feed_session_token(
+        name,
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(now + 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint");
+    // Something scribbles a rotating pair into the sidecar (the mis-fill).
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill", Some("rt-misfill"))).expect("ser"),
+    )
+    .expect("misfill");
+    assert!(heal_misfilled_sidecar(name).expect("heal"));
+    assert_eq!(
+        std::fs::read(dir.join("session-token.json")).expect("sidecar"),
+        mint_bytes,
+        "mint restored"
+    );
+    assert!(
+        !dir.join("session-token.static.json").exists(),
+        "backup consumed"
+    );
+    let quarantine = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("quarantine");
+    let quarantined = std::fs::read_dir(&quarantine)
+        .expect("quarantine dir")
+        .filter_map(|e| e.ok())
+        .any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(&format!("{name}.session-token.json"))
+        });
+    assert!(quarantined, "mis-fill evidence preserved in quarantine");
+
+    // Second mis-fill, no backup left: nothing healed, nothing touched.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&creds("at-misfill-2", Some("rt-misfill-2"))).expect("ser"),
+    )
+    .expect("misfill 2");
+    assert!(!heal_misfilled_sidecar(name).expect("no-backup heal"));
+    assert!(
+        matches!(
+            session_token_status(name),
+            Some(SessionTokenStatus::NotLongLived)
+        ),
+        "mis-fill left in place without a backup"
+    );
+}

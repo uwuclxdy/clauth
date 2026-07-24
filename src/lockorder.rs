@@ -148,6 +148,10 @@ pub(crate) mod rank {
         /// `tick`/`fetch_third_party_due`, never under another lock.
         SuppressedGeneric = 1300;
         PendingSwitch = 1500;
+        /// Fallback-config edits queued by the daemon control socket for the main
+        /// loop to apply. Leaf — the socket pushes standalone; the main loop
+        /// drains into a `Vec` and releases before taking `config`.
+        PendingConfigOps = 1600;
         PendingSwitchOff = 1700;
     }
 }

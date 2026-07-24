@@ -20,6 +20,46 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         &["auto_switch", "snapshot_chain", "resolves_started_profile"],
     ),
     (
+        "Codex accounts too (CDX-1)",
+        &[
+            "capture_creates_an_active_codex_profile",
+            "switch_installs_the_target_chain",
+            "switch_adopts_back_a_rotated_outgoing_chain",
+            "switch_over_a_foreign_login_refuses_or_archives_by_policy",
+            "codex_follow_adopts_a_rotated_live_chain",
+            "codex_profiles_are_excluded_from_both_fetch_legs",
+            "cross_harness_switches_are_refused",
+            "login_codex_flag_and_its_browser_modifier",
+            "tui_switch_dispatches_codex_targets_to_the_codex_slot",
+            "build_status_publishes_codex_fields",
+        ],
+    ),
+    (
+        "Codex, the rest of the ladder (CDX-3/1b/4/5)",
+        &[
+            // CDX-3 standby refresh + PKCE login
+            "refresh_failure_truth_table",
+            "apply_refresh_overwrites_only_present_fields_and_stamps_last_refresh",
+            "codex_standby_tick_refreshes_a_due_parked_profile",
+            "codex_standby_tick_never_spends_the_live_owner_chain",
+            "build_auth_json_writes_the_codex_shape_with_explicit_auth_mode",
+            "browser_login_store_never_touches_live_or_the_active_slot",
+            // CDX-1b isolated start
+            "acquire_builds_the_isolated_home_and_holds_a_lease",
+            "acquire_refuses_the_live_owner_and_loginless_profiles",
+            // CDX-4 codex chain + per-harness independence
+            "codex_walk_fires_only_on_an_exhausted_active",
+            "codex_limiter_verdict_drives_the_switch_and_clears_on_reset",
+            "membership_edits_route_by_harness",
+            "pending_switch_gates_are_harness_scoped",
+            "scan_codex_auto_switch_enqueues_past_a_pending_claude_entry",
+            // CDX-5 injection proxy
+            "e2e_injects_identity_and_relays_the_sse_response",
+            "e2e_429_rotates_to_the_next_account_and_replays",
+            "codex_passive_tick_stands_down_while_the_proxy_is_active",
+        ],
+    ),
+    (
         "Log in an account",
         &[
             "authorize_url",
@@ -38,6 +78,9 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "live_session_excluded",
             "force_true_bypasses",
             "rotation_guard_is_independent",
+            // AUTH-3: a dead refresh token flags auth_broken; a transient one doesn't.
+            "dead_refresh_token_is_terminal",
+            "transient_refresh_failure_is_not_terminal",
         ],
     ),
     (
@@ -75,6 +118,14 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         "Headless daemon + status feed",
         &[
             "build_status",
+            "switch_valid_profile",
+            "snapshot_reply_is_one_line",
+            // fallback configuration over the socket (CBAR-2)
+            "fallback_add_remove",
+            "set_threshold_validates",
+            "add_appends",
+            "set_wrap_off_toggles",
+            // Daemon::tick loop body characterization (TECH-5)
             "tick_with_empty_queues",
             "drain_pending_switch_executes",
             "drain_pending_switch_skips",

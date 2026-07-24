@@ -13,8 +13,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -22,8 +22,8 @@ use anyhow::Result;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
-    CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
-    clear_profile_api_key, clear_profile_credentials, create_blank_profile,
+    CaptureIdentity, CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot,
+    classify_env_key, clear_profile_api_key, clear_profile_credentials, create_blank_profile,
     create_profile_from_login, delete_profile, edit_profile_endpoint, edit_profile_env,
     edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
     reorder_profile, switch_off, switch_profile, validate_profile_name,
@@ -261,8 +261,9 @@ impl ConfigRow {
 pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opusplan"];
 
 /// The weekly-line preset ladder: one source for the Config row's segmented
-/// control AND `step_weekly_threshold`'s cycle. 100 reproduces the old
-/// hard-cap behavior (switch only once the API already refuses).
+/// control (`render/global_config.rs`) AND `step_weekly_threshold`'s cycle. 100
+/// reproduces the old hard-cap behavior (switch only once the API already
+/// refuses).
 pub(crate) const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
 
 /// Presets for the burn-aware early-switch floor (percent). The projection may
@@ -1342,13 +1343,13 @@ pub(crate) struct App {
     /// `Some` while the threshold field is open (⏎ opens, owns keyboard).
     /// `+`/`-` still step the value when `None`.
     pub(crate) fallback_threshold_draft: Option<InputState>,
-    /// In-flight value for the member's `max auto-spend` field (`None` = not
-    /// editing). Same lifecycle as `fallback_threshold_draft`.
-    pub(crate) fallback_max_spend_draft: Option<InputState>,
     /// The `weekly at` override editor's buffer, or None (not editing). Same
     /// lifecycle as `fallback_threshold_draft`; an EMPTY commit clears the
     /// member's override.
     pub(crate) fallback_weekly_draft: Option<InputState>,
+    /// In-flight value for the member's `max auto-spend` field (`None` = not
+    /// editing). Same lifecycle as `fallback_threshold_draft`.
+    pub(crate) fallback_max_spend_draft: Option<InputState>,
     /// Cursor into [`GLOBAL_CONFIG_ROWS`] on the program-wide Config tab.
     pub(crate) global_config_cursor: usize,
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
@@ -1491,6 +1492,14 @@ pub(crate) struct App {
     /// Used to detect fresh fetches and append history JSONL lines.
     pub(crate) last_history_usage: HashMap<String, UsageInfo>,
 
+    /// Account-email cache for the overview column: `(tick stamp, email by
+    /// profile name)`. Reloaded from the per-profile anchor caches at most
+    /// every ~2s by `render::overview` — bounds the overview's disk IO to
+    /// zero between reloads instead of one read per OAuth profile per frame.
+    /// `None` until the first overview draw. Own mutex, never held across
+    /// another lock (the reloader snapshots names first, reads disk, then
+    /// stores).
+    pub(crate) overview_emails: Mutex<Option<EmailsByName>>,
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
     /// marker + the type tag, so it needn't stat each `session-token.json` per
@@ -1511,6 +1520,10 @@ fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::Se
         .filter_map(|n| crate::claude::session_token_status(n).map(|s| (n.clone(), s)))
         .collect()
 }
+
+/// `(tick stamp, cached account email per profile name)` — see
+/// [`App::overview_emails`].
+pub(crate) type EmailsByName = (u64, HashMap<String, Option<String>>);
 
 /// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
 /// safe to construct while holding any lock.
@@ -1574,7 +1587,7 @@ impl App {
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
         let poll_streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
-        let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(VecDeque::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
         let third_party_tokens: ThirdPartyList = Arc::new(RankedMutex::new(
@@ -1698,8 +1711,8 @@ impl App {
             fallback_detail_cursor: 0,
             fallback_armed_remove: false,
             fallback_threshold_draft: None,
-            fallback_max_spend_draft: None,
             fallback_weekly_draft: None,
+            fallback_max_spend_draft: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
             weekly_threshold_draft: None,
@@ -1755,6 +1768,7 @@ impl App {
             history_cache,
             history_mtimes,
             last_history_usage: HashMap::new(),
+            overview_emails: Mutex::new(None),
             session_tokens,
         }
     }
@@ -1946,6 +1960,13 @@ impl App {
     }
 
     /// Bundle scheduler `Arc`s and launch the background refresher.
+    ///
+    /// Daemon coordination (R3): the refresher is spawned unconditionally but
+    /// probes for a live daemon every tick (`standdown_probe`) and stands down
+    /// while one runs — rendering from the daemon's on-disk caches instead of
+    /// double-fetching / double-rotating / re-deciding its switches — then
+    /// re-arms within a tick of the daemon dying. Spawn-time detection alone
+    /// would miss a daemon started or stopped mid-session.
     fn start_scheduler(&self) {
         let h = WorkerHandles::from_app(self);
         // Session-scoped suppressed-generic set: rebuilt fresh each TUI launch,
@@ -2398,6 +2419,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         && app.fallback_threshold_draft.is_some()
     {
         handle_fallback_threshold_edit_key(app, key);
+        return;
+    }
+
+    // Same for the per-member `weekly at` override editor.
+    if app.tab == Tab::Fallback
+        && app.fallback_focus == FallbackFocus::Detail
+        && app.fallback_weekly_draft.is_some()
+    {
+        handle_fallback_weekly_edit_key(app, key);
         return;
     }
 
@@ -3318,10 +3348,17 @@ fn request_switch_to(app: &mut App, idx: usize) {
         return;
     };
     let name = profile.name.to_string();
+    // Per-slot no-op check: a codex profile is "already active" against the
+    // codex slot, never the claude one (CDX-1 T8).
+    let already_active = if profile.is_codex() {
+        cfg.is_active_codex(&name)
+    } else {
+        cfg.is_active(&name)
+    };
     // `switch_profile` already refuses a disabled target (shared guard), but a
     // disabled row must never even offer the confirm — never selectable, not
     // just never landed.
-    if cfg.is_active(&name) || profile.is_disabled() {
+    if already_active || profile.is_disabled() {
         return;
     }
     drop(cfg);
@@ -3381,12 +3418,47 @@ pub(crate) struct SwitchGateResult {
 /// `claude` refreshing through the symlink — the same exemption as the
 /// CLI/MCP paths.
 fn perform_switch(app: &mut App, name: &str) {
+    // CDX-1 T8: a codex target takes the codex path — no AUTH-1 OAuth gate
+    // (nothing to refresh over HTTP), no claude divergence machinery.
+    if app.config().find(name).is_some_and(|p| p.is_codex()) {
+        perform_codex_switch(app, name);
+        return;
+    }
     let active = app.config().state.active_profile.clone();
     if active.as_deref() == Some(name) {
         finalize_switch(app, name);
         return;
     }
     spawn_switch_gate(app, name.to_string(), oauth::refresh_result);
+}
+
+/// Complete a codex switch on the UI thread (CDX-1 T8). Local file work only —
+/// no HTTP. The confirmed Enter IS the operator decision, so a foreign live
+/// login is archived to quarantine (RESCUE-2 / User-origin semantics), never a
+/// silent refusal.
+fn perform_codex_switch(app: &mut App, name: &str) {
+    let result = {
+        let mut cfg = app.config();
+        crate::actions::codex_switch_profile(
+            &mut cfg,
+            name,
+            crate::actions::ForeignLivePolicy::Archive,
+        )
+    };
+    match result {
+        Ok(report) => {
+            app.last_reload_fp = reload_fingerprint();
+            let mut msg = format!("codex now uses '{name}'");
+            if report.adopted_back.is_some() {
+                msg.push_str("\n(refreshed live login adopted back first)");
+            }
+            if report.archived.is_some() {
+                msg.push_str("\n(unrecognized live login archived to quarantine)");
+            }
+            app.toast(ToastKind::Success, msg);
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("codex switch failed\n{e}")),
+    }
 }
 
 /// Run `ensure_installable` for `name` off the UI thread and post the answer
@@ -3417,7 +3489,12 @@ where
 
 /// True when the live credentials diverge from the stored chain and it's not a
 /// first-login adoption (must be reconciled before clearing/relinking). A
-/// logged-out shell is exempt — an empty login needs no reconciling.
+/// logged-out shell is exempt — an empty login needs no reconciling. A
+/// clauth-owned symlink is exempt too — its content is a profile store by
+/// construction, nothing unsaved to reconcile (CLA-SPLIT-3: a repaired
+/// sidecar flips the install source under a live link; prompting on that
+/// stale link wedged switches, daemon parity in
+/// `daemon::active_diverged_unsaved`).
 fn active_diverged_unsaved(active: &str) -> bool {
     crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
@@ -3452,6 +3529,20 @@ fn open_divergence_modal(app: &mut App, active: &str) {
 /// already answered (or the target is the already-active exemption) by the
 /// time this runs.
 fn finalize_switch(app: &mut App, name: &str) {
+    // AUTH-1 (Incident C) parity with the CLI/noninteractive gates: a
+    // quarantined target's dead token must never land in the Keychain (it
+    // would log out every running `claude`). Flag-only — no HTTP on the UI
+    // thread; the flag is set/cleared by the poller and every refresh site,
+    // so it is current within one tick. A flagged-but-actually-healthy
+    // account clears itself on its next successful refresh.
+    if app.config().is_auth_broken(name) {
+        clear_activity(&app.activity, name);
+        app.toast(
+            ToastKind::Danger,
+            format!("login for '{name}' has expired — run: clauth login {name}"),
+        );
+        return;
+    }
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
@@ -3796,6 +3887,9 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             }
             if app.fallback_threshold_draft.is_some() {
                 return FallbackHint::DetailThresholdEdit;
+            }
+            if app.fallback_weekly_draft.is_some() {
+                return FallbackHint::DetailWeeklyAtEdit;
             }
             if app.fallback_max_spend_draft.is_some() {
                 return FallbackHint::DetailMaxSpendEdit;
@@ -4155,8 +4249,8 @@ pub(crate) fn parse_refresh_secs(raw: &str) -> Option<u64> {
 
 /// Step the weekly exhaustion line forward through the preset ladder (space on
 /// the Config row), wrapping past the top back to the first — the same
-/// segmented-control grammar as the refresh row. Presets mirror
-/// `WEEKLY_PRESETS` in `render/global_config.rs`.
+/// segmented-control grammar as the refresh row. Cycles the shared
+/// [`WEEKLY_PRESETS`] ladder (also drawn by `render/global_config.rs`).
 fn step_weekly_threshold(app: &mut App) {
     let current = app.config().state.weekly_switch_threshold_pct();
     let next = WEEKLY_PRESETS
@@ -4166,8 +4260,7 @@ fn step_weekly_threshold(app: &mut App) {
         .unwrap_or(WEEKLY_PRESETS[0]);
     {
         let mut cfg = app.config();
-        cfg.state.weekly_switch_threshold = Some(next);
-        let _ = save_app_state(&cfg.state);
+        let _ = crate::fallback_config::set_weekly_threshold(&mut cfg, next);
     }
     app.last_reload_fp = reload_fingerprint();
 }
@@ -4204,8 +4297,7 @@ fn commit_weekly_threshold_edit(app: &mut App) {
     };
     {
         let mut cfg = app.config();
-        cfg.state.weekly_switch_threshold = Some(pct);
-        let _ = save_app_state(&cfg.state);
+        let _ = crate::fallback_config::set_weekly_threshold(&mut cfg, pct);
     }
     app.last_reload_fp = reload_fingerprint();
     app.weekly_threshold_draft = None;
@@ -4318,14 +4410,18 @@ fn selected_chain_member(app: &App) -> Option<usize> {
     }
 }
 
-/// Profiles not yet in the chain (add-picker candidates). A disabled account
-/// is excluded — the fallback-chain editing UI must never offer adding one
-/// (it still sits in `fallback_chain` untouched if it was already a member
-/// before being disabled; only new additions are blocked here).
+/// Profiles not yet in the chain (add-picker candidates). Codex profiles are
+/// never candidates — the claude chain is harness-homogeneous (CDX-1 T1b);
+/// the picker is the only TUI path into `fallback_chain`, so filtering here
+/// covers the whole surface. A disabled account is excluded too — the
+/// chain-editing UI must never offer adding one (it still sits in
+/// `fallback_chain` untouched if it was already a member before being
+/// disabled; only new additions are blocked here).
 pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
     let cfg = app.config();
     cfg.profiles
         .iter()
+        .filter(|p| !p.is_codex())
         .filter(|p| !p.is_disabled() && !cfg.state.fallback_chain.iter().any(|c| c == &p.name))
         .map(|p| p.name.to_string())
         .collect()
@@ -4585,6 +4681,50 @@ fn write_max_spend(app: &mut App, value: f64) {
     }
 }
 
+/// Which per-member usage gate a toggle row flips (`Profile::check_weekly` /
+/// `Profile::check_scoped`).
+#[derive(Clone, Copy)]
+enum MemberFlag {
+    CheckWeekly,
+    CheckScoped,
+}
+
+/// Flip a per-member usage gate and persist it; rolls back in memory when the
+/// save fails so the UI never shows a state the disk doesn't hold (same
+/// contract as [`toggle_last_resort`], minus its exclusivity move).
+fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
+    let Some(pos) = selected_chain_member(app) else {
+        return;
+    };
+    let failed = {
+        let mut cfg = app.config();
+        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+            return;
+        };
+        let Some(profile) = cfg.find_mut(&name) else {
+            return;
+        };
+        fn field(p: &mut crate::profile::Profile, flag: MemberFlag) -> &mut bool {
+            match flag {
+                MemberFlag::CheckWeekly => &mut p.check_weekly,
+                MemberFlag::CheckScoped => &mut p.check_scoped,
+            }
+        }
+        *field(profile, flag) = !*field(profile, flag);
+        match save_profile(profile) {
+            Ok(()) => None,
+            Err(e) => {
+                *field(profile, flag) = !*field(profile, flag);
+                Some(e)
+            }
+        }
+    };
+    match failed {
+        None => app.refresh_tokens(),
+        Some(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
+    }
+}
+
 /// Effective threshold for the selected member, or `None` on `+ add`.
 fn selected_threshold(app: &App) -> Option<f64> {
     let pos = selected_chain_member(app)?;
@@ -4651,50 +4791,6 @@ fn adjust_weekly(app: &mut App, delta: f64) {
 /// reads the shared config directly, unlike `auto_start` which lives in the
 /// `TokenList`); it's kept so every per-profile toggle path re-derives the
 /// scheduler snapshot the same way.
-/// Which per-member usage gate a toggle row flips (`Profile::check_weekly` /
-/// `Profile::check_scoped`).
-#[derive(Clone, Copy)]
-enum MemberFlag {
-    CheckWeekly,
-    CheckScoped,
-}
-
-/// Flip a per-member usage gate and persist it; rolls back in memory when the
-/// save fails so the UI never shows a state the disk doesn't hold (same
-/// contract as [`toggle_last_resort`], minus its exclusivity move).
-fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
-    let Some(pos) = selected_chain_member(app) else {
-        return;
-    };
-    let failed = {
-        let mut cfg = app.config();
-        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
-            return;
-        };
-        let Some(profile) = cfg.find_mut(&name) else {
-            return;
-        };
-        fn field(p: &mut crate::profile::Profile, flag: MemberFlag) -> &mut bool {
-            match flag {
-                MemberFlag::CheckWeekly => &mut p.check_weekly,
-                MemberFlag::CheckScoped => &mut p.check_scoped,
-            }
-        }
-        *field(profile, flag) = !*field(profile, flag);
-        match save_profile(profile) {
-            Ok(()) => None,
-            Err(e) => {
-                *field(profile, flag) = !*field(profile, flag);
-                Some(e)
-            }
-        }
-    };
-    match failed {
-        None => app.refresh_tokens(),
-        Some(e) => app.toast(ToastKind::Danger, format!("save failed\n{e}")),
-    }
-}
-
 fn toggle_last_resort(app: &mut App) {
     enum Outcome {
         Missing,
@@ -5276,16 +5372,23 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         Some(d) => !d.base_url.value.trim().is_empty(),
         None => profile.map(|p| !p.is_oauth()).unwrap_or(false),
     };
+    // A codex profile carries no claude-shaped settings: no endpoint rows
+    // (edit_profile_endpoint refuses codex targets — this keeps the UI from
+    // offering the dead ends), no auto-start (Anthropic kick), no model
+    // overrides (Claude Code settings.json knobs).
+    let is_codex = profile.is_some_and(|p| p.is_codex());
     let mut rows = vec![ConfigRow::Name];
     // auto-start sits right below name (OAuth-only; mutually exclusive with api key).
-    if !is_api {
+    if !is_api && !is_codex {
         rows.push(ConfigRow::AutoStart);
     }
-    rows.push(ConfigRow::BaseUrl);
-    if is_api {
-        rows.push(ConfigRow::ApiKey);
+    if !is_codex {
+        rows.push(ConfigRow::BaseUrl);
+        if is_api {
+            rows.push(ConfigRow::ApiKey);
+        }
+        rows.push(ConfigRow::Model);
     }
-    rows.push(ConfigRow::Model);
 
     // Alias overrides collapse: render the ones already set, tuck the rest behind
     // a single `+ model override` reveal until ⏎ expands them (draft-scoped).
@@ -5303,28 +5406,30 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
             v.is_some_and(|s| !s.trim().is_empty())
         }
     };
-    let mut any_collapsed = false;
-    for row in [
-        ConfigRow::OpusModel,
-        ConfigRow::SonnetModel,
-        ConfigRow::HaikuModel,
-        ConfigRow::SubagentModel,
-    ] {
-        if expanded || override_set(row) {
-            rows.push(row);
-        } else {
-            any_collapsed = true;
+    if !is_codex {
+        let mut any_collapsed = false;
+        for row in [
+            ConfigRow::OpusModel,
+            ConfigRow::SonnetModel,
+            ConfigRow::HaikuModel,
+            ConfigRow::SubagentModel,
+        ] {
+            if expanded || override_set(row) {
+                rows.push(row);
+            } else {
+                any_collapsed = true;
+            }
         }
-    }
-    if any_collapsed {
-        rows.push(ConfigRow::ModelOverrideAdd);
-    }
+        if any_collapsed {
+            rows.push(ConfigRow::ModelOverrideAdd);
+        }
 
-    // One row per custom env entry (sorted), then the `+ add env` row. Indices
-    // must match the sorted env snapshot used by the renderer and the commit path.
-    let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
-    rows.extend((0..env_count).map(ConfigRow::EnvEntry));
-    rows.push(ConfigRow::EnvAdd);
+        // One row per custom env entry (sorted), then the `+ add env` row. Indices
+        // must match the sorted env snapshot used by the renderer and the commit path.
+        let env_count = profile.map(|p| p.env.len()).unwrap_or(0);
+        rows.extend((0..env_count).map(ConfigRow::EnvEntry));
+        rows.push(ConfigRow::EnvAdd);
+    }
     // Log in / re-login, then log out once a credential exists — for both OAuth
     // (browser mint) and API (base url + api key) accounts. "Has a credential"
     // reads the OAuth token or the api key depending on the account's credential
@@ -5332,7 +5437,18 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // row acts on what's on disk, so a hybrid's token can't be hidden behind
     // either a base url or an uncommitted draft.
     rows.push(ConfigRow::Login);
-    let has_creds = if profile.is_some_and(|p| p.login_is_oauth()) {
+    let has_creds = if is_codex {
+        // A codex login is the stored auth.json snapshot, not a claude
+        // credential shape.
+        profile
+            .map(|p| {
+                crate::codex::read_profile_auth(&p.name)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .unwrap_or(false)
+    } else if profile.is_some_and(|p| p.login_is_oauth()) {
         profile.and_then(|p| p.credentials.as_ref()).is_some()
     } else {
         profile
@@ -5529,6 +5645,32 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .and_then(|d| d.editing_name.clone());
             // An existing API account re-enters its base url + api key inline (no
             // browser); only OAuth accounts run the token-minting flow below.
+            // The codex check must come FIRST: a hand-edited codex profile
+            // carrying a stray base_url would otherwise classify as API and
+            // reach the endpoint re-login (whose writer refuses codex targets
+            // — this keeps the UI off that dead end entirely).
+            let is_codex_account = editing.as_deref().is_some_and(|n| {
+                let cfg = app.config();
+                cfg.find(n).is_some_and(|p| p.is_codex())
+            });
+            if is_codex_account {
+                let name = editing.clone().unwrap_or_default();
+                let result = {
+                    let mut cfg = app.config();
+                    crate::actions::codex_capture_into_profile(&mut cfg, &name)
+                };
+                match result {
+                    Ok(()) => {
+                        app.last_reload_fp = reload_fingerprint();
+                        app.toast(
+                            ToastKind::Success,
+                            format!("captured the live codex login into '{name}'"),
+                        );
+                    }
+                    Err(e) => app.toast(ToastKind::Danger, format!("codex capture failed\n{e}")),
+                }
+                return;
+            }
             let is_api_account = editing.as_deref().is_some_and(|n| {
                 let cfg = app.config();
                 cfg.find(n).map(|p| !p.login_is_oauth()).unwrap_or(false)
@@ -6684,10 +6826,15 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
         ConfirmAction::BlankCredentials(name) => {
             let result = {
                 let mut cfg = app.config();
-                // OAuth accounts drop the token via the shared clearer; API
-                // accounts drop only the api key, keeping the base-url shell.
+                // Codex accounts drop their stored auth.json snapshot (the
+                // live file is codex's own — never touched); OAuth accounts
+                // drop the token via the shared clearer; API accounts drop
+                // only the api key, keeping the base-url shell.
+                let is_codex = cfg.find(&name).is_some_and(|p| p.is_codex());
                 let is_oauth = cfg.find(&name).map(|p| p.login_is_oauth()).unwrap_or(true);
-                if is_oauth {
+                if is_codex {
+                    crate::actions::codex_clear_profile_auth(&mut cfg, &name)
+                } else if is_oauth {
                     clear_profile_credentials(&mut cfg, &name)
                 } else {
                     clear_profile_api_key(&mut cfg, &name)
@@ -7228,13 +7375,20 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         );
         return;
     }
-    // The uuid rides the snapshot: this may land in a confirm modal instead of
-    // committing now, and only the commit may seed the anchor.
+    // The identity rides the snapshot: this may land in a confirm modal instead
+    // of committing now, and only the commit may seed the anchor. The uuid comes
+    // from the mint's OWN verification probe (never the unrelated live login's
+    // `~/.claude.json` hint — the CAP-2 pollution); a probe that saw none is
+    // Unknown, which drops a stale anchor for the fetcher to backfill.
     let snapshot = CaptureSnapshot {
         credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
-        account_uuid: outcome.account_uuid,
+        identity: outcome
+            .account_uuid
+            .map_or(CaptureIdentity::Unknown, |uuid| {
+                CaptureIdentity::Known(crate::usage::AccountIdentity { uuid, email: None })
+            }),
     };
     // No stored creds → nothing diverges; adopt silently (mirrors the
     // first-login adopt in `poll_credentials_divergence`).
@@ -7301,11 +7455,14 @@ pub(crate) fn on_tick(app: &mut App) {
     app.apply_usage();
 
     drain_switch_gates(app);
-
+    // TECH-6: the queue is now ordered `PendingSwitchEntry`s. In the TUI the queue
+    // only ever carries the scheduler's auto-targets (a user switch is a keypress →
+    // `perform_switch`, never enqueued), so draining every target and switching each
+    // idle one preserves the prior behavior.
     let auto_switch_targets: Vec<String> = app
         .pending_switch
         .lock()
-        .map(|mut g| g.drain().collect())
+        .map(|mut g| g.drain(..).map(|e| e.target).collect())
         .unwrap_or_default();
     for name in auto_switch_targets {
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
@@ -7373,6 +7530,27 @@ fn update_banner(app: &mut App) {
     let cfg = app.config();
     let no_active = !cfg.profiles.is_empty() && cfg.state.active_profile.is_none();
     let any_spent = no_active && cfg.profiles.iter().any(crate::fallback::is_exhausted_hard);
+    // A quarantined login was previously INVISIBLE on the Overview (only a
+    // switch attempt toasted it): the row's fetch state shows the 429/cached
+    // MASK of the dead login, and the operator chased a rate limit while the
+    // fix was a re-login (2026-07-12). Name it in the one system banner.
+    let broken: Vec<&str> = cfg
+        .state
+        .auth_broken
+        .iter()
+        .map(|n| n.as_str())
+        .filter(|n| cfg.find(n).is_some())
+        .collect();
+    let broken_msg = match broken.as_slice() {
+        [] => None,
+        [one] => Some(format!(
+            "login expired for '{one}' · run: clauth login {one}"
+        )),
+        [first, rest @ ..] => Some(format!(
+            "login expired for '{first}' (+{} more) · run: clauth login {first}",
+            rest.len()
+        )),
+    };
     drop(cfg);
 
     // Divergence outranks the compact-size nudge (both WARNING): a live-login
@@ -7393,6 +7571,13 @@ fn update_banner(app: &mut App) {
         Some(Banner {
             severity: BannerSeverity::Danger,
             message: message.to_string(),
+        })
+    } else if let Some(message) = broken_msg {
+        // A dead login outranks divergence/compact: it silently shrinks the
+        // fallback chain and needs a human (browser re-login) to recover.
+        Some(Banner {
+            severity: BannerSeverity::Danger,
+            message,
         })
     } else if let Some(message) = divergence_msg {
         Some(Banner {
@@ -7642,12 +7827,7 @@ fn note_divergence(app: &mut App, active: &str) -> bool {
 /// every refresh, so the banner's owner lookup re-runs exactly when the creds
 /// change. `None` when no readable OAuth login is present.
 fn live_creds_fingerprint() -> Option<u64> {
-    use std::hash::{DefaultHasher, Hash, Hasher};
-    let creds = read_claude_credentials().ok().flatten()?;
-    let token = creds.access_token().filter(|t| !t.is_empty())?;
-    let mut hasher = DefaultHasher::new();
-    token.hash(&mut hasher);
-    Some(hasher.finish())
+    crate::claude::live_credentials_fingerprint()
 }
 
 /// Clears `bootstrap_active` and posts `BootstrapDone` when dropped — success

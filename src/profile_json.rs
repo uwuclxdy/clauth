@@ -9,9 +9,12 @@ use crate::profile::Profile;
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache};
 use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
-/// Display provider for a profile: a recognised third-party name, else
-/// `anthropic` for an OAuth profile.
+/// Display provider for a profile: `openai` for a codex-harness profile, a
+/// recognised third-party name, else `anthropic` for an OAuth profile.
 pub(crate) fn provider_label(profile: &Profile) -> String {
+    if profile.is_codex() {
+        return "openai".to_string();
+    }
     profile
         .provider
         .map(|p| p.display_name().to_string())
@@ -27,6 +30,24 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 /// account as a genuine free one. `None` for third-party/api-key profiles and
 /// when neither a fetched plan nor a token hint is on disk.
 pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
+    // Codex plan tier: prefer the LIVE `plan_type` the CDX-6 poll cached
+    // (fresh within a poll interval of a plan change) over the stored
+    // id_token claim, which only re-mints when codex itself refreshes —
+    // stale for days after an upgrade (observed: plus→pro, 2026-07-22).
+    if profile.is_codex() {
+        if let Some(plan) = load_profile_cache::<String>(
+            profile.name.as_str(),
+            crate::profile_cache::CODEX_PLAN_CACHE_FILE,
+        )
+        .filter(|p| !p.trim().is_empty())
+        {
+            return Some(plan);
+        }
+        let bytes = crate::codex::read_profile_auth(profile.name.as_str())
+            .ok()
+            .flatten()?;
+        return crate::codex::CodexAuthFile::parse(&bytes).ok()?.plan();
+    }
     if profile.is_third_party() {
         return None;
     }

@@ -11,11 +11,11 @@ const BASH: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which sessions resume info daemon status mcp completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login delete disable enable which sessions resume info daemon status doctor mcp feed proxy fallback completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--base-url --api-key --setup-token --yes -y --model" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--base-url --api-key --model --new --codex --browser --setup-token --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --rescue --no-rescue" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
@@ -28,8 +28,10 @@ const BASH: &str = r#"_clauth() {
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "which" ] || [ "$prev" = "status" ]; }; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "completions" ]; then
+        COMPREPLY=( $(compgen -W "bash zsh fish install" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "resume" ] && [ "${cur:0:2}" = "--" ]; then
@@ -59,13 +61,17 @@ _clauth() {
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
             'which[print profile owning the loaded credentials]' \
+            'status[print the usage / auto-switch snapshot]' \
+            'daemon[run the headless scheduler (no TUI)]' \
+            'doctor[read-only health check of the daemon + macOS wiring]' \
+            'feed[feed the session token from the usage chain (on|off)]' \
+            'proxy[run the codex injection proxy]' \
+            'fallback[edit the auto-switch fallback chains]' \
             'sessions[list Claude Code sessions (add --json)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
-            'daemon[run the headless scheduler with no TUI]' \
-            'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
-            'completions[emit shell completion script]'
+            'completions[print or install shell completions]'
         _values 'option' '--theme[force a color depth instead of auto-detecting]'
     elif (( CURRENT >= 3 )) && [[ "${words[CURRENT-1]}" == "--theme" ]]; then
         _values 'tier' 'full[24-bit truecolor]' 'compatible[xterm-256 palette, safe on every terminal]'
@@ -84,14 +90,16 @@ _clauth() {
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
-    elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == (which|status) ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == completions ]]; then
+        _values 'arg' 'bash' 'zsh' 'fish' 'install[install into the shell rc]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
-        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--setup-token[capture a claude setup-token mint as a long-lived login]' '--yes[replace an existing long-lived token unprompted]' '-y[replace an existing long-lived token unprompted]' '--model[set the default model before signing in]'
+        _values 'flag' '--base-url[API base url]' '--api-key[API key (prompted echo-off if omitted)]' '--model[set the default model before signing in]' '--new[refuse to touch an existing profile]' '--codex[codex profile: capture the current codex login]' '--browser[codex profile: fresh browser sign-in]' '--setup-token[capture a claude setup-token mint as a long-lived login]' '--yes[replace an existing long-lived token unprompted]' '-y[replace an existing long-lived token unprompted]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]' '--force[override the live-session guard]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
@@ -120,12 +128,20 @@ complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile an
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
+complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot"
+complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler (no TUI)"
+complete -c clauth -f -n __fish_is_first_token -a doctor -d "Read-only health check of the daemon + macOS wiring"
+complete -c clauth -f -n __fish_is_first_token -a feed -d "Feed the session token from the usage chain (on|off)"
+complete -c clauth -f -n __fish_is_first_token -a proxy -d "Run the codex injection proxy"
+complete -c clauth -f -n __fish_is_first_token -a fallback -d "Edit the auto-switch fallback chains"
+complete -c clauth -f -n __fish_is_first_token -a completions -d "Print or install shell completions"
+complete -c clauth -f -n "__fish_seen_subcommand_from start login delete" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
+complete -c clauth -f -n "__fish_seen_subcommand_from which status" -a --json -d "Emit JSON"
+complete -c clauth -f -n "__fish_seen_subcommand_from completions" -a "bash zsh fish install" -d Shell
 complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
 complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
-complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
-complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
-complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
@@ -133,7 +149,6 @@ complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --rescue -d "Isolated only: lift transcripts + sidecars into the global store"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --no-rescue -d "Isolated only: discard the isolated store"
-complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --base-url -d "API base url"
@@ -142,6 +157,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --setup-token -d
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --yes -d "Replace an existing long-lived token unprompted"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a -y -d "Replace an existing long-lived token unprompted"
 complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --model -d "Set default model before signing in"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --new -d "Refuse to touch an existing profile"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --codex -d "Codex profile: capture the current codex login"
+complete -c clauth -f -n "__fish_seen_subcommand_from login" -a --browser -d "Codex profile: fresh browser sign-in"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from delete" -a --force -d "Override the live-session guard"

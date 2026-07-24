@@ -157,6 +157,29 @@ pub(crate) fn strip_home_oauth_account() -> Result<()> {
     atomic_write(&path, &bytes).with_context(|| format!("failed to write {}", path.display()))
 }
 
+/// Both identity halves — `(accountUuid, emailAddress)` — extracted from ONE
+/// read of `~/.claude.json`, so a rewrite between two separate reads can never
+/// pair one account's uuid with another's email. `None` when the file/block/
+/// uuid is absent (same contract as [`home_oauth_account_uuid`]); the email is
+/// independently optional.
+pub(crate) fn live_oauth_account_pair() -> Option<(String, Option<String>)> {
+    let path = home_dir().ok()?.join(".claude.json");
+    let bytes = std::fs::read(&path).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    let account = v.get("oauthAccount")?;
+    let uuid = account.get("accountUuid")?.as_str()?.trim();
+    if uuid.is_empty() {
+        return None;
+    }
+    let email = account
+        .get("emailAddress")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::to_string);
+    Some((uuid.to_string(), email))
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/claude_json.rs"]
 mod tests;
