@@ -92,7 +92,10 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   proactive-rotation feed override; EXP-2 re-feed timer (`claude_feed_tick`
   5-min scan + `refeed_session_token` with `fresh_horizon_ms` threaded
   through the feed gates — switch paths keep the 60s grace; active-profile
-  Keychain mirror).
+  Keychain mirror). **Contributed upstream as PR #59** (2026-07-25, branch
+  `feat/session-token-feed` cut from `upstream/mommy`, two-commit series:
+  feed core, then the timer) — when it merges this bullet collapses to
+  whatever the fork still adds on top of the merged form.
 - **EXP-2 codex 401 kick**: CDX-6 poll `Unauthorized` →
   `codex_auth_kicks` → CDX-3 standby force-refresh
   (`codex_refresh_parked(force)` bypasses only `standby_due`), with a
