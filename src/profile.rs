@@ -1227,6 +1227,21 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// True for a profile's isolated `codex-home/` (`profiles/<name>/codex-home`),
+/// the one subtree [`enforce_clauth_perms`] must not descend into. Matches on
+/// the grandparent being the profiles root, not the basename alone, so a
+/// profile literally NAMED `codex-home` still gets swept.
+#[cfg(unix)]
+fn is_isolated_codex_home(path: &Path) -> bool {
+    if path.file_name() != Some(std::ffi::OsStr::new("codex-home")) {
+        return false;
+    }
+    let Ok(root) = profiles_root() else {
+        return false;
+    };
+    path.parent().and_then(Path::parent) == Some(root.as_path())
+}
+
 /// Retighten an existing `~/.clauth` tree to the owner-only invariant (0o700
 /// dirs, 0o600 files). Installs created before the invariant carry umask modes
 /// no writer revisits once the bytes stop changing, so [`load_config`] runs
@@ -1234,6 +1249,14 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// shared-mode runtime is full of links into the operator's `~/.claude`, and
 /// following one would chmod a file clauth does not own. Best-effort per entry
 /// — a chmod failure on one path never aborts the walk or the load.
+///
+/// A profile's isolated `codex-home/` is codex's tree, not ours: codex plants
+/// PATH-alias helper binaries inside it, and a blanket 0o600 strips their exec
+/// bit — on EVERY entry point, so a single `clauth which` breaks a running
+/// isolated session. The descent stops there; the dir node itself is still
+/// tightened to 0o700. Nothing is loosened by the exemption: the seed writes
+/// `codex-home/auth.json` through [`atomic_write_600`], so the credential's
+/// mode comes from its writer rather than from this sweep.
 pub(crate) fn enforce_clauth_perms(root: &Path) {
     #[cfg(unix)]
     {
@@ -1249,7 +1272,10 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
         if meta.permissions().mode() & 0o777 != want {
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
         }
-        if is_dir && let Ok(entries) = std::fs::read_dir(root) {
+        if is_dir
+            && !is_isolated_codex_home(root)
+            && let Ok(entries) = std::fs::read_dir(root)
+        {
             for entry in entries.flatten() {
                 enforce_clauth_perms(&entry.path());
             }

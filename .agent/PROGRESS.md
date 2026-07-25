@@ -1924,3 +1924,75 @@ The two "small and certain" fixes from EXP-1, shipped together:
   (rotation-hook discipline), all-feed-profiles scan documented as intended;
   +3 tests (kick-permanent termination, breaker stand-down/re-arm,
   degrade pacing) → 1786 green.
+
+## UPS-7 — upstream adopted the codex design as its own spec; we own the build (2026-07-25)
+
+**#51 was NOT merged.** The maintainer distilled the PR-#51 design conversation
+into an upstream spec — `docs/codex-plan.md`, commit `3d42fd5`, on `mommy` —
+verified the codex-specific claims against `codex 0.145.0` with source refs,
+and handed the implementation to us: contributor owns groundwork + codex engine
+end to end, on a branch cut from the **v0.14 tag** (not yet released; latest is
+v0.13.1), shipped as a six-part reviewable series. Maintainer designs + reviews.
+AX accepted (option A, 2026-07-25).
+
+**Their pinned decisions that diverge from the fork** (we adopt theirs; this is
+a state-layer rewrite, not a rebase):
+
+| | fork today | spec |
+|---|---|---|
+| harness location | `Profile.harness` in per-profile `config.toml`; `active_codex_profile` / `codex_fallback_chain` in `AppState` (`profile.rs:495-507`) | a separate `~/.clauth/codex-profiles.toml`; harness = which FILE the name came from |
+| profile dir | bare (`profiles/<name>`) | `-cx` suffix (`profiles/<name>-cx`) |
+| codex store mode | refuse unless `file` (`runtime.rs:247`) | force `-c cli_auth_credentials_store="file"` on every spawn |
+
+The three are causally linked: `-cx` (maintainer wants it because the agent sees
+the path in its system prompt) makes the dir path depend on the harness, so the
+harness can no longer live in a file inside the dir, so it must go to shared
+state — and putting it in `AppState` reopens the mixed-version write-hole, hence
+the separate file. Their reasoning holds; both their calls are better than ours.
+
+**Reply posted** (#51 comment `5077575647`) — acceptance + 6 gaps + all 9 open
+questions answered from production evidence:
+
+- *gap 1 (the one that matters)*: spec phase 4 inherits AGE-scheduled standby
+  refresh, which EXP-1 proved blind to the real death mode. Recommended the
+  EXP-2 F1 shape (`PollError::Unauthorized` → kick set → force-refresh
+  bypassing only the age gate, 2-strike breaker).
+- *gap 2*: decision 5 covers spawn but not CAPTURE — `clauth login --codex`
+  reads the operator's real `~/.codex/auth.json`, absent under keyring; the
+  fork's `actions.rs:1386` refusal stays, only the spawn-side one goes.
+- *gap 3*: their `enforce_clauth_perms` codex-home exemption needs its other
+  half (skip DESCENT, keep the dir at 0700, credential mode owned by
+  `atomic_write_600`). **Fork had the identical bug — fixed this session.**
+- *gap 4*: seed/adopt-back must move `auth.json` as an opaque blob —
+  re-serializing drops `last_refresh` and makes a seeded codex self-refresh on
+  startup, racing the daemon for the same chain (two-carrier death at seed).
+- *gap 5*: the mixed-version window is silent (#57's singleton keeps the old
+  daemon); publish `clauth_version` in status.json (fork already does) + a
+  one-line CLI warning.
+- *Q1* delegate cut from the series (no production evidence; `codex exec`
+  output contract ≠ `claude -p`). *Q2* allowlist-symlink the operator's
+  `skills/rules/agents/templates/references/AGENTS.md`, copy `config.toml`
+  (MCP rides it), isolate all writable state; `hooks.json` excluded by default.
+  *Q3* reuse the named window model, map by duration (`route_windows`,
+  `codex/usage.rs:302`). *Q4* auto-start is claude-only. *Q5* SOLVED — the
+  `wham/usage` body carries a live top-level `plan_type` (`codex/poll.rs:64-68`)
+  that supersedes the stale id_token claim. *Q6* proxy deferred; advisory-rank
+  lesson passed on. *Q7* reimplement PKCE, never shell out to `codex login`
+  (it writes the LIVE auth.json → forks the chain), + 5 wire traps.
+  *Q8* disambiguate by file, name both harnesses in the error, add an explicit
+  `--codex`/`--claude` override. *Q9* exclude codex from the Tokens tab.
+
+**Shipped this session (fork):** the gap-3 fix — `enforce_clauth_perms` no
+longer DESCENDS into `profiles/<name>/codex-home/` (`is_isolated_codex_home`
+matches on the grandparent being the profiles root, so a profile literally
+named `codex-home` is still swept). The dir node still tightens to 0700;
+nothing loosens, since the seed writes `codex-home/auth.json` through
+`atomic_write_600`. Without the guard a single `clauth which` stripped the exec
+bit off codex's PATH-alias helper binaries under a RUNNING isolated session
+(`load_config` sweeps on every entry point). RED verified (0o600 vs 0o755)
+before the fix went in. Also corrected the now-stale CDX-6 module doc that
+still claimed a 401 "just waits" for the standby refresh — EXP-2 made it kick.
+1787 green, clippy 0, fmt clean.
+
+**Next**: blocked on the v0.14 tag. Re-verify the spec's phase-1 line anchors
+against `mommy` HEAD when the branch is cut (the plan says approximate).

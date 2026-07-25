@@ -55,7 +55,13 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   `clauth resume <codex-profile>` carryover (dispatch-shared with upstream's
   session resume), codex TUI rungs/tokens dashboard/route column, CDX-6
   read-only `wham/usage` polling per profile (60s, parked accounts included;
-  AX reversal 2026-07-22, kill switch `codex_usage_poll`).
+  AX reversal 2026-07-22, kill switch `codex_usage_poll`), and the
+  `enforce_clauth_perms` codex-home exemption (the sweep tightens the
+  `codex-home/` dir node to 0700 but does not DESCEND, or it strips the exec
+  bit off codex's PATH-alias helper binaries under a live isolated session —
+  `auth.json`'s 0600 comes from `atomic_write_600` at seed, not from the
+  sweep). Upstream's `docs/codex-plan.md` phase 3 carries the same exemption,
+  so this one reconciles rather than persists.
 - **Scheduler hardening**: SCW-1 per-model scoped weekly windows in both
   walks, SCW-2 per-member gates + `weekly at` override (folded into
   `ChainMember.weekly_line/scoped_line/check_scoped`), RLS-1 stuck-rate-limit
@@ -93,3 +99,14 @@ Contribution branches are cut from `upstream/mommy`, never from fork `main`
 (`feat/scoped-weekly-walk` = PR #55 is the template): port the feature onto
 upstream's shape, let the fork adopt the upstream form back on the next sync.
 The fork's standing upstream threads live in `.agent/PROGRESS.md`.
+
+**The codex engine's endgame (UPS-7, 2026-07-25):** upstream owns the codex
+design now — `docs/codex-plan.md` on `mommy` is the spec, and we implement it
+as a six-part series on a branch cut from the **v0.14 tag** (branch cut from a
+TAG, not `upstream/mommy` — the one deliberate exception to the rule above).
+It is a state-layer rewrite, not a port: harness moves out of
+`Profile`/`AppState` into a separate `codex-profiles.toml`, dirs gain a `-cx`
+suffix, and the store-mode refusal becomes a forced
+`-c cli_auth_credentials_store="file"`. When that series lands, the "Codex
+engine" bullet above collapses to whatever the fork still adds on top —
+budget for the inventory to shrink, not grow.

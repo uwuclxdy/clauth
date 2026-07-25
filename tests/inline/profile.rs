@@ -998,6 +998,73 @@ fn credential_and_cache_files_have_restricted_permissions() {
     );
 }
 
+/// The blanket 0o600 sweep must NOT descend into a profile's isolated
+/// `codex-home/`: codex plants PATH-alias helper binaries there, and
+/// `load_config` runs the sweep on every entry point, so an unguarded walk
+/// strips their exec bit out from under a running isolated session — one
+/// `clauth which` is enough. The dir node itself still tightens to 0o700, and
+/// everything outside `codex-home/` is swept as before.
+#[cfg(unix)]
+#[test]
+fn perms_sweep_skips_an_isolated_codex_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let name = "perm-test-codex-home";
+
+    let codex_home = profile_subpath(name, "codex-home").expect("codex-home path");
+    let helper_dir = codex_home.join("bin");
+    std::fs::create_dir_all(&helper_dir).expect("create codex-home/bin");
+    let helper = helper_dir.join("codex-shim");
+    std::fs::write(&helper, b"#!/bin/sh\n").expect("write helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod helper");
+
+    // A sibling under the profile dir but OUTSIDE codex-home: still swept.
+    let sibling = profile_subpath(name, "sibling.json").expect("sibling path");
+    std::fs::write(&sibling, b"{}").expect("write sibling");
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod sibling");
+
+    // The basename alone must not exempt: a profile literally NAMED
+    // `codex-home` is an ordinary claude profile and keeps getting swept.
+    let decoy = profile_subpath("codex-home", "creds.json").expect("decoy path");
+    std::fs::create_dir_all(decoy.parent().expect("decoy parent")).expect("create decoy dir");
+    std::fs::write(&decoy, b"{}").expect("write decoy");
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).expect("chmod decoy");
+
+    enforce_clauth_perms(&clauth_dir().expect("clauth_dir"));
+
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap_or_else(|e| panic!("metadata {}: {e}", p.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    assert_eq!(
+        mode(&helper),
+        0o755,
+        "the sweep stripped the exec bit off a codex helper binary",
+    );
+    assert_eq!(
+        mode(&codex_home),
+        0o700,
+        "the codex-home dir node itself must still be tightened",
+    );
+    assert_eq!(
+        mode(&sibling),
+        0o600,
+        "a file outside codex-home must be swept"
+    );
+    assert_eq!(
+        mode(&decoy),
+        0o600,
+        "a profile named `codex-home` is not an isolated codex home",
+    );
+}
+
 /// Disabling an account is a `config.toml`-only edit: flipping it must persist
 /// on reload and never touch the profile directory or stored credentials.
 /// `disabled = false` (the default) leaves stock behaviour bit-identical, so

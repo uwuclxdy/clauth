@@ -20,8 +20,10 @@
 //! INVARIANTS (what keeps this strictly safer than the sibling projects):
 //!   * READ-ONLY — this leg never refreshes, never writes auth files, never
 //!     touches a refresh token. CDX-3's standby refresh (RotationGuard
-//!     single-writer) is the only parked-chain renewer; a 401 here just
-//!     waits for it.
+//!     single-writer) is the only parked-chain renewer; since EXP-2 a 401
+//!     here KICKS that refresh onto the next standby tick instead of waiting
+//!     out its age schedule, but the rotation still happens over there, under
+//!     the guard.
 //!   * The banned-by-design surfaces stay banned: no `/backend-api/accounts`,
 //!     no credit endpoints, no live `~/.codex/auth.json` reads (stored
 //!     profile snapshots only).
