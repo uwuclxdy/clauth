@@ -1996,3 +1996,64 @@ still claimed a 401 "just waits" for the standby refresh — EXP-2 made it kick.
 
 **Next**: blocked on the v0.14 tag. Re-verify the spec's phase-1 line anchors
 against `mommy` HEAD when the branch is cut (the plan says approximate).
+
+## UPS-8 — CLA-FEED contributed upstream as PR #59 (2026-07-25)
+
+Picked while blocked on the v0.14 tag: shrink the fork delta with the piece
+that has real upstream value and that upstream can actually test (claude-side,
+unlike the codex engine).
+
+**The pick was wrong the first time, and the inventory is why.** `SYNC.md`
+listed "browser OAuth login" as a fork-only Claude-side feature, so it was the
+obvious first contribution. Measuring instead of reading: upstream HAS
+`src/oauth_login.rs` on `mommy` with the whole flow inline (PKCE, percent
+codecs, loopback server). The fork's only delta there is the CDX-3 R4
+extraction into `src/loopback.rs` so codex's login can share it — which rides
+along with the codex series and was never upstreamable alone. Corrected in
+SYNC.md (`aaef926`) with a standing instruction to `git grep` against
+`upstream/mommy` before trusting a line in that inventory.
+
+Re-measured every fork-only module against `upstream/mommy` — 0 upstream files
+match `doctor`, `session_feed`, `tokens.json`, or `socket`; 34 match
+`fallback`, so `fallback_config.rs` is an extension, not a feature. That made
+**CLA-FEED** the pick: genuine feature, direct sequel to merged #53, fixes a
+problem every upstream user of the split hits (the mint carries no
+`subscriptionType`, so plan-gated models get capped).
+
+**PR #59** — branch `feat/session-token-feed` cut from `upstream/mommy` per the
+contributing template, two-commit reviewable series:
+
+1. `832ed33` feed core — `session_feed` flag, `feed_install_gate` (the six-state
+   decision table), rotation hook, `clauth feed <p> on|off` + completions,
+   start-time arming, degrade ladder (`session-token.static.json`), mis-fill
+   quarantine/heal, additive `session_feed` in status.json, fed-aware TUI token
+   row, README + SECURITY.md.
+2. `9ac36f7` the re-feed timer — `claude_feed_tick` 5-min scan +
+   `refeed_session_token`, `fresh_horizon_ms` threaded through the feed gates
+   so switch paths keep the tight 60s grace byte-identical.
+
+**Port shape (not a copy):** upstream's typed clap variant instead of the
+fork's `trailing_var_arg` grammar; `is_codex()` guard dropped (no harness
+upstream); `proactive_rotation_due` gains only the `feed` param, NOT the fork's
+`active_diverged` (separate delta); "Fable-capable" generalized to
+"plan-gated" — a model name in someone else's repo ages badly; the
+`archive_live_credentials` intra-doc link (fork-only symbol) rewritten to prose.
+
+**Behavior-preserving by construction, not inspection:** `vanilla_install_gate`
+is the old `ensure_installable` body verbatim; `expiring` delegates to
+`horizon_expiring(.., AUTH_GATE_GRACE_MS)`; `(enabled && keychain_live || false)`
+collapses to the old predicate — pinned by two added flag-off assertions.
+
+**Gates:** 1479 passed / 0 failed, clippy `-D warnings` clean, fmt clean;
+commit 1 green on its own (1472) so the series bisects. +25 tests.
+
+Two drift-guards fired and were fed rather than silenced — the status.json key
+contract and the README↔test `FEATURE_MAP`; the completions test caught that
+three shell scripts needed the new subcommand. Two self-inflicted defects from
+carving the series were caught by clippy `-D warnings` (an orphaned F2 test
+helper, and a `#[test]` attribute eaten by the cut) and fixed before the PR.
+
+**Next upstream candidates**, in order: `clauth doctor` (717 LOC, 0 upstream
+footprint, but `mod.rs` has 54 codex refs to gate first), then the daemon
+socket + `tokens.json` feed (our ccsbar/ccu contract — upstream may not want
+it). Still blocked-on-v0.14: the codex series (UPS-7).
