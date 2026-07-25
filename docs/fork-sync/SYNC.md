@@ -70,10 +70,17 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
 - **Daemon surface**: status.json fork fields (`forecast`, `burn_aware`,
   `weekly_switch_threshold`, `last_error`), tokens.json feed, per-member
   gate/override socket commands, ccsbar/ccu client contracts.
-- **Claude-side**: macOS Keychain-first link ordering, browser OAuth login,
-  RESCUE-1 dead-live-login reclaim, CLA-SPLIT hardening on top of merged #53
+- **Claude-side**: macOS Keychain-first link ordering, RESCUE-1
+  dead-live-login reclaim, CLA-SPLIT hardening on top of merged #53
   (genuinely-long-lived engagement gate, force-snapshot guard), auth-broken
   quarantine surfaces, `--new` / `--codex` / `--browser` login flags.
+  **NOT browser OAuth login itself** — upstream has that (`src/oauth_login.rs`
+  on `mommy`, full inline PKCE + loopback). The fork's only delta there is the
+  CDX-3 R4 extraction of the shared mechanics into `src/loopback.rs` so codex's
+  login can reuse them, so it rides along with the codex series rather than
+  being upstreamable on its own. (Corrected 2026-07-25 — this bullet used to
+  claim the feature; measure with `git grep` against `upstream/mommy` before
+  trusting any line in this inventory.)
 - **CLA-FEED session-token feed** (`docs/cla-feed/DESIGN.md`): per-profile
   `session_feed` flag; the daemon re-stamps `session-token.json` from the
   usage chain's access token on every rotation (full scopes +
