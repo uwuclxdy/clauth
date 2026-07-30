@@ -493,6 +493,190 @@ fn auto_switch_picks_member_with_headroom() {
     );
 }
 
+// --- greedy re-pick (opt-in `AppState::greedy_switching`) -----------------
+// Greedy scores each account by its sustainable weekly burn rate =
+// (weekly line - 7d util) / (hours until the 7d window resets). Every case
+// below keeps the active HEALTHY (5h and 7d both under their lines), so only
+// the greedy pass — never the exhaustion walk — can move it. Weekly line is the
+// default 98, so a member's rate is (98 - seven) / days.
+
+// UsageInfo with a live 5h window at `five` and a 7d window at `seven` whose
+// reset is `days` out — lets a test set an account's weekly burn rate
+// independent of its 5h.
+fn rate_info(five: f64, seven: f64, days: i64) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, Some(live_reset()))),
+        seven_day: Some(window(
+            seven,
+            Some(epoch_secs_to_iso(now_epoch_secs() + days * 86_400)),
+        )),
+        ..UsageInfo::default()
+    }
+}
+
+// Like `rate_info` but the 7d window resets `hours` out — for the near-reset case.
+fn rate_info_h(five: f64, seven: f64, hours: f64) -> UsageInfo {
+    UsageInfo {
+        five_hour: Some(window(five, Some(live_reset()))),
+        seven_day: Some(window(
+            seven,
+            Some(epoch_secs_to_iso(
+                now_epoch_secs() + (hours * 3600.0) as i64,
+            )),
+        )),
+        ..UsageInfo::default()
+    }
+}
+
+// Greedy off (the default): a healthy active stays put even when a rival has a
+// far higher burn rate. Pre-feature behavior, unchanged.
+#[test]
+fn greedy_off_leaves_healthy_active_in_place() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    let snap = snapshot_chain(&config).expect("snapshot"); // greedy_switching defaults off
+    // a rate (98-78)/2 = 10 ; b rate (98-8)/3 = 30 — but greedy is off.
+    let store = store_with_infos(vec![
+        ("a", rate_info(50.0, 78.0, 2)),
+        ("b", rate_info(1.0, 8.0, 3)),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// Greedy on: the active (rate 10) is left for the higher-rate rival (rate 30),
+// since 10 < 0.8 * 30. The water-filling / "return after offload" move.
+#[test]
+fn greedy_switches_to_the_higher_rate_account() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.greedy_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", rate_info(50.0, 78.0, 2)),
+        ("b", rate_info(1.0, 8.0, 3)),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+    );
+}
+
+// Hysteresis: a rival better than the active, but by less than the band, holds
+// the login. a rate 10 ; b rate (98-62)/3 = 12 → 10 is not < 0.8 * 12 (= 9.6).
+#[test]
+fn greedy_holds_within_the_hysteresis_band() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.greedy_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", rate_info(50.0, 78.0, 2)),
+        ("b", rate_info(1.0, 62.0, 3)),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// 5h is a gate, never a rate axis: a rival with a far higher weekly rate whose
+// own 5h is maxed is not a candidate, so greedy never chases a short-term
+// throttle that refills on its own.
+#[test]
+fn greedy_ignores_a_5h_capped_candidate() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.greedy_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    // b's weekly rate would win, but its 5h is maxed (100 ≥ 95) → not clear.
+    let store = store_with_infos(vec![
+        ("a", rate_info(50.0, 78.0, 2)),
+        ("b", rate_info(100.0, 8.0, 3)),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// A `last_resort` rival is the chain's parking spot, not a greedy target,
+// however high its burn rate.
+#[test]
+fn greedy_never_migrates_onto_a_last_resort_member() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            mark_last_resort(profile_with_util("b", Some(95.0), None)),
+        ],
+        "a",
+    );
+    config.state.greedy_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", rate_info(50.0, 78.0, 2)),
+        ("b", rate_info(1.0, 8.0, 3)),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// The active already holds the highest rate (30 vs 10): greedy leaves it there
+// rather than moving live sessions for no gain.
+#[test]
+fn greedy_stays_when_active_has_the_highest_rate() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.greedy_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", rate_info(50.0, 8.0, 3)),
+        ("b", rate_info(1.0, 78.0, 2)),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+// A rival whose weekly reset is imminent (< GREEDY_MIN_HORIZON_HOURS) is valued
+// as the fresh week it is about to become, NOT remaining/near-zero-hours. So it
+// never spikes to an infinite rate that would yank every session onto it for the
+// minutes before it refreshes. Here b resets in 1h with 5% used: the naive rate
+// (90-5)/1 = 85/h would force a switch; valued fresh it is 90/168 ≈ 0.54/h, which
+// does not beat the active's steady 0.60/h ((97-37)/100h) past the band, so stay.
+#[test]
+fn greedy_values_an_imminent_weekly_reset_as_fresh() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), None),
+            profile_with_util("b", Some(95.0), None),
+        ],
+        "a",
+    );
+    config.state.greedy_switching = true;
+    let snap = snapshot_chain(&config).expect("snapshot");
+    let store = store_with_infos(vec![
+        ("a", rate_info_h(50.0, 37.0, 100.0)),
+        ("b", rate_info_h(1.0, 5.0, 1.0)),
+    ]);
+    assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
 // Both marked last_resort at a non-100 threshold (80%) — active is itself the
 // sink; the loop guard holds and no migration to B forms.
 #[test]
@@ -3883,6 +4067,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
         switch_off_when_budget_spent: false,
         kick_rejected: vec![],
         fresh: vec![],
+        greedy: false,
     }
 }
 

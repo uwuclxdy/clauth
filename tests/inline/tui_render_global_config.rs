@@ -27,6 +27,7 @@ fn toggles() -> RowState {
     RowState {
         switch_off_when_spent: false,
         burn_aware: false,
+        greedy: false,
         spend_budget: false,
         switch_off_when_budget_spent: true,
         preemptive: false,

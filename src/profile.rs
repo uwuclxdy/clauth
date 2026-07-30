@@ -410,6 +410,21 @@ pub(crate) struct AppState {
     /// either way — see `fallback::is_exhausted_active`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) burn_aware_switching: bool,
+    /// Opt-in greedy re-pick (default off). The exhaustion-only walk switches
+    /// AWAY from a spent active but never back; with this on, the daemon may
+    /// also switch TOWARD the chain member with the highest sustainable weekly
+    /// burn rate — its remaining 7d budget divided by the time until that window
+    /// resets — while the active profile is still healthy. Leaning on the
+    /// highest-rate account draws its rate down toward the field, so the daemon
+    /// equalizes weekly burn across accounts (water-filling) and returns to a
+    /// preferred account on its own after a 5h offload. The 5h window stays a
+    /// pure gate (a 5h-capped member is not a candidate), so greedy never chases
+    /// a short-term throttle that refills on its own. The active is left only
+    /// once its rate falls below [`crate::fallback::GREEDY_RATE_HYSTERESIS`] of
+    /// the best rival's, so two near-equal accounts don't thrash — every switch
+    /// moves all live sessions. See `fallback::greedy_better_target`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) greedy_switching: bool,
     /// Opt-in master switch for spending real money: when on, the auto-switch
     /// chain may pick a member whose subscription windows are spent but whose
     /// account still has pay-as-you-go budget, bounded by that member's
@@ -657,6 +672,7 @@ impl Default for AppState {
             switch_off_when_spent: false,
             auth_broken: Vec::new(),
             burn_aware_switching: false,
+            greedy_switching: false,
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),

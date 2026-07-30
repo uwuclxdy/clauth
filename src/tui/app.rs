@@ -312,6 +312,12 @@ pub(crate) enum GlobalConfigRow {
     /// space cycles [`BURN_HORIZON_PRESETS`]. Dimmed + inert unless burn-aware
     /// is on.
     BurnHorizon,
+    /// Opt-in greedy re-pick (`AppState.greedy_switching`) — off by default. On,
+    /// the daemon may also switch the active account TOWARD the chain member
+    /// with the most weekly (7d) headroom while the active is still healthy —
+    /// the "return" after a 5h offload, and steady weekly load-balancing. 5h
+    /// stays a gate, so a short-term throttle never drives the move.
+    Greedy,
     /// Opt-in master switch for real-money fallback
     /// (`AppState.spend_budget_switching`) — off by default. On, the chain may
     /// hop to a member whose subscription is spent but whose account still has
@@ -3628,7 +3634,7 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 7] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 14] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 15] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
@@ -3640,6 +3646,7 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 14] = [
     GlobalConfigRow::BurnAware,
     GlobalConfigRow::BurnFloor,
     GlobalConfigRow::BurnHorizon,
+    GlobalConfigRow::Greedy,
     GlobalConfigRow::SwitchOffWhenSpent,
     GlobalConfigRow::SpendBudget,
     GlobalConfigRow::SwitchOffWhenBudgetSpent,
@@ -3663,6 +3670,7 @@ impl GlobalConfigRow {
             | GlobalConfigRow::BurnAware
             | GlobalConfigRow::BurnFloor
             | GlobalConfigRow::BurnHorizon
+            | GlobalConfigRow::Greedy
             | GlobalConfigRow::SwitchOffWhenSpent => "auto-switch",
             GlobalConfigRow::SpendBudget | GlobalConfigRow::SwitchOffWhenBudgetSpent => {
                 "extra usage"
@@ -3730,6 +3738,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::WeeklyThreshold => step_weekly_threshold(app),
         GlobalConfigRow::RefreshInterval => step_refresh_interval(app),
         GlobalConfigRow::BurnAware => toggle_burn_aware_switching(app),
+        GlobalConfigRow::Greedy => toggle_greedy_switching(app),
         // Inert while burn-aware is off (rendered dimmed): the floor/cap only
         // shape the projection, which the static path never runs.
         GlobalConfigRow::BurnFloor => {
@@ -3975,6 +3984,18 @@ fn toggle_burn_aware_switching(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.burn_aware_switching = !cfg.state.burn_aware_switching;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip opt-in greedy re-pick (`AppState.greedy_switching`) and persist. Mirrors
+/// [`toggle_burn_aware_switching`]: no other field moves, and the reload
+/// fingerprint is bumped so a daemon sharing the config picks the change up.
+fn toggle_greedy_switching(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.greedy_switching = !cfg.state.greedy_switching;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();

@@ -50,6 +50,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         RowState {
             switch_off_when_spent: state.switch_off_when_spent,
             burn_aware: state.burn_aware_switching,
+            greedy: state.greedy_switching,
             spend_budget: state.spend_budget_switching,
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
@@ -181,6 +182,7 @@ fn band_header(label: &str, focused: bool) -> Line<'static> {
 struct RowState {
     switch_off_when_spent: bool,
     burn_aware: bool,
+    greedy: bool,
     spend_budget: bool,
     switch_off_when_budget_spent: bool,
     preemptive: bool,
@@ -244,6 +246,11 @@ fn row_hint(
             "switch away once the burn rate would hit 100% before the next check"
         } else {
             "switch the active account away once its usage crosses its threshold"
+        }),
+        GlobalConfigRow::Greedy => String::from(if rows.greedy {
+            "also lean on whichever account can sustain the most usage before its weekly reset"
+        } else {
+            "only switch off an account once it's spent, and never switch back on its own"
         }),
         GlobalConfigRow::BurnFloor => format!(
             "never switch away before {}% used, however fast the burn",
@@ -376,6 +383,12 @@ fn detail_row(
                 ("static", !rows.burn_aware),
                 ("burn-aware", rows.burn_aware),
             ],
+            selected,
+        ),
+        GlobalConfigRow::Greedy => cycle_row(
+            arrow,
+            "greedy re-pick",
+            &[("off", !rows.greedy), ("on", rows.greedy)],
             selected,
         ),
         GlobalConfigRow::BurnFloor => {

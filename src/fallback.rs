@@ -70,6 +70,26 @@ fn live_five_hour(profile: &Profile) -> Option<&UsageWindow> {
 /// a member is spent while that member still serves requests.
 pub(crate) const WEEKLY_HARD_BLOCK_PCT: f64 = 100.0;
 
+/// Hysteresis for greedy re-pick: the active profile is left for a rival only
+/// once the active's sustainable weekly burn rate falls below this fraction of
+/// the rival's — 0.8, i.e. "switch when the active is ~20% worse". A
+/// multiplicative band (the active stays put while the two rates are within
+/// 0.8–1.25× of each other), so two accounts near parity don't trade the login
+/// as their windows drift. A switch moves every live session, so the band is
+/// deliberately wide.
+///
+/// [`AppState::greedy_switching`]: crate::profile::AppState::greedy_switching
+pub(crate) const GREEDY_RATE_HYSTERESIS: f64 = 0.8;
+
+/// A weekly reset closer than this many hours is treated as "about to refresh":
+/// [`greedy_burn_rate`] values the account as a fresh week rather than dividing
+/// its leftover budget by near-zero hours (which spikes the rate toward infinity
+/// and would yank every live session onto an account for the minutes before it
+/// refreshes, then off again). ~a 5h window — near-term burn is 5h-gated anyway,
+/// so an imminent weekly reset can't be realized, and this keeps the rate finite
+/// and continuous across the reset boundary.
+const GREEDY_MIN_HORIZON_HOURS: f64 = 5.0;
+
 /// Fraction of the binding spend cap a member may reach and still be picked for
 /// spend reasons. The 10% slack is poll drift insurance: utilization is sampled
 /// on a cadence, not streamed, so a member picked AT its cap would overshoot it
@@ -812,6 +832,11 @@ pub(crate) struct ChainSnapshot {
     /// so an exhausted active never loses its escape (2026-06-28 target
     /// asymmetry: the walk gates only the ACTIVE, never the target).
     pub(crate) fresh: Vec<String>,
+    /// Snapshot of `AppState::greedy_switching` — when set, a HEALTHY active may
+    /// still be switched away from, toward the member with the most weekly
+    /// headroom (see [`greedy_better_target`]). Off by default: the walk only
+    /// leaves an exhausted active, exactly as before.
+    pub(crate) greedy: bool,
 }
 
 /// Snapshot active profile + chain + per-member thresholds out of `AppConfig`.
@@ -934,6 +959,7 @@ fn build_chain_snapshot(
         switch_off_when_budget_spent: config.state.switch_off_when_budget_spent,
         kick_rejected: Vec::new(),
         fresh: Vec::new(),
+        greedy: config.state.greedy_switching,
     }
 }
 
@@ -1231,6 +1257,82 @@ pub(crate) fn next_target(
     None
 }
 
+/// A member's sustainable weekly burn rate: its weekly (7d) headroom (resolved
+/// soft line minus live utilization, floored at 0) divided by the hours until
+/// that 7d window resets — how much of its weekly budget it can spend per hour
+/// and have it last exactly to the reset. This is the axis greedy scores on: an
+/// account rich in weekly budget with time to spend it absorbs the most sustained
+/// work. Within [`GREEDY_MIN_HORIZON_HOURS`] of its reset the account is valued as
+/// the fresh week it is about to become, so the rate stays finite and continuous
+/// across the reset rather than spiking as the divisor goes to zero. `None` when
+/// the member has no live 7d window with a parseable future reset (never fetched),
+/// so it is neither scored as a target nor used to judge the active. 5h is left
+/// entirely to the `clear` gate.
+fn greedy_burn_rate(
+    member: &ChainMember,
+    usage: &HashMap<String, UsageInfo>,
+    now: i64,
+) -> Option<f64> {
+    let info = usage.get(&member.name)?;
+    if !seven_day_live(info, now) {
+        return None;
+    }
+    let window = info.seven_day.as_ref()?;
+    let resets = window.resets_at.as_deref().and_then(iso_to_epoch_secs)?;
+    let hours = (resets - now) as f64 / 3600.0;
+    // About to refresh: value it as the fresh week it becomes, not
+    // remaining/near-zero. `seven_day_live` already guarantees hours > 0.
+    if hours < GREEDY_MIN_HORIZON_HOURS {
+        return Some(member.weekly_line / (7.0 * 24.0));
+    }
+    let remaining = (member.weekly_line - window.utilization).max(0.0);
+    Some(remaining / hours)
+}
+
+/// Greedy re-pick target (opt-in via [`ChainSnapshot::greedy`]): among the
+/// CLEAR, non-sink candidates, the one with the highest sustainable weekly burn
+/// rate ([`greedy_burn_rate`]) — but only once the active's own rate has fallen
+/// below [`GREEDY_RATE_HYSTERESIS`] of it. Leaning on the higher-rate account
+/// draws its rate down toward the field, so over time the daemon equalizes burn
+/// across accounts (water-filling) and keeps each alive until its own reset.
+///
+/// `skip`/`clear` are the caller's own closures, so candidate eligibility
+/// (`broken`, `kick_rejected`, `canceled`, 5h/weekly/scoped exhaustion) is
+/// exactly the walk's; greedy adds only the rate comparison. A `last_resort`
+/// member is never a target — it is the chain's parking spot, not somewhere to
+/// migrate live work. If the active has no rate (no live 7d window) the walk
+/// stays put; a rival with an equal rate never displaces the active (a `fresh`
+/// read only breaks ties BETWEEN rivals), so nothing switches on noise.
+fn greedy_better_target(
+    snapshot: &ChainSnapshot,
+    usage: &HashMap<String, UsageInfo>,
+    active_idx: usize,
+    skip: &dyn Fn(usize) -> bool,
+    clear: &dyn Fn(&ChainMember) -> bool,
+) -> Option<String> {
+    let now = now_epoch_secs();
+    let active_rate = greedy_burn_rate(&snapshot.chain[active_idx], usage, now)?;
+    let is_fresh = |name: &str| snapshot.fresh.iter().any(|n| n == name);
+    let mut best: Option<(&ChainMember, f64)> = None;
+    for (i, m) in snapshot.chain.iter().enumerate() {
+        if i == active_idx || m.last_resort || skip(i) || !clear(m) {
+            continue;
+        }
+        let Some(rate) = greedy_burn_rate(m, usage, now) else {
+            continue;
+        };
+        let wins = match best {
+            None => true,
+            Some((_, best_rate)) => rate > best_rate || (rate == best_rate && is_fresh(&m.name)),
+        };
+        if wins {
+            best = Some((m, rate));
+        }
+    }
+    best.filter(|(_, rate)| active_rate < GREEDY_RATE_HYSTERESIS * rate)
+        .map(|(m, _)| m.name.clone())
+}
+
 /// Scheduler-side [`auto_switch_if_needed`]: same logic over an in-memory
 /// [`ChainSnapshot`] taken under the config mutex, reading utilization from the
 /// shared `UsageStore`. Returns the member to switch to, or `None`.
@@ -1344,6 +1446,18 @@ fn next_auto_switch_target_with_usage(
         if !active.last_resort
             && scoped_blocked_from_usage(active, usage)
             && let Some(name) = walk(&clear)
+        {
+            return Some(SwitchAction::To(name));
+        }
+        // Greedy re-pick (opt-in): the healthy active is not spent, but a
+        // sibling may hold materially more weekly headroom — the "return" after
+        // a 5h offload, and steady balancing of the weekly bucket. Off by
+        // default, so the walk otherwise leaves a healthy active exactly where
+        // it is. A `last_resort` active stays parked (it is the sink, not a
+        // greedy mover), consistent with every pass below.
+        if snapshot.greedy
+            && !active.last_resort
+            && let Some(name) = greedy_better_target(snapshot, usage, active_idx, &skip, &clear)
         {
             return Some(SwitchAction::To(name));
         }
