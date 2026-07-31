@@ -2112,3 +2112,100 @@ live stays pinned on `ax-codex-xfx` (`codex_fallback_chain` is unset so the
 daemon never auto-flips), and other accounts run via `clauth start <p>`
 (isolated CODEX_HOME, live untouched). The v2 spec dissolves the class:
 clauth never writes `~/.codex` at all.
+
+## UPS-10 — #59 round 2 shipped: rebased onto v0.14.0, renamed, all blockers closed (2026-07-31)
+
+**PR #59 head is now `5db71ce`, 3 commits on `v0.14.0`, `mergeStateStatus: CLEAN`**
+(was `CONFLICTING`, 151 behind). Force-pushed; pre-rebase head preserved as
+`origin/backup/feed-pre-rebase-2026-07-31` (`9ac36f7`). Local gate at the head:
+`cargo test` 1743 passed / 0 failed / 2 ignored, clippy `-D warnings` clean,
+`fmt --check` clean. Commit 1 green alone (1706), commit 2 (1740) — the series
+still bisects, which the maintainer asked for.
+
+**The stack (2 commits → 3, AX authorized the restructure):**
+
+1. `856c593 refactor(runtime): narrow the live-session rotation refusal to what
+   the session holds` — ZERO rolling-token code, stands alone, improves plain
+   #53 profiles too. This is the blocker-4 answer, and it turned out bigger
+   than "move the exemption inside `rotation_blocked_for`": the exemption
+   should not be about this feature at all. `rotation_blocked_for` now reads
+   `live_session_holds_rotatable`, which asks what each live session LAUNCHED
+   on. New `LiveSession.launch_store` field (the PATH, not a verdict —
+   `heal_misfilled_sidecar` proves sidecar CONTENT changes under a running
+   session, so a bool frozen at acquire would permit the exact rotation the
+   refusal stops). Fail-closed on every unknown; 7 tests, one macOS-gated to
+   pin the WIRING (mutation-verified: deleting the conjunct leaves the other
+   six green).
+2. `85b9965 feat(claude): rolling session token …` — the feature under its
+   final name.
+3. `5db71ce test(completions): parse every completion script in its own shell`
+   — bash -n / zsh -n / fish --no-execute, + CI installs zsh+fish and sets
+   `CLAUTH_REQUIRE_SHELL_LINT=1` so a skip cannot masquerade as a pass under
+   nextest (which discards passing-test output).
+
+**Rename `feed` → `rolling-token`/`static-token` done** (198 identifier
+occurrences + prose sweep). Two verbs, not `on|off` — answered his 07-29
+`clauth <p> --rolling-token` question with grammar evidence: the bare form is
+`external_subcommand` and exits 2 on a second token (pinned by two tests), it
+is a MUTATING switch, and every other per-profile toggle has zero CLI surface
+except the `disable`/`enable` VERB pair. **`#[serde(alias = "session_feed")]`
+is load-bearing** — without it `serde(default)` eats the old key and the next
+`render_config_toml` drops it: flag gone, sidecar still live, nothing
+re-stamping it. That is the CLA-SPLIT-3 silent-disengage class itself.
+
+**Discriminator answered (AX's call: keep the backup).** Marker is a SIBLING
+FILE `<profile>/session-token.kind` (`mint`|`rolling`), NOT a ProfileConfig
+key — a config field would put a new failure mode on the `--setup-token`
+capture path that non-rolling profiles also take, drag in `load_profile` →
+`recover_pending_credentials`, and be DROPPED (not ignored) by an older binary.
+Ordering rule: *the marker may only read `mint` while the sidecar has
+definitely been a mint since it was written* — rolling marks BEFORE, mint marks
+AFTER, so a crash always lands on the cheap side. **UNMARKED is a third state**
+falling back to the old heuristic, NOT to `mint`: every field sidecar predates
+the marker, and resolving unmarked→mint would let the first post-upgrade
+rotation snapshot an in-flight rolling bearer as the permanent degrade backup.
+
+**Blocker 2** (pre-guard snapshot) fixed with a post-guard re-read + re-checked
+freshness gate. Note: the FIRST regression test passed against unfixed code —
+it only advanced the chain before the leg started. The real test holds the
+`RotationGuard` on the test thread while the arming thread parks in `acquire`.
+
+**Other majors:** timer candidates → `enabled_profiles()`; `cmd_feed` never
+called `refuse_if_disabled` (found while checking — arming a disabled profile
+made a bearer nothing would re-stamp); quarantine `create_dir_all` deleted
+(0755 dir receiving rotating pairs); `cmd_api_key` doc comment reattached;
+`arm_rolling_token`'s postcondition used `has_session_token` and printed a LIE
+on the three degrade paths — now reads the marker back. 10 em-dashes in output
+macros rewritten (he undercounted by 3). Fork-private `EXP-1/F2`, `RC-C` labels
+and a dangling `CodexStandbyPacing` intra-doc link removed for upstreamability.
+
+**Test arithmetic answered:** 1471 (Linux) + 9 macOS-only − 1 Linux-only = 1479.
+
+**Doc debt closed:** `wiki/daemon.md` had NO row for the published key (every
+other per-profile field has one); `SECURITY.md` gained the scope-widening
+bullet + `session-token.kind` row; README feature bullet rewritten (it is the
+source `feature_coverage.rs` parses, so the rename reds that test until both
+move together).
+
+**Deployment coupling to watch:** the fork's deployed binary is built from
+`main`, which still writes `session_feed` in status.json. ccsbar decodes
+`session_feed` leniently (`decodeIfPresent ?? false`), so **when this lands in
+fork main, ccsbar must rename its coding key in the same window** or a rolling
+token renders through the MINT's 30-day ramp — healthy credential shown as
+dying, the exact display gap of 2026-07-20. `ccu` is unaffected (never read the
+key) but note its schema gate is `!=`, not `>`, so SCHEMA_VERSION must NOT be
+bumped — it wasn't.
+
+**#51:** replied with the branch-point question (v0.14.0 shipped without #59,
+so his stated order is void; proposed cutting from mommy after #59 merges,
+fallback = branch from the tag and start phase 1, which touches no credential
+path). Plus three substantive additions: (a) the symlink design makes codex a
+NON-ATOMIC writer of the profile's only copy of the chain (`storage.rs` is
+truncate+write, no rename) — a crash mid-write wedges a file whose loss costs a
+browser re-login exactly like `refresh_token_reused`, proposed a
+never-linked last-known-good copy; (b) codex session rows MUST set
+`launch_store` or every live codex session blocks rotation for its profile
+under the new predicate; (c) the 5-min stand-down + the health kick deadlock a
+PARKED chain (no codex process → nobody refreshes → 401 → kick → stand-down →
+breaker trips on a healthy chain), so scope the stand-down to profiles with a
+live codex session.
