@@ -2226,3 +2226,40 @@ every recursion level; mutation-verified.
 Lesson for next time: the fork develops on macOS and the Windows leg is the only
 place `LinkMode::Fake` (recursive copy instead of symlinks) is exercised at all,
 so fake-mode races are invisible locally by construction.
+
+**Self-review pass on the shipped diff found 5 more real defects (3d8dab8).**
+Four adversarial lenses (concurrency / rename-regression / credentials /
+upstreamability), each finding verified against source before acting; 9 of 16
+survived verification. The ones that mattered:
+
+1. **The marker ordering rule had an exception I asserted it did not.** "A crash
+   between the sidecar write and the marker write costs at worst a skipped
+   backup the next write repairs" is FALSE on the two RESTORE paths, which
+   CONSUME the backup — a stale `rolling` over a just-restored mint makes the
+   next roll skip the snapshot and overwrite the only copy. Fixed twice: restores
+   mark BEFORE removing the backup and propagate; and `preserve_static_mint`
+   gives content a VETO in the destructive direction only (mint-SHAPED sidecar
+   preserved whatever the marker says). The reverse veto would be wrong.
+2. TUI token row keyed off the config FLAG not the marker → a dead-chain degrade
+   rendered a year-scale mint as "rolling · re-stamps in ~8760h", permanently.
+3. `clauth rolling-token` on a DEAD chain exited 0 saying "the daemon retries".
+4. `cmd_static_token` reintroduced the "mid-rotation, retry" misdiagnosis
+   upstream had already retired — in a line written in the same round that
+   quoted that correction back at him. `acquire` BLOCKS; contention never
+   surfaces there.
+5. Quarantined mis-fills (rotating pairs) lived in a GLOBAL `~/.clauth/quarantine/`
+   and survived `clauth delete <profile>`. Moved under the profile dir.
+
+**Process lessons worth keeping:**
+- **A regression test can pass against the unfixed code.** The first
+  blocker-2 test only advanced the chain BEFORE the leg started, which is not
+  the interleaving; it passed under mutation. The real one holds the
+  `RotationGuard` on the test thread while the arming thread parks in
+  `acquire`. Mutation-test every regression test, not just the fix.
+- Same again on the marker: a test asserting "a failed mark degrades to
+  UNMARKED" passed vacuously (the induced failure made the cleanup fail too),
+  so the defensive line was deleted and replaced with the testable content veto.
+- **Windows CI is the only place `LinkMode::Fake` runs at all**, so fake-mode
+  races are invisible on macOS by construction. The first fix attempt covered
+  `copy_tree`'s recursion but NOT `build_runtime_dir`'s top-level walk, so it
+  did not fix its own motivating incident and Windows failed identically twice.
