@@ -2209,3 +2209,20 @@ under the new predicate; (c) the 5-min stand-down + the health kick deadlock a
 PARKED chain (no codex process → nobody refreshes → 401 → kick → stand-down →
 breaker trips on a healthy chain), so scope the stand-down to profiles with a
 live codex session.
+
+**Windows CI caught a real pre-existing upstream bug (a38a075).** The first push
+went red on `check / windows-latest` only, in
+`fake_mode_second_session_does_not_rebuild_the_tree`, with `copy_file` failing
+`os error 32` ("used by another process") on a `.tmp.<pid>.<seq>` staging
+sibling. NOT ours and NOT a flake to retry away: `union_children` already skips
+staging siblings for the watchdog mirror and its comment says exactly why, but
+`copy_tree` — which `build_runtime_dir` walks on a second acquire — had no such
+skip. There the consequence is worse because that walk PROPAGATES its error, so
+the whole `ProfileRuntime::acquire` fails instead of a tick re-converging. The
+same test passed in the RELEASE leg minutes earlier on the same runner, which is
+the signature of a race rather than a break. Fixed with the same predicate at
+every recursion level; mutation-verified.
+
+Lesson for next time: the fork develops on macOS and the Windows leg is the only
+place `LinkMode::Fake` (recursive copy instead of symlinks) is exercised at all,
+so fake-mode races are invisible locally by construction.
