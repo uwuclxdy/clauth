@@ -2057,3 +2057,58 @@ helper, and a `#[test]` attribute eaten by the cut) and fixed before the PR.
 footprint, but `mod.rs` has 54 codex refs to gate first), then the daemon
 socket + `tokens.json` feed (our ccsbar/ccu contract — upstream may not want
 it). Still blocked-on-v0.14: the codex series (UPS-7).
+
+## UPS-9 — upstream round: v0.14.0 out, #59 review round 1, codex spec v2 (2026-07-30)
+
+**v0.14.0 released 2026-07-29** ("i'll release v0.14 now, take your time" on
+#59) — WITHOUT #59, so the stated branch order from the 07-27 #51 comment
+("#59 lands first, then v0.14 gets cut, then you branch from the tag") no
+longer holds literally; confirm the actual codex-series branch point with the
+maintainer in the next #59 round (likely: mommy after #59 merges, since #59
+rewrites `ensure_installable` into the dispatch phase 2 wraps).
+
+**#59 changes-requested (2026-07-27).** Full text on the PR; the spine:
+
+- **Rename `feed` → `rolling-token` / `static-token`** verbs (config +
+  status.json key `rolling_token`, marker CLA-ROLL) — "feed" collides with the
+  status feed vocabulary already in the codebase. His 07-29 follow-up floats
+  `clauth <p> --rolling-token` as an alternative surface — answer both.
+- Blockers: (1) zsh completion apostrophe (`profile's`) breaks ALL zsh
+  completion — grammar-walk test can't see it; add shell `-n` parse legs;
+  (2) `arm_feed_from_disk` writes a PRE-RotationGuard token snapshot — re-read
+  after acquire; (3) a mint inside the 30d horizon is overwritten with no
+  backup; (4) the branch is 67 commits behind and mommy centralized rotation
+  refusals into `runtime::rotation_blocked_for` — the scheduler exemption must
+  move inside it (hand-resolve; either side wholesale is wrong-but-green).
+- Majors: timer candidates must come from `enabled_profiles()`;
+  `has_session_token` reads the sidecar now, not what the live session
+  started from; quarantine dir landed 0755 (delete the `create_dir_all`);
+  `cmd_api_key`'s doc comment reattached to `cmd_feed`.
+- Tests: the feed-axis expiry conjunct is unpinned (a `feed ||` short-circuit
+  survives the suite) — add tuples with expiry outside the window and `None`.
+- **The discriminator is ours to call**: mint-vs-fed inference (30d horizon +
+  `subscriptionType`) is buggy on both sides of the horizon. Either drop
+  `session-token.static.json` (restore = re-mint via `--setup-token`) or keep
+  it with an explicit marker OUTSIDE the sidecar wire shape.
+
+**#51 codex spec v2 (rewritten 2026-07-27 against mommy HEAD).** Four flips,
+all improvements: `-cx` dropped (bare dirs, names globally unique across both
+state files); seed/adopt-back DELETED — per-session home `auth.json` is a
+symlink to `profiles/<name>/auth.json` (codex-0.145 writes in place through
+symlinks and re-reads before spending, so one physical file makes concurrent
+carriers safe); codex self-refreshes on the ACCESS token clock (5-min
+pre-expiry window — clauth stands down inside it), not day-scale. All 6 of our
+gaps taken; 4 claude-side latent fixes folded into the series; maintainer runs
+clean-rust refactors in parallel on mommy (phase-1 state type must NOT mirror
+AppState's public slots). Key doc: `upstream/mommy:docs/codex-plan.md` — the
+07-24 revision is stale, do not implement from it.
+
+**Codex app collision (AX report, this session):** the Codex desktop app
+shares `~/.codex` with the CLI (it writes `.codex-global-state.json` there),
+so the fork's live-slot writes — `clauth <codex-profile>` switch,
+`clauth resume <codex-profile>`, and CDX-4 auto-switch (`daemon/tick.rs`
+`codex_switch_profile`) — flip the app's account too. Today's mitigation:
+live stays pinned on `ax-codex-xfx` (`codex_fallback_chain` is unset so the
+daemon never auto-flips), and other accounts run via `clauth start <p>`
+(isolated CODEX_HOME, live untouched). The v2 spec dissolves the class:
+clauth never writes `~/.codex` at all.
