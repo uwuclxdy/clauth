@@ -2348,3 +2348,29 @@ migrate `session_feed` → `rolling_token` by re-running `clauth rolling-token
 <p>` once per armed profile (the alias is gone); (b) delete the now-orphaned
 `~/.clauth/profiles/*/session-token.kind` files; (c) ccsbar already reads
 both keys, nothing to do there.
+
+### UPS-11 addendum — ccsbar review round (4778b3c + 6cb51b2, both deployed)
+
+A code-review pass over 0e128bc found 6 real defects; a verification re-run
+confirmed 4 closed and narrowed 2, now also fixed:
+
+1. stderr→reason took the LAST line, so clauth's two-line `resolve_or_bail`
+   refusal rendered as a bare profile list with no error. Now
+   `deleteFailureReason` (pure, fixture-tested) flattens the WHOLE refusal.
+2. stderr drained only inside `terminationHandler` = unbounded-pipe deadlock,
+   and `deleteInFlight` is a single global gate, so one wedged delete would
+   disable the verb app-wide. Concurrent drain + 30s SIGTERM watchdog.
+3. Delete had no mutual exclusion with `clauth login` (which runs OUTSIDE the
+   state flock for its whole browser wait — a concurrent delete races the
+   profile dir). Menu item + confirm guard + the banner's own Delete button
+   all gate on loginInFlight now.
+4. `pendingDeletePrompt` self-heals when its target vanishes (mirrors
+   `ChainEdit.removalConsequence`); `commitRename` gained the same guard.
+5. Inspection anchoring a collapsed row: both the EXPLICIT path (onChange on
+   hiddenNames + the toggle action) and the FALLBACK path
+   (`StatusModel.inspected` skips `planInactive && !active` rows; all-folded
+   → no card). Pinned both directions.
+6. The one inlined bug was in the one helper NOT extracted as pure — the
+   extraction discipline is the test coverage, again.
+
+229 tests / 0 failures. #59 CI: all six legs green on `088001a`.
