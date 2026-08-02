@@ -2263,3 +2263,88 @@ survived verification. The ones that mattered:
   races are invisible on macOS by construction. The first fix attempt covered
   `copy_tree`'s recursion but NOT `build_runtime_dir`'s top-level walk, so it
   did not fix its own motivating incident and Windows failed identically twice.
+
+## UPS-11 — #59 round 3: the scopes classifier ends the marker; #51 unblocked; ccsbar decoupled (2026-08-02)
+
+**PR #59 head is `088001a`, 7 commits on `mommy` (`ccdad87`).** Round-2 review
+(2026-07-31 13:48) verified every round-1 fix landed, took the mint exemption
+("feed-agnostic was the right instinct"), ruled the `session_feed` alias DROPPED,
+and left one arm open plus a page of smaller findings. All addressed; round-3
+reply posted (`issuecomment-5159564417`), PR body rewritten. Local gate:
+1767/0/2, clippy `-D warnings`, fmt. The branch had gone DIRTY (mommy moved 5
+commits past v0.14.0 — the `preferred` return-to-home feature both-added fields
+next to `rolling_token` in 13 files; all conflicts were keep-both pairs).
+
+**The centerpiece: `session-token.kind` is DELETED, not patched.** The
+maintainer observed the discriminating signal already on disk — every sidecar
+ever written carries either `SETUP_TOKEN_SCOPES` (2 entries) or the chain's
+grant — and proposed folding it into `mint_shaped`. Taken to its conclusion:
+`sidecar_kind_of` classifies content exactly (rolling ⇔ plan stamp or any
+scope beyond the setup pair; expiry NEVER consulted, so hand-edited
+`expiresAt` cannot reclassify), `stamp_rolling_token` refuses a grant that
+would classify Mint (totality at the only rolling writer — a chain shaped
+like that could never have polled usage, per the #52 403 fact), and the
+marker file, `mark_sidecar`/`clear_sidecar_mark`, the ordering rule, the
+content veto, `MINT_HORIZON_MS`, and `mint_shaped` are all gone. The
+justification is the maintainer's own alias ruling: the marker never shipped
+in any release either. One classifier now feeds `preserve_static_mint`,
+`sidecar_summary`, the gate's rolling-fresh test, the TUI, and status.json.
+
+**Everything else in the round-3 commit (`aec85c1`):**
+- status.json `rolling_token` publishes what the sidecar HOLDS (sidecar_summary,
+  the TUI's source), never the config flag — "the one that matters most".
+  wiki/daemon.md row rewritten to truth semantics.
+- The three unpinned fixes pinned + mutation-verified: build_snap/build_status
+  truth pins; `launch_store` exact-path assert in the acquire test (kills both
+  the `None` and the fails-OPEN runtime-side-copy mutations); horizon-revert
+  mutation reds SIX tests across three modules.
+- The sleep-based arming test is EXACT now: `arm_rolling_from_disk_synced`
+  seam (injected closure between pre-guard read and `acquire`) + a Barrier;
+  a second test pins the NEW post-guard chain-staleness re-check with a
+  re-taken clock.
+- Alias dropped + test inverted (`session_feed = true` pins to OFF).
+- `ClaudeRollingPacing` behind `RankedMutex` (new leaf rank `RollingPacing =
+  1400`), field renamed `claude_rolling`; quarantined chains take the Broken
+  leash on every verdict (flag read AFTER the gate); `restore_static_mint`
+  errors loud; `serving_desc` replaces the three unconditional "the mint"
+  loglines; `RollAttempt::Fed`→`Stamped`, `FEED_ARM_GRACE_MS`→`ROLLING_ARM_...`;
+  residual feed language swept.
+- `088001a`: the Windows fake-mode soak flake — ONE late legitimate
+  convergence pass landed after the fixed 400ms `settled` sample on a loaded
+  runner and read as self-feeding. Quiescence now measures from an observed
+  plateau (deadline catches real self-feeds). 4 local runs green.
+
+**The macOS Keychain question, answered from the field with one honest gap:**
+live slot (our daily topology) — `~/.claude/.credentials.json` is STILL the
+clauth symlink days into constant use, so the migrate-and-rewrite behavior
+never fires for a refresh-less login (under a rotating pair CC demonstrably
+replaces the symlink — `classify_link_at`'s content arm is the fossil), and
+sessions ran across the Aug-2 07:50 re-stamp and weeks of chain cycles with
+no sign-outs. Disclosed caveat: the fork also mirrors the unsuffixed Keychain
+item on re-stamp, so survival alone can't prove the read path — the intact
+symlink is the part the mirror can't explain. `clauth start` (namespaced
+item): NO field data — our sessions don't use it. Written to the maintainer
+as inference-not-observation; offered to instrument a long start-session.
+
+**#51 UNBLOCKED (comment 2026-07-31 15:59):** "Start after #59 merges … cut
+from `mommy`." Belt accepted (last-known-good copy on every well-formed read,
+restore after two bad reads under RotationGuard); both one-liners accepted
+(`launch_store: Some(profiles/<name>/auth.json)` at codex registration in
+phase 3; stand-down scoped to profiles with a live codex session). Codex
+series starts when #59 lands.
+
+**ccsbar (0e128bc, deployed + pushed):** delete-account verb (context menu →
+danger-tinted armed confirm naming every consequence → `clauth delete <name>
+--yes`, CLI-only, never `--force`, stderr surfaced verbatim), inactive-plan
+collapse (tier `canceled`/`free` folds into a "N inactive accounts"
+disclosure; the ACTIVE account never collapses — mutation-verified), and the
+`rolling_token` decode alias (new key falling back to `session_feed`) — the
+"rename ccsbar's coding key in the same window as fork main" coordination
+hazard is GONE. 222 tests / 0 failures.
+
+**Fork-sync debts this round creates (for the next SYNC):** when fork main
+reconciles to the merged #59 form — (a) fork machines' `config.toml` keys
+migrate `session_feed` → `rolling_token` by re-running `clauth rolling-token
+<p>` once per armed profile (the alias is gone); (b) delete the now-orphaned
+`~/.clauth/profiles/*/session-token.kind` files; (c) ccsbar already reads
+both keys, nothing to do there.
