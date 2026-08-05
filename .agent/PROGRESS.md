@@ -2374,3 +2374,57 @@ confirmed 4 closed and narrowed 2, now also fixed:
    extraction discipline is the test coverage, again.
 
 229 tests / 0 failures. #59 CI: all six legs green on `088001a`.
+
+## UPS-12 — #59 round 4: the reviewer's round 3 + the verification fleet catching my own round (2026-08-04)
+
+**Head `deea209`, 9 commits on `mommy` (`edff4a8`).** His round 3 ("Round 4"
+by his count) ACCEPTED the marker deletion — "went further than I asked and
+the tree is better for it" — re-ran all five of our mutations himself, and
+returned 2 blockers + 5 majors + ~20 smaller. Everything taken; reply
+`issuecomment-5187215252`; PR body at nine commits.
+
+**His two blockers:** (1) the dead-chain degrade could install an EXPIRED
+preserved mint (`restored ||` short-circuited `sidecar_live`) — fixed at the
+source: `live_backup_bytes` refuses non-live backups for every restore path
+(heal included), the file stays as evidence, and the missing test arm asserts
+Broken; (2) mommy moved again and its new `no_bare_print_macro_under_src`
+guard reds our 10 `println!` sites — rebased, `outln!` everywhere.
+
+**His majors:** `SidecarKind::Misfilled` third variant (a mis-fill carries
+chain scopes and classified Rolling; status.json published the lie — his
+"one that stings" on his own wiki-row contract); preserve's swallowed read
+error could destroy the only mint copy (loud now, NotFound-only quiet); the
+inline re-stamp leg could park the tick thread on the timeout-less
+rotation.lock (`RotationGuard::try_acquire` + `LockWait::NoWait`, gate
+answers `Cause::RotationLockHeld`); `static-token`'s four verdicts; the
+false 2026-07 attribution in wiki/daemon.md cut; both MEASURED test-rigor
+holes (outer scan gap, TUI rolling row — whose label also counted to the
+wrong clock, off by the 2h horizon).
+
+**The fleet round (the part to remember):** an adversarial 5-lens Workflow
+over my own round-3 commit, verify-behind-find, CONFIRMED five regressions
+in my fixes before push — the practice his reviews model, now applied to
+ourselves pre-push:
+1. His own "validate, arm, then persist" suggestion breaks the arm: the
+   refresh leg stamps through the FLAG-GATED rotation hook, and `outln!`
+   exit(0)-on-closed-reader at the report could leave armed-but-unflagged.
+   Correct shape: persist BEFORE, roll back to PRIOR value on failed report.
+2. My GrantUnusable pre-check dropped the WriteFailed arm's live-sidecar
+   fallback → live-mint profiles became hard switch refusals.
+3. The expired-backup refusal + bare `exists()` idempotence guard poisoned
+   the slot permanently (the recovery my own error message prescribes
+   destroyed the fresh mint). preserve now REPLACES non-live backups.
+4. static-token's Mint no-op verdict ignored the clock; expired backups
+   went unnamed in two verdicts.
+5. The unreadable-sidecar test was vacuous (a dir fails the WRITE too) —
+   pins the read arm's error context now.
+
+**Tooling lessons, both mutation-related:** (a) `mv`-restored sources keep
+pre-mutation mtimes and cargo keeps the MUTATED object — `touch` before
+trusting any post-restore run (a false red burned 20 minutes); (b) a
+string-anchored mutation can hit the WRONG occurrence of an identical line
+(`sidecar_live` appears in two arms) — anchor mutations to the ARM, and
+treat "mutation stayed green" as target-verification failure first.
+
+1823 passed / 0 failed / 2 ignored, clippy `-D warnings`, fmt. All new pins
+mutation-verified red. #51 still gated on #59 merging.
