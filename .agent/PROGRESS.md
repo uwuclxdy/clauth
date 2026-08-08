@@ -2428,3 +2428,70 @@ treat "mutation stayed green" as target-verification failure first.
 
 1823 passed / 0 failed / 2 ignored, clippy `-D warnings`, fmt. All new pins
 mutation-verified red. #51 still gated on #59 merging.
+
+## UPS-13 — #59 round 5: his round 4 measured the CLI layer unpinned; the fleet caught the freshness hole (2026-08-07)
+
+**Head `f0ca1be`, 11 commits on `mommy` (`edff4a8` — no move, no rebase).**
+His round 4 (review 2026-08-05, after our round-4 reply) confirmed both prior
+blockers closed, planted 34 mutations of his own — credential logic well
+pinned (15/18 killed), CLI report/copy layer almost entirely unpinned (14/16
+survived) — and returned 3 gates + 4 majors + ~14 smaller + ONE question he
+wanted answered, not fixed. Everything taken across two commits (`7e30f59`
+round-4 findings, `f0ca1be` fleet catches); reply
+`issuecomment-5224210166`; PR body at eleven commits, counts both legs.
+
+**His three gates:** (1) the mis-fill `Ok(false)` arm fell through to
+`vanilla_install_gate`, whose acquire BLOCKS — my own expired-backup fix had
+just WIDENED that arm, so round 3's `LockWait::NoWait` held everywhere
+except the newest path. Fixed by making `heal_misfilled_sidecar` a
+three-state `HealOutcome` (also his heal-log major: the bool's fold made the
+log lie and sent raced-away repairs down the vanilla path); `NoLiveBackup` on
+NoWait answers new `Cause::SidecarMisfilled`. (2) Four measured survivors
+(flag rollback `= true`, static-token clock gate, both read-back bails →
+print+Ok) — all pinned and re-measured as mutations. (3) An unparseable
+`session-token.static.json` trapped static-token in a loop its own recovery
+advice couldn't exit (flag-off first → parse error → re-mint takes the
+no-backup branch → identical failure) — not-a-mint slot content is now
+QUARANTINED under the profile, slot cleared, recovery converges (e2e pinned).
+
+**His question (flag-off-before-restore in `cmd_static_token`): answered as
+DELIBERATE** — flag-on means the daemon re-stamps over the very mint the
+failure copy tells the operator to capture; comment at the persist site +
+the bail copy owns causation ("this command is what stopped its
+re-stamping", substring-pinned).
+
+**The fleet round (5 lenses over my own round-4 commit, 21 agents, 16
+findings, 14 survived refutation, deduped to 9 — five real):**
+1. **The freshness half of the one-rule major, which NEITHER of us named:**
+   preserve keeping any LIVE backup let a live-but-OLDER backup do exactly
+   what the dead one used to — flag off, `login --setup-token` writes the
+   sidecar alone, next roll destroys the fresh year mint while preserving
+   the stale one. Slot rule now: live AND at least as fresh (missing expiry
+   = unbounded); pinned in three directions.
+2. Disposal shared too: preserve quarantines a displaced never-was-a-mint
+   holder (matching live_backup_bytes); dead mints overwritten in place.
+3. `restore_static_mint` was the ONE repair destroying mis-fill evidence
+   silently — quarantines the pair before overwriting now.
+4. My new expired-mint CLI verdict used zero grace beside the 5-minute rule
+   the same commit argued for — both share `BACKUP_EXPIRY_GRACE_MS`, window
+   itself pinned (his "zero the grace, suite stays green" probe now reds).
+5. A restore that ERRORS bailed with the flag off and a raw fs error owning
+   none of it — with_context copy owns the flip, pinned.
+
+**Sweep-worthy specifics:** BACKUP_EXPIRY_GRACE_MS = 5min standing on CC's
+own refresh threshold (AUTH_GATE_GRACE_MS's sibling gap left — inherited,
+offered as follow-up); `Transient::permanent_until_relogin` →
+`ROLLING_BROKEN_RETRY_MS` (asymmetry pinned: ordinary Endpoint transient
+keeps the short cadence); Cause copy test states all NINE arms + the
+permanence split; retry_after_ms sweeps departed names; `rolling_projection`
+one constructor; SECURITY.md requested-vs-granted six-scope clause (his own
+correction) + quarantine row covers the static.json class; wiki row says
+refresh-token-first. `RotationLockUnavailable` KEEPS its semicolon — his
+round-1 copy and its pin; the ` · ` sweep is round-new strings only.
+
+**Count discipline (his catch):** `grep Summary | tail` returns the DEBUG
+leg; rounds had drifted comparing release-vs-debug. From now on: both legs,
+platform named. This round: 1837 debug / 1835 release, 0 failed, 2 ignored
+(macOS), clippy `-D warnings`, fmt. 16/16 targeted mutations red across the
+two rounds. Two-file shape: filed on HIS side, blocked on the codex harness
+proving the file-membership resolver. #51 still gated on #59 merging.
