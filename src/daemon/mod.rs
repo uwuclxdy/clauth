@@ -12,6 +12,7 @@
 //! the daemon and the TUI share one cache. A single-instance advisory lock keeps
 //! two schedulers from double-firing.
 
+pub(crate) mod api;
 pub(crate) mod log_rotate;
 mod probe;
 mod status_json;
@@ -29,6 +30,7 @@ pub(crate) use probe::{daemon_lock_path, hold_daemon_lock};
 pub(crate) use types::{SwitchBackoff, switch_backoff_ms};
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -55,6 +57,9 @@ use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
 pub(crate) use status_json::build_status;
+// The feed's schema number, published by `GET /v1/health` so a remote reader
+// can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).
+pub(crate) use status_json::SCHEMA_VERSION;
 
 /// Main-loop cadence. The scheduler ticks on its own 1s timer; this loop only
 /// executes queued switches/config edits and rewrites `status.json`, so 1s is plenty.
@@ -147,9 +152,21 @@ pub(crate) enum StartMode {
     Replace,
 }
 
+/// Opt-out for the REST API, matching `CLAUTH_NO_UPDATE` / `CLAUTH_NO_COMPLETIONS`
+/// (only `"1"` opts out). A listening socket is the one daemon behavior an
+/// operator might need to kill without editing the unit that passes `--listen`.
+const NO_API_ENV: &str = "CLAUTH_NO_API";
+
+fn api_enabled() -> bool {
+    std::env::var(NO_API_ENV).as_deref() != Ok("1")
+}
+
 /// `clauth daemon` — build the shared stores, run the scheduler headless, and
 /// loop executing auto-switches + rewriting `status.json` until killed.
-pub(crate) fn serve(mode: StartMode) -> Result<()> {
+///
+/// `listen` is the REST API's bind address (`--listen`), or `None` for the
+/// default file-only daemon.
+pub(crate) fn serve(mode: StartMode, listen: Option<SocketAddr>) -> Result<()> {
     // First thing, before any output (including the standing-by line below):
     // daemon stderr IS daemon.log, and undated lines cost real forensics time
     // (2026-07-09 — see `logline`).
@@ -194,6 +211,20 @@ pub(crate) fn serve(mode: StartMode) -> Result<()> {
     warn_if_spend_is_uncapped(&config);
     let mut daemon = Daemon::new(config, dir.join(STATUS_FILE));
     daemon.boot();
+
+    // After `boot` (the stores are seeded and the scheduler is up, so a request
+    // arriving immediately gets real numbers) and before `run` (which never
+    // returns). A bind or certificate failure propagates: the operator asked
+    // for a listener, and a daemon that quietly ran without one would look
+    // healthy while the remote client stayed dark.
+    if let Some(addr) = listen {
+        if api_enabled() {
+            api::spawn(addr, Arc::clone(&daemon.config), daemon.status_path.clone())?;
+        } else {
+            logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
+        }
+    }
+
     logline!(
         "clauth daemon: running (status → {})",
         daemon.status_path.display()

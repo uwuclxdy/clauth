@@ -886,7 +886,7 @@ fn a_redundant_instance_exits_without_touching_the_shared_tree() {
     let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
     held.try_lock().expect("hold the singleton lock");
 
-    super::serve(super::StartMode::ExitIfRunning).expect("a redundant instance exits clean");
+    super::serve(super::StartMode::ExitIfRunning, None).expect("a redundant instance exits clean");
 
     assert!(
         ghost.exists(),

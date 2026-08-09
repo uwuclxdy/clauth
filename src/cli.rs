@@ -9,9 +9,16 @@
 //! `clauth start <profile> <claude args…>` forwards every token `start` does
 //! not declare to `claude` untouched, leading hyphens included.
 
+use std::net::SocketAddr;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::runtime::Isolation;
+
+/// Where a value-less `--listen` binds. Every interface, because the flag's
+/// whole purpose is a client on a different machine; a loopback default would
+/// parse fine and then serve nobody.
+pub(crate) const DEFAULT_LISTEN: &str = "0.0.0.0:8443";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -162,18 +169,47 @@ pub(crate) enum Command {
     Daemon {
         /// Wait instead, and take over when the running daemon exits. For a
         /// launchd/systemd unit paired with a manual run.
-        #[arg(long, conflicts_with_all = ["no_standby", "replace", "status"])]
+        #[arg(long, conflicts_with_all = ["no_standby", "replace", "status", "print_token", "rotate_token"])]
         standby: bool,
         /// The default's explicit spelling, kept so a spawner or unit still
         /// passing it behaves unchanged.
-        #[arg(long, conflicts_with_all = ["replace", "status"])]
+        #[arg(long, conflicts_with_all = ["replace", "status", "print_token", "rotate_token"])]
         no_standby: bool,
         /// Terminate the running daemon and take over, for an in-place upgrade.
-        #[arg(long, conflicts_with = "status")]
+        #[arg(long, conflicts_with_all = ["status", "print_token", "rotate_token"])]
         replace: bool,
         /// Print the running daemon, or exit 1 with no output when none is.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["listen", "print_token", "rotate_token"])]
         status: bool,
+        /// Also serve the REST API over TLS; bare --listen means 0.0.0.0:8443
+        ///
+        /// For running the daemon on one machine and a client (clauth-tray) on
+        /// another. TLS comes from this host's lego certificate — from
+        /// /etc/lego/certificates on macOS and Linux, and from
+        /// %AppData%\lego\certificates on Windows, either overridable in
+        /// ~/.clauth/tls.json. Every request needs the bearer token from
+        /// `--print-token`.
+        ///
+        /// The value-less spelling binds every interface, matching what the
+        /// flag is for — a client on another machine. It is the same exposure
+        /// the spelled-out form always had, just less to type; the flag itself
+        /// still has to be passed, so nothing listens by accident.
+        #[arg(
+            long,
+            value_name = "ADDR:PORT",
+            num_args = 0..=1,
+            default_missing_value = DEFAULT_LISTEN,
+            conflicts_with_all = ["print_token", "rotate_token"],
+        )]
+        listen: Option<SocketAddr>,
+        /// Print the REST API's auth token, creating it on first use, and exit.
+        #[arg(long, conflicts_with = "rotate_token")]
+        print_token: bool,
+        /// Replace the REST API's auth token with a fresh one, print it, exit.
+        ///
+        /// Every client holding the old token starts getting 401s.
+        #[arg(long)]
+        rotate_token: bool,
     },
 
     /// Print the usage / auto-switch snapshot as JSON

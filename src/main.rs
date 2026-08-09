@@ -156,17 +156,29 @@ fn dispatch(cli: Cli) -> Result<()> {
             standby,
             replace,
             status,
+            listen,
+            print_token,
+            rotate_token,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
         } => {
-            if status {
+            // The token arms come first: both print and exit without touching
+            // the singleton lock, so they answer for a daemon that is already
+            // running as readily as for one that is not.
+            if print_token {
+                println!("{}", daemon::api::token::load_or_create()?);
+                Ok(())
+            } else if rotate_token {
+                println!("{}", daemon::api::token::rotate()?);
+                Ok(())
+            } else if status {
                 daemon::status_probe()
             } else if replace {
-                daemon::serve(daemon::StartMode::Replace)
+                daemon::serve(daemon::StartMode::Replace, listen)
             } else if standby {
-                daemon::serve(daemon::StartMode::Standby)
+                daemon::serve(daemon::StartMode::Standby, listen)
             } else {
-                daemon::serve(daemon::StartMode::ExitIfRunning)
+                daemon::serve(daemon::StartMode::ExitIfRunning, listen)
             }
         }
         Command::Status {

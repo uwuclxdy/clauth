@@ -20,7 +20,7 @@ const BASH: &str = r#"_clauth() {
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--isolated --rescue --no-rescue --with-fallback" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status --listen --print-token --rotate-token" -- "${cur}") )
     elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
@@ -107,7 +107,10 @@ _clauth() {
             '--standby[wait and take over when the running daemon exits]' \
             '--no-standby[explicit spelling of the default]' \
             '--replace[terminate the running daemon and take over]' \
-            '--status[print the running daemon, or exit 1 when none is]'
+            '--status[print the running daemon, or exit 1 when none is]' \
+            '--listen[also serve the REST API over TLS, default 0.0.0.0:8443]' \
+            '--print-token[print the REST API auth token and exit]' \
+            '--rotate-token[replace the REST API auth token and exit]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == status ]]; then
         _values 'flag' '--json[print the status snapshot as JSON]' '--all[also list disabled profiles]' '--disabled[also list disabled profiles]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == list ]]; then
@@ -167,6 +170,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --standby -d "W
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --no-standby -d "Explicit spelling of the default"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --replace -d "Terminate the running daemon and take over"
 complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --status -d "Print the running daemon, or exit 1 when none is"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --listen -d "Also serve the REST API over TLS, default 0.0.0.0:8443"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --print-token -d "Print the REST API auth token and exit"
+complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --rotate-token -d "Replace the REST API auth token and exit"
 "#;
 
 pub(crate) fn print_script(shell: &str) -> Result<()> {

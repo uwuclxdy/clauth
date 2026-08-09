@@ -119,6 +119,13 @@ pub(crate) mod rank {
         ThirdPartyStatus = 280;
         UsageStore = 300;
         UsageStatus = 350;
+        /// The REST API's in-process switch gate (`daemon::api`). One `POST
+        /// /v1/switch` at a time: a second concurrent request gets an immediate
+        /// 409 instead of parking 25s on the cross-process state flock and then
+        /// timing out. Ranked OUTSIDE `Config` because that is where it is held
+        /// — across `switch_profile_noninteractive`, which takes `Config` (400)
+        /// and then `State` (500) beneath it.
+        ApiSwitch = 380;
         Config = 400;
         /// `/profile` re-fetch TTL clock in `usage::fetch` (in-memory memo +
         /// durable stamp). A true leaf: every acquisition is take-read/insert-
@@ -276,7 +283,32 @@ impl<T, R: Rank> RankedMutex<T, R> {
             })),
         }
     }
+
+    /// Acquire the lock if it is free, else return `Err` at once.
+    ///
+    /// Ranks like [`lock`](Self::lock) rather than skipping the check: a
+    /// try-lock that SUCCEEDS holds the rank for exactly as long, so an
+    /// out-of-order try is the same latent deadlock as an out-of-order lock and
+    /// has to assert the same way. The rank is entered before the attempt and
+    /// dropped again when the attempt fails, so a contended try leaves nothing
+    /// behind.
+    ///
+    /// `daemon::api`'s switch gate is still the only caller, on every platform
+    /// clauth targets.
+    pub(crate) fn try_lock(&self) -> Result<RankedGuard<'_, T>, TryLockError> {
+        let rank = RankGuard::enter::<R>();
+        match self.inner.try_lock() {
+            Ok(guard) => Ok(RankedGuard { guard, _rank: rank }),
+            Err(_) => Err(TryLockError),
+        }
+    }
 }
+
+/// [`RankedMutex::try_lock`] found the lock held (or poisoned). Deliberately
+/// opaque: the one caller turns it into a "busy, try again" answer, and a
+/// poisoned mutex is just as unavailable as a held one.
+#[derive(Debug)]
+pub(crate) struct TryLockError;
 
 /// Guard for a [`RankedMutex`]. Derefs to `T`. Releases the inner mutex first,
 /// then the held rank (field declaration order), so the rank outlives the lock
