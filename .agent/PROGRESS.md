@@ -2495,3 +2495,65 @@ platform named. This round: 1837 debug / 1835 release, 0 failed, 2 ignored
 (macOS), clippy `-D warnings`, fmt. 16/16 targeted mutations red across the
 two rounds. Two-file shape: filed on HIS side, blocked on the codex harness
 proving the file-membership resolver. #51 still gated on #59 merging.
+
+## UPS-14 (2026-08-11) — #59 round 6: rebase onto 4c6c97c, --clear reconcile, the watching leash
+
+**Trigger:** his round-6 review (2026-08-08, 4th→5th CHANGES_REQUESTED,
+review 4888351018: three holds + a round-5 reachability mea culpa +
+smaller) AND his 2026-08-11 comment: mommy moved to 4c6c97c (23 commits),
+last four in our namespace — upstream shipped `static-token --clear`
+(required=true, bare form RESERVED for our restore) + which::SessionTokenMatch,
+and left two design questions to our two-file shape.
+
+**Shipped (head 8330fa1, 14 commits on 4c6c97c, force-pushed; reply
+issuecomment-5253252430; PR body at fourteen commits):**
+
+- REBASE onto 4c6c97c: 11 commits replayed (rerere; conflicts at 4 commits;
+  cli.rs AUTO-MERGED into TWO StaticToken variants — the trap: git showed no
+  marker), README rolling prose → wiki (Quickstart/Configuration), FEATURE_MAP
+  re-bucketed Switch+Headless, ·rolling tag dropped per upstream 5dde024,
+  session_tokens cache collapsed back to plain SessionTokenStatus.
+- --CLEAR = FULL EXIT (both his questions answered YES, one principle):
+  flag first, then sidecar, then preserved mint — CLI + TUI. Widened
+  nothing-to-clear (all three pieces), other-login guard covers the backup
+  slot, backup DELETED not quarantined (operator-confirmed removal ≠
+  evidence), mis-filled sidecar QUARANTINED first (fleet catch).
+- Hold 1: every 6h hold records credential_fingerprint (mtime+len of the
+  three files), any change releases next scan; two false re-login comments
+  rewritten; his not-an-ask TAKEN: rolling_sidecar_restamp_due reads
+  NotLongLived due NOW → daemon-side heal reachable.
+- Hold 2: AUTH_GATE_GRACE_MS = BACKUP_EXPIRY_GRACE_MS (one home) — PLUS the
+  fleet found the SIXTH consumer neither of us listed: vanilla_install_gate's
+  static arm had zero grace (static-token EXPIRED vs switch installs same
+  bytes — his exact scenario, one gate over). Pinned both directions.
+- Hold 3: scope_widening_disclosure/restamp_promise/rollback_stranded_warning
+  + the clear's three lines = single-caller fns (deleted print = dead_code
+  under -D warnings, HIS verification method) + content pins.
+- StateLockBusy: sidecar_repair_transient downcasts StateLockTimeout in the
+  chain (macOS flock across 20s security shell-out = contention, never
+  "check permissions"). TEN cause arms stated.
+- FLEET (57 agents, 22 confirmed of 26): THE CRITICAL — clear/restore flag
+  persist wrote the pre-acquire config snapshot back through save_profile
+  (persists WHOLE profile) → a rotation landing during the UNBOUNDED confirm
+  prompt rewound to a spent refresh token. Fix: load_profile from disk UNDER
+  the guard, write only the flag; `active` re-read under guard too (dangling
+  symlink both directions). TUI clear: RotationGuard::try_acquire (loud toast
+  on held), row offered on ANY long-lived piece, hint discloses full scope.
+- ecf7db2 (upstream) fails clippy 1.96 nonminimal_bool → is_none_or rewrite
+  in our series (flagged in reply, his to keep or cherry-pick).
+
+**Verification:** 1881 debug / 1879 release, 0 failed, 2 ignored (macOS),
+clippy -D warnings + fmt clean. 23/23 targeted mutations red across two
+sweeps (17 + 6, incl. his five measured survivors). CI watcher pending at
+ledger time.
+
+**Learned:** (1) A rebase can auto-merge two same-named clap variants with
+NO conflict marker — grep the enum after every rebase. (2) save_profile
+persists the whole profile: NEVER write a pre-prompt/pre-guard config
+snapshot back — load under the guard, mutate one field. (3) The fleet's
+worktree must be a git worktree pinned at HEAD (mutation driver runs
+concurrently in the main tree).
+
+**Next:** his round-7 re-measure. #51 codex series still gated on #59
+merging. AUTH_GATE sibling gap CLOSED this round (the 6th consumer), so the
+old offered follow-up is moot.
