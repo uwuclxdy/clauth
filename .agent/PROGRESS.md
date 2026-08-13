@@ -2557,3 +2557,74 @@ concurrently in the main tree).
 **Next:** his round-7 re-measure. #51 codex series still gated on #59
 merging. AUTH_GATE sibling gap CLOSED this round (the 6th consumer), so the
 old offered follow-up is moot.
+
+## UPS-15 — #59 round 7 (2026-08-13)
+
+**Shipped:** head `7368560`, 16 commits REBASED onto mommy `043c813`
+(upstream +51: api-key clear copy 1103ec2, trimmed action menu, keychain
+budget work, alibaba console). Reply issuecomment-5278735531; PR body at
+sixteen commits.
+
+**His round-7 review (4921878688):** one ask (--yes destroys the preserved
+mint silently) + seven measured items + rebase instruction ("leave that
+copy to me") + a claim he could not repro (clippy 1.96 nonminimal_bool) +
+wiki field-data request.
+
+**Round-7 commit (findings):** clear_backup_postscript unconditional on the
+removal (CLI) + " · the preserved mint is gone" toast suffix (TUI), content
+pins for all four clear copy fns, TUI flag persisted-then-flipped, one
+refusal condition on both surfaces (flag-only disarms; was visible-row-
+silent-return), other-login refusal re-checked under the guard (threaded
+race test, "anymore" discriminator, retry-until-won), has_static_backup
+one spelling at the clear site, retry_hold takes HoldKind (duration+watch
+derive from kind).
+
+**Rebase resolutions:** his TUI strings byte-identical (his pins pass
+unmodified); CLI weave was git-clean (his confirm/post-clear branching
+around our three-piece); ActionMenuAction::ClearSessionToken + menu test
+DROPPED (upstream removed the whole row-proxy layer); keychain_write →
+keychain_mirror_rotation at claude_feed_tick's active mirror (his call to
+verify); 248d41f == his 3ca1663 (comment contributed); one replay dropped
+his logline import from claude.rs (marker-free auto-merge — caught by
+building every commit's tree); wiki merges keep his AuthExpired/api-key
+rows + our rolling rows.
+
+**Fleet (51 agents, 23 raw → 18 upheld / 5 refuted), second commit:**
+- CRITICAL PAIR: arm_rolling_from_disk + rolling_install_gate never
+  re-checked the FLAG under the guard → a parked writer re-stamps a fresh
+  rolling bearer over a COMPLETED clear (flag off = nothing re-stamps it,
+  backup already gone). Both re-read disk under guard now; Block leg drops
+  guard → vanilla, NoWait leg → Ready.
+- TUI other-login gate read a snapshot reload_fingerprint can never
+  invalidate (doesn't stat credentials.json) → disk re-check under guard.
+  `active` stays in-memory deliberately (TUI is the switcher; his tests pin it).
+- Relink now lands BEFORE backup removal on both surfaces (dangling live
+  slot under "clear failed" otherwise); partial state owned in words.
+- detail_row was a THIRD gate reader still dimming on the old condition →
+  Snap::clear_gated, one spelling; flag-only-no-login gets its own copy on
+  hint/toast/CLI (was promising an api key that doesn't exist).
+
+**Clippy claim resolution:** BOTH real — local stable 1.96.0 reds the
+isolated repro under -D warnings; his 1.97.1 passes (lint narrowed).
+Wiki field data: the plan-gated model tier is Fable (claude-fable-5); no
+captured response body (incident predates the feature).
+
+**Verification:** 2028 debug / 2026 release, 0 failed, 3 ignored (macOS),
+clippy -D warnings + fmt clean. 20/20 targeted mutations red across two
+sweeps (10 + 10; N10 needed the persist-failure injection moved from
+config.toml-as-dir to read-only-dir after the fleet fix relocated the
+first fallible read). CI watcher pending at ledger time.
+
+**Learned:** (1) zsh eats `$c:src/...` as a history modifier — quote
+`${c}:path` in loops or the data is garbage. (2) A fleet fix can MOVE the
+first fallible step above a mutation's target, silently degrading an
+existing kill — re-run the prior sweep's neighbors after restructuring.
+(3) rerere can resurrect a stale resolution mid-autosquash; disable it
+before surgical rebases. (4) Upstream deleting a host mechanism (menu
+row-proxy layer) means our plug-in variant dies with it — follow the
+rework, don't re-introduce the layer.
+
+**Next:** his round-8 re-measure (two veto handles left open: menu entry
+for the clear row, keychain_mirror_rotation choice; plus the bare-restore
+backup spelling offered as next-round work). #51 codex series still gated
+on #59 merging.
