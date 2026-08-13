@@ -2628,3 +2628,57 @@ rework, don't re-introduce the layer.
 for the clear row, keychain_mirror_rotation choice; plus the bare-restore
 backup spelling offered as next-round work). #51 codex series still gated
 on #59 merging.
+
+## UPS-16 — #59 MERGED (2026-08-13)
+
+Upstream merged `feat/session-token-feed` as TRUE MERGE `7340d44` — second
+parent is our exact head `7368560`, sixteen commits kept as reviewed. His
+gate on the merged tree (linux, isolated target): 2103 debug / 2101
+release, 0 failed; clippy -D warnings, fmt, deny, audit clean. Post-merge
+comment: issuecomment-5282390909; our ack: issuecomment-5284558847.
+
+- **Merge-side collision fix (his):** mommy had grown 8 herdr commits; the
+  only real break was herdr's zsh `'"'"'` apostrophe idiom (correct zsh,
+  odd quote count) vs our completions single-quote-parity scan. Each
+  branch green alone; no CI leg on either side ever ran the pair. His fix:
+  idiom elided before counting behind a shared `zsh_quote_parity_holds`;
+  a bare apostrophe in the rolling-token spec still reds both backstops.
+- **All three follow-ups owned upstream — nothing owed by us:**
+  - `aed141b` (landed): TUI clear row reads `active` OFF DISK — his
+    override of our deliberate in-memory read; the argument that settles
+    it is `daemon/tick.rs:226` + `fallback.rs:1628` calling
+    `switch_profile` with no keypress in this process, so the snapshot
+    goes stale with no user action and the relink lands on the wrong
+    profile or leaves the live slot dangling. Plus em-dash → `·` sweep
+    and the backup-failure message keeping the completed relink/disarm.
+  - `c33204a` (landed): Quickstart names the third clear outcome.
+  - PENDING his side: `keychain_mirror_rotation` foreign-login hole — the
+    ONE finding he rates seriously. Both mirror writes (`oauth.rs:1315`
+    sidecar-fill, `:2145` rolling tick) sit where `live_login_is_foreign`
+    (:1286) can never run, so the only guard is `cfg.is_active` — clauth's
+    belief about the file layer, not a read of the item. Failure shape:
+    A rolling+active, operator `/login`s as B in a session, CC writes B
+    into the item; next re-stamp lands A's bearer while `Keep::Everything`
+    preserves B's organizationUuid/trustedDeviceToken → mixed-identity
+    item that never self-corrects. CONFIRMED by us on the merged tree
+    (ack has the line numbers). The same-account assumption was our pick
+    in round 7 (keychain_write's replacement); he fixes it upstream.
+- **Round-7 decisions ratified:** menu-variant drop = right, no veto.
+  Clippy dispute settled as 1.96→1.97 lint narrowing (both measurements
+  real; rewrite kept, costs nothing). Fable wiki detail recorded as
+  relayed-not-measured. `cmd_static_token` hand-built backup path moved
+  to HIS books (consolidation = bail→silent-false on restore, his call).
+
+**Learned:** (1) A completions-parity test can be broken by a sibling
+branch's legal-but-odd shell idiom — quote-counting scans need the idiom
+table, not just the balance. (2) "Same-account by construction" is a
+claim about MY writer, not about the item: any shared-store mirror must
+re-check whose login it is overwriting (live_login_is_foreign) — file-
+layer belief (`is_active`) is not that check.
+
+**Next:** #51 codex series UNBLOCKED — cut from `mommy` (now `c33204a`),
+against upstream's `docs/codex-plan.md`, 6-part series, belt + both
+one-liners accepted. OWED at next fork SYNC: true-merge the merged mommy
+(incl. herdr + his follow-ups), reconcile CLA-FEED to merged form, then
+the standing debts — re-run `clauth rolling-token <p>` per armed profile,
+delete orphaned session-token.kind files.
