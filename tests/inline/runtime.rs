@@ -7537,3 +7537,39 @@ fn rotation_blocked_for_reads_what_the_live_session_holds() {
         );
     });
 }
+
+/// The isolated stores are CLAUDE stores by roster, not by directory shape: a
+/// codex profile's dir is skipped before its children are read — folded fix 4's
+/// membership half, now that the false dead_code attribute is gone
+/// (sessions.rs consumes this fn).
+#[test]
+fn live_isolated_stores_skip_codex_profiles_by_roster() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut locks = Vec::new();
+    for name in ["cl", "cx"] {
+        let projects = home
+            .home()
+            .join(format!(".clauth/profiles/{name}/runtime-isolated/projects"));
+        fs::create_dir_all(&projects).expect("mkdir projects");
+        let sessions = home
+            .home()
+            .join(format!(".clauth/profiles/{name}/sessions-isolated"));
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let lock = open_pid_file(&sessions.join("12345")).expect("open pid");
+        lock.lock().expect("lock pid");
+        locks.push(lock);
+    }
+    fs::write(
+        home.home().join(".clauth/codex-profiles.toml"),
+        "profiles = [\"cx\"]\n",
+    )
+    .expect("write codex roster");
+
+    let stores = live_isolated_stores();
+
+    assert_eq!(
+        stores.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+        ["cl"],
+        "the codex twin of an identically live-shaped store is not listed"
+    );
+}

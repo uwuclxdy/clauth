@@ -970,10 +970,11 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
 /// [`has_live_session`], which also counts shared sessions) and on the projects
 /// dir existing, so a shared-only or not-yet-written runtime is skipped.
 /// Fail-soft: an unreadable profiles root or entry is skipped, never an error.
-#[allow(
-    dead_code,
-    reason = "consumed by the session index (src/sessions.rs), wired into a surface in a later phase"
-)]
+///
+/// Claude-only by roster, not by accident: the session index this feeds reads
+/// Claude Code transcripts, and a codex profile's dir — which sits in the same
+/// root — is skipped outright rather than relying on it never containing a
+/// `runtime-isolated*` child.
 pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(root) = profiles_root_dir() else {
         return Vec::new();
@@ -981,12 +982,16 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
     let mut out = Vec::new();
     for profile in entries.flatten() {
         let profile_name = profile.file_name();
         let Some(profile_name) = profile_name.to_str() else {
             continue;
         };
+        if codex.holds(profile_name) {
+            continue;
+        }
         let profile_path = profile.path();
         let Ok(children) = std::fs::read_dir(&profile_path) else {
             continue;
