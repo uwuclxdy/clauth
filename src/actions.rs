@@ -963,19 +963,14 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
         }
         Err(e) => return Err(e).with_context(|| format!("failed to read {}", auth_path.display())),
     };
-    let parsed: serde_json::Value = serde_json::from_slice(&raw).with_context(|| {
+    let parsed = crate::codex_auth::CodexAuth::parse(&raw).with_context(|| {
         format!(
             "failed to parse {} — codex writes this file in place, so a login caught \
              mid-write reads half-written; re-run the capture",
             auth_path.display()
         )
     })?;
-    let has_chain = parsed
-        .get("tokens")
-        .and_then(|t| t.get("refresh_token"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|rt| !rt.is_empty());
-    if !has_chain {
+    if parsed.refresh_token().is_none() {
         bail!(
             "{} holds no ChatGPT token chain (an API-key-only setup?) — only a \
              `codex login` chain can be captured",
@@ -1023,23 +1018,15 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
             && let Ok(bytes) = std::fs::read(
                 profile_dir(&ProfileName::from(canonical.as_str()))?.join("auth.json"),
             )
-            && let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && let Ok(existing) = crate::codex_auth::CodexAuth::parse(&bytes)
+            && let (Some(old), Some(new)) = (existing.account_id(), parsed.account_id())
+            && old != new
         {
-            let account = |v: &serde_json::Value| {
-                v.get("tokens")
-                    .and_then(|t| t.get("account_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            };
-            if let (Some(old), Some(new)) = (account(&existing), account(&parsed))
-                && old != new
-            {
-                bail!(
-                    "'{canonical}' stores ChatGPT account {old}, but the operator login \
-                     is account {new} — capture it into a new profile, or delete \
-                     '{canonical}' first"
-                );
-            }
+            bail!(
+                "'{canonical}' stores ChatGPT account {old}, but the operator login \
+                 is account {new} — capture it into a new profile, or delete \
+                 '{canonical}' first"
+            );
         }
         let dir = profile_dir(&ProfileName::from(canonical.as_str()))?;
         crate::profile::mkdir_700(&dir)

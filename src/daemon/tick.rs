@@ -31,6 +31,13 @@ impl super::Daemon {
         self.reload_if_changed();
         self.drain_pending_switch();
         self.drain_pending_switch_off();
+        // The codex standby leg: self-contained (reads the codex roster
+        // itself), so the claude scheduler's state stays untouched —
+        // per-harness independence, decision 4 of the codex plan.
+        crate::codex_auth::standby_tick(
+            crate::usage::now_ms() as i64,
+            &chrono::Utc::now().to_rfc3339(),
+        );
         self.write_status();
     }
 

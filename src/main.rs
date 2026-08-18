@@ -3,6 +3,7 @@ mod alibaba_login;
 mod claude;
 mod claude_json;
 mod cli;
+mod codex_auth;
 mod codex_profiles;
 mod completions;
 mod daemon;
