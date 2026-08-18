@@ -846,6 +846,76 @@ pub(crate) fn gc_stale_runtimes() {
     gc_live_session_rows();
     gc_bare_markers();
     crate::hook_note::gc_conversation_records();
+    gc_codex_homes();
+}
+
+/// True for a PER-SESSION codex home name — `codex-home-<sid>` /
+/// `codex-home-isolated-<sid>` — the strict form GC may `remove_dir_all`.
+/// The bare stems (the durable store, and fake mode's shared home) are
+/// deliberately NOT matched: `rest.is_empty()` is excluded, unlike
+/// [`is_paired_dir_name`], because the bare codex home holds state that must
+/// outlive every session.
+fn is_per_session_codex_home_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(CODEX_HOME_STEM) else {
+        return false;
+    };
+    let rest = rest.strip_prefix("-isolated").unwrap_or(rest);
+    rest.strip_prefix('-').is_some_and(is_session_id)
+}
+
+/// Collect codex session homes whose session died without teardown. The
+/// claude GC's pairing rule cannot see these (a codex home matches no
+/// `runtime*` stem — by design, so the reconcilers never touch it), and the
+/// marker-dir orphan branch reaps the SESSIONS dir on its own — which would
+/// leave the home tree unpairable and immortal. Same liveness rule as every
+/// other sweep: a dir whose paired marker dir holds a live flock is spared,
+/// and so is one whose liveness cannot be READ (unknown reads as live).
+fn gc_codex_homes() {
+    let Ok(root) = profiles_root_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for profile in entries.flatten() {
+        let profile = profile.path();
+        let Ok(children) = std::fs::read_dir(&profile) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let file_name = child.file_name();
+            let Some(child_name) = file_name.to_str() else {
+                continue;
+            };
+            if !is_per_session_codex_home_name(child_name) {
+                continue;
+            }
+            // `codex-home<rest>` pairs with `sessions<rest>` — the same
+            // `<rest>` convention the runtime pairing uses. A missing marker
+            // dir reads as DEAD, not live: the acquire creates the marker
+            // before the home, so a home with no marker dir is a crashed
+            // teardown's leftover, and sparing it would be the immortality
+            // this sweep exists to end.
+            let Some(rest) = child_name.strip_prefix(CODEX_HOME_STEM) else {
+                continue;
+            };
+            let sessions = profile.join(format!("{SESSIONS_STEM}{rest}"));
+            // The acquire creates and flock-holds the marker BEFORE the home
+            // exists (both under the state lock), so "home present, marker
+            // dir absent" is never a start in flight — only a crash's
+            // leftover. An unreadable marker dir reads as live, like every
+            // sweep here.
+            let dead = if sessions.exists() {
+                matches!(live_sessions_at(&sessions), Some(0))
+            } else {
+                true
+            };
+            if dead {
+                let _ = std::fs::remove_dir_all(child.path());
+                let _ = std::fs::remove_dir(&sessions);
+            }
+        }
+    }
 }
 
 fn gc_runtime_trees() {
@@ -3890,18 +3960,28 @@ fn codex_global_home(name: &str) -> Result<PathBuf> {
     profile_subpath(&ProfileName::from(name), CODEX_HOME_STEM)
 }
 
-/// The sqlite stores plus the history file — per-session paths symlinked into
-/// the profile-global home so memory survives session teardown. The `-wal`/
-/// `-shm` companions are NOT linked: sqlite resolves the database path before
-/// deriving them, so they land beside the link TARGET on their own, and a
-/// pre-planted dangling link would only be something for sqlite to trip over.
-/// A store name a future codex adds stays per-session until this list learns
-/// it — a bounded, visible degradation, against silently linking anything.
+/// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
+/// table) plus the history file — per-session paths symlinked into the
+/// profile-global home so memory survives session teardown. The companions
+/// ride along deliberately: a write through a dangling symlink CREATES its
+/// target, so the bytes land in the store whichever path sqlite derives the
+/// auxiliary names from — linking them makes the layout correct without
+/// betting on sqlite's symlink resolution. A store name a future codex adds
+/// stays per-session until this list learns it — a bounded, visible
+/// degradation, against silently linking anything.
 const CODEX_DURABLE_ENTRIES: &[&str] = &[
     "goals_1.sqlite",
+    "goals_1.sqlite-wal",
+    "goals_1.sqlite-shm",
     "logs_2.sqlite",
+    "logs_2.sqlite-wal",
+    "logs_2.sqlite-shm",
     "memories_1.sqlite",
+    "memories_1.sqlite-wal",
+    "memories_1.sqlite-shm",
     "state_5.sqlite",
+    "state_5.sqlite-wal",
+    "state_5.sqlite-shm",
     "history.jsonl",
 ];
 
@@ -3982,15 +4062,19 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
     // The one physical auth.json. Placed even while the store is absent (a
     // captured login can arrive after the first start): a dangling link reads
     // as "no credentials" to codex today and as the store the moment it
-    // exists. Under Fake there is nothing to dangle — an absent store just
-    // copies nothing yet.
-    if home.join("auth.json").symlink_metadata().is_err() {
-        match mode {
-            LinkMode::Real => link_entry(&auth_store, &home.join("auth.json"))?,
-            LinkMode::Fake => {
-                if auth_store.exists() {
-                    copy_file(&auth_store, &home.join("auth.json"))?;
-                }
+    // exists. Under Fake the copy is a PROJECTION of the store, re-converged
+    // at every session start so a re-capture reaches the next session —
+    // mid-session staleness stays fake mode's documented cost.
+    let auth_dst = home.join("auth.json");
+    match mode {
+        LinkMode::Real => {
+            if auth_dst.symlink_metadata().is_err() {
+                link_entry(&auth_store, &auth_dst)?;
+            }
+        }
+        LinkMode::Fake => {
+            if auth_store.exists() && !files_match(&auth_store, &auth_dst).unwrap_or(false) {
+                copy_file(&auth_store, &auth_dst)?;
             }
         }
     }
@@ -4146,10 +4230,15 @@ impl Drop for CodexRuntime {
             && let Ok(global) = codex_global_home(&self.profile)
         {
             let src = self.home.join("sessions");
-            if src.is_dir()
-                && let Err(e) = copy_tree(&src, &global.join("sessions"))
-            {
-                logline!("clauth: codex sessions sync-back failed: {e:#}");
+            if src.is_dir() {
+                // Owner-only from birth: the sweep stops at the codex-home
+                // threshold, so nothing retightens what lands loose here, and
+                // rollouts are chat content.
+                let _ = crate::profile::mkdir_700(&global);
+                let _ = crate::profile::mkdir_700(&global.join("sessions"));
+                if let Err(e) = copy_tree(&src, &global.join("sessions")) {
+                    logline!("clauth: codex sessions sync-back failed: {e:#}");
+                }
             }
         }
 

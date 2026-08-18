@@ -22,9 +22,9 @@
 //!   the claude roster first, then this one; membership decides the harness,
 //!   nothing else has to. Claude-first also arbitrates the state uniqueness
 //!   cannot promise: two hand-edited state files both claiming a name.
-//! - `clauth login <name> --codex` — the create/re-auth verb; the flag picks
-//!   which file the profile lives in, appears only there, and ships with the
-//!   codex login itself later in the series.
+//! - `clauth login <name> --codex` — the create/re-auth verb (an adoption of
+//!   the operator's own codex login); the flag picks which file the profile
+//!   lives in and appears only there.
 //! - rename follows the bare-name rule when its surface (the TUI) gains
 //!   codex rows.
 //!

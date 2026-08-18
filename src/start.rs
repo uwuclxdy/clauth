@@ -254,7 +254,9 @@ pub(crate) fn run(
 
     #[cfg(not(unix))]
     let outcome = ChildOutcome {
-        status: child.wait().context("failed to wait for claude")?,
+        status: child
+            .wait()
+            .context("failed to wait for the session child")?,
         signal: None,
     };
 
@@ -381,7 +383,10 @@ fn wait_for_child(
     signals: &Receiver<i32>,
 ) -> Result<ChildOutcome> {
     loop {
-        if let Some(status) = child.try_wait().context("failed to wait for claude")? {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to wait for the session child")?
+        {
             return Ok(ChildOutcome {
                 status,
                 signal: next_signal(signals),
@@ -407,7 +412,10 @@ fn wait_after_signal(
 ) -> Result<ChildOutcome> {
     let mut signal = first_signal;
     loop {
-        match child.try_wait().context("failed to wait for claude")? {
+        match child
+            .try_wait()
+            .context("failed to wait for the session child")?
+        {
             Some(status) => {
                 return Ok(ChildOutcome {
                     status,
@@ -465,6 +473,34 @@ fn forward_signal(child: &std::process::Child, signal: i32) -> std::io::Result<(
 /// the store mode simply re-breaks the linked `auth.json` for that one run,
 /// the same class of self-inflicted foot-gun as `claude --settings` against a
 /// clauth runtime.
+/// The spawn command for a codex session on `home`, split from [`run_codex`]
+/// so the wire facts are pinned without spawning anything: the `CODEX_HOME`
+/// pin, the scrub, and the forced file store BEFORE the passthrough args.
+///
+/// The store override (decision 6): the session's config.toml is a COPY of
+/// the operator's, and a keyring/auto setting in it would make codex ignore
+/// the linked auth.json — and delete it on the first refresh. Forced on every
+/// clauth spawn, never demanded of the operator's own config (the capture
+/// path owns that refusal). The value carries its TOML quotes as literal arg
+/// bytes, so codex's `-c` override parser reads a well-formed TOML string
+/// rather than leaning on its bare-word fallback. Caller args come AFTER, so
+/// a later `-c` of the same key wins in codex's layering — overriding the
+/// store re-breaks the linked auth.json for that one run, the same class of
+/// self-inflicted foot-gun as `claude --settings` against a clauth runtime.
+fn codex_spawn_command(
+    home: &Path,
+    codex_args: &[String],
+    active_env_keys: &[String],
+) -> std::process::Command {
+    let engine = crate::harness::Harness::Codex.engine();
+    let mut command = engine.command();
+    engine.scrub_env(&mut command, active_env_keys);
+    command.env(engine.home_env_key(), home);
+    command.arg("-c").arg("cli_auth_credentials_store=\"file\"");
+    command.args(codex_args);
+    command
+}
+
 pub(crate) fn run_codex(
     config: &AppConfig,
     name: &str,
@@ -488,27 +524,34 @@ pub(crate) fn run_codex(
         crate::runtime::CodexRuntime::acquire(name, isolation)?
     };
 
-    let engine = crate::harness::Harness::Codex.engine();
-    let mut command = engine.command();
-    engine.scrub_env(&mut command, &active_env_keys);
-    command.env(engine.home_env_key(), runtime.home());
-    // Force the file store (codex plan, decision 6): the session's config.toml
-    // is a COPY of the operator's, and an operator running keyring/auto would
-    // otherwise make codex ignore the linked auth.json — and DELETE it on the
-    // first refresh. Forced on every clauth spawn, never demanded of the
-    // operator's own config (the capture path owns that refusal).
-    command.arg("-c").arg("cli_auth_credentials_store=\"file\"");
-    command.args(codex_args);
+    let mut command = codex_spawn_command(runtime.home(), codex_args, &active_env_keys);
+
+    // The same signal discipline as the claude start: without it a SIGTERM to
+    // clauth skips the teardown — the sync-back is lost, the flock releases
+    // with the codex child still RUNNING, and a rotation then reads the
+    // account as idle while a live session holds its chain, which is the
+    // precise burn the marker exists to prevent.
+    #[cfg(unix)]
+    let signal_watcher = SignalWatcher::new()?;
 
     let mut child = command.spawn().with_context(|| {
         "failed to launch codex — is the `codex` CLI installed and on PATH?".to_string()
     })?;
-    let status = child.wait().context("failed to wait for codex")?;
+
+    #[cfg(unix)]
+    let outcome = wait_for_child(&mut child, signal_watcher.receiver())?;
+    #[cfg(not(unix))]
+    let outcome = ChildOutcome {
+        status: child
+            .wait()
+            .context("failed to wait for the session child")?,
+        signal: None,
+    };
 
     // Teardown before the exit so the sync-back and marker release run.
     drop(runtime);
 
-    let code = status_code(status, None);
+    let code = status_code(outcome.status, outcome.signal);
     if code != 0 {
         std::process::exit(code);
     }

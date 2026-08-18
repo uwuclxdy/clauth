@@ -393,10 +393,10 @@ pub(crate) struct LoginArgs {
     /// on the next switch and touches nothing else about the profile.
     #[arg(long, conflicts_with_all = ["base_url", "api_key"])]
     pub(crate) setup_token: bool,
-    /// Create (or re-authenticate) a CODEX profile instead, by capturing the
-    /// operator's own `codex login` from ~/.codex/auth.json. The flag picks
+    /// Create (or re-authenticate) a CODEX profile instead, by adopting the
+    /// operator's own `codex login` out of ~/.codex/auth.json. The flag picks
     /// which state file the profile lives in and appears only on this verb —
-    /// every name-taking verb resolves bare names against both rosters.
+    /// switch, delete, and start resolve bare names against both rosters.
     #[arg(long, conflicts_with_all = ["base_url", "api_key", "setup_token", "model"])]
     pub(crate) codex: bool,
     /// Replace an existing long-lived token unprompted.

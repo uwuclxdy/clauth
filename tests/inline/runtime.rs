@@ -7626,7 +7626,11 @@ fn a_shared_codex_home_links_the_table() {
         "model = \"o3\"\n",
         "config.toml is a copy of the operator's (codex writes it in place)"
     );
-    for entry in ["memories_1.sqlite", "history.jsonl"] {
+    for entry in [
+        "memories_1.sqlite",
+        "memories_1.sqlite-wal",
+        "history.jsonl",
+    ] {
         let link = session_home.join(entry);
         assert!(
             link.symlink_metadata()
@@ -7741,22 +7745,87 @@ fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
     let home = crate::testutil::HomeSandbox::new();
     let profile = home.home().join(".clauth/profiles/cx");
     fs::create_dir_all(&profile).expect("mkdir profile");
-    set_link_mode_override(LinkMode::Fake);
 
-    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
-    let session_home = runtime.home().to_path_buf();
-    assert_eq!(
-        session_home,
-        profile.join("codex-home"),
-        "fake mode lives in the bare stem"
-    );
-    fs::write(session_home.join("memories_1.sqlite"), b"m").expect("write durable");
+    with_link_mode(LinkMode::Fake, || {
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+        let session_home = runtime.home().to_path_buf();
+        assert_eq!(
+            session_home,
+            profile.join("codex-home"),
+            "fake mode lives in the bare stem"
+        );
+        fs::write(session_home.join("memories_1.sqlite"), b"m").expect("write durable");
 
-    drop(runtime);
-    clear_link_mode_override();
+        drop(runtime);
 
+        assert!(
+            session_home.join("memories_1.sqlite").exists(),
+            "teardown must never remove the profile's memory because the last session left"
+        );
+    });
+}
+
+/// Under Fake the auth copy is a PROJECTION of the store: a re-capture
+/// reaches the NEXT session because the build re-converges the copy at every
+/// acquire, instead of copying once and never again.
+#[test]
+fn a_fake_mode_codex_home_reconverges_the_auth_projection() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("auth.json"), b"{\"v\":1}").expect("seed store");
+
+    with_link_mode(LinkMode::Fake, || {
+        drop(CodexRuntime::acquire("cx", Isolation::Shared).expect("first acquire"));
+        // A re-capture replaced the store between sessions.
+        fs::write(profile.join("auth.json"), b"{\"v\":2}").expect("replace store");
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("second acquire");
+        assert_eq!(
+            fs::read(runtime.home().join("auth.json")).expect("read projection"),
+            b"{\"v\":2}",
+            "the projection re-converges at session start"
+        );
+    });
+}
+
+/// A crashed session's per-session home is collected once its marker reads
+/// dead — and the bare durable store is never touched, whatever GC runs.
+#[test]
+fn gc_collects_a_dead_codex_home_and_spares_the_live_and_the_bare() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+
+    // A crash's leftover: home with a dead (empty) marker dir.
+    let dead_home = profile.join("codex-home-4242-0");
+    fs::create_dir_all(&dead_home).expect("mkdir dead home");
+    fs::create_dir_all(profile.join("sessions-4242-0")).expect("mkdir dead marker");
+    // One with NO marker dir at all (teardown died between removals).
+    let orphan_home = profile.join("codex-home-isolated-4243-0");
+    fs::create_dir_all(&orphan_home).expect("mkdir orphan home");
+    // A LIVE one: locked pid in its marker dir.
+    let live_home = profile.join("codex-home-4244-0");
+    fs::create_dir_all(&live_home).expect("mkdir live home");
+    let live_marker = profile.join("sessions-4244-0");
+    fs::create_dir_all(&live_marker).expect("mkdir live marker");
+    let pid = open_pid_file(&live_marker.join("4244-0")).expect("open pid");
+    pid.lock().expect("lock pid");
+    // The durable store, and a name that only LOOKS per-session.
+    let bare = profile.join("codex-home");
+    fs::create_dir_all(&bare).expect("mkdir bare store");
+    let lookalike = profile.join("codex-home-notasid");
+    fs::create_dir_all(&lookalike).expect("mkdir lookalike");
+
+    gc_stale_runtimes();
+
+    assert!(!dead_home.exists(), "a dead session's home is collected");
     assert!(
-        session_home.join("memories_1.sqlite").exists(),
-        "teardown must never remove the profile's memory because the last session left"
+        !orphan_home.exists(),
+        "a markerless home is a crash leftover, collected"
+    );
+    assert!(live_home.exists(), "a live session's home is spared");
+    assert!(bare.exists(), "the durable store is never GC territory");
+    assert!(
+        lookalike.exists(),
+        "a non-sid suffix is not a per-session home"
     );
 }

@@ -774,3 +774,44 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
         fake.log()
     );
 }
+
+/// The codex spawn's wire facts, pinned without spawning: the CODEX_HOME pin,
+/// the forced file store as the FIRST -c (a caller's later -c wins in codex's
+/// layering, which is their own foot-gun to aim), and the passthrough args
+/// after it. The store value carries its TOML quotes as literal bytes — a
+/// well-formed TOML string to codex's -c parser, not a bare-word fallback.
+#[test]
+fn the_codex_spawn_command_carries_the_wire_facts() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let cmd = codex_spawn_command(
+        &session_home,
+        &["exec".to_string(), "--full-auto".to_string()],
+        &[],
+    );
+
+    assert_eq!(
+        cmd.get_program(),
+        crate::runtime::codex_command().get_program()
+    );
+    let env = crate::testutil::env_overrides(&cmd);
+    assert_eq!(
+        env.get("CODEX_HOME").and_then(|v| v.as_deref()),
+        session_home.to_str(),
+        "the home pin is the session's own home"
+    );
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        args,
+        [
+            "-c",
+            "cli_auth_credentials_store=\"file\"",
+            "exec",
+            "--full-auto"
+        ],
+        "forced store first, passthrough after"
+    );
+}

@@ -3670,12 +3670,14 @@ fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&
 
 const OPERATOR_AUTH: &str = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"id.x","access_token":"at.x","refresh_token":"rt.x","account_id":"acc"},"last_refresh":"2026-08-13T00:00:00Z","from_the_future":1}"#;
 
-/// The capture is a verbatim snapshot — every byte, unknown keys included —
-/// landed 0600 with the roster entry and the self-describing marker.
+/// The capture ADOPTS: verbatim bytes into the store (every byte, unknown
+/// keys included, 0600), and the operator slot becomes a symlink to it — one
+/// physical file, decision 8's own mechanism, never a second carrier.
 #[test]
-fn codex_capture_creates_the_profile_verbatim() {
+fn codex_capture_adopts_the_operator_slot() {
     let home = HomeSandbox::new();
     write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    let operator_auth = home.home().join(".codex").join("auth.json");
 
     codex_login_capture("cx").expect("capture");
 
@@ -3687,7 +3689,7 @@ fn codex_capture_creates_the_profile_verbatim() {
     assert_eq!(
         std::fs::read(&stored).expect("read stored"),
         OPERATOR_AUTH.as_bytes(),
-        "a snapshot preserves every byte, unknown keys included"
+        "the chain moves verbatim, unknown keys included"
     );
     #[cfg(unix)]
     {
@@ -3699,7 +3701,7 @@ fn codex_capture_creates_the_profile_verbatim() {
                 .mode()
                 & 0o777,
             0o600,
-            "the writer owns auth.json's 0600 — the perms sweep won't"
+            "the writer lands auth.json at 0600 from birth, never waiting on a later sweep"
         );
     }
     assert_eq!(
@@ -3711,9 +3713,21 @@ fn codex_capture_creates_the_profile_verbatim() {
         .expect("read marker"),
         "harness = \"codex\"\n"
     );
+    assert!(
+        operator_auth
+            .symlink_metadata()
+            .expect("operator slot")
+            .file_type()
+            .is_symlink(),
+        "the operator slot follows the store now — one carrier"
+    );
+    assert_eq!(
+        std::fs::read_link(&operator_auth).expect("read link"),
+        stored
+    );
 
-    // Re-capture under a case variant re-authenticates the SAME profile.
-    codex_login_capture("CX").expect("re-capture");
+    // An adopted slot has nothing left to capture — under any casing.
+    codex_login_capture("CX").expect("an adopted slot is a clean no-op");
     let state = crate::codex_profiles::CodexState::load().expect("load");
     assert_eq!(
         state.profiles(),
@@ -3722,7 +3736,71 @@ fn codex_capture_creates_the_profile_verbatim() {
     );
 }
 
-/// The two refusals name their fixes; nothing is created on either.
+/// A REAL re-auth: the operator logged in fresh (a regular file again), and
+/// the re-capture replaces the profile's chain in place — unless a live
+/// session still holds the old one, which refuses by name.
+#[test]
+fn codex_recapture_replaces_the_chain_unless_a_session_holds_it() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("first capture");
+
+    // A fresh `codex login` overwrote the slot with a new chain (codex writes
+    // in place THROUGH a symlink — here the operator re-logged after removing
+    // the link, the worst case).
+    let operator_auth = home.home().join(".codex").join("auth.json");
+    std::fs::remove_file(&operator_auth).expect("drop link");
+    let fresh = OPERATOR_AUTH.replace("rt.x", "rt.fresh");
+    std::fs::write(&operator_auth, &fresh).expect("write fresh login");
+
+    // A live session on the profile blocks the replacement.
+    let sessions = home.home().join(".clauth/profiles/cx/sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
+    pid.lock().expect("lock pid");
+    let err = codex_login_capture("cx").expect_err("a live session blocks");
+    assert!(err.to_string().contains("close it first"), "{err}");
+    drop(pid);
+    std::fs::remove_dir_all(&sessions).expect("clear sessions");
+
+    codex_login_capture("cx").expect("re-capture");
+    assert_eq!(
+        std::fs::read(
+            profile_dir(&crate::profile::ProfileName::from("cx"))
+                .expect("dir")
+                .join("auth.json")
+        )
+        .expect("read"),
+        fresh.as_bytes(),
+        "the profile chain is replaced — that is what re-auth means"
+    );
+}
+
+/// A slot already adopted by ANOTHER profile refuses by name: one chain, one
+/// profile.
+#[test]
+fn codex_capture_refuses_a_slot_another_profile_adopted() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("first").expect("capture");
+
+    let err = codex_login_capture("second").expect_err("the chain belongs to 'first'");
+    assert!(
+        err.to_string()
+            .contains("already captured as codex profile 'first'"),
+        "{err}"
+    );
+    assert!(
+        !crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("second")
+    );
+}
+
+/// Every refusal names its fix; nothing lands on the roster from any of
+/// them. The store gate is an ALLOW-list: only the file default proceeds, so
+/// `ephemeral` — and any mode a future codex invents — refuses instead of
+/// snapshotting a stale leftover.
 #[test]
 fn codex_capture_refusals_name_the_fix() {
     let home = HomeSandbox::new();
@@ -3730,17 +3808,20 @@ fn codex_capture_refusals_name_the_fix() {
     let err = codex_login_capture("cx").expect_err("no auth.json refuses");
     assert!(err.to_string().contains("run `codex login` first"), "{err}");
 
-    write_operator_codex(
-        &home,
-        Some(OPERATOR_AUTH),
-        Some("cli_auth_credentials_store = \"keyring\"\n"),
-    );
-    let err = codex_login_capture("cx").expect_err("keyring refuses");
-    assert!(
-        err.to_string().contains("cli_auth_credentials_store"),
-        "{err}"
-    );
-    assert!(err.to_string().contains("\"file\""), "{err}");
+    for mode in ["keyring", "auto", "ephemeral", "from-the-future"] {
+        write_operator_codex(
+            &home,
+            Some(OPERATOR_AUTH),
+            Some(&format!("cli_auth_credentials_store = \"{mode}\"\n")),
+        );
+        let err = codex_login_capture("cx").expect_err("a non-file store refuses");
+        assert!(
+            err.to_string().contains("cli_auth_credentials_store"),
+            "{mode}: {err}"
+        );
+        assert!(err.to_string().contains(mode), "{mode} is named: {err}");
+        assert!(err.to_string().contains("\"file\""), "{mode}: {err}");
+    }
 
     write_operator_codex(
         &home,

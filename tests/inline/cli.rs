@@ -2387,23 +2387,20 @@ fn the_not_found_listing_names_both_rosters() {
     assert!(msg.contains("available: codex: cx1"), "{msg}");
 }
 
-/// The claude-only start flags refuse ON a codex profile by name, before any
-/// home is built or process spawned — silently ignoring them would be the
-/// non-switch/non-rescue the flags exist to prevent.
-#[test]
-fn codex_start_refuses_the_claude_only_flags_by_name() {
+/// `--with-fallback` refuses ON a codex profile by name, before any spawn:
+/// codex reads `auth.json` once at start, so a chain lands at the NEXT start
+/// rather than mid-session, and silently not doing what the flag promises is
+/// the worse answer. (`--rescue`/`--no-rescue` were the other half until
+/// upstream retired them; an isolated session keeps its transcripts now.)
+fn codex_start_refuses_with_fallback_by_name() {
     let _home = crate::testutil::HomeSandbox::new();
     let clauth = crate::profile::clauth_dir().expect("clauth dir");
     crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
     std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
         .expect("write codex state");
 
-    let err = cmd_start("cx", &[], Isolation::Shared, None, true)
+    let err = cmd_start("cx", &[], Isolation::Shared, true)
         .expect_err("--with-fallback refuses on codex");
     assert!(err.to_string().contains("--with-fallback"), "{err}");
     assert!(err.to_string().contains("NEXT start"), "{err}");
-
-    let err = cmd_start("cx", &[], Isolation::Isolated, Some(true), false)
-        .expect_err("--rescue refuses on codex");
-    assert!(err.to_string().contains("--rescue"), "{err}");
 }

@@ -91,8 +91,8 @@ fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
 
 /// Resolve `name` to its canonical spelling against the CLAUDE roster, or bail
 /// with a [`UsageError`]. Shared by every claude-only profile-naming command:
-/// `start`/`disable`/`enable`/`rolling-token`/`static-token`. `switch` and
-/// `delete` resolve by hand instead — a claude miss falls through to the codex
+/// `disable`/`enable`/`rolling-token`/`static-token`. `switch`, `delete`, and
+/// `start` resolve by hand instead — a claude miss falls through to the codex
 /// roster there.
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<ProfileName> {
     config
