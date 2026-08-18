@@ -4,23 +4,29 @@
 //! `profiles.toml` ([`crate::profile::AppState`]), which this module never
 //! reads or writes. That file split IS the harness axis (see
 //! [`crate::harness::Harness`]), and it is what makes back-compat trivial by
-//! construction: `profiles.toml` keeps its exact pre-codex schema, an old
-//! binary never opens this file, and a mixed-version window has no dual-write
-//! or serde-drop hazard anywhere — the failure class is dissolved, not
-//! handled.
+//! construction: `profiles.toml` keeps its exact pre-codex schema, and an OLD
+//! binary never opens this file at all — so the mixed-version dual-write and
+//! serde-drop hazards `profiles.toml` would have carried are dissolved, not
+//! handled. (A NEWER binary's unknown keys are tolerated on load and dropped
+//! on the next rewrite, exactly `profiles.toml`'s own contract.)
 //!
 //! One namespace spans both files: a profile name held by either harness is
 //! taken (enforced by `actions::validate_profile_name`, which reads both
 //! rosters itself). Uniqueness is what lets every name-keyed subsystem — the
 //! live-session tally, the pending-switch set, the per-profile cache files,
 //! `profiles/<name>/` itself — carry codex members without learning a second
-//! key, and it is why the CLI grammar needs no `--codex` on name-taking verbs:
+//! key, and it is why the CLI grammar (pinned here for the whole series)
+//! needs no `--codex` on name-taking verbs:
 //!
-//! - `clauth login <name> --codex` — create or re-authenticate; the flag picks
-//!   which file the profile lives in and appears ONLY here.
 //! - `clauth <name>` / `clauth delete <name>` — the bare name resolves against
-//!   both rosters; membership decides the harness, nothing else has to.
-//! - rename follows the same rule when its surface (the TUI) gains codex rows.
+//!   the claude roster first, then this one; membership decides the harness,
+//!   nothing else has to. Claude-first also arbitrates the state uniqueness
+//!   cannot promise: two hand-edited state files both claiming a name.
+//! - `clauth login <name> --codex` — the create/re-auth verb; the flag picks
+//!   which file the profile lives in, appears only there, and ships with the
+//!   codex login itself later in the series.
+//! - rename follows the bare-name rule when its surface (the TUI) gains
+//!   codex rows.
 //!
 //! Dirs are bare for both harnesses: a codex profile stores under
 //! `profiles/<name>/` exactly like a claude one, so the whole path layer
@@ -126,11 +132,19 @@ impl CodexState {
     /// Filesystem work that must land atomically with the state change (a dir
     /// removal, a rename) belongs inside the closure, which runs under the
     /// same hold.
+    ///
+    /// Saves only when the closure changed something: an untouched state
+    /// leaves the file's bytes AND mtime alone, so a no-op verb (switching to
+    /// the already-active profile) neither rewrites a hand-edited file
+    /// through this binary's serializer nor bumps the reload fingerprint.
     pub(crate) fn update<T>(f: impl FnOnce(&mut CodexState) -> Result<T>) -> Result<T> {
         let lock = StateLock::acquire()?;
         let mut state = Self::load()?;
+        let before = state.clone();
         let out = f(&mut state)?;
-        state.save(&lock)?;
+        if state != before {
+            state.save(&lock)?;
+        }
         Ok(out)
     }
 

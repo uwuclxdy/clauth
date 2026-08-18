@@ -289,7 +289,9 @@ pub(crate) fn is_codex_home_dir_name(name: &str) -> bool {
 /// Whether `path` is a codex session home by POSITION as well as name:
 /// `…/profiles/<name>/codex-home*`. The positional half matters — the profile
 /// charset allows a profile literally named `codex-home`, and
-/// `profiles/codex-home` is a profile dir, not a home.
+/// `profiles/codex-home` is a profile dir, not a home. The ONE spelling of
+/// that rule: the perms sweep asks it as a bool, `which`'s codex arm extracts
+/// the profile name off the same predicate.
 pub(crate) fn is_codex_home_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())

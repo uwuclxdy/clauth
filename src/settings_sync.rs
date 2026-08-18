@@ -156,30 +156,55 @@ struct EnvOnlyConfig {
 /// Union of every profile's custom `[env]` keys. A missing `config.toml` is a
 /// profile with no overrides and contributes nothing.
 ///
-/// `None` when a `config.toml` cannot be read or parsed: that profile's
-/// per-profile env set is then unknown, and [`sync_members`] skips the merge
-/// rather than treat its keys as shared and leak them into a sibling.
-/// Fail-closed, and self-healing — a config caught mid-edit reads cleanly on the
+/// `None` when a `config.toml` cannot be read or parsed — or when the codex
+/// roster (which decides whose dirs this walk skips) cannot be: the affected
+/// profiles' env sets are then unknown, and [`sync_members`] skips the merge
+/// rather than treat their keys as shared and leak them into a sibling.
+/// Fail-closed, and self-healing — a file caught mid-edit reads cleanly on the
 /// next tick. Because that pauses settings sync entirely, the first failure is
 /// logged; the latch keeps the watchdog's ~10 Hz retry from flooding the log,
 /// and clears on the next clean read so a recurrence is reported again.
 fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
-    // The CLAUDE roster, never the directory listing: bare codex dirs share
-    // the same profiles/ root, and a readdir would read a codex profile's
-    // `[env]` as claude per-profile env — worse, the fail-closed arm below
-    // would let one unparseable codex config pause this claude-only
-    // subsystem. A roster name whose dir or config.toml is missing is a
-    // profile with no overrides, same as before.
-    let names = match crate::profile::claude_roster_names() {
-        Ok(names) => names,
+    // The union must cover every profile the MEMBER SET can contain, and the
+    // members (`known_paths` → `shared_runtime_dirs`) are DIRECTORY-derived —
+    // so the union walks the same directory listing. A roster-driven union
+    // would let an off-roster dir (the partial-save drift
+    // `sync_state_profiles` exists to repair) keep merging its runtime
+    // settings while its `[env]` keys read as shared: the exact leak this fn
+    // fails closed against. What the codex split changes is only WHOSE dirs
+    // belong to this subsystem: a dir the codex roster claims is skipped — it
+    // can never become a member (a codex home matches no `runtime*` stem) —
+    // so a codex `[env]` can neither join the union nor, unparseable, pause a
+    // claude-only sync. An unreadable codex roster pauses: unknown
+    // membership is unknown union coverage, and fail-closed is the direction
+    // every other arm here takes.
+    let codex = match crate::codex_profiles::CodexState::load() {
+        Ok(state) => state,
         Err(e) => {
-            let path = clauth_dir().ok()?.join("profiles.toml");
-            return warn_paused(&path, &format!("could not be read ({e})"));
+            let path = clauth_dir().ok()?.join("codex-profiles.toml");
+            return warn_paused(
+                &path,
+                &format!("did not yield the codex roster ({})", e.root_cause()),
+            );
         }
     };
-    for name in names {
-        let path = crate::profile::profile_subpath(&name, "config.toml").ok()?;
+    let profiles = clauth_dir().ok()?.join("profiles");
+    let Ok(entries) = std::fs::read_dir(&profiles) else {
+        return Some(keys);
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| codex.holds(name))
+        {
+            continue;
+        }
+        let path = entry.path().join("config.toml");
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -194,14 +219,14 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     Some(keys)
 }
 
-/// Report the first `config.toml` failure that pauses settings sync, then latch.
+/// Report the first file failure that pauses settings sync, then latch.
 /// Always returns `None` so callers can `return warn_paused(..)` directly.
 fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     if !ENV_KEYS_WARNED.swap(true, Ordering::Relaxed) {
         logline!(
             "clauth: settings.json sync paused — {} {reason}; \
-             that profile's custom [env] keys are unknown, so no settings are \
-             synced until it reads cleanly",
+             the affected profiles' custom [env] keys are unknown, so no \
+             settings are synced until it reads cleanly",
             path.display()
         );
     }

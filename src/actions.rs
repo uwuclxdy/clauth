@@ -834,19 +834,19 @@ pub(crate) fn delete_profile(
 }
 
 /// `clauth <name>` resolving to a codex profile: move the codex active marker
-/// and nothing else. The state slot is the whole switch — a codex session
-/// binds `auth.json` at start through its own home, so there is no live
-/// credential to install, no Keychain to mirror, and the change lands at the
-/// next session (the parity map's "session-boundary"). Membership is re-made
-/// against the state [`CodexState::update`] loaded under the lock, so a
-/// concurrent delete can't be switched onto.
+/// and nothing else. The state slot is the whole switch — nothing global is
+/// installed for codex, no live credentials link, no Keychain mirror; codex
+/// sessions (later in the series) bind `auth.json` at start through their own
+/// home, which is what makes this the parity map's "session-boundary" switch.
+/// Membership is re-made against the state [`CodexState::update`] loaded
+/// under the lock, so a concurrent delete can't be switched onto.
 pub(crate) fn switch_codex_profile(name: &str) -> Result<()> {
     crate::codex_profiles::CodexState::update(|state| {
         if !state.holds(name) {
             bail!("codex profile '{name}' not found");
         }
         // Same early return the claude switch takes on `is_active` — nothing
-        // to move. The rewrite this still commits is byte-identical state.
+        // to move, and `update`'s dirty check then leaves the file untouched.
         if state.active_profile().map(ProfileName::as_str) == Some(name) {
             return Ok(());
         }
@@ -863,6 +863,15 @@ pub(crate) fn switch_codex_profile(name: &str) -> Result<()> {
 /// delete leaves the record intact and retryable.
 pub(crate) fn delete_codex_profile(name: &str, force: bool) -> Result<()> {
     crate::codex_profiles::CodexState::update(|state| {
+        // Membership re-made against the state loaded UNDER the lock, before
+        // anything irreversible: the caller resolved this name from a
+        // lock-free snapshot and then parked on an unbounded confirm prompt.
+        // In that window the profile can be deleted elsewhere and the name
+        // re-created — on either harness — and `remove_dir_all` below would
+        // then destroy a dir this record no longer owns.
+        if !state.holds(name) {
+            bail!("codex profile '{name}' not found");
+        }
         let owned = ProfileName::from(name);
         if !force && crate::runtime::has_live_session(&owned) {
             bail!("'{name}' has a live session, pass --force to delete it anyway");

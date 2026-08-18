@@ -40,14 +40,17 @@ use crate::runtime::{SessionId, is_session_id};
 pub(crate) struct LiveSession {
     pub(crate) session_id: String,
     pub(crate) start_profile: String,
-    /// Which harness's session this row describes. Codex rows count in the
-    /// live tally and gate delete/disable/rotation exactly like claude ones —
-    /// the registry is harness-blind everywhere it counts — but the swap
-    /// executor and the daemon's per-session decision leg skip them (codex
-    /// reads `auth.json` once at start, so a mid-session member change is a
-    /// no-op the executor would publish as a success). `serde(default)` (=
-    /// claude) is the upgrade gate: a row written by a clauth that predates
-    /// the axis is a claude row, which is what it was.
+    /// Which harness's session this row describes. Liveness gating
+    /// (delete/disable/rotation) never reads a row — it reads the flock-held
+    /// markers, which a codex session stamps identically — and the tally keys
+    /// on the name, which one namespace keeps unambiguous; both stay
+    /// harness-blind with no help from this field. The tag exists for the
+    /// consumers that must tell rows APART: the swap executor and the
+    /// daemon's per-session decision leg skip codex rows when those sessions
+    /// exist (codex reads `auth.json` once at start, so a mid-session member
+    /// change is a no-op the executor would publish as a success).
+    /// `serde(default)` (= claude) is the upgrade gate: a row written by a
+    /// clauth that predates the axis is a claude row, which is what it was.
     #[serde(default)]
     pub(crate) harness: crate::harness::Harness,
     pub(crate) pid: u32,

@@ -70,9 +70,22 @@ use crate::runtime::Isolation;
 /// position. Either way the caller named something that isn't there: a usage
 /// error (exit 2), not a runtime failure (exit 1).
 fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
-    let available = config.names().join(", ");
+    let mut parts = Vec::new();
+    let claude = config.names().join(", ");
+    if !claude.is_empty() {
+        parts.push(claude);
+    }
+    // The codex roster too — `switch` and `delete` take those names, and a
+    // list that hides them turns a typo'd codex name into "no such thing".
+    if let Ok(codex) = codex_profiles::CodexState::load()
+        && !codex.profiles().is_empty()
+    {
+        let names: Vec<&str> = codex.profiles().iter().map(|n| n.as_str()).collect();
+        parts.push(format!("codex: {}", names.join(", ")));
+    }
     usage_error(format!(
-        "profile '{name}' not found\navailable: {available}"
+        "profile '{name}' not found\navailable: {}",
+        parts.join(" · ")
     ))
 }
 
@@ -1003,6 +1016,11 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
         return cmd_delete_codex(&config, name, yes, force);
     };
     let canonical = ProfileName::from(canonical);
+    // Same collision note as `cmd_switch`, and it matters more here: the verb
+    // is destructive, and silence would read as "the only 'foo' is gone".
+    if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!("clauth: note — '{canonical}' also names a codex profile; deleting the CLAUDE one");
+    }
     if !confirm_profile_delete(&canonical, yes)? {
         return Ok(());
     }
@@ -1133,12 +1151,18 @@ fn cmd_switch(name: &str) -> Result<()> {
         // active slot, with no live install to perform (session-boundary).
         if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
             actions::switch_codex_profile(&canonical)?;
-            outln!("clauth: switched codex to '{canonical}' — live at the next codex session");
+            outln!("clauth: switched codex to '{canonical}'");
             return Ok(());
         }
         return Err(unknown_profile_error(&config, name));
     };
     let canonical = ProfileName::from(canonical);
+    // One namespace is enforced at creation, not against hand-edited state:
+    // when both files claim the name, claude-first is the pinned precedence —
+    // said out loud rather than resolved silently.
+    if codex_profiles::CodexState::load().is_ok_and(|s| s.canonical_name(&canonical).is_some()) {
+        outln!("clauth: note — '{canonical}' also names a codex profile; switching the CLAUDE one");
+    }
     refuse_if_disabled(&config, &canonical)?;
     actions::switch_profile_cli(config, &canonical)
 }

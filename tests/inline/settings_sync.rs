@@ -53,17 +53,6 @@ fn write_config(home: &Path, profile: &str, body: &str) {
     let dir = home.join(".clauth/profiles").join(profile);
     fs::create_dir_all(&dir).expect("mkdir profile");
     fs::write(dir.join("config.toml"), body).expect("write config.toml");
-    // Register the name on the CLAUDE roster: `per_profile_env_keys` reads the
-    // roster, not the directory listing, so a bare dir contributes nothing.
-    let mut names = crate::profile::claude_roster_names().expect("roster");
-    if !names.iter().any(|n| n.as_str() == profile) {
-        names.push(profile.into());
-        crate::profile::save_app_state(&crate::profile::AppState {
-            profiles: names,
-            ..Default::default()
-        })
-        .expect("save roster");
-    }
 }
 
 /// One reconciliation over the real member list, exactly as `sync_once` runs it
@@ -548,10 +537,12 @@ fn custom_env_keys_are_unioned_across_every_profile() {
     );
 }
 
-/// The union is ROSTER-driven. A codex profile shares the profiles/ root, and
-/// its `[env]` must not leak into the claude union — worse, its config.toml,
-/// even one that does not parse, must not pause a claude-only subsystem. A
-/// bare dir on neither roster contributes nothing the same way.
+/// The union walks the same DIRECTORY listing the member set is derived from
+/// — an off-roster drift dir keeps contributing (its runtime can still be a
+/// sync member, so dropping its keys from the union would leak them as
+/// shared) — and codex membership is the one exclusion: a codex `[env]` must
+/// not join the claude union, and a codex config.toml that does not parse
+/// must not pause a claude-only subsystem.
 #[test]
 fn a_codex_profiles_config_is_never_read_here() {
     let home = HomeSandbox::new();
@@ -564,13 +555,16 @@ fn a_codex_profiles_config_is_never_read_here() {
     fs::create_dir_all(&cx).expect("mkdir codex profile");
     fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");
 
-    let stray = clauth.join("profiles").join("stray");
-    fs::create_dir_all(&stray).expect("mkdir stray");
-    fs::write(stray.join("config.toml"), "[env]\nSTRAY_KEY = \"1\"\n").expect("write stray");
+    // NOT on either roster: still a union contributor, because the member set
+    // is directory-derived and would still merge this dir's runtime.
+    write_config(home.home(), "drift", "[env]\nDRIFT_KEY = \"1\"\n");
 
     let keys = per_profile_env_keys()
         .expect("a codex config — parseable or not — must not pause the claude sync");
-    assert_eq!(keys, BTreeSet::from(["A_KEY".to_string()]));
+    assert_eq!(
+        keys,
+        BTreeSet::from(["A_KEY".to_string(), "DRIFT_KEY".to_string()])
+    );
 }
 
 #[test]

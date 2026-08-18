@@ -990,7 +990,7 @@ fn delete_codex_removes_the_dir_and_every_slot() {
     write_codex_state(
         "active_profile = \"cx2\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx2\", \"cx1\"]\n",
     );
-    let dir = profile_dir("cx2").expect("profile dir");
+    let dir = profile_dir(&crate::profile::ProfileName::from("cx2")).expect("profile dir");
     crate::profile::mkdir_700(&dir).expect("mkdir profile");
     std::fs::write(dir.join("auth.json"), b"{}").expect("write auth");
 
@@ -1004,11 +1004,109 @@ fn delete_codex_removes_the_dir_and_every_slot() {
         !state.holds("cx2"),
         "the roster no longer holds the deleted name"
     );
+    // The chain slot too — asserted on the saved bytes, since the chain has
+    // no accessor yet: the name must be gone from the whole file.
+    let raw = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("codex-profiles.toml"),
+    )
+    .expect("read state");
+    assert!(
+        !raw.contains("cx2"),
+        "no slot in the saved state still names the deleted profile: {raw}"
+    );
     let violations =
         crate::testutil::owner_only_violations(&crate::profile::clauth_dir().expect("clauth dir"));
     assert!(
         violations.is_empty(),
         "the rewritten state file keeps owner-only modes: {violations:?}"
+    );
+}
+
+/// Dir before state, observed from the failure side: when the dir removal
+/// fails, the roster entry must survive so the delete is retryable — state
+/// persisted first would strand an orphan dir behind a record that is gone.
+#[cfg(unix)]
+#[test]
+fn a_failed_codex_dir_removal_keeps_the_record() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    write_codex_state("profiles = [\"cx\"]\n");
+    let dir = profile_dir(&crate::profile::ProfileName::from("cx")).expect("profile dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir profile");
+    let profiles_root = dir.parent().expect("profiles root").to_path_buf();
+    // Read-only profiles/ makes the final rmdir of the profile dir fail.
+    std::fs::set_permissions(&profiles_root, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod profiles");
+
+    let err = delete_codex_profile("cx", false).expect_err("the dir removal must fail");
+    std::fs::set_permissions(&profiles_root, std::fs::Permissions::from_mode(0o700))
+        .expect("restore profiles");
+
+    assert!(
+        err.to_string()
+            .contains("failed to delete profile directory"),
+        "the failure names the step: {err}"
+    );
+    assert!(
+        crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("cx"),
+        "a failed removal must leave the record for a retry"
+    );
+}
+
+/// The caller resolves from a lock-free snapshot and then parks on an
+/// unbounded confirm prompt; the destructive step re-checks membership under
+/// the lock, so a record that vanished in that window — with its dir perhaps
+/// already re-created by the other harness — refuses instead of removing a
+/// dir the state no longer owns.
+#[test]
+fn delete_codex_refuses_a_dir_the_roster_no_longer_owns() {
+    let _home = HomeSandbox::new();
+    write_codex_state("profiles = [\"other\"]\n");
+    let dir = profile_dir(&crate::profile::ProfileName::from("cx")).expect("profile dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir profile");
+    std::fs::write(dir.join("credentials.json"), b"{}").expect("write foreign login");
+
+    let err = delete_codex_profile("cx", false).expect_err("no record, no removal");
+    assert_eq!(err.to_string(), "codex profile 'cx' not found");
+    assert!(
+        dir.join("credentials.json").exists(),
+        "the dir the roster does not own must be left untouched"
+    );
+}
+
+/// A no-op switch (already active) must leave the file's exact bytes and
+/// mtime alone: a hand-edited file is not rewritten through this binary's
+/// serializer, and the reload fingerprint does not churn.
+#[test]
+fn a_noop_codex_switch_leaves_the_file_untouched() {
+    let _home = HomeSandbox::new();
+    let body = "# hand note\nactive_profile = \"cx\"\nprofiles = [\"cx\"]\nfrom_the_future = 1\n";
+    write_codex_state(body);
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("codex-profiles.toml");
+    let epoch = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5_000);
+    crate::testutil::set_mtime(&path, epoch);
+
+    switch_codex_profile("cx").expect("no-op switch");
+
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read state"),
+        body,
+        "the comment and the unknown key survive a no-op verb"
+    );
+    assert_eq!(
+        std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime"),
+        epoch,
+        "no write happened at all"
     );
 }
 
