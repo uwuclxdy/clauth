@@ -7573,3 +7573,190 @@ fn live_isolated_stores_skip_codex_profiles_by_roster() {
         "the codex twin of an identically live-shaped store is not listed"
     );
 }
+
+// ── codex session homes ──────────────────────────────────────────────────────
+
+/// The shared-flavor home per the codex plan's table: auth.json links the
+/// profile's ONE physical file (dangling until a login exists — that is the
+/// point), the operator surfaces link in, hooks.json only by opt-in, and the
+/// durable stores link into the profile-global home.
+#[cfg(unix)]
+#[test]
+fn a_shared_codex_home_links_the_table() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(operator.join("skills")).expect("mkdir operator skills");
+    fs::write(operator.join("AGENTS.md"), b"# agents").expect("write agents");
+    fs::write(operator.join("hooks.json"), b"{}").expect("write hooks");
+    fs::write(operator.join("config.toml"), b"model = \"o3\"\n").expect("write config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let auth = session_home.join("auth.json");
+    assert!(
+        auth.symlink_metadata()
+            .expect("auth link")
+            .file_type()
+            .is_symlink(),
+        "auth.json is a link, never a copy"
+    );
+    assert_eq!(
+        fs::read_link(&auth).expect("read link"),
+        profile.join("auth.json"),
+        "…to the profile's one physical file"
+    );
+    assert!(
+        !auth.exists(),
+        "dangling until a login is captured — by design"
+    );
+
+    assert!(session_home.join("skills").symlink_metadata().is_ok());
+    assert!(session_home.join("AGENTS.md").symlink_metadata().is_ok());
+    assert!(
+        session_home.join("hooks.json").symlink_metadata().is_err(),
+        "hooks execute code: never linked by default"
+    );
+    assert_eq!(
+        fs::read_to_string(session_home.join("config.toml")).expect("read config"),
+        "model = \"o3\"\n",
+        "config.toml is a copy of the operator's (codex writes it in place)"
+    );
+    for entry in ["memories_1.sqlite", "history.jsonl"] {
+        let link = session_home.join(entry);
+        assert!(
+            link.symlink_metadata()
+                .expect("durable link")
+                .file_type()
+                .is_symlink(),
+            "{entry} links into the profile-global home"
+        );
+        assert_eq!(
+            fs::read_link(&link).expect("read link"),
+            profile.join("codex-home").join(entry)
+        );
+    }
+    assert!(session_home.join("sessions").is_dir());
+
+    // The opt-in flips exactly the hooks link.
+    fs::write(profile.join("config.toml"), b"hooks_json = true\n").expect("write opts");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("rebuild");
+    assert!(
+        session_home.join("hooks.json").symlink_metadata().is_ok(),
+        "the per-profile opt-in links hooks.json"
+    );
+}
+
+/// Isolated links NOTHING from the operator and shares nothing durable — only
+/// the auth.json link (one physical file in both flavors) and the config copy.
+#[cfg(unix)]
+#[test]
+fn an_isolated_codex_home_links_only_the_auth() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(operator.join("skills")).expect("mkdir operator skills");
+    fs::write(operator.join("AGENTS.md"), b"# agents").expect("write agents");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-isolated-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+
+    build_codex_home(&session_home, "cx", Isolation::Isolated, LinkMode::Real).expect("build");
+
+    assert!(session_home.join("auth.json").symlink_metadata().is_ok());
+    assert!(session_home.join("skills").symlink_metadata().is_err());
+    assert!(session_home.join("AGENTS.md").symlink_metadata().is_err());
+    assert!(
+        session_home
+            .join("memories_1.sqlite")
+            .symlink_metadata()
+            .is_err()
+    );
+    assert!(session_home.join("sessions").is_dir());
+}
+
+/// The acquire/teardown lifecycle: a live marker the registry row never
+/// outlives, the codex tag and launch_store on the row, and a teardown that
+/// removes the per-session home while the durable store — sessions synced
+/// back into it — survives.
+#[test]
+fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    let session_home = runtime.home().to_path_buf();
+    assert!(
+        session_home
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_codex_home_dir_name),
+        "the home carries the codex stem: {session_home:?}"
+    );
+    assert!(
+        has_live_session(&crate::profile::ProfileName::from("cx")),
+        "the marker layout makes the shared liveness gates answer for codex"
+    );
+    let rows = crate::live_sessions::list();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].harness, crate::harness::Harness::Codex);
+    assert_eq!(rows[0].start_profile, "cx");
+    assert_eq!(
+        rows[0].launch_store.as_deref(),
+        Some(profile.join("auth.json").as_path()),
+        "launch_store names what the session actually holds — the #59 one-liner"
+    );
+
+    // A rollout the session wrote must survive the session.
+    fs::write(session_home.join("sessions").join("rollout-1.jsonl"), b"{}").expect("write rollout");
+
+    drop(runtime);
+
+    assert!(!session_home.exists(), "the per-session home is torn down");
+    assert!(
+        profile
+            .join("codex-home")
+            .join("sessions")
+            .join("rollout-1.jsonl")
+            .exists(),
+        "the rollout was synced into the durable store"
+    );
+    assert!(
+        crate::live_sessions::list().is_empty(),
+        "the row went with it"
+    );
+    assert!(!has_live_session(&crate::profile::ProfileName::from("cx")));
+}
+
+/// Under the fake transport the home collapses to the BARE stem — which is
+/// the durable store itself — and teardown must never remove it.
+#[test]
+fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    set_link_mode_override(LinkMode::Fake);
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    let session_home = runtime.home().to_path_buf();
+    assert_eq!(
+        session_home,
+        profile.join("codex-home"),
+        "fake mode lives in the bare stem"
+    );
+    fs::write(session_home.join("memories_1.sqlite"), b"m").expect("write durable");
+
+    drop(runtime);
+    clear_link_mode_override();
+
+    assert!(
+        session_home.join("memories_1.sqlite").exists(),
+        "teardown must never remove the profile's memory because the last session left"
+    );
+}

@@ -44,3 +44,86 @@ fn the_claude_scrub_is_the_shared_scrub() {
         "an unmanaged key rides through untouched"
     );
 }
+
+#[test]
+fn the_codex_engine_carries_its_own_spawn_facts() {
+    let engine: &dyn HarnessEngine = &CodexEngine;
+    assert_eq!(engine.home_env_key(), "CODEX_HOME");
+    assert_eq!(
+        engine.command().get_program(),
+        crate::runtime::codex_command().get_program()
+    );
+    let err = engine
+        .install_credentials("cx")
+        .expect_err("a codex switch installs nothing — the seam refuses by contract");
+    assert_eq!(
+        err.to_string(),
+        "codex profile 'cx' installs nothing at switch — sessions bind auth.json at start"
+    );
+}
+
+/// The codex scrub drops its managed keys and the claude actives, and strips
+/// an inherited CLAUDE_CONFIG_DIR only when it names a tree clauth built — an
+/// operator's own custom dir is not clauth's to strip.
+#[test]
+fn the_codex_scrub_is_managed_keys_plus_clauth_runtime_hygiene() {
+    let home = crate::testutil::HomeSandbox::new();
+    let engine: &dyn HarnessEngine = &CodexEngine;
+
+    let runtime_dir = home.home().join(".clauth/profiles/started/runtime-4242-0");
+    {
+        let _env = crate::testutil::ConfigDirSandbox::new(&home, &runtime_dir);
+        let mut cmd = std::process::Command::new("probe");
+        engine.scrub_env(&mut cmd, &["A_KEY".to_string()]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(env.get("CODEX_HOME"), Some(&None));
+        assert_eq!(env.get("OPENAI_API_KEY"), Some(&None));
+        assert_eq!(env.get("A_KEY"), Some(&None));
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR"),
+            Some(&None),
+            "an inherited clauth runtime claim is scrubbed from a codex spawn"
+        );
+    }
+    {
+        let _env = crate::testutil::ConfigDirSandbox::new(&home, &home.home().join("custom-dir"));
+        let mut cmd = std::process::Command::new("probe");
+        engine.scrub_env(&mut cmd, &[]);
+        let env = crate::testutil::env_overrides(&cmd);
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR"),
+            None,
+            "an operator's custom dir is left alone"
+        );
+    }
+}
+
+/// The claude engine's mirror hygiene: an inherited clauth codex home is
+/// scrubbed from a claude spawn, a foreign CODEX_HOME is not.
+#[test]
+fn the_claude_scrub_strips_only_a_clauth_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let engine: &dyn HarnessEngine = &ClaudeEngine;
+
+    let codex_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    {
+        let _env = crate::testutil::CodexHomeSandbox::new(&home, &codex_home);
+        let mut cmd = std::process::Command::new("probe");
+        engine.scrub_env(&mut cmd, &[]);
+        assert_eq!(
+            crate::testutil::env_overrides(&cmd).get("CODEX_HOME"),
+            Some(&None),
+            "a clauth codex home claim is scrubbed from a claude spawn"
+        );
+    }
+    {
+        let _env = crate::testutil::CodexHomeSandbox::new(&home, &home.home().join(".codex"));
+        let mut cmd = std::process::Command::new("probe");
+        engine.scrub_env(&mut cmd, &[]);
+        assert_eq!(
+            crate::testutil::env_overrides(&cmd).get("CODEX_HOME"),
+            None,
+            "the operator's own CODEX_HOME is not clauth's to strip"
+        );
+    }
+}

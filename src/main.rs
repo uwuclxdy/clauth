@@ -298,7 +298,23 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation, follows_chain: b
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let Some(canonical) = config.canonical_name(name) else {
+        // Not a claude name — a codex profile starts an interactive `codex`
+        // in its own clauth-built home. The claude-only flags refuse by name
+        // rather than silently not doing what they promise.
+        if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
+            if follows_chain {
+                anyhow::bail!(
+                    "--with-fallback is not available on a codex profile: codex reads \
+                     auth.json once at start, so a chain lands at the NEXT start, not \
+                     mid-session — start without the flag"
+                );
+            }
+            return start::run_codex(&config, &canonical, rest, isolation);
+        }
+        return Err(unknown_profile_error(&config, name));
+    };
+    let canonical = ProfileName::from(canonical);
     refuse_if_disabled(&config, &canonical)?;
     start::run(&config, &canonical, rest, isolation, None, follows_chain)
 }

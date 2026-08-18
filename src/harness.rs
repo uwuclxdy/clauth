@@ -35,6 +35,15 @@ impl Harness {
             Harness::Codex => "codex",
         }
     }
+
+    /// The tag's behavior — the bridge every dispatch site crosses from
+    /// "which file held the name" to "what runs for it".
+    pub(crate) fn engine(self) -> &'static dyn HarnessEngine {
+        match self {
+            Harness::Claude => &ClaudeEngine,
+            Harness::Codex => &CodexEngine,
+        }
+    }
 }
 
 impl std::fmt::Display for Harness {
@@ -95,6 +104,70 @@ impl HarnessEngine for ClaudeEngine {
 
     fn scrub_env(&self, command: &mut std::process::Command, active_env_keys: &[String]) {
         crate::runtime::scrub_profile_env(command, active_env_keys);
+        // Cross-harness hygiene: a claude session started from inside a
+        // clauth codex session inherits that session's CODEX_HOME, and a
+        // `codex` run from the claude shell would then land in another
+        // profile's home. Scrubbed only when the value names a home clauth
+        // built — an operator's own CODEX_HOME is not clauth's to strip.
+        if std::env::var_os("CODEX_HOME")
+            .is_some_and(|v| crate::runtime::is_codex_home_path(std::path::Path::new(&v)))
+        {
+            command.env_remove("CODEX_HOME");
+        }
+    }
+}
+
+/// codex behind the seams. The spawn half delegates to the codex runtime; the
+/// install half REFUSES by contract — a codex switch is a state slot and
+/// sessions bind `auth.json` at start, so no flow may ask this engine to
+/// install anything, and a caller that does has dispatched a claude flow onto
+/// a codex tag.
+pub(crate) struct CodexEngine;
+
+/// The env keys a spawned codex session must receive only through its own
+/// home, never inherited: `CODEX_HOME` itself (the parent's pin — exactly the
+/// key this spawn is about to set right), and `OPENAI_API_KEY` (codex treats a
+/// bare key in the env as an auth mode of its own, over the linked
+/// `auth.json`).
+const CODEX_MANAGED_ENV_KEYS: &[&str] = &["CODEX_HOME", "OPENAI_API_KEY"];
+
+impl HarnessEngine for CodexEngine {
+    fn install_credentials(&self, name: &str) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "codex profile '{name}' installs nothing at switch — sessions bind auth.json at start"
+        )
+    }
+
+    fn force_install_credentials(&self, name: &str) -> anyhow::Result<()> {
+        self.install_credentials(name)
+    }
+
+    fn command(&self) -> std::process::Command {
+        crate::runtime::codex_command()
+    }
+
+    fn home_env_key(&self) -> &'static str {
+        "CODEX_HOME"
+    }
+
+    fn scrub_env(&self, command: &mut std::process::Command, active_env_keys: &[String]) {
+        for key in CODEX_MANAGED_ENV_KEYS {
+            command.env_remove(key);
+        }
+        for key in active_env_keys {
+            command.env_remove(key);
+        }
+        // The mirror of ClaudeEngine's CODEX_HOME hygiene: a codex session
+        // started from inside a clauth claude session inherits
+        // CLAUDE_CONFIG_DIR, and `clauth which` run in the codex session
+        // would answer as the ancestor claude session (the runtime claim
+        // deliberately outranks the codex arm). Scrubbed only when it names a
+        // tree clauth built — a custom operator dir is left alone.
+        if std::env::var_os("CLAUDE_CONFIG_DIR")
+            .is_some_and(|v| crate::runtime::is_clauth_runtime_path(std::path::Path::new(&v)))
+        {
+            command.env_remove("CLAUDE_CONFIG_DIR");
+        }
     }
 }
 

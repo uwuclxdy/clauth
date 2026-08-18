@@ -452,6 +452,69 @@ fn forward_signal(child: &std::process::Child, signal: i32) -> std::io::Result<(
     }
 }
 
+/// `clauth start <codex-profile>` — spawn an interactive `codex` against this
+/// session's own clauth-built home. The claude start's extras have no codex
+/// counterpart and are absent on purpose: no usage priming (codex usage is
+/// passive), no run-window transcript stamping or rescue (codex owns its own
+/// `sessions/`, synced back by the runtime's teardown), no fallback watchdog
+/// (a codex chain lands at the next start), no home-project settings guard
+/// (project-tier settings are a Claude Code concept).
+///
+/// `codex_args` pass through verbatim, AFTER clauth's own `-c` store override
+/// — later `-c` occurrences win in codex's config layering, but overriding
+/// the store mode simply re-breaks the linked `auth.json` for that one run,
+/// the same class of self-inflicted foot-gun as `claude --settings` against a
+/// clauth runtime.
+pub(crate) fn run_codex(
+    config: &AppConfig,
+    name: &str,
+    codex_args: &[String],
+    isolation: Isolation,
+) -> Result<()> {
+    // The ACTIVE CLAUDE profile's custom env, scrubbed like any spawn: those
+    // keys reached this process from the live settings.json and describe a
+    // claude account, not this codex session.
+    let active_env_keys: Vec<String> = config
+        .state
+        .active_profile
+        .as_deref()
+        .map(crate::profile::ProfileName::from)
+        .and_then(|n| config.find(&n))
+        .map(|p| p.env.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let runtime = {
+        let _spinner = Spinner::start("clauth: preparing codex home");
+        crate::runtime::CodexRuntime::acquire(name, isolation)?
+    };
+
+    let engine = crate::harness::Harness::Codex.engine();
+    let mut command = engine.command();
+    engine.scrub_env(&mut command, &active_env_keys);
+    command.env(engine.home_env_key(), runtime.home());
+    // Force the file store (codex plan, decision 6): the session's config.toml
+    // is a COPY of the operator's, and an operator running keyring/auto would
+    // otherwise make codex ignore the linked auth.json — and DELETE it on the
+    // first refresh. Forced on every clauth spawn, never demanded of the
+    // operator's own config (the capture path owns that refusal).
+    command.arg("-c").arg("cli_auth_credentials_store=\"file\"");
+    command.args(codex_args);
+
+    let mut child = command.spawn().with_context(|| {
+        "failed to launch codex — is the `codex` CLI installed and on PATH?".to_string()
+    })?;
+    let status = child.wait().context("failed to wait for codex")?;
+
+    // Teardown before the exit so the sync-back and marker release run.
+    drop(runtime);
+
+    let code = status_code(status, None);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "../tests/inline/start.rs"]
 mod tests;

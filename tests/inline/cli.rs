@@ -2386,3 +2386,24 @@ fn the_not_found_listing_names_both_rosters() {
     let msg = unknown_profile_error(&empty, "ghost").to_string();
     assert!(msg.contains("available: codex: cx1"), "{msg}");
 }
+
+/// The claude-only start flags refuse ON a codex profile by name, before any
+/// home is built or process spawned — silently ignoring them would be the
+/// non-switch/non-rescue the flags exist to prevent.
+#[test]
+fn codex_start_refuses_the_claude_only_flags_by_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let err = cmd_start("cx", &[], Isolation::Shared, None, true)
+        .expect_err("--with-fallback refuses on codex");
+    assert!(err.to_string().contains("--with-fallback"), "{err}");
+    assert!(err.to_string().contains("NEXT start"), "{err}");
+
+    let err = cmd_start("cx", &[], Isolation::Isolated, Some(true), false)
+        .expect_err("--rescue refuses on codex");
+    assert!(err.to_string().contains("--rescue"), "{err}");
+}
