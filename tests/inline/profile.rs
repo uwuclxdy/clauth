@@ -1520,6 +1520,56 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
     );
 }
 
+/// The perms sweep stops at a codex home's threshold: the home NODE keeps the
+/// 0700 invariant, while the PATH-alias helper binaries codex plants inside
+/// keep their exec bits — a blanket 0600 would break them. The exemption is
+/// positional, so a claude profile literally NAMED `codex-home` (the charset
+/// allows it) is still a profile dir and still fully retightened.
+#[cfg(unix)]
+#[test]
+fn the_perms_sweep_stops_at_a_codex_homes_threshold() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let clauth = clauth_dir().expect("clauth_dir");
+
+    let codex_home = clauth.join("profiles").join("cx").join("codex-home-4242-0");
+    std::fs::create_dir_all(&codex_home).expect("mkdir codex home");
+    let helper = codex_home.join("codex-alias");
+    std::fs::write(&helper, b"#!/bin/sh\n").expect("write helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let impostor = clauth.join("profiles").join("codex-home");
+    std::fs::create_dir_all(&impostor).expect("mkdir impostor profile");
+    std::fs::write(impostor.join("config.toml"), b"").expect("write config");
+    std::fs::set_permissions(
+        impostor.join("config.toml"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("chmod");
+
+    enforce_clauth_perms(&clauth);
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&codex_home),
+        0o700,
+        "the home node itself keeps the invariant"
+    );
+    assert_eq!(
+        mode(&helper),
+        0o755,
+        "the helper binary inside keeps its exec bits"
+    );
+    assert_eq!(
+        mode(&impostor.join("config.toml")),
+        0o600,
+        "a profile NAMED codex-home is a profile dir, retightened in full"
+    );
+}
+
 /// Installs from before the 0o600/0o700 rule carry a umask-moded tree that no
 /// writer ever revisits: bytes that never change keep their mode forever. Every
 /// entry point loads the config, so that is where the tree gets retightened.

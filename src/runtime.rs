@@ -286,6 +286,21 @@ pub(crate) fn is_codex_home_dir_name(name: &str) -> bool {
     name.starts_with(CODEX_HOME_STEM)
 }
 
+/// Whether `path` is a codex session home by POSITION as well as name:
+/// `…/profiles/<name>/codex-home*`. The positional half matters — the profile
+/// charset allows a profile literally named `codex-home`, and
+/// `profiles/codex-home` is a profile dir, not a home.
+pub(crate) fn is_codex_home_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_codex_home_dir_name)
+        && path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            == Some(std::ffi::OsStr::new("profiles"))
+}
+
 /// The sessions dir paired with a runtime dir of this name, per the module's one
 /// layout rule: `runtime<rest>` ↔ `sessions<rest>`. Deliberately loose about
 /// what `<rest>` is; callers that DELETE gate on [`is_runtime_dir_name`] first.

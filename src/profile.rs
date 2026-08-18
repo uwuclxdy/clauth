@@ -1724,6 +1724,15 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
         if meta.permissions().mode() & 0o777 != want {
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
         }
+        // A codex home's CONTENTS are codex's own: the PATH-alias helper
+        // binaries codex plants there carry exec bits a blanket 0600 would
+        // strip. The home node itself keeps the 0700 invariant (just applied
+        // above); the walk stops at its threshold rather than skipping the
+        // node, and `auth.json`'s writer owns that file's 0600 itself instead
+        // of relying on this sweep to retighten it.
+        if is_dir && crate::runtime::is_codex_home_path(root) {
+            return;
+        }
         if is_dir && let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
                 enforce_clauth_perms(&entry.path());

@@ -979,6 +979,12 @@ pub(crate) fn owner_only_violations(root: &Path) -> Vec<String> {
     if mode != want {
         out.push(format!("{mode:#o} {} (want {want:#o})", root.display()));
     }
+    // Mirror of `enforce_clauth_perms`: a codex home's contents are codex's
+    // own (exec-bit helper binaries included), so the invariant covers the
+    // home NODE and stops at its threshold.
+    if is_dir && crate::runtime::is_codex_home_path(root) {
+        return out;
+    }
     if is_dir && let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
             out.extend(owner_only_violations(&entry.path()));
