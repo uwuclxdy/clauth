@@ -53,6 +53,17 @@ fn write_config(home: &Path, profile: &str, body: &str) {
     let dir = home.join(".clauth/profiles").join(profile);
     fs::create_dir_all(&dir).expect("mkdir profile");
     fs::write(dir.join("config.toml"), body).expect("write config.toml");
+    // Register the name on the CLAUDE roster: `per_profile_env_keys` reads the
+    // roster, not the directory listing, so a bare dir contributes nothing.
+    let mut names = crate::profile::claude_roster_names().expect("roster");
+    if !names.iter().any(|n| n.as_str() == profile) {
+        names.push(profile.into());
+        crate::profile::save_app_state(&crate::profile::AppState {
+            profiles: names,
+            ..Default::default()
+        })
+        .expect("save roster");
+    }
 }
 
 /// One reconciliation over the real member list, exactly as `sync_once` runs it
@@ -535,6 +546,31 @@ fn custom_env_keys_are_unioned_across_every_profile() {
         keys,
         BTreeSet::from(["A_KEY".to_string(), "B_KEY".to_string()])
     );
+}
+
+/// The union is ROSTER-driven. A codex profile shares the profiles/ root, and
+/// its `[env]` must not leak into the claude union — worse, its config.toml,
+/// even one that does not parse, must not pause a claude-only subsystem. A
+/// bare dir on neither roster contributes nothing the same way.
+#[test]
+fn a_codex_profiles_config_is_never_read_here() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p1", "[env]\nA_KEY = \"1\"\n");
+
+    let clauth = home.home().join(".clauth");
+    fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex roster");
+    let cx = clauth.join("profiles").join("cx");
+    fs::create_dir_all(&cx).expect("mkdir codex profile");
+    fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");
+
+    let stray = clauth.join("profiles").join("stray");
+    fs::create_dir_all(&stray).expect("mkdir stray");
+    fs::write(stray.join("config.toml"), "[env]\nSTRAY_KEY = \"1\"\n").expect("write stray");
+
+    let keys = per_profile_env_keys()
+        .expect("a codex config — parseable or not — must not pause the claude sync");
+    assert_eq!(keys, BTreeSet::from(["A_KEY".to_string()]));
 }
 
 #[test]

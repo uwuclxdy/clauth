@@ -165,15 +165,21 @@ struct EnvOnlyConfig {
 /// and clears on the next clean read so a recurrence is reported again.
 fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
-    let profiles = clauth_dir().ok()?.join("profiles");
-    let Ok(entries) = std::fs::read_dir(&profiles) else {
-        return Some(keys);
-    };
-    for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
-            continue;
+    // The CLAUDE roster, never the directory listing: bare codex dirs share
+    // the same profiles/ root, and a readdir would read a codex profile's
+    // `[env]` as claude per-profile env — worse, the fail-closed arm below
+    // would let one unparseable codex config pause this claude-only
+    // subsystem. A roster name whose dir or config.toml is missing is a
+    // profile with no overrides, same as before.
+    let names = match crate::profile::claude_roster_names() {
+        Ok(names) => names,
+        Err(e) => {
+            let path = clauth_dir().ok()?.join("profiles.toml");
+            return warn_paused(&path, &format!("could not be read ({e})"));
         }
-        let path = entry.path().join("config.toml");
+    };
+    for name in names {
+        let path = crate::profile::profile_subpath(&name, "config.toml").ok()?;
         let raw = match std::fs::read_to_string(&path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
