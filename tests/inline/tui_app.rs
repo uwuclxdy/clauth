@@ -7043,6 +7043,7 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
     let row = crate::live_sessions::LiveSession {
         session_id: sid.to_string(),
         start_profile: "late".to_string(),
+        harness: crate::harness::Harness::Claude,
         pid: 4242,
         started_at: 1_700_000_000_000,
         cwd: None,
@@ -7110,6 +7111,7 @@ fn runtime_check_names_a_multi_session_account_with_its_count() {
         crate::live_sessions::register(&crate::live_sessions::LiveSession {
             session_id: sid.to_string(),
             start_profile: name.to_string(),
+            harness: crate::harness::Harness::Claude,
             pid: 4242,
             started_at: 1_700_000_000_000,
             cwd: None,
@@ -7178,6 +7180,7 @@ fn runtime_check_says_one_account_when_every_live_session_shares_it() {
         crate::live_sessions::register(&crate::live_sessions::LiveSession {
             session_id: sid.to_string(),
             start_profile: "busy".to_string(),
+            harness: crate::harness::Harness::Claude,
             pid: 5151,
             started_at: 1_700_000_000_000,
             cwd: None,

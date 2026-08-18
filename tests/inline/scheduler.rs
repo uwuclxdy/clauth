@@ -1983,6 +1983,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
     crate::live_sessions::LiveSession {
         session_id: session_id.to_string(),
         start_profile: start_profile.to_string(),
+        harness: crate::harness::Harness::Claude,
         pid: 4242,
         started_at: 1_700_000_000_000,
         cwd: None,

@@ -950,3 +950,91 @@ fn json_view_doc_names_the_managed_half_and_points_at_the_routing_answer() {
         "the doc points at the reader that answers both halves: {doc}"
     );
 }
+// ── the codex arm off CODEX_HOME ───────────────────────────────────────────
+
+/// The path parse is structural: `profiles/<name>/codex-home[-<sid>]` names
+/// the profile; anything else — the operator's real `~/.codex`, a claude
+/// runtime, a codex-home dir parked outside a profiles tree — names nothing.
+#[test]
+fn codex_home_parse_accepts_the_clauth_shape_only() {
+    use std::path::Path;
+    for good in [
+        "/home/u/.clauth/profiles/cx/codex-home-4242-0",
+        "/home/u/.clauth/profiles/cx/codex-home",
+    ] {
+        assert_eq!(
+            session_profile_from_codex_home(Path::new(good)).as_deref(),
+            Some("cx"),
+            "{good}"
+        );
+    }
+    for bad in [
+        "/home/u/.codex",
+        "/home/u/.clauth/profiles/cx/runtime-4242-0",
+        "/home/u/codex-home-4242-0",
+        "/home/u/.clauth/cx/codex-home-4242-0",
+    ] {
+        assert_eq!(
+            session_profile_from_codex_home(Path::new(bad)),
+            None,
+            "{bad}"
+        );
+    }
+}
+
+/// A well-shaped home whose name the codex roster does not hold attributes
+/// nothing — the membership gate the claude session-dir tier gets from
+/// `config.find`, mirrored.
+#[test]
+fn codex_home_attribution_is_roster_gated() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let member = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("cx")
+        .join("codex-home-4242-0");
+    let stranger = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("ghost")
+        .join("codex-home-4242-0");
+
+    assert_eq!(codex_session_profile_at(&member).as_deref(), Some("cx"));
+    assert_eq!(
+        codex_session_profile_at(&stranger),
+        None,
+        "a home naming no stored codex profile attributes nothing"
+    );
+}
+
+/// The codex `--json` payload keeps every claude-era key (null where the
+/// claude question has no codex answer), adds the harness, and answers
+/// `active` from the CODEX slot.
+#[test]
+fn codex_json_view_keeps_the_key_set_and_reads_the_codex_slot() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx\"\nprofiles = [\"cx\", \"other\"]\n",
+    )
+    .expect("write codex state");
+
+    let v = codex_json_view("cx");
+    assert_eq!(v["profile"], "cx");
+    assert_eq!(v["source"], "codex_home");
+    assert_eq!(v["harness"], "codex");
+    assert!(v["base_url"].is_null());
+    assert!(v["tier"].is_null());
+    assert!(v["oauth"].is_null());
+    assert_eq!(v["active"], true);
+    assert_eq!(codex_json_view("other")["active"], false);
+}

@@ -54,6 +54,19 @@ impl Source {
 }
 
 pub(crate) fn run(json: bool) -> Result<()> {
+    // A clauth codex session first: its home names its profile, and the
+    // claude tiers below would otherwise attribute this session to whatever
+    // the GLOBAL ~/.claude credentials resolve to — a different harness's
+    // answer entirely. A CODEX_HOME that is not a clauth codex home says
+    // nothing about the claude question, so it falls through.
+    if let Some(name) = codex_session_profile() {
+        if json {
+            outln!("{}", codex_json_view(&name));
+        } else {
+            emit_plain(Some(&name));
+        }
+        return Ok(());
+    }
     let config = load_config()?;
     let resolved = resolve_active(&config);
 
@@ -63,6 +76,65 @@ pub(crate) fn run(json: bool) -> Result<()> {
         emit_plain(resolved.as_ref().map(|(name, _)| name.as_str()));
     }
     Ok(())
+}
+
+/// The codex arm off `CODEX_HOME`: the profile whose clauth-built codex home
+/// this session runs in, roster-checked. Empty env is unset, same as the
+/// `CLAUDE_CONFIG_DIR` rule.
+fn codex_session_profile() -> Option<String> {
+    let home = std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty())?;
+    codex_session_profile_at(Path::new(&home))
+}
+
+/// [`codex_session_profile`] with the path injected, shared with its tests:
+/// parse `profiles/<name>/codex-home*`, then require the codex roster to hold
+/// `<name>` — a dir shaped like ours but naming no stored profile attributes
+/// nothing, mirroring the membership gate the claude session-dir tier gets
+/// from `config.find`.
+fn codex_session_profile_at(home: &Path) -> Option<String> {
+    let name = session_profile_from_codex_home(home)?;
+    crate::codex_profiles::CodexState::load()
+        .ok()?
+        .holds(&name)
+        .then_some(name)
+}
+
+/// Extract the `<name>` from a clauth codex home path
+/// (`~/.clauth/profiles/<name>/codex-home[-<sid>]`). Returns `None` for any
+/// other shape — the structural twin of [`session_profile_from_config_dir`].
+fn session_profile_from_codex_home(dir: &Path) -> Option<String> {
+    if !dir
+        .file_name()?
+        .to_str()
+        .is_some_and(crate::runtime::is_codex_home_dir_name)
+    {
+        return None;
+    }
+    let profile_dir = dir.parent()?;
+    if profile_dir.parent()?.file_name()? != "profiles" {
+        return None;
+    }
+    Some(profile_dir.file_name()?.to_str()?.to_string())
+}
+
+/// The `--json` payload for a codex session. The claude-shaped fields keep
+/// their keys with the honest empty answer (`null`) so an existing reader's
+/// indexing stays valid, `active` compares against the CODEX active slot, and
+/// `harness` says which roster answered — the claude payload stays untouched
+/// until the published-surface phase adds its own field.
+fn codex_json_view(name: &str) -> serde_json::Value {
+    let active = crate::codex_profiles::CodexState::load()
+        .ok()
+        .is_some_and(|s| s.active_profile().map(|n| n.as_str()) == Some(name));
+    serde_json::json!({
+        "profile": name,
+        "source": "codex_home",
+        "harness": "codex",
+        "base_url": serde_json::Value::Null,
+        "tier": serde_json::Value::Null,
+        "oauth": serde_json::Value::Null,
+        "active": active,
+    })
 }
 
 /// Gather the session env + loaded credentials and resolve them to the owning

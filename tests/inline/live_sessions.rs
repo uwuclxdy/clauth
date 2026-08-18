@@ -9,6 +9,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
     LiveSession {
         session_id: session_id.to_string(),
         start_profile: profile.to_string(),
+        harness: crate::harness::Harness::Claude,
         pid: 4242,
         started_at: 1_700_000_000_000,
         cwd: Some(PathBuf::from("/w/proj")),
@@ -35,6 +36,36 @@ fn a_row_predating_the_opt_in_key_deserializes_as_not_following_the_chain() {
     assert!(
         !row.follows_chain,
         "a row with no `follows_chain` key must default to opted OUT"
+    );
+    assert_eq!(
+        row.harness,
+        crate::harness::Harness::Claude,
+        "a row with no `harness` key predates the axis, so it is a claude row"
+    );
+}
+
+/// The tag survives the registry round-trip and spells itself lowercase, the
+/// stable on-disk form a mixed-version window reads back.
+#[test]
+fn a_codex_row_round_trips_its_harness_tag() {
+    let _home = HomeSandbox::new();
+    let mut written = row("4242-0", "cx");
+    written.harness = crate::harness::Harness::Codex;
+
+    register(&written).expect("register");
+
+    let listed = list().pop().expect("one row");
+    assert_eq!(listed, written, "the tag must survive the round-trip");
+    let raw = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("live_sessions")
+            .join("4242-0.json"),
+    )
+    .expect("read row file");
+    assert!(
+        raw.contains("\"harness\":\"codex\""),
+        "the on-disk spelling is lowercase: {raw}"
     );
 }
 

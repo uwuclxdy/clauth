@@ -40,6 +40,16 @@ use crate::runtime::{SessionId, is_session_id};
 pub(crate) struct LiveSession {
     pub(crate) session_id: String,
     pub(crate) start_profile: String,
+    /// Which harness's session this row describes. Codex rows count in the
+    /// live tally and gate delete/disable/rotation exactly like claude ones —
+    /// the registry is harness-blind everywhere it counts — but the swap
+    /// executor and the daemon's per-session decision leg skip them (codex
+    /// reads `auth.json` once at start, so a mid-session member change is a
+    /// no-op the executor would publish as a success). `serde(default)` (=
+    /// claude) is the upgrade gate: a row written by a clauth that predates
+    /// the axis is a claude row, which is what it was.
+    #[serde(default)]
+    pub(crate) harness: crate::harness::Harness,
     pub(crate) pid: u32,
     pub(crate) started_at: u64,
     pub(crate) cwd: Option<PathBuf>,
@@ -91,6 +101,7 @@ impl LiveSession {
     pub(crate) fn starting(
         session_id: &SessionId,
         start_profile: &str,
+        harness: crate::harness::Harness,
         isolated: bool,
         follows_chain: bool,
         launch_store: Option<PathBuf>,
@@ -98,6 +109,7 @@ impl LiveSession {
         Self {
             session_id: session_id.as_str().to_string(),
             start_profile: start_profile.to_string(),
+            harness,
             pid: std::process::id(),
             started_at: crate::usage::now_ms(),
             cwd: std::env::current_dir().ok(),

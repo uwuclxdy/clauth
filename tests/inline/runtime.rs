@@ -4697,6 +4697,11 @@ fn gc_leaves_profile_children_that_only_look_like_runtime_dirs() {
             "sessions.json",
             "runtime-isolatedish",
             "runtime-4242-x",
+            // A codex session home: outside the runtime*/sessions* stems BY
+            // DESIGN, so the pairing rule has no claim on it and the orphan
+            // branch never sees it. Its lifecycle belongs to the codex
+            // runtime, not this GC.
+            "codex-home-4242-0",
         ];
         for name in bystanders {
             let path = profile.join(name);
@@ -4936,6 +4941,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
         let mut dead = crate::live_sessions::LiveSession {
             session_id: "6001-0".into(),
             start_profile: "rowdead".into(),
+            harness: crate::harness::Harness::Claude,
             pid: 6001,
             started_at: 1,
             cwd: None,
@@ -5169,6 +5175,7 @@ fn lone_session(
     let row = crate::live_sessions::LiveSession::starting(
         &session,
         name,
+        crate::harness::Harness::Claude,
         isolation == Isolation::Isolated,
         false,
         Some(store.to_path_buf()),
@@ -7351,6 +7358,7 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
     crate::live_sessions::register(&crate::live_sessions::LiveSession {
         session_id: sid.to_string(),
         start_profile: profile.to_string(),
+        harness: crate::harness::Harness::Claude,
         pid: std::process::id(),
         started_at: 1_700_000_000_000,
         cwd: None,

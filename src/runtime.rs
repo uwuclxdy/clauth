@@ -157,6 +157,13 @@ const RUNTIME_STEM: &str = "runtime";
 const SESSIONS_STEM: &str = "sessions";
 const ISOLATED_RUNTIME_STEM: &str = "runtime-isolated";
 const ISOLATED_SESSIONS_STEM: &str = "sessions-isolated";
+/// A codex session home under `profiles/<name>/`. Deliberately OUTSIDE the
+/// `runtime*`/`sessions*` stems: the config reconcilers walk
+/// [`shared_runtime_dirs`] and would drop Claude Code's `settings.json` into
+/// any dir matching those, and the GC pairing rule would collect a home it has
+/// no pairing story for. A codex home named off this stem falls through both
+/// untouched, which is the designed behavior, not an accident.
+pub(crate) const CODEX_HOME_STEM: &str = "codex-home";
 
 impl Isolation {
     fn runtime_stem(self) -> &'static str {
@@ -270,6 +277,13 @@ pub(crate) fn sid_of_runtime_dir_name(name: &str) -> Option<String> {
     rest.strip_prefix('-')
         .filter(|s| is_session_id(s))
         .map(str::to_string)
+}
+
+/// Whether `name` is a codex session home (`codex-home*` under a profile dir)
+/// — the codex counterpart of [`is_shared_runtime_dir_name`] for
+/// session-to-profile attribution.
+pub(crate) fn is_codex_home_dir_name(name: &str) -> bool {
+    name.starts_with(CODEX_HOME_STEM)
 }
 
 /// The sessions dir paired with a runtime dir of this name, per the module's one
@@ -2172,6 +2186,7 @@ impl ProfileRuntime {
             let row = crate::live_sessions::LiveSession::starting(
                 &session,
                 name,
+                crate::harness::Harness::Claude,
                 isolation == Isolation::Isolated,
                 opt_in,
                 // The SAME value the runtime tree is built from below, so the
