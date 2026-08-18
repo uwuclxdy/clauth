@@ -1028,20 +1028,7 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
                  '{canonical}' first"
             );
         }
-        let dir = profile_dir(&ProfileName::from(canonical.as_str()))?;
-        crate::profile::mkdir_700(&dir)
-            .with_context(|| format!("failed to create {}", dir.display()))?;
-        let store = dir.join("auth.json");
-        crate::profile::atomic_write_600(&store, &raw)
-            .with_context(|| format!("failed to write {}", store.display()))?;
-        // The self-describing harness marker: file membership stays the
-        // authority, this is for a human reading the dir.
-        let config_path = dir.join("config.toml");
-        if !config_path.exists() {
-            crate::profile::atomic_write_600(&config_path, "harness = \"codex\"\n")
-                .with_context(|| format!("failed to write {}", config_path.display()))?;
-        }
-        state.add_profile(&canonical);
+        let store = write_codex_profile_store(state, &canonical, &raw)?;
         // The adoption itself: the operator slot becomes a link to the store,
         // atomically (symlink at a staging sibling, renamed over). Best-effort
         // — a host that cannot symlink keeps the copy and hears the cost.
@@ -1069,6 +1056,82 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
             auth_path.display()
         );
     }
+    Ok(())
+}
+
+/// Land a codex chain into `profiles/<name>/auth.json` (atomic, 0600), stamp
+/// the self-describing harness marker, and add the name to the roster —
+/// returning the store path. The shared core of every codex-profile creation
+/// (adopt-capture and browser login), always called inside a
+/// [`CodexState::update`] closure so the roster write and the store write
+/// land under one lock.
+fn write_codex_profile_store(
+    state: &mut crate::codex_profiles::CodexState,
+    name: &str,
+    raw: &[u8],
+) -> Result<std::path::PathBuf> {
+    let dir = profile_dir(&ProfileName::from(name))?;
+    crate::profile::mkdir_700(&dir)
+        .with_context(|| format!("failed to create {}", dir.display()))?;
+    let store = dir.join("auth.json");
+    crate::profile::atomic_write_600(&store, raw)
+        .with_context(|| format!("failed to write {}", store.display()))?;
+    let config_path = dir.join("config.toml");
+    if !config_path.exists() {
+        crate::profile::atomic_write_600(&config_path, "harness = \"codex\"\n")
+            .with_context(|| format!("failed to write {}", config_path.display()))?;
+    }
+    state.add_profile(name);
+    Ok(store)
+}
+
+/// `clauth login <name> --codex --browser` — mint a FRESH codex chain via
+/// codex's own PKCE flow and land it as a new profile, without touching
+/// `~/.codex`. Unlike the adopt-capture this is not a second carrier of an
+/// existing chain — it is a brand-new login clauth alone holds.
+pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
+    let trimmed = validate_name_chars(name)?.to_string();
+    // Validate before the browser opens — a name the other roster holds
+    // should refuse without a round trip. Re-checked under the lock below.
+    validate_profile_name(&trimmed, Harness::Codex, None).or_else(|e| {
+        // An own-roster duplicate is a re-auth, allowed; a cross-harness clash
+        // is not. Distinguish by re-running the foreign half alone.
+        validate_foreign_harness_free(&trimmed, Harness::Codex).and(Err(e))
+    })?;
+
+    let outcome = crate::codex_login::login_with(|url| {
+        outln!("clauth: opening {url}");
+        outln!("clauth: if the browser did not open, paste that URL into it");
+    })?;
+
+    let guess = crate::codex_profiles::CodexState::load()?
+        .canonical_name(&trimmed)
+        .unwrap_or_else(|| trimmed.clone());
+    let _rotation_guard =
+        crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
+    let canonical = crate::codex_profiles::CodexState::update(|state| {
+        let canonical = match state.canonical_name(&trimmed) {
+            Some(canonical) => canonical,
+            None => {
+                validate_profile_name(&trimmed, Harness::Codex, None)?;
+                trimmed.clone()
+            }
+        };
+        if canonical != guess {
+            bail!("'{trimmed}' was renamed while the login ran — re-run it");
+        }
+        if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
+            bail!("'{canonical}' has a live codex session — close it before re-authenticating");
+        }
+        write_codex_profile_store(state, &canonical, &outcome.auth_json)?;
+        Ok(canonical)
+    })?;
+
+    outln!("clauth: logged a fresh codex chain into codex profile '{canonical}'");
+    if let Some(acc) = outcome.account_id {
+        outln!("clauth: ChatGPT account {acc}");
+    }
+    outln!("clauth: run it with `clauth start {canonical}` — your own ~/.codex is untouched");
     Ok(())
 }
 

@@ -4,6 +4,7 @@ mod claude;
 mod claude_json;
 mod cli;
 mod codex_auth;
+mod codex_login;
 mod codex_profiles;
 mod completions;
 mod daemon;
@@ -503,7 +504,11 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
     if args.codex {
-        return actions::codex_login_capture(&args.profile);
+        return if args.browser {
+            actions::codex_login_browser(&args.profile)
+        } else {
+            actions::codex_login_capture(&args.profile)
+        };
     }
     let mut config = load_config()?;
     let route = login_route(&config, &args.profile);

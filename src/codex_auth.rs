@@ -124,14 +124,18 @@ impl CodexAuth {
     }
 }
 
-/// `exp` (epoch ms) out of an unverified JWT payload. No signature check —
-/// this feeds a SCHEDULE, not an authorization decision.
-pub(crate) fn jwt_exp_ms(jwt: &str) -> Option<i64> {
+/// The decoded JWT payload, unverified. No signature check anywhere in this
+/// module — payloads feed schedules and identity LABELS, never an
+/// authorization decision.
+pub(crate) fn jwt_payload(jwt: &str) -> Option<serde_json::Value> {
     let payload = jwt.split('.').nth(1)?;
     let bytes = base64url_decode_nopad(payload)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let exp = value.get("exp")?.as_i64()?;
-    exp.checked_mul(1000)
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// `exp` (epoch ms) out of an unverified JWT payload.
+pub(crate) fn jwt_exp_ms(jwt: &str) -> Option<i64> {
+    jwt_payload(jwt)?.get("exp")?.as_i64()?.checked_mul(1000)
 }
 
 /// Base64url (no padding) decode — the JWT alphabet. Hand-rolled because the

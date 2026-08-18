@@ -399,6 +399,11 @@ pub(crate) struct LoginArgs {
     /// switch, delete, and start resolve bare names against both rosters.
     #[arg(long, conflicts_with_all = ["base_url", "api_key", "setup_token", "model"])]
     pub(crate) codex: bool,
+    /// With --codex: mint a FRESH codex chain via the browser instead of
+    /// adopting ~/.codex — a login clauth alone holds, leaving your own codex
+    /// untouched. Requires --codex.
+    #[arg(long, requires = "codex")]
+    pub(crate) browser: bool,
     /// Replace an existing long-lived token unprompted.
     #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
