@@ -664,6 +664,12 @@ pub(crate) fn standby_pass(
         return StandbyOutcome::Idle;
     };
 
+    // Test seam: a live codex rotates the store in exactly this window (after
+    // the pre-guard capture, before the post-guard re-read), which the
+    // re-read below must catch. Nothing outside tests sets this.
+    #[cfg(test)]
+    run_pre_reread_hook(name);
+
     // Re-read under the guard: a live codex may have rotated while we
     // decided. Only the post-guard token feeds the wire.
     let bytes = match std::fs::read(&store) {
@@ -729,6 +735,34 @@ pub(crate) fn standby_pass(
             logline!("clauth: codex refresh for '{name}' failed: {e}");
             StandbyOutcome::Failed
         }
+    }
+}
+
+/// Test seam for the post-guard re-read: a hook, keyed by profile name, run
+/// once between the pre-guard token capture and the post-guard re-read to
+/// simulate a live codex rotating the store in that window.
+#[cfg(test)]
+pub(crate) type PreRereadHook = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+static PRE_REREAD_HOOK: Mutex<Option<HashMap<String, PreRereadHook>>> = Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_pre_reread_hook(name: &str, f: PreRereadHook) {
+    if let Ok(mut g) = PRE_REREAD_HOOK.lock() {
+        g.get_or_insert_with(HashMap::new)
+            .insert(name.to_string(), f);
+    }
+}
+
+#[cfg(test)]
+fn run_pre_reread_hook(name: &str) {
+    let hook = PRE_REREAD_HOOK
+        .lock()
+        .ok()
+        .and_then(|mut g| g.as_mut().and_then(|m| m.remove(name)));
+    if let Some(f) = hook {
+        f();
     }
 }
 

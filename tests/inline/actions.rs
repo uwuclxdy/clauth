@@ -3904,17 +3904,24 @@ fn codex_browser_login_preflight_refuses_only_a_cross_harness_clash() {
     })
     .expect("save claude state");
 
-    // A claude-held name refuses immediately (no browser).
-    let err = codex_login_browser("cl").expect_err("cross-harness clash refuses");
+    // A codex roster holding "cx" (a re-auth target).
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    // A claude-held name refuses at the pre-flight (no browser).
+    let err = codex_browser_preflight("cl").expect_err("cross-harness clash refuses");
     assert!(err.to_string().contains("claude"), "{err}");
 
-    // An own-roster codex name is a re-auth: the pre-flight (validate_foreign_
-    // harness_free) passes it — proven by the pre-flight NOT being the error
-    // source. A fresh name likewise passes the pre-flight. Both then reach
-    // login_with (a real browser), which we do not drive here; the point is
-    // that neither is rejected by the inverted guard the fleet caught.
-    assert!(
-        validate_foreign_harness_free("cx-existing", crate::harness::Harness::Codex).is_ok(),
-        "an own-roster / fresh codex name clears the cross-harness pre-flight"
+    // An own-roster codex name is a RE-AUTH: the pre-flight must pass it (the
+    // inverted `.and(Err)` the fleet caught refused every re-auth here).
+    assert_eq!(
+        codex_browser_preflight("cx").expect("an own-roster re-auth clears the pre-flight"),
+        "cx"
+    );
+    // A fresh name passes too.
+    assert_eq!(
+        codex_browser_preflight("fresh").expect("fresh clears"),
+        "fresh"
     );
 }

@@ -468,3 +468,91 @@ fn the_belt_never_restores_under_a_live_session() {
     );
     drop(pid);
 }
+
+/// A successful rotation does NOT reset the kick breaker — only a successful
+/// poll does. Otherwise a non-token 401 (a suspended account) would rotate
+/// fine each cycle, reset the breaker, and force-refresh forever.
+#[test]
+fn a_successful_rotation_does_not_reset_the_breaker() {
+    let _home = HomeSandbox::new();
+    let name = "cx-breaker";
+    let now: i64 = 1_700_000_000_000;
+    let ok = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        Ok(CodexTokenResponse {
+            id_token: None,
+            access_token: jwt_with_exp((now / 1000) + 3600),
+            refresh_token: "rt.rot".into(),
+        })
+    };
+    let fail = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        Err(CodexRefreshError::Transient("stub".into()))
+    };
+
+    // Memo-block the routine leg so only a kick can drive a refresh.
+    write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"));
+    assert_eq!(
+        standby_pass(name, now, "x".into(), &fail),
+        StandbyOutcome::Failed
+    );
+
+    // Kick 1 → forced attempt → SUCCEEDS. If this wrongly reset the breaker,
+    // the strike count would return to 0.
+    kick_codex(name);
+    write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"));
+    assert_eq!(
+        standby_pass(name, now, "x".into(), &ok),
+        StandbyOutcome::Rotated
+    );
+
+    // Kick 2 → still under the breaker (strikes=2) → forced attempt fires.
+    kick_codex(name);
+    write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"));
+    assert_eq!(
+        standby_pass(name, now, "x".into(), &fail),
+        StandbyOutcome::Failed
+    );
+
+    // Kick 3 → strikes=3 > breaker → nothing fires. This only holds because
+    // the successful rotation at kick 1 did NOT reset the count.
+    kick_codex(name);
+    write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"));
+    assert_eq!(
+        standby_pass(name, now, "x".into(), &fail),
+        StandbyOutcome::Idle,
+        "a rotation that reset the breaker would let this third kick fire"
+    );
+    kick_reset(name);
+}
+
+/// The post-guard re-read catches a live codex rotating the store in the
+/// window between the pre-guard capture and the guarded read — clauth must
+/// NOT then spend the token codex just rotated away.
+#[test]
+fn a_rotation_under_the_guard_window_is_caught() {
+    let _home = HomeSandbox::new();
+    let name = "cx-reread";
+    let now: i64 = 1_700_000_000_000;
+    let boom = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        panic!("must not hit the wire — the token changed under the guard");
+    };
+    write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"));
+
+    // Between the pre-guard capture of rt.a and the post-guard re-read, a live
+    // codex rotates the store to rt.b.
+    let n = name.to_string();
+    crate::codex_auth::set_pre_reread_hook(
+        name,
+        std::sync::Arc::new(move || {
+            write_store(&n, &auth_body("at.b", "rt.b"));
+        }),
+    );
+    assert_eq!(
+        standby_pass(name, now, "x".into(), &boom),
+        StandbyOutcome::Idle,
+        "a token changed under the guard is not spent"
+    );
+    assert!(
+        read_store(name).contains("rt.b"),
+        "the live codex's fresh chain is left untouched"
+    );
+}

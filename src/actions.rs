@@ -1103,16 +1103,23 @@ fn write_codex_profile_store(
     Ok(store)
 }
 
+/// The browser login's pre-browser gate: charset, then refuse ONLY a
+/// cross-harness clash (an own-roster codex name is a re-auth, exempt — the
+/// full check under the lock allows it). Returns the trimmed name. Extracted
+/// so the "own-roster passes, cross-harness refuses" rule is testable without
+/// opening a real browser.
+fn codex_browser_preflight(name: &str) -> Result<String> {
+    let trimmed = validate_name_chars(name)?.to_string();
+    validate_foreign_harness_free(&trimmed, Harness::Codex)?;
+    Ok(trimmed)
+}
+
 /// `clauth login <name> --codex --browser` — mint a FRESH codex chain via
 /// codex's own PKCE flow and land it as a new profile, without touching
 /// `~/.codex`. Unlike the adopt-capture this is not a second carrier of an
 /// existing chain — it is a brand-new login clauth alone holds.
 pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
-    let trimmed = validate_name_chars(name)?.to_string();
-    // Refuse a cross-harness clash before the browser opens (no round trip
-    // for a name that can't land). An own-roster duplicate is NOT refused
-    // here — that is a re-auth, and the full check under the lock exempts it.
-    validate_foreign_harness_free(&trimmed, Harness::Codex)?;
+    let trimmed = codex_browser_preflight(name)?;
 
     let outcome = crate::codex_login::login_with(|url| {
         outln!("clauth: opening {url}");
