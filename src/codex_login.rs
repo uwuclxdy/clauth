@@ -153,9 +153,31 @@ fn handle_callback(
     mut stream: std::net::TcpStream,
     expected_state: &str,
 ) -> Result<Option<String>> {
-    let mut buf = [0u8; 8192];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    let request = String::from_utf8_lossy(&buf[..n]);
+    // The accepted socket inherits the listener's O_NONBLOCK on some
+    // platforms (macOS), so a single `read` could return WouldBlock and drop
+    // the code on the floor. Force blocking with a read deadline: the browser
+    // has already connected, so the request is milliseconds away, and the
+    // deadline keeps a half-open connection from hanging the login. Read in a
+    // short loop so a redirect split across packets still arrives whole.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                // The request line plus the query is all we need; stop once
+                // the header block is complete or the buffer is generous.
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") || buf.len() >= 16384 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let request = String::from_utf8_lossy(&buf);
     let target = request
         .lines()
         .next()
@@ -205,16 +227,23 @@ struct CodeExchange {
     refresh_token: String,
 }
 
-/// The authorization-code exchange: `application/x-www-form-urlencoded`, the
-/// encoding that differs from the JSON refresh at the same endpoint.
-fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Result<CodeExchange> {
-    let body = format!(
+/// The authorization-code exchange BODY — `application/x-www-form-urlencoded`,
+/// the encoding that differs from the JSON refresh at the same endpoint (the
+/// trap the spec pins). Split out so the encoding is a unit-testable value.
+fn code_exchange_body(code: &str, verifier: &str, redirect_uri: &str) -> String {
+    format!(
         "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
         percent_encode(code),
         percent_encode(redirect_uri),
         percent_encode(CODEX_CLIENT_ID),
         percent_encode(verifier),
-    );
+    )
+}
+
+/// The authorization-code exchange: `application/x-www-form-urlencoded`, the
+/// encoding that differs from the JSON refresh at the same endpoint.
+fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Result<CodeExchange> {
+    let body = code_exchange_body(code, verifier, redirect_uri);
     let mut resp = crate::oauth::http_agent()
         .post(CODEX_TOKEN_URL)
         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -228,13 +257,20 @@ fn exchange_code(code: &str, verifier: &str, redirect_uri: &str) -> Result<CodeE
     serde_json::from_str(&text).context("codex token exchange response did not parse")
 }
 
-/// Assemble the `auth.json` codex expects. `auth_mode` explicit, the chain,
-/// `last_refresh` now, the account id off the id_token, and — best-effort —
-/// the RFC-8693-exchanged `OPENAI_API_KEY`.
+/// Assemble the `auth.json` codex expects, performing the best-effort api-key
+/// exchange. The pure assembly is [`assemble_auth_json`]; this is the one
+/// place the RFC-8693 network call happens.
 fn build_auth_json(tok: CodeExchange) -> CodexLoginOutcome {
-    let account_id = chatgpt_account_id(&tok.id_token);
     let api_key = exchange_api_key(&tok.id_token).unwrap_or(None);
+    assemble_auth_json(tok, api_key)
+}
 
+/// The pure assembly (no network): `auth_mode` explicit, the chain,
+/// `last_refresh` now, the account id off the id_token, and the api key when
+/// one was minted. Split from the network exchange so the shape is unit-tested
+/// hermetically.
+fn assemble_auth_json(tok: CodeExchange, api_key: Option<String>) -> CodexLoginOutcome {
+    let account_id = chatgpt_account_id(&tok.id_token);
     let mut tokens = serde_json::json!({
         "id_token": tok.id_token,
         "access_token": tok.access_token,

@@ -2450,6 +2450,19 @@ fn tick(state: &SchedulerState) {
         crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
     });
 
+    // The codex standby leg, on THIS thread rather than the daemon's
+    // watchdog-bounded reconcile loop: its refreshes are blocking token round
+    // trips, exactly the kind of work the claude rotations already do here,
+    // and putting them under the 30s daemon watchdog would let a slow OpenAI
+    // endpoint trip the abort that wipes clauth's own state. Lease-holder only
+    // (like every leg here), so it is also the single cross-process writer the
+    // no-replay rule needs — and self-contained over the codex roster, so the
+    // claude scheduler's snapshots stay untouched (decision 4). Each pass hits
+    // the wire only when a chain is actually due or kicked, so the steady
+    // state is zero HTTP; the NoWait guard inside keeps a `clauth start`
+    // holding rotation.lock from parking this thread.
+    crate::codex_auth::standby_tick(now_ms() as i64, &chrono::Utc::now().to_rfc3339());
+
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
     // whose snapshot owns it, so neither starves the other.

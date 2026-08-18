@@ -2692,6 +2692,19 @@ fn clear_link_mode_override() {
     }
 }
 
+/// Test-only: force the fake-symlink transport for every subsequent
+/// `detect_link_mode`, without exposing the private `LinkMode` enum. Paired
+/// with [`clear_forced_link_mode`]; serialized by `HOME_TEST_LOCK`.
+#[cfg(test)]
+pub(crate) fn force_fake_link_mode() {
+    set_link_mode_override(LinkMode::Fake);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_forced_link_mode() {
+    clear_link_mode_override();
+}
+
 /// Probe the OS by attempting a real symlink in `probe_dir`. Anything other than
 /// success — privilege denial, unsupported filesystem, the
 /// `cfg(not(any(unix, windows)))` fallback — drops to fake-symlink mode.
@@ -3950,6 +3963,20 @@ fn codex_paired_dir_names(isolation: Isolation, session: &str, mode: LinkMode) -
         format!("{}{suffix}", codex_home_stem(isolation)),
         format!("{}{suffix}", isolation.sessions_stem()),
     )
+}
+
+/// Whether `name`'s sessions run under the fake-symlink transport — where a
+/// codex session home holds a COPY of `auth.json`, not a symlink to the
+/// store. The standby refresh reads this: under real symlinks a live session
+/// reads the very file a rotation writes (codex reloads before spending, the
+/// guard serializes), but under fake mode it holds a separate carrier, so a
+/// store rotation would spend a token the session still holds. Only meaningful
+/// when the profile dir exists (a live session guarantees it).
+pub(crate) fn profile_uses_fake_transport(name: &str) -> bool {
+    let Ok(dir) = profile_dir(&ProfileName::from(name)) else {
+        return false;
+    };
+    matches!(detect_link_mode(&dir), Ok(LinkMode::Fake))
 }
 
 /// The durable per-profile codex store, `profiles/<name>/codex-home` — the

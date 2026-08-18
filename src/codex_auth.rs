@@ -10,24 +10,30 @@
 //!   [`RotationGuard`](crate::runtime::RotationGuard); codex-vs-codex is
 //!   handled by codex's own reload-and-skip, clauth-vs-codex by the guard.
 //! - **No replay.** A failed refresh persists nothing and the SAME token is
-//!   never retried on the next tick — the attempt memo remembers the token a
-//!   tick spent its shot on, and only the health kick (401-triggered, phase
-//!   5's wire) may retry it, twice at most.
-//! - **Stand down where codex is about to act.** Codex refreshes within five
-//!   minutes of the access token's JWT expiry; for a profile with a LIVE
-//!   codex session, clauth entering that window is a race it loses by
-//!   construction, so it does not enter. A parked profile has no codex to
-//!   defer to, and waiting there is how chains die at the wham 401.
+//!   never retried on the routine leg — a DURABLE memo (a fingerprint file
+//!   beside the store) remembers the token a tick spent its shot on, so even
+//!   a daemon restart, which forgets every in-memory map, does not re-send a
+//!   token the server may have already consumed. Only the health kick
+//!   (401-triggered) may retry past the memo, one forced attempt per kick and
+//!   two consecutive kicks at most.
+//! - **Stand down where a live carrier holds the chain.** Under real symlinks
+//!   a live session reads the very file a rotation writes, so the only race is
+//!   codex's own five-minute pre-expiry window; under the fake transport the
+//!   session holds a SEPARATE copy, so any rotation desyncs it and clauth
+//!   stands down for the whole live session. A PARKED profile has no carrier
+//!   to defer to — waiting there is how chains die at the wham 401.
 //!
 //! The belt (accepted on #51): every well-formed read of the store records a
 //! last-known-good copy — atomic, 0600, never linked from any home, so it can
-//! never be a second carrier — and a store that reads bad twice in a row
-//! ACROSS a guard acquisition (i.e. not a live in-place write half-done) is
-//! restored from it. The window this cannot close: a crash between codex's
-//! truncate and its write of a newly ROTATED pair leaves the belt holding the
-//! superseded token, and restoring that hits `refresh_token_reused` — the
-//! same death doing nothing hits, so the belt is strictly better than
-//! nothing and never worse.
+//! never be a second carrier — and it is restored only after the store reads
+//! bad continuously for a real wall-clock window (past any single codex
+//! truncate+write) with NO live session, since a live session IS the writer.
+//! Those two gates are what make it never-worse-than-nothing: a slow write is
+//! never mistaken for a corrupt file, and its rotated pair is never stomped by
+//! the pre-rotation belt. The residual window is a crash between codex's
+//! truncate and its write of a newly rotated pair with no session live — the
+//! belt then holds the superseded token, which fails exactly the way doing
+//! nothing fails.
 
 use crate::profile::ProfileName;
 use std::collections::HashMap;
@@ -54,6 +60,12 @@ pub(crate) const CODEX_SELF_REFRESH_WINDOW_MS: i64 = 5 * 60 * 1000;
 /// live-session profile still gets a guard-serialized rotation safely outside
 /// the window codex itself acts in.
 pub(crate) const CODEX_STANDBY_LEAD_MS: i64 = 10 * 60 * 1000;
+
+/// codex's `TOKEN_REFRESH_INTERVAL` (`manager.rs:181`): the fallback age at
+/// which a chain with an UNREADABLE access-token `exp` is due — matching
+/// codex's own behavior rather than treating an unparseable JWT as due every
+/// tick (which would spend a single-use token per second).
+pub(crate) const CODEX_TOKEN_REFRESH_INTERVAL_MS: i64 = 8 * 24 * 60 * 60 * 1000;
 
 /// A parsed view over a codex `auth.json`. The FULL value is kept and
 /// rewritten — read-modify-write, never a typed round-trip — so every key a
@@ -90,6 +102,16 @@ impl CodexAuth {
 
     pub(crate) fn account_id(&self) -> Option<&str> {
         self.token_str("account_id").filter(|t| !t.is_empty())
+    }
+
+    /// `last_refresh` as epoch ms — codex writes it as an RFC-3339 stamp. The
+    /// fallback schedule signal when the access token's JWT `exp` is
+    /// unreadable, exactly as codex's own manager falls back to it.
+    pub(crate) fn last_refresh_ms(&self) -> Option<i64> {
+        let raw = self.raw.get("last_refresh")?.as_str()?;
+        chrono::DateTime::parse_from_rfc3339(raw)
+            .ok()
+            .map(|dt| dt.timestamp_millis())
     }
 
     /// The access token's `exp`, in epoch ms — an UNVERIFIED read of the JWT
@@ -273,14 +295,6 @@ fn classify_refresh_failure(status: u16, body: &str) -> CodexRefreshError {
 
 // ── the attempt memo (no-replay) ─────────────────────────────────────────────
 
-/// The refresh token each profile last spent a standby attempt on, by
-/// fingerprint. An entry blocks the ROUTINE leg from replaying that token;
-/// a successful rotation changes the token and the memo no longer matches;
-/// the health kick consumes the entry deliberately. In-memory: the rule is
-/// per-tick discipline, and a daemon restart retrying once is the claude
-/// path's tolerated shape, not this one's steady state.
-static ATTEMPTED: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
-
 fn token_fingerprint(token: &str) -> String {
     use sha2::Digest as _;
     let mut h = sha2::Sha256::new();
@@ -289,30 +303,47 @@ fn token_fingerprint(token: &str) -> String {
     out.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
+/// The no-replay memo is DURABLE — a small file beside the store holding the
+/// fingerprint of the token a tick spent its shot on. In-memory alone would
+/// re-arm the replay decision 7 calls permanent: a daemon restart forgets the
+/// map, reads the OLD token still in the store (a failed refresh persisted
+/// nothing), and re-sends it — but if the earlier attempt actually reached
+/// the server and rotated (a lost response is indistinguishable from a
+/// never-sent request), that re-send is a replay and the chain dies
+/// permanently. Persisting the fingerprint closes that window across the one
+/// thing that forgets: a restart. Always written and read under the rotation
+/// guard, so there is no concurrent writer.
+fn attempt_memo_path(name: &str) -> Result<std::path::PathBuf> {
+    profile_subpath(&ProfileName::from(name), "auth.attempt")
+}
+
 fn attempted_matches(name: &str, token: &str) -> bool {
-    ATTEMPTED
-        .lock()
-        .ok()
-        .and_then(|g| {
-            g.as_ref()
-                .and_then(|m| m.get(name).map(|fp| *fp == token_fingerprint(token)))
-        })
+    let Ok(path) = attempt_memo_path(name) else {
+        return false;
+    };
+    std::fs::read_to_string(&path)
+        .map(|fp| fp.trim() == token_fingerprint(token))
         .unwrap_or(false)
 }
 
 fn mark_attempted(name: &str, token: &str) {
-    if let Ok(mut g) = ATTEMPTED.lock() {
-        g.get_or_insert_with(HashMap::new)
-            .insert(name.to_string(), token_fingerprint(token));
+    if let Ok(path) = attempt_memo_path(name)
+        && let Err(e) = crate::profile::atomic_write_600(&path, token_fingerprint(token))
+    {
+        logline!("clauth: codex attempt memo write for '{name}' failed: {e}");
     }
 }
 
 fn clear_attempted(name: &str) {
-    if let Ok(mut g) = ATTEMPTED.lock()
-        && let Some(m) = g.as_mut()
-    {
-        m.remove(name);
+    if let Ok(path) = attempt_memo_path(name) {
+        let _ = std::fs::remove_file(path);
     }
+}
+
+/// Retire any no-replay memo for `name` — for an out-of-band store write
+/// (capture/login) that installs a fresh chain the old memo has no claim on.
+pub(crate) fn forget_attempt(name: &str) {
+    clear_attempted(name);
 }
 
 // ── the last-known-good belt ────────────────────────────────────────────────
@@ -334,20 +365,31 @@ pub(crate) fn record_lkg(name: &str, bytes: &[u8]) {
     }
 }
 
-/// Bad-read strikes per profile — a strike lands only on a read that stayed
-/// bad UNDER the rotation guard (a live in-place write cannot span that), and
-/// the second strike restores.
-static BAD_READS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+/// Bad-read strikes per profile, each carrying the wall-clock of the FIRST
+/// strike. A strike lands only on a read that stayed bad under the rotation
+/// guard, but the guard is not real confirmation on its own — codex takes no
+/// such lock, and on a slow/NFS home one truncate+write can straddle several
+/// adjacent ticks, so two microsecond-apart re-reads can BOTH fall inside one
+/// in-flight write. The restore therefore also requires a real elapsed
+/// interval and no live session (see [`BELT_CONFIRM_MS`] /
+/// [`restore_confirmed`]).
+static BAD_READS: Mutex<Option<HashMap<String, (u32, i64)>>> = Mutex::new(None);
 
-fn bump_bad_read(name: &str) -> u32 {
+/// The store must read bad continuously for at least this long before the belt
+/// restores — generously past any single codex truncate+write, so a slow
+/// write is never mistaken for a corrupt file.
+const BELT_CONFIRM_MS: i64 = 30_000;
+
+/// Register a confirmed-bad read at `now_ms`, returning `(strikes, first_ms)`.
+fn bump_bad_read(name: &str, now_ms: i64) -> (u32, i64) {
     let mut g = match BAD_READS.lock() {
         Ok(g) => g,
-        Err(_) => return 0,
+        Err(_) => return (0, now_ms),
     };
     let m = g.get_or_insert_with(HashMap::new);
-    let n = m.entry(name.to_string()).or_insert(0);
-    *n += 1;
-    *n
+    let e = m.entry(name.to_string()).or_insert((0, now_ms));
+    e.0 += 1;
+    *e
 }
 
 fn clear_bad_reads(name: &str) {
@@ -358,7 +400,19 @@ fn clear_bad_reads(name: &str) {
     }
 }
 
-/// Restore the store from the belt — caller holds the rotation guard.
+/// Whether a restore is now safe: at least two strikes, a real wall-clock gap
+/// since the first (so an in-flight write has long since landed), and NO live
+/// codex session — a live session IS the writer, and stomping its in-place
+/// write with the pre-rotation belt is the one way the belt is worse than
+/// doing nothing.
+fn restore_confirmed(name: &str, strikes: u32, first_ms: i64, now_ms: i64) -> bool {
+    strikes >= 2
+        && now_ms - first_ms >= BELT_CONFIRM_MS
+        && !crate::runtime::has_live_session(&ProfileName::from(name))
+}
+
+/// Restore the store from the belt — caller holds the rotation guard, and
+/// [`restore_confirmed`] has ruled out a live writer.
 fn restore_from_lkg(name: &str) -> Result<()> {
     let bytes = std::fs::read(lkg_path(name)?).context("no last-known-good copy")?;
     CodexAuth::parse(&bytes).context("the last-known-good copy does not parse")?;
@@ -411,6 +465,22 @@ pub(crate) fn kick_reset(name: &str) {
     }
 }
 
+/// Whether `name` has a pending kick the breaker would still honor — a PEEK,
+/// consuming nothing. The decision path peeks first (to know a memo-blocked
+/// or not-yet-due chain is still worth pursuing) and only [`take_kick`]s once
+/// it is actually about to hit the wire, so a stand-down or a busy guard
+/// never burns the one forced attempt.
+fn kick_available(name: &str) -> bool {
+    KICKED
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.get(name).map(|s| s.pending && s.strikes <= KICK_BREAKER))
+        })
+        .unwrap_or(false)
+}
+
 /// Consume `name`'s pending kick, if the breaker allows it: each kick buys
 /// exactly one forced attempt, and past [`KICK_BREAKER`] consecutive kicks
 /// nothing fires — a chain two forced refreshes did not heal needs a
@@ -428,6 +498,29 @@ fn take_kick(name: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Latch so a chain that is unreadable AND unrestorable logs its plight once,
+/// not every tick (the daemon log would otherwise truncate). Cleared by any
+/// good read.
+static CORRUPT_WARNED: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+fn corrupt_warn_once(name: &str) -> bool {
+    CORRUPT_WARNED
+        .lock()
+        .map(|mut g| {
+            g.get_or_insert_with(Default::default)
+                .insert(name.to_string())
+        })
+        .unwrap_or(false)
+}
+
+fn clear_corrupt_warn(name: &str) {
+    if let Ok(mut g) = CORRUPT_WARNED.lock()
+        && let Some(s) = g.as_mut()
+    {
+        s.remove(name);
+    }
 }
 
 // ── the standby leg ─────────────────────────────────────────────────────────
@@ -466,6 +559,7 @@ pub(crate) fn standby_pass(
     let auth = match CodexAuth::parse(&bytes) {
         Ok(a) => {
             clear_bad_reads(name);
+            clear_corrupt_warn(name);
             record_lkg(name, &bytes);
             a
         }
@@ -489,21 +583,28 @@ pub(crate) fn standby_pass(
                     return StandbyOutcome::Idle;
                 }
                 None => {
-                    if bump_bad_read(name) >= 2 {
+                    let (strikes, first_ms) = bump_bad_read(name, now_ms);
+                    if restore_confirmed(name, strikes, first_ms, now_ms) {
                         return match restore_from_lkg(name) {
                             Ok(()) => {
                                 clear_bad_reads(name);
+                                clear_corrupt_warn(name);
                                 logline!(
-                                    "clauth: '{name}' codex auth.json was unreadable twice — \
-                                     restored the last-known-good copy"
+                                    "clauth: '{name}' codex auth.json read bad for \
+                                     {}s — restored the last-known-good copy",
+                                    (now_ms - first_ms) / 1000
                                 );
                                 StandbyOutcome::Restored
                             }
                             Err(e) => {
-                                logline!(
-                                    "clauth: '{name}' codex auth.json is unreadable and the \
-                                     belt could not restore it: {e:#}"
-                                );
+                                // Latched: this line would otherwise repeat every
+                                // tick until a re-login and truncate the log.
+                                if corrupt_warn_once(name) {
+                                    logline!(
+                                        "clauth: '{name}' codex auth.json is unreadable and the \
+                                         belt could not restore it: {e:#}"
+                                    );
+                                }
                                 StandbyOutcome::Idle
                             }
                         };
@@ -518,28 +619,42 @@ pub(crate) fn standby_pass(
         return StandbyOutcome::Idle;
     };
 
-    let kicked = take_kick(name);
-    // The age gate: due when the access token is inside the standby lead (or
-    // its exp is unreadable — no schedule beats a dead chain), bypassed by a
-    // kick. The memo blocks a routine replay; a kick spends its strike on
-    // exactly that retry.
+    // The age gate: due when the access token is inside the standby lead, or
+    // — with an UNREADABLE exp — when `last_refresh` is older than codex's own
+    // 8-day fallback interval. A pathological token with neither signal is NOT
+    // due every tick (that would spend a single-use token per second); a 401
+    // kick forces it if it is actually dead. A kick bypasses the gate and the
+    // memo.
     let due = match auth.access_exp_ms() {
         Some(exp) => exp - now_ms < CODEX_STANDBY_LEAD_MS,
-        None => true,
+        None => auth
+            .last_refresh_ms()
+            .is_some_and(|lr| now_ms - lr >= CODEX_TOKEN_REFRESH_INTERVAL_MS),
     };
-    if !kicked && (!due || attempted_matches(name, &refresh_token)) {
+    let routine = due && !attempted_matches(name, &refresh_token);
+    // Peek — do not consume — so a stand-down or a busy guard below never
+    // burns the one forced attempt the kick buys.
+    if !routine && !kick_available(name) {
         return StandbyOutcome::Idle;
     }
 
-    // The stand-down, scoped exactly as accepted on #51: only a profile with
-    // a LIVE codex session has a codex to lose the race to. The liveness
-    // marker layout answers for codex sessions with no harness awareness.
-    if crate::runtime::has_live_session(&ProfileName::from(name))
-        && auth
+    // The stand-down. A rotation is unsafe whenever a live carrier holds the
+    // same chain and could replay the token we spend. Two live-session cases:
+    //  - fake transport: the session holds a physically SEPARATE copy of
+    //    auth.json (decision 8's second-carrier case), so ANY rotation of the
+    //    store desyncs it — stand down regardless of the window;
+    //  - real symlinks: the session reads the very file we write (codex
+    //    reloads before spending), so only codex's own pre-expiry window is a
+    //    race — stand down just inside it.
+    // A stand-down consumes no kick: a chain we cannot safely touch is not one
+    // two forced attempts should count against.
+    if crate::runtime::has_live_session(&ProfileName::from(name)) {
+        let in_window = auth
             .access_exp_ms()
-            .is_some_and(|exp| exp - now_ms < CODEX_SELF_REFRESH_WINDOW_MS)
-    {
-        return StandbyOutcome::StoodDown;
+            .is_some_and(|exp| exp - now_ms < CODEX_SELF_REFRESH_WINDOW_MS);
+        if crate::runtime::profile_uses_fake_transport(name) || in_window {
+            return StandbyOutcome::StoodDown;
+        }
     }
 
     let Ok(guard) = crate::runtime::RotationGuard::try_acquire(&ProfileName::from(name)) else {
@@ -563,7 +678,18 @@ pub(crate) fn standby_pass(
         return StandbyOutcome::Idle;
     };
     if fresh_token != refresh_token {
-        // Somebody rotated in the window — the chain is fresh, nothing to do.
+        // Somebody rotated in the window — the chain is fresh, nothing to do,
+        // and a pending kick was chasing a now-stale 401, so retire it.
+        kick_reset(name);
+        return StandbyOutcome::Idle;
+    }
+
+    // Commit to the wire now — and only now consume the kick, iff this is a
+    // FORCED attempt (a routine due-and-unmemoed pass needs none).
+    let forced = if routine { false } else { take_kick(name) };
+    if !routine && !forced {
+        // The kick evaporated between the peek and here (a sibling tick took
+        // it, or the breaker tripped) — nothing to do.
         return StandbyOutcome::Idle;
     }
 
@@ -575,9 +701,14 @@ pub(crate) fn standby_pass(
                 Ok(()) => {
                     record_lkg(name, &rotated.to_bytes());
                     clear_attempted(name);
-                    if kicked {
-                        kick_reset(name);
-                    }
+                    // The kick's breaker is NOT reset here. A successful
+                    // rotation only proves the TOKEN rotated — if the 401 that
+                    // kicked us has a non-token cause (a suspended account),
+                    // the next poll 401s again and re-kicks, and resetting
+                    // here would force a fresh rotation every cycle forever,
+                    // burning the single-use chain. Only a successful POLL
+                    // (phase 5's wire) clears the breaker; a persistently
+                    // 401ing account trips it after two forced attempts.
                     logline!("clauth: rotated codex chain for '{name}'");
                     StandbyOutcome::Rotated
                 }

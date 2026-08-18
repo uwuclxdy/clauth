@@ -1009,24 +1009,8 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
                  capture would replace — close it first"
             );
         }
-        // A re-auth must be the SAME account: silently swapping the identity
-        // under a profile's name mislabels everything keyed on it (usage,
-        // chain slots, the operator's own mental model). An unreadable or
-        // chainless existing store is exempt — re-capture is the repair for
-        // exactly that state.
-        if reauth
-            && let Ok(bytes) = std::fs::read(
-                profile_dir(&ProfileName::from(canonical.as_str()))?.join("auth.json"),
-            )
-            && let Ok(existing) = crate::codex_auth::CodexAuth::parse(&bytes)
-            && let (Some(old), Some(new)) = (existing.account_id(), parsed.account_id())
-            && old != new
-        {
-            bail!(
-                "'{canonical}' stores ChatGPT account {old}, but the operator login \
-                 is account {new} — capture it into a new profile, or delete \
-                 '{canonical}' first"
-            );
+        if reauth {
+            refuse_codex_account_swap(&canonical, parsed.account_id())?;
         }
         let store = write_codex_profile_store(state, &canonical, &raw)?;
         // The adoption itself: the operator slot becomes a link to the store,
@@ -1059,6 +1043,33 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a re-auth that would silently swap the ChatGPT account under a
+/// profile's name — usage, chain slots, and the operator's own mental model
+/// are all keyed on the profile, so a different `account_id` is almost always
+/// a wrong target, and the fix (a new name, or a delete first) is cheap. An
+/// unreadable or chainless existing store, or an incoming login with no
+/// account id, is exempt: re-auth is the repair for exactly those states.
+/// Shared by adopt-capture and the browser login.
+fn refuse_codex_account_swap(canonical: &str, incoming: Option<&str>) -> Result<()> {
+    let Some(new) = incoming else { return Ok(()) };
+    let Ok(bytes) = std::fs::read(profile_dir(&ProfileName::from(canonical))?.join("auth.json"))
+    else {
+        return Ok(());
+    };
+    let Ok(existing) = crate::codex_auth::CodexAuth::parse(&bytes) else {
+        return Ok(());
+    };
+    if let Some(old) = existing.account_id()
+        && old != new
+    {
+        bail!(
+            "'{canonical}' stores ChatGPT account {old}, but this login is account \
+             {new} — log into a new profile, or delete '{canonical}' first"
+        );
+    }
+    Ok(())
+}
+
 /// Land a codex chain into `profiles/<name>/auth.json` (atomic, 0600), stamp
 /// the self-describing harness marker, and add the name to the roster —
 /// returning the store path. The shared core of every codex-profile creation
@@ -1082,6 +1093,13 @@ fn write_codex_profile_store(
             .with_context(|| format!("failed to write {}", config_path.display()))?;
     }
     state.add_profile(name);
+    // Seed the last-known-good belt from this fresh, well-formed chain and
+    // retire any stale no-replay memo: a capture/login is an out-of-band store
+    // write, and without this the belt could later restore a chain SUPERSEDED
+    // by the one just written, and a memo from a pre-capture attempt could
+    // block the new token.
+    crate::codex_auth::record_lkg(name, raw);
+    crate::codex_auth::forget_attempt(name);
     Ok(store)
 }
 
@@ -1091,13 +1109,10 @@ fn write_codex_profile_store(
 /// existing chain — it is a brand-new login clauth alone holds.
 pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
     let trimmed = validate_name_chars(name)?.to_string();
-    // Validate before the browser opens — a name the other roster holds
-    // should refuse without a round trip. Re-checked under the lock below.
-    validate_profile_name(&trimmed, Harness::Codex, None).or_else(|e| {
-        // An own-roster duplicate is a re-auth, allowed; a cross-harness clash
-        // is not. Distinguish by re-running the foreign half alone.
-        validate_foreign_harness_free(&trimmed, Harness::Codex).and(Err(e))
-    })?;
+    // Refuse a cross-harness clash before the browser opens (no round trip
+    // for a name that can't land). An own-roster duplicate is NOT refused
+    // here — that is a re-auth, and the full check under the lock exempts it.
+    validate_foreign_harness_free(&trimmed, Harness::Codex)?;
 
     let outcome = crate::codex_login::login_with(|url| {
         outln!("clauth: opening {url}");
@@ -1109,12 +1124,15 @@ pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
         .unwrap_or_else(|| trimmed.clone());
     let _rotation_guard =
         crate::runtime::RotationGuard::acquire(&ProfileName::from(guess.as_str()))?;
+    let account_id = crate::codex_auth::CodexAuth::parse(&outcome.auth_json)
+        .ok()
+        .and_then(|a| a.account_id().map(str::to_string));
     let canonical = crate::codex_profiles::CodexState::update(|state| {
-        let canonical = match state.canonical_name(&trimmed) {
-            Some(canonical) => canonical,
+        let (canonical, reauth) = match state.canonical_name(&trimmed) {
+            Some(canonical) => (canonical, true),
             None => {
                 validate_profile_name(&trimmed, Harness::Codex, None)?;
-                trimmed.clone()
+                (trimmed.clone(), false)
             }
         };
         if canonical != guess {
@@ -1122,6 +1140,9 @@ pub(crate) fn codex_login_browser(name: &str) -> Result<()> {
         }
         if crate::runtime::has_live_session(&ProfileName::from(canonical.as_str())) {
             bail!("'{canonical}' has a live codex session — close it before re-authenticating");
+        }
+        if reauth {
+            refuse_codex_account_swap(&canonical, account_id.as_deref())?;
         }
         write_codex_profile_store(state, &canonical, &outcome.auth_json)?;
         Ok(canonical)

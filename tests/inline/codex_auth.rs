@@ -185,6 +185,9 @@ fn the_standby_pass_walks_its_decision_table() {
         standby_pass(name, now, stamp(), &ok),
         StandbyOutcome::Rotated
     );
+    // A successful rotation does NOT reset the breaker (only a successful poll
+    // does); reset here to test the breaker from a clean count.
+    kick_reset(name);
 
     // …and the breaker stops the third consecutive kick.
     write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"));
@@ -247,9 +250,9 @@ fn the_stand_down_is_scoped_to_a_live_session() {
     );
 }
 
-/// The belt: a store that reads bad twice in a row across guard acquisitions
-/// is restored from the last-known-good copy; one bad read alone is a live
-/// in-place write and repairs nothing.
+/// The belt restores only after the store reads bad continuously for a real
+/// wall-clock interval (past any single codex write) with NO live session —
+/// two adjacent ticks are not confirmation, so a slow write is never stomped.
 #[test]
 fn the_belt_restores_after_two_confirmed_bad_reads() {
     let _home = HomeSandbox::new();
@@ -267,20 +270,26 @@ fn the_belt_restores_after_two_confirmed_bad_reads() {
         StandbyOutcome::Idle
     );
 
-    // The store goes bad (a crash mid-truncate): first confirmed bad read is
-    // a strike, second restores.
+    // The store goes bad (a crash mid-truncate). The first strike stamps the
+    // clock; a second read microseconds later is NOT confirmation.
     write_store(name, "{ half a wri");
     assert_eq!(
         standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
         StandbyOutcome::Idle
     );
     assert_eq!(
-        read_store(name),
-        "{ half a wri",
-        "one strike repairs nothing"
+        standby_pass(name, now + 1, "2026-08-13T00:00:00Z".into(), &ok),
+        StandbyOutcome::Idle,
+        "two adjacent ticks are not confirmation — a slow write could still land"
     );
     assert_eq!(
-        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        read_store(name),
+        "{ half a wri",
+        "nothing restored while the bad window is short"
+    );
+    // Past the confirmation interval, still bad, still parked: restore.
+    assert_eq!(
+        standby_pass(name, now + 31_000, "2026-08-13T00:00:00Z".into(), &ok),
         StandbyOutcome::Restored
     );
     assert_eq!(
@@ -288,4 +297,174 @@ fn the_belt_restores_after_two_confirmed_bad_reads() {
         good,
         "the belt restored the last good bytes"
     );
+}
+
+/// The no-replay memo is DURABLE: after a failed refresh the fingerprint sits
+/// on disk beside the store, so a fresh process (a daemon restart) that
+/// forgets every in-memory map still refuses to replay the token — the
+/// decision-7 permanent-death hole.
+#[test]
+fn the_no_replay_memo_survives_on_disk() {
+    let _home = HomeSandbox::new();
+    let name = "cx-durable";
+    let now: i64 = 1_700_000_000_000;
+    let fail = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        Err(CodexRefreshError::Transient("stub".into()))
+    };
+    write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 60), "rt.a"));
+    assert_eq!(
+        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &fail),
+        StandbyOutcome::Failed
+    );
+    // The fingerprint is on disk — not merely in a static map.
+    let memo = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("dir")
+        .join("auth.attempt");
+    assert!(
+        memo.exists(),
+        "the attempt memo is persisted beside the store"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&memo)
+            .expect("read memo")
+            .trim()
+            .len(),
+        16,
+        "an 8-byte fingerprint, hex"
+    );
+    // A capture/login installing a fresh chain retires the memo.
+    crate::codex_auth::forget_attempt(name);
+    assert!(!memo.exists());
+}
+
+/// An UNREADABLE access-token exp does not make the chain due every tick: it
+/// falls back to last_refresh age (codex's own 8-day interval), so a
+/// recently-refreshed chain with a non-JWT token is NOT rotated.
+#[test]
+fn an_unreadable_exp_falls_back_to_last_refresh_age() {
+    let _home = HomeSandbox::new();
+    let name = "cx-noexp";
+    let now: i64 = 1_700_000_000_000;
+    let boom = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        panic!("must not hit the wire — not due");
+    };
+    // Non-JWT access token, last_refresh one hour ago: not due.
+    let recent = chrono::DateTime::from_timestamp_millis(now - 3_600_000)
+        .expect("ts")
+        .to_rfc3339();
+    write_store(
+        name,
+        &format!(
+            "{{ \"tokens\": {{\"access_token\": \"not-a-jwt\", \"refresh_token\": \"rt.a\", \
+             \"account_id\": \"acc\"}}, \"last_refresh\": \"{recent}\" }}"
+        ),
+    );
+    assert_eq!(
+        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &boom),
+        StandbyOutcome::Idle,
+        "a fresh chain with an unreadable exp is not due every tick"
+    );
+
+    // last_refresh nine days ago: now due, rotates.
+    let old = chrono::DateTime::from_timestamp_millis(now - 9 * 24 * 3_600_000)
+        .expect("ts")
+        .to_rfc3339();
+    write_store(
+        name,
+        &format!(
+            "{{ \"tokens\": {{\"access_token\": \"not-a-jwt\", \"refresh_token\": \"rt.a\", \
+             \"account_id\": \"acc\"}}, \"last_refresh\": \"{old}\" }}"
+        ),
+    );
+    let ok = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        Ok(CodexTokenResponse {
+            id_token: None,
+            access_token: "not-a-jwt-2".into(),
+            refresh_token: "rt.b".into(),
+        })
+    };
+    assert_eq!(
+        standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &ok),
+        StandbyOutcome::Rotated,
+        "past the 8-day fallback it rotates"
+    );
+}
+
+/// Under the fake transport a live session holds a SEPARATE copy of the
+/// chain, so the standby stands down for ANY live session — not only inside
+/// codex's 5-minute window — and that stand-down burns no kick.
+#[test]
+fn fake_transport_stands_down_for_any_live_session_and_keeps_the_kick() {
+    let home = HomeSandbox::new();
+    let name = "cx-fake";
+    let now: i64 = 1_700_000_000_000;
+    let boom = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        panic!("must not rotate a fake-mode live carrier");
+    };
+    // Due (inside the lead) but NOT inside codex's own 5-min window.
+    write_store(name, &auth_body(&jwt_with_exp((now / 1000) + 400), "rt.a"));
+    let sessions = home.home().join(".clauth/profiles/cx-fake/sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("pid");
+    pid.lock().expect("lock");
+
+    crate::runtime::force_fake_link_mode();
+    // Even a kick must not force a rotation while a fake-mode carrier is live.
+    kick_codex(name);
+    let out = standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &boom);
+    crate::runtime::clear_forced_link_mode();
+    drop(pid);
+    assert_eq!(out, StandbyOutcome::StoodDown);
+    // The kick was not consumed by the stand-down.
+    assert!(
+        kick_available(name),
+        "a stand-down must not burn the one forced attempt"
+    );
+    kick_reset(name);
+}
+
+/// A live codex session BLOCKS the belt restore: the session is the writer,
+/// and stomping its in-place write with the pre-rotation belt is the one path
+/// where the belt is worse than doing nothing (it resurrects a spent token).
+#[test]
+fn the_belt_never_restores_under_a_live_session() {
+    let home = HomeSandbox::new();
+    let name = "cx-belt-live";
+    let now: i64 = 1_700_000_000_000;
+    let unused = |_t: &str| -> std::result::Result<CodexTokenResponse, CodexRefreshError> {
+        Err(CodexRefreshError::Transient("unused".into()))
+    };
+    // Record a belt from a good read, then the store goes bad.
+    write_store(
+        name,
+        &auth_body(&jwt_with_exp((now / 1000) + 86_400), "rt.a"),
+    );
+    assert_eq!(
+        standby_pass(name, now, "x".into(), &unused),
+        StandbyOutcome::Idle
+    );
+    write_store(name, "{ half a wri");
+
+    // A live session — codex is the writer.
+    let sessions = home.home().join(".clauth/profiles/cx-belt-live/sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir");
+    let pid = crate::runtime::open_pid_file(&sessions.join("1")).expect("pid");
+    pid.lock().expect("lock");
+
+    // Even well past the confirmation interval, the restore is refused.
+    assert_eq!(
+        standby_pass(name, now + 1, "x".into(), &unused),
+        StandbyOutcome::Idle
+    );
+    assert_eq!(
+        standby_pass(name, now + 120_000, "x".into(), &unused),
+        StandbyOutcome::Idle,
+        "a live session is the writer — never stomp its in-place write"
+    );
+    assert_eq!(
+        read_store(name),
+        "{ half a wri",
+        "the store is left for codex"
+    );
+    drop(pid);
 }

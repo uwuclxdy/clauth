@@ -58,7 +58,7 @@ fn the_auth_json_is_codexs_shape() {
         access_token: "at.x".into(),
         refresh_token: "rt.x".into(),
     };
-    let outcome = build_auth_json(tok);
+    let outcome = assemble_auth_json(tok, None);
     let v: serde_json::Value = serde_json::from_slice(&outcome.auth_json).unwrap();
     assert_eq!(v["auth_mode"], "chatgpt", "explicit, never inferred");
     assert_eq!(v["tokens"]["access_token"], "at.x");
@@ -74,4 +74,27 @@ fn the_auth_json_is_codexs_shape() {
     let parsed = crate::codex_auth::CodexAuth::parse(&outcome.auth_json).expect("parse");
     assert_eq!(parsed.refresh_token(), Some("rt.x"));
     assert_eq!(parsed.account_id(), Some("acc-9"));
+}
+
+/// The encoding trap the spec pins: the authorization-code exchange is
+/// form-urlencoded, while the refresh at the SAME endpoint is JSON. A
+/// mutation swapping the exchange to JSON reds this.
+#[test]
+fn the_code_exchange_is_form_urlencoded_unlike_the_json_refresh() {
+    let body = code_exchange_body(
+        "the-code",
+        "the-verifier",
+        "http://localhost:1455/auth/callback",
+    );
+    assert!(body.starts_with("grant_type=authorization_code&"), "{body}");
+    assert!(body.contains("&code=the-code&"), "{body}");
+    assert!(body.contains("&code_verifier=the-verifier"), "{body}");
+    assert!(
+        !body.trim_start().starts_with('{'),
+        "form, never JSON: {body}"
+    );
+
+    // The refresh body IS json, at the same endpoint — the two must not drift.
+    let refresh = crate::codex_auth::CODEX_TOKEN_URL;
+    assert_eq!(refresh, "https://auth.openai.com/oauth/token");
 }

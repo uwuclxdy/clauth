@@ -3889,3 +3889,32 @@ fn codex_recapture_refuses_a_different_account() {
     .expect("corrupt store");
     codex_login_capture("cx").expect("a corrupt store re-captures");
 }
+
+/// The browser login's pre-flight refuses a cross-harness clash before ever
+/// opening a browser — but an own-roster name is a RE-AUTH, so the pre-flight
+/// must NOT refuse it (the earlier `.and(Err(e))` made every re-auth
+/// unreachable). We can only drive the pre-flight without a real browser, so
+/// this pins exactly that half.
+#[test]
+fn codex_browser_login_preflight_refuses_only_a_cross_harness_clash() {
+    let _home = HomeSandbox::new();
+    save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl".into()],
+        ..Default::default()
+    })
+    .expect("save claude state");
+
+    // A claude-held name refuses immediately (no browser).
+    let err = codex_login_browser("cl").expect_err("cross-harness clash refuses");
+    assert!(err.to_string().contains("claude"), "{err}");
+
+    // An own-roster codex name is a re-auth: the pre-flight (validate_foreign_
+    // harness_free) passes it — proven by the pre-flight NOT being the error
+    // source. A fresh name likewise passes the pre-flight. Both then reach
+    // login_with (a real browser), which we do not drive here; the point is
+    // that neither is rejected by the inverted guard the fleet caught.
+    assert!(
+        validate_foreign_harness_free("cx-existing", crate::harness::Harness::Codex).is_ok(),
+        "an own-roster / fresh codex name clears the cross-harness pre-flight"
+    );
+}
