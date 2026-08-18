@@ -2682,3 +2682,56 @@ one-liners accepted. OWED at next fork SYNC: true-merge the merged mommy
 (incl. herdr + his follow-ups), reconcile CLA-FEED to merged form, then
 the standing debts — re-run `clauth rolling-token <p>` per armed profile,
 delete orphaned session-token.kind files.
+
+## CXH — codex harness series (#51), phases 1-4 (2026-08-17/18)
+
+Branch `feat/codex-harness`, cut from mommy `98958aa` (post-#59-merge). Spec:
+upstream `docs/codex-plan.md`. NOT pushed yet (whole series lands together or
+per-phase per maintainer's delivery pref — decide at PR time). Local head after
+phase 4: `135e3dd`.
+
+Per-phase, each sealed with impl → adversarial fleet (opus, find→2 refuters) →
+targeted mutations → both test legs:
+
+- **P1 harness axis** (2f0ec60..06a3cc0, 7 commits): Harness enum,
+  codex-profiles.toml (CodexState, private slots, update() = load-mutate-save
+  under one lock), cross-file name uniqueness (reads both rosters), reload
+  fingerprint stat, live-row harness tag, which codex arm (claude-runtime-claim
+  outranks inherited CODEX_HOME; shaped-home fails closed), folded fixes 2/4/5,
+  switch/delete dispatch off bare name. Fleet 72 agents, 15/15 mutations, 2347/0.
+- **P2 seam** (3384752): HarnessEngine trait, ClaudeEngine delegation; start /
+  mcp-delegate / switch_profile bound through it. ensure_installable NOT seamed
+  (claude-shaped AUTH-1 gate). Behavior-preserving.
+- **P3 runtime+capture** (013c075/cead056/3c04194/edb75f6/17a9151): per-session
+  codex-home-<sid> (auth.json ONE physical file symlinked; config copied;
+  operator surfaces linked; hooks opt-in; durable sqlite+wal/shm+history linked;
+  sessions synced back at teardown); start dispatch (forced -c store=file,
+  cross-harness env scrub, --with-fallback/--rescue refuse); `login --codex` =
+  ADOPT (operator auth.json → symlink into profile store; one carrier, decision
+  8; copy+warn on no-symlink hosts); GC of dead codex homes; fake-mode auth
+  converge both ways; identity-guarded re-auth. Two fleet rounds (120+ agents),
+  16/16 mutations.
+- **P4 refresh** (7308fd5/2a6b178/143e071/135e3dd): codex_auth = auth model
+  (read-modify-write, key-preserving) + refresh classification (reused=permanent)
+  + standby pass (DURABLE no-replay memo survives restart; kick w/ 2-breaker
+  consumed only at wire; stand-down scoped to live carrier, fake-mode=always;
+  belt gated on 30s bad-read + no live session; unreadable-exp → last_refresh
+  fallback) wired into the SCHEDULER tick (fetch-lease holder, NOT the daemon
+  watchdog tick — the fleet's critical catch). codex_login = PKCE browser flow
+  reimplemented (wire facts vs openai/codex rust-v0.145.0: ports 1455/1457,
+  form-vs-JSON encoding, nested account_id claim, best-effort api-key exchange).
+  Fleet 98 agents (16 upheld all fixed), 15/16 mutations (P11 scheduler-wire =
+  accepted gap, needs full-tick harness).
+
+STANDING PRACTICE reinforced: adversarial fleet on a git-worktree pinned at HEAD;
+mutation driver uses `git checkout --` so COMMIT BEFORE MUTATING (wiped an
+uncommitted batch once, recovered by replay); seal on the FULL suite not a name
+filter (a grammar-drift + a GC-neutrality test only fire there); fmt reflows
+multi-line anchors (re-read before re-mutating).
+
+**REMAINING: P5 usage leg** (wham/usage → named 5h/7d slots, chain member,
+disarm check_scoped for codex, fold fix 1, wire kick_codex to the 401 arm — the
+last #[allow(dead_code)]) and **P6 published surface** (status.json/which
+--json/list_profiles additive codex fields, TUI c-codex/c-claude filter + header
+chip, daemon-version warning, MCP/plugin/tokens copy fixes). Then fleet+mutate
+each, PR to uwuclxdy/clauth per delivery series.
