@@ -420,6 +420,8 @@ pub(crate) const LOGIN_FLAGS: &[&str] = &[
     "--base-url",
     "--api-key",
     "--setup-token",
+    "--codex",
+    "--browser",
     "--yes",
     "-y",
     "--model",

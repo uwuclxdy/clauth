@@ -2392,6 +2392,7 @@ fn the_not_found_listing_names_both_rosters() {
 /// rather than mid-session, and silently not doing what the flag promises is
 /// the worse answer. (`--rescue`/`--no-rescue` were the other half until
 /// upstream retired them; an isolated session keeps its transcripts now.)
+#[test]
 fn codex_start_refuses_with_fallback_by_name() {
     let _home = crate::testutil::HomeSandbox::new();
     let clauth = crate::profile::clauth_dir().expect("clauth dir");

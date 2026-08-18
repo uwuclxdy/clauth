@@ -4697,11 +4697,11 @@ fn gc_leaves_profile_children_that_only_look_like_runtime_dirs() {
             "sessions.json",
             "runtime-isolatedish",
             "runtime-4242-x",
-            // A codex session home: outside the runtime*/sessions* stems BY
-            // DESIGN, so the pairing rule has no claim on it and the orphan
-            // branch never sees it. Its lifecycle belongs to the codex
-            // runtime, not this GC.
-            "codex-home-4242-0",
+            // The BARE codex store stem: outside the runtime*/sessions* stems
+            // BY DESIGN, and not a per-session home either, so no GC touches
+            // it. (A per-session codex-home-<sid> IS collected by
+            // gc_codex_homes — see gc_collects_a_dead_codex_home_*.)
+            "codex-home",
         ];
         for name in bystanders {
             let path = profile.join(name);
