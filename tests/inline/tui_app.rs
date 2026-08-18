@@ -7694,6 +7694,14 @@ fn duplicate_refuses_a_name_already_on_the_roster() {
 
     let src = Profile::new("src".to_string(), None, None);
     crate::profile::save_profile(&src).expect("save source");
+    // The validator reads the roster off DISK (cross-harness uniqueness), so
+    // the taken name must be in the stored state, not only in the in-memory
+    // fixture.
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["src".into(), "taken".into()],
+        ..Default::default()
+    })
+    .expect("save roster");
     let mut app = app_with(vec![src, Profile::new("taken".to_string(), None, None)]);
     app.tab = Tab::Setup;
     app.profile_cursor = 0;

@@ -14,6 +14,7 @@ use crate::claude::{
     live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
     read_claude_endpoint_config, snapshot_active_credentials,
 };
+use crate::harness::Harness;
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::lockorder::RankedMutex;
 use crate::oauth;
@@ -26,15 +27,13 @@ use crate::providers::Provider;
 use crate::runtime::RotationGuard;
 use crate::spinner::Spinner;
 
-/// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty, not a duplicate
-/// (`exclude` exempts the current name for rename-in-place). `@`/`+` let an
+/// ASCII alphanumeric + `-_.@+`, not leading-dot, not empty. `@`/`+` let an
 /// account be named after its email; both are path-separator-free so the name
-/// stays a single `profiles/<name>` segment with no traversal.
-pub(crate) fn validate_profile_name(
-    name: &str,
-    existing: &[&str],
-    exclude: Option<&str>,
-) -> Result<()> {
+/// stays a single `profiles/<name>` segment with no traversal. The charset
+/// half of [`validate_profile_name`], standing alone for names that live in a
+/// namespace of their own (the preset store), where neither roster has a say.
+/// Returns the trimmed name the checks ran against.
+pub(crate) fn validate_name_chars(name: &str) -> Result<&str> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         bail!("name cannot be empty");
@@ -45,9 +44,66 @@ pub(crate) fn validate_profile_name(
     if !valid_chars || trimmed.starts_with('.') {
         bail!("name: letters, digits and - _ . @ + only, and can't start with '.'");
     }
-    if existing
+    Ok(trimmed)
+}
+
+/// Refuse a name the OTHER harness's roster holds, naming the holder. Profile
+/// names are one namespace across both state files — `profiles/<name>/` is one
+/// dir set, and every name-keyed subsystem (the live tally, the pending-switch
+/// set, the per-profile caches) carries one key per name. The half of
+/// [`validate_profile_name`] a creation flow can take alone when it
+/// deliberately tolerates an own-roster collision (the capture-name prompt
+/// routes that case into capture-into-existing) but must still refuse to
+/// shadow the other harness, which no flow can adopt across.
+pub(crate) fn validate_foreign_harness_free(name: &str, harness: Harness) -> Result<()> {
+    let foreign = match harness {
+        Harness::Claude => Harness::Codex,
+        Harness::Codex => Harness::Claude,
+    };
+    let held = match foreign {
+        Harness::Claude => crate::profile::claude_roster_names()?
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name)),
+        Harness::Codex => crate::codex_profiles::CodexState::load()?
+            .profiles()
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name)),
+    };
+    if held {
+        bail!("'{name}' is a {foreign} profile — profile names span both harnesses, pick another");
+    }
+    Ok(())
+}
+
+/// The full gate for creating or renaming a profile on `harness`: charset,
+/// then the other harness's roster (refused by name), then this harness's own
+/// duplicate check (`exclude` exempts the current name for rename-in-place).
+///
+/// Reads both rosters itself rather than trusting a caller-supplied list: the
+/// cross-harness half must run at every creation site, and a caller curating
+/// its own `existing` slice would silently skip it. The reads are two small
+/// TOML stats on an interactive path, never a per-frame one.
+pub(crate) fn validate_profile_name(
+    name: &str,
+    harness: Harness,
+    exclude: Option<&str>,
+) -> Result<()> {
+    let trimmed = validate_name_chars(name)?;
+    validate_foreign_harness_free(trimmed, harness)?;
+    let own: Vec<String> = match harness {
+        Harness::Claude => crate::profile::claude_roster_names()?
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+        Harness::Codex => crate::codex_profiles::CodexState::load()?
+            .profiles()
+            .iter()
+            .map(|n| n.as_str().to_string())
+            .collect(),
+    };
+    if own
         .iter()
-        .any(|&n| n.eq_ignore_ascii_case(trimmed) && Some(n) != exclude)
+        .any(|n| n.eq_ignore_ascii_case(trimmed) && Some(n.as_str()) != exclude)
     {
         bail!("a profile named '{trimmed}' already exists");
     }

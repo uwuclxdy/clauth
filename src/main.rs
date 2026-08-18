@@ -3,10 +3,12 @@ mod alibaba_login;
 mod claude;
 mod claude_json;
 mod cli;
+mod codex_profiles;
 mod completions;
 mod daemon;
 mod fallback;
 mod format;
+mod harness;
 mod herdr;
 mod hook_note;
 mod jobs_cli;
@@ -469,7 +471,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     let target = ProfileName::from(match &route {
         LoginRoute::Reauth(existing) => existing.clone(),
         LoginRoute::New(fresh) => {
-            actions::validate_profile_name(fresh, &config.names(), None)?;
+            actions::validate_profile_name(fresh, crate::harness::Harness::Claude, None)?;
             fresh.clone()
         }
     });

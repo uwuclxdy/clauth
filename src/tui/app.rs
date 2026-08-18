@@ -26,7 +26,8 @@ use crate::actions::{
     create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
     edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
     overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
-    switch_off, switch_profile, validate_profile_name,
+    switch_off, switch_profile, validate_foreign_harness_free, validate_name_chars,
+    validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -36,6 +37,7 @@ use crate::claude::{
 };
 use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
 use crate::format::format_pct;
+use crate::harness::Harness;
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -6475,10 +6477,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         .as_ref()
                         .map(|d| d.name.trimmed().to_string())
                         .unwrap_or_default();
-                    let validation = {
-                        let cfg = app.config();
-                        validate_profile_name(&typed, &cfg.names(), None)
-                    };
+                    let validation = validate_profile_name(&typed, Harness::Claude, None);
                     match validation {
                         Ok(()) => Some((typed, true)),
                         Err(e) => {
@@ -7489,10 +7488,7 @@ fn commit_rename(app: &mut App) {
         }
         return;
     }
-    let validation = {
-        let cfg = app.config();
-        validate_profile_name(&new, &cfg.names(), Some(old.as_str()))
-    };
+    let validation = validate_profile_name(&new, Harness::Claude, Some(old.as_str()));
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
@@ -7586,10 +7582,7 @@ fn commit_new_account(app: &mut App) {
         None
     };
     let mint_discarded = base_url.is_some() && d.captured_login.is_some();
-    let validation = {
-        let cfg = app.config();
-        validate_profile_name(&name, &cfg.names(), None)
-    };
+    let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
@@ -7781,10 +7774,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
             let action = form.action.clone();
             match action {
                 NamePromptAction::DuplicateProfile(source) => {
-                    let validation = {
-                        let cfg = app.config();
-                        validate_profile_name(&name, &cfg.names(), None)
-                    };
+                    let validation = validate_profile_name(&name, Harness::Claude, None);
                     if let Err(e) = validation {
                         app.toast(ToastKind::Danger, format!("{e}"));
                         return;
@@ -7797,9 +7787,9 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     );
                 }
                 NamePromptAction::SavePreset(source) => {
-                    // The preset store is its own namespace, so the roster is
-                    // empty here; only the charset + built-in rules apply.
-                    if let Err(e) = validate_profile_name(&name, &[], None) {
+                    // The preset store is its own namespace — neither harness's
+                    // roster has a say; only the charset + built-in rules apply.
+                    if let Err(e) = validate_name_chars(&name) {
                         app.toast(ToastKind::Danger, format!("{e}"));
                         return;
                     }
@@ -8647,11 +8637,17 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
-            // Chars/empty-only check here — the duplicate-name branch of
-            // `validate_profile_name` is skipped (empty `existing`) so a
+            // Chars + cross-harness only — the own-roster duplicate branch of
+            // `validate_profile_name` is deliberately skipped so a claude
             // collision falls through to the canonical_name lookup below
-            // instead of dead-ending with an "already exists" error.
-            if let Err(e) = validate_profile_name(&name, &[], None) {
+            // (capture-into-existing) instead of dead-ending with an "already
+            // exists" error. A codex-held name has no such flow — a claude
+            // login can't be captured into a codex profile — so that half
+            // still refuses here.
+            let validation = validate_name_chars(&name)
+                .map(|_| ())
+                .and_then(|()| validate_foreign_harness_free(&name, Harness::Claude));
+            if let Err(e) = validation {
                 app.toast(ToastKind::Danger, format!("{e}"));
                 return;
             }

@@ -1714,6 +1714,28 @@ fn reload_fingerprint_changes_when_profiles_toml_mtime_bumps() {
     );
 }
 
+/// A codex switch or chain edit writes `codex-profiles.toml` and nothing else,
+/// so the fingerprint must move on that file appearing and on its mtime alone
+/// — otherwise the TUI and daemon would run on stale codex state forever.
+#[test]
+fn reload_fingerprint_covers_the_codex_state_file() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let before = reload_fingerprint();
+    let path = dir.join("codex-profiles.toml");
+    std::fs::write(&path, "profiles = []\n").expect("write codex state");
+    let appeared = reload_fingerprint();
+    assert_ne!(before, appeared, "the file appearing must shift it");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    crate::testutil::set_mtime(&path, later);
+    assert_ne!(
+        appeared,
+        reload_fingerprint(),
+        "a bare mtime bump must shift it"
+    );
+}
+
 #[test]
 fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
     let _home = crate::testutil::HomeSandbox::new();

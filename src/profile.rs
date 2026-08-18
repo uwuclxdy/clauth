@@ -1342,6 +1342,11 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct ReloadFingerprint {
     profiles_toml_mtime: Option<SystemTime>,
+    /// `codex-profiles.toml`'s mtime — a codex switch or chain edit writes that
+    /// file and nothing else, so without this stat a codex state change would
+    /// never shift the fingerprint. The dir walk below already covers a codex
+    /// profile's `config.toml`; this is the only codex-specific stat needed.
+    codex_toml_mtime: Option<SystemTime>,
     /// `(profile dir name, config.toml mtime, session-token.json write time)`,
     /// each `None` when the file is absent, sorted by name so readdir order can't
     /// spuriously flip equality. The sidecar rides here because a
@@ -1390,6 +1395,7 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     config_mtimes.sort();
     ReloadFingerprint {
         profiles_toml_mtime,
+        codex_toml_mtime: crate::codex_profiles::codex_state_mtime(),
         config_mtimes,
     }
 }
@@ -1781,6 +1787,14 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
 /// boundary, not an oversight.
 pub(crate) fn is_configured(name: &ProfileName) -> Result<bool> {
     Ok(load_app_state()?.profiles.iter().any(|n| n == name))
+}
+
+/// The claude roster, read from `profiles.toml` alone — the name list without
+/// the per-profile config/credential reads `load_config` does. For the
+/// cross-harness name-uniqueness check, which needs both rosters from disk and
+/// neither's profiles.
+pub(crate) fn claude_roster_names() -> Result<Vec<ProfileName>> {
+    Ok(load_app_state()?.profiles)
 }
 
 pub(crate) fn load_app_state() -> Result<AppState> {

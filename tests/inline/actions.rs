@@ -843,24 +843,108 @@ fn edit_profile_preset_writes_endpoint_and_models_in_one_shot() {
 
 #[test]
 fn validate_profile_name_accepts_email_rejects_path_chars() {
+    let _home = HomeSandbox::new();
     for name in [
         "claude@domain.com",
         "user2@domain.com",
         "claude+work@gmail.com",
     ] {
         assert!(
-            validate_profile_name(name, &[], None).is_ok(),
+            validate_profile_name(name, Harness::Claude, None).is_ok(),
             "{name} rejected"
         );
     }
     // path separators / windows-reserved chars stay blocked so the name can't
-    // escape its profiles/<name> directory segment.
+    // escape its profiles/<name> directory segment. The charset half alone
+    // (what the preset store runs) blocks the same set.
     for name in ["a/b", "a\\b", "a:b", ".lead", "a b"] {
         assert!(
-            validate_profile_name(name, &[], None).is_err(),
+            validate_profile_name(name, Harness::Claude, None).is_err(),
             "{name} accepted"
         );
+        assert!(validate_name_chars(name).is_err(), "{name} passed chars");
     }
+}
+
+/// The rosters are read from DISK inside the check — decision 2 of the codex
+/// plan. A caller cannot curate the cross-harness half away by passing a
+/// list, because there is no list to pass.
+#[test]
+fn a_name_the_other_harness_holds_is_refused_naming_the_holder() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl".into()],
+        ..Default::default()
+    })
+    .expect("save claude state");
+
+    let err = validate_profile_name("cx", Harness::Claude, None)
+        .expect_err("a codex-held name must refuse on the claude side");
+    assert!(err.to_string().contains("codex"), "names the holder: {err}");
+    // Case-insensitive, same as the own-roster duplicate rule.
+    assert!(validate_profile_name("CX", Harness::Claude, None).is_err());
+
+    let err = validate_profile_name("cl", Harness::Codex, None)
+        .expect_err("a claude-held name must refuse on the codex side");
+    assert!(
+        err.to_string().contains("claude"),
+        "names the holder: {err}"
+    );
+
+    // A free name passes on both sides.
+    assert!(validate_profile_name("fresh", Harness::Claude, None).is_ok());
+    assert!(validate_profile_name("fresh", Harness::Codex, None).is_ok());
+}
+
+/// The own-roster duplicate check keeps its rename-in-place exemption, and the
+/// codex side gets the same rule against its own roster.
+#[test]
+fn the_own_roster_duplicate_keeps_the_rename_exemption() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl".into()],
+        ..Default::default()
+    })
+    .expect("save claude state");
+
+    assert!(validate_profile_name("cl", Harness::Claude, None).is_err());
+    assert!(validate_profile_name("cl", Harness::Claude, Some("cl")).is_ok());
+    assert!(
+        validate_profile_name("CL", Harness::Claude, Some("cl")).is_ok(),
+        "a case-only rename of the same profile is a rename-in-place"
+    );
+    assert!(validate_profile_name("cx", Harness::Codex, None).is_err());
+    assert!(validate_profile_name("cx", Harness::Codex, Some("cx")).is_ok());
+}
+
+/// The capture-name flavor: tolerate an own-roster collision (it routes into
+/// capture-into-existing) while still refusing to shadow the other harness.
+#[test]
+fn the_cross_harness_half_stands_alone_for_the_capture_flow() {
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl".into()],
+        ..Default::default()
+    })
+    .expect("save claude state");
+
+    assert!(
+        validate_foreign_harness_free("cl", Harness::Claude).is_ok(),
+        "an own-roster collision is this flavor's business to allow"
+    );
+    assert!(validate_foreign_harness_free("cx", Harness::Claude).is_err());
 }
 
 // ── capture-name collision overwrite (issue #7) ────────────────────────────
