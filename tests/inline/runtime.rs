@@ -7713,8 +7713,10 @@ fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
     assert_eq!(rows[0].start_profile, "cx");
     assert_eq!(
         rows[0].launch_store.as_deref(),
-        Some(profile.join("auth.json").as_path()),
-        "launch_store names what the session actually holds — the #59 one-liner"
+        Some(session_home.join("auth.json").as_path()),
+        "launch_store names the auth.json THIS SESSION READS — under real \
+         symlinks that file IS profiles/<name>/auth.json (the #59 one-liner), \
+         and under fake mode it is the copy the session actually holds"
     );
 
     // A rollout the session wrote must survive the session.
@@ -7777,13 +7779,27 @@ fn a_fake_mode_codex_home_reconverges_the_auth_projection() {
 
     with_link_mode(LinkMode::Fake, || {
         drop(CodexRuntime::acquire("cx", Isolation::Shared).expect("first acquire"));
-        // A re-capture replaced the store between sessions.
+        // A re-capture replaced the store between sessions (newer mtime).
         fs::write(profile.join("auth.json"), b"{\"v\":2}").expect("replace store");
         let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("second acquire");
+        let copy = runtime.home().join("auth.json");
         assert_eq!(
-            fs::read(runtime.home().join("auth.json")).expect("read projection"),
+            fs::read(&copy).expect("read copy"),
             b"{\"v\":2}",
-            "the projection re-converges at session start"
+            "a newer store wins the converge at session start"
+        );
+
+        // The session ROTATES the copy — the fresh chain must reach the
+        // store at teardown, not sit in a copy the next converge overwrites
+        // with the store's spent token (the permanent-death direction).
+        fs::write(&copy, b"{\"v\":3}").expect("rotate the copy");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        crate::testutil::set_mtime(&copy, later);
+        drop(runtime);
+        assert_eq!(
+            fs::read(profile.join("auth.json")).expect("read store"),
+            b"{\"v\":3}",
+            "a chain rotated in the copy reaches the store at teardown"
         );
     });
 }

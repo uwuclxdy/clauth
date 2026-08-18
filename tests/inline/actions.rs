@@ -3860,3 +3860,32 @@ fn codex_capture_refuses_a_claude_held_name() {
         "names the holder: {err}"
     );
 }
+
+/// A re-auth must be the SAME account: a different account_id refuses naming
+/// both identities, while a corrupt existing store — the state re-capture
+/// exists to repair — stays capturable.
+#[test]
+fn codex_recapture_refuses_a_different_account() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    codex_login_capture("cx").expect("first capture");
+
+    let operator_auth = home.home().join(".codex").join("auth.json");
+    std::fs::remove_file(&operator_auth).expect("drop link");
+    let other = OPERATOR_AUTH.replace("\"acc\"", "\"acc-other\"");
+    std::fs::write(&operator_auth, &other).expect("write other account");
+
+    let err = codex_login_capture("cx").expect_err("identity swap refuses");
+    assert!(err.to_string().contains("acc-other"), "{err}");
+    assert!(err.to_string().contains("new profile"), "{err}");
+
+    // A corrupt store is the state re-capture repairs — allowed through.
+    std::fs::write(
+        profile_dir(&crate::profile::ProfileName::from("cx"))
+            .expect("dir")
+            .join("auth.json"),
+        b"{ half a wri",
+    )
+    .expect("corrupt store");
+    codex_login_capture("cx").expect("a corrupt store re-captures");
+}

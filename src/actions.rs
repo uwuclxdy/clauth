@@ -1014,6 +1014,33 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
                  capture would replace — close it first"
             );
         }
+        // A re-auth must be the SAME account: silently swapping the identity
+        // under a profile's name mislabels everything keyed on it (usage,
+        // chain slots, the operator's own mental model). An unreadable or
+        // chainless existing store is exempt — re-capture is the repair for
+        // exactly that state.
+        if reauth
+            && let Ok(bytes) = std::fs::read(
+                profile_dir(&ProfileName::from(canonical.as_str()))?.join("auth.json"),
+            )
+            && let Ok(existing) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        {
+            let account = |v: &serde_json::Value| {
+                v.get("tokens")
+                    .and_then(|t| t.get("account_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            };
+            if let (Some(old), Some(new)) = (account(&existing), account(&parsed))
+                && old != new
+            {
+                bail!(
+                    "'{canonical}' stores ChatGPT account {old}, but the operator login \
+                     is account {new} — capture it into a new profile, or delete \
+                     '{canonical}' first"
+                );
+            }
+        }
         let dir = profile_dir(&ProfileName::from(canonical.as_str()))?;
         crate::profile::mkdir_700(&dir)
             .with_context(|| format!("failed to create {}", dir.display()))?;

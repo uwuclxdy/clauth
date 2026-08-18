@@ -3999,6 +3999,39 @@ const CODEX_OPERATOR_ENTRIES: &[&str] = &[
     "AGENTS.md",
 ];
 
+/// Converge the profile store and a fake-mode home's `auth.json` copy —
+/// newer-mtime wins, content-equal is a no-op. One direction is not enough in
+/// EITHER direction: store→copy alone means a re-capture never reaches the
+/// next session once the copy exists, and — worse — it would overwrite a
+/// chain the last session ROTATED in the copy with the store's now-SPENT
+/// refresh token, which is the permanent-death shape. Copy→store alone means
+/// a re-capture is undone at the next start. The claude fake transport solves
+/// this with a per-tick bidirectional mirror; codex has no watchdog, so its
+/// convergence points are the session boundaries — the build here, and the
+/// teardown — with mid-session divergence staying fake mode's documented
+/// cost.
+fn converge_fake_codex_auth(store: &Path, copy: &Path) -> Result<()> {
+    match (store.exists(), copy.exists()) {
+        (false, false) => Ok(()),
+        (true, false) => copy_file(store, copy),
+        // The store must never lag a chain that exists only in the copy: the
+        // rotation and capture machinery read the STORE.
+        (false, true) => copy_file(copy, store),
+        (true, true) => {
+            if files_match(store, copy).unwrap_or(false) {
+                return Ok(());
+            }
+            let store_m = file_mtime(store);
+            let copy_m = file_mtime(copy);
+            if copy_m > store_m {
+                copy_file(copy, store)
+            } else {
+                copy_file(store, copy)
+            }
+        }
+    }
+}
+
 /// The per-profile codex knobs, read from the profile's own `config.toml` —
 /// the file the reload fingerprint already walks. A codex profile's config is
 /// never read by the claude `load_profile`, so this minimal shape is its one
@@ -4062,9 +4095,9 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
     // The one physical auth.json. Placed even while the store is absent (a
     // captured login can arrive after the first start): a dangling link reads
     // as "no credentials" to codex today and as the store the moment it
-    // exists. Under Fake the copy is a PROJECTION of the store, re-converged
-    // at every session start so a re-capture reaches the next session —
-    // mid-session staleness stays fake mode's documented cost.
+    // exists. Under Fake the store and the home's copy CONVERGE at every
+    // session boundary (here, and again at teardown) — see
+    // [`converge_fake_codex_auth`] for why one direction is not enough.
     let auth_dst = home.join("auth.json");
     match mode {
         LinkMode::Real => {
@@ -4072,11 +4105,7 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
                 link_entry(&auth_store, &auth_dst)?;
             }
         }
-        LinkMode::Fake => {
-            if auth_store.exists() && !files_match(&auth_store, &auth_dst).unwrap_or(false) {
-                copy_file(&auth_store, &auth_dst)?;
-            }
-        }
+        LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst)?,
     }
 
     let operator_config = operator.join("config.toml");
@@ -4185,15 +4214,19 @@ impl CodexRuntime {
 
             // Register inside the same hold, marker already flock-held — the
             // row never exists without a liveness signal. `launch_store` is
-            // the profile's auth.json: what this session actually holds, which
-            // is what the rotation refusal reads (the #59 review's one-liner).
+            // the auth.json THIS SESSION READS — which is what the rotation
+            // refusal must test (the #59 review's one-liner, honored by
+            // intent): under real symlinks the home's auth.json IS
+            // profiles/<name>/auth.json, and under the fake transport it is
+            // the copy the session actually holds, where the accepted
+            // spelling would name a file the session never reads.
             let row = crate::live_sessions::LiveSession::starting(
                 &session,
                 name,
                 crate::harness::Harness::Codex,
                 isolation == Isolation::Isolated,
                 false,
-                Some(profile_subpath(&owned, "auth.json")?),
+                Some(home.join("auth.json")),
             );
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live codex session failed: {e}");
@@ -4221,6 +4254,17 @@ impl CodexRuntime {
 
 impl Drop for CodexRuntime {
     fn drop(&mut self) {
+        // The teardown half of the fake-mode auth convergence: a chain the
+        // session rotated in the copy reaches the store NOW, not at some next
+        // start that may never come — and a rotation or capture between
+        // sessions reads a store that is not stale.
+        if self.mode == LinkMode::Fake
+            && let Ok(store) =
+                profile_subpath(&ProfileName::from(self.profile.as_str()), "auth.json")
+            && let Err(e) = converge_fake_codex_auth(&store, &self.home.join("auth.json"))
+        {
+            logline!("clauth: codex auth converge at teardown failed: {e:#}");
+        }
         // Sync the shared flavor's sessions back into the durable store so a
         // rollout survives its session — best-effort, never failing a
         // completed session, and a no-op when the home IS the store (fake
