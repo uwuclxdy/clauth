@@ -63,23 +63,29 @@ use crate::out::{errln, out, outln};
 use crate::profile::{AppConfig, ProfileName, ThemeName, load_config};
 use crate::runtime::Isolation;
 
-/// Resolve `name` to its canonical spelling, or bail with a [`UsageError`].
-/// A bare unrecognized word lands here as a profile name (clap's `external`
-/// subcommand), so a typo'd subcommand and a typo'd profile name are
-/// indistinguishable at this position. Either way the caller named something
-/// that isn't there: a usage error (exit 2), not a runtime failure (exit 1).
-/// Shared by every profile-naming command: `start`/`delete`/`disable`/
-/// `enable`/`switch`/`rolling-token`/`static-token`.
+/// The not-found half of [`resolve_or_bail`], buildable on its own for the
+/// commands that try the codex roster before giving up. A bare unrecognized
+/// word lands here as a profile name (clap's `external` subcommand), so a
+/// typo'd subcommand and a typo'd profile name are indistinguishable at this
+/// position. Either way the caller named something that isn't there: a usage
+/// error (exit 2), not a runtime failure (exit 1).
+fn unknown_profile_error(config: &AppConfig, name: &str) -> anyhow::Error {
+    let available = config.names().join(", ");
+    usage_error(format!(
+        "profile '{name}' not found\navailable: {available}"
+    ))
+}
+
+/// Resolve `name` to its canonical spelling against the CLAUDE roster, or bail
+/// with a [`UsageError`]. Shared by every claude-only profile-naming command:
+/// `start`/`disable`/`enable`/`rolling-token`/`static-token`. `switch` and
+/// `delete` resolve by hand instead — a claude miss falls through to the codex
+/// roster there.
 fn resolve_or_bail(config: &AppConfig, name: &str) -> Result<ProfileName> {
     config
         .canonical_name(name)
         .map(ProfileName::from)
-        .ok_or_else(|| {
-            let available = config.names().join(", ");
-            usage_error(format!(
-                "profile '{name}' not found\navailable: {available}"
-            ))
-        })
+        .ok_or_else(|| unknown_profile_error(config, name))
 }
 
 fn main() {
@@ -991,21 +997,14 @@ fn clear_backup_postscript(target: &str) -> String {
 fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
-    if !yes {
-        use std::io::IsTerminal as _;
-        if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-            anyhow::bail!(
-                "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
-            );
-        }
-        out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
-        let mut answer = String::new();
-        std::io::stdin().read_line(&mut answer)?;
-        if !reauth_confirmed(&answer) {
-            outln!("clauth: aborted. '{canonical}' left in place.");
-            return Ok(());
-        }
+    let Some(canonical) = config.canonical_name(name) else {
+        // Not a claude name — a codex profile deletes through its own state
+        // file, same confirm gate, same flags.
+        return cmd_delete_codex(&config, name, yes, force);
+    };
+    let canonical = ProfileName::from(canonical);
+    if !confirm_profile_delete(&canonical, yes)? {
+        return Ok(());
     }
     let was_active = config.is_active(&canonical);
     let rotation = actions::rotation_guard_for_mutation(&canonical)?;
@@ -1015,6 +1014,45 @@ fn cmd_delete(name: &str, yes: bool, force: bool) -> Result<()> {
     } else {
         outln!("clauth: deleted profile '{canonical}'.");
     }
+    Ok(())
+}
+
+/// The `delete` confirm gate, one spelling for both harnesses: refuse a
+/// promptless non-TTY delete, prompt on a TTY, `--yes` skips. `Ok(false)` is
+/// the clean abort.
+fn confirm_profile_delete(canonical: &str, yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    use std::io::IsTerminal as _;
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        anyhow::bail!(
+            "refusing to delete '{canonical}' without confirmation; pass --yes for a non-interactive delete"
+        );
+    }
+    out!("clauth: delete profile '{canonical}' and all its credentials? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !reauth_confirmed(&answer) {
+        outln!("clauth: aborted. '{canonical}' left in place.");
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// The codex leg of [`cmd_delete`]: resolve against the codex roster, then the
+/// same confirm gate and the codex delete. No was-active postscript — nothing
+/// global is installed for a codex profile, so an active one's delete clears
+/// only its own state slot.
+fn cmd_delete_codex(config: &AppConfig, name: &str, yes: bool, force: bool) -> Result<()> {
+    let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
+        return Err(unknown_profile_error(config, name));
+    };
+    if !confirm_profile_delete(&canonical, yes)? {
+        return Ok(());
+    }
+    actions::delete_codex_profile(&canonical, force)?;
+    outln!("clauth: deleted codex profile '{canonical}'.");
     Ok(())
 }
 
@@ -1090,7 +1128,17 @@ fn cmd_enable(name: &str) -> Result<()> {
 fn cmd_switch(name: &str) -> Result<()> {
     platform::init();
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let Some(canonical) = config.canonical_name(name) else {
+        // Not a claude name — a codex profile switches its own harness's
+        // active slot, with no live install to perform (session-boundary).
+        if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
+            actions::switch_codex_profile(&canonical)?;
+            outln!("clauth: switched codex to '{canonical}' — live at the next codex session");
+            return Ok(());
+        }
+        return Err(unknown_profile_error(&config, name));
+    };
+    let canonical = ProfileName::from(canonical);
     refuse_if_disabled(&config, &canonical)?;
     actions::switch_profile_cli(config, &canonical)
 }

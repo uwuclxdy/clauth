@@ -30,10 +30,11 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{ProfileName, clauth_dir, read_toml_file};
+use crate::lock::StateLock;
+use crate::profile::{ProfileName, atomic_write_600, clauth_dir, mkdir_700, read_toml_file};
 
 /// The codex roster and its per-harness slots: the same four fields
 /// `profiles.toml` holds for claude — active marker, ordering, fallback chain,
@@ -77,6 +78,69 @@ impl CodexState {
     /// Every codex profile, in roster order.
     pub(crate) fn profiles(&self) -> &[ProfileName] {
         &self.profiles
+    }
+
+    /// The active codex profile — the codex twin of `AppState.active_profile`,
+    /// with no bearing on the claude slot.
+    pub(crate) fn active_profile(&self) -> Option<&ProfileName> {
+        self.active_profile.as_ref()
+    }
+
+    /// Exact-match membership, same semantics as `AppConfig::find` answering
+    /// `is_some`.
+    pub(crate) fn holds(&self, name: &str) -> bool {
+        self.profiles.iter().any(|n| n.as_str() == name)
+    }
+
+    /// Case-insensitive lookup returning the canonical casing — the codex twin
+    /// of `AppConfig::canonical_name`, for CLI name resolution.
+    pub(crate) fn canonical_name(&self, query: &str) -> Option<String> {
+        self.profiles
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(query))
+            .map(|n| n.as_str().to_string())
+    }
+
+    /// Move (or clear) the active marker. Callers resolve membership first;
+    /// under [`CodexState::update`] that resolution is re-made against the
+    /// state this closure was handed, which was loaded under the lock.
+    pub(crate) fn set_active(&mut self, name: Option<&str>) {
+        self.active_profile = name.map(ProfileName::from);
+    }
+
+    /// Remove `name` from every slot — roster, fallback chain, and the active
+    /// marker — the codex twin of `AppConfig::remove`.
+    pub(crate) fn remove_profile(&mut self, name: &str) {
+        self.profiles.retain(|n| n.as_str() != name);
+        self.fallback_chain.retain(|n| n.as_str() != name);
+        if self.active_profile.as_deref() == Some(name) {
+            self.active_profile = None;
+        }
+    }
+
+    /// The one mutation path: load under the state lock, hand the closure the
+    /// on-disk state, persist what it left behind. Holding the lock across
+    /// load → mutate → save is what makes a concurrent writer impossible to
+    /// clobber — there is no way to persist a pre-acquisition snapshot,
+    /// because [`CodexState::save`] is unreachable outside this function.
+    /// Filesystem work that must land atomically with the state change (a dir
+    /// removal, a rename) belongs inside the closure, which runs under the
+    /// same hold.
+    pub(crate) fn update<T>(f: impl FnOnce(&mut CodexState) -> Result<T>) -> Result<T> {
+        let lock = StateLock::acquire()?;
+        let mut state = Self::load()?;
+        let out = f(&mut state)?;
+        state.save(&lock)?;
+        Ok(out)
+    }
+
+    /// Persist, witness-gated: the `StateLock` parameter is proof the caller
+    /// holds the cross-process state lock, and the only caller is
+    /// [`CodexState::update`], which acquired it around the load.
+    fn save(&self, _witness: &StateLock) -> Result<()> {
+        mkdir_700(&clauth_dir()?)?;
+        atomic_write_600(&codex_state_path()?, toml::to_string_pretty(self)?)
+            .context("failed to write codex-profiles.toml")
     }
 }
 

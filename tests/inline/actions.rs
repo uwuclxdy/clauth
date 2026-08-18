@@ -947,6 +947,102 @@ fn the_cross_harness_half_stands_alone_for_the_capture_flow() {
     assert!(validate_foreign_harness_free("cx", Harness::Claude).is_err());
 }
 
+// ── codex CRUD: switch + delete against codex-profiles.toml ────────────────
+
+fn write_codex_state(body: &str) {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), body).expect("write codex state");
+}
+
+/// A codex switch writes the codex file's active slot and nothing anywhere
+/// else — decision 4's per-harness independence, observed rather than assumed.
+#[test]
+fn switch_codex_moves_only_the_codex_slot() {
+    let _home = HomeSandbox::new();
+    write_codex_state("active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\n");
+    save_app_state(&crate::profile::AppState {
+        active_profile: Some("cl".into()),
+        profiles: vec!["cl".into()],
+        ..Default::default()
+    })
+    .expect("save claude state");
+
+    switch_codex_profile("cx2").expect("switch");
+
+    let state = crate::codex_profiles::CodexState::load().expect("load");
+    assert_eq!(state.active_profile().map(|n| n.as_str()), Some("cx2"));
+    assert_eq!(
+        crate::profile::active_profile_name().as_deref(),
+        Some("cl"),
+        "the claude active slot must not move on a codex switch"
+    );
+
+    let err = switch_codex_profile("ghost").expect_err("unknown name refuses");
+    assert_eq!(err.to_string(), "codex profile 'ghost' not found");
+}
+
+/// The codex delete mirrors the claude one's order (dir before state) and
+/// clears every slot the name occupies: roster, chain, active marker.
+#[test]
+fn delete_codex_removes_the_dir_and_every_slot() {
+    let _home = HomeSandbox::new();
+    write_codex_state(
+        "active_profile = \"cx2\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx2\", \"cx1\"]\n",
+    );
+    let dir = profile_dir("cx2").expect("profile dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir profile");
+    std::fs::write(dir.join("auth.json"), b"{}").expect("write auth");
+
+    delete_codex_profile("cx2", false).expect("delete");
+
+    assert!(!dir.exists(), "the profile dir is removed");
+    let state = crate::codex_profiles::CodexState::load().expect("load");
+    assert_eq!(state.profiles(), ["cx1"]);
+    assert_eq!(state.active_profile(), None, "the active marker is cleared");
+    assert!(
+        !state.holds("cx2"),
+        "the roster no longer holds the deleted name"
+    );
+    let violations =
+        crate::testutil::owner_only_violations(&crate::profile::clauth_dir().expect("clauth dir"));
+    assert!(
+        violations.is_empty(),
+        "the rewritten state file keeps owner-only modes: {violations:?}"
+    );
+}
+
+/// Same live gate as the claude delete, same words — one predicate, one noun.
+#[test]
+fn delete_codex_refuses_a_live_session_unforced() {
+    let home = HomeSandbox::new();
+    write_codex_state("profiles = [\"busy\"]\n");
+    let sessions = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("busy")
+        .join("sessions");
+    std::fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("open pid");
+    pid.lock().expect("lock pid");
+
+    let err = delete_codex_profile("busy", false).expect_err("live session blocks");
+    assert_eq!(
+        err.to_string(),
+        "'busy' has a live session, pass --force to delete it anyway"
+    );
+    let state = crate::codex_profiles::CodexState::load().expect("load");
+    assert!(state.holds("busy"), "the refused delete leaves the record");
+
+    delete_codex_profile("busy", true).expect("--force overrides the gate");
+    assert!(
+        !crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("busy")
+    );
+}
+
 // ── capture-name collision overwrite (issue #7) ────────────────────────────
 
 /// Overwriting an existing profile on a capture-name collision must mutate it

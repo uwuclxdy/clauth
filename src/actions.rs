@@ -833,6 +833,50 @@ pub(crate) fn delete_profile(
     Ok(())
 }
 
+/// `clauth <name>` resolving to a codex profile: move the codex active marker
+/// and nothing else. The state slot is the whole switch — a codex session
+/// binds `auth.json` at start through its own home, so there is no live
+/// credential to install, no Keychain to mirror, and the change lands at the
+/// next session (the parity map's "session-boundary"). Membership is re-made
+/// against the state [`CodexState::update`] loaded under the lock, so a
+/// concurrent delete can't be switched onto.
+pub(crate) fn switch_codex_profile(name: &str) -> Result<()> {
+    crate::codex_profiles::CodexState::update(|state| {
+        if !state.holds(name) {
+            bail!("codex profile '{name}' not found");
+        }
+        // Same early return the claude switch takes on `is_active` — nothing
+        // to move. The rewrite this still commits is byte-identical state.
+        if state.active_profile().map(ProfileName::as_str) == Some(name) {
+            return Ok(());
+        }
+        state.set_active(Some(name));
+        Ok(())
+    })
+}
+
+/// `clauth delete <name>` for a codex profile. Same shape as the claude
+/// [`delete_profile`] minus the steps that have no codex counterpart: nothing
+/// global is installed for codex (no live credentials link, no settings.json
+/// endpoint, no usage-TTL memo), so the unwire half is simply absent. The live
+/// gate and the dir-before-state order are kept exactly — a refused or failed
+/// delete leaves the record intact and retryable.
+pub(crate) fn delete_codex_profile(name: &str, force: bool) -> Result<()> {
+    crate::codex_profiles::CodexState::update(|state| {
+        let owned = ProfileName::from(name);
+        if !force && crate::runtime::has_live_session(&owned) {
+            bail!("'{name}' has a live session, pass --force to delete it anyway");
+        }
+        let dir = profile_dir(&owned)?;
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir)
+                .with_context(|| format!("failed to delete profile directory for '{name}'"))?;
+        }
+        state.remove_profile(name);
+        Ok(())
+    })
+}
+
 /// `clauth disable <name>` — mark `name` as user-disabled (see
 /// [`Profile::disabled`]): invisible to the fallback-chain walk, the
 /// usage/rotation scheduler, and the daemon status feed by default, while its
