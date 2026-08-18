@@ -114,6 +114,14 @@ impl CodexState {
         self.active_profile = name.map(ProfileName::from);
     }
 
+    /// Append `name` to the roster. Idempotent — a re-capture of an existing
+    /// profile must not double its entry.
+    pub(crate) fn add_profile(&mut self, name: &str) {
+        if !self.holds(name) {
+            self.profiles.push(ProfileName::from(name));
+        }
+    }
+
     /// Remove `name` from every slot — roster, fallback chain, and the active
     /// marker — the codex twin of `AppConfig::remove`.
     pub(crate) fn remove_profile(&mut self, name: &str) {

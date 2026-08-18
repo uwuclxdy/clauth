@@ -3654,3 +3654,124 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
         "a reauth that clears the endpoint clears the session with it",
     );
 }
+
+// ── codex login capture (`clauth login <name> --codex`) ────────────────────
+
+fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&str>) {
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(&operator).expect("mkdir .codex");
+    if let Some(body) = auth {
+        std::fs::write(operator.join("auth.json"), body).expect("write operator auth");
+    }
+    if let Some(body) = config {
+        std::fs::write(operator.join("config.toml"), body).expect("write operator config");
+    }
+}
+
+const OPERATOR_AUTH: &str = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"id.x","access_token":"at.x","refresh_token":"rt.x","account_id":"acc"},"last_refresh":"2026-08-13T00:00:00Z","from_the_future":1}"#;
+
+/// The capture is a verbatim snapshot — every byte, unknown keys included —
+/// landed 0600 with the roster entry and the self-describing marker.
+#[test]
+fn codex_capture_creates_the_profile_verbatim() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+
+    codex_login_capture("cx").expect("capture");
+
+    let state = crate::codex_profiles::CodexState::load().expect("load");
+    assert!(state.holds("cx"));
+    let stored = profile_dir(&crate::profile::ProfileName::from("cx"))
+        .expect("dir")
+        .join("auth.json");
+    assert_eq!(
+        std::fs::read(&stored).expect("read stored"),
+        OPERATOR_AUTH.as_bytes(),
+        "a snapshot preserves every byte, unknown keys included"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&stored)
+                .expect("meta")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the writer owns auth.json's 0600 — the perms sweep won't"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(
+            profile_dir(&crate::profile::ProfileName::from("cx"))
+                .expect("dir")
+                .join("config.toml")
+        )
+        .expect("read marker"),
+        "harness = \"codex\"\n"
+    );
+
+    // Re-capture under a case variant re-authenticates the SAME profile.
+    codex_login_capture("CX").expect("re-capture");
+    let state = crate::codex_profiles::CodexState::load().expect("load");
+    assert_eq!(
+        state.profiles(),
+        ["cx"],
+        "no second roster entry, no case twin"
+    );
+}
+
+/// The two refusals name their fixes; nothing is created on either.
+#[test]
+fn codex_capture_refusals_name_the_fix() {
+    let home = HomeSandbox::new();
+
+    let err = codex_login_capture("cx").expect_err("no auth.json refuses");
+    assert!(err.to_string().contains("run `codex login` first"), "{err}");
+
+    write_operator_codex(
+        &home,
+        Some(OPERATOR_AUTH),
+        Some("cli_auth_credentials_store = \"keyring\"\n"),
+    );
+    let err = codex_login_capture("cx").expect_err("keyring refuses");
+    assert!(
+        err.to_string().contains("cli_auth_credentials_store"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("\"file\""), "{err}");
+
+    write_operator_codex(
+        &home,
+        Some(r#"{"OPENAI_API_KEY":"sk-x"}"#),
+        Some("cli_auth_credentials_store = \"file\"\n"),
+    );
+    let err = codex_login_capture("cx").expect_err("api-key-only refuses");
+    assert!(err.to_string().contains("no ChatGPT token chain"), "{err}");
+
+    assert!(
+        !crate::codex_profiles::CodexState::load()
+            .expect("load")
+            .holds("cx"),
+        "a refused capture creates nothing"
+    );
+}
+
+/// Cross-harness uniqueness holds at capture, checked under the lock.
+#[test]
+fn codex_capture_refuses_a_claude_held_name() {
+    let home = HomeSandbox::new();
+    write_operator_codex(&home, Some(OPERATOR_AUTH), None);
+    save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl".into()],
+        ..Default::default()
+    })
+    .expect("save claude state");
+
+    let err = codex_login_capture("cl").expect_err("a claude-held name refuses");
+    assert!(
+        err.to_string().contains("claude"),
+        "names the holder: {err}"
+    );
+}

@@ -501,6 +501,9 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
+    if args.codex {
+        return actions::codex_login_capture(&args.profile);
+    }
     let mut config = load_config()?;
     let route = login_route(&config, &args.profile);
     let target = ProfileName::from(match &route {

@@ -890,6 +890,118 @@ pub(crate) fn delete_codex_profile(name: &str, force: bool) -> Result<()> {
     })
 }
 
+/// `clauth login <name> --codex` — create (or re-authenticate) a codex
+/// profile by capturing the operator's own `codex login` from
+/// `~/.codex/auth.json` into `profiles/<name>/auth.json`. The bytes are
+/// copied VERBATIM — a whole-file snapshot preserves every key, known or not
+/// — written atomic and 0600 (this writer owns that mode; the perms sweep
+/// deliberately does not descend into codex territory).
+///
+/// Two refusals, each naming its fix:
+/// - keyring/auto store (`cli_auth_credentials_store` in the operator's
+///   config.toml): under those modes the file is absent or stale BY DESIGN,
+///   so a capture would snapshot nothing or yesterday's chain.
+/// - no `tokens` chain in the file: an API-key-only codex setup has no chain
+///   to manage — rotation, usage, and the session symlink all speak ChatGPT
+///   tokens.
+///
+/// What capture deliberately does NOT do: touch the operator's `~/.codex` in
+/// any way. The cost is stated out loud at the end — the operator's own
+/// bare `codex` now holds a diverging copy of a single-use rotating chain,
+/// and whichever side refreshes first strands the other — because silence
+/// there would read as "both keep working", which is exactly false.
+pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
+    let operator = crate::profile::home_dir()?.join(".codex");
+    let store_mode = codex_operator_store_mode(&operator);
+    if matches!(store_mode.as_deref(), Some("keyring") | Some("auto")) {
+        bail!(
+            "the operator codex stores its login in the OS keyring \
+             (cli_auth_credentials_store = \"{}\" in ~/.codex/config.toml), so \
+             ~/.codex/auth.json is absent or stale by design — set it to \
+             \"file\", run `codex login`, then re-run this capture",
+            store_mode.unwrap_or_default()
+        );
+    }
+    let auth_path = operator.join("auth.json");
+    let raw = match std::fs::read(&auth_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "no codex login to capture — ~/.codex/auth.json does not exist; run `codex login` first"
+            )
+        }
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", auth_path.display())),
+    };
+    let parsed: serde_json::Value = serde_json::from_slice(&raw)
+        .with_context(|| format!("failed to parse {}", auth_path.display()))?;
+    let has_chain = parsed
+        .get("tokens")
+        .and_then(|t| t.get("refresh_token"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|rt| !rt.is_empty());
+    if !has_chain {
+        bail!(
+            "~/.codex/auth.json holds no ChatGPT token chain (an API-key-only \
+             setup?) — only a `codex login` chain can be captured"
+        );
+    }
+
+    let (canonical, reauth) = crate::codex_profiles::CodexState::update(|state| {
+        // An existing name re-authenticates in place under its stored
+        // canonical casing, matching the claude login's route; a fresh one is
+        // validated UNDER the same lock the roster write happens under — the
+        // pre-prompt/pre-IO window rule. (The claude half of the check reads
+        // profiles.toml, which the state lock also serializes.)
+        let (canonical, reauth) = match state.canonical_name(name) {
+            Some(canonical) => (canonical, true),
+            None => {
+                validate_profile_name(name, Harness::Codex, None)?;
+                (name.trim().to_string(), false)
+            }
+        };
+        let dir = profile_dir(&ProfileName::from(canonical.as_str()))?;
+        crate::profile::mkdir_700(&dir)
+            .with_context(|| format!("failed to create {}", dir.display()))?;
+        crate::profile::atomic_write_600(&dir.join("auth.json"), &raw)
+            .with_context(|| format!("failed to write {}", dir.join("auth.json").display()))?;
+        // The self-describing harness marker: file membership stays the
+        // authority, this is for a human reading the dir.
+        let config_path = dir.join("config.toml");
+        if !config_path.exists() {
+            crate::profile::atomic_write_600(&config_path, "harness = \"codex\"\n")
+                .with_context(|| format!("failed to write {}", config_path.display()))?;
+        }
+        state.add_profile(&canonical);
+        Ok((canonical, reauth))
+    })?;
+
+    if reauth {
+        outln!("clauth: re-captured the operator codex login into '{canonical}'");
+    } else {
+        outln!("clauth: captured the operator codex login into codex profile '{canonical}'");
+    }
+    outln!(
+        "clauth: note — the login in ~/.codex is now a separate copy of a single-use \
+         rotating chain: the first refresh on either side strands the other. Run codex \
+         through `clauth start {canonical}` from here on (or `codex login` again for your \
+         own ~/.codex)"
+    );
+    Ok(())
+}
+
+/// The operator's `cli_auth_credentials_store`, read tolerantly from
+/// `~/.codex/config.toml` — `None` when the file or key is absent (codex
+/// defaults to the file store) or the TOML does not parse (the capture then
+/// proceeds on the file-store assumption and fails honestly on the read).
+fn codex_operator_store_mode(operator: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(operator.join("config.toml")).ok()?;
+    let parsed: toml::Value = toml::from_str(&raw).ok()?;
+    parsed
+        .get("cli_auth_credentials_store")
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+}
+
 /// `clauth disable <name>` — mark `name` as user-disabled (see
 /// [`Profile::disabled`]): invisible to the fallback-chain walk, the
 /// usage/rotation scheduler, and the daemon status feed by default, while its
