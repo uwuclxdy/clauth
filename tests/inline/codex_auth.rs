@@ -408,11 +408,11 @@ fn fake_transport_stands_down_for_any_live_session_and_keeps_the_kick() {
     let pid = crate::runtime::open_pid_file(&sessions.join("99999")).expect("pid");
     pid.lock().expect("lock");
 
-    crate::runtime::force_fake_link_mode();
+    let forced = crate::runtime::ForcedFakeLinkMode::new();
     // Even a kick must not force a rotation while a fake-mode carrier is live.
     kick_codex(name);
     let out = standby_pass(name, now, "2026-08-13T00:00:00Z".into(), &boom);
-    crate::runtime::clear_forced_link_mode();
+    drop(forced);
     drop(pid);
     assert_eq!(out, StandbyOutcome::StoodDown);
     // The kick was not consumed by the stand-down.

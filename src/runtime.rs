@@ -2692,17 +2692,28 @@ fn clear_link_mode_override() {
     }
 }
 
-/// Test-only: force the fake-symlink transport for every subsequent
-/// `detect_link_mode`, without exposing the private `LinkMode` enum. Paired
-/// with [`clear_forced_link_mode`]; serialized by `HOME_TEST_LOCK`.
+/// Test-only RAII: force the fake-symlink transport for every subsequent
+/// `detect_link_mode` for the guard's lifetime, clearing the process-global
+/// override on drop even if the test panics — so a Fake mode can never leak
+/// into a concurrent test. Without exposing the private `LinkMode` enum.
+/// Serialized against other override users by `HOME_TEST_LOCK`, which the
+/// caller already holds via its `HomeSandbox`.
 #[cfg(test)]
-pub(crate) fn force_fake_link_mode() {
-    set_link_mode_override(LinkMode::Fake);
+pub(crate) struct ForcedFakeLinkMode;
+
+#[cfg(test)]
+impl ForcedFakeLinkMode {
+    pub(crate) fn new() -> Self {
+        set_link_mode_override(LinkMode::Fake);
+        Self
+    }
 }
 
 #[cfg(test)]
-pub(crate) fn clear_forced_link_mode() {
-    clear_link_mode_override();
+impl Drop for ForcedFakeLinkMode {
+    fn drop(&mut self) {
+        clear_link_mode_override();
+    }
 }
 
 /// Probe the OS by attempting a real symlink in `probe_dir`. Anything other than
