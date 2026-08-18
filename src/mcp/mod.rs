@@ -3580,13 +3580,16 @@ fn apply_delegate_env(
     config_dir: &std::path::Path,
     depth: u32,
 ) {
-    crate::runtime::scrub_profile_env(command, active_env_keys);
+    // Delegates are claude sessions; the seam keeps this builder's env story
+    // aligned with `start`'s (same scrub, same home pin).
+    let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
+    engine.scrub_env(command, active_env_keys);
     command.envs(caller_env);
     if !caller_env.contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
         command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
     }
     command
-        .env("CLAUDE_CONFIG_DIR", config_dir)
+        .env(engine.home_env_key(), config_dir)
         .env(MCP_DEPTH_ENV, (depth + 1).to_string());
 }
 
@@ -3679,7 +3682,8 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         ));
     }
 
-    let mut command = crate::runtime::claude_command();
+    let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
+    let mut command = engine.command();
     apply_delegate_env(
         &mut command,
         &opts.env,

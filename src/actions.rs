@@ -178,10 +178,14 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
             None => false,
         };
         snapshot_active_credentials(config)?;
+        // Through the credential-install seam — this chokepoint is where a
+        // future harness's install would dispatch; the sibling switch flavors
+        // below keep their direct calls (claude-only by construction).
+        let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
         if uncaptured_relogin {
-            link_profile_credentials(name)?;
+            engine.install_credentials(name)?;
         } else {
-            force_link_profile_credentials(name)?;
+            engine.force_install_credentials(name)?;
         }
         finish_switch(config, name, held)
     })

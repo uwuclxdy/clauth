@@ -212,12 +212,15 @@ pub(crate) fn run(
     #[cfg(unix)]
     let signal_watcher = SignalWatcher::new()?;
 
-    let mut command = crate::runtime::claude_command();
+    // Through the runtime-spawn seam: this is a claude session, and the codex
+    // engine plugs into the same three calls when its runtime lands.
+    let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
+    let mut command = engine.command();
     // Scrub clauth-managed + active custom env so a session started under
     // profile B doesn't inherit profile A's endpoint/auth/model overrides from
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
-    crate::runtime::scrub_profile_env(&mut command, &active_env_keys);
+    engine.scrub_env(&mut command, &active_env_keys);
     // A resume pins `claude` to the session's workspace; a normal start inherits
     // this process's cwd. Either way the resolved dir feeds the home-project
     // settings guard: when it is the real `$HOME`, its project-tier settings
@@ -227,7 +230,7 @@ pub(crate) fn run(
     if let Some(cwd) = spawn_cwd.as_deref() {
         crate::runtime::guard_home_project_settings(&mut command, cwd);
     }
-    command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
+    command.env(engine.home_env_key(), runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
     // `.claude.json`, so the only extension surface is what the caller passes.
     // Deliberately NOT `--safe-mode`. The cross-account leak (the operator's
