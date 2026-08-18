@@ -3668,7 +3668,11 @@ fn write_operator_codex(home: &HomeSandbox, auth: Option<&str>, config: Option<&
     }
 }
 
-const OPERATOR_AUTH: &str = r#"{"auth_mode":"chatgpt","tokens":{"id_token":"id.x","access_token":"at.x","refresh_token":"rt.x","account_id":"acc"},"last_refresh":"2026-08-13T00:00:00Z","from_the_future":1}"#;
+// Deliberately NON-canonical JSON (spacing, key order, a unicode escape): a
+// verbatim copy keeps these bytes, while any parse-and-reserialize normalizes
+// them away — which is exactly what the verbatim pin must catch.
+const OPERATOR_AUTH: &str = r#"{ "tokens": {"id_token": "id.x", "access_token": "at.x", "refresh_token": "rt.x", "account_id": "acc"},
+  "auth_mode": "chatgpt",  "last_refresh": "2026-08-13T00:00:00Z", "note": "\u0063odex", "from_the_future": 1 }"#;
 
 /// The capture ADOPTS: verbatim bytes into the store (every byte, unknown
 /// keys included, 0600), and the operator slot becomes a symlink to it — one
