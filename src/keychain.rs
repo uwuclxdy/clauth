@@ -194,6 +194,55 @@ fn run_with_deadline(
 /// Keychain generic-password service Claude Code reads/writes for its login.
 const SERVICE: &str = "Claude Code-credentials";
 
+/// Longest command line `security -i`'s tokenizer reads as ONE command.
+///
+/// Measured on macOS 15 / Darwin 25 against a throwaway service: a 3900-byte
+/// value round-trips byte-identical, a 4100-byte value does NOT. Past the
+/// ceiling `security` does not refuse — it splits the line, executes the head
+/// with a TRUNCATED `-w` value, and reports the tail as `unknown command`. The
+/// item is left holding the truncated JSON, so a write that overruns this
+/// silently destroys whatever the item held.
+///
+/// This mattered nowhere until the mirror started preserving Claude Code's
+/// sibling keys: a login-only blob is 1-2 KB and never came close, while a blob
+/// carrying `mcpOAuth` for a dozen-plus OAuth MCP servers clears it easily.
+const SECURITY_STDIN_LINE_MAX: usize = 4096;
+
+/// Largest value that survives the argv transport intact, same measurement run:
+/// 64 KiB round-trips, 128 KiB does not. NOT an `ARG_MAX` limit — that is 1 MiB
+/// on this host — so the ceiling is `security`/Keychain's own. A blob past this
+/// is refused rather than written, because every transport we have would mangle
+/// it and a mangled item is a lost login plus lost MCP servers.
+const SECURITY_ARGV_VALUE_MAX: usize = 64 * 1024;
+
+/// How [`put_blob_at`] hands one write to `security`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutTransport {
+    /// `security -i`, command line over stdin. Keeps the token out of this
+    /// process's argv, hence out of Endpoint Security exec logging (PR #21).
+    Stdin,
+    /// `security add-generic-password …` with the value as a real argv word.
+    /// Gives up the EDR-log property to stay under [`SECURITY_STDIN_LINE_MAX`];
+    /// argv is still same-UID-or-root only, the tradeoff PR #21 called already
+    /// accepted. Correctness wins: the alternative is a truncated item.
+    Argv,
+}
+
+/// Pick the transport for a `-i` command line of `line_len` bytes carrying a
+/// `value_len`-byte password. PURE, so the decision and both ceilings are pinned
+/// without a Keychain.
+fn put_transport(line_len: usize, value_len: usize) -> Result<PutTransport> {
+    if line_len <= SECURITY_STDIN_LINE_MAX {
+        return Ok(PutTransport::Stdin);
+    }
+    if value_len <= SECURITY_ARGV_VALUE_MAX {
+        return Ok(PutTransport::Argv);
+    }
+    anyhow::bail!(
+        "refusing to write a {value_len}-byte Keychain item: past the {SECURITY_ARGV_VALUE_MAX}-byte          ceiling every `security` transport truncates instead of failing, which would destroy the          login and any MCP server logins stored beside it"
+    )
+}
+
 /// `security(1)` exit status for `errSecItemNotFound` (-25300). Returned when no
 /// matching item exists; treated as "absent" (`None`) on read and a no-op on delete.
 const EXIT_ITEM_NOT_FOUND: i32 = 44;
@@ -433,10 +482,32 @@ fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
         security_quote(account)?,
         security_quote(&json)?,
     );
-    let mut cmd = Command::new(SECURITY_BIN);
-    cmd.arg("-i");
-    let output = run_with_deadline(cmd, security_deadline(), Some(&line))
-        .with_context(|| format!("failed to run {SECURITY_BIN} add-generic-password"))?;
+    // Past `-i`'s line ceiling the tokenizer truncates the value instead of
+    // refusing, so the transport is chosen by size, not by preference.
+    let output = match put_transport(line.len(), json.len())? {
+        PutTransport::Stdin => {
+            let mut cmd = Command::new(SECURITY_BIN);
+            cmd.arg("-i");
+            run_with_deadline(cmd, security_deadline(), Some(&line))
+        }
+        PutTransport::Argv => {
+            // No `security_quote` here: argv words reach `security` verbatim, so
+            // the `-i` tokenizer's escaping would be written INTO the password.
+            let mut cmd = Command::new(SECURITY_BIN);
+            cmd.args([
+                "add-generic-password",
+                "-U",
+                "-s",
+                service,
+                "-a",
+                account,
+                "-w",
+                &json,
+            ]);
+            run_with_deadline(cmd, security_deadline(), None)
+        }
+    }
+    .with_context(|| format!("failed to run {SECURITY_BIN} add-generic-password"))?;
     if output.status.success() {
         Ok(())
     } else {
