@@ -862,21 +862,43 @@ enum RotateOutcome {
     Persisted(bool),
 }
 
-/// The dead-chain arm's toast detail: the keyless sentence when the profile is
-/// a keyless third-party one — the browser re-login the OAuth line prescribes
-/// leaves the missing key missing, the same state the MCP pre-flight's keyless
-/// arms refuse on — and the shared login hint otherwise.
+/// How a profile's dead chain reads when the chain is not the whole of what it
+/// has, or `None` when the caller's own `login_expired` rendering applies. The
+/// one place that split is decided — the rotate toast, the quarantine's own
+/// log line and `clauth rolling-token`'s bail all route through it, so no two
+/// of them can prescribe different commands for one state.
+///
+/// The two arms carry `mcp::preflight_target`'s two predicates. The ORDER is
+/// the opposite one and can be, because these arms are disjoint where the
+/// gate's overlap: a keyless profile fails `has_own_inference_endpoint` too, so
+/// the gate has to refuse it for the key BEFORE reaching its quarantine arm,
+/// while here the own-endpoint arm already excludes it. An account serving its
+/// own inference is told the split state
+/// whether or not clauth recognises its provider (a dead chain beside a
+/// working key reads the same on litellm as on DeepSeek), and a RECOGNISED
+/// keyless one is told about the key. A keyless unrecognised endpoint falls
+/// through to `None` on purpose — it may be a local model needing no key, the
+/// same 2026-08-28 ruling that keeps the delegate's keyless arm scoped.
+pub(crate) fn third_party_dead_chain_copy(
+    profile: Option<&crate::profile::Profile>,
+    name: &ProfileName,
+) -> Option<String> {
+    let profile = profile?;
+    if crate::claude::has_own_inference_endpoint(profile) {
+        return Some(crate::format::third_party_dead_chain(name));
+    }
+    if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
+        return Some(crate::format::third_party_keyless(name));
+    }
+    None
+}
+
+/// The dead-chain arm's toast detail.
 fn dead_chain_detail(config: &crate::profile::ConfigHandle, name: &ProfileName) -> String {
     #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
     let cfg = config.lock().expect("config mutex poisoned");
-    let keyless_third_party = cfg
-        .find(name)
-        .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p));
-    if keyless_third_party {
-        crate::format::third_party_keyless(name)
-    } else {
-        crate::format::login_expired(name).detail().to_string()
-    }
+    third_party_dead_chain_copy(cfg.find(name), name)
+        .unwrap_or_else(|| crate::format::login_expired(name).detail().to_string())
 }
 
 /// Body of each [`refresh_all`] worker. Holds the per-profile rotation lock
@@ -949,11 +971,11 @@ fn rotate_one_inner(
         Err(e) => {
             logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
             // This `OpResult`'s only sink is the TUI's Danger toast, whose first
-            // line already reads `refresh for '<name>' failed` — so the arms
-            // carry the NEXT STEP alone rather than restating the condition and
-            // the account name under it. The keyless third-party branch is the
-            // exception: its sentence is the approved pre-flight spelling of
-            // that state, rendered whole so the surfaces cannot drift.
+            // line already reads `refresh for '<name>' failed` — so the OAuth
+            // arm carries the NEXT STEP alone rather than restating the
+            // condition and the account name under it. Both third-party
+            // branches restate it: their sentences are owner-ruled copy,
+            // rendered whole so the surfaces cannot drift.
             Err(match e {
                 RefreshError::Invalid(_) => {
                     anyhow::anyhow!("{}", dead_chain_detail(config, name))
@@ -2505,10 +2527,12 @@ pub(crate) fn mark_auth_broken(
     // (pinned by `set_auth_broken_reports_transitions_and_is_idempotent`) so a
     // dropped login leaves one stderr line, never a per-tick repeat.
     if broken {
-        logline!(
-            "clauth: {} (flagged auth_broken)",
-            crate::format::login_expired(name).line()
-        );
+        // The durable record of the quarantine names the same recovery the
+        // live surfaces do: this leg fires for a third-party hybrid too (the
+        // scheduler spends any profile holding a refresh token).
+        let sentence = third_party_dead_chain_copy(cfg.find(name), name)
+            .unwrap_or_else(|| crate::format::login_expired(name).line());
+        logline!("clauth: {sentence} (flagged auth_broken)");
     } else {
         logline!("clauth: '{name}' re-authenticated: auth_broken cleared");
     }

@@ -449,7 +449,7 @@ fn gate_third_party_bypasses() {
 /// no AUTH-1 surface (CLI/MCP switch, TUI toast, daemon tick) can hand a
 /// quarantined keyless third-party target `login_expired`'s bare
 /// `clauth login <name>` — for that state the fix is the `--api-key` command,
-/// and the surface that refuses on it is the MCP pre-flight's combined arm.
+/// and the surface that refuses on it is the MCP pre-flight's keyless arm.
 /// Reds if a gate change ever routes third-party targets into the OAuth arm
 /// without revisiting that copy.
 #[test]
@@ -2958,6 +2958,66 @@ fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
     );
 }
 
+/// The same toast on a KEYED third-party hybrid: "name the split state" (owner
+/// ruling, 2026-08-30) reaches this surface too — the rotate leg spends any
+/// profile holding a refresh token, so a hybrid's dying chain lands here with
+/// its api key still working.
+#[test]
+fn rotate_names_the_split_state_for_a_keyed_third_party_profile() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-keyed-third-party";
+    let (base, server) = crate::testutil::serve_endpoints(1, |_, _| {
+        (400, r#"{"error": "invalid_grant"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+
+    let mut profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-live".to_string()),
+    );
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    let cfg: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
+
+    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a dead chain is never a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(
+        msg,
+        "stored OAuth chain is dead, its api key still works: rotate-keyed-third-party \
+         (run `clauth login rotate-keyed-third-party --api-key <key>` to clear the quarantine)"
+    );
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the leg actually answered the endpoint"
+    );
+}
+
 /// The terminal-vs-transient split is what the `auth_broken` quarantine rests
 /// on, and it now lives entirely inside `refresh_result` — the body that decides
 /// it is dropped the instant it has decided. Driven over the real wire in BOTH
@@ -4148,6 +4208,66 @@ fn rotated_tokens_do_not_resurrect_a_deleted_profile() {
             .expect("dir")
             .exists(),
         "the deleted profile's directory must stay deleted"
+    );
+}
+
+/// The durable record of a quarantine names the same recovery the live
+/// surfaces do, split the same three ways: this leg fires for a third-party
+/// hybrid (the scheduler spends any profile holding a refresh token), and a
+/// log that prescribes the bare browser login there contradicts the toast the
+/// same event raises.
+#[test]
+fn the_quarantine_logline_splits_the_recovery_like_every_other_surface() {
+    let _home = HomeSandbox::new();
+    let mk = |name: &str, base_url: Option<&str>, api_key: Option<&str>| {
+        let p = Profile::new(
+            name.to_string(),
+            base_url.map(str::to_string),
+            api_key.map(str::to_string),
+        );
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let oauth = mk("ql-oauth", None, None);
+    let keyed = mk(
+        "ql-keyed",
+        Some("https://api.deepseek.com/anthropic"),
+        Some("sk-live"),
+    );
+    let keyless = mk(
+        "ql-keyless",
+        Some("https://api.deepseek.com/anthropic"),
+        None,
+    );
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["ql-oauth".into(), "ql-keyed".into(), "ql-keyless".into()],
+            ..AppState::default()
+        },
+        profiles: vec![oauth, keyed, keyless],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let handle = Arc::new(RankedMutex::new(config));
+
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    for name in ["ql-oauth", "ql-keyed", "ql-keyless"] {
+        mark_auth_broken(&handle, &crate::profile::ProfileName::from(name), true);
+    }
+
+    assert_eq!(
+        sink.snapshot(),
+        vec![
+            "clauth: login for 'ql-oauth' has expired: refresh token revoked or invalid: \
+             run clauth login ql-oauth (flagged auth_broken)"
+                .to_string(),
+            "clauth: stored OAuth chain is dead, its api key still works: ql-keyed (run \
+             `clauth login ql-keyed --api-key <key>` to clear the quarantine) (flagged auth_broken)"
+                .to_string(),
+            "clauth: profile has no api key: ql-keyless (run `clauth login ql-keyless \
+             --api-key <key>`) (flagged auth_broken)"
+                .to_string(),
+        ],
     );
 }
 

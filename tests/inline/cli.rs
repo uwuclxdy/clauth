@@ -1600,6 +1600,140 @@ mod static_token_verdicts {
         assert!(!p.rolling_token, "nothing durable from a failed arm");
     }
 
+    /// The reauth confirm's survivor clause is the prompt's only affirmative
+    /// promise, and it is destructive to get wrong in either direction: a
+    /// profile told its endpoint survives when the arm will not fire, or one
+    /// told nothing survives while it silently keeps a key. It tracks the
+    /// preserve arm's own predicate, so an OAuth profile — which has neither
+    /// field — is never promised one.
+    #[test]
+    fn the_reauth_confirm_promises_a_survivor_only_where_one_survives() {
+        assert_eq!(
+            reauth_confirm_object(false, true),
+            "stored subscription login, keeping its endpoint and api key"
+        );
+        assert_eq!(reauth_confirm_object(false, false), "stored credentials");
+        // An api-mode login carries both fields and replaces them, so the
+        // preserve never applies whatever the profile holds.
+        assert_eq!(reauth_confirm_object(true, true), "endpoint + API key");
+        assert_eq!(reauth_confirm_object(true, false), "endpoint + API key");
+    }
+
+    /// "Name the split state" (owner ruling, 2026-08-30): a quarantined
+    /// third-party hybrid's dead chain sits beside a working api key, and the
+    /// bail says so instead of prescribing the bare browser login.
+    #[test]
+    fn rolling_token_on_a_flagged_third_party_hybrid_names_the_split_state() {
+        let _home = HomeSandbox::new();
+        let mut profile = crate::profile::Profile::new(
+            "rt-hybrid".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some("sk-live".to_string()),
+        );
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-dead".to_string(),
+                refresh_token: Some("rt-dead".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            auth_broken: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+
+        let err = cmd_rolling_token("rt-hybrid").expect_err("a flagged hybrid refuses up front");
+        assert_eq!(
+            format!("{err:#}"),
+            "stored OAuth chain is dead, its api key still works: rt-hybrid (run \
+             `clauth login rt-hybrid --api-key <key>` to clear the quarantine)"
+        );
+
+        // The keyless leg of the same bail. Its one reachable shape past the
+        // load boundary: a key non-empty after trim (so `effective_base_url`
+        // keeps the endpoint) that `validate_api_key` rejects — a hand-edited
+        // `config.toml` or a bad paste, the `ds-ctrl` shape the MCP surface
+        // fixtures. Without this the mirror can drift with nothing reddening.
+        let mut unusable = crate::profile::Profile::new(
+            "rt-badkey".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some("sk-test\r\nInjected: x".to_string()),
+        );
+        unusable.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-dead".to_string(),
+                refresh_token: Some("rt-dead".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        });
+        crate::profile::save_profile(&unusable).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone(), unusable.name.clone()],
+            auth_broken: vec![profile.name.clone(), unusable.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        #[allow(clippy::expect_used, reason = "test")]
+        let reloaded =
+            crate::profile::load_profile(&crate::profile::ProfileName::from("rt-badkey"))
+                .expect("reload");
+        assert!(
+            reloaded.is_third_party() && !crate::claude::has_inference_auth(&reloaded),
+            "fixture: the shape must survive the load boundary as keyless third-party",
+        );
+
+        let err = cmd_rolling_token("rt-badkey").expect_err("a flagged keyless hybrid refuses");
+        assert_eq!(
+            format!("{err:#}"),
+            "profile has no api key: rt-badkey (run `clauth login rt-badkey --api-key <key>`)"
+        );
+    }
+
+    /// "Copy-only: name why not" (owner ruling, 2026-08-30): an api-key
+    /// third-party profile has no chain to roll, so the bail names that and
+    /// prescribes nothing — a bare login would mint one, but that turns an
+    /// api-key account into an Anthropic login rather than answering the
+    /// request. An OAuth profile keeps the hint, where it IS the recovery.
+    #[test]
+    fn rolling_token_on_an_api_key_profile_names_the_missing_chain() {
+        let _home = HomeSandbox::new();
+        let ds = crate::profile::Profile::new(
+            "rt-keyed".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some("sk-live".to_string()),
+        );
+        crate::profile::save_profile(&ds).expect("save ds");
+        let logged_out = crate::profile::Profile::new("rt-oauth".to_string(), None, None);
+        crate::profile::save_profile(&logged_out).expect("save oauth");
+        let state = crate::profile::AppState {
+            profiles: vec![
+                crate::profile::ProfileName::from("rt-keyed"),
+                crate::profile::ProfileName::from("rt-oauth"),
+            ],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+
+        let err = cmd_rolling_token("rt-keyed").expect_err("no chain, no roll");
+        assert_eq!(
+            format!("{err:#}"),
+            "'rt-keyed' has no usage OAuth chain to roll from"
+        );
+
+        let err = cmd_rolling_token("rt-oauth").expect_err("no chain either");
+        assert!(
+            format!("{err:#}").contains("run `clauth login rt-oauth` first"),
+            "an OAuth profile keeps the recovery hint: {err:#}"
+        );
+    }
+
     /// A mint chain shape for the arm tests: a real access token whose grant
     /// was never recorded (setup scopes only, no plan stamp) — the shape
     /// `roll_from_stored_chain` refuses pre-stamp, so the arm fails AFTER the

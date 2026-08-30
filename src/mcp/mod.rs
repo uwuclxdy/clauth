@@ -253,12 +253,17 @@ fn profile_row(p: &Profile, config: &AppConfig, now: i64) -> serde_json::Value {
     if p.is_third_party() && !crate::claude::has_inference_auth(p) {
         row["keyless"] = serde_json::json!(true);
     }
-    // The other two states `preflight_target` refuses on, marked rather than
-    // filtered: a silently missing row reads exactly like "that profile is
-    // gone", which the unknown-`names` refusal already rejects.
+    // Also marked rather than filtered: a silently missing row reads exactly
+    // like "that profile is gone", which the unknown-`names` refusal already
+    // rejects.
     if p.is_disabled() {
         row["disabled"] = serde_json::json!(true);
     }
+    // NOT a delegate refusal on an account that serves its own inference,
+    // which delegates off its api key while the flag describes its usage chain
+    // (`preflight_target`, owner ruling 2026-08-30). It stays on the row
+    // because the picker is choosing where to spend and a dead chain means
+    // this account's usage figures are stale.
     if config.is_auth_broken(name) {
         row["auth_broken"] = serde_json::json!(true);
     }
@@ -690,8 +695,9 @@ impl ClauthServer {
         description = "List of clauth accounts with their cached usage headrooms. A window's \
 percentage is how much of it is already used. Call it before picking a `delegate` target. A row \
 can carry `disabled`, `login expired`, `no api key` or `subscription canceled`; when `delegate` \
-refuses an account, its refusal names the state and the fix. `subscription canceled` does not \
-mean a refusal."
+refuses an account, its refusal names the state and the fix. `subscription canceled` never means \
+a refusal, and `login expired` does not mean one on an account that has its own `host` and api \
+key, which delegates on that key."
     )]
     async fn profiles(
         &self,
@@ -3993,9 +3999,10 @@ fn classify_run(
 }
 
 /// Refuse a resolved target that `delegate` must not spend on: a profile the
-/// operator disabled, one whose OAuth chain is quarantined, or a recognised
-/// third-party profile whose inference has nothing to authenticate with (which
-/// would spawn a `claude` that dies on an empty envelope). The keyless test is
+/// operator disabled, a recognised third-party profile whose inference has
+/// nothing to authenticate with (which
+/// would spawn a `claude` that dies on an empty envelope), or a quarantined
+/// one with nothing but that dead chain to authenticate with. The keyless test is
 /// `has_inference_auth`, the predicate derived from
 /// `build_claude_settings_json` (a validated api key, or a profile `env` entry
 /// carrying `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`) — NOT the usage
@@ -4010,13 +4017,17 @@ fn classify_run(
 /// `AppState::auth_broken`, and it is deliberately NOT a refresh attempt: the
 /// MCP layer takes no rotation lock. It sits AFTER the disabled bail for the
 /// reason `switch` orders them the same way — a disabled, clock-expired target
-/// must be refused before anything can rotate its single-use refresh token —
-/// and a combined arm sits before it, refusing a target that is BOTH
-/// quarantined and keyless as keyless: the quarantine arm's `clauth login
-/// <name>` runs the browser flow on a third-party profile (OAuth for most
-/// providers, the console flow on Alibaba) and leaves the missing key missing,
-/// while the `--api-key` command clears the state it is actually in (a login
-/// clears the quarantine, AUTH-1 in `actions.rs`).
+/// must be refused before anything can rotate its single-use refresh token.
+/// It skips any target whose own endpoint and credential serve inference
+/// (`claude::has_own_inference_endpoint`, owner ruling 2026-08-30): that
+/// account's chain feeds usage polling alone, so a quarantine is no reason to
+/// refuse its spawn. Everything else still takes the arm — an OAuth account,
+/// an endpoint with no credential, and a credential with no endpoint alike:
+/// the exemption is for an account that demonstrably routes and authenticates
+/// on its own, never a judgement that the others have nothing. The keyless arm
+/// sits ABOVE it and is load-bearing
+/// there: a keyless third-party target fails that predicate too, and must be
+/// told about the key rather than sent to a browser login.
 ///
 /// Called from every path that refuses before a spawn: the single-background
 /// arm and `resolve_fanout` up front, and `run_delegate` as the blocking
@@ -4032,30 +4043,35 @@ fn preflight_target(
             "profile is disabled: {name} (run `clauth enable {name}`)"
         ));
     }
-    // Refused as keyless, not quarantined: only the keyless sentence's command
-    // clears BOTH states — why a bare login does not, see
-    // `format::third_party_keyless`.
-    if config.is_auth_broken(name)
-        && profile.is_third_party()
-        && !crate::claude::has_inference_auth(profile)
-    {
-        return Err(crate::format::third_party_keyless(name));
-    }
-    // Verbatim `switch`'s own refusal (`actions.rs`, its AUTH-1 arm), so the two
-    // surfaces cannot spell one quarantine two ways. It already names the fix.
-    if config.is_auth_broken(name) {
-        return Err(crate::format::login_expired(name).line());
-    }
+    // BEFORE the quarantine arm, and that order is the whole of what the
+    // deleted quarantined+keyless arm used to say: this target's spawn is
+    // stopped by the missing key, and a key is what its fix has to name. The
+    // quarantine sentence below would send it to a browser login that leaves
+    // the key missing.
     if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
         return Err(crate::format::third_party_keyless(name));
+    }
+    // A quarantined target whose own endpoint and credential serve inference
+    // is ADMITTED (owner ruling 2026-08-30, "let the delegate run"): the dead
+    // chain feeds usage polling, the spawned `claude` never reads it, so the
+    // run would have succeeded. `has_own_inference_endpoint` is the shared
+    // predicate — whether clauth RECOGNISES the host says nothing about
+    // whether inference works against it. What is left is the account with
+    // nothing but the dead chain, refused with `switch`'s own sentence
+    // (`actions.rs`, its AUTH-1 arm) so the two surfaces cannot spell that
+    // quarantine two ways.
+    if config.is_auth_broken(name) && !crate::claude::has_own_inference_endpoint(profile) {
+        return Err(crate::format::login_expired(name).line());
     }
     Ok(())
 }
 
 /// Resolve a `profiles` fan-out list to canonical target names. Refuses by name:
 /// a list over [`MAX_FANOUT`], a duplicate (case-insensitive, the same rule a
-/// single `profile` resolves under), a name resolving to no account, a disabled
-/// member, or a recognised third-party member with no inference auth source.
+/// single `profile` resolves under), a name resolving to no account, or
+/// anything [`preflight_target`] refuses — a disabled member, a recognised
+/// third-party member with no inference auth source, a quarantined one that
+/// does not serve its own inference.
 /// Runs before any spawn: N delegates is N real usage windows with no undo.
 fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
     // An empty list passes every check below vacuously and would return a

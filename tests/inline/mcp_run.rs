@@ -770,10 +770,11 @@ fn a_disabled_and_quarantined_target_refuses_as_disabled() {
 }
 
 /// Gate ORDER, second pinned case: a target that is quarantined AND a keyless
-/// third-party profile refuses as KEYLESS. The quarantine arm alone would hand
-/// it `login_expired`'s `clauth login <name>`, which on a third-party profile
-/// runs the browser flow and leaves the missing api key missing; `--api-key`
-/// clears the state it is actually in (a login clears the quarantine, AUTH-1).
+/// third-party profile refuses as KEYLESS. This is what the arm ORDER buys —
+/// the quarantine arm below would catch this target too (a keyless profile
+/// serves no inference of its own either) and prescribe a browser login that
+/// leaves the missing key missing. Measured: moving the keyless arm below the
+/// quarantine one reds this test.
 #[test]
 fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
     let _home = HomeSandbox::new();
@@ -803,12 +804,21 @@ fn a_quarantined_and_keyless_third_party_target_refuses_as_keyless() {
     );
 }
 
-/// The `!has_inference_auth` leg of the combined arm, pinned because no
-/// keyless-shaped fixture can hold it: a third-party profile WITH a key that
-/// is quarantined must stay on the `auth_broken` arm (`login_expired`'s line),
-/// and a leg-drop turns this assertion into the keyless string.
+/// "Let the delegate run" (owner ruling, 2026-08-30): a quarantined
+/// third-party target whose api key authenticates inference is ADMITTED. The
+/// dead chain feeds usage polling alone, and the spawned `claude` never reads
+/// it — refusing spent the caller's turn on a run that would have worked.
+/// The keyless twin above still refuses, which is what keeps the keyless arm
+/// load-bearing.
+///
+/// The other two targets pin the ruling's SHAPE: the discriminator is whether
+/// inference runs on the account's own endpoint and credential, never whether
+/// clauth recognises the provider — so an unrecognised endpoint is admitted
+/// too, while an account holding nothing but the dead chain still refuses.
+/// Without both, a swap to `is_third_party` or `is_oauth` ships green while
+/// silently re-narrowing or widening what the gate admits.
 #[test]
-fn a_quarantined_keyed_third_party_target_stays_on_the_auth_broken_arm() {
+fn a_quarantined_keyed_third_party_target_is_admitted() {
     let _home = HomeSandbox::new();
     let mut config = crate::profile::AppConfig {
         state: crate::profile::AppState::default(),
@@ -828,11 +838,78 @@ fn a_quarantined_keyed_third_party_target_stays_on_the_auth_broken_arm() {
     );
 
     let raw = vec!["ds-keyq".to_string()];
-    let err =
-        resolve_fanout(&config, &raw).expect_err("a quarantined member refuses the whole fan-out");
     assert_eq!(
-        err,
-        crate::format::login_expired(&crate::profile::ProfileName::from("ds-keyq")).line()
+        resolve_fanout(&config, &raw),
+        Ok(vec!["ds-keyq".to_string()]),
+        "a quarantined third-party member with a working key still delegates",
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let profile = config
+        .find(&crate::profile::ProfileName::from("ds-keyq"))
+        .expect("profile");
+    assert_eq!(
+        preflight_target(
+            profile,
+            &config,
+            &crate::profile::ProfileName::from("ds-keyq")
+        ),
+        Ok(()),
+        "and the pre-flight the blocking path and the backstop share admits it too",
+    );
+
+    // The scope control: same state, endpoint clauth has no provider for.
+    // Admitted for the same reason — the ruling is about whether inference
+    // works, and provider recognition says nothing about that.
+    crate::actions::create_blank_profile(
+        &mut config,
+        "generic-q".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("sk-test".to_string()),
+        None,
+    )
+    .expect("create profile");
+    assert!(
+        config.set_auth_broken(&crate::profile::ProfileName::from("generic-q"), true),
+        "fixture control: the profile was not already quarantined",
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let generic = config
+        .find(&crate::profile::ProfileName::from("generic-q"))
+        .expect("profile");
+    assert!(
+        !generic.is_third_party(),
+        "fixture control: the endpoint must be one clauth has no provider for",
+    );
+    assert_eq!(
+        preflight_target(
+            generic,
+            &config,
+            &crate::profile::ProfileName::from("generic-q")
+        ),
+        Ok(()),
+        "provider recognition is not the discriminator: an unrecognised endpoint \
+         with a working key delegates too",
+    );
+
+    // The account the arm still refuses: a dead chain and nothing else.
+    crate::actions::create_blank_profile(&mut config, "oauth-q".to_string(), None, None, None)
+        .expect("create profile");
+    assert!(
+        config.set_auth_broken(&crate::profile::ProfileName::from("oauth-q"), true),
+        "fixture control: the profile was not already quarantined",
+    );
+    #[allow(clippy::expect_used, reason = "test")]
+    let oauth = config
+        .find(&crate::profile::ProfileName::from("oauth-q"))
+        .expect("profile");
+    assert_eq!(
+        preflight_target(
+            oauth,
+            &config,
+            &crate::profile::ProfileName::from("oauth-q")
+        ),
+        Err(crate::format::login_expired(&crate::profile::ProfileName::from("oauth-q")).line()),
+        "an account with nothing but the dead chain still refuses",
     );
 }
 
@@ -4909,7 +4986,17 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
         // names (a canceled account still delegates), so the description is
         // the only surface that can carry the fact.
         "`subscription canceled`",
-        "does not mean a refusal",
+        "never means a refusal",
+        // The same shape for `login expired` since the 2026-08-30 ruling: an
+        // account with its own endpoint and key delegates while carrying it,
+        // so a picker that reads the flag as a refusal skips a target it
+        // could have spent. The needle is the non-refusal direction, for the
+        // reason the canceled clause above states.
+        // Keyed on `host`, the field the row actually carries for exactly the
+        // accounts this exempts: the roster spells a generic endpoint's
+        // provider `anthropic`, so a scope term naming provider recognition
+        // would be one the reader cannot check against the row it filters.
+        "does not mean one on an account that has its own `host` and api key",
         // The direction of the percentage. A caller reading it backwards picks
         // the most-spent account. Relaxed 2026-08-20 from `less headroom` to the
         // clause the owner's copy states it with: the direction is what matters,

@@ -282,9 +282,11 @@ fn seed_flag_states() {
     );
 }
 
-/// The three states that make `delegate` refuse a target render adjacent, so a
-/// reader sees one refusal group, and `canceled` follows them as the
-/// informational marker it is — clauth has no cancel gate. Each is absent
+/// The three account-state markers render adjacent, so a reader meets one
+/// group, and `canceled` follows them as the informational marker it is —
+/// clauth has no cancel gate. Two of the three refuse a delegate outright;
+/// `login expired` refuses only where the expired login is what the account
+/// authenticates with (`preflight_target`). Each is absent
 /// (never `false`) on an account it does not describe, the rule `keyless`
 /// already ships, and a row in none of the states is byte-unchanged.
 #[test]
@@ -304,11 +306,11 @@ fn roster_flags_name_each_state_and_leave_a_clean_row_unchanged() {
     );
 }
 
-/// The refusal group is contiguous: a profile in all three states spells them
+/// The marker group is contiguous: a profile in all three states spells them
 /// in one run, ahead of the informational `canceled`, rather than scattering
 /// them through the line.
 #[test]
-fn the_three_refusal_markers_render_as_one_group() {
+fn the_three_state_markers_render_as_one_group() {
     let line = render::profiles_prose(&serde_json::json!({
         "profiles": [{
             "name": "wreck",

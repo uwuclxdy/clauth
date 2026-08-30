@@ -322,16 +322,26 @@ fn reauth_confirmed(input: &str) -> bool {
 /// Prompt `[y/N]` before a reauth overwrites a profile's stored credentials.
 /// Non-TTY stdin proceeds (a piped script can't be prompted), matching the
 /// OAuth reauth contract. `is_api` tailors the copy (endpoint + key vs tokens).
-fn confirm_reauth(target: &str, is_api: bool) -> Result<bool> {
+/// What the reauth confirm says it REPLACES. Split out so the survivor clause
+/// is unit-pinned: it is the only affirmative promise the prompt makes, and it
+/// is true only where the preserve arm actually fires
+/// (`actions::overwrite_captured_profile`) — an api-mode login replaces the
+/// endpoint set outright, and a profile with nothing to preserve must not be
+/// told something survives.
+fn reauth_confirm_object(is_api: bool, keeps_endpoint: bool) -> &'static str {
+    match (is_api, keeps_endpoint) {
+        (true, _) => "endpoint + API key",
+        (false, true) => "stored subscription login, keeping its endpoint and api key",
+        (false, false) => "stored credentials",
+    }
+}
+
+fn confirm_reauth(target: &str, is_api: bool, keeps_endpoint: bool) -> Result<bool> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(true);
     }
-    let object = if is_api {
-        "endpoint + API key"
-    } else {
-        "stored credentials"
-    };
+    let object = reauth_confirm_object(is_api, keeps_endpoint);
     out!(
         "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}. Continue? [y/N] "
     );
@@ -458,9 +468,13 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
 /// settings survive; stale per-account fetch caches are dropped; when it is the
 /// ACTIVE profile the live link is re-run so a running `claude` picks the new
 /// login up). A reauth that crosses types (OAuth ↔ API) is allowed: the
-/// snapshot overwrites all three of credentials/base_url/api_key, so the old
-/// type's leftovers are cleared. Neither path switches to the profile (`clauth
-/// <name>` does that). `--model` is persisted onto the profile after capture.
+/// snapshot overwrites all three of credentials/base_url/api_key — except that
+/// a browser reauth onto a profile with a stored endpoint and working
+/// inference auth preserves the endpoint + key the snapshot omits, whether or
+/// not clauth recognises the provider (see
+/// [`actions::overwrite_captured_profile`]). Neither
+/// path switches to the profile (`clauth <name>` does that). `--model` is
+/// persisted onto the profile after capture.
 /// Tokens are never printed — only a sha256 prefix.
 fn cmd_login(args: LoginArgs) -> Result<()> {
     platform::init();
@@ -509,7 +523,13 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
-    if reauth && !confirm_reauth(&target, is_api)? {
+    // The preserve arm's own predicate, called rather than re-spelled: only a
+    // profile that has an endpoint AND something to authenticate with keeps
+    // them through a browser reauth, so only that one is told so.
+    let keeps_endpoint = config
+        .find(&target)
+        .is_some_and(claude::has_own_inference_endpoint);
+    if reauth && !confirm_reauth(&target, is_api, keeps_endpoint)? {
         outln!("clauth: aborted. '{target}' left unchanged.");
         return Ok(());
     }
@@ -1119,6 +1139,15 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         .as_ref()
         .and_then(|c| c.claude_ai_oauth.as_ref())
     else {
+        // Third-party names the why-not and stops. A bare login WOULD mint a
+        // chain here (the browser flow; Alibaba diverts to its console), but
+        // that adds an Anthropic login to an api-key account rather than
+        // answering the request, so this arm states the missing chain and
+        // prescribes nothing. The OAuth arm keeps the tail, where the same
+        // login IS the recovery.
+        if claude::has_own_inference_endpoint(profile) {
+            anyhow::bail!("'{canonical}' has no usage OAuth chain to roll from");
+        }
         anyhow::bail!(
             "'{canonical}' has no usage OAuth chain to roll from; run \
              `clauth login {canonical}` first"
@@ -1130,6 +1159,15 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
     // with nothing at all, which is worse than the disengaged mis-fill it
     // started in.
     if config.state.auth_broken.contains(&canonical) {
+        // Through the shared splitter, so this bail, the rotate toast and the
+        // quarantine's own log line cannot prescribe different commands for
+        // one state. Both third-party legs are reachable here: the load
+        // boundary re-reads a creds-and-no-key profile as OAuth, but a key
+        // that survives its emptiness test and fails `validate_api_key` keeps
+        // the endpoint and reaches the keyless leg (pinned with `rt-badkey`).
+        if let Some(sentence) = oauth::third_party_dead_chain_copy(Some(profile), &canonical) {
+            anyhow::bail!("{sentence}");
+        }
         anyhow::bail!(
             "'{canonical}' usage chain is dead · run `clauth login {canonical}` first, \
              then re-run"

@@ -311,7 +311,13 @@ impl Transient {
 }
 
 /// A login whose refresh token is dead: re-login is the only fix. Shared by the
-/// CLI/MCP switch bail, the daemon tick log, and the TUI switch toast.
+/// CLI/MCP switch bail, the daemon tick log, the TUI switch toast, the MCP
+/// pre-flight's quarantine arm, and — through
+/// `oauth::third_party_dead_chain_copy`'s `None` case — the rotate toast and
+/// the quarantine's own log line, wherever the profile neither serves its own
+/// inference nor is a recognised keyless one. `clauth rolling-token`'s dead-chain bail takes that
+/// same `None` case but words its own sentence, since it also has to say the
+/// arming did not happen.
 pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
@@ -327,10 +333,39 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// for most providers, the console flow on Alibaba) and leaves the missing key
 /// missing, while `--api-key` also lifts any quarantine the profile carries
 /// (`clauth login` is the documented quarantine recovery, AUTH-1 in
-/// `actions.rs`). The MCP pre-flight's keyless arms render this same sentence,
-/// so the surfaces cannot spell one state two ways.
+/// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
+/// rolling-token bail, the manual-rotate toast and the quarantine's own log
+/// line, so the surfaces cannot spell one state two ways.
 pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
     format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+}
+
+/// A third-party profile whose stored OAuth chain is dead while it still has
+/// an inference auth source: the split state, named so the reader learns the
+/// account is not dead and what clears the quarantine (an api-mode login
+/// replaces the credential set and lifts the flag, AUTH-1 in `actions.rs`).
+///
+/// The sentence is owner-ruled verbatim and claims more than the predicate
+/// behind it proves: `has_inference_auth` is satisfied by a well-formed key OR
+/// an `[env]` token, and well-formed is not live — clauth even records a
+/// per-credential `AuthExpired` verdict no refusal site consults. An honest
+/// re-wording is an open copy question (`docs/todo.md`).
+///
+/// Three sites route through `oauth::third_party_dead_chain_copy`:
+/// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
+/// and the quarantine's own `mark_auth_broken` log line. `report_armed_sidecar`
+/// carries a fourth dead-chain sentence and is deliberately NOT routed: its
+/// `chain_is_broken` comes from the arm's own gate, which cannot reach `Broken`
+/// for a profile with a `base_url`, so a third-party branch there is dead code.
+/// The MCP pre-flight admits that target instead of refusing it, so it renders
+/// nothing (owner ruling 2026-08-30).
+/// The command is backticked to match [`third_party_keyless`], which renders
+/// beside it on the same surfaces (owner ruling: house style).
+pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> String {
+    format!(
+        "stored OAuth chain is dead, its api key still works: {name} \
+         (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+    )
 }
 
 /// A refresh that failed for a transient reason: this switch is refused but the

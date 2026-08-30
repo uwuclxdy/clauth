@@ -972,10 +972,13 @@ fn profile_line(row: &Value) -> String {
     {
         out.push_str("; live session");
     }
-    // The three states `delegate` refuses on render as one contiguous run, so a
-    // reader meets one refusal group rather than three markers scattered
-    // through the line. `canceled` follows them because clauth has no cancel
-    // gate: it informs the pick, it does not block it.
+    // The three account-state markers render as one contiguous run, so a
+    // reader meets one group rather than three scattered through the line.
+    // Two of them refuse a delegate; `login expired` refuses everywhere EXCEPT
+    // an account serving its own inference (`preflight_target`), where it
+    // reports a stale usage reading rather than a blocked spawn. `canceled` follows them
+    // because clauth has no cancel gate: it informs the pick, it does not
+    // block it.
     if row
         .get("disabled")
         .and_then(Value::as_bool)
