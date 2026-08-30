@@ -4032,18 +4032,14 @@ fn preflight_target(
             "profile is disabled: {name} (run `clauth enable {name}`)"
         ));
     }
-    // The quarantine arm below would hand this target `login_expired`'s
-    // `clauth login <name>`, which on a third-party profile runs the browser
-    // flow (OAuth for most providers, the console flow on Alibaba) and leaves
-    // the missing key missing. The `--api-key` command clears the state it is
-    // actually in — a login clears the quarantine too (AUTH-1 in `actions.rs`).
+    // Refused as keyless, not quarantined: only the keyless sentence's command
+    // clears BOTH states — why a bare login does not, see
+    // `format::third_party_keyless`.
     if config.is_auth_broken(name)
         && profile.is_third_party()
         && !crate::claude::has_inference_auth(profile)
     {
-        return Err(format!(
-            "profile has no api key: {name} (run `clauth login {name} --api-key <key>`)"
-        ));
+        return Err(crate::format::third_party_keyless(name));
     }
     // Verbatim `switch`'s own refusal (`actions.rs`, its AUTH-1 arm), so the two
     // surfaces cannot spell one quarantine two ways. It already names the fix.
@@ -4051,12 +4047,7 @@ fn preflight_target(
         return Err(crate::format::login_expired(name).line());
     }
     if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {
-        // `--api-key` is what selects api-key mode; a bare `clauth login` on a
-        // third-party profile runs the browser OAuth flow instead and leaves
-        // the missing key missing.
-        return Err(format!(
-            "profile has no api key: {name} (run `clauth login {name} --api-key <key>`)"
-        ));
+        return Err(crate::format::third_party_keyless(name));
     }
     Ok(())
 }

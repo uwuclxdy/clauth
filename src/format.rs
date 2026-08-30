@@ -321,6 +321,18 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     }
 }
 
+/// A third-party profile with no inference auth source: an api key is the only
+/// credential that fixes it, so the fix names the `--api-key` command — a bare
+/// `clauth login <name>` on a third-party profile runs the browser flow (OAuth
+/// for most providers, the console flow on Alibaba) and leaves the missing key
+/// missing, while `--api-key` also lifts any quarantine the profile carries
+/// (`clauth login` is the documented quarantine recovery, AUTH-1 in
+/// `actions.rs`). The MCP pre-flight's keyless arms render this same sentence,
+/// so the surfaces cannot spell one state two ways.
+pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
+    format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
+}
+
 /// A refresh that failed for a transient reason: this switch is refused but the
 /// login is not quarantined. The next step comes from `err`'s own [`Retry`], so
 /// a throttle is never told to check its connection.

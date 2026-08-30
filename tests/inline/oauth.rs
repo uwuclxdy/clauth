@@ -444,6 +444,45 @@ fn gate_third_party_bypasses() {
     ));
 }
 
+/// The quarantine flag cannot route a third-party (custom-endpoint) profile
+/// into the gate's `Broken` arm: non-OAuth targets pass through as `Ready`, so
+/// no AUTH-1 surface (CLI/MCP switch, TUI toast, daemon tick) can hand a
+/// quarantined keyless third-party target `login_expired`'s bare
+/// `clauth login <name>` — for that state the fix is the `--api-key` command,
+/// and the surface that refuses on it is the MCP pre-flight's combined arm.
+/// Reds if a gate change ever routes third-party targets into the OAuth arm
+/// without revisiting that copy.
+#[test]
+fn gate_passes_a_quarantined_keyless_third_party_target_through() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-tp-quarantined-keyless";
+    let target = crate::profile::ProfileName::from(name);
+    let mut config = third_party_config(name);
+    {
+        #[allow(clippy::expect_used, reason = "test")]
+        let p = config.profiles.get_mut(0).expect("fixture profile");
+        p.api_key = None;
+        p.provider = Some(crate::providers::Provider::DeepSeek);
+    }
+    config.set_auth_broken(&target, true);
+    let handle = Arc::new(RankedMutex::new(config));
+    {
+        #[allow(clippy::expect_used, reason = "test")]
+        let cfg = handle.lock().expect("lock");
+        #[allow(clippy::expect_used, reason = "test")]
+        let p = cfg.find(&target).expect("profile");
+        assert!(
+            p.is_third_party() && !crate::claude::has_inference_auth(p),
+            "the fixture must be the keyless third-party shape"
+        );
+        assert!(cfg.is_auth_broken(&target), "the fixture must be flagged");
+    }
+    assert!(matches!(
+        ensure_installable(&handle, &target, never_refresh),
+        AuthGate::Ready
+    ));
+}
+
 /// OAuth token with real life left → install as-is, no refresh.
 #[test]
 fn gate_valid_token_ready_without_refresh() {
@@ -2852,6 +2891,70 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
         seen,
         vec!["/v1/oauth/token".to_string(); 2],
         "proof of execution: both legs actually answered the endpoint"
+    );
+}
+
+/// The dead-chain toast on a keyless third-party profile: `login_expired`'s
+/// bare `clauth login <name>` runs the browser flow and leaves the missing key
+/// missing, so the arm carries the pre-flight's keyless sentence instead — the
+/// command that clears the state the profile is actually in. The OAuth shape
+/// keeps the shared login hint, pinned one test up.
+#[test]
+fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-keyless-third-party";
+    let (base, server) = crate::testutil::serve_endpoints(1, |_, _| {
+        (400, r#"{"error": "invalid_grant"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+
+    // A hybrid the endpoint edit produced: browser-login credentials that
+    // predate setting the endpoint (setting one never drops them), so the
+    // rotate leg still spends the dying chain while inference has no key.
+    let mut profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    let cfg: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
+
+    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a dead chain is never a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(
+        msg,
+        "profile has no api key: rotate-keyless-third-party (run \
+         `clauth login rotate-keyless-third-party --api-key <key>`)"
+    );
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the leg actually answered the endpoint"
     );
 }
 

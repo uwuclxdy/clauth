@@ -862,6 +862,23 @@ enum RotateOutcome {
     Persisted(bool),
 }
 
+/// The dead-chain arm's toast detail: the keyless sentence when the profile is
+/// a keyless third-party one — the browser re-login the OAuth line prescribes
+/// leaves the missing key missing, the same state the MCP pre-flight's keyless
+/// arms refuse on — and the shared login hint otherwise.
+fn dead_chain_detail(config: &crate::profile::ConfigHandle, name: &ProfileName) -> String {
+    #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+    let cfg = config.lock().expect("config mutex poisoned");
+    let keyless_third_party = cfg
+        .find(name)
+        .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p));
+    if keyless_third_party {
+        crate::format::third_party_keyless(name)
+    } else {
+        crate::format::login_expired(name).detail().to_string()
+    }
+}
+
 /// Body of each [`refresh_all`] worker. Holds the per-profile rotation lock
 /// across the ENTIRE HTTP window so an external `clauth start <name>` cannot
 /// begin a refresh of the same single-use token while ours is in flight (the
@@ -932,12 +949,14 @@ fn rotate_one_inner(
         Err(e) => {
             logline!("clauth: refresh for '{name}' failed: {}", e.log_detail());
             // This `OpResult`'s only sink is the TUI's Danger toast, whose first
-            // line already reads `refresh for '<name>' failed` — so both arms
+            // line already reads `refresh for '<name>' failed` — so the arms
             // carry the NEXT STEP alone rather than restating the condition and
-            // the account name under it.
+            // the account name under it. The keyless third-party branch is the
+            // exception: its sentence is the approved pre-flight spelling of
+            // that state, rendered whole so the surfaces cannot drift.
             Err(match e {
                 RefreshError::Invalid(_) => {
-                    anyhow::anyhow!("{}", crate::format::login_expired(name).detail())
+                    anyhow::anyhow!("{}", dead_chain_detail(config, name))
                 }
                 RefreshError::Transient(f) => {
                     anyhow::anyhow!("{}", f.as_refresh_transient().text())
