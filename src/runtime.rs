@@ -178,6 +178,23 @@ impl Isolation {
             Isolation::Isolated => ISOLATED_SESSIONS_STEM,
         }
     }
+    /// The other flavor. Only the fake transport needs to ask: there the two
+    /// collapse to separate bare homes that do NOT share one `auth.json`.
+    fn other(self) -> Self {
+        match self {
+            Isolation::Shared => Isolation::Isolated,
+            Isolation::Isolated => Isolation::Shared,
+        }
+    }
+}
+
+impl std::fmt::Display for Isolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Isolation::Shared => "shared",
+            Isolation::Isolated => "isolated",
+        })
+    }
 }
 
 /// Per-process counter making each `acquire`'s [`SessionId`] unique. A single
@@ -4336,6 +4353,30 @@ impl CodexRuntime {
             let sessions = profile_subpath(&owned, &sessions_name)?;
             let pid_file = sessions.join(session.as_str());
 
+            // Decision 8 lets codex sessions run concurrently because they share
+            // ONE physical auth.json. Under Fake there is no sharing: the two
+            // flavors collapse to DIFFERENT bare stems, each holding its own
+            // COPY converged from the same store. Two live flavors are then two
+            // carriers of one single-use chain with no reload-and-skip between
+            // them (codex's own answer needs one inode), and the first refresh
+            // on either side strands the other for good. Same flavor is fine —
+            // that IS one home. Refusing is what the premise actually supports.
+            if mode == LinkMode::Fake {
+                let other = isolation.other();
+                let (_, other_sessions_name) =
+                    codex_paired_dir_names(other, session.as_str(), mode);
+                let other_sessions = profile_subpath(&owned, &other_sessions_name)?;
+                if other_sessions.exists() && !matches!(live_sessions_at(&other_sessions), Some(0))
+                {
+                    anyhow::bail!(
+                        "'{name}' already has a live {other} codex session, and this host \
+                         cannot symlink — the two would hold SEPARATE copies of one \
+                         single-use chain, and the first refresh on either strands the \
+                         other. Close it before starting a {isolation} one"
+                    );
+                }
+            }
+
             crate::profile::mkdir_700(&sessions)
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
             let active = prune_stale_sessions(&sessions).unwrap_or(1);
@@ -4435,6 +4476,27 @@ impl Drop for CodexRuntime {
             && self.mode == LinkMode::Real
             && let Ok(global) = codex_global_home(&self.profile)
         {
+            // codex's own corrupt-DB recovery RENAMES the path it was handed
+            // (`state/src/runtime/recovery.rs`) — and the path it was handed is
+            // our symlink, so the rename moves the LINK into the home's
+            // db-backups and codex writes a fresh REAL file in its place. The
+            // corrupt bytes stay in the store untouched, so without this the
+            // healed DB dies with the session and every later one relinks to the
+            // same corruption and recovers again, forever. A regular file where
+            // this build placed a link is exactly that signal.
+            for entry in CODEX_DURABLE_ENTRIES {
+                let healed = self.home.join(entry);
+                let Ok(meta) = healed.symlink_metadata() else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    continue;
+                }
+                if let Err(e) = copy_file(&healed, &global.join(entry)) {
+                    logline!("clauth: codex {entry} recovery sync-back failed: {e:#}");
+                }
+            }
+
             for rollout_root in CODEX_ROLLOUT_ROOTS {
                 let src = self.home.join(rollout_root);
                 if !src.is_dir() {

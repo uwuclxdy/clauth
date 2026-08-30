@@ -7910,6 +7910,85 @@ fn a_session_home_carries_the_profile_layers_and_the_plugin_store() {
     );
 }
 
+/// codex heals a corrupt state DB by RENAMING the path it was handed into
+/// `db-backups/` and writing a fresh one in its place — and the path it was
+/// handed is our symlink, so the rename moves the LINK and the corrupt bytes
+/// stay in the store. Without a sync-back the healed DB dies with the session
+/// and every later one relinks to the same corruption, forever.
+#[cfg(unix)]
+#[test]
+fn a_db_codex_healed_in_place_reaches_the_durable_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let store = profile.join("codex-home");
+    fs::create_dir_all(&store).expect("mkdir store");
+    fs::write(store.join("state_5.sqlite"), b"corrupt").expect("seed corrupt db");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    let session_home = runtime.home().to_path_buf();
+    let healed = session_home.join("state_5.sqlite");
+    assert!(
+        healed
+            .symlink_metadata()
+            .expect("placed")
+            .file_type()
+            .is_symlink(),
+        "the build places a link"
+    );
+    // codex's recovery: the LINK is renamed away, a fresh REAL file takes its
+    // name. The store still holds the corrupt bytes at this point.
+    let backups = session_home.join("db-backups");
+    fs::create_dir_all(&backups).expect("mkdir backups");
+    fs::rename(&healed, backups.join("state_5.sqlite")).expect("rename the link away");
+    fs::write(&healed, b"healed").expect("codex writes a fresh db");
+    assert_eq!(
+        fs::read(store.join("state_5.sqlite")).expect("read store"),
+        b"corrupt",
+        "the store is untouched by codex's rename — that is the whole problem"
+    );
+
+    drop(runtime);
+
+    assert_eq!(
+        fs::read(store.join("state_5.sqlite")).expect("read store"),
+        b"healed",
+        "teardown carries the healed DB back, so the next session stops relinking to corruption"
+    );
+}
+
+/// Decision 8 lets codex sessions run concurrently BECAUSE they share one
+/// physical auth.json. Under the fake transport they do not: the two flavors
+/// collapse to separate bare homes, each holding its own copy converged from
+/// the same store, so two live flavors are two carriers of one single-use
+/// chain. The acquire refuses instead of minting the permanent-death setup.
+#[test]
+fn fake_mode_refuses_the_second_flavor_of_one_profile() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("auth.json"), b"{\"v\":1}").expect("seed store");
+
+    with_link_mode(LinkMode::Fake, || {
+        let shared = CodexRuntime::acquire("cx", Isolation::Shared).expect("shared acquire");
+        let msg = match CodexRuntime::acquire("cx", Isolation::Isolated) {
+            Ok(_) => panic!("the second flavor would be a second carrier"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("SEPARATE copies of one single-use chain"),
+            "the refusal names why: {msg}"
+        );
+        // Same flavor is still fine — that IS one home.
+        let second =
+            CodexRuntime::acquire("cx", Isolation::Shared).expect("same flavor is one home");
+        drop(second);
+        drop(shared);
+        // With nothing live, the other flavor is free again.
+        drop(CodexRuntime::acquire("cx", Isolation::Isolated).expect("free once the first ends"));
+    });
+}
+
 /// A crash leaves the fake-mode ISOLATED home holding the only copy of a
 /// rotated chain — no Drop ran, so nothing converged it back to the store. The
 /// next acquire must not wipe that home: its name is sid-free like every fake
