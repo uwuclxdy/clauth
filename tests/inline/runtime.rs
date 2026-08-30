@@ -7957,6 +7957,44 @@ fn a_db_codex_healed_in_place_reaches_the_durable_store() {
     );
 }
 
+/// The recovery sync-back must carry back ONLY what codex replaced. An
+/// untouched durable entry is still a link into the store, and copying it back
+/// would rewrite the store file through its own link — same bytes, NEW inode,
+/// swapped out from under any concurrent session that has that sqlite open
+/// through its own link. Teardown of one session must not do that to another.
+#[cfg(unix)]
+#[test]
+fn teardown_leaves_an_untouched_durable_entry_on_its_own_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let store = profile.join("codex-home");
+    fs::create_dir_all(&store).expect("mkdir store");
+    fs::write(store.join("state_5.sqlite"), b"live").expect("seed db");
+    let before = fs::metadata(store.join("state_5.sqlite"))
+        .expect("stat")
+        .ino();
+
+    let first = CodexRuntime::acquire("cx", Isolation::Shared).expect("first");
+    let second = CodexRuntime::acquire("cx", Isolation::Shared).expect("second");
+    drop(first);
+
+    assert_eq!(
+        fs::metadata(store.join("state_5.sqlite"))
+            .expect("stat")
+            .ino(),
+        before,
+        "the second session still holds this inode open — teardown may not replace it"
+    );
+    assert_eq!(
+        fs::read(store.join("state_5.sqlite")).expect("read"),
+        b"live"
+    );
+    drop(second);
+}
+
 /// Decision 8 lets codex sessions run concurrently BECAUSE they share one
 /// physical auth.json. Under the fake transport they do not: the two flavors
 /// collapse to separate bare homes, each holding its own copy converged from
