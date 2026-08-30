@@ -124,7 +124,7 @@ clauth ships a plugin that exposes your profiles to a live Claude Code session v
 
 | Tool | What it does | Quota |
 |------|--------------|-------|
-| `profiles` | every account with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, and the states a delegate there is refused for (disabled, login expired, no api key) plus a canceled subscription; `scope: "session"` names the account this session runs on | zero (disk cache) |
+| `profiles` | every account with cached 5h/7d usage, provider, tier, live-session flag, observed throughput, and the account states worth a look before spending (disabled and no api key, both of which refuse a delegate; login expired, which refuses one except on an account that runs its own endpoint with its own key; a canceled subscription, which never refuses); `scope: "session"` names the account this session runs on | zero (disk cache) |
 | `switch_profile` | relink the global active profile; the reply says what it does to this session | zero |
 | `delegate` | hand a headless prompt to another account and return the answer (or a `job_id`) | **real usage window on the target account** |
 | `monitor` | check, collect or wait on backgrounded delegates' results, or wait on clauth's state (active profile, its usage cache, the credentials file) | zero (filesystem) |

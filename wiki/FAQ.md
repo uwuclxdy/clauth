@@ -26,7 +26,7 @@
 
 **Usage numbers are stuck.** Only one clauth instance fetches at a time. If a daemon holds the lease, an open TUI reads its results instead of polling itself, and picks the lease back up within a tick of the daemon exiting. `clauth daemon --status` says whether one is up.
 
-**An account has a `×` next to it.** Its login was rejected for good, so it is quarantined and excluded from the chain. Run `clauth login <name>` to re-authenticate it.
+**An account has a `×` next to it.** Its login was rejected for good, so it is quarantined and excluded from the chain. Run `clauth login <name>` to re-authenticate it. On an account that authenticates by api key, what died is the stored subscription login its usage figures came from, so `clauth login <name> --api-key <key>` is the one that clears the quarantine against the credential that account actually runs on. A bare browser login clears it too and leaves the endpoint and key standing.
 
 **The chain will not switch to an account that looks fine.** Check the reason on its row. Weekly windows, per-model weekly windows, a spend ceiling, a canceled subscription, or a `disabled` flag all take a member out of rotation independently of its 5h number. The [exclusion table](Auto-Switch#excluded-members) lists all of them.
 
