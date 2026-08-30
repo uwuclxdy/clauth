@@ -567,6 +567,32 @@ fn a_codex_profiles_config_is_never_read_here() {
     );
 }
 
+/// Uniqueness is enforced at creation, never against hand-edited state, so a
+/// name BOTH files claim is reachable — and every other resolution site is
+/// pinned claude-first. Skipping on the codex roster alone inverted it here,
+/// which silently dropped the claude profile whose `[env]` leak this union
+/// exists to catch.
+#[test]
+fn a_dual_claimed_name_stays_claude_first_here() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "shared", "[env]\nSHARED_KEY = \"1\"\n");
+
+    let clauth = home.home().join(".clauth");
+    fs::write(clauth.join("profiles.toml"), "profiles = [\"shared\"]\n")
+        .expect("write claude roster");
+    fs::write(
+        clauth.join("codex-profiles.toml"),
+        "profiles = [\"shared\"]\n",
+    )
+    .expect("write codex roster claiming the same name");
+
+    let keys = per_profile_env_keys().expect("every config.toml parses");
+    assert!(
+        keys.contains("SHARED_KEY"),
+        "a dual-claimed name resolves claude-first, so its env still joins the union: {keys:?}"
+    );
+}
+
 #[test]
 fn a_config_that_does_not_parse_aborts_the_tick() {
     let home = HomeSandbox::new();

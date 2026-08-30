@@ -189,6 +189,11 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
             );
         }
     };
+    let claude_roster: Vec<String> = crate::profile::claude_roster_names()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
     let profiles = clauth_dir().ok()?.join("profiles");
     let Ok(entries) = std::fs::read_dir(&profiles) else {
         return Some(keys);
@@ -197,10 +202,16 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
+        // Claude-FIRST for a name both files claim, the precedence pinned at
+        // every other resolution site (`cmd_switch`, `cmd_start`). Skipping on
+        // the codex roster alone inverted it here: a hand-edited dual claim
+        // (uniqueness is enforced at creation, never against edited state) made
+        // this arm treat the name as codex-only and skip the very dir whose
+        // `[env]` leak it exists to catch.
         if entry
             .file_name()
             .to_str()
-            .is_some_and(|name| codex.holds(name))
+            .is_some_and(|name| codex.holds(name) && !claude_roster.iter().any(|p| p == name))
         {
             continue;
         }

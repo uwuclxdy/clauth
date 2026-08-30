@@ -1102,13 +1102,19 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
         return Vec::new();
     };
     let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let claude_roster: Vec<String> = crate::profile::claude_roster_names()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
     let mut out = Vec::new();
     for profile in entries.flatten() {
         let profile_name = profile.file_name();
         let Some(profile_name) = profile_name.to_str() else {
             continue;
         };
-        if codex.holds(profile_name) {
+        // Claude-first for a dual-claimed name, like every other site.
+        if codex.holds(profile_name) && !claude_roster.iter().any(|p| p == profile_name) {
             continue;
         }
         let profile_path = profile.path();
@@ -4078,6 +4084,14 @@ fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
 /// betting on sqlite's symlink resolution. A store name a future codex adds
 /// stays per-session until this list learns it — a bounded, visible
 /// degradation, against silently linking anything.
+/// The rollout roots a codex home keeps side by side: live threads under
+/// `sessions/`, and the ones the operator archived under `archived_sessions/`
+/// (codex `rollout/src/lib.rs`). Archiving MOVES a rollout between them, so a
+/// sync-back that names only the first turns "archive this thread" into
+/// "delete it at teardown" — the one operation whose whole promise is that the
+/// thread is kept.
+const CODEX_ROLLOUT_ROOTS: &[&str] = &["sessions", "archived_sessions"];
+
 const CODEX_DURABLE_ENTRIES: &[&str] = &[
     "goals_1.sqlite",
     "goals_1.sqlite-wal",
@@ -4109,6 +4123,13 @@ const CODEX_OPERATOR_ENTRIES: &[&str] = &[
     "templates",
     "references",
     "AGENTS.md",
+    // Installed plugins (`plugins/cache`, `plugins/data` — codex
+    // `core-plugins/src/store.rs`) are the operator's tooling, the same family
+    // as skills and rules, so they are LINKED rather than made durable
+    // per-profile: an install reaches every profile and outlives the session
+    // that made it. Unlinked they were neither, and a plugin installed inside a
+    // clauth session died with the home.
+    "plugins",
 ];
 
 /// Converge the profile store and a fake-mode home's `auth.json` copy —
@@ -4223,6 +4244,25 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
     let operator_config = operator.join("config.toml");
     if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
         copy_codex_config(&operator_config, &home.join("config.toml"))?;
+    }
+    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the
+    // base config, and CODEX_HOME is this session home — so without these the
+    // flag resolves to an empty layer and silently runs the base config. They
+    // are sanitized like the base file: a layer can spell the same escapes.
+    if let Ok(entries) = std::fs::read_dir(&operator) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".config.toml") {
+                continue;
+            }
+            let dst = home.join(name);
+            if dst.symlink_metadata().is_err() {
+                copy_codex_config(&entry.path(), &dst)?;
+            }
+        }
     }
 
     if isolation == Isolation::Shared {
@@ -4395,15 +4435,18 @@ impl Drop for CodexRuntime {
             && self.mode == LinkMode::Real
             && let Ok(global) = codex_global_home(&self.profile)
         {
-            let src = self.home.join("sessions");
-            if src.is_dir() {
+            for rollout_root in CODEX_ROLLOUT_ROOTS {
+                let src = self.home.join(rollout_root);
+                if !src.is_dir() {
+                    continue;
+                }
                 // Owner-only from birth: the sweep stops at the codex-home
                 // threshold, so nothing retightens what lands loose here, and
                 // rollouts are chat content.
                 let _ = crate::profile::mkdir_700(&global);
-                let _ = crate::profile::mkdir_700(&global.join("sessions"));
-                if let Err(e) = copy_tree(&src, &global.join("sessions")) {
-                    logline!("clauth: codex sessions sync-back failed: {e:#}");
+                let _ = crate::profile::mkdir_700(&global.join(rollout_root));
+                if let Err(e) = copy_tree(&src, &global.join(rollout_root)) {
+                    logline!("clauth: codex {rollout_root} sync-back failed: {e:#}");
                 }
             }
         }

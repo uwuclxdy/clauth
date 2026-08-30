@@ -7809,8 +7809,12 @@ fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
          and under fake mode it is the copy the session actually holds"
     );
 
-    // A rollout the session wrote must survive the session.
+    // A rollout the session wrote must survive the session — and so must one
+    // the session ARCHIVED, which codex moves to the sibling rollout root.
     fs::write(session_home.join("sessions").join("rollout-1.jsonl"), b"{}").expect("write rollout");
+    let archived = session_home.join("archived_sessions");
+    fs::create_dir_all(&archived).expect("mkdir archived");
+    fs::write(archived.join("rollout-0.jsonl"), b"{}").expect("write archived rollout");
 
     drop(runtime);
 
@@ -7822,6 +7826,14 @@ fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
             .join("rollout-1.jsonl")
             .exists(),
         "the rollout was synced into the durable store"
+    );
+    assert!(
+        profile
+            .join("codex-home")
+            .join("archived_sessions")
+            .join("rollout-0.jsonl")
+            .exists(),
+        "archiving a thread must not mean deleting it at teardown"
     );
     assert!(
         crate::live_sessions::list().is_empty(),
@@ -7855,6 +7867,47 @@ fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
             "teardown must never remove the profile's memory because the last session left"
         );
     });
+}
+
+/// `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml`, and
+/// CODEX_HOME is the session home — so the operator's profile-v2 files have to
+/// land there too, sanitized like the base config, or the flag silently
+/// resolves to an empty layer. The operator's installed plugins ride the same
+/// link set as skills and rules, so an install outlives the session.
+#[cfg(unix)]
+#[test]
+fn a_session_home_carries_the_profile_layers_and_the_plugin_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(operator.join("plugins/cache")).expect("mkdir plugins");
+    fs::write(operator.join("config.toml"), b"model = \"o3\"\n").expect("write config");
+    fs::write(
+        operator.join("work.config.toml"),
+        b"model = \"gpt-5\"\nsqlite_home = \"/tmp/shared\"\n",
+    )
+    .expect("write profile layer");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let layer = fs::read_to_string(session_home.join("work.config.toml")).expect("read layer");
+    let parsed: toml::Value = toml::from_str(&layer).expect("valid TOML");
+    assert_eq!(
+        parsed.get("model").and_then(toml::Value::as_str),
+        Some("gpt-5"),
+        "the profile layer reached the home `--profile` looks in"
+    );
+    assert!(
+        parsed.get("sqlite_home").is_none(),
+        "and a layer cannot spell the escape the base config just lost: {layer}"
+    );
+    assert!(
+        session_home.join("plugins").symlink_metadata().is_ok(),
+        "installed plugins are linked like skills and rules"
+    );
 }
 
 /// A crash leaves the fake-mode ISOLATED home holding the only copy of a
