@@ -83,6 +83,24 @@ fn the_codex_scrub_is_managed_keys_plus_clauth_runtime_hygiene() {
             Some(&None),
             "an inherited state-DB home would pool every profile's DBs in one dir"
         );
+        for carrier in ["CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+            assert_eq!(
+                env.get(carrier),
+                Some(&None),
+                "{carrier} outranks the linked auth.json in codex's own load_auth order"
+            );
+        }
+        for endpoint in [
+            "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+            "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+            "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+        ] {
+            assert_eq!(
+                env.get(endpoint),
+                Some(&None),
+                "{endpoint} would spend the profile's single-use chain elsewhere"
+            );
+        }
         assert_eq!(env.get("A_KEY"), Some(&None));
         assert_eq!(
             env.get("CLAUDE_CONFIG_DIR"),

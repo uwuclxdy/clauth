@@ -124,15 +124,38 @@ impl HarnessEngine for ClaudeEngine {
 /// a codex tag.
 pub(crate) struct CodexEngine;
 
-/// The env keys a spawned codex session must receive only through its own
-/// home, never inherited: `CODEX_HOME` itself (the parent's pin — exactly the
-/// key this spawn is about to set right), and `OPENAI_API_KEY` (codex treats a
-/// bare key in the env as an auth mode of its own, over the linked
-/// `auth.json`), and `CODEX_SQLITE_HOME` (codex resolves its state DBs there
-/// when it is set, so an inherited one points every profile's
-/// goals/logs/memories/state at ONE directory and the home's durable links are
-/// never opened through).
-const CODEX_MANAGED_ENV_KEYS: &[&str] = &["CODEX_HOME", "OPENAI_API_KEY", "CODEX_SQLITE_HOME"];
+/// The env keys a spawned codex session must receive only through its own home
+/// and its own `auth.json`, never inherited. Three groups, each an answer to a
+/// different way an inherited value silently unbinds the profile:
+///
+/// - the PINS. `CODEX_HOME` is the parent's, exactly the key this spawn is
+///   about to set right. `CODEX_SQLITE_HOME` decides where codex resolves its
+///   state DBs, so an inherited one points every profile's
+///   goals/logs/memories/state at ONE directory and the home's durable links
+///   are never opened through.
+/// - the CREDENTIAL CARRIERS, which outrank the linked `auth.json` in codex's
+///   own resolution order (`login/src/auth/manager.rs` `load_auth`, whose
+///   first comment reads "API key via env var takes precedence over any other
+///   auth method"): `CODEX_API_KEY` first, then `CODEX_ACCESS_TOKEN`, and only
+///   then the persistent store this session was built around. `OPENAI_API_KEY`
+///   is the same hazard one layer down, since `resolved_mode()` reads a bare
+///   key as an auth mode of its own. Left inherited, `clauth start <p>` spends
+///   a DIFFERENT account than the one it names — the exact confusion clauth
+///   exists to prevent.
+/// - the ENDPOINT OVERRIDES codex ships for its own tests. They decide where a
+///   refresh POSTs, where a revoke goes, and which client id is claimed. A
+///   codex refresh token is single-use, so an inherited override spends the
+///   profile's one live chain against a host clauth did not choose.
+const CODEX_MANAGED_ENV_KEYS: &[&str] = &[
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "CODEX_REFRESH_TOKEN_URL_OVERRIDE",
+    "CODEX_REVOKE_TOKEN_URL_OVERRIDE",
+    "CODEX_APP_SERVER_LOGIN_CLIENT_ID",
+];
 
 impl HarnessEngine for CodexEngine {
     fn install_credentials(&self, name: &str) -> anyhow::Result<()> {
