@@ -3799,6 +3799,20 @@ fn codex_capture_refuses_a_slot_another_profile_adopted() {
             .expect("load")
             .holds("second")
     );
+    // The refusal must not prescribe the one command that destroys 'first'.
+    // codex's login opens with logout_with_revoke, which loads the stored auth
+    // THROUGH the adopted link and POSTs its refresh token to the revoke
+    // endpoint — so "just run `codex login`" would kill 'first' server-side,
+    // permanently, while looking like ordinary setup advice.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("revokes whatever it finds there"),
+        "the refusal names the revoke hazard: {msg}"
+    );
+    assert!(
+        msg.contains("Remove the link first"),
+        "and prescribes detaching before minting: {msg}"
+    );
 }
 
 /// Every refusal names its fix; nothing lands on the roster from any of

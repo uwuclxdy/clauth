@@ -945,11 +945,20 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
             );
             return Ok(());
         }
+        // NOT "run `codex login`": that slot is a LINK to '{holder}'s store, and
+        // codex's login opens with `clear_existing_auth_before_login` ->
+        // `logout_with_revoke`, which LOADS the stored auth through the link and
+        // POSTs its refresh token to the revoke endpoint before minting. The
+        // obvious next step would therefore kill the already-captured profile
+        // server-side, which no re-login of '{trimmed}' can undo.
         bail!(
-            "{} is already captured as codex profile '{holder}' — one chain, one \
-             profile. Run `codex login` to mint a fresh chain, then capture that \
+            "{slot} is already captured as codex profile '{holder}' — one chain, one \
+             profile. That slot is a LINK to '{holder}'s store, and `codex login` \
+             revokes whatever it finds there before minting, so running it now would \
+             kill '{holder}'s chain for good. Remove the link first (`rm {slot}` \
+             leaves '{holder}' itself intact), then `codex login` and capture that \
              into '{trimmed}'",
-            auth_path.display()
+            slot = auth_path.display()
         );
     }
 
@@ -1030,6 +1039,11 @@ pub(crate) fn codex_login_capture(name: &str) -> Result<()> {
             "clauth: {} now follows the profile store — your own codex and clauth \
              sessions share one chain",
             auth_path.display()
+        );
+        outln!(
+            "clauth: while it does, `codex login` and `codex logout` reach '{canonical}'s \
+             chain through that link and revoke it server-side — remove the link first \
+             if you mean to mint a chain for a different account"
         );
     } else {
         outln!(

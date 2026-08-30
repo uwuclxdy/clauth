@@ -7579,6 +7579,95 @@ fn live_isolated_stores_skip_codex_profiles_by_roster() {
 /// The shared-flavor home per the codex plan's table: auth.json links the
 /// profile's ONE physical file (dangling until a login exists — that is the
 /// point), the operator surfaces link in, hooks.json only by opt-in, and the
+/// The copied config.toml loses exactly the keys that would let the session read
+/// or write outside the home clauth just built — and nothing else. `sqlite_home`
+/// and `cli_auth_credentials_store` are also pinned by a forced `-c` at spawn;
+/// `debug.config_lockfile` is why that pin alone is not enough, since a lockfile
+/// replay rebuilds the config from ONE layer and erases the `-c` layer entirely.
+#[cfg(unix)]
+#[test]
+fn a_session_config_loses_the_keys_that_escape_the_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    fs::write(
+        operator.join("config.toml"),
+        b"model = \"o3\"\n\
+          sqlite_home = \"/tmp/one-shared-dir\"\n\
+          cli_auth_credentials_store = \"keyring\"\n\
+          \n[debug.config_lockfile]\n\
+          load_path = \"/tmp/replay.lock\"\n\
+          \n[tui]\n\
+          notifications = true\n",
+    )
+    .expect("write config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let copied = fs::read_to_string(session_home.join("config.toml")).expect("read copy");
+    let parsed: toml::Value = toml::from_str(&copied).expect("the rewrite is still valid TOML");
+    let table = parsed.as_table().expect("table");
+    assert!(
+        table.get("sqlite_home").is_none(),
+        "the state-DB escape is gone: {copied}"
+    );
+    assert!(
+        table.get("cli_auth_credentials_store").is_none(),
+        "the credential-store escape is gone: {copied}"
+    );
+    assert!(
+        table
+            .get("debug")
+            .and_then(toml::Value::as_table)
+            .map(|d| d.get("config_lockfile").is_none())
+            .unwrap_or(true),
+        "the lockfile replay that erases the -c layer is gone: {copied}"
+    );
+    assert_eq!(
+        table.get("model").and_then(toml::Value::as_str),
+        Some("o3"),
+        "every key that is not an escape survives"
+    );
+    assert_eq!(
+        table
+            .get("tui")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("notifications"))
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "including whole tables the strip does not name"
+    );
+}
+
+/// A config clauth cannot parse copies through untouched. codex will reject it
+/// the same way, and a session that refuses to start beats one silently reshaped
+/// by a parse that got it wrong.
+#[cfg(unix)]
+#[test]
+fn an_unparseable_operator_config_copies_through_verbatim() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let broken = "model = \"o3\n[unclosed\n";
+    fs::write(operator.join("config.toml"), broken).expect("write config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    assert_eq!(
+        fs::read_to_string(session_home.join("config.toml")).expect("read copy"),
+        broken,
+        "byte-for-byte, not a best-effort reshape"
+    );
+}
+
 /// durable stores link into the profile-global home.
 #[cfg(unix)]
 #[test]
@@ -7764,6 +7853,52 @@ fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
         assert!(
             session_home.join("memories_1.sqlite").exists(),
             "teardown must never remove the profile's memory because the last session left"
+        );
+    });
+}
+
+/// A crash leaves the fake-mode ISOLATED home holding the only copy of a
+/// rotated chain — no Drop ran, so nothing converged it back to the store. The
+/// next acquire must not wipe that home: its name is sid-free like every fake
+/// name, so a guard testing only the SHARED bare stem read it as a recycled
+/// per-session tree and deleted the live refresh token, after which the build
+/// converged the store's SPENT token outward for codex to replay.
+#[test]
+fn a_crashed_fake_isolated_home_keeps_the_only_rotated_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("auth.json"), b"{\"spent\":true}").expect("seed store");
+
+    with_link_mode(LinkMode::Fake, || {
+        let session_home = {
+            let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("acquire");
+            let home = runtime.home().to_path_buf();
+            assert_eq!(
+                home,
+                profile.join("codex-home-isolated"),
+                "fake mode collapses the isolated home to its own bare stem"
+            );
+            // The session rotates the copy, then the process dies: forget the
+            // runtime instead of dropping it, so no teardown converge runs.
+            fs::write(home.join("auth.json"), b"{\"rotated\":true}").expect("rotate the copy");
+            std::mem::forget(runtime);
+            home
+        };
+        // The marker the dead session left behind reads as zero active.
+        let _ = fs::remove_dir_all(profile.join("sessions-isolated"));
+
+        let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("re-acquire");
+        assert_eq!(
+            fs::read(session_home.join("auth.json")).expect("read copy"),
+            b"{\"rotated\":true}",
+            "the only carrier of the rotated chain survived the re-acquire"
+        );
+        drop(runtime);
+        assert_eq!(
+            fs::read(profile.join("auth.json")).expect("read store"),
+            b"{\"rotated\":true}",
+            "and reached the store, instead of the spent token being replayed"
         );
     });
 }

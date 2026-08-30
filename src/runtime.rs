@@ -877,6 +877,7 @@ fn gc_codex_homes() {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
+    let mut candidates: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     for profile in entries.flatten() {
         let profile = profile.path();
         let Ok(children) = std::fs::read_dir(&profile) else {
@@ -899,23 +900,38 @@ fn gc_codex_homes() {
             let Some(rest) = child_name.strip_prefix(CODEX_HOME_STEM) else {
                 continue;
             };
-            let sessions = profile.join(format!("{SESSIONS_STEM}{rest}"));
-            // The acquire creates and flock-holds the marker BEFORE the home
-            // exists (both under the state lock), so "home present, marker
-            // dir absent" is never a start in flight — only a crash's
-            // leftover. An unreadable marker dir reads as live, like every
-            // sweep here.
+            candidates.push((child.path(), profile.join(format!("{SESSIONS_STEM}{rest}"))));
+        }
+    }
+    // Peek before locking, like `gc_bare_markers`: nothing to collect must not
+    // pay the state flock's wait, which a macOS switch legitimately holds for
+    // ~20s. A home that appears after the peek is the next sweep's, which is
+    // the whole contract of a best-effort GC.
+    if candidates.is_empty() {
+        return;
+    }
+    let _ = with_state_lock(|_held| {
+        for (home, sessions) in candidates {
+            // The liveness read and the removal BOTH belong under the state
+            // lock, because the acquire's whole critical section runs under it
+            // and the marker's flock is taken AFTER the home is built. Read
+            // unlocked, the entire `build_codex_home` window shows a home
+            // present beside a marker dir that is empty — indistinguishable
+            // from a crash's leftover — and this sweep would reap a session
+            // that is starting. Under the lock the only two states left are
+            // "not begun" (no home) and "finished" (flock held).
             let dead = if sessions.exists() {
                 matches!(live_sessions_at(&sessions), Some(0))
             } else {
                 true
             };
             if dead {
-                let _ = std::fs::remove_dir_all(child.path());
+                let _ = std::fs::remove_dir_all(&home);
                 let _ = std::fs::remove_dir(&sessions);
             }
         }
-    }
+        Ok::<_, anyhow::Error>(())
+    });
 }
 
 fn gc_runtime_trees() {
@@ -3998,6 +4014,61 @@ fn codex_global_home(name: &str) -> Result<PathBuf> {
     profile_subpath(&ProfileName::from(name), CODEX_HOME_STEM)
 }
 
+/// The config keys a clauth-built codex home must not inherit, whatever the
+/// operator set for their own `~/.codex`. Each one lets a session read or write
+/// outside the boundary the home exists to draw:
+///
+/// - `sqlite_home` moves the state DBs, so every profile's
+///   goals/logs/memories/state land in one directory and the home's durable
+///   links are never opened through.
+/// - `cli_auth_credentials_store` makes codex ignore the linked `auth.json` and
+///   delete it on the first refresh (decision 6).
+/// - `debug.config_lockfile` replays a lockfile as the WHOLE effective config:
+///   `ConfigLayerStack::new(vec![lock_layer], ..)` (codex `core/src/config/mod.rs`)
+///   rebuilds from one layer, so the `-c` layer carrying both forced overrides
+///   is not outranked but ERASED.
+///
+/// The first two are also pinned by a forced `-c` at spawn. Stripping them here
+/// too is deliberate: the third key is what makes a `-c` alone insufficient, and
+/// a defense that only holds while the layer stack survives is not one.
+const CODEX_CONFIG_STRIP_KEYS: &[&str] = &["sqlite_home", "cli_auth_credentials_store"];
+const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile")];
+
+/// Copy the operator's `config.toml` into a session home with the escape keys
+/// removed. An unparseable config copies through verbatim: codex will reject it
+/// the same way, and a session that cannot start is a better answer than one
+/// silently reshaped by a parse this function got wrong. Comments and key order
+/// are lost in the rewrite, which costs nothing — the copy is codex's to write
+/// in place and is discarded at teardown, never synced back over the original.
+fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
+    let raw = match std::fs::read_to_string(src) {
+        Ok(raw) => raw,
+        Err(_) => return copy_file(src, dst),
+    };
+    let Ok(mut parsed) = toml::from_str::<toml::Value>(&raw) else {
+        return copy_file(src, dst);
+    };
+    let Some(table) = parsed.as_table_mut() else {
+        return copy_file(src, dst);
+    };
+    let mut stripped = false;
+    for key in CODEX_CONFIG_STRIP_KEYS {
+        stripped |= table.remove(*key).is_some();
+    }
+    for (parent, key) in CODEX_CONFIG_STRIP_SUBKEYS {
+        if let Some(sub) = table.get_mut(*parent).and_then(toml::Value::as_table_mut) {
+            stripped |= sub.remove(*key).is_some();
+        }
+    }
+    if !stripped {
+        return copy_file(src, dst);
+    }
+    let rendered = toml::to_string(&parsed)
+        .with_context(|| format!("failed to re-render {}", src.display()))?;
+    crate::profile::atomic_write_600(dst, rendered.as_bytes())
+        .with_context(|| format!("failed to write {}", dst.display()))
+}
+
 /// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
 /// table) plus the history file — per-session paths symlinked into the
 /// profile-global home so memory survives session teardown. The companions
@@ -4151,7 +4222,7 @@ fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMod
 
     let operator_config = operator.join("config.toml");
     if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
-        copy_file(&operator_config, &home.join("config.toml"))?;
+        copy_codex_config(&operator_config, &home.join("config.toml"))?;
     }
 
     if isolation == Isolation::Shared {
@@ -4229,11 +4300,21 @@ impl CodexRuntime {
                 .with_context(|| format!("failed to create {}", sessions.display()))?;
             let active = prune_stale_sessions(&sessions).unwrap_or(1);
             // A dead session's leftovers under a recycled sid are rebuilt from
-            // scratch — but ONLY a per-session home: the bare stem is the
-            // durable store under Fake, and wiping it would destroy the
-            // profile's memory, not a stale tree.
+            // scratch — but ONLY a genuinely per-session home. Testing the
+            // SHARED bare stem alone was not enough: under Fake every name is
+            // sid-free, so the isolated home (`codex-home-isolated`) read as
+            // per-session and was wiped. That home holds a physical auth.json
+            // COPY, and a session that died before Drop could converge leaves
+            // the rotated chain nowhere else — the wipe destroyed it, and
+            // `build_codex_home` then converged the SPENT store token back out
+            // for codex to replay into `refresh_token_reused`. The predicate
+            // that already answers this correctly demands a session id, so
+            // both bare stems keep the state that must outlive a session.
             if active == 0
-                && home.file_name().and_then(|n| n.to_str()) != Some(CODEX_HOME_STEM)
+                && home
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_per_session_codex_home_name)
                 && home.symlink_metadata().is_ok()
             {
                 std::fs::remove_dir_all(&home)
