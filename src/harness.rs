@@ -128,8 +128,11 @@ pub(crate) struct CodexEngine;
 /// home, never inherited: `CODEX_HOME` itself (the parent's pin — exactly the
 /// key this spawn is about to set right), and `OPENAI_API_KEY` (codex treats a
 /// bare key in the env as an auth mode of its own, over the linked
-/// `auth.json`).
-const CODEX_MANAGED_ENV_KEYS: &[&str] = &["CODEX_HOME", "OPENAI_API_KEY"];
+/// `auth.json`), and `CODEX_SQLITE_HOME` (codex resolves its state DBs there
+/// when it is set, so an inherited one points every profile's
+/// goals/logs/memories/state at ONE directory and the home's durable links are
+/// never opened through).
+const CODEX_MANAGED_ENV_KEYS: &[&str] = &["CODEX_HOME", "OPENAI_API_KEY", "CODEX_SQLITE_HOME"];
 
 impl HarnessEngine for CodexEngine {
     fn install_credentials(&self, name: &str) -> anyhow::Result<()> {

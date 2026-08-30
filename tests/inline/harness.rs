@@ -78,6 +78,11 @@ fn the_codex_scrub_is_managed_keys_plus_clauth_runtime_hygiene() {
         let env = crate::testutil::env_overrides(&cmd);
         assert_eq!(env.get("CODEX_HOME"), Some(&None));
         assert_eq!(env.get("OPENAI_API_KEY"), Some(&None));
+        assert_eq!(
+            env.get("CODEX_SQLITE_HOME"),
+            Some(&None),
+            "an inherited state-DB home would pool every profile's DBs in one dir"
+        );
         assert_eq!(env.get("A_KEY"), Some(&None));
         assert_eq!(
             env.get("CLAUDE_CONFIG_DIR"),

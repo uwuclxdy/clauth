@@ -7629,6 +7629,7 @@ fn a_shared_codex_home_links_the_table() {
     for entry in [
         "memories_1.sqlite",
         "memories_1.sqlite-wal",
+        "thread_history_1.sqlite",
         "history.jsonl",
     ] {
         let link = session_home.join(entry);

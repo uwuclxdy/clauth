@@ -809,9 +809,59 @@ fn the_codex_spawn_command_carries_the_wire_facts() {
         [
             "-c",
             "cli_auth_credentials_store=\"file\"",
+            "-c",
+            &format!("sqlite_home='{}'", session_home.display()),
             "exec",
             "--full-auto"
         ],
-        "forced store first, passthrough after"
+        "forced store and state-DB home first, passthrough after"
+    );
+}
+
+/// The state-DB pin exists to outrank a `sqlite_home` the COPIED config.toml
+/// carries: scrubbing `CODEX_SQLITE_HOME` cannot reach a config key, and an
+/// operator's absolute path there would pool every profile's goals/memories/
+/// state DBs in one directory while the home's durable links sit unopened.
+#[test]
+fn the_spawn_pins_the_state_db_home_past_a_copied_config_key() {
+    let home = crate::testutil::HomeSandbox::new();
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    std::fs::create_dir_all(&session_home).expect("mkdir home");
+    // The operator's own setting, faithfully copied into the session home by
+    // `build_codex_home` — codex would resolve its DBs there, not here.
+    std::fs::write(
+        session_home.join("config.toml"),
+        b"sqlite_home = \"/tmp/one-shared-dir\"\n",
+    )
+    .expect("write config");
+
+    let cmd = codex_spawn_command(&session_home, &[], &[]);
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let pinned = format!("sqlite_home='{}'", session_home.display());
+    assert!(
+        args.windows(2).any(|w| w[0] == "-c" && w[1] == pinned),
+        "the session's own home is pinned past the copied key: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.contains("/tmp/one-shared-dir")),
+        "the operator's path is never what the spawn names"
+    );
+}
+
+/// A home whose path carries an apostrophe cannot ride a TOML literal string,
+/// so the override falls back to a basic string rather than emitting a value
+/// codex's `-c` parser would read as truncated.
+#[test]
+fn a_quoted_home_path_falls_back_to_a_basic_toml_string() {
+    assert_eq!(
+        toml_path_value(std::path::Path::new("/Users/o'brien/.clauth")),
+        "\"/Users/o'brien/.clauth\""
+    );
+    assert_eq!(
+        toml_path_value(std::path::Path::new("/Users/plain/.clauth")),
+        "'/Users/plain/.clauth'"
     );
 }

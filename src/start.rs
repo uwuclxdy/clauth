@@ -473,6 +473,20 @@ fn forward_signal(child: &std::process::Child, signal: i32) -> std::io::Result<(
 /// the store mode simply re-breaks the linked `auth.json` for that one run,
 /// the same class of self-inflicted foot-gun as `claude --settings` against a
 /// clauth runtime.
+/// A path rendered as a TOML string for a `-c key=<value>` override. Literal
+/// (single-quoted) is preferred: it processes no escapes, so a Windows path's
+/// backslashes survive verbatim. A path carrying a single quote cannot be a
+/// literal string at all, so it falls back to a basic string with the two
+/// characters TOML requires escaped there.
+fn toml_path_value(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if raw.contains('\'') {
+        format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("'{raw}'")
+    }
+}
+
 /// The spawn command for a codex session on `home`, split from [`run_codex`]
 /// so the wire facts are pinned without spawning anything: the `CODEX_HOME`
 /// pin, the scrub, and the forced file store BEFORE the passthrough args.
@@ -487,6 +501,15 @@ fn forward_signal(child: &std::process::Child, signal: i32) -> std::io::Result<(
 /// a later `-c` of the same key wins in codex's layering — overriding the
 /// store re-breaks the linked auth.json for that one run, the same class of
 /// self-inflicted foot-gun as `claude --settings` against a clauth runtime.
+///
+/// The state-DB override, the same reasoning one layer down: the store the
+/// sqlite DBs live in is a config KEY (`sqlite_home`) as well as an env var,
+/// and the session's config.toml is that same copy of the operator's. Left
+/// alone, every profile's goals/logs/memories/state DBs land in whichever one
+/// directory the operator named — the home's durable links are never opened
+/// through, and two accounts share one conversation history. Scrubbing the env
+/// cannot reach it, since the key outranks the variable, so it is pinned to the
+/// home clauth just set: exactly what codex resolves when neither is spelled.
 fn codex_spawn_command(
     home: &Path,
     codex_args: &[String],
@@ -497,6 +520,9 @@ fn codex_spawn_command(
     engine.scrub_env(&mut command, active_env_keys);
     command.env(engine.home_env_key(), home);
     command.arg("-c").arg("cli_auth_credentials_store=\"file\"");
+    command
+        .arg("-c")
+        .arg(format!("sqlite_home={}", toml_path_value(home)));
     command.args(codex_args);
     command
 }

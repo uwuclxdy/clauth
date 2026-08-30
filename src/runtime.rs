@@ -4020,6 +4020,9 @@ const CODEX_DURABLE_ENTRIES: &[&str] = &[
     "state_5.sqlite",
     "state_5.sqlite-wal",
     "state_5.sqlite-shm",
+    "thread_history_1.sqlite",
+    "thread_history_1.sqlite-wal",
+    "thread_history_1.sqlite-shm",
     "history.jsonl",
 ];
 
