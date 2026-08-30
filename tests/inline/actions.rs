@@ -1027,6 +1027,696 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
     }
 }
 
+/// "Preserve key on reauth" (owner ruling, 2026-08-30): a browser reauth's
+/// snapshot carries the minted tokens and nothing else (`run_oauth_browser`),
+/// so the uniform replace stripped a third-party profile's endpoint and key —
+/// a login about the OAuth chain deleting the working api-key credential. A
+/// field the snapshot omits keeps the stored one on a provider-set profile.
+/// The console rule is unchanged: it keys on the EFFECTIVE provider, so an
+/// Alibaba reauth keeps its session and a non-Alibaba one still clears it.
+#[test]
+fn browser_reauth_on_a_third_party_profile_keeps_its_endpoint_and_key() {
+    let _home = HomeSandbox::new();
+
+    fn pair(access: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some("fresh-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }
+    }
+    let console = || crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+
+    let mut ds = Profile::new(
+        "ds-hybrid".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    ds.credentials = Some(pair("old-access"));
+    ds.console = Some(console());
+    let mut qwen = Profile::new(
+        "qwen-hybrid".to_string(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com".to_string()),
+        Some("sk-sp-old".to_string()),
+    );
+    qwen.credentials = Some(pair("old-access"));
+    qwen.console = Some(console());
+    save_profile(&ds).expect("save ds");
+    save_profile(&qwen).expect("save qwen");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![ds.name.clone(), qwen.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![ds, qwen],
+    };
+
+    for (name, access) in [("ds-hybrid", "ds-new"), ("qwen-hybrid", "qwen-new")] {
+        let snapshot = CaptureSnapshot {
+            credentials: Some(pair(access)),
+            base_url: None,
+            api_key: None,
+            account_uuid: None,
+        };
+        overwrite_captured_profile(
+            &mut config,
+            &crate::profile::ProfileName::from(name),
+            snapshot,
+        )
+        .expect("reauth");
+    }
+
+    let ds = config
+        .find(&crate::profile::ProfileName::from("ds-hybrid"))
+        .expect("profile");
+    assert_eq!(
+        ds.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "a snapshot that omits the endpoint keeps the stored one"
+    );
+    assert_eq!(
+        ds.api_key.as_deref(),
+        Some("sk-old"),
+        "a snapshot that omits the key keeps the stored one"
+    );
+    assert_eq!(
+        ds.provider,
+        Some(crate::providers::Provider::DeepSeek),
+        "the provider is re-derived off the PRESERVED endpoint"
+    );
+    assert_eq!(
+        ds.access_token(),
+        Some("ds-new"),
+        "the credential set is still replaced"
+    );
+    assert!(
+        ds.console.is_none(),
+        "non-Alibaba keeps the console-clearing rule"
+    );
+
+    let qwen = config
+        .find(&crate::profile::ProfileName::from("qwen-hybrid"))
+        .expect("profile");
+    assert_eq!(
+        qwen.base_url.as_deref(),
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com")
+    );
+    assert_eq!(qwen.api_key.as_deref(), Some("sk-sp-old"));
+    assert_eq!(
+        qwen.provider,
+        Some(crate::providers::Provider::Alibaba),
+        "the preserved endpoint keeps the Alibaba identity"
+    );
+    assert!(
+        qwen.console.is_some(),
+        "an Alibaba reauth keeps its console session — the clear keys on the \
+         effective provider, and preservation does not change that rule"
+    );
+    assert_eq!(qwen.access_token(), Some("qwen-new"));
+}
+
+/// A switch that follows `switch_off` has no outgoing marker to read, and a
+/// cleared `active_profile` is clauth's record rather than a statement about
+/// `settings.json` — `switch_off` never touches the file. Stripping nothing
+/// there leaves the departed account's `[env]` entries live while the same
+/// write repoints the endpoint and `apiKeyHelper` at the incoming account.
+/// Reachable unattended: the fallback walk switches off, then switches to.
+///
+/// `ANTHROPIC_AUTH_TOKEN` cannot show this — `build_claude_settings_json`
+/// clears that one on every write, whatever the strip list says.
+#[test]
+fn a_switch_after_a_switch_off_does_not_inherit_the_departed_accounts_env() {
+    let _home = HomeSandbox::new();
+
+    let mut departing = Profile::new("departing".to_string(), None, None);
+    departing.env.insert(
+        "ANTHROPIC_API_KEY".to_string(),
+        "departing-token".to_string(),
+    );
+    departing.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-departing".to_string(),
+            refresh_token: Some("rt-departing".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let mut incoming = Profile::new(
+        "incoming".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-incoming".to_string()),
+    );
+    incoming.credentials = None;
+    save_profile(&departing).expect("save departing");
+    save_profile(&incoming).expect("save incoming");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["departing".into(), "incoming".into()],
+            active_profile: Some("departing".into()),
+            ..AppState::default()
+        },
+        profiles: vec![departing, incoming],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    #[allow(clippy::expect_used, reason = "test")]
+    let departing_ref = config
+        .find(&crate::profile::ProfileName::from("departing"))
+        .expect("profile");
+    crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
+        .expect("seed the departing account's env into the live settings");
+
+    switch_off(&mut config).expect("switch off");
+    assert_eq!(
+        config.state.active_profile, None,
+        "fixture: the marker must be cleared, which is what the switch then reads"
+    );
+
+    switch_profile(&mut config, &crate::profile::ProfileName::from("incoming"))
+        .expect("switch to the incoming account");
+
+    let settings = crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    assert!(
+        !settings.contains("departing-token"),
+        "the departed account's env entry must not survive under the incoming \
+         account's endpoint: {settings}"
+    );
+}
+
+/// "Widen to any endpoint" (owner ruling, 2026-08-30): the preserve keys on a
+/// stored endpoint plus working inference auth, never on a RECOGNISED provider
+/// — most endpoints in use (litellm, LMStudio, ollama, a router) resolve to
+/// `provider: None` and lose exactly as much. An endpoint that is empty once
+/// trimmed is no endpoint, spelled the way `effective_base_url` spells the
+/// same emptiness test for the api key beside it.
+#[test]
+fn browser_reauth_keeps_a_generic_endpoint_and_key() {
+    let _home = HomeSandbox::new();
+
+    fn oauth_pair(access: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some("refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }
+    }
+
+    let mut generic = Profile::new(
+        "litellm".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("sk-generic".to_string()),
+    );
+    generic.credentials = Some(oauth_pair("old-access"));
+    let mut blank_endpoint = Profile::new(
+        "blank-endpoint".to_string(),
+        Some("   ".to_string()),
+        Some("sk-generic".to_string()),
+    );
+    blank_endpoint.credentials = Some(oauth_pair("old-access"));
+    save_profile(&generic).expect("save generic");
+    save_profile(&blank_endpoint).expect("save blank");
+    assert_eq!(
+        config_provider_of(&generic),
+        None,
+        "fixture: the endpoint must be one clauth has no provider for",
+    );
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["litellm".into(), "blank-endpoint".into()],
+            ..AppState::default()
+        },
+        profiles: vec![generic, blank_endpoint],
+    };
+
+    for name in ["litellm", "blank-endpoint"] {
+        overwrite_captured_profile(
+            &mut config,
+            &crate::profile::ProfileName::from(name),
+            CaptureSnapshot {
+                credentials: Some(oauth_pair("new-access")),
+                base_url: None,
+                api_key: None,
+                account_uuid: None,
+            },
+        )
+        .expect("reauth");
+    }
+
+    let generic = config
+        .find(&crate::profile::ProfileName::from("litellm"))
+        .expect("profile");
+    assert_eq!(
+        generic.base_url.as_deref(),
+        Some("http://127.0.0.1:4000"),
+        "an unrecognised endpoint is preserved like a recognised one"
+    );
+    assert_eq!(generic.api_key.as_deref(), Some("sk-generic"));
+    assert_eq!(generic.provider, None, "and stays unrecognised");
+    assert_eq!(generic.access_token(), Some("new-access"));
+
+    let blank = config
+        .find(&crate::profile::ProfileName::from("blank-endpoint"))
+        .expect("profile");
+    assert_eq!(
+        blank.base_url, None,
+        "a whitespace-only endpoint is no endpoint to preserve"
+    );
+    assert_eq!(
+        blank.api_key, None,
+        "and its key goes with it, rather than being kept against nothing"
+    );
+}
+
+/// The provider a profile's endpoint resolves to, for a fixture control.
+fn config_provider_of(profile: &Profile) -> Option<crate::providers::Provider> {
+    profile
+        .base_url
+        .as_deref()
+        .and_then(crate::providers::Provider::from_base_url)
+}
+
+/// The auto-activate arm writes the settings too. It never did before, and
+/// never had to: a browser snapshot cleared the endpoint on its way through,
+/// so there was nothing to write. With the endpoint preserved, an arm that
+/// makes this profile active while leaving `settings.json` endpoint-less
+/// routes the live session at Anthropic under a profile that says otherwise.
+#[test]
+fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
+    let _home = HomeSandbox::new();
+
+    let mut ds = Profile::new(
+        "ds-autoactivate".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-live".to_string()),
+    );
+    ds.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&ds).expect("save ds");
+
+    // A DEPARTING account whose env entry is still sitting in the live
+    // settings: a cleared `active_profile` is clauth's record, not a statement
+    // about the file (`switch_off` and the TUI divergence arm clear the marker
+    // without touching it), so this is the state the activation write lands on.
+    // NOT `ANTHROPIC_AUTH_TOKEN`: `build_claude_settings_json` clears that one
+    // unconditionally, so it is the single key that cannot leak. Everything
+    // else in an `[env]` block survives on exactly the strip list it is handed.
+    let mut departed = Profile::new("departed".to_string(), None, None);
+    departed.env.insert(
+        "ANTHROPIC_API_KEY".to_string(),
+        "departing-token".to_string(),
+    );
+    save_profile(&departed).expect("save departed");
+    crate::claude::apply_profile_to_claude_settings(&departed, &[])
+        .expect("seed the departing account's env into the live settings");
+
+    // No active profile at all: the shape left behind by deleting the active
+    // one, which is what makes the next reauth auto-activate.
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["ds-autoactivate".into(), "departed".into()],
+            active_profile: None,
+            ..AppState::default()
+        },
+        profiles: vec![ds, departed],
+    };
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("ds-autoactivate"),
+        CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "new-access".to_string(),
+                    refresh_token: Some("new-refresh".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            account_uuid: None,
+        },
+    )
+    .expect("reauth");
+
+    assert_eq!(
+        config.state.active_profile.as_deref(),
+        Some("ds-autoactivate"),
+        "fixture: the arm under test is the auto-activating one",
+    );
+    let settings = crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    assert!(
+        !settings.contains("departing-token"),
+        "a departing account's env entry must not survive under the incoming \
+         account's endpoint: {settings}"
+    );
+    let live = crate::claude::read_claude_endpoint_config().expect("read live endpoint");
+    assert_eq!(
+        live.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "the profile it just made active must route where the profile says"
+    );
+    assert_eq!(live.api_key.as_deref(), Some("sk-live"));
+}
+
+/// The preserve is PAIR-WISE: a snapshot carrying one endpoint field but not
+/// the other takes both from the snapshot. Per-field fallback would marry one
+/// vendor's stored key to another vendor's incoming host and then transmit it
+/// there — a live-read snapshot (the divergence adopt) can arrive half-filled.
+#[test]
+fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
+    let _home = HomeSandbox::new();
+
+    let ds = Profile::new(
+        "ds-mixed".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-deepseek".to_string()),
+    );
+    let other = Profile::new(
+        "ds-keyonly".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-deepseek".to_string()),
+    );
+    save_profile(&ds).expect("save ds");
+    save_profile(&other).expect("save other");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["ds-mixed".into(), "ds-keyonly".into()],
+            ..AppState::default()
+        },
+        profiles: vec![ds, other],
+    };
+
+    // Endpoint only: the incoming host must not inherit the stored key.
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("ds-mixed"),
+        CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://api.z.ai/api/anthropic".to_string()),
+            api_key: None,
+            account_uuid: None,
+        },
+    )
+    .expect("endpoint-only capture");
+    let mixed = config
+        .find(&crate::profile::ProfileName::from("ds-mixed"))
+        .expect("profile");
+    assert_eq!(
+        mixed.base_url.as_deref(),
+        Some("https://api.z.ai/api/anthropic")
+    );
+    assert_eq!(
+        mixed.api_key, None,
+        "one vendor's key must never be re-paired with another vendor's host"
+    );
+
+    // Key only: the stored endpoint must not survive under a new key either.
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("ds-keyonly"),
+        CaptureSnapshot {
+            credentials: None,
+            base_url: None,
+            api_key: Some("sk-foreign".to_string()),
+            account_uuid: None,
+        },
+    )
+    .expect("key-only capture");
+    let keyonly = config
+        .find(&crate::profile::ProfileName::from("ds-keyonly"))
+        .expect("profile");
+    assert_eq!(keyonly.api_key.as_deref(), Some("sk-foreign"));
+    assert_eq!(
+        keyonly.base_url, None,
+        "a half-filled snapshot replaces the endpoint set whole"
+    );
+}
+
+/// The preserve arm stands down with no key behind the endpoint: preserving
+/// the `base_url` alone would leave the freshly minted ANTHROPIC bearer
+/// pointed at the third-party host, which the `was_active` leg writes into the
+/// live settings at once. Reachable through `clear_profile_api_key` (the TUI
+/// clears the key and keeps the endpoint) followed by a bare `clauth login`.
+#[test]
+fn browser_reauth_does_not_keep_an_endpoint_with_no_key_behind_it() {
+    let _home = HomeSandbox::new();
+
+    let keyless = Profile::new(
+        "ds-keyless".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    save_profile(&keyless).expect("save keyless");
+    crate::claude::apply_profile_to_claude_settings(&keyless, &[]).expect("seed live settings");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["ds-keyless".into()],
+            active_profile: Some("ds-keyless".into()),
+            ..AppState::default()
+        },
+        profiles: vec![keyless],
+    };
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("ds-keyless"))
+            .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
+        "fixture: the profile must be third-party with nothing to authenticate with",
+    );
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("ds-keyless"),
+        CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "anthropic-bearer".to_string(),
+                    refresh_token: Some("anthropic-refresh".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            account_uuid: None,
+        },
+    )
+    .expect("reauth");
+
+    let profile = config
+        .find(&crate::profile::ProfileName::from("ds-keyless"))
+        .expect("profile");
+    assert_eq!(
+        profile.base_url, None,
+        "an endpoint with no credential behind it must not survive an OAuth reauth"
+    );
+    assert_eq!(profile.provider, None);
+    let live = crate::claude::read_claude_endpoint_config().expect("read live endpoint");
+    assert_eq!(
+        live.base_url, None,
+        "and the live settings must not route the minted Anthropic bearer to a third-party host"
+    );
+}
+
+/// The preserve arm through the ACTIVE profile's re-apply leg: `was_active`
+/// re-writes `settings.json` from the just-saved record, so a browser reauth on
+/// an active third-party profile must leave the live endpoint + key standing
+/// rather than stripping the running `claude`'s only inference credential.
+#[test]
+fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
+    let _home = HomeSandbox::new();
+
+    let mut ds = Profile::new(
+        "ds-active".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-live".to_string()),
+    );
+    ds.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&ds).expect("save ds");
+    crate::claude::apply_profile_to_claude_settings(&ds, &[]).expect("seed live settings");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["ds-active".into()],
+            active_profile: Some("ds-active".into()),
+            ..AppState::default()
+        },
+        profiles: vec![ds],
+    };
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("ds-active"),
+        CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "new-access".to_string(),
+                    refresh_token: Some("new-refresh".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            account_uuid: None,
+        },
+    )
+    .expect("reauth the active profile");
+
+    let live = crate::claude::read_claude_endpoint_config().expect("read live endpoint");
+    assert_eq!(
+        live.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "the re-apply leg must write the PRESERVED endpoint, not clear it"
+    );
+    assert_eq!(
+        live.api_key.as_deref(),
+        Some("sk-live"),
+        "a running claude keeps the key its inference authenticates with"
+    );
+}
+
+/// The uniform replace survives everywhere the preserve arm does not apply:
+/// a profile with NO stored endpoint has its stray key replaced by a browser
+/// snapshot as before, and an api-mode snapshot — which carries both endpoint
+/// fields — still replaces the whole set on an endpoint profile.
+#[test]
+fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
+    let _home = HomeSandbox::new();
+
+    let mut plain = Profile::new(
+        "plain-oauth".to_string(),
+        None,
+        Some("stray-key".to_string()),
+    );
+    plain.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let ds = Profile::new(
+        "ds-keyed".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    save_profile(&plain).expect("save plain");
+    save_profile(&ds).expect("save ds");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![plain.name.clone(), ds.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![plain, ds],
+    };
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("plain-oauth"),
+        CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "fresh".to_string(),
+                    refresh_token: Some("fresh-refresh".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            account_uuid: None,
+        },
+    )
+    .expect("reauth");
+    let plain = config
+        .find(&crate::profile::ProfileName::from("plain-oauth"))
+        .expect("profile");
+    assert_eq!(
+        plain.api_key, None,
+        "off the preserve arm a browser snapshot still clears the fields it omits"
+    );
+    assert_eq!(plain.base_url, None);
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("ds-keyed"),
+        CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://api.z.ai/api/anthropic".to_string()),
+            api_key: Some("zai-key".to_string()),
+            account_uuid: None,
+        },
+    )
+    .expect("api-mode reauth");
+    let ds = config
+        .find(&crate::profile::ProfileName::from("ds-keyed"))
+        .expect("profile");
+    assert_eq!(
+        ds.base_url.as_deref(),
+        Some("https://api.z.ai/api/anthropic"),
+        "an api-mode snapshot carries both fields and replaces them"
+    );
+    assert_eq!(ds.api_key.as_deref(), Some("zai-key"));
+    assert_eq!(
+        ds.provider,
+        Some(crate::providers::Provider::Zai),
+        "the provider follows the replaced endpoint"
+    );
+    assert_eq!(
+        ds.access_token(),
+        None,
+        "an api-mode reauth clears the OAuth pair"
+    );
+}
+
 /// Reachable via login → switch away → disable → delete the (now-inactive)
 /// active (clears `active_profile` to `None` — `AppConfig::remove`) →
 /// `clauth login <disabled>`, the documented revoked-token recovery: the
@@ -3349,7 +4039,11 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
         "a same-provider edit keeps the session the operator just captured",
     );
 
-    // overwrite_captured_profile: the reauth path, Alibaba → a fresh OAuth login.
+    // overwrite_captured_profile: the reauth path, Alibaba → an api-mode login
+    // that moves the endpoint off Alibaba. "Preserve key on reauth" (owner,
+    // 2026-08-30) keeps the endpoint a browser snapshot omits — and with it the
+    // session — so the clearing this leg pins is the SNAPSHOT-side move: the
+    // endpoint the reauth replaces off Alibaba takes the session with it.
     let mut p = Profile::new(
         "reauthed".to_string(),
         Some(alibaba.to_string()),
@@ -3362,8 +4056,8 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
         &crate::profile::ProfileName::from("reauthed"),
         CaptureSnapshot {
             credentials: None,
-            base_url: None,
-            api_key: None,
+            base_url: Some("https://api.z.ai/api/anthropic".to_string()),
+            api_key: Some("zai-key".to_string()),
             account_uuid: None,
         },
     )
@@ -3373,6 +4067,6 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
             .expect("load_profile")
             .console
             .is_none(),
-        "a reauth that clears the endpoint clears the session with it",
+        "a reauth that moves the endpoint off Alibaba clears the session with it",
     );
 }

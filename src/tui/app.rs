@@ -8262,6 +8262,11 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // skips its own guarded relink. Then force the live link onto it and
             // make it active — the divergence is resolved onto the target.
             let name = ProfileName::from(name);
+            // Captured before the activation replaces the marker, through the
+            // one helper that also answers for a CLEARED marker — this arm can
+            // run after a `switch_off` left the departed account's `[env]` in
+            // the live file.
+            let outgoing_env_keys = crate::actions::outgoing_env_keys(&app.config());
             let result = {
                 let mut cfg = app.config();
                 overwrite_captured_profile(&mut cfg, &name, *snapshot).and_then(|()| {
@@ -8271,7 +8276,20 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     })
                 })
             };
-            let result = result.and_then(|()| force_link_profile_credentials(&name));
+            let result = result
+                .and_then(|()| force_link_profile_credentials(&name))
+                .and_then(|()| {
+                    // This arm activates OUTSIDE `overwrite_captured_profile`,
+                    // so the settings write its own activate arms make has to
+                    // happen here too: an endpoint that never reaches
+                    // `settings.json` routes the live session at Anthropic
+                    // under a profile that says otherwise.
+                    let cfg = app.config();
+                    let Some(profile) = cfg.find(&name) else {
+                        return Ok(());
+                    };
+                    crate::claude::apply_profile_to_claude_settings(profile, &outgoing_env_keys)
+                });
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
@@ -8624,6 +8642,14 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             let Some(snapshot) = capture_live_or_toast(app) else {
                 return;
             };
+            // Names no surviving endpoint, unlike the browser-login confirm:
+            // this snapshot is a LIVE read (`capture_snapshot` reads the live
+            // settings' endpoint), so what it carries describes the OUTGOING
+            // active profile, not this target. An endpoint-carrying active
+            // profile fills both fields and the target's pair is replaced by
+            // it; an OAuth-active one fills neither and the preserve arm keeps
+            // the target's. The outcome turns on an account this prompt is not
+            // about, so it promises nothing about either field.
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: format!("save the live login into '{target}'?"),
                 detail: Some(format!(
@@ -8996,11 +9022,23 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             Some(DivergenceChoice::Overwrite)
         );
     if !apply_now {
+        // Names the endpoint only where the preserve arm will actually keep it
+        // — the same rule `reauth_confirm_object` enforces on the CLI prompt,
+        // asked of the same predicate. This snapshot is credential-only, so
+        // the arm turns on the stored profile alone.
+        let keeps_endpoint = app
+            .config()
+            .find(&ProfileName::from(session.name.clone()))
+            .is_some_and(crate::claude::has_own_inference_endpoint);
         app.modals.push(Modal::Confirm(ConfirmState {
             message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
-                "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
-                    .to_string(),
+                if keeps_endpoint {
+                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, model settings, and its endpoint and api key stay."
+                } else {
+                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
+                }
+                .to_string(),
             ),
             choice: false,
             on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),

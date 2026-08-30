@@ -365,15 +365,40 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
     })
 }
 
-fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHeld) -> Result<()> {
-    // Capture outgoing env keys before active_profile is reassigned.
-    let prev_env_keys: Vec<String> = config
+/// The env keys an activation has to strip out of `settings.json` before it
+/// writes the incoming profile's: the OUTGOING profile's, or — with no active
+/// marker to read — every configured profile's.
+///
+/// The fallback is the point. A cleared `active_profile` is clauth's record,
+/// never a statement about `settings.json`: `switch_off` clears the marker
+/// without touching the file, so a departed account's `[env]` entries are
+/// still sitting there while the next activation repoints `ANTHROPIC_BASE_URL`
+/// and `apiKeyHelper` at a different account. Stripping nothing pairs that
+/// stale key with a new host. The incoming profile's own keys are re-applied
+/// immediately after every call, so the wider strip costs nothing.
+///
+/// One helper rather than the expression inlined per site: the same
+/// record-vs-file confusion produced this bug twice, at `finish_switch` and at
+/// the reauth auto-activate arm, and a third copy is how it comes back.
+pub(crate) fn outgoing_env_keys(config: &AppConfig) -> Vec<String> {
+    config
         .state
         .active_profile
         .as_ref()
         .and_then(|n| config.find(n))
         .map(|p| p.env.keys().cloned().collect())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            config
+                .profiles
+                .iter()
+                .flat_map(|p| p.env.keys().cloned())
+                .collect()
+        })
+}
+
+fn finish_switch(config: &mut AppConfig, name: &ProfileName, held: &StateLockHeld) -> Result<()> {
+    // Captured before `active_profile` is reassigned.
+    let prev_env_keys = outgoing_env_keys(config);
     let profile = config.find(name).context("profile not found")?;
     apply_profile_to_claude_settings(profile, &prev_env_keys)?;
     // issue #17: drop the outgoing account's cached identity so Claude Code
@@ -1088,8 +1113,13 @@ pub(crate) fn create_profile_from_login(
 /// simply keeps its chain position, env, model settings, and `auto_start`.
 /// `usage_history.jsonl` is a persisted log, not a cache, and is left alone;
 /// the per-profile fetch caches (`usage_cache.json`, `third_party_cache.json`,
-/// `throughput_cache.json`) describe the OLD account and are dropped so the
-/// UI doesn't show stale numbers under the swapped-in credentials. The
+/// `throughput_cache.json`) are dropped unconditionally, because a swapped
+/// credential set can be a different account entirely and stale numbers under
+/// it are the worse failure. On the preserve path (endpoint + key kept) the
+/// third-party half describes the CURRENT account and is dropped anyway: the
+/// provider bar refills on the next scheduler tick, while the throughput
+/// history only rebuilds from later delegate runs — a real cost, taken over a
+/// wrong-account read on the paths where the credential DID change. The
 /// `/profile` TTL clock describes the old account too and is expired for the
 /// same reason — otherwise the swapped-in account's tier stays unfetched (and,
 /// with `usage_cache.json` just dropped, unrendered) for up to an hour. A
@@ -1109,11 +1139,40 @@ pub(crate) fn overwrite_captured_profile(
         account_uuid,
     } = snapshot;
     with_state_lock(|held| {
-        let provider = base_url.as_deref().and_then(Provider::from_base_url);
         let was_active = config.is_active(name);
         let profile = config
             .find_mut(name)
             .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
+        // A browser reauth's snapshot carries the minted tokens and nothing
+        // else (`run_oauth_browser`), so a uniform replace strips the profile's
+        // endpoint and key — the login was about the chain, and its side effect
+        // deleted the credential its inference actually runs on. A field the
+        // snapshot omits keeps the stored one; an api-mode login carries both
+        // and still replaces.
+        //
+        // ANY endpoint, never `is_third_party` (owner ruling 2026-08-30): a
+        // recognised provider is a fraction of the endpoints in use, and an
+        // unrecognised host loses exactly as much. `has_own_inference_endpoint`
+        // is that predicate, shared with the delegate gate so the two rulings
+        // cannot drift; it also refuses to preserve an endpoint with no
+        // credential behind it, which would leave the freshly minted ANTHROPIC
+        // bearer pointed at that host (`was_active` writes the endpoint into
+        // the live settings at once).
+        //
+        // The endpoint and the key are preserved as a PAIR, and only when the
+        // snapshot carries neither. Per-field fallback re-pairs one vendor's
+        // stored key with another vendor's incoming host — a live-read
+        // snapshot (the divergence adopt) can fill either field alone — and
+        // that key then travels to a host it does not belong to.
+        let keep_stored_endpoint = base_url.is_none()
+            && api_key.is_none()
+            && crate::claude::has_own_inference_endpoint(profile);
+        let (base_url, api_key) = if keep_stored_endpoint {
+            (profile.base_url.clone(), profile.api_key.clone())
+        } else {
+            (base_url, api_key)
+        };
+        let provider = base_url.as_deref().and_then(Provider::from_base_url);
         profile.base_url = base_url;
         profile.api_key = api_key;
         profile.set_credentials(credentials, held);
@@ -1149,8 +1208,21 @@ pub(crate) fn overwrite_captured_profile(
         // flag, but the check must describe the profile as committed.
         let disabled = config.find(name).is_some_and(Profile::is_disabled);
         if config.state.active_profile.is_none() && !disabled {
+            // BEFORE `set_active`, like `finish_switch`: once the marker names
+            // the incoming profile the helper answers with its keys, which
+            // strips nothing that was already in the file.
+            let stale_env_keys = outgoing_env_keys(config);
             link_profile_credentials(name)?;
             config.state.set_active(Some(name.clone()), held);
+            // Same settings write the `was_active` arm makes, for the same
+            // reason: this profile IS the active one now, and an endpoint that
+            // never reaches `settings.json` routes the live session at
+            // Anthropic while the profile says otherwise. Added with the
+            // preserve arm, which made a browser reauth able to leave an
+            // endpoint on a profile this branch then activates.
+            //
+            let profile = config.find(name).context("profile not found")?;
+            apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         } else if was_active {
             // The overwritten profile is (and stays) the active one: unlike a
             // brand-new capture, `save_profile` just rewrote credentials.json

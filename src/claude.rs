@@ -1781,6 +1781,31 @@ pub(crate) fn has_inference_auth(profile: &Profile) -> bool {
         })
 }
 
+/// Whether this account's inference runs on its OWN endpoint and credential,
+/// independent of any stored OAuth chain: it routes somewhere
+/// ([`Profile::routing_endpoint`], so an `[env] ANTHROPIC_BASE_URL` counts like
+/// a managed `base_url`) and has something to authenticate there with.
+///
+/// The single predicate behind two decisions the owner ruled on the same day,
+/// deliberately shared so they cannot drift apart: a browser re-login PRESERVES
+/// such an account's endpoint + key instead of wiping them
+/// (`actions::overwrite_captured_profile`), and a dead OAuth chain does NOT
+/// refuse its `delegate` (`mcp::preflight_target`), because the chain it lost
+/// feeds usage polling and nothing else.
+///
+/// Never keyed on a RECOGNISED provider: whether clauth has a usage integration
+/// for a host says nothing about whether inference works against it, and most
+/// endpoints in use resolve to `provider: None`. The keyless refusal is a
+/// different question and keeps its own `is_third_party` scope — an
+/// unrecognised endpoint may be a local model that needs no key at all.
+pub(crate) fn has_own_inference_endpoint(profile: &Profile) -> bool {
+    profile
+        .routing_endpoint()
+        .map(str::trim)
+        .is_some_and(|u| !u.is_empty())
+        && has_inference_auth(profile)
+}
+
 /// Build the merged settings.json content. `prev_env_keys` are stripped before
 /// the new profile's env is applied; pass `&[]` on start to leave existing keys.
 /// Also writes the profile's model config — the top-level `model` setting and

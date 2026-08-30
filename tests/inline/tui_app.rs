@@ -3849,6 +3849,80 @@ fn divergence_picker_saves_the_login_into_a_chosen_profile() {
     );
 }
 
+/// The adopt makes its target active OUTSIDE `overwrite_captured_profile`, so
+/// it owes the same settings write that fn's own activate arms make. With an
+/// endpoint now preserved through a credential-less snapshot, an adopt that
+/// skips it leaves the live session routed at Anthropic under a profile whose
+/// record says otherwise — the record and `settings.json` must agree.
+#[test]
+fn adopting_a_divergence_writes_the_targets_endpoint_into_the_live_settings() {
+    use super::{ConfirmAction, run_confirm_action};
+    use crate::profile::{AppConfig, AppState, Profile, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut active = Profile::new("work".to_string(), None, None);
+    active.credentials = Some(creds_ra("rt-work", "at-work"));
+    // The outgoing account carries an `[env]` entry, so the strip this arm
+    // performs is actually exercised: without one, removing the strip
+    // altogether passes. Not `ANTHROPIC_AUTH_TOKEN`, which every write clears
+    // unconditionally.
+    active
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "work-token".to_string());
+    let mut target = Profile::new(
+        "ds-target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-live".to_string()),
+    );
+    target.credentials = Some(creds_ra("rt-target", "at-target"));
+    save_profile(&active).expect("save work");
+    save_profile(&target).expect("save target");
+    write_live_creds(&creds_ra("rt-fresh", "at-fresh"));
+    // The outgoing account's env has to be IN the live settings for the strip
+    // to have anything to remove; nothing else in this fixture writes it.
+    crate::claude::apply_profile_to_claude_settings(&active, &[])
+        .expect("seed the outgoing account's env into the live settings");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec!["work".into(), "ds-target".into()],
+            active_profile: Some("work".into()),
+            ..AppState::default()
+        },
+        profiles: vec![active, target],
+    });
+
+    let snapshot = crate::actions::capture_snapshot().expect("capture the live login");
+    run_confirm_action(
+        &mut app,
+        ConfirmAction::AdoptDivergence(Box::new(snapshot), "ds-target".to_string()),
+    );
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("ds-target"),
+        "fixture: the adopt is what activated the target",
+    );
+    let live = crate::claude::read_claude_endpoint_config().expect("read live endpoint");
+    assert_eq!(
+        live.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "the newly active profile's preserved endpoint must reach the live settings"
+    );
+    assert_eq!(live.api_key.as_deref(), Some("sk-live"));
+
+    let settings = crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    assert!(
+        !settings.contains("work-token"),
+        "and the outgoing account's env entry goes with it, rather than sitting \
+         in front of the incoming account's endpoint: {settings}"
+    );
+}
+
 /// A configured `default_divergence` is owner-gated: it may only resolve a login
 /// no stored sibling owns. An owner-blind default captures a SIBLING profile's
 /// re-login into the active profile — credential misattribution the user never
