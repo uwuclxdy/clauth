@@ -428,6 +428,94 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     );
 }
 
+/// The half a spent-skip gate keyed on `is_third_party` gets wrong: a GENERIC
+/// api-key endpoint (`provider` is `None`, so that predicate says false) is
+/// fetched on the cadence by the third-party leg, and `drop_spent_oauth` blanks
+/// the OAuth leg's countdown map alone — so a spent account is skipped on one
+/// leg while the other still has a refresh pending, and the feed published
+/// `null` over it.
+///
+/// The fixture is the HYBRID, which is the reachable shape: one Setup endpoint
+/// edit on a spent OAuth account (`edit_profile_endpoint`) keeps the pair, the
+/// key and the maxed `usage_cache.json`, so that reading is CURRENT rather than
+/// leftover and the OAuth leg is genuinely mid-skip.
+#[test]
+fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
+    let _home = HomeSandbox::new();
+    let mut api = oauth_profile("litellm");
+    api.base_url = Some("http://127.0.0.1:4000".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    assert!(
+        !api.is_third_party() && api.usage_cache_is_third_party(),
+        "fixture must be the case the two predicates disagree on",
+    );
+    let config = AppConfig {
+        state: AppState {
+            refresh_spent_accounts: false,
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    };
+    crate::testutil::register_names(&["litellm"]);
+    // Current, not stale: the OAuth leg still polls this pair, and this is the
+    // reading `drop_spent_oauth` skips on.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    // The cache this account's own leg writes.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    // Single-shot: derived off the third-party cache's mtime, not suppressed.
+    let single = build_status(&config, 300_000, None, false);
+    let p = &single["profiles"].as_array().unwrap()[0];
+    assert!(
+        !p["next_refresh_at"].is_null(),
+        "the third-party leg refreshes this account on the cadence: {p}"
+    );
+
+    // Live daemon: the countdown that leg published must reach the feed
+    // verbatim — a stamp the mtime derivation could not have produced, so this
+    // fails on suppression rather than on the two paths agreeing by accident.
+    let next: std::collections::HashMap<String, u64> = [("litellm".to_string(), 4_102_444_800_000)]
+        .into_iter()
+        .collect();
+    let empty_status = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        p["next_refresh_at"], "2100-01-01T00:00:00+00:00",
+        "the live third-party countdown must reach the feed: {p}"
+    );
+}
+
 // RLS-1: the additive per-profile `stale` flag = the daemon distrusts this
 // reading as a deep-slot stuck RateLimited (live status RateLimited AND the 429
 // streak past the active cap) — the SAME predicate `scan_auto_switch` acts on,

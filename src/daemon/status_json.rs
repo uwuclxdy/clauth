@@ -244,9 +244,16 @@ pub(crate) fn build_profile_entries(
             // pending refresh — the scheduler blanks its live entry, so guard the
             // derivation too, else it falls through to a past mtime+interval
             // stamp that reads as perpetually overdue.
+            //
+            // Excluded on the cache selector, not `is_third_party`: the skip
+            // this mirrors (`drop_spent_oauth`) blanks the OAUTH leg's map
+            // alone, so an account the third-party leg also fetches keeps that
+            // leg's countdown — a hybrid is spent on one leg and pending on the
+            // other. That predicate also pins the constant below: the `&&`
+            // reaches it only where `usage_cache_file` resolves to that file.
             let derived_next = || mtime_ms.map(|mt| mt.saturating_add(interval_ms));
             let spent_skipped = !config.state.refresh_spent_accounts
-                && !p.is_third_party()
+                && !p.usage_cache_is_third_party()
                 && load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
                     .is_some_and(|u| windows_maxed(&u, (now / 1000) as i64));
             let next_refresh_ms: Option<u64> = if spent_skipped {
