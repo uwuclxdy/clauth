@@ -198,8 +198,17 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &ProfileName, file: 
 /// parse of `profiles.toml` per write — the record is small, and the same
 /// read already backs the oauth adopt gate and the daemon's switch-target
 /// existence check.
+///
+/// "The record" means EITHER roster. The gate exists to skip names that are no
+/// longer accounts, and a codex profile is an account — it simply lives in
+/// `codex-profiles.toml`, which `is_configured` cannot see (it reads
+/// `profiles.toml` alone, by design). Checking only that one silently dropped
+/// every codex usage reading, so the cache the published feed and the Overview
+/// resolve BY NAME stayed empty forever while the fetch itself succeeded.
 pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
-    if !crate::profile::is_configured(name).unwrap_or(false) {
+    let configured = crate::profile::is_configured(name).unwrap_or(false)
+        || crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()));
+    if !configured {
         return;
     }
     let Some(path) = profile_cache_path(name, file) else {

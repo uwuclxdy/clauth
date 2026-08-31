@@ -1462,6 +1462,88 @@ pub(crate) enum MainItemKind {
     Profile(usize),
 }
 
+/// Which harness the Overview shows. A VIEW filter only: selection and every
+/// action stay bound to the claude list, because a codex account has no
+/// `Profile` record for them to act on and clauth switches it through its own
+/// CLI verb. So the codex section renders READ-ONLY, and hiding the claude one
+/// hides nothing the cursor can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HarnessFilter {
+    #[default]
+    All,
+    Claude,
+    Codex,
+}
+
+impl HarnessFilter {
+    /// `c` cycles: both → claude → codex → both.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            HarnessFilter::All => HarnessFilter::Claude,
+            HarnessFilter::Claude => HarnessFilter::Codex,
+            HarnessFilter::Codex => HarnessFilter::All,
+        }
+    }
+    pub(crate) fn shows_claude(self) -> bool {
+        !matches!(self, HarnessFilter::Codex)
+    }
+    pub(crate) fn shows_codex(self) -> bool {
+        !matches!(self, HarnessFilter::Claude)
+    }
+    /// Header chip text; `None` while both harnesses show, so the default view
+    /// carries no badge at all.
+    pub(crate) fn chip(self) -> Option<&'static str> {
+        match self {
+            HarnessFilter::All => None,
+            HarnessFilter::Claude => Some("claude only"),
+            HarnessFilter::Codex => Some("codex only"),
+        }
+    }
+}
+
+/// One codex account as the Overview renders it — name, plan, and the two
+/// windows, read from the same per-profile usage cache the codex leg writes.
+/// Deliberately NOT a `Profile`: synthesizing one would put a record with no
+/// credentials into every claude path that walks `config.profiles`.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexRow {
+    pub(crate) name: ProfileName,
+    pub(crate) active: bool,
+    pub(crate) plan: Option<String>,
+    pub(crate) five_hour: Option<crate::usage::UsageWindow>,
+    pub(crate) seven_day: Option<crate::usage::UsageWindow>,
+}
+
+/// Snapshot the codex roster for the Overview. Cheap and lock-free: the roster
+/// is one small TOML and each reading is the profile's own cache file, the same
+/// pair `status --json` reads with no daemon running.
+pub(crate) fn codex_rows() -> Vec<CodexRow> {
+    let Ok(state) = crate::codex_profiles::CodexState::load() else {
+        return Vec::new();
+    };
+    let active = state.active_profile().cloned();
+    state
+        .profiles()
+        .iter()
+        .map(|name| {
+            let cached: Option<crate::usage::UsageInfo> = crate::profile_cache::load_profile_cache(
+                name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+            );
+            CodexRow {
+                name: name.clone(),
+                active: active.as_ref().is_some_and(|a| a == name),
+                plan: cached
+                    .as_ref()
+                    .and_then(|u| u.plan.as_ref())
+                    .and_then(|p| p.codex_plan.clone()),
+                five_hour: cached.as_ref().and_then(|u| u.five_hour.clone()),
+                seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
+            }
+        })
+        .collect()
+}
+
 // ── Login session ─────────────────────────────────────────────────────────────
 
 /// An in-flight browser OAuth login. The worker blocks up to 180s in
@@ -1572,6 +1654,9 @@ pub(crate) struct App {
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    /// Which harness the Overview lists (`c` cycles). A view filter only — see
+    /// [`HarnessFilter`].
+    pub(crate) harness_filter: HarnessFilter,
     /// Which Setup pane has focus.
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Setup tab's right pane.
@@ -1977,6 +2062,7 @@ impl App {
             third_party_usage_store,
             third_party_status,
             tab: Tab::Overview,
+            harness_filter: HarnessFilter::default(),
             herdr_mode: false,
             modals: Vec::new(),
             help_scroll: 0,
@@ -2774,6 +2860,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if let Some(notice) = app.divergence_pending.clone() {
                 app.disarm_quit();
                 open_divergence_modal(app, &notice.active);
+            }
+            return;
+        }
+        KeyCode::Char('c') => {
+            // Overview only: it is the one screen listing accounts, so the
+            // filter has nothing to mean anywhere else.
+            if app.tab == Tab::Overview {
+                app.disarm_quit();
+                app.harness_filter = app.harness_filter.next();
             }
             return;
         }

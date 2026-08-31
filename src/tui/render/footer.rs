@@ -42,7 +42,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let q_label: &str = if has_sub_focus(app) { "back" } else { "quit" };
 
     let tail: &[(&str, &str)] = match app.tab {
-        Tab::Overview => &[("⇧↑↓", "reorder"), ("a", "actions"), ("?", "help")],
+        Tab::Overview => &[
+            ("⇧↑↓", "reorder"),
+            ("a", "actions"),
+            ("c", "harness"),
+            ("?", "help"),
+        ],
         Tab::Usage => &[
             ("↑↓", "account"),
             ("r", "refresh account"),
