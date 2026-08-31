@@ -256,6 +256,15 @@ struct AwaitContent {
     store: PathBuf,
     want: &'static [u8],
     done: Sender<()>,
+    /// Ticks the loop ran. The forbidden leg: a ticker driving the reconcile
+    /// this test pins to the publish event.
+    ticks: AtomicUsize,
+}
+
+impl AwaitContent {
+    fn ticks(&self) -> usize {
+        self.ticks.load(Ordering::Relaxed)
+    }
 }
 
 impl Reconcile for AwaitContent {
@@ -266,12 +275,15 @@ impl Reconcile for AwaitContent {
         }
     }
     fn swap_poll(&self) {}
+    fn tick_driven(&self) {
+        self.ticks.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-/// The measured "reflected without waiting a tick" claim. Every ticker is set
-/// past the bound, so a publish into a watched directory is the only thing that
-/// can drive a reconcile at all — which is what makes a green here mean the
-/// event path and not a poll that happened to land.
+/// Every ticker is set past the bound, so a publish into a watched directory is
+/// the only thing that can drive a reconcile at all. The tick counter below is
+/// what makes a green here mean the event path and not a poll that happened to
+/// land: a reconcile reached on a tick instead of the publish's event reads 1.
 #[test]
 fn a_store_publish_reconciles_with_every_ticker_disabled() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -296,6 +308,7 @@ fn a_store_publish_reconciles_with_every_ticker_disabled() {
         store: store.clone(),
         want: FRESH,
         done: done_tx,
+        ticks: AtomicUsize::new(0),
     };
 
     // Armed before the spawn, exactly as `runtime::acquire` does it, so the
@@ -309,21 +322,23 @@ fn a_store_publish_reconciles_with_every_ticker_disabled() {
     std::thread::scope(|scope| {
         scope.spawn(move || run_with_watcher(watcher, requested, shutdown, timings, recorder));
 
-        let started = Instant::now();
         publish(&store, FRESH);
         done_rx
             .recv_timeout(BOUND)
             .expect("a publish into the credential store drove no reconcile");
-        let took = started.elapsed();
-        assert!(
-            took < PRODUCTION.credential_poll,
-            "the event path took {took:?}, no better than the {:?} credential \
-             poll it replaced",
-            PRODUCTION.credential_poll
-        );
 
         drop(shutdown_tx);
     });
+
+    // Read after the scope: the loop has exited, so this is every tick the
+    // watchdog ever ran, not a sample taken at the moment the publish was seen.
+    assert_eq!(
+        rec.ticks(),
+        0,
+        "the reconcile that observed the publish ran on a tick, not on the \
+         filesystem event: every ticker is disabled, so any tick means the \
+         loop ignored its timings"
+    );
 }
 
 /// The filter is what keeps a directory watch from costing a reconcile per

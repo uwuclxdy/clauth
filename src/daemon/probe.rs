@@ -235,6 +235,25 @@ pub(crate) fn claim_singleton_with(
     Ok(claim)
 }
 
+/// Test-only: claim attempts each directory has seen, keyed by directory because
+/// tests run in parallel over distinct sandboxes. Lets a test pin "the retry leg
+/// did not run" by counting attempts instead of by a wall-clock bound.
+#[cfg(test)]
+static CLAIM_ATTEMPTS_BY_DIR: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Claim attempts `dir` has seen so far (test builds only).
+#[cfg(test)]
+fn claim_attempts(dir: &Path) -> u64 {
+    CLAIM_ATTEMPTS_BY_DIR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// One claim attempt. `standby` false (`--no-standby`) turns a lost race straight
 /// into [`Claim::Redundant`] without so much as creating the slot file.
 ///
@@ -243,6 +262,14 @@ pub(crate) fn claim_singleton_with(
 /// instance would otherwise announce a daemon that isn't there and exit 0. A
 /// hard failure exits non-zero, which a supervisor retries and an operator sees.
 fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
+    #[cfg(test)]
+    {
+        *CLAIM_ATTEMPTS_BY_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(dir.to_path_buf())
+            .or_insert(0) += 1;
+    }
     let active = crate::profile::open_state_file(&dir.join(super::LOCK_FILE))
         .context("failed to open the clauth daemon lock file")?;
     match active.try_lock() {

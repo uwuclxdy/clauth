@@ -33,6 +33,12 @@ pub(crate) trait Reconcile {
     fn credentials(&self);
     /// Pick up a daemon-requested member swap.
     fn swap_poll(&self);
+    /// A tick — the fallback cadence or the polling fallback — just drove a
+    /// reconcile where a filesystem event was supposed to. Test-only hook:
+    /// impls that pin the event leg count these, everything else keeps the
+    /// no-op default. Compiled out of production builds.
+    #[cfg(test)]
+    fn tick_driven(&self) {}
 }
 
 /// Every interval the watchdog loop runs on. A struct rather than consts so a
@@ -678,6 +684,8 @@ pub(crate) fn run_events(
                 pending = true;
             }
             recv(fallback) -> _ => {
+                #[cfg(test)]
+                r.tick_driven();
                 pending = true;
                 if let Some(health) = health
                     && let Some((kind, counts)) = dead.fires(health)
@@ -732,6 +740,8 @@ pub(crate) fn run_poll(shutdown: &Receiver<()>, t: &Timings, r: &dyn Reconcile) 
         crossbeam_channel::select! {
             recv(shutdown) -> _ => return,
             recv(ticker) -> _ => {
+                #[cfg(test)]
+                r.tick_driven();
                 r.config();
                 until_cred -= 1;
                 if until_cred == 0 {

@@ -1828,6 +1828,12 @@ pub(crate) struct SessionSwap {
     launch_marker: PathBuf,
     cell: crate::lockorder::RankedMutex<SwapCell, crate::lockorder::rank::SwapCell>,
     shutdown: ShutdownFlag,
+    /// Ticks this session's watchdog reconciled on — the fallback cadence or the
+    /// polling fallback — rather than a filesystem event. Test-only observable:
+    /// the event-leg pins count these to forbid the tick leg without a wall-clock
+    /// bound. Compiled out of production builds.
+    #[cfg(test)]
+    tick_reconciles: std::sync::atomic::AtomicU64,
 }
 
 impl SessionSwap {
@@ -1855,6 +1861,8 @@ impl SessionSwap {
                 last_refusal: None,
             }),
             shutdown: ShutdownFlag::new(),
+            #[cfg(test)]
+            tick_reconciles: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1872,6 +1880,15 @@ impl SessionSwap {
     /// `with_state_lock` hold a swap publishes under.
     fn canonical(&self) -> PathBuf {
         self.cell().canonical.clone()
+    }
+
+    /// Ticks this session's watchdog reconciled on rather than on a filesystem
+    /// event. Test-only: the event-leg pin reads this. Gated with its caller
+    /// (the unix-only relogin test), so no dead-code red on the windows leg.
+    #[cfg(all(test, unix))]
+    fn tick_reconciles(&self) -> u64 {
+        self.tick_reconciles
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Claim `paths`'s markers for this session, separating a marker this session
@@ -2557,6 +2574,12 @@ impl ProfileRuntime {
             fn swap_poll(&self) {
                 self.swap.poll();
             }
+            #[cfg(test)]
+            fn tick_driven(&self) {
+                self.swap
+                    .tick_reconciles
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
 
         let (watchdog_tx, watchdog_rx) = crossbeam_channel::bounded::<()>(1);
@@ -2611,6 +2634,14 @@ impl ProfileRuntime {
 
     pub(crate) fn config_dir(&self) -> &Path {
         &self.swap.runtime
+    }
+
+    /// Ticks this session's watchdog reconciled on rather than on a filesystem
+    /// event. Test-only: the unix-only relogin test pins the event leg through
+    /// this. Gated with that caller so the windows leg sees no dead code.
+    #[cfg(all(test, unix))]
+    pub(crate) fn tick_reconciles(&self) -> u64 {
+        self.swap.tick_reconciles()
     }
 
     /// This session's swap executor. Production reaches it through the watchdog

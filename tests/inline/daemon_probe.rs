@@ -337,18 +337,18 @@ fn a_won_standby_slot_is_kept_rather_than_re_taken() {
         panic!("the first instance takes the singleton lock");
     };
 
-    let started = std::time::Instant::now();
+    let attempts = claim_attempts(&dir);
     let claim = claim_singleton(&dir, true).expect("claim");
-    let elapsed = started.elapsed();
 
     assert!(
         matches!(claim, Claim::Standby(_)),
         "the second instance parks in the standby slot"
     );
-    assert!(
-        elapsed < CLAIM_RETRY,
-        "a won slot must stand: the claim took {elapsed:?}, past the {CLAIM_RETRY:?} gap it \
-         would only wait for by re-testing an answer it already had"
+    assert_eq!(
+        claim_attempts(&dir),
+        attempts + 1,
+        "a won slot must stand: the claim re-tested an answer it already had instead \
+         of returning it"
     );
     assert!(
         standby_waiting(),

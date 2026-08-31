@@ -7331,11 +7331,11 @@ fn gc_takes_no_state_flock_when_no_bare_marker_exists() {
 /// the filesystem event, not on the fallback ticker: the point of the event path
 /// is that a contended rotation does not sit on a 30 s timer.
 ///
-/// This is the WIRING pin — specs → watcher → reconcile → the sibling's view. It
-/// does not on its own separate an event from the 1 Hz credential leg of the
-/// polling fallback, since both fit the window; that separation is
-/// `watchdog::tests::a_store_publish_reconciles_with_every_ticker_disabled`,
-/// which leaves no ticker able to explain a reconcile.
+/// This is the WIRING pin — specs → watcher → reconcile → the sibling's view —
+/// plus the separation from the polling fallback: each session's watchdog counts
+/// its tick-driven reconciles, and both must read 0. The 1 Hz credential leg of
+/// the polling fallback reaches the store and the sibling too, so only the
+/// counters tell an event apart from a poll that happened to land.
 #[cfg(unix)]
 #[test]
 fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
@@ -7360,14 +7360,17 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
         let b =
             ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire b");
 
-        // Sized at the credential cadence the poll fallback would run: measured
-        // convergence here is ~30 ms, so this is a ~30x margin that still fails
-        // the moment the event path stops being the thing driving it.
-        let window = crate::watchdog::PRODUCTION.credential_poll;
+        // A hang guard, not a timing pin: the event path converges in
+        // milliseconds, and the tick counters below are what separate it from
+        // the polling fallback. The deadline only bounds a regression to a
+        // failure instead of a hang. It stays under the 30 s fallback, so a
+        // fallback-driven converge cannot satisfy the file assertions either.
+        const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
         assert!(
-            crate::watchdog::PRODUCTION.fallback > window,
-            "fixture: the fallback ticker must not be able to meet the window, \
-             or a pass says nothing about the event path"
+            crate::watchdog::PRODUCTION.fallback > DEADLINE,
+            "fixture: the fallback ticker must not be able to meet the deadline, \
+             or the file assertions could be satisfied by a fallback-driven \
+             reconcile instead of acting as a pure hang guard"
         );
 
         // Claude Code's re-login shape: unlink the link, write a regular file.
@@ -7376,8 +7379,8 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
         fs::write(&live, CREDS_V2).expect("write re-login");
 
         let sibling = b.config_dir().join(".credentials.json");
-        let started = std::time::Instant::now();
-        while started.elapsed() < window {
+        let deadline = std::time::Instant::now() + DEADLINE;
+        while std::time::Instant::now() < deadline {
             if fs::read(&canonical).ok().as_deref() == Some(CREDS_V2)
                 && fs::read(&sibling).ok().as_deref() == Some(CREDS_V2)
             {
@@ -7389,12 +7392,23 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
         assert_eq!(
             fs::read(&canonical).expect("read canonical"),
             CREDS_V2,
-            "the re-login never reached the store within {window:?}"
+            "the re-login never reached the store within {DEADLINE:?}"
         );
         assert_eq!(
             fs::read(&sibling).expect("read sibling"),
             CREDS_V2,
-            "the sibling session still resolves the pre-re-login chain after {window:?}"
+            "the sibling session still resolves the pre-re-login chain after {DEADLINE:?}"
+        );
+        assert_eq!(
+            a.tick_reconciles(),
+            0,
+            "the relogin reached the store on the filesystem event, not on a ticker: \
+             the session's watchdog never reconciled on a poll"
+        );
+        assert_eq!(
+            b.tick_reconciles(),
+            0,
+            "the sibling's watchdog stayed on its events too"
         );
 
         drop(b);
