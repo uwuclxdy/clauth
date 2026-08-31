@@ -303,6 +303,13 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
+/// The shared HTTP agent — one connect/recv budget and one
+/// status-as-value policy for every clauth-side token call, the codex
+/// refresh included.
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    &AGENT
+}
+
 /// A token-refresh failure, split so the AUTH-1 gate can tell a *permanently*
 /// revoked/invalid refresh token (quarantine the account — `clauth login` is the
 /// only fix) from a *transient* network/429/5xx blip (refuse this one switch,

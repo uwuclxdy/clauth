@@ -416,10 +416,12 @@ fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
     let prev_pro = PlanInfo {
         tier: PlanTier::Pro,
         subscription_status: None,
+        codex_plan: None,
     };
     let canceled = PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
+        codex_plan: None,
     };
 
     // /profile observed canceled this tick → the 429 carries canceled, not Pro.

@@ -46,7 +46,11 @@ fn build_status_top_level_shape_and_active() {
     assert_eq!(
         top,
         [
+            "active_codex_profile",
             "active_profile",
+            "clauth_version",
+            "codex_fallback_chain",
+            "codex_wrap_off",
             "generated_at",
             "pending_switch",
             "profiles",
@@ -74,6 +78,7 @@ fn build_status_top_level_shape_and_active() {
             "fallback",
             "fetch_status",
             "fetched_at",
+            "harness",
             "has_live_session",
             "name",
             "next_refresh_at",
@@ -844,4 +849,72 @@ fn published_entries_deserialize_into_the_typed_contract() {
         .collect();
     win_keys.sort_unstable();
     assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
+}
+
+/// The codex half of the feed is ADDITIVE (decision 10): the top-level
+/// `active_profile`/`wrap_off` stay the CLAUDE slots, the per-harness ones sit
+/// beside them, and codex entries are APPENDED so a reader that predates codex
+/// takes the prefix it always took.
+#[test]
+fn the_codex_surface_is_additive_and_appended() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\nwrap_off = true\n",
+    )
+    .expect("write codex state");
+
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl".into()],
+            active_profile: Some("cl".into()),
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cl"),
+        )],
+    };
+    let v = build_status(&config, 300_000, None, false);
+
+    assert_eq!(
+        v["active_profile"], "cl",
+        "the top-level slot stays CLAUDE's"
+    );
+    assert_eq!(v["wrap_off"], false, "…and so does the top-level wrap-off");
+    assert_eq!(v["active_codex_profile"], "cx1");
+    assert_eq!(v["codex_wrap_off"], true, "the codex slot carries its own");
+    assert_eq!(
+        v["codex_fallback_chain"].as_array().unwrap().len(),
+        2,
+        "the codex chain is published beside the claude one"
+    );
+    assert!(
+        v["clauth_version"].as_str().is_some_and(|s| !s.is_empty()),
+        "the writer names itself, so an old daemon is distinguishable from an empty roster"
+    );
+
+    let profiles = v["profiles"].as_array().unwrap();
+    assert_eq!(profiles[0]["name"], "cl");
+    assert_eq!(profiles[0]["harness"], "claude");
+    assert_eq!(
+        profiles.iter().filter(|p| p["harness"] == "codex").count(),
+        2,
+        "both codex accounts are entries, after the claude ones"
+    );
+    let cx1 = profiles.iter().find(|p| p["name"] == "cx1").expect("cx1");
+    assert_eq!(
+        cx1["active"], true,
+        "the codex active marker is the codex slot's"
+    );
+    assert_eq!(cx1["provider"], "openai");
+    assert_eq!(
+        cx1["rolling_token"], false,
+        "a rolling sidecar is a claude mechanism; codex holds one chain in one auth.json"
+    );
+    assert!(
+        cx1["tier"].is_null(),
+        "no reading yet means no plan — never a fabricated Claude tier"
+    );
 }

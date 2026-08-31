@@ -1,4 +1,5 @@
 mod burn;
+mod codex;
 mod fetch;
 mod scheduler;
 
@@ -6,6 +7,11 @@ pub(crate) use burn::{
     BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, compute_burn_rates_from_history,
     project_utilization,
 };
+pub(crate) use codex::fetch_codex_usage;
+// The mapping is exercised directly by the codex chain tests, which drive a real
+// wham/usage body through the walk rather than hand-building a UsageInfo.
+#[cfg(test)]
+pub(crate) use codex::map_usage as map_codex_usage;
 #[allow(unused_imports)]
 pub(crate) use fetch::{
     ANTHROPIC_ORIGIN, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, LoginProfile, PlanInfo,

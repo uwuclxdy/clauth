@@ -1730,6 +1730,7 @@ fn an_armed_session_silences_the_reader_before_any_read() {
     crate::live_sessions::register(&crate::live_sessions::LiveSession {
         session_id: "123-1".to_string(),
         start_profile: "a".to_string(),
+        harness: crate::harness::Harness::Claude,
         pid: std::process::id(),
         started_at: 0,
         cwd: None,

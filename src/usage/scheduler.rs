@@ -2450,6 +2450,24 @@ fn tick(state: &SchedulerState) {
         crate::oauth::restamp_rolling_token(&state.config, name, crate::oauth::refresh_result)
     });
 
+    // The codex standby leg, on THIS thread rather than the daemon's
+    // watchdog-bounded reconcile loop: its refreshes are blocking token round
+    // trips, exactly the kind of work the claude rotations already do here,
+    // and putting them under the 30s daemon watchdog would let a slow OpenAI
+    // endpoint trip the abort that wipes clauth's own state. Lease-holder only
+    // (like every leg here), so it is also the single cross-process writer the
+    // no-replay rule needs — and self-contained over the codex roster, so the
+    // claude scheduler's snapshots stay untouched (decision 4). Each pass hits
+    // the wire only when a chain is actually due or kicked, so the steady
+    // state is zero HTTP; the NoWait guard inside keeps a `clauth start`
+    // holding rotation.lock from parking this thread.
+    crate::codex_auth::standby_tick(now_ms() as i64, &chrono::Utc::now().to_rfc3339());
+
+    // The codex usage leg. Deliberately AFTER the standby refresh above: a
+    // chain that just re-stamped its access token polls with the fresh one
+    // instead of spending a tick on a 401 the kick then has to undo.
+    codex_usage_tick(state);
+
     // Names pushed by rotation or manual refresh — bypass cadence this tick.
     // Drained once and handed to both legs; a forced name only matches the leg
     // whose snapshot owns it, so neither starves the other.
@@ -2624,6 +2642,163 @@ fn tick(state: &SchedulerState) {
         &state.kick_blocks,
         &state.pending_switch,
     );
+}
+
+/// The pacing key for `wham/usage`. Its own host, so codex polls never
+/// serialize behind the anthropic ones and vice versa.
+const CODEX_USAGE_ORIGIN: &str = "chatgpt.com";
+
+/// Per-profile pacing for the codex usage leg, epoch ms of the last poll. Its
+/// own map rather than `LastFetchedAt` because that store feeds the claude
+/// countdown surfaces, which have no codex column until the published-surface
+/// phase adds one.
+static CODEX_POLLED_AT: std::sync::Mutex<Option<HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// Codex accounts whose last poll answered 401. Their access token is stale, so
+/// the standby leg force-refreshes them on its next pass — see
+/// [`crate::codex_auth::kick_codex`], whose only production caller this is.
+///
+/// One poll per profile per refresh interval, and only for profiles that
+/// actually hold a chain: an account clauth is not rotating between is not one
+/// it needs a window reading for.
+///
+/// Readings land in the SHARED [`UsageStore`], keyed by profile name. That is
+/// safe by construction rather than by convention: names are globally unique
+/// across both state files (decision 2), and the claude chain walk only ever
+/// indexes the map by ITS OWN members' names, so a codex entry is inert there
+/// while every read-only surface (the Usage tab, the published feed) gets codex
+/// for free.
+fn codex_usage_tick(state: &SchedulerState) {
+    let Ok(codex) = crate::codex_profiles::CodexState::load() else {
+        return;
+    };
+    if codex.profiles().is_empty() {
+        return;
+    }
+    let interval_ms = state.refresh_interval.load(Ordering::Relaxed);
+    let now = now_ms();
+    let due: Vec<ProfileName> = {
+        let Ok(mut guard) = CODEX_POLLED_AT.lock() else {
+            return;
+        };
+        let seen = guard.get_or_insert_with(HashMap::new);
+        codex
+            .profiles()
+            .iter()
+            .filter(|name| {
+                seen.get(name.as_str())
+                    .is_none_or(|last| now.saturating_sub(*last) >= interval_ms)
+            })
+            .cloned()
+            .collect()
+    };
+    if due.is_empty() {
+        return;
+    }
+
+    for name in &due {
+        // Read the chain from the profile store, never from a session home: the
+        // store is the one physical carrier (decision 8), and this leg holds no
+        // rotation guard because it only READS.
+        let Some(auth) = crate::codex_auth::read_store_auth(name.as_str()) else {
+            continue;
+        };
+        let Some(token) = auth.access_token() else {
+            continue;
+        };
+        await_request_slot(CODEX_USAGE_ORIGIN);
+        let outcome = crate::usage::fetch_codex_usage(token, auth.account_id(), now_epoch_secs());
+        if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
+            guard
+                .get_or_insert_with(HashMap::new)
+                .insert(name.to_string(), now);
+        }
+        match outcome {
+            Ok(info) => {
+                crate::codex_auth::kick_reset(name.as_str());
+                // Persist through the same per-profile cache the claude leg
+                // writes, so every reader that resolves a window BY NAME —
+                // `published_windows`, the Usage tab's seed, a `status --json`
+                // taken with no daemon running — answers for codex without one
+                // line of harness awareness.
+                write_profile_cache(name, USAGE_CACHE_FILE, &info);
+                if let Ok(mut store) = state.store.lock() {
+                    store.insert(name.to_string(), info);
+                }
+                if let Ok(mut st) = state.status.lock() {
+                    st.insert(name.to_string(), FetchStatus::Fresh);
+                }
+            }
+            // The token is stale, not the account: queue ONE forced refresh for
+            // the standby leg and leave the last good reading in place, so a
+            // transient 401 never reads as "this account has no headroom".
+            Err(FetchError::Status(401)) => crate::codex_auth::kick_codex(name.as_str()),
+            Err(_) => {}
+        }
+    }
+
+    apply_codex_switch(state, &codex, interval_ms);
+}
+
+/// Walk the codex chain over the readings just taken and move the codex active
+/// slot when it says to. No executor and no pending-switch handshake: codex
+/// binds `auth.json` at start, so a switch lands at the NEXT codex session
+/// (settled question 1) rather than mid-flight — which is also why this cannot
+/// reuse the claude `SessionSwap` path.
+fn apply_codex_switch(
+    state: &SchedulerState,
+    codex: &crate::codex_profiles::CodexState,
+    interval_ms: u64,
+) {
+    let weekly_pct = match state.config.lock() {
+        Ok(cfg) => cfg.state.weekly_switch_threshold_pct(),
+        Err(_) => return,
+    };
+    let Some(mut snapshot) = crate::fallback::snapshot_codex_chain(codex, weekly_pct, interval_ms)
+    else {
+        return;
+    };
+    // Folded fix 1, answered where it actually bites rather than by changing a
+    // shared predicate: `is_exhausted_from_usage` reads a member with NO entry
+    // as un-exhausted, which is the only safe reading (a never-polled account
+    // may well have headroom) but is not PROOF of headroom — and a codex
+    // account starts in exactly that state. The freshness pass is what keeps an
+    // unknown member from outranking a known-good one, so it is filled here the
+    // same way the claude scan fills it, instead of leaving every codex member
+    // equally preferred forever.
+    if let Ok(st) = state.status.lock() {
+        snapshot.fresh = snapshot
+            .chain
+            .iter()
+            .filter(|m| matches!(st.get(m.name.as_str()), Some(FetchStatus::Fresh)))
+            .map(|m| m.name.clone())
+            .collect();
+    }
+    let Some(action) = crate::fallback::next_auto_switch_target(&snapshot, &state.store) else {
+        return;
+    };
+    match action {
+        crate::fallback::SwitchAction::To(target) => {
+            if let Err(e) = crate::actions::switch_codex_profile(target.as_str()) {
+                logline!("clauth: codex auto-switch to '{target}' failed: {e:#}");
+            } else {
+                logline!(
+                    "clauth: codex auto-switched to '{target}' — live at the next codex session"
+                );
+            }
+        }
+        crate::fallback::SwitchAction::Off => {
+            if let Err(e) = crate::codex_profiles::CodexState::update(|st| {
+                st.set_active(None);
+                Ok(())
+            }) {
+                logline!("clauth: codex switch-off failed: {e:#}");
+            } else {
+                logline!("clauth: every codex account is spent — codex active slot cleared");
+            }
+        }
+    }
 }
 
 /// Log a stand-down / lease-acquired transition. Either the TUI or the daemon

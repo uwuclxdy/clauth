@@ -393,6 +393,17 @@ pub(crate) struct LoginArgs {
     /// on the next switch and touches nothing else about the profile.
     #[arg(long, conflicts_with_all = ["base_url", "api_key"])]
     pub(crate) setup_token: bool,
+    /// Create (or re-authenticate) a CODEX profile instead, by adopting the
+    /// operator's own `codex login` out of ~/.codex/auth.json. The flag picks
+    /// which state file the profile lives in and appears only on this verb —
+    /// switch, delete, and start resolve bare names against both rosters.
+    #[arg(long, conflicts_with_all = ["base_url", "api_key", "setup_token", "model"])]
+    pub(crate) codex: bool,
+    /// With --codex: mint a FRESH codex chain via the browser instead of
+    /// adopting ~/.codex — a login clauth alone holds, leaving your own codex
+    /// untouched. Requires --codex.
+    #[arg(long, requires = "codex")]
+    pub(crate) browser: bool,
     /// Replace an existing long-lived token unprompted.
     #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
@@ -409,6 +420,8 @@ pub(crate) const LOGIN_FLAGS: &[&str] = &[
     "--base-url",
     "--api-key",
     "--setup-token",
+    "--codex",
+    "--browser",
     "--yes",
     "-y",
     "--model",

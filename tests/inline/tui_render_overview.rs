@@ -524,6 +524,7 @@ fn canceled_marker_is_dead_first() {
     a.usage.as_mut().unwrap().plan = Some(PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
+        codex_plan: None,
     });
     let mut config = config_with(vec![a], Some("a"), vec![]); // also active
     config.state.auth_broken.push("a".into()); // also auth-broken
@@ -834,6 +835,7 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
         p.usage.as_mut().unwrap().plan = Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Pro,
             subscription_status: None,
+            codex_plan: None,
         });
     }
     let config = config_with(vec![a, b], None, vec![]);
@@ -2094,5 +2096,75 @@ fn deepseek_amount_w_spans_all_currencies() {
         multi_cell.find("CNY"),
         single_cell.find("USD"),
         "first currencies in both cells start at the same column:\n  {multi_cell:?}\n  {single_cell:?}"
+    );
+}
+
+/// `c` cycles the Overview's harness filter, and the header chip says which
+/// harness the account count is about. Absent while both show, so the default
+/// header is byte-identical to the one that predates codex.
+#[test]
+fn the_harness_filter_cycles_and_names_itself() {
+    use crate::tui::app::HarnessFilter;
+    assert_eq!(HarnessFilter::default(), HarnessFilter::All);
+    assert_eq!(
+        HarnessFilter::All.chip(),
+        None,
+        "the default carries no badge"
+    );
+
+    let claude = HarnessFilter::All.next();
+    assert_eq!(claude, HarnessFilter::Claude);
+    assert_eq!(claude.chip(), Some("claude only"));
+    assert!(claude.shows_claude() && !claude.shows_codex());
+
+    let codex = claude.next();
+    assert_eq!(codex, HarnessFilter::Codex);
+    assert_eq!(codex.chip(), Some("codex only"));
+    assert!(codex.shows_codex() && !codex.shows_claude());
+
+    assert_eq!(codex.next(), HarnessFilter::All, "three states, then back");
+    assert!(HarnessFilter::All.shows_claude() && HarnessFilter::All.shows_codex());
+}
+
+/// The codex rows the Overview draws come from the codex roster plus the same
+/// per-profile usage cache the codex leg writes — never from a synthesized
+/// `Profile`, which would put a credential-less record into every claude path
+/// that walks `config.profiles`.
+#[test]
+fn codex_rows_read_the_roster_and_its_own_cache() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx2\"\nprofiles = [\"cx1\", \"cx2\"]\n",
+    )
+    .expect("write codex state");
+
+    let info = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cx1"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &info,
+    );
+
+    let rows = crate::tui::app::codex_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].name.as_str(), "cx1");
+    assert!(!rows[0].active, "the roster's active marker is cx2's");
+    assert_eq!(rows[0].plan.as_deref(), Some("plus"));
+    assert_eq!(
+        rows[0].five_hour.as_ref().map(|w| w.utilization),
+        Some(42.0),
+        "the window comes from the codex leg's own cache"
+    );
+    assert!(rows[1].active, "cx2 holds the codex active slot");
+    assert!(
+        rows[1].plan.is_none() && rows[1].five_hour.is_none(),
+        "a never-polled account shows no data rather than a fabricated reading"
     );
 }

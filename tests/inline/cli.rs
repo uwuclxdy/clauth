@@ -2349,3 +2349,59 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
         "'cli-held' has a token rotation in progress, retry in a moment"
     );
 }
+
+/// The not-found listing names BOTH rosters — `switch` and `delete` accept
+/// codex names, so a list hiding them turns a typo'd codex name into "no such
+/// thing" — with the codex half labeled so nothing reads as a claude profile.
+#[test]
+fn the_not_found_listing_names_both_rosters() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx1\"]\n")
+        .expect("write codex state");
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["cl1".into()],
+            ..Default::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("cl1"),
+        )],
+    };
+
+    let msg = unknown_profile_error(&config, "ghost").to_string();
+    assert!(msg.contains("profile 'ghost' not found"), "{msg}");
+    assert!(msg.contains("cl1"), "claude roster listed: {msg}");
+    assert!(
+        msg.contains("codex: cx1"),
+        "codex roster listed, labeled: {msg}"
+    );
+
+    // An empty claude roster leaves no dangling separator.
+    let empty = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![],
+    };
+    let msg = unknown_profile_error(&empty, "ghost").to_string();
+    assert!(msg.contains("available: codex: cx1"), "{msg}");
+}
+
+/// `--with-fallback` refuses ON a codex profile by name, before any spawn:
+/// codex reads `auth.json` once at start, so a chain lands at the NEXT start
+/// rather than mid-session, and silently not doing what the flag promises is
+/// the worse answer. (`--rescue`/`--no-rescue` were the other half until
+/// upstream retired them; an isolated session keeps its transcripts now.)
+#[test]
+fn codex_start_refuses_with_fallback_by_name() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let err = cmd_start("cx", &[], Isolation::Shared, true)
+        .expect_err("--with-fallback refuses on codex");
+    assert!(err.to_string().contains("--with-fallback"), "{err}");
+    assert!(err.to_string().contains("NEXT start"), "{err}");
+}

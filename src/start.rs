@@ -212,12 +212,15 @@ pub(crate) fn run(
     #[cfg(unix)]
     let signal_watcher = SignalWatcher::new()?;
 
-    let mut command = crate::runtime::claude_command();
+    // Through the runtime-spawn seam: this is a claude session, and the codex
+    // engine plugs into the same three calls when its runtime lands.
+    let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
+    let mut command = engine.command();
     // Scrub clauth-managed + active custom env so a session started under
     // profile B doesn't inherit profile A's endpoint/auth/model overrides from
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
-    crate::runtime::scrub_profile_env(&mut command, &active_env_keys);
+    engine.scrub_env(&mut command, &active_env_keys);
     // A resume pins `claude` to the session's workspace; a normal start inherits
     // this process's cwd. Either way the resolved dir feeds the home-project
     // settings guard: when it is the real `$HOME`, its project-tier settings
@@ -227,7 +230,7 @@ pub(crate) fn run(
     if let Some(cwd) = spawn_cwd.as_deref() {
         crate::runtime::guard_home_project_settings(&mut command, cwd);
     }
-    command.env("CLAUDE_CONFIG_DIR", runtime.config_dir());
+    command.env(engine.home_env_key(), runtime.config_dir());
     // Isolated: also suppress global/project MCP servers wired through
     // `.claude.json`, so the only extension surface is what the caller passes.
     // Deliberately NOT `--safe-mode`. The cross-account leak (the operator's
@@ -251,7 +254,9 @@ pub(crate) fn run(
 
     #[cfg(not(unix))]
     let outcome = ChildOutcome {
-        status: child.wait().context("failed to wait for claude")?,
+        status: child
+            .wait()
+            .context("failed to wait for the session child")?,
         signal: None,
     };
 
@@ -378,7 +383,10 @@ fn wait_for_child(
     signals: &Receiver<i32>,
 ) -> Result<ChildOutcome> {
     loop {
-        if let Some(status) = child.try_wait().context("failed to wait for claude")? {
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to wait for the session child")?
+        {
             return Ok(ChildOutcome {
                 status,
                 signal: next_signal(signals),
@@ -404,7 +412,10 @@ fn wait_after_signal(
 ) -> Result<ChildOutcome> {
     let mut signal = first_signal;
     loop {
-        match child.try_wait().context("failed to wait for claude")? {
+        match child
+            .try_wait()
+            .context("failed to wait for the session child")?
+        {
             Some(status) => {
                 return Ok(ChildOutcome {
                     status,
@@ -447,6 +458,130 @@ fn forward_signal(child: &std::process::Child, signal: i32) -> std::io::Result<(
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// `clauth start <codex-profile>` — spawn an interactive `codex` against this
+/// session's own clauth-built home. The claude start's extras have no codex
+/// counterpart and are absent on purpose: no usage priming (codex usage is
+/// passive), no run-window transcript stamping or rescue (codex owns its own
+/// `sessions/`, synced back by the runtime's teardown), no fallback watchdog
+/// (a codex chain lands at the next start), no home-project settings guard
+/// (project-tier settings are a Claude Code concept).
+///
+/// `codex_args` pass through verbatim, AFTER clauth's own `-c` store override
+/// — later `-c` occurrences win in codex's config layering, but overriding
+/// the store mode simply re-breaks the linked `auth.json` for that one run,
+/// the same class of self-inflicted foot-gun as `claude --settings` against a
+/// clauth runtime.
+/// A path rendered as a TOML string for a `-c key=<value>` override. Literal
+/// (single-quoted) is preferred: it processes no escapes, so a Windows path's
+/// backslashes survive verbatim. A path carrying a single quote cannot be a
+/// literal string at all, so it falls back to a basic string with the two
+/// characters TOML requires escaped there.
+fn toml_path_value(path: &Path) -> String {
+    let raw = path.display().to_string();
+    if raw.contains('\'') {
+        format!("\"{}\"", raw.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        format!("'{raw}'")
+    }
+}
+
+/// The spawn command for a codex session on `home`, split from [`run_codex`]
+/// so the wire facts are pinned without spawning anything: the `CODEX_HOME`
+/// pin, the scrub, and the forced file store BEFORE the passthrough args.
+///
+/// The store override (decision 6): the session's config.toml is a COPY of
+/// the operator's, and a keyring/auto setting in it would make codex ignore
+/// the linked auth.json — and delete it on the first refresh. Forced on every
+/// clauth spawn, never demanded of the operator's own config (the capture
+/// path owns that refusal). The value carries its TOML quotes as literal arg
+/// bytes, so codex's `-c` override parser reads a well-formed TOML string
+/// rather than leaning on its bare-word fallback. Caller args come AFTER, so
+/// a later `-c` of the same key wins in codex's layering — overriding the
+/// store re-breaks the linked auth.json for that one run, the same class of
+/// self-inflicted foot-gun as `claude --settings` against a clauth runtime.
+///
+/// The state-DB override, the same reasoning one layer down: the store the
+/// sqlite DBs live in is a config KEY (`sqlite_home`) as well as an env var,
+/// and the session's config.toml is that same copy of the operator's. Left
+/// alone, every profile's goals/logs/memories/state DBs land in whichever one
+/// directory the operator named — the home's durable links are never opened
+/// through, and two accounts share one conversation history. Scrubbing the env
+/// cannot reach it, since the key outranks the variable, so it is pinned to the
+/// home clauth just set: exactly what codex resolves when neither is spelled.
+fn codex_spawn_command(
+    home: &Path,
+    codex_args: &[String],
+    active_env_keys: &[String],
+) -> std::process::Command {
+    let engine = crate::harness::Harness::Codex.engine();
+    let mut command = engine.command();
+    engine.scrub_env(&mut command, active_env_keys);
+    command.env(engine.home_env_key(), home);
+    command.arg("-c").arg("cli_auth_credentials_store=\"file\"");
+    command
+        .arg("-c")
+        .arg(format!("sqlite_home={}", toml_path_value(home)));
+    command.args(codex_args);
+    command
+}
+
+pub(crate) fn run_codex(
+    config: &AppConfig,
+    name: &str,
+    codex_args: &[String],
+    isolation: Isolation,
+) -> Result<()> {
+    // The ACTIVE CLAUDE profile's custom env, scrubbed like any spawn: those
+    // keys reached this process from the live settings.json and describe a
+    // claude account, not this codex session.
+    let active_env_keys: Vec<String> = config
+        .state
+        .active_profile
+        .as_deref()
+        .map(crate::profile::ProfileName::from)
+        .and_then(|n| config.find(&n))
+        .map(|p| p.env.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let runtime = {
+        let _spinner = Spinner::start("clauth: preparing codex home");
+        crate::runtime::CodexRuntime::acquire(name, isolation)?
+    };
+
+    let mut command = codex_spawn_command(runtime.home(), codex_args, &active_env_keys);
+
+    // The same signal discipline as the claude start: without it a SIGTERM to
+    // clauth skips the teardown — the sync-back is lost, the flock releases
+    // with the codex child still RUNNING, and a rotation then reads the
+    // account as idle while a live session holds its chain, which is the
+    // precise burn the marker exists to prevent.
+    #[cfg(unix)]
+    let signal_watcher = SignalWatcher::new()?;
+
+    let mut child = command.spawn().with_context(|| {
+        "failed to launch codex — is the `codex` CLI installed and on PATH?".to_string()
+    })?;
+
+    #[cfg(unix)]
+    let outcome = wait_for_child(&mut child, signal_watcher.receiver())?;
+    #[cfg(not(unix))]
+    let outcome = ChildOutcome {
+        status: child
+            .wait()
+            .context("failed to wait for the session child")?,
+        signal: None,
+    };
+
+    // Teardown before the exit so the sync-back and marker release run.
+    drop(runtime);
+
+    let code = status_code(outcome.status, outcome.signal);
+    if code != 0 {
+        std::process::exit(code);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

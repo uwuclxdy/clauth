@@ -1021,6 +1021,7 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
         plan: Some(PlanInfo {
             tier: PlanTier::Pro,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     };
@@ -1035,6 +1036,7 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
     let canceled = PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
+        codex_plan: None,
     };
     apply_outcome(
         FetchOutcome::cached(
@@ -1101,6 +1103,7 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
     let canceled = PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
+        codex_plan: None,
     };
     apply_outcome(
         FetchOutcome::cached(
@@ -1983,6 +1986,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
     crate::live_sessions::LiveSession {
         session_id: session_id.to_string(),
         start_profile: start_profile.to_string(),
+        harness: crate::harness::Harness::Claude,
         pid: 4242,
         started_at: 1_700_000_000_000,
         cwd: None,
@@ -3593,6 +3597,7 @@ fn pre_rotation_serves_a_live_body() {
         plan: Some(PlanInfo {
             tier: PlanTier::Pro,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..UsageInfo::default()
     };
@@ -3616,6 +3621,7 @@ fn pre_rotation_429_on_a_valid_token_bails_rate_limited_with_plan() {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
     };
     // token_clock_expired == false: a still-valid token's 429 is a pure
@@ -3653,6 +3659,7 @@ fn pre_rotation_429_on_an_expired_token_rotates_and_drops_the_plan() {
         plan: Some(PlanInfo {
             tier: PlanTier::Pro,
             subscription_status: None,
+            codex_plan: None,
         }),
     };
     // token_clock_expired == true: falls through to rotation. The `Rotate`
@@ -5165,6 +5172,7 @@ fn scan_recovery_never_relinks_to_a_canceled_member() {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
                 subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
             }),
             ..Default::default()
         },

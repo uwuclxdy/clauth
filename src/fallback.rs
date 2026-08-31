@@ -855,6 +855,59 @@ pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     snapshot_chain_from(config, &active)
 }
 
+/// [`snapshot_chain`]'s codex twin, built from `codex-profiles.toml` instead of
+/// `AppConfig`. Chains are strictly per-harness (decision 4), so this reads the
+/// codex active slot, the codex chain, and the codex wrap-off — and nothing
+/// from the claude state.
+///
+/// Every member takes the DEFAULTS a claude member would inherit from a missing
+/// `Profile` record, because a codex profile has none: `profiles.toml` is
+/// untouched by the file split, so `config.find` cannot answer for these names
+/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
+/// thresholds) simply do not exist on this harness yet.
+///
+/// `check_scoped` is DISARMED for every codex member, per the delivery spec:
+/// per-model weekly windows are a claude concept (`"7d fable"` and friends come
+/// from the anthropic `limits[]` array), and `wham/usage` has no equivalent. An
+/// armed gate would judge codex members against windows that can never appear.
+pub(crate) fn snapshot_codex_chain(
+    state: &crate::codex_profiles::CodexState,
+    weekly_pct: f64,
+    interval_ms: u64,
+) -> Option<ChainSnapshot> {
+    let active = state.active_profile()?.clone();
+    let chain: Vec<ProfileName> = state.fallback_chain().to_vec();
+    if !chain.iter().any(|n| n == &active) {
+        return None;
+    }
+    Some(ChainSnapshot {
+        active,
+        chain: chain
+            .into_iter()
+            .map(|name| ChainMember {
+                name,
+                threshold: DEFAULT_THRESHOLD,
+                last_resort: false,
+                preferred: false,
+                max_spend: 0.0,
+                weekly_line: weekly_pct,
+                scoped_line: weekly_pct,
+                check_scoped: false,
+            })
+            .collect(),
+        switch_off_when_spent: state.switch_off_when_spent(),
+        broken: Vec::new(),
+        burn_aware: false,
+        interval_ms,
+        burn_floor_pct: 0.0,
+        burn_horizon_cap_ms: 0,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected: Vec::new(),
+        fresh: Vec::new(),
+    })
+}
+
 /// [`snapshot_chain`] anchored on an explicit member instead of the global
 /// active. The headroom nudge's replay (`hook_note::chain_would_act`) is the
 /// one caller: its gate reads the account the session's credentials RESOLVE
@@ -1309,6 +1362,14 @@ pub(crate) fn next_auto_switch_target(
 /// from `usage`, the single per-evaluation clone of the `UsageStore` map. Split
 /// out so tests can drive the evaluation against a frozen snapshot and prove
 /// the decision depends only on its content, never on a later store mutation.
+#[cfg(test)]
+pub(crate) fn next_auto_switch_target_for_test(
+    snapshot: &ChainSnapshot,
+    usage: &HashMap<String, UsageInfo>,
+) -> Option<SwitchAction> {
+    next_auto_switch_target_with_usage(snapshot, usage)
+}
+
 fn next_auto_switch_target_with_usage(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,

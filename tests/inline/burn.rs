@@ -71,6 +71,8 @@ fn make_info(five_h: Option<f64>, seven_d: Option<f64>) -> UsageInfo {
         window_dollars: Vec::new(),
         extra_usage: None,
         spend: None,
+        codex_limit_reached: None,
+        codex_reset_credits: None,
     }
 }
 

@@ -523,6 +523,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         plan: Some(crate::usage::PlanInfo {
             tier: crate::usage::PlanTier::Max(Some(20)),
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -641,6 +642,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -694,6 +696,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
+            codex_plan: None,
         }),
         ..Default::default()
     });
@@ -1463,6 +1466,8 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
+            codex_limit_reached: None,
+            codex_reset_credits: None,
         });
         collect_stats(&profile, ResetFmt::default())
     };

@@ -6,7 +6,7 @@
 //!
 //! The left panel is one cursor-driven selector over the integration checks
 //! (clauth on PATH, mcpServers wiring, plugin install, CC version, and a
-//! `runtime` row that folds every profile's live sessions / credential link /
+//! `runtime` row that folds every CLAUDE profile's live sessions / credential link /
 //! token freshness into one summary). Each row is a status dot + label, the
 //! verdict in the detail pane. Enter descends into the detail pane; `f` applies
 //! the selected row's fix (when one applies). All data is recomputed

@@ -622,6 +622,7 @@ fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
         plan: Some(PlanInfo {
             tier,
             subscription_status: status.map(str::to_string),
+            codex_plan: None,
         }),
         ..Default::default()
     };
@@ -948,5 +949,180 @@ fn json_view_doc_names_the_managed_half_and_points_at_the_routing_answer() {
     assert!(
         doc.contains("crate::profile::stored_endpoint"),
         "the doc points at the reader that answers both halves: {doc}"
+    );
+}
+// ── the codex arm off CODEX_HOME ───────────────────────────────────────────
+
+/// The path parse is structural: `profiles/<name>/codex-home[-<sid>]` names
+/// the profile; anything else — the operator's real `~/.codex`, a claude
+/// runtime, a codex-home dir parked outside a profiles tree — names nothing.
+#[test]
+fn codex_home_parse_accepts_the_clauth_shape_only() {
+    use std::path::Path;
+    for good in [
+        "/home/u/.clauth/profiles/cx/codex-home-4242-0",
+        "/home/u/.clauth/profiles/cx/codex-home",
+    ] {
+        assert_eq!(
+            session_profile_from_codex_home(Path::new(good)).as_deref(),
+            Some("cx"),
+            "{good}"
+        );
+    }
+    for bad in [
+        "/home/u/.codex",
+        "/home/u/.clauth/profiles/cx/runtime-4242-0",
+        "/home/u/codex-home-4242-0",
+        "/home/u/.clauth/cx/codex-home-4242-0",
+    ] {
+        assert_eq!(
+            session_profile_from_codex_home(Path::new(bad)),
+            None,
+            "{bad}"
+        );
+    }
+}
+
+/// The three outcomes stay three: a member answers, a well-shaped home the
+/// roster misses fails CLOSED (its own outcome, never a fall-through to the
+/// claude tiers — those would attribute this codex session to whatever the
+/// global ~/.claude resolves to), and only a foreign path falls through.
+#[test]
+fn codex_home_attribution_is_roster_gated() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let member = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("cx")
+        .join("codex-home-4242-0");
+    let stranger = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("ghost")
+        .join("codex-home-4242-0");
+
+    assert!(matches!(
+        codex_session_profile_at(&member),
+        CodexClaim::Member(name) if name == "cx"
+    ));
+    assert!(
+        matches!(codex_session_profile_at(&stranger), CodexClaim::UnknownHome),
+        "a home naming no stored codex profile fails closed, not through"
+    );
+    assert!(matches!(
+        codex_session_profile_at(std::path::Path::new("/home/u/.codex")),
+        CodexClaim::NotACodexHome
+    ));
+
+    // An unreadable roster is UnknownHome too: attribution needs membership,
+    // and membership is unknowable.
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [not toml")
+        .expect("corrupt codex state");
+    assert!(matches!(
+        codex_session_profile_at(&member),
+        CodexClaim::UnknownHome
+    ));
+}
+
+/// `codex_json_view` promises to keep every claude-era key. Pinned against
+/// `json_view`'s ACTUAL key set, not a hand-copied list, so a key added to
+/// the claude payload reds this test until the codex payload carries it too.
+#[test]
+fn codex_json_view_tracks_the_claude_key_set() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    let config = config_with(vec![blank_profile("cl")], Some("cl"));
+
+    let claude_keys: std::collections::BTreeSet<String> = match json_view(
+        &config,
+        Some(&("cl".to_string(), Source::CredentialLessActive)),
+    ) {
+        serde_json::Value::Object(map) => map.keys().cloned().collect(),
+        other => panic!("json_view is an object, got {other}"),
+    };
+    let codex_keys: std::collections::BTreeSet<String> = match codex_json_view("cx") {
+        serde_json::Value::Object(map) => map.keys().cloned().collect(),
+        other => panic!("codex_json_view is an object, got {other}"),
+    };
+
+    let missing: Vec<_> = claude_keys.difference(&codex_keys).collect();
+    assert!(
+        missing.is_empty(),
+        "claude-era keys the codex payload dropped: {missing:?}"
+    );
+    let extra: Vec<_> = codex_keys.difference(&claude_keys).collect();
+    assert_eq!(
+        extra,
+        ["harness"],
+        "the codex payload adds exactly the harness key"
+    );
+}
+
+/// The codex `--json` payload keeps every claude-era key (null where the
+/// claude question has no codex answer), adds the harness, and answers
+/// `active` from the CODEX slot.
+#[test]
+fn codex_json_view_keeps_the_key_set_and_reads_the_codex_slot() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(
+        dir.join("codex-profiles.toml"),
+        "active_profile = \"cx\"\nprofiles = [\"cx\", \"other\"]\n",
+    )
+    .expect("write codex state");
+
+    let v = codex_json_view("cx");
+    assert_eq!(v["profile"], "cx");
+    assert_eq!(v["source"], "codex_home");
+    assert_eq!(v["harness"], "codex");
+    assert!(v["base_url"].is_null());
+    assert!(v["tier"].is_null());
+    assert!(v["oauth"].is_null());
+    assert_eq!(v["active"], true);
+    assert_eq!(codex_json_view("other")["active"], false);
+}
+
+/// Env vars inherit: a claude session started from inside a codex session
+/// carries the ancestor's CODEX_HOME, and its own CLAUDE_CONFIG_DIR names the
+/// clauth runtime that IS this process's identity. The runtime claim wins;
+/// with no such claim, the inherited codex home answers.
+#[test]
+fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let clauth = home.home().join(".clauth");
+    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
+    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+    let codex_home = clauth.join("profiles").join("cx").join("codex-home-4242-0");
+    let _codex_env = crate::testutil::CodexHomeSandbox::new(&home, &codex_home);
+
+    assert!(
+        !claude_session_dir_claims_this_process(),
+        "fixture control: no claude runtime claim yet"
+    );
+    assert!(
+        matches!(codex_session_profile(), CodexClaim::Member(name) if name == "cx"),
+        "with no claude claim, the inherited codex home answers"
+    );
+
+    let runtime = clauth
+        .join("profiles")
+        .join("started")
+        .join("runtime-4242-0");
+    let _config_dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    assert!(
+        claude_session_dir_claims_this_process(),
+        "a clauth runtime CLAUDE_CONFIG_DIR is this process's identity and wins"
     );
 }

@@ -26,7 +26,8 @@ use crate::actions::{
     create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
     edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
     overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
-    switch_off, switch_profile, validate_profile_name,
+    switch_off, switch_profile, validate_foreign_harness_free, validate_name_chars,
+    validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -36,6 +37,7 @@ use crate::claude::{
 };
 use crate::fallback::{DEFAULT_THRESHOLD, SwitchAction, auto_switch_if_needed, threshold_for};
 use crate::format::format_pct;
+use crate::harness::Harness;
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
@@ -1460,6 +1462,88 @@ pub(crate) enum MainItemKind {
     Profile(usize),
 }
 
+/// Which harness the Overview shows. A VIEW filter only: selection and every
+/// action stay bound to the claude list, because a codex account has no
+/// `Profile` record for them to act on and clauth switches it through its own
+/// CLI verb. So the codex section renders READ-ONLY, and hiding the claude one
+/// hides nothing the cursor can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum HarnessFilter {
+    #[default]
+    All,
+    Claude,
+    Codex,
+}
+
+impl HarnessFilter {
+    /// `c` cycles: both → claude → codex → both.
+    pub(crate) fn next(self) -> Self {
+        match self {
+            HarnessFilter::All => HarnessFilter::Claude,
+            HarnessFilter::Claude => HarnessFilter::Codex,
+            HarnessFilter::Codex => HarnessFilter::All,
+        }
+    }
+    pub(crate) fn shows_claude(self) -> bool {
+        !matches!(self, HarnessFilter::Codex)
+    }
+    pub(crate) fn shows_codex(self) -> bool {
+        !matches!(self, HarnessFilter::Claude)
+    }
+    /// Header chip text; `None` while both harnesses show, so the default view
+    /// carries no badge at all.
+    pub(crate) fn chip(self) -> Option<&'static str> {
+        match self {
+            HarnessFilter::All => None,
+            HarnessFilter::Claude => Some("claude only"),
+            HarnessFilter::Codex => Some("codex only"),
+        }
+    }
+}
+
+/// One codex account as the Overview renders it — name, plan, and the two
+/// windows, read from the same per-profile usage cache the codex leg writes.
+/// Deliberately NOT a `Profile`: synthesizing one would put a record with no
+/// credentials into every claude path that walks `config.profiles`.
+#[derive(Debug, Clone)]
+pub(crate) struct CodexRow {
+    pub(crate) name: ProfileName,
+    pub(crate) active: bool,
+    pub(crate) plan: Option<String>,
+    pub(crate) five_hour: Option<crate::usage::UsageWindow>,
+    pub(crate) seven_day: Option<crate::usage::UsageWindow>,
+}
+
+/// Snapshot the codex roster for the Overview. Cheap and lock-free: the roster
+/// is one small TOML and each reading is the profile's own cache file, the same
+/// pair `status --json` reads with no daemon running.
+pub(crate) fn codex_rows() -> Vec<CodexRow> {
+    let Ok(state) = crate::codex_profiles::CodexState::load() else {
+        return Vec::new();
+    };
+    let active = state.active_profile().cloned();
+    state
+        .profiles()
+        .iter()
+        .map(|name| {
+            let cached: Option<crate::usage::UsageInfo> = crate::profile_cache::load_profile_cache(
+                name,
+                crate::profile_cache::USAGE_CACHE_FILE,
+            );
+            CodexRow {
+                name: name.clone(),
+                active: active.as_ref().is_some_and(|a| a == name),
+                plan: cached
+                    .as_ref()
+                    .and_then(|u| u.plan.as_ref())
+                    .and_then(|p| p.codex_plan.clone()),
+                five_hour: cached.as_ref().and_then(|u| u.five_hour.clone()),
+                seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
+            }
+        })
+        .collect()
+}
+
 // ── Login session ─────────────────────────────────────────────────────────────
 
 /// An in-flight browser OAuth login. The worker blocks up to 180s in
@@ -1570,6 +1654,9 @@ pub(crate) struct App {
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    /// Which harness the Overview lists (`c` cycles). A view filter only — see
+    /// [`HarnessFilter`].
+    pub(crate) harness_filter: HarnessFilter,
     /// Which Setup pane has focus.
     pub(crate) config_focus: ConfigFocus,
     /// Cursor into the detail rows on the Setup tab's right pane.
@@ -1975,6 +2062,7 @@ impl App {
             third_party_usage_store,
             third_party_status,
             tab: Tab::Overview,
+            harness_filter: HarnessFilter::default(),
             herdr_mode: false,
             modals: Vec::new(),
             help_scroll: 0,
@@ -2772,6 +2860,15 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             if let Some(notice) = app.divergence_pending.clone() {
                 app.disarm_quit();
                 open_divergence_modal(app, &notice.active);
+            }
+            return;
+        }
+        KeyCode::Char('c') => {
+            // Overview only: it is the one screen listing accounts, so the
+            // filter has nothing to mean anywhere else.
+            if app.tab == Tab::Overview {
+                app.disarm_quit();
+                app.harness_filter = app.harness_filter.next();
             }
             return;
         }
@@ -6475,10 +6572,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         .as_ref()
                         .map(|d| d.name.trimmed().to_string())
                         .unwrap_or_default();
-                    let validation = {
-                        let cfg = app.config();
-                        validate_profile_name(&typed, &cfg.names(), None)
-                    };
+                    let validation = validate_profile_name(&typed, Harness::Claude, None);
                     match validation {
                         Ok(()) => Some((typed, true)),
                         Err(e) => {
@@ -7489,10 +7583,7 @@ fn commit_rename(app: &mut App) {
         }
         return;
     }
-    let validation = {
-        let cfg = app.config();
-        validate_profile_name(&new, &cfg.names(), Some(old.as_str()))
-    };
+    let validation = validate_profile_name(&new, Harness::Claude, Some(old.as_str()));
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
@@ -7586,10 +7677,7 @@ fn commit_new_account(app: &mut App) {
         None
     };
     let mint_discarded = base_url.is_some() && d.captured_login.is_some();
-    let validation = {
-        let cfg = app.config();
-        validate_profile_name(&name, &cfg.names(), None)
-    };
+    let validation = validate_profile_name(&name, Harness::Claude, None);
     if let Err(e) = validation {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
@@ -7781,10 +7869,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
             let action = form.action.clone();
             match action {
                 NamePromptAction::DuplicateProfile(source) => {
-                    let validation = {
-                        let cfg = app.config();
-                        validate_profile_name(&name, &cfg.names(), None)
-                    };
+                    let validation = validate_profile_name(&name, Harness::Claude, None);
                     if let Err(e) = validation {
                         app.toast(ToastKind::Danger, format!("{e}"));
                         return;
@@ -7797,9 +7882,9 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     );
                 }
                 NamePromptAction::SavePreset(source) => {
-                    // The preset store is its own namespace, so the roster is
-                    // empty here; only the charset + built-in rules apply.
-                    if let Err(e) = validate_profile_name(&name, &[], None) {
+                    // The preset store is its own namespace — neither harness's
+                    // roster has a say; only the charset + built-in rules apply.
+                    if let Err(e) = validate_name_chars(&name) {
                         app.toast(ToastKind::Danger, format!("{e}"));
                         return;
                     }
@@ -8647,11 +8732,17 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter => {
             let name = form.input.trimmed().to_string();
-            // Chars/empty-only check here — the duplicate-name branch of
-            // `validate_profile_name` is skipped (empty `existing`) so a
+            // Chars + cross-harness only — the own-roster duplicate branch of
+            // `validate_profile_name` is deliberately skipped so a claude
             // collision falls through to the canonical_name lookup below
-            // instead of dead-ending with an "already exists" error.
-            if let Err(e) = validate_profile_name(&name, &[], None) {
+            // (capture-into-existing) instead of dead-ending with an "already
+            // exists" error. A codex-held name has no such flow — a claude
+            // login can't be captured into a codex profile — so that half
+            // still refuses here.
+            let validation = validate_name_chars(&name)
+                .map(|_| ())
+                .and_then(|()| validate_foreign_harness_free(&name, Harness::Claude));
+            if let Err(e) = validation {
                 app.toast(ToastKind::Danger, format!("{e}"));
                 return;
             }

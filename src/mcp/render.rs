@@ -523,10 +523,11 @@ pub(crate) fn instructions_block(
 ) -> String {
     let mut out = String::new();
     out.push_str(
-        "clauth manages multiple Claude Code accounts (\"profiles\"): each an isolated \
-credential set / subscription. Use its tools to compare usage headroom across accounts, relink \
-the active account, or delegate a task to another account without spending this session's \
-window.\n\n",
+        "clauth manages multiple accounts (\"profiles\"): each an isolated credential set / \
+subscription. Use its tools to compare usage headroom across accounts, relink the active \
+account, or delegate a task to another account without spending this session's window. These \
+tools see CLAUDE CODE accounts only — clauth also manages codex accounts, which are invisible \
+here and switch through its CLI.\n\n",
     );
     if let Some(line) = identity_line(profiles, auth) {
         out.push_str(&line);

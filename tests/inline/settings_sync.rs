@@ -537,6 +537,62 @@ fn custom_env_keys_are_unioned_across_every_profile() {
     );
 }
 
+/// The union walks the same DIRECTORY listing the member set is derived from
+/// — an off-roster drift dir keeps contributing (its runtime can still be a
+/// sync member, so dropping its keys from the union would leak them as
+/// shared) — and codex membership is the one exclusion: a codex `[env]` must
+/// not join the claude union, and a codex config.toml that does not parse
+/// must not pause a claude-only subsystem.
+#[test]
+fn a_codex_profiles_config_is_never_read_here() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "p1", "[env]\nA_KEY = \"1\"\n");
+
+    let clauth = home.home().join(".clauth");
+    fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex roster");
+    let cx = clauth.join("profiles").join("cx");
+    fs::create_dir_all(&cx).expect("mkdir codex profile");
+    fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");
+
+    // NOT on either roster: still a union contributor, because the member set
+    // is directory-derived and would still merge this dir's runtime.
+    write_config(home.home(), "drift", "[env]\nDRIFT_KEY = \"1\"\n");
+
+    let keys = per_profile_env_keys()
+        .expect("a codex config — parseable or not — must not pause the claude sync");
+    assert_eq!(
+        keys,
+        BTreeSet::from(["A_KEY".to_string(), "DRIFT_KEY".to_string()])
+    );
+}
+
+/// Uniqueness is enforced at creation, never against hand-edited state, so a
+/// name BOTH files claim is reachable — and every other resolution site is
+/// pinned claude-first. Skipping on the codex roster alone inverted it here,
+/// which silently dropped the claude profile whose `[env]` leak this union
+/// exists to catch.
+#[test]
+fn a_dual_claimed_name_stays_claude_first_here() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "shared", "[env]\nSHARED_KEY = \"1\"\n");
+
+    let clauth = home.home().join(".clauth");
+    fs::write(clauth.join("profiles.toml"), "profiles = [\"shared\"]\n")
+        .expect("write claude roster");
+    fs::write(
+        clauth.join("codex-profiles.toml"),
+        "profiles = [\"shared\"]\n",
+    )
+    .expect("write codex roster claiming the same name");
+
+    let keys = per_profile_env_keys().expect("every config.toml parses");
+    assert!(
+        keys.contains("SHARED_KEY"),
+        "a dual-claimed name resolves claude-first, so its env still joins the union: {keys:?}"
+    );
+}
+
 #[test]
 fn a_config_that_does_not_parse_aborts_the_tick() {
     let home = HomeSandbox::new();

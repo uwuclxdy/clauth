@@ -71,7 +71,12 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if app.config().profiles.is_empty() {
+    let codex = if app.harness_filter.shows_codex() {
+        crate::tui::app::codex_rows()
+    } else {
+        Vec::new()
+    };
+    if app.config().profiles.is_empty() && codex.is_empty() {
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -83,10 +88,14 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
-    let items = app.main_items();
+    let items = if app.harness_filter.shows_claude() {
+        app.main_items()
+    } else {
+        Vec::new()
+    };
     let sel = app.profile_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
-    let rows: Vec<ListItem<'_>> = items
+    let mut rows: Vec<ListItem<'_>> = items
         .iter()
         .enumerate()
         .map(|(row, item)| match item {
@@ -97,6 +106,22 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
             }
         })
         .collect();
+    // The codex section, after the claude rows and never selectable: the cursor
+    // and every action are bound to `config.profiles`, and a codex account has
+    // no record there for them to act on. Rendering it read-only is what keeps
+    // "what the cursor can reach" and "what the screen shows" from diverging.
+    if !codex.is_empty() {
+        if !rows.is_empty() {
+            rows.push(ListItem::new(Line::from("")));
+        }
+        rows.push(ListItem::new(Line::from(vec![Span::styled(
+            "  codex — switch with `clauth switch <name>`",
+            theme::dim(),
+        )])));
+        for row in &codex {
+            rows.push(ListItem::new(render_codex_row(row, &widths)));
+        }
+    }
 
     let total = items.len();
     let list = List::new(rows).style(theme::base());
@@ -304,6 +329,38 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     if widths.live > 0 {
         spans.push(gap(widths));
         spans.push(Span::styled(fixed("live", widths.live), theme::label()));
+    }
+    Line::from(spans)
+}
+
+/// One codex account, in the claude columns: name, plan, 5h, 7d. No cursor
+/// glyph and no live/timer cells — this section is read-only, and a timer would
+/// promise a countdown the Overview cannot act on.
+fn render_codex_row(row: &crate::tui::app::CodexRow, widths: &OverviewWidths) -> Line<'static> {
+    let name_style = if row.active {
+        theme::accent().bold()
+    } else {
+        theme::base()
+    };
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(fixed(row.name.as_str(), widths.name), name_style),
+        Span::raw(" ".repeat(widths.gap)),
+        Span::styled(
+            fixed(row.plan.as_deref().unwrap_or("—"), widths.kind),
+            theme::dim(),
+        ),
+    ];
+    for (window, w) in [
+        (row.five_hour.as_ref(), widths.five_hour),
+        (row.seven_day.as_ref(), widths.seven_day),
+    ] {
+        spans.push(Span::raw(" ".repeat(widths.gap)));
+        let cell = match window {
+            Some(win) => format!("{:>w$}", format!("{:.0}%", win.utilization), w = w),
+            None => format!("{:>w$}", "—", w = w),
+        };
+        spans.push(Span::styled(cell, theme::base()));
     }
     Line::from(spans)
 }

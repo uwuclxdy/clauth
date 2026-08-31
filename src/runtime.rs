@@ -157,6 +157,13 @@ const RUNTIME_STEM: &str = "runtime";
 const SESSIONS_STEM: &str = "sessions";
 const ISOLATED_RUNTIME_STEM: &str = "runtime-isolated";
 const ISOLATED_SESSIONS_STEM: &str = "sessions-isolated";
+/// A codex session home under `profiles/<name>/`. Deliberately OUTSIDE the
+/// `runtime*`/`sessions*` stems: the config reconcilers walk
+/// [`shared_runtime_dirs`] and would drop Claude Code's `settings.json` into
+/// any dir matching those, and the GC pairing rule would collect a home it has
+/// no pairing story for. A codex home named off this stem falls through both
+/// untouched, which is the designed behavior, not an accident.
+pub(crate) const CODEX_HOME_STEM: &str = "codex-home";
 
 impl Isolation {
     fn runtime_stem(self) -> &'static str {
@@ -170,6 +177,23 @@ impl Isolation {
             Isolation::Shared => SESSIONS_STEM,
             Isolation::Isolated => ISOLATED_SESSIONS_STEM,
         }
+    }
+    /// The other flavor. Only the fake transport needs to ask: there the two
+    /// collapse to separate bare homes that do NOT share one `auth.json`.
+    fn other(self) -> Self {
+        match self {
+            Isolation::Shared => Isolation::Isolated,
+            Isolation::Isolated => Isolation::Shared,
+        }
+    }
+}
+
+impl std::fmt::Display for Isolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Isolation::Shared => "shared",
+            Isolation::Isolated => "isolated",
+        })
     }
 }
 
@@ -245,6 +269,22 @@ fn is_runtime_dir_name(name: &str) -> bool {
     is_paired_dir_name(name, RUNTIME_STEM)
 }
 
+/// Whether `path` is a clauth CLAUDE runtime tree by position as well as name
+/// — `…/profiles/<name>/runtime*`, either flavor. The claude twin of
+/// [`is_codex_home_path`], for the cross-harness env hygiene a codex spawn
+/// performs: an inherited `CLAUDE_CONFIG_DIR` is scrubbed only when it names
+/// a tree clauth built, never the operator's own custom dir.
+pub(crate) fn is_clauth_runtime_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_runtime_dir_name)
+        && path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            == Some(std::ffi::OsStr::new("profiles"))
+}
+
 /// Sibling of [`is_runtime_dir_name`] for marker dirs.
 fn is_sessions_dir_name(name: &str) -> bool {
     is_paired_dir_name(name, SESSIONS_STEM)
@@ -270,6 +310,30 @@ pub(crate) fn sid_of_runtime_dir_name(name: &str) -> Option<String> {
     rest.strip_prefix('-')
         .filter(|s| is_session_id(s))
         .map(str::to_string)
+}
+
+/// Whether `name` is a codex session home (`codex-home*` under a profile dir)
+/// — the codex counterpart of [`is_shared_runtime_dir_name`] for
+/// session-to-profile attribution.
+pub(crate) fn is_codex_home_dir_name(name: &str) -> bool {
+    name.starts_with(CODEX_HOME_STEM)
+}
+
+/// Whether `path` is a codex session home by POSITION as well as name:
+/// `…/profiles/<name>/codex-home*`. The positional half matters — the profile
+/// charset allows a profile literally named `codex-home`, and
+/// `profiles/codex-home` is a profile dir, not a home. The ONE spelling of
+/// that rule: the perms sweep asks it as a bool, `which`'s codex arm extracts
+/// the profile name off the same predicate.
+pub(crate) fn is_codex_home_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_codex_home_dir_name)
+        && path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            == Some(std::ffi::OsStr::new("profiles"))
 }
 
 /// The sessions dir paired with a runtime dir of this name, per the module's one
@@ -799,6 +863,92 @@ pub(crate) fn gc_stale_runtimes() {
     gc_live_session_rows();
     gc_bare_markers();
     crate::hook_note::gc_conversation_records();
+    gc_codex_homes();
+}
+
+/// True for a PER-SESSION codex home name — `codex-home-<sid>` /
+/// `codex-home-isolated-<sid>` — the strict form GC may `remove_dir_all`.
+/// The bare stems (the durable store, and fake mode's shared home) are
+/// deliberately NOT matched: `rest.is_empty()` is excluded, unlike
+/// [`is_paired_dir_name`], because the bare codex home holds state that must
+/// outlive every session.
+fn is_per_session_codex_home_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(CODEX_HOME_STEM) else {
+        return false;
+    };
+    let rest = rest.strip_prefix("-isolated").unwrap_or(rest);
+    rest.strip_prefix('-').is_some_and(is_session_id)
+}
+
+/// Collect codex session homes whose session died without teardown. The
+/// claude GC's pairing rule cannot see these (a codex home matches no
+/// `runtime*` stem — by design, so the reconcilers never touch it), and the
+/// marker-dir orphan branch reaps the SESSIONS dir on its own — which would
+/// leave the home tree unpairable and immortal. Same liveness rule as every
+/// other sweep: a dir whose paired marker dir holds a live flock is spared,
+/// and so is one whose liveness cannot be READ (unknown reads as live).
+fn gc_codex_homes() {
+    let Ok(root) = profiles_root_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut candidates: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for profile in entries.flatten() {
+        let profile = profile.path();
+        let Ok(children) = std::fs::read_dir(&profile) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let file_name = child.file_name();
+            let Some(child_name) = file_name.to_str() else {
+                continue;
+            };
+            if !is_per_session_codex_home_name(child_name) {
+                continue;
+            }
+            // `codex-home<rest>` pairs with `sessions<rest>` — the same
+            // `<rest>` convention the runtime pairing uses. A missing marker
+            // dir reads as DEAD, not live: the acquire creates the marker
+            // before the home, so a home with no marker dir is a crashed
+            // teardown's leftover, and sparing it would be the immortality
+            // this sweep exists to end.
+            let Some(rest) = child_name.strip_prefix(CODEX_HOME_STEM) else {
+                continue;
+            };
+            candidates.push((child.path(), profile.join(format!("{SESSIONS_STEM}{rest}"))));
+        }
+    }
+    // Peek before locking, like `gc_bare_markers`: nothing to collect must not
+    // pay the state flock's wait, which a macOS switch legitimately holds for
+    // ~20s. A home that appears after the peek is the next sweep's, which is
+    // the whole contract of a best-effort GC.
+    if candidates.is_empty() {
+        return;
+    }
+    let _ = with_state_lock(|_held| {
+        for (home, sessions) in candidates {
+            // The liveness read and the removal BOTH belong under the state
+            // lock, because the acquire's whole critical section runs under it
+            // and the marker's flock is taken AFTER the home is built. Read
+            // unlocked, the entire `build_codex_home` window shows a home
+            // present beside a marker dir that is empty — indistinguishable
+            // from a crash's leftover — and this sweep would reap a session
+            // that is starting. Under the lock the only two states left are
+            // "not begun" (no home) and "finished" (flock held).
+            let dead = if sessions.exists() {
+                matches!(live_sessions_at(&sessions), Some(0))
+            } else {
+                true
+            };
+            if dead {
+                let _ = std::fs::remove_dir_all(&home);
+                let _ = std::fs::remove_dir(&sessions);
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
 }
 
 fn gc_runtime_trees() {
@@ -956,10 +1106,11 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
 /// [`has_live_session`], which also counts shared sessions) and on the projects
 /// dir existing, so a shared-only or not-yet-written runtime is skipped.
 /// Fail-soft: an unreadable profiles root or entry is skipped, never an error.
-#[allow(
-    dead_code,
-    reason = "consumed by the session index (src/sessions.rs), wired into a surface in a later phase"
-)]
+///
+/// Claude-only by roster, not by accident: the session index this feeds reads
+/// Claude Code transcripts, and a codex profile's dir — which sits in the same
+/// root — is skipped outright rather than relying on it never containing a
+/// `runtime-isolated*` child.
 pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(root) = profiles_root_dir() else {
         return Vec::new();
@@ -967,12 +1118,22 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let claude_roster: Vec<String> = crate::profile::claude_roster_names()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
     let mut out = Vec::new();
     for profile in entries.flatten() {
         let profile_name = profile.file_name();
         let Some(profile_name) = profile_name.to_str() else {
             continue;
         };
+        // Claude-first for a dual-claimed name, like every other site.
+        if codex.holds(profile_name) && !claude_roster.iter().any(|p| p == profile_name) {
+            continue;
+        }
         let profile_path = profile.path();
         let Ok(children) = std::fs::read_dir(&profile_path) else {
             continue;
@@ -2172,6 +2333,7 @@ impl ProfileRuntime {
             let row = crate::live_sessions::LiveSession::starting(
                 &session,
                 name,
+                crate::harness::Harness::Claude,
                 isolation == Isolation::Isolated,
                 opt_in,
                 // The SAME value the runtime tree is built from below, so the
@@ -2446,16 +2608,6 @@ impl Drop for ProfileRuntime {
     }
 }
 
-/// A [`Command`](std::process::Command) for the `claude` CLI, resolved so an
-/// npm-installed shim launches on Windows too. Rust's bare `Command::new`
-/// appends only `.exe` and skips `PATHEXT`, so a `claude.cmd`/`claude.bat` (npm
-/// global) is invisible and `start`/`delegate` fail with "program not found"
-/// even though the user runs `claude` fine by hand. `which_all` enumerates every
-/// `PATHEXT` match in `PATH` order; we prefer a native `.exe` over a `.cmd`/
-/// `.bat` shim whenever both resolve (the shim adds a cmd.exe hop, and PATH dir
-/// order could otherwise surface it first), else take the first match and let
-/// std route it through cmd.exe with hardened escaping (post-CVE-2024-24576).
-/// Unix keeps the bare lookup.
 /// clauth-owned env keys that must reach the spawned `claude` only via the
 /// target profile's runtime `settings.json`, never inherited from the parent
 /// process. A parent `claude` running profile A had these written into its own
@@ -2520,9 +2672,31 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
     }
 }
 
+/// A [`Command`](std::process::Command) for the `claude` CLI — see
+/// [`resolve_cli_command`] for the Windows shim story.
 pub(crate) fn claude_command() -> std::process::Command {
+    resolve_cli_command("claude")
+}
+
+/// The codex CLI, resolved the same way — one home for the Windows shim
+/// quirk, so a second harness cannot re-learn it wrong.
+pub(crate) fn codex_command() -> std::process::Command {
+    resolve_cli_command("codex")
+}
+
+/// Resolve `name` into a spawnable [`Command`](std::process::Command) so an
+/// npm-installed shim launches on Windows too. Rust's bare `Command::new`
+/// appends only `.exe` and skips `PATHEXT`, so a `<name>.cmd`/`<name>.bat`
+/// (npm global) is invisible and `start`/`delegate` fail with "program not
+/// found" even though the user runs the CLI fine by hand. `which_all`
+/// enumerates every `PATHEXT` match in `PATH` order; we prefer a native
+/// `.exe` over a `.cmd`/`.bat` shim whenever both resolve (the shim adds a
+/// cmd.exe hop, and PATH dir order could otherwise surface it first), else
+/// take the first match and let std route it through cmd.exe with hardened
+/// escaping (post-CVE-2024-24576). Unix keeps the bare lookup.
+fn resolve_cli_command(name: &str) -> std::process::Command {
     #[cfg(windows)]
-    if let Ok(matches) = which::which_all("claude") {
+    if let Ok(matches) = which::which_all(name) {
         let all: Vec<std::path::PathBuf> = matches.collect();
         let chosen = all
             .iter()
@@ -2532,7 +2706,7 @@ pub(crate) fn claude_command() -> std::process::Command {
             return std::process::Command::new(path);
         }
     }
-    std::process::Command::new("claude")
+    std::process::Command::new(name)
 }
 
 /// Test-only [`detect_link_mode`] override. `try_real_symlink` always succeeds
@@ -2554,6 +2728,30 @@ fn set_link_mode_override(mode: LinkMode) {
 fn clear_link_mode_override() {
     if let Ok(mut guard) = LINK_MODE_OVERRIDE.lock() {
         *guard = None;
+    }
+}
+
+/// Test-only RAII: force the fake-symlink transport for every subsequent
+/// `detect_link_mode` for the guard's lifetime, clearing the process-global
+/// override on drop even if the test panics — so a Fake mode can never leak
+/// into a concurrent test. Without exposing the private `LinkMode` enum.
+/// Serialized against other override users by `HOME_TEST_LOCK`, which the
+/// caller already holds via its `HomeSandbox`.
+#[cfg(test)]
+pub(crate) struct ForcedFakeLinkMode;
+
+#[cfg(test)]
+impl ForcedFakeLinkMode {
+    pub(crate) fn new() -> Self {
+        set_link_mode_override(LinkMode::Fake);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedFakeLinkMode {
+    fn drop(&mut self) {
+        clear_link_mode_override();
     }
 }
 
@@ -3778,6 +3976,567 @@ fn link_entry(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn link_entry(_src: &Path, _dst: &Path) -> Result<()> {
     anyhow::bail!("clauth start requires symlink support");
+}
+
+// ── codex session homes ──────────────────────────────────────────────────────
+//
+// The codex runtime mirrors the claude runtime: per-session, keyed by the same
+// minted sid, marker-flock liveness through the same `sessions[-isolated]-<sid>`
+// dirs (which is what makes `has_live_session` — and so delete/disable/rotation
+// gating — work for codex with no harness awareness), registered in the same
+// live-session registry with the codex tag. What it does NOT mirror: no swap
+// executor, no settings/claude-json watchdog legs, no legacy marker (a binary
+// old enough to probe the bare marker dirs predates codex profiles entirely and
+// never gates on their names), and no wipe of the profile-global store.
+
+/// The stem of a codex home of this flavor. Both spell a `codex-home` prefix,
+/// so [`is_codex_home_dir_name`] covers every variant, and neither matches the
+/// `runtime*`/`sessions*` predicates GC and the config reconcilers act on.
+fn codex_home_stem(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::Shared => CODEX_HOME_STEM,
+        Isolation::Isolated => "codex-home-isolated",
+    }
+}
+
+/// The `(home, sessions)` dir names a codex session of this flavor uses under
+/// this transport — [`paired_dir_names`]'s codex twin, with the same
+/// [`LinkMode::Fake`] collapse to the bare stems. Under the bare SHARED stem
+/// the home is the profile-global store itself, which is the fake-mode sharing
+/// story in one line: no symlinks, so the durable state is simply lived in.
+fn codex_paired_dir_names(isolation: Isolation, session: &str, mode: LinkMode) -> (String, String) {
+    let suffix = match mode {
+        LinkMode::Real => format!("-{session}"),
+        LinkMode::Fake => String::new(),
+    };
+    (
+        format!("{}{suffix}", codex_home_stem(isolation)),
+        format!("{}{suffix}", isolation.sessions_stem()),
+    )
+}
+
+/// Whether `name`'s sessions run under the fake-symlink transport — where a
+/// codex session home holds a COPY of `auth.json`, not a symlink to the
+/// store. The standby refresh reads this: under real symlinks a live session
+/// reads the very file a rotation writes (codex reloads before spending, the
+/// guard serializes), but under fake mode it holds a separate carrier, so a
+/// store rotation would spend a token the session still holds. Only meaningful
+/// when the profile dir exists (a live session guarantees it).
+pub(crate) fn profile_uses_fake_transport(name: &str) -> bool {
+    let Ok(dir) = profile_dir(&ProfileName::from(name)) else {
+        return false;
+    };
+    matches!(detect_link_mode(&dir), Ok(LinkMode::Fake))
+}
+
+/// The durable per-profile codex store, `profiles/<name>/codex-home` — the
+/// symlink target for the state that must outlive one session (the sqlite
+/// stores, `history.jsonl`), and the destination of the teardown sessions
+/// sync-back.
+fn codex_global_home(name: &str) -> Result<PathBuf> {
+    profile_subpath(&ProfileName::from(name), CODEX_HOME_STEM)
+}
+
+/// The config keys a clauth-built codex home must not inherit, whatever the
+/// operator set for their own `~/.codex`. Each one lets a session read or write
+/// outside the boundary the home exists to draw:
+///
+/// - `sqlite_home` moves the state DBs, so every profile's
+///   goals/logs/memories/state land in one directory and the home's durable
+///   links are never opened through.
+/// - `cli_auth_credentials_store` makes codex ignore the linked `auth.json` and
+///   delete it on the first refresh (decision 6).
+/// - `debug.config_lockfile` replays a lockfile as the WHOLE effective config:
+///   `ConfigLayerStack::new(vec![lock_layer], ..)` (codex `core/src/config/mod.rs`)
+///   rebuilds from one layer, so the `-c` layer carrying both forced overrides
+///   is not outranked but ERASED.
+///
+/// The first two are also pinned by a forced `-c` at spawn. Stripping them here
+/// too is deliberate: the third key is what makes a `-c` alone insufficient, and
+/// a defense that only holds while the layer stack survives is not one.
+const CODEX_CONFIG_STRIP_KEYS: &[&str] = &["sqlite_home", "cli_auth_credentials_store"];
+const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile")];
+
+/// Copy the operator's `config.toml` into a session home with the escape keys
+/// removed. An unparseable config copies through verbatim: codex will reject it
+/// the same way, and a session that cannot start is a better answer than one
+/// silently reshaped by a parse this function got wrong. Comments and key order
+/// are lost in the rewrite, which costs nothing — the copy is codex's to write
+/// in place and is discarded at teardown, never synced back over the original.
+fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
+    let raw = match std::fs::read_to_string(src) {
+        Ok(raw) => raw,
+        Err(_) => return copy_file(src, dst),
+    };
+    let Ok(mut parsed) = toml::from_str::<toml::Value>(&raw) else {
+        return copy_file(src, dst);
+    };
+    let Some(table) = parsed.as_table_mut() else {
+        return copy_file(src, dst);
+    };
+    let mut stripped = false;
+    for key in CODEX_CONFIG_STRIP_KEYS {
+        stripped |= table.remove(*key).is_some();
+    }
+    for (parent, key) in CODEX_CONFIG_STRIP_SUBKEYS {
+        if let Some(sub) = table.get_mut(*parent).and_then(toml::Value::as_table_mut) {
+            stripped |= sub.remove(*key).is_some();
+        }
+    }
+    if !stripped {
+        return copy_file(src, dst);
+    }
+    let rendered = toml::to_string(&parsed)
+        .with_context(|| format!("failed to re-render {}", src.display()))?;
+    crate::profile::atomic_write_600(dst, rendered.as_bytes())
+        .with_context(|| format!("failed to write {}", dst.display()))
+}
+
+/// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
+/// table) plus the history file — per-session paths symlinked into the
+/// profile-global home so memory survives session teardown. The companions
+/// ride along deliberately: a write through a dangling symlink CREATES its
+/// target, so the bytes land in the store whichever path sqlite derives the
+/// auxiliary names from — linking them makes the layout correct without
+/// betting on sqlite's symlink resolution. A store name a future codex adds
+/// stays per-session until this list learns it — a bounded, visible
+/// degradation, against silently linking anything.
+/// The rollout roots a codex home keeps side by side: live threads under
+/// `sessions/`, and the ones the operator archived under `archived_sessions/`
+/// (codex `rollout/src/lib.rs`). Archiving MOVES a rollout between them, so a
+/// sync-back that names only the first turns "archive this thread" into
+/// "delete it at teardown" — the one operation whose whole promise is that the
+/// thread is kept.
+const CODEX_ROLLOUT_ROOTS: &[&str] = &["sessions", "archived_sessions"];
+
+const CODEX_DURABLE_ENTRIES: &[&str] = &[
+    "goals_1.sqlite",
+    "goals_1.sqlite-wal",
+    "goals_1.sqlite-shm",
+    "logs_2.sqlite",
+    "logs_2.sqlite-wal",
+    "logs_2.sqlite-shm",
+    "memories_1.sqlite",
+    "memories_1.sqlite-wal",
+    "memories_1.sqlite-shm",
+    "state_5.sqlite",
+    "state_5.sqlite-wal",
+    "state_5.sqlite-shm",
+    "thread_history_1.sqlite",
+    "thread_history_1.sqlite-wal",
+    "thread_history_1.sqlite-shm",
+    "history.jsonl",
+];
+
+/// The operator-`~/.codex` entries a SHARED codex session sees — instruction
+/// and extension surfaces, same reasoning as the claude shared runtime linking
+/// the operator's `~/.claude`. `hooks.json` is deliberately absent: hooks
+/// execute code inside a home clauth built, so linking it is a per-profile
+/// opt-in ([`CodexProfileOpts::hooks_json`]), never a default.
+const CODEX_OPERATOR_ENTRIES: &[&str] = &[
+    "skills",
+    "rules",
+    "agents",
+    "templates",
+    "references",
+    "AGENTS.md",
+    // Installed plugins (`plugins/cache`, `plugins/data` — codex
+    // `core-plugins/src/store.rs`) are the operator's tooling, the same family
+    // as skills and rules, so they are LINKED rather than made durable
+    // per-profile: an install reaches every profile and outlives the session
+    // that made it. Unlinked they were neither, and a plugin installed inside a
+    // clauth session died with the home.
+    "plugins",
+];
+
+/// Converge the profile store and a fake-mode home's `auth.json` copy —
+/// newer-mtime wins, content-equal is a no-op. One direction is not enough in
+/// EITHER direction: store→copy alone means a re-capture never reaches the
+/// next session once the copy exists, and — worse — it would overwrite a
+/// chain the last session ROTATED in the copy with the store's now-SPENT
+/// refresh token, which is the permanent-death shape. Copy→store alone means
+/// a re-capture is undone at the next start. The claude fake transport solves
+/// this with a per-tick bidirectional mirror; codex has no watchdog, so its
+/// convergence points are the session boundaries — the build here, and the
+/// teardown — with mid-session divergence staying fake mode's documented
+/// cost.
+fn converge_fake_codex_auth(store: &Path, copy: &Path) -> Result<()> {
+    match (store.exists(), copy.exists()) {
+        (false, false) => Ok(()),
+        (true, false) => copy_file(store, copy),
+        // The store must never lag a chain that exists only in the copy: the
+        // rotation and capture machinery read the STORE.
+        (false, true) => copy_file(copy, store),
+        (true, true) => {
+            if files_match(store, copy).unwrap_or(false) {
+                return Ok(());
+            }
+            let store_m = file_mtime(store);
+            let copy_m = file_mtime(copy);
+            if copy_m > store_m {
+                copy_file(copy, store)
+            } else {
+                copy_file(store, copy)
+            }
+        }
+    }
+}
+
+/// The per-profile codex knobs, read from the profile's own `config.toml` —
+/// the file the reload fingerprint already walks. A codex profile's config is
+/// never read by the claude `load_profile`, so this minimal shape is its one
+/// reader and unknown keys stay tolerated.
+#[derive(Default, serde::Deserialize)]
+struct CodexProfileOpts {
+    /// Link the operator's `~/.codex/hooks.json` into shared session homes.
+    #[serde(default)]
+    hooks_json: bool,
+}
+
+fn codex_profile_opts(name: &str) -> CodexProfileOpts {
+    let Ok(path) = profile_subpath(&ProfileName::from(name), "config.toml") else {
+        return CodexProfileOpts::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => toml::from_str(&raw).unwrap_or_default(),
+        Err(_) => CodexProfileOpts::default(),
+    }
+}
+
+/// Build one codex session home. Additive over an existing tree, like the
+/// claude build: a link already in place is left alone, so a rebuild over a
+/// live shared tree cannot yank entries out from under a sibling.
+///
+/// The table (from the codex plan):
+/// - `auth.json` — under real symlinks, BOTH flavors link the profile's own
+///   `profiles/<name>/auth.json`: one physical file is what makes concurrent
+///   carriers safe (codex's own reload-and-skip handles codex-vs-codex, the
+///   rotation guard handles clauth-vs-codex). Under [`LinkMode::Fake`] it is
+///   a copy — the same consequences the claude fake-mode credential copy
+///   already documents, sharpened by codex's single-use refresh chain: the
+///   copy is a second carrier whose refreshes strand the store, and a
+///   fake-mode host accepts that or does not run codex sessions.
+/// - `config.toml` — a COPY of the operator's (codex writes it in place, so a
+///   link would mutate the operator's own file). Absent operator config copies
+///   nothing.
+/// - the operator surfaces ([`CODEX_OPERATOR_ENTRIES`]) — shared flavor only,
+///   links (fake: copies); isolated links nothing from the operator.
+/// - the durable stores ([`CODEX_DURABLE_ENTRIES`]) — shared flavor under real
+///   symlinks: links into the profile-global home, dangling until codex
+///   creates through them, which is the point. Isolated: per-session. Fake:
+///   the home IS the global store, nothing to link.
+/// - `sessions/` — always a real per-home dir; the shared flavor's is synced
+///   back into the global store at teardown.
+fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMode) -> Result<()> {
+    let operator = home_dir()?.join(".codex");
+    let global = codex_global_home(name)?;
+    let auth_store = profile_subpath(&ProfileName::from(name), "auth.json")?;
+
+    let place = |src: &Path, dst: &Path| -> Result<()> {
+        if dst.symlink_metadata().is_ok() || !src.exists() {
+            return Ok(());
+        }
+        match mode {
+            LinkMode::Real => link_entry(src, dst),
+            LinkMode::Fake => copy_tree(src, dst),
+        }
+    };
+
+    // The one physical auth.json. Placed even while the store is absent (a
+    // captured login can arrive after the first start): a dangling link reads
+    // as "no credentials" to codex today and as the store the moment it
+    // exists. Under Fake the store and the home's copy CONVERGE at every
+    // session boundary (here, and again at teardown) — see
+    // [`converge_fake_codex_auth`] for why one direction is not enough.
+    let auth_dst = home.join("auth.json");
+    match mode {
+        LinkMode::Real => {
+            if auth_dst.symlink_metadata().is_err() {
+                link_entry(&auth_store, &auth_dst)?;
+            }
+        }
+        LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst)?,
+    }
+
+    let operator_config = operator.join("config.toml");
+    if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
+        copy_codex_config(&operator_config, &home.join("config.toml"))?;
+    }
+    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the
+    // base config, and CODEX_HOME is this session home — so without these the
+    // flag resolves to an empty layer and silently runs the base config. They
+    // are sanitized like the base file: a layer can spell the same escapes.
+    if let Ok(entries) = std::fs::read_dir(&operator) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".config.toml") {
+                continue;
+            }
+            let dst = home.join(name);
+            if dst.symlink_metadata().is_err() {
+                copy_codex_config(&entry.path(), &dst)?;
+            }
+        }
+    }
+
+    if isolation == Isolation::Shared {
+        for entry in CODEX_OPERATOR_ENTRIES {
+            place(&operator.join(entry), &home.join(entry))?;
+        }
+        if codex_profile_opts(name).hooks_json {
+            place(&operator.join("hooks.json"), &home.join("hooks.json"))?;
+        }
+        if mode == LinkMode::Real {
+            crate::profile::mkdir_700(&global)
+                .with_context(|| format!("failed to create {}", global.display()))?;
+            for entry in CODEX_DURABLE_ENTRIES {
+                let dst = home.join(entry);
+                if dst.symlink_metadata().is_err() {
+                    link_entry(&global.join(entry), &dst)?;
+                }
+            }
+        }
+    }
+
+    crate::profile::mkdir_700(&home.join("sessions"))
+        .with_context(|| format!("failed to create {}", home.join("sessions").display()))?;
+    Ok(())
+}
+
+/// Live codex session guard — the codex [`ProfileRuntime`]. On drop: syncs the
+/// shared flavor's `sessions/` back into the profile-global store, drops the
+/// registry row and marker, and removes the per-session home; the bare
+/// `codex-home` (the durable store, and the fake-mode shared home) is never
+/// removed.
+pub(crate) struct CodexRuntime {
+    home: PathBuf,
+    sessions: PathBuf,
+    pid_file: PathBuf,
+    session: SessionId,
+    profile: String,
+    isolation: Isolation,
+    mode: LinkMode,
+    _pid_lock: File,
+}
+
+impl CodexRuntime {
+    pub(crate) fn acquire(name: &str, isolation: Isolation) -> Result<Self> {
+        let owned = ProfileName::from(name);
+        let profile_root = profile_dir(&owned)?;
+        // Same ordering rule as the claude acquire: RotationGuard outermost,
+        // state flock inside. What it buys here is the row: `launch_store` and
+        // the marker must be visible before any clauth-side codex rotation
+        // (phase 4) can decide against this profile, or the rotation gate
+        // reads the account as idle while a session is mid-start on it.
+        let _rotation_guard = RotationGuard::acquire(&owned)?;
+
+        let (session, home, sessions, pid_file, pid_lock, mode) = with_state_lock(|_held| {
+            crate::profile::mkdir_700(&profile_root)
+                .with_context(|| format!("failed to create {}", profile_root.display()))?;
+            let mode = detect_link_mode(&profile_root)?;
+            let mut session = SessionId::mint();
+            let (mut home_name, mut sessions_name) =
+                codex_paired_dir_names(isolation, session.as_str(), mode);
+            for _ in 0..SID_COLLISION_REMINTS {
+                let pid_file = profile_subpath(&owned, &sessions_name)?.join(session.as_str());
+                if !is_session_alive(&pid_file) {
+                    break;
+                }
+                session = SessionId::mint();
+                (home_name, sessions_name) =
+                    codex_paired_dir_names(isolation, session.as_str(), mode);
+            }
+            let home = profile_subpath(&owned, &home_name)?;
+            let sessions = profile_subpath(&owned, &sessions_name)?;
+            let pid_file = sessions.join(session.as_str());
+
+            // Decision 8 lets codex sessions run concurrently because they share
+            // ONE physical auth.json. Under Fake there is no sharing: the two
+            // flavors collapse to DIFFERENT bare stems, each holding its own
+            // COPY converged from the same store. Two live flavors are then two
+            // carriers of one single-use chain with no reload-and-skip between
+            // them (codex's own answer needs one inode), and the first refresh
+            // on either side strands the other for good. Same flavor is fine —
+            // that IS one home. Refusing is what the premise actually supports.
+            if mode == LinkMode::Fake {
+                let other = isolation.other();
+                let (_, other_sessions_name) =
+                    codex_paired_dir_names(other, session.as_str(), mode);
+                let other_sessions = profile_subpath(&owned, &other_sessions_name)?;
+                if other_sessions.exists() && !matches!(live_sessions_at(&other_sessions), Some(0))
+                {
+                    anyhow::bail!(
+                        "'{name}' already has a live {other} codex session, and this host \
+                         cannot symlink — the two would hold SEPARATE copies of one \
+                         single-use chain, and the first refresh on either strands the \
+                         other. Close it before starting a {isolation} one"
+                    );
+                }
+            }
+
+            crate::profile::mkdir_700(&sessions)
+                .with_context(|| format!("failed to create {}", sessions.display()))?;
+            let active = prune_stale_sessions(&sessions).unwrap_or(1);
+            // A dead session's leftovers under a recycled sid are rebuilt from
+            // scratch — but ONLY a genuinely per-session home. Testing the
+            // SHARED bare stem alone was not enough: under Fake every name is
+            // sid-free, so the isolated home (`codex-home-isolated`) read as
+            // per-session and was wiped. That home holds a physical auth.json
+            // COPY, and a session that died before Drop could converge leaves
+            // the rotated chain nowhere else — the wipe destroyed it, and
+            // `build_codex_home` then converged the SPENT store token back out
+            // for codex to replay into `refresh_token_reused`. The predicate
+            // that already answers this correctly demands a session id, so
+            // both bare stems keep the state that must outlive a session.
+            if active == 0
+                && home
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_per_session_codex_home_name)
+                && home.symlink_metadata().is_ok()
+            {
+                std::fs::remove_dir_all(&home)
+                    .with_context(|| format!("failed to clear {}", home.display()))?;
+            }
+            crate::profile::mkdir_700(&home)
+                .with_context(|| format!("failed to create {}", home.display()))?;
+            build_codex_home(&home, name, isolation, mode)?;
+
+            let file = open_pid_file(&pid_file)
+                .with_context(|| format!("failed to open {}", pid_file.display()))?;
+            if let Err(e) = file.try_lock() {
+                anyhow::bail!(
+                    "failed to claim session marker {}: {e}. Another live process \
+                     holds this session id",
+                    pid_file.display()
+                );
+            }
+
+            // Register inside the same hold, marker already flock-held — the
+            // row never exists without a liveness signal. `launch_store` is
+            // the auth.json THIS SESSION READS — which is what the rotation
+            // refusal must test (the #59 review's one-liner, honored by
+            // intent): under real symlinks the home's auth.json IS
+            // profiles/<name>/auth.json, and under the fake transport it is
+            // the copy the session actually holds, where the accepted
+            // spelling would name a file the session never reads.
+            let row = crate::live_sessions::LiveSession::starting(
+                &session,
+                name,
+                crate::harness::Harness::Codex,
+                isolation == Isolation::Isolated,
+                false,
+                Some(home.join("auth.json")),
+            );
+            if let Err(e) = crate::live_sessions::register(&row) {
+                logline!("clauth: registering the live codex session failed: {e}");
+            }
+            Ok::<_, anyhow::Error>((session, home, sessions, pid_file, file, mode))
+        })?;
+
+        Ok(Self {
+            home,
+            sessions,
+            pid_file,
+            session,
+            profile: name.to_string(),
+            isolation,
+            mode,
+            _pid_lock: pid_lock,
+        })
+    }
+
+    /// The home this session's `CODEX_HOME` pins.
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+}
+
+impl Drop for CodexRuntime {
+    fn drop(&mut self) {
+        // The teardown half of the fake-mode auth convergence: a chain the
+        // session rotated in the copy reaches the store NOW, not at some next
+        // start that may never come — and a rotation or capture between
+        // sessions reads a store that is not stale.
+        if self.mode == LinkMode::Fake
+            && let Ok(store) =
+                profile_subpath(&ProfileName::from(self.profile.as_str()), "auth.json")
+            && let Err(e) = converge_fake_codex_auth(&store, &self.home.join("auth.json"))
+        {
+            logline!("clauth: codex auth converge at teardown failed: {e:#}");
+        }
+        // Sync the shared flavor's sessions back into the durable store so a
+        // rollout survives its session — best-effort, never failing a
+        // completed session, and a no-op when the home IS the store (fake
+        // shared) or the flavor discards by design (isolated).
+        if self.isolation == Isolation::Shared
+            && self.mode == LinkMode::Real
+            && let Ok(global) = codex_global_home(&self.profile)
+        {
+            // codex's own corrupt-DB recovery RENAMES the path it was handed
+            // (`state/src/runtime/recovery.rs`) — and the path it was handed is
+            // our symlink, so the rename moves the LINK into the home's
+            // db-backups and codex writes a fresh REAL file in its place. The
+            // corrupt bytes stay in the store untouched, so without this the
+            // healed DB dies with the session and every later one relinks to the
+            // same corruption and recovers again, forever. A regular file where
+            // this build placed a link is exactly that signal.
+            for entry in CODEX_DURABLE_ENTRIES {
+                let healed = self.home.join(entry);
+                let Ok(meta) = healed.symlink_metadata() else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    continue;
+                }
+                if let Err(e) = copy_file(&healed, &global.join(entry)) {
+                    logline!("clauth: codex {entry} recovery sync-back failed: {e:#}");
+                }
+            }
+
+            for rollout_root in CODEX_ROLLOUT_ROOTS {
+                let src = self.home.join(rollout_root);
+                if !src.is_dir() {
+                    continue;
+                }
+                // Owner-only from birth: the sweep stops at the codex-home
+                // threshold, so nothing retightens what lands loose here, and
+                // rollouts are chat content.
+                let _ = crate::profile::mkdir_700(&global);
+                let _ = crate::profile::mkdir_700(&global.join(rollout_root));
+                if let Err(e) = copy_tree(&src, &global.join(rollout_root)) {
+                    logline!("clauth: codex {rollout_root} sync-back failed: {e:#}");
+                }
+            }
+        }
+
+        if let Err(e) = with_state_lock(|_held| {
+            if let Err(e) = crate::live_sessions::unregister(self.session.as_str()) {
+                logline!("clauth: unregistering the live codex session failed: {e}");
+            }
+            if let Err(e) = std::fs::remove_file(&self.pid_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                logline!("clauth: remove pid file failed: {e}");
+            }
+            let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
+            if still_active == 0 {
+                // Never the bare stem: under Fake the shared home is the
+                // profile's durable store, and removing it would be removing
+                // the profile's memory because the last session left.
+                if self.home.file_name().and_then(|n| n.to_str()) != Some(CODEX_HOME_STEM) {
+                    let _ = std::fs::remove_dir_all(&self.home);
+                }
+                let _ = std::fs::remove_dir(&self.sessions);
+            }
+            Ok::<_, anyhow::Error>(())
+        }) {
+            logline!("clauth: codex session teardown failed: {e:#}");
+        }
+    }
 }
 
 #[cfg(test)]

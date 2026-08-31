@@ -156,21 +156,63 @@ struct EnvOnlyConfig {
 /// Union of every profile's custom `[env]` keys. A missing `config.toml` is a
 /// profile with no overrides and contributes nothing.
 ///
-/// `None` when a `config.toml` cannot be read or parsed: that profile's
-/// per-profile env set is then unknown, and [`sync_members`] skips the merge
-/// rather than treat its keys as shared and leak them into a sibling.
-/// Fail-closed, and self-healing — a config caught mid-edit reads cleanly on the
+/// `None` when a `config.toml` cannot be read or parsed — or when the codex
+/// roster (which decides whose dirs this walk skips) cannot be: the affected
+/// profiles' env sets are then unknown, and [`sync_members`] skips the merge
+/// rather than treat their keys as shared and leak them into a sibling.
+/// Fail-closed, and self-healing — a file caught mid-edit reads cleanly on the
 /// next tick. Because that pauses settings sync entirely, the first failure is
 /// logged; the latch keeps the watchdog's ~10 Hz retry from flooding the log,
 /// and clears on the next clean read so a recurrence is reported again.
 fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     let mut keys = BTreeSet::new();
+    // The union must cover every profile the MEMBER SET can contain, and the
+    // members (`known_paths` → `shared_runtime_dirs`) are DIRECTORY-derived —
+    // so the union walks the same directory listing. A roster-driven union
+    // would let an off-roster dir (the partial-save drift
+    // `sync_state_profiles` exists to repair) keep merging its runtime
+    // settings while its `[env]` keys read as shared: the exact leak this fn
+    // fails closed against. What the codex split changes is only WHOSE dirs
+    // belong to this subsystem: a dir the codex roster claims is skipped — it
+    // can never become a member (a codex home matches no `runtime*` stem) —
+    // so a codex `[env]` can neither join the union nor, unparseable, pause a
+    // claude-only sync. An unreadable codex roster pauses: unknown
+    // membership is unknown union coverage, and fail-closed is the direction
+    // every other arm here takes.
+    let codex = match crate::codex_profiles::CodexState::load() {
+        Ok(state) => state,
+        Err(e) => {
+            let path = clauth_dir().ok()?.join("codex-profiles.toml");
+            return warn_paused(
+                &path,
+                &format!("did not yield the codex roster ({})", e.root_cause()),
+            );
+        }
+    };
+    let claude_roster: Vec<String> = crate::profile::claude_roster_names()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
     let profiles = clauth_dir().ok()?.join("profiles");
     let Ok(entries) = std::fs::read_dir(&profiles) else {
         return Some(keys);
     };
     for entry in entries.flatten() {
         if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        // Claude-FIRST for a name both files claim, the precedence pinned at
+        // every other resolution site (`cmd_switch`, `cmd_start`). Skipping on
+        // the codex roster alone inverted it here: a hand-edited dual claim
+        // (uniqueness is enforced at creation, never against edited state) made
+        // this arm treat the name as codex-only and skip the very dir whose
+        // `[env]` leak it exists to catch.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| codex.holds(name) && !claude_roster.iter().any(|p| p == name))
+        {
             continue;
         }
         let path = entry.path().join("config.toml");
@@ -188,14 +230,14 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
     Some(keys)
 }
 
-/// Report the first `config.toml` failure that pauses settings sync, then latch.
+/// Report the first file failure that pauses settings sync, then latch.
 /// Always returns `None` so callers can `return warn_paused(..)` directly.
 fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     if !ENV_KEYS_WARNED.swap(true, Ordering::Relaxed) {
         logline!(
             "clauth: settings.json sync paused — {} {reason}; \
-             that profile's custom [env] keys are unknown, so no settings are \
-             synced until it reads cleanly",
+             the affected profiles' custom [env] keys are unknown, so no \
+             settings are synced until it reads cleanly",
             path.display()
         );
     }

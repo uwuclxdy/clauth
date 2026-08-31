@@ -54,6 +54,52 @@ impl Source {
 }
 
 pub(crate) fn run(json: bool) -> Result<()> {
+    // The codex arm, OUTRANKED by a claude session-dir claim: env vars
+    // inherit, so a claude session started from inside a codex session
+    // carries the ancestor's CODEX_HOME — but its own CLAUDE_CONFIG_DIR names
+    // a clauth runtime, which is this process's identity. Only when no clauth
+    // claude runtime claims the asker does a clauth-shaped CODEX_HOME answer.
+    // And a clauth-SHAPED home answers or answers unknown — never falls
+    // through: the claude tiers below would attribute a codex session to
+    // whatever the GLOBAL ~/.claude credentials resolve to, a different
+    // harness's answer entirely. A CODEX_HOME that is not a clauth codex home
+    // (the operator's own ~/.codex) says nothing and falls through.
+    if !claude_session_dir_claims_this_process() {
+        match codex_session_profile() {
+            CodexClaim::Member(name) => {
+                if json {
+                    outln!("{}", codex_json_view(&name));
+                } else {
+                    emit_plain(Some(&name));
+                }
+                return Ok(());
+            }
+            CodexClaim::UnknownHome => {
+                // Shaped like ours, naming no stored codex profile (or the
+                // roster was unreadable): the same fail-closed answer the
+                // claude session-dir tier gives an unrecognized runtime —
+                // unknown, not somebody else's profile.
+                if json {
+                    outln!(
+                        "{}",
+                        serde_json::json!({
+                            "profile": serde_json::Value::Null,
+                            "source": serde_json::Value::Null,
+                            "harness": "codex",
+                            "base_url": serde_json::Value::Null,
+                            "tier": serde_json::Value::Null,
+                            "oauth": serde_json::Value::Null,
+                            "active": false,
+                        })
+                    );
+                } else {
+                    emit_plain(None);
+                }
+                return Ok(());
+            }
+            CodexClaim::NotACodexHome => {}
+        }
+    }
     let config = load_config()?;
     let resolved = resolve_active(&config);
 
@@ -63,6 +109,85 @@ pub(crate) fn run(json: bool) -> Result<()> {
         emit_plain(resolved.as_ref().map(|(name, _)| name.as_str()));
     }
     Ok(())
+}
+
+/// Whether this process's `CLAUDE_CONFIG_DIR` names a clauth claude runtime —
+/// the strongest identity claim there is, and the tie-break against an
+/// inherited `CODEX_HOME`.
+fn claude_session_dir_claims_this_process() -> bool {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|d| !d.is_empty())
+        .is_some_and(|dir| session_profile_from_config_dir(Path::new(&dir)).is_some())
+}
+
+/// What a session's `CODEX_HOME` says about it. The three outcomes are
+/// deliberately distinct: only [`CodexClaim::NotACodexHome`] may fall through
+/// to the claude tiers.
+enum CodexClaim {
+    /// A clauth codex home whose profile the roster holds.
+    Member(String),
+    /// Shaped like a clauth codex home, but the roster misses the name or
+    /// could not be read — fail closed, never attribute.
+    UnknownHome,
+    /// Not a clauth codex home at all (unset, empty, or foreign).
+    NotACodexHome,
+}
+
+/// The codex arm off `CODEX_HOME`. Empty env is unset, same as the
+/// `CLAUDE_CONFIG_DIR` rule.
+fn codex_session_profile() -> CodexClaim {
+    match std::env::var_os("CODEX_HOME").filter(|d| !d.is_empty()) {
+        Some(home) => codex_session_profile_at(Path::new(&home)),
+        None => CodexClaim::NotACodexHome,
+    }
+}
+
+/// [`codex_session_profile`] with the path injected, shared with its tests:
+/// parse `profiles/<name>/codex-home*`, then require the codex roster to hold
+/// `<name>` — the membership gate the claude session-dir tier gets from
+/// `config.find`, with the roster miss (and an unreadable roster) reported as
+/// its own outcome rather than collapsed into "not ours".
+fn codex_session_profile_at(home: &Path) -> CodexClaim {
+    let Some(name) = session_profile_from_codex_home(home) else {
+        return CodexClaim::NotACodexHome;
+    };
+    match crate::codex_profiles::CodexState::load() {
+        Ok(state) if state.holds(&name) => CodexClaim::Member(name),
+        Ok(_) | Err(_) => CodexClaim::UnknownHome,
+    }
+}
+
+/// Extract the `<name>` from a clauth codex home path
+/// (`~/.clauth/profiles/<name>/codex-home[-<sid>]`). Returns `None` for any
+/// other shape — the structural twin of [`session_profile_from_config_dir`],
+/// answering off the same predicate the perms sweep asks
+/// ([`crate::runtime::is_codex_home_path`]) so the two can never disagree
+/// about what a codex home is.
+fn session_profile_from_codex_home(dir: &Path) -> Option<String> {
+    if !crate::runtime::is_codex_home_path(dir) {
+        return None;
+    }
+    Some(dir.parent()?.file_name()?.to_str()?.to_string())
+}
+
+/// The `--json` payload for a codex session. The claude-shaped fields keep
+/// their keys with the honest empty answer (`null`) so an existing reader's
+/// indexing stays valid, `active` compares against the CODEX active slot, and
+/// `harness` says which roster answered — the claude payload stays untouched
+/// until the published-surface phase adds its own field.
+fn codex_json_view(name: &str) -> serde_json::Value {
+    let active = crate::codex_profiles::CodexState::load()
+        .ok()
+        .is_some_and(|s| s.active_profile().map(|n| n.as_str()) == Some(name));
+    serde_json::json!({
+        "profile": name,
+        "source": "codex_home",
+        "harness": "codex",
+        "base_url": serde_json::Value::Null,
+        "tier": serde_json::Value::Null,
+        "oauth": serde_json::Value::Null,
+        "active": active,
+    })
 }
 
 /// Gather the session env + loaded credentials and resolve them to the owning
