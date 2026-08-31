@@ -802,9 +802,9 @@ fn json_base_url_is_null_for_an_anthropic_account() {
 }
 
 /// The shape a reader gets wrong: a profile can hold a `base_url` AND stored
-/// OAuth credentials, since setting an endpoint never drops them. On an
-/// UNRECOGNISED endpoint the two fields are independent — `is_third_party` is
-/// `provider.is_some()` and no provider was recognised, so the stored pair's
+/// OAuth credentials, since setting an endpoint never drops them. With no api
+/// key of its own the two fields are independent — `usage_cache_is_third_party`
+/// stays false, its figures still live in the OAuth cache, so the stored pair's
 /// tier still reports while requests route elsewhere.
 #[test]
 fn json_publishes_both_an_endpoint_and_a_tier_for_a_hybrid_profile() {
@@ -820,9 +820,10 @@ fn json_publishes_both_an_endpoint_and_a_tier_for_a_hybrid_profile() {
 }
 
 /// The arm the guard defends, and the limit of the independence above: give the
-/// same hybrid a RECOGNISED provider and `tier_label`'s `is_third_party` exit
-/// fires, so the endpoint's presence does rule the tier out — `null` despite a
-/// stored pair claiming `max`.
+/// same hybrid a RECOGNISED provider and `tier_label`'s
+/// `usage_cache_is_third_party` exit fires (its provider arm), so the
+/// endpoint's presence does rule the tier out — `null` despite a stored pair
+/// claiming `max`.
 #[test]
 fn json_tier_is_null_for_a_recognised_third_party_holding_oauth_creds() {
     let _home = HomeSandbox::new();

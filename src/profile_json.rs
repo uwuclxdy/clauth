@@ -57,7 +57,7 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 /// subscription is canceled, so a `Free` reading already carries it, and the
 /// marker belongs on the status line the way every other surface renders it.
 pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
-    if profile.is_third_party() {
+    if profile.usage_cache_is_third_party() {
         return None;
     }
     let fetched = cached_plan(&profile.name).filter(|p| p.tier != PlanTier::Unknown);

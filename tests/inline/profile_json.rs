@@ -275,6 +275,45 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
     assert_eq!(tier_label(&profile), Some("Max 5x".to_string()));
 }
 
+/// `tier_label` reads the same OAuth cache `published_windows` does, so it
+/// inherits the same leftover: a CONVERTED profile — a `base_url` + key saved on
+/// disk, the `edit_profile_endpoint` shape — publishes no tier even with a
+/// plan-bearing `usage_cache.json` from its earlier OAuth life still on disk:
+/// publishing that leftover rendered `Max 5x` beside the account's new
+/// `generic` label. The OAuth half is the guard's other direction: an account
+/// whose figures do live in the OAuth cache keeps its tier.
+#[test]
+fn tier_label_is_none_for_a_converted_profile() {
+    let _home = HomeSandbox::new();
+    let converted = Profile::new(
+        "litellm".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("k".to_string()),
+    );
+    crate::profile::save_profile(&converted).expect("save the converted profile");
+    let stale_plan = UsageInfo {
+        plan: Some(PlanInfo {
+            tier: PlanTier::Max(Some(5)),
+            subscription_status: None,
+        }),
+        ..Default::default()
+    };
+    seed_usage_cache("litellm", &stale_plan, Duration::from_secs(100));
+
+    assert_eq!(
+        tier_label(&converted),
+        None,
+        "a converted account publishes no Anthropic tier"
+    );
+
+    seed_usage_cache("kerry", &stale_plan, Duration::from_secs(100));
+    assert_eq!(
+        tier_label(&blank_profile(&crate::profile::ProfileName::from("kerry"))),
+        Some("Max 5x".to_string()),
+        "an OAuth account keeps its tier"
+    );
+}
+
 /// The published `provider` field names exactly one of three cases: the
 /// recognised provider's display name, `"anthropic"` for a profile with no
 /// managed endpoint of its own, and `"generic"` for every other endpoint.
