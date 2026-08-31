@@ -319,7 +319,9 @@ fn seed_done_at(job_id: &str, started_at: u64, done_at: Option<u64>) {
 #[test]
 fn gc_reaps_expired_running_and_done_keeps_fresh() {
     let _home = HomeSandbox::new();
-    let now = 10_000_000_000u64; // far-future ms so "fresh" entries read as recent
+    // A synthetic clock, high enough that every TTL this file subtracts from it
+    // stays positive; entries seeded at `now` read as fresh against it.
+    let now = 10_000_000_000u64;
 
     seed_done_at("d-fresh-done", now, Some(now));
     write_running(&spec("d-fresh-run", "p", now)).unwrap();
@@ -439,7 +441,7 @@ fn a_job_still_talking_survives_the_corpse_sweep_however_old_it_is() {
     let now = 10_000_000_000u64;
     let ancient = now - 10 * RUNNING_TTL_MS;
 
-    // Minted half a day ago, said something a second ago: alive.
+    // Minted ten corpse windows ago, said something a second ago: alive.
     write_heartbeat(&spec("d-talking", "p", ancient), now - 1000, "still going").unwrap();
     // Same age, never heard from since the mint: a corpse.
     write_running(&spec("d-silent", "p", ancient)).unwrap();

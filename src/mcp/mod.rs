@@ -2705,8 +2705,9 @@ fn job_id_minted_at(token: &str) -> Option<u64> {
 /// AND carry the never-minted one, rather than asserting a cause and telling the
 /// caller to spend another window on it. Which of the two a caller lands in is
 /// the stamp's accident: the aged branch (the stamp older than
-/// [`jobs::DONE_TTL_MS`]) is the only one a sweep can explain — both reaps run
-/// from a day back, so a younger id cannot have been swept — and collection
+/// [`jobs::DONE_TTL_MS`]) is the only one a sweep can explain — neither reap
+/// runs from less than a day back ([`jobs::RUNNING_TTL_MS`] adds a 600 s
+/// grace on top), so a younger id cannot have been swept — and collection
 /// leads there because every collect evicts while the sweep runs at startup
 /// alone.
 fn unknown_job_reason(job_id: &str, now: u64) -> String {

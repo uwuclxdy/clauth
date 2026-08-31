@@ -59,12 +59,12 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// a deadline derivation: a record whose server died — crash, kill, reboot —
 /// stays resolvable for a day, so the `session_id` it carries can still be
 /// collected and resumed the next morning. Nothing a healthy run does comes
-/// near it: a streaming run is killed by its own idle guard (≤ 3600 s,
-/// `mcp`'s `MAX_RUN_TIMEOUT_SECS`) once silent, and a pinned-`--output-format`
-/// one by its wall clock (also ≤ 3600 s), so once a run has spawned, only a
-/// dead server keeps its record silent for anything close to a day. The 600 s
-/// grace, carried over from the old 3600+600 s window, covers the heartbeat
-/// throttle, the kill and the teardown before `write_done` lands.
+/// near it: whichever deadline a run's shape carries bounds that run's SILENCE,
+/// and `resolve_deadlines` caps it at `mcp`'s `MAX_RUN_TIMEOUT_SECS` (3600 s),
+/// so once a run has spawned, only a dead server keeps its record silent for
+/// anything close to a day. The 600 s grace, carried over from the old
+/// 3600+600 s window, covers the heartbeat throttle, the kill and the teardown
+/// before `write_done` lands.
 ///
 /// "Silent" is measured from the record's own mint (`recorded_at`), not the
 /// run's birth. A blocking delegate handed off mid-flight keeps a `started_at`
@@ -78,11 +78,11 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// reader thread that writes the beats has not spawned yet. Both background
 /// shapes spend that delay silent-since-mint — a streaming run is still inside
 /// the acquire with no child, while a pinned-format one can be well past it,
-/// since the same block plus its 3600 s wall already sits a long run past the
-/// old window with the child spending. The day covers both where 3600+600 s
-/// could not, for a block under roughly a day; `acquire` blocks for as long as
-/// that session lasts, so a block past the day can still overrun it and a live
-/// run's record then reads as a corpse. A blocking run's
+/// since the same block plus a wall at the 3600 s ceiling already sits a long
+/// run past the old window with the child spending. The day covers both where
+/// 3600+600 s could not, for a block under roughly a day; `acquire` blocks for
+/// as long as that session lasts, so a block past the day can still overrun it
+/// and a live run's record then reads as a corpse. A blocking run's
 /// [`RecordKind::Liveness`] record is minted at
 /// the spawn, so the delay is outside its clock entirely and its silence is
 /// bounded by the run's own guards. A handed-off run adds no third exposure:
@@ -160,13 +160,11 @@ pub(crate) struct JobRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) envelope: Option<serde_json::Value>,
     /// Which endpoint this run's requests went to, in the roster's own host
-    /// spelling (`anthropic`, or the host the stored endpoint names). The
-    /// CALL's answer, resolved once when the call was made, because a caller
-    /// `env` override retargets one run without touching the profile and no
-    /// later name-keyed read can recover it. `None` on a record an older
-    /// server wrote or on one whose endpoint could not be resolved at the
-    /// call: the fold reads it as "cannot say" rather than asserting the
-    /// managed field's answer for a call that may have gone elsewhere.
+    /// spelling, as `delegate_call_endpoint` resolved it once at the call:
+    /// stored rather than re-derived because a caller `env` override retargets
+    /// one run without touching the profile, and no later name-keyed read can
+    /// recover it. `None` on a record an older server wrote and on one whose
+    /// endpoint could not be resolved at the call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) endpoint: Option<String>,
     /// The child's own session id, off the first streamed event that carried

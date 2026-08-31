@@ -339,17 +339,16 @@ pub(super) enum WatchOutcome {
 /// fold. Only [`DigestMode::Report`] can put `since_your_last_call` into the
 /// payload.
 pub(super) enum DigestMode<'a> {
-    /// Report (and consume) the delta over all three observables — every
-    /// folded reply except `switch_profile`'s post-mutation arms.
+    /// Report the delta over all three observables and CONSUME it: whatever
+    /// this reply names, the next reporting reply no longer carries.
     Report(&'a DigestTracker),
-    /// Reseed the baseline silently — `switch_profile` after its mutation ran:
-    /// the reply's own `previous`/`active` (or `reason`) is the report of what
-    /// it did, and its write must not echo back as news from elsewhere.
+    /// Reseed the baseline silently, for a reply whose own body is the report
+    /// of what it did: its write must not echo back as news from elsewhere,
+    /// and leaving the baseline stale would echo it on the next call instead.
     Reseed(&'a DigestTracker),
-    /// Neither report nor touch the baseline — `monitor`'s per-result folds in
-    /// the several-ids mode. A batch is one call, so its reply carries one
-    /// digest beside `results`; a per-result fold would report one job's news
-    /// into a place the batch prose never renders.
+    /// Neither report nor touch the baseline, for a fold that is not where this
+    /// call's news belongs. The delta survives for whichever reply does report
+    /// it.
     Skip,
 }
 

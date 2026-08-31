@@ -160,15 +160,16 @@ pub(crate) enum Cause {
     SidecarMisfilled(String),
     /// The cross-process state flock could not be taken inside its bounded
     /// wait — another clauth process is busy under `~/.clauth` (on macOS that
-    /// flock is even held across a `/usr/bin/security` shell-out for up to 20
-    /// seconds). Surfaced by the CLA-ROLL sidecar repair and the gate's
-    /// rotation-adoption leg alike. Genuine contention, not a fault: the
-    /// holder finishes and a retry goes through. Distinct from
-    /// [`Self::SidecarWriteFailed`] and [`Self::StateLockUnavailable`] on
-    /// purpose — that copy prescribes a permissions check, which a busy
-    /// sibling would send the operator on for nothing. Same
-    /// contention-vs-fault split as [`Self::RotationLockUnavailable`] (fault)
-    /// vs [`Self::RotationLockHeld`] (contention).
+    /// flock is even held across `/usr/bin/security` shell-outs, bounded in
+    /// aggregate by `lock::SUBPROCESS_BUDGET`). Surfaced by the CLA-ROLL
+    /// sidecar repair and the gate's rotation-adoption leg alike. Genuine
+    /// contention, not a fault: the holder finishes and a retry goes through.
+    /// Distinct from [`Self::SidecarWriteFailed`] and
+    /// [`Self::StateLockUnavailable`] on purpose — that copy prescribes a
+    /// permissions check, which a busy sibling would send the operator on for
+    /// nothing. Same contention-vs-fault split as
+    /// [`Self::RotationLockUnavailable`] (fault) vs
+    /// [`Self::RotationLockHeld`] (contention).
     StateLockBusy(String),
     /// The cross-process state flock could not be CREATED or OPENED during
     /// the gate's rotation-adoption leg — a filesystem or permissions problem

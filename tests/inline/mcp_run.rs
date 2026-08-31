@@ -2484,8 +2484,8 @@ fn wait_for_batch_running_id_never_falls_out_as_unknown_at_deadline() {
 /// A collect must never destroy what it came for. The Done TTL is measured from
 /// the FINISH, and the sweep a collect runs reaps only orphaned `running` files
 /// — a mint-anchored done sweep here deletes the salvage envelope of every
-/// delegate killed at the default 3600 s wall clock, on the very next check,
-/// and tells the caller to spend another window.
+/// delegate that ran longer than that TTL, on the very next check, and tells the
+/// caller to spend another window.
 #[test]
 fn a_collect_never_sweeps_the_envelope_it_came_for() {
     let _home = HomeSandbox::new();
@@ -2516,13 +2516,17 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
 
     // A result that finished over the retention TTL ago is the case the two
     // sweeps disagree on: startup is entitled to reap it, a reader never is.
+    // Its own stamp, aged past `DONE_TTL_MS` rather than riding `minted`: at the
+    // day-long TTL a two-hour-old finish sits inside the window, where a reader
+    // applying the done TTL would keep it anyway and the arm proves nothing.
+    let late = now_ms() - jobs::DONE_TTL_MS - 1000;
     let dir = jobs::jobs_dir().unwrap();
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("d-late-0.json"),
         format!(
-            r#"{{"job_id":"d-late-0","profile":"work","state":"done","started_at":{minted},
-               "done_at":{minted},"envelope":{{"result":"collected late"}}}}"#
+            r#"{{"job_id":"d-late-0","profile":"work","state":"done","started_at":{late},
+               "done_at":{late},"envelope":{{"result":"collected late"}}}}"#
         ),
     )
     .unwrap();
@@ -4681,7 +4685,8 @@ fn an_unknown_job_id_names_which_cause_it_was() {
     let aged_word = unknown_job_reason("d-day-1", now);
     let fresh_word = unknown_job_reason("d-notebook-1", now);
     // The sweep claim is the branch discriminator: only the aged branch names
-    // it, and the fresh branch must not, since both reaps run from a day back.
+    // it, and the fresh branch must not, since neither reap runs from less
+    // than a day back.
     assert!(
         aged_word.contains("swept") && !fresh_word.contains("swept"),
         "fixture control: the two words really take opposite age branches: \

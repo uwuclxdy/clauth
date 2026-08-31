@@ -682,7 +682,7 @@ pub(crate) fn monitor_state_prose(p: &Value) -> String {
 ///
 /// Empty rather than a "no jobs" line: a session that never delegated should
 /// pay nothing for a listing it has no use for, which is the only-when-true rule
-/// the roster flags already render by. Each line opens with ``job `<id>` `` —
+/// `profile_line`'s own flags render by. Each line opens with ``job `<id>` `` —
 /// the same opener `monitor_batch_prose` uses — so the id a caller has
 /// to copy out is always in the same place.
 ///
@@ -974,11 +974,9 @@ fn profile_line(row: &Value) -> String {
     }
     // The three account-state markers render as one contiguous run, so a
     // reader meets one group rather than three scattered through the line.
-    // Two of them refuse a delegate; `login expired` refuses everywhere EXCEPT
-    // an account serving its own inference (`preflight_target`), where it
-    // reports a stale usage reading rather than a blocked spawn. `canceled` follows them
-    // because clauth has no cancel gate: it informs the pick, it does not
-    // block it.
+    // Which of them refuses a delegate, and on which exemption, is
+    // `preflight_target`'s rule. `canceled` follows them because clauth has no
+    // cancel gate: it informs the pick, it does not block it.
     if row
         .get("disabled")
         .and_then(Value::as_bool)
@@ -1420,8 +1418,9 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
         // `total_cost_usd` is the CHILD CLI's own figure, priced against
         // Anthropic's card whatever endpoint served the call, so a DeepSeek or
         // z.ai target's number is a wrong-basis figure a caller reads as the
-        // bill. The endpoint arrives as data through the fold — this file
-        // derives no figure the JSON did not carry.
+        // bill. Which endpoint answered is `delegate_call_endpoint`'s answer,
+        // arriving as data through the fold — this file derives no figure the
+        // JSON did not carry.
         //
         // Three readings, kept apart for the same reason `live_usage_prose`
         // keeps its three: only a POSITIVE `anthropic` earns the bare clause;
@@ -1546,8 +1545,8 @@ pub(crate) fn delegate_refusal_prose(p: &Value) -> String {
 /// The headroom clauses follow the id list rather than sitting inside each
 /// parenthesis: the ids and the account names are what the caller (and the
 /// `asyncRewake` hook) reads first, and a footer spliced between them would
-/// bury the handles. The digest is the reply's, not a row's — it is folded once
-/// at the top level, because reporting consumes the delta.
+/// bury the handles. The digest is the reply's, not a row's: it is folded once
+/// at the top level, on `DigestMode`'s reporting rule.
 pub(crate) fn delegate_fanout_prose(p: &Value) -> String {
     let jobs = p
         .get("jobs")
@@ -1642,13 +1641,12 @@ pub(crate) fn monitor_job_prose(p: &Value) -> String {
 /// far each deadline still is, that account's headroom, and — on its own
 /// indented line — the newest thing the delegate wrote.
 ///
-/// A run can be missing either deadline and still be perfectly healthy, so each
-/// absence is NAMED rather than left to read as a lost figure: a streaming run
-/// has no wall clock at all (the idle guard is its only deadline), and a run
-/// whose caller pinned its own `--output-format` has no idle one (silence there
-/// carries no information). Missing BOTH is the only case that means clauth is
-/// short a fact rather than reporting one: every deadline is recorded together
-/// at reserve time, so that job was started by a clauth which recorded neither.
+/// A run can be missing either deadline and still be perfectly healthy — which
+/// shape drops which key is `running_payload`'s rule — so each absence is NAMED
+/// rather than left to read as a lost figure. Missing BOTH is the only case
+/// that means clauth is short a fact rather than reporting one: every deadline
+/// is recorded together at reserve time, so that job was started by a clauth
+/// which recorded neither.
 pub(super) fn running_status_prose(p: &Value) -> String {
     let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
     let status = p.get("status").and_then(Value::as_str).unwrap_or("unknown");
