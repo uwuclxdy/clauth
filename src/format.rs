@@ -132,7 +132,10 @@ pub(crate) enum Cause {
     /// Another holder has the profile's rotation lock and the caller must not
     /// park behind it — the scheduler's CLA-ROLL re-stamp leg, which runs on a
     /// thread that cannot wait, and the account-mutation refusals, which decline
-    /// rather than block on a lock carrying no timeout. Genuine contention — the
+    /// rather than park on a form of the acquire that carries no deadline. Both are
+    /// properties of the FORM, not of the lock: a session start takes a bounded
+    /// acquire (`runtime::ROTATION_LOCK_TIMEOUT`), and neither of these callers
+    /// wants that wait either. Genuine contention — the
     /// opposite claim from [`Self::RotationLockUnavailable`], which is why it is
     /// not that arm: the holder's own path usually re-stamps the sidecar itself,
     /// and the scan retries in minutes against an hours-wide horizon either way.

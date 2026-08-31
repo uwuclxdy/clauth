@@ -3924,9 +3924,9 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
 }
 
 /// The scheduler's re-stamp leg must never park behind a held rotation lock:
-/// it runs inline on the tick thread and the rotation lock has no timeout, so a
-/// `clauth start` holding the lock across its recursive copy would stall
-/// every account's poll. With the lock held, the gate answers Transient
+/// it runs inline on the tick thread and this gate's waiting form carries no
+/// deadline, so a `clauth start` holding the lock across its recursive copy would
+/// stall every account's poll. With the lock held, the gate answers Transient
 /// promptly (the NoWait path) instead of blocking until release.
 #[test]
 fn restamp_never_parks_behind_a_held_rotation_lock() {

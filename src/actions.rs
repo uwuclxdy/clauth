@@ -624,8 +624,10 @@ pub(crate) fn classify_env_key(
 /// profile by NAME when it persists, so a delete or rename landing inside that
 /// window either resurrects the directory the delete removed or strands the
 /// spent refresh token on the renamed account. Refused rather than queued
-/// because the lock carries no timeout: a stuck round trip would park the
-/// command instead of failing it.
+/// because the blocking acquisition carries no deadline: a stuck round trip would
+/// park the command instead of failing it. The bounded form a session start takes
+/// (`runtime::ROTATION_LOCK_TIMEOUT`) is no substitute — it waits tens of seconds,
+/// and a mutation the operator typed should answer now.
 ///
 /// Creates `~/.clauth/rotation-locks/` and this profile's lock file when they
 /// are absent (`RotationGuard::try_acquire` does), so it is a write rather than

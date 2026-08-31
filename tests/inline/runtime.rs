@@ -2836,9 +2836,11 @@ fn acquire_creates_runtime_and_pid_file() {
     });
 }
 
-/// The window row 2 of the lock-race backlog names: a caller loads config,
-/// `RotationGuard::acquire` BLOCKS, a delete lands, and the acquire then rebuilds
-/// a whole session for an account nothing configures.
+/// The window row 2 of the lock-race backlog names: a caller loads config, the
+/// acquire's rotation-lock wait parks it, a delete lands, and the acquire then
+/// rebuilds a whole session for an account nothing configures. The wait's own
+/// deadline is beside the point here — the window is open for however long the
+/// caller waits, bounded or not.
 ///
 /// Driven single-threaded and through the REAL `actions::delete_profile`,
 /// because the seam is between two statements of the CALLER rather than inside
@@ -2948,31 +2950,39 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
         fake_claude_home(tmp.path());
         let profile = configured_profile("mixedver");
 
-        let err = ProfileRuntime::acquire_synced(&profile, Isolation::Shared, &[], false, || {
-            // A record removal taking no rotation lock — the shape a clauth
-            // predating the witness ships. Its own body still runs under
-            // `with_state_lock`, which is the serialization this gate's
-            // placement rests on.
-            let mut config = crate::profile::load_config().expect("load config");
-            assert!(
-                config
-                    .find(&crate::profile::ProfileName::from("mixedver"))
-                    .is_some(),
-                "the seam must fire while the account is still configured, \
+        let err = ProfileRuntime::acquire_synced(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            || {
+                // A record removal taking no rotation lock — the shape a clauth
+                // predating the witness ships. Its own body still runs under
+                // `with_state_lock`, which is the serialization this gate's
+                // placement rests on.
+                let mut config = crate::profile::load_config().expect("load config");
+                assert!(
+                    config
+                        .find(&crate::profile::ProfileName::from("mixedver"))
+                        .is_some(),
+                    "the seam must fire while the account is still configured, \
                      or it poses nothing"
-            );
-            crate::lock::with_state_lock(|held| {
-                config.remove(&crate::profile::ProfileName::from("mixedver"), held);
-                Ok(())
-            })
-            .expect("remove record");
-            crate::profile::save_app_state(&config.state).expect("save app state");
-            std::fs::remove_dir_all(
-                crate::profile::profile_dir(&crate::profile::ProfileName::from("mixedver"))
-                    .expect("profile dir"),
-            )
-            .expect("remove the profile dir");
-        })
+                );
+                crate::lock::with_state_lock(|held| {
+                    config.remove(&crate::profile::ProfileName::from("mixedver"), held);
+                    Ok(())
+                })
+                .expect("remove record");
+                crate::profile::save_app_state(&config.state).expect("save app state");
+                std::fs::remove_dir_all(
+                    crate::profile::profile_dir(&crate::profile::ProfileName::from("mixedver"))
+                        .expect("profile dir"),
+                )
+                .expect("remove the profile dir");
+            },
+            |_, _| unreachable!("the gate refuses before the stamp window ever closes"),
+            || unreachable!("the gate refuses before the hold is ever released"),
+        )
         .map(|_| ())
         .expect_err("a record removed inside the window must still refuse");
 
@@ -3656,6 +3666,335 @@ fn teardown_retries_a_persistent_wedge_then_gives_up() {
         set_teardown_timeout_hook(None);
         crate::lock::set_state_lock_timeout_override(None);
     });
+}
+
+/// A locked handle on `name`'s rotation lock from a separate fd, standing in for
+/// another process mid-rotation — `flock(2)` binds to the open file description,
+/// so this genuinely contends with the acquire's own. Creates the locks directory
+/// the way `RotationGuard::open` does, since a real holder made it on its way in.
+/// Call INSIDE [`with_fake_home`].
+fn hold_rotation_lock(name: &str) -> std::fs::File {
+    let path =
+        crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name)).expect("path");
+    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
+    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
+    holder.lock().expect("hold the rotation lock");
+    holder
+}
+
+/// A wedge on the rotation lock ends the start with a NAMED failure instead of an
+/// unbounded park. The deadline is shortened via
+/// `set_rotation_lock_timeout_override` so the wedge poses without waiting out the
+/// real one.
+///
+/// Driven on a worker with a deadline of its own, because what this defends
+/// against is a wait that never ENDS: an acquire with its bound removed parks on
+/// the wedge and HANGS the suite rather than failing it, and a hang is the one red
+/// that never arrives. The main thread unwedges before rendering any verdict, so
+/// the worker always terminates and can always be joined — which the
+/// process-global home override requires anyway. The deadline override is
+/// thread-local, so the worker sets its own rather than inheriting the main
+/// thread's.
+///
+/// The typed error is the assertion, not the sentence: `run_delegate` renders it
+/// through `{e}` and the TUI through the chain, so a caller that must tell
+/// contention from an `~/.clauth` fault does it by `downcast_ref` and would keep
+/// passing on a reworded string.
+#[test]
+fn a_start_behind_a_wedged_rotation_fails_with_the_bounded_wait() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("wedged-rot");
+        let holder = hold_rotation_lock("wedged-rot");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            crate::runtime::set_rotation_lock_timeout_override(Some(Duration::from_millis(150)));
+            let started = std::time::Instant::now();
+            let outcome =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).map(drop);
+            let _ = tx.send((outcome, started.elapsed()));
+        });
+        // 20x the deadline: wide enough that a loaded box never reads as a park,
+        // narrow enough that an unbounded acquire reports as one instead of hanging.
+        let verdict = rx.recv_timeout(Duration::from_secs(3));
+        drop(holder);
+        let joined = worker.join();
+        let (outcome, waited) = verdict
+            .expect("the acquire was still parked 3s into a 150ms deadline: the wait has no bound");
+        joined.expect("join the acquiring worker");
+
+        let err = outcome.expect_err("a start behind a held rotation lock must give up, not park");
+        assert!(
+            err.chain().any(|c| c
+                .downcast_ref::<crate::runtime::RotationLockTimeout>()
+                .is_some()),
+            "the wait must end in the typed timeout a caller can retry on, got: {err:#}"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("wedged-rot") && msg.contains("retry"),
+            "the refusal must name the account and the way out, got: {msg}"
+        );
+        assert!(
+            waited >= Duration::from_millis(150),
+            "the wait must last the whole deadline, not fail early: {waited:?}"
+        );
+        assert!(
+            crate::live_sessions::list().is_empty(),
+            "a start that never took the lock must register no live row"
+        );
+    });
+}
+
+/// The other half of the same verdict: a holder that releases INSIDE the deadline
+/// is waited out, not refused. Without it the test above passes on an acquire that
+/// gave up instantly, which is the failure mode a bound invites.
+#[test]
+fn a_start_behind_a_rotation_that_releases_in_time_proceeds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("slow-rot");
+        let holder = hold_rotation_lock("slow-rot");
+        // Wide enough that the release lands well inside it on a loaded box.
+        crate::runtime::set_rotation_lock_timeout_override(Some(Duration::from_secs(20)));
+
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(holder);
+        });
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .expect("a rotation that releases inside the deadline must be waited out");
+        releaser.join().expect("join releaser");
+
+        assert_eq!(
+            live_session_count(&crate::profile::ProfileName::from("slow-rot")),
+            1,
+            "the waited-out start must be a live session like any other"
+        );
+        drop(rt);
+        crate::runtime::set_rotation_lock_timeout_override(None);
+    });
+}
+
+/// The hold spans the register-and-stamp window and ends with it — held at the
+/// window's head, free by the time the watcher arms.
+///
+/// Driven through both seams because neither end is observable from outside: the
+/// tail gap is the watchdog arming, 18-34 ms on macOS, which an outside waiter
+/// could only catch by racing. Inside the seams the questions are exact.
+///
+/// Three legs, each catching what the others cannot.
+///
+/// The STAMPED leg runs as the last statement inside the flock closure and is the
+/// only one that can answer the question the hold exists for: are the marker's
+/// flock and the registry row on disk while the lock is still held. Asked after
+/// the drop instead — as an earlier version of this test asked it — it cannot tell
+/// "stamped before the lock went" from "stamped one statement after", so hoisting
+/// either artifact out of the closure satisfied it. Measured, twice.
+///
+/// The RELEASED leg runs after the drop and answers the only question the stamped
+/// leg cannot: that the lock is free by then. It reds on a hold restored to the end
+/// of `acquire_synced` wherever in the tail it sits, so its position is not
+/// load-bearing.
+///
+/// The HELD leg fires BEFORE the flock closure and its reach is narrower than it
+/// looks: it catches only a hold that ends before the acquire enters that closure.
+/// A drop moved between it and the closure passes here and is caught by
+/// `refuse_if_unconfigured`'s rank `debug_assert` — which lives on the DEBUG leg
+/// alone, since the rank stack is `cfg(debug_assertions)`-only. That leg is gated
+/// (`cargo.sh` and CI both run it), so the floor is covered; it is not covered by
+/// anything a release run can see, and this test is not what covers it.
+///
+/// All three count themselves, because a probe that lives inside an injected
+/// closure asserts nothing at all if the closure stops being called — and a
+/// dropped call site is exactly the shape an edit here produces. Only the count
+/// separates "every end checked out" from "no end was looked at".
+#[test]
+fn the_rotation_hold_ends_at_the_register_and_stamp_window() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = configured_profile("shrunk");
+        let name = crate::profile::ProfileName::from("shrunk");
+        let head = crate::profile::ProfileName::from("shrunk");
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let head_fired = std::sync::Arc::clone(&fired);
+        let stamped_fired = std::sync::Arc::clone(&fired);
+        let released_fired = std::sync::Arc::clone(&fired);
+
+        let rt = ProfileRuntime::acquire_synced(
+            &profile,
+            Isolation::Shared,
+            &[],
+            false,
+            || {
+                head_fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Same process, second fd: `flock(2)` binds to the open file
+                // description, so a `None` here is this acquire's own hold.
+                assert!(
+                    crate::runtime::RotationGuard::try_acquire(&head)
+                        .expect("probe the rotation lock")
+                        .is_none(),
+                    "the rotation lock must be held before the flock closure opens, \
+                     or the stamp window serializes against nothing"
+                );
+            },
+            |paths, session| {
+                stamped_fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // The fourth fact, and the one no other leg can observe: the lock
+                // is STILL HELD here. Without this, moving this whole seam past the
+                // drop — the natural shape of an extract-function edit, which moves
+                // the call with the block it is named for — passes every assertion
+                // below while the artifacts land after the hold. Measured, it did.
+                assert!(
+                    crate::runtime::RotationGuard::try_acquire(&head)
+                        .expect("probe the rotation lock")
+                        .is_none(),
+                    "the rotation lock must still be held while the stamp window closes"
+                );
+                // THIS session's own marker, never the profile-wide predicate:
+                // the compat marker is stamped in the same closure and satisfies
+                // `has_live_session` alone, so a probe written against that passes
+                // with the session's own marker unclaimed. Measured — it did.
+                assert!(
+                    is_session_alive(&paths.pid_file),
+                    "the session's liveness marker must be flock-held before the hold ends"
+                );
+                // ...and `live_session_holds_rotatable` reads the row's launch
+                // store. Keyed on the SESSION ID for the same reason the marker
+                // above is this session's own: a profile-wide scan is satisfied by
+                // a sibling session's row.
+                assert!(
+                    crate::live_sessions::get(session.as_str())
+                        .is_some_and(|r| r.launch_store.is_some()),
+                    "the registry row must carry its launch store before the hold ends"
+                );
+            },
+            || {
+                released_fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    crate::runtime::RotationGuard::try_acquire(&name)
+                        .expect("probe the rotation lock")
+                        .is_some(),
+                    "the rotation lock must be free once the stamp window closes, \
+                     so a queued peer waits out that window and nothing after it"
+                );
+            },
+        )
+        .expect("acquire");
+        assert_eq!(
+            fired.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "every seam must have run, or the assertions above pinned nothing"
+        );
+        drop(rt);
+    });
+}
+
+/// The FLOOR under the shortened hold has exactly one guard —
+/// `refuse_if_unconfigured`'s rotation-rank `debug_assert` — and deleting it is
+/// silent: the suite stays green, and a later hold-shortening then passes both
+/// legs. So the guard's PRESENCE is pinned here, the way
+/// `run_delegate_reads_the_cancel_flag_between_the_acquire_and_the_spawn` pins
+/// its own.
+///
+/// It observes source text and nothing else, which is why it pins the assertion
+/// WHOLE: the `cfg!(test) ||` escape its two neighbours in that file carry is the
+/// edit its own doc discusses, and that escape would leave every literal a
+/// `contains` of the rank or the message could key on standing.
+#[test]
+fn the_record_re_read_still_asserts_the_rotation_lock_is_held() {
+    let src = include_str!("../../src/runtime.rs");
+    let body = src
+        .split_once("fn refuse_if_unconfigured(")
+        .expect("refuse_if_unconfigured is defined")
+        .1;
+    let gate = body
+        .find("is_configured")
+        .expect("the gate reads the record");
+    // Bound to a `let` so `cargo fmt` cannot reflow the literal's continuation
+    // whitespace into it, which is how the first spelling of this pin failed.
+    let whole = "\n    debug_assert!(\n        crate::lockorder::holds::<crate::lockorder::rank::Rotation>(),\n";
+    assert!(
+        body[..gate].contains(whole),
+        "the rotation-rank assertion must stand ahead of the record read, \
+         unqualified: {}",
+        &body[..gate]
+    );
+}
+
+/// A timed-out wait leaves no ROTATION rank on the thread, and no flock either. A
+/// rank entered before the lock was actually taken would survive the failure and
+/// make the NEXT acquisition on this thread panic as a lock-order violation — the
+/// ordering assertion firing on an inversion that never happened.
+///
+/// The re-acquire is BOUNDED, not blocking, and that is the whole point of its
+/// shape: it also pins that the timed-out wait released the flock the helper
+/// thread went on to win. A helper that kept it would hang a blocking re-acquire
+/// forever, and a hang is the one red that never arrives.
+#[test]
+fn a_timed_out_rotation_wait_leaves_no_rank_behind() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("rank-leak");
+        let holder = hold_rotation_lock("rank-leak");
+        crate::runtime::set_rotation_lock_timeout_override(Some(Duration::from_millis(50)));
+
+        crate::runtime::RotationGuard::acquire_with_timeout(
+            &name,
+            crate::runtime::rotation_lock_timeout(),
+        )
+        .map(|_| ())
+        .expect_err("the wedge must time the wait out");
+        drop(holder);
+
+        // Panics on a leaked rank rather than returning an error, so the
+        // acquisition itself is the rank assertion; its deadline is what makes a
+        // retained flock red instead of hanging.
+        let guard =
+            crate::runtime::RotationGuard::acquire_with_timeout(&name, Duration::from_secs(5))
+                .expect("the released lock must be takeable after a timed-out wait");
+        drop(guard);
+        crate::runtime::set_rotation_lock_timeout_override(None);
+    });
+}
+
+/// The FLOOR, pinned as a LITERAL rather than re-derived from the two constants it
+/// adds: an assertion keyed on those tracks any re-tune silently, and this number
+/// is a claim about how long a healthy holder spends — 19 s of the two deadlines a
+/// token call carries, plus 20 s for a macOS Keychain mirror's two `security`
+/// invocations. The token term bounds no phase of its call — the constant's own
+/// doc carries the measurement — while the keychain term does bound the mirror;
+/// both are what a HEALTHY holder fits inside, which is the floor's whole claim. Moving either term must red this and force the claim to be re-made
+/// against what that term now bounds.
+#[test]
+fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {
+    assert_eq!(
+        crate::runtime::ROTATION_LOCK_TIMEOUT,
+        Duration::from_secs(39),
+        "the session-start wait must outlast a healthy rotation's token call and \
+         its macOS Keychain mirror"
+    );
+}
+
+/// The CEILING, as a relation between two independently-derived constants rather
+/// than a second literal: the pre-spawn wait is silent on the wire, so it has to
+/// end before the MCP peer that cannot receive progress gives up on the call. A
+/// deadline past that turns clauth's named refusal into the client's opaque abort,
+/// which is the outcome the bound exists to remove.
+#[test]
+fn the_rotation_deadline_ends_before_a_silent_mcp_peer_gives_up() {
+    assert!(
+        crate::runtime::ROTATION_LOCK_TIMEOUT
+            < Duration::from_secs(crate::mcp::MAX_WAIT_SECS_NO_PROGRESS),
+        "the rotation wait must end inside the silence budget of a peer that \
+         cannot be sent progress: {:?} against {}s",
+        crate::runtime::ROTATION_LOCK_TIMEOUT,
+        crate::mcp::MAX_WAIT_SECS_NO_PROGRESS,
+    );
 }
 
 /// Two same-profile sessions share the one compat dir, so it may only go when

@@ -1612,7 +1612,13 @@ const MAX_WAIT_SECS: u64 = MAX_RUN_TIMEOUT_SECS;
 /// cap would turn every long wait into a hard abort. The token IS the capability
 /// probe — a config key would ask the operator to know their client's
 /// idle-timeout behaviour, which is precisely the thing they cannot observe.
-const MAX_WAIT_SECS_NO_PROGRESS: u64 = 1500;
+///
+/// `pub(crate)` so a test can pin a RELATION against it, not because production
+/// code outside `mcp` reads it. `runtime::ROTATION_LOCK_TIMEOUT` bounds the
+/// pre-spawn rotation-lock wait, which is silent for exactly this reason — no
+/// child exists yet to report progress on — and must sit inside this budget; that
+/// is an inequality to assert, and asserting it needs the number.
+pub(crate) const MAX_WAIT_SECS_NO_PROGRESS: u64 = 1500;
 
 /// The wait this call actually gets: the requested seconds under whichever
 /// ceiling this peer can survive.
@@ -2075,7 +2081,9 @@ fn fanout_is_error(rows: &[serde_json::Value]) -> bool {
 /// — `crate::sessions::stamp_run_sessions`, plus an isolated
 /// `crate::start::rescue_teardown`. It bounds nothing on the other side of the
 /// spawn: a run still inside `ProfileRuntime::acquire` ends when that acquire
-/// returns, which is a live session's business, not this constant's.
+/// returns, and neither of that wait's legs is this constant's business — the
+/// rotation-lock leg is bounded by `runtime::ROTATION_LOCK_TIMEOUT` whoever
+/// holds it, and the acquire's own recursive `~/.claude` copy by nothing at all.
 const CANCEL_GRACE_SECS: u64 = 10;
 
 /// Process-local cancel registry: `job_id` → the flag that job's supervision
@@ -2163,9 +2171,11 @@ fn cancel_job(job_id: &str) -> bool {
 /// with no recorded death was alive when
 /// the wait gave up on it, whatever the flag intends: the flag is
 /// read by the supervision loop, and between the registry entry and that loop
-/// sit `load_config`, the pre-flight and `ProfileRuntime::acquire` — which
-/// BLOCKS behind a live `clauth start` session on the same profile. So the
-/// verdict says what was seen, never "stopped".
+/// sit `load_config`, the pre-flight and `ProfileRuntime::acquire` — whose
+/// rotation-lock wait queues behind a same-profile rotation or session start for
+/// up to `runtime::ROTATION_LOCK_TIMEOUT`, and whose own recursive `~/.claude`
+/// copy on a fake-symlink host is bounded by nothing at all. Either outlasts this
+/// call's grace. So the verdict says what was seen, never "stopped".
 ///
 /// An id the registry does not hold is NAMED rather than left to come back as a
 /// plain `running` row, which reads as "the cancel did nothing". Its causes are
@@ -3664,8 +3674,9 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
 
     // The acquire above is the longest thing that can happen before a child
     // exists, and the supervision loop that reads this flag does not exist until
-    // one does: `RotationGuard::acquire` BLOCKS behind a live `clauth start`
-    // session on the same profile, and a copy-mode host mirrors `~/.claude`
+    // one does: its rotation-lock wait queues behind a same-profile rotation or
+    // session start (bounded by `runtime::ROTATION_LOCK_TIMEOUT`, tens of seconds),
+    // and a copy-mode host mirrors `~/.claude`
     // inside it. A cancel that landed in there must not now spawn the run it
     // cancelled. Nothing has been spent at this point, which is the fact the
     // caller acts on — and the fact that decides [`Handoff::hand_off`] stops an

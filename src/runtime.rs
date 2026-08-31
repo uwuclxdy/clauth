@@ -1060,8 +1060,9 @@ pub(crate) fn rotation_lock_path(name: &ProfileName) -> Result<PathBuf> {
 /// and `ProfileRuntime::acquire` takes the same lock before it stamps its
 /// session PID file — so the two operations are mutually exclusive:
 ///
-/// - rotate wins the race → acquire blocks until the new pair is persisted,
-///   then the session starts against the rotated token;
+/// - rotate wins the race → acquire waits until the new pair is persisted, then
+///   the session starts against the rotated token — or, if the rotation outlasts
+///   the wait's deadline, fails with the named refusal and no session starts;
 /// - acquire wins the race → it creates its session PID file before releasing,
 ///   so a macOS rotate's in-lock [`rotation_blocked_by_live_session`] check sees
 ///   the live session and skips. Off macOS the rotate proceeds and the session
@@ -1069,7 +1070,9 @@ pub(crate) fn rotation_lock_path(name: &ProfileName) -> Result<PathBuf> {
 ///   ordering alone: the two rotations serialize instead of double-spending.
 ///
 /// Distinct from `~/.clauth/.lock` (global state) and a session's own marker
-/// file (per-session liveness). Blocking `flock`; the holder window is short.
+/// file (per-session liveness). [`RotationGuard::acquire`] blocks with no
+/// deadline; [`RotationGuard::acquire_with_timeout`] is the bounded form a
+/// session start takes.
 #[must_use]
 pub(crate) struct RotationGuard {
     // Drops before `_rank` (declaration order): the flock releases, then the
@@ -1078,12 +1081,145 @@ pub(crate) struct RotationGuard {
     _rank: crate::lockorder::RankGuard,
 }
 
+/// How long [`ProfileRuntime::acquire`] waits for this profile's rotation lock
+/// before failing with a [`RotationLockTimeout`].
+///
+/// It is NOT the sum of every leg a holder can run, and must not be re-derived as
+/// one. Four legs have no bound at all: every phase of the token call except the
+/// connect — header receipt included, which reads bounded and is not
+/// ([`crate::oauth::TOKEN_HTTP_DEADLINES`] carries the measurement) — a
+/// sibling start's recursive `~/.claude` copy inside
+/// [`build_runtime_dir_with_active_env`], the state-flock acquisitions of the
+/// longest holder — `oauth::gate_under_guard`, which takes up to four and whose
+/// count moves with its quarantine branches — and, on macOS, a state flock a peer
+/// is legitimately holding across its own Keychain budget. A sum over legs like
+/// those is a number wearing a proof's clothes.
+///
+/// So it is derived from the two ends that are fixed.
+///
+/// The FLOOR is the two legs a HEALTHY holder spends real time in, so an ordinary
+/// rotation is waited out rather than refused:
+/// - [`crate::oauth::TOKEN_HTTP_DEADLINES`] — every rotation makes exactly
+///   one token call, and this is what the two deadlines that call carries add up
+///   to. The floor wants a number a healthy call comfortably fits inside, which
+///   this is; it is not a ceiling, and the constant's own doc says why.
+/// - [`KEYCHAIN_MIRROR_BUDGET`] — a macOS rotation mirrors the new pair into the
+///   Keychain and may spend that whole budget doing it. Never
+///   `crate::lock::SUBPROCESS_BUDGET`, which the two coincide with today: that one
+///   bounds a state-flock hold's shell-outs in aggregate and
+///   `oauth::apply_rotated_tokens_locked` runs its mirror AFTER the closure ends,
+///   where nothing clamps it. Kept in the sum on every host, for the reason stated
+///   at the constant.
+///
+/// Everything else a healthy holder does is sub-millisecond disk work ON LINUX,
+/// which is [`crate::lock::state_lock_timeout`]'s own qualification of the same
+/// claim. A state-flock acquisition that reaches that deadline is the wedge THAT
+/// constant exists to name, so it is what this deadline waits out rather than
+/// something to budget for — but on macOS a peer can legitimately hold that flock
+/// for most of its 25 s, and a start queued behind a rotation queued behind such a
+/// peer is refused here. Accepted: it needs three-way concurrency plus a keychain
+/// slow enough to burn its budget, which is an unanswered ACL dialog or a locked
+/// keychain, and the refusal is retryable.
+///
+/// The CEILING is [`crate::mcp::MAX_WAIT_SECS_NO_PROGRESS`], the only deadline
+/// this wait sits inside: the MCP `delegate`'s pre-spawn window emits no progress
+/// notification, there being no child to report on yet, and that constant is the
+/// crate's already-derived answer to how long a peer that cannot receive progress
+/// tolerates silence — itself a conservative proxy for Claude Code's 30-minute
+/// stdio idle abort, not that abort. Past the abort the named refusal below
+/// reaches nobody. Pinned as a relation rather than restated here.
+///
+/// A holder past this deadline gets a named retry rather than a fault, because
+/// the unbounded legs mean a firing is not proof of a wedge.
+///
+/// `saturating_add` over `as_secs()` arithmetic: both terms are whole seconds
+/// today, and a sub-second one added later would round DOWN through `as_secs`,
+/// quietly shortening the deadline it was meant to lengthen.
+pub(crate) const ROTATION_LOCK_TIMEOUT: Duration =
+    crate::oauth::TOKEN_HTTP_DEADLINES.saturating_add(KEYCHAIN_MIRROR_BUDGET);
+
+/// What a macOS rotation's Keychain mirror may spend under the rotation lock: two
+/// `security` invocations at `keychain::SECURITY_TIMEOUT` each, unclamped because
+/// `oauth::apply_rotated_tokens_locked` runs the mirror after its state-flock
+/// closure ends.
+///
+/// Spelled here rather than read out of `keychain`, which is macOS-gated while
+/// this deadline is one number on every host. Off macOS the term is not waste: it
+/// is the headroom the only slow leg a holder has there — the token call,
+/// which the other term derives for — would otherwise have none of. `keychain` holds
+/// the other side of the derivation as a `const` assertion, so a re-tune of
+/// `SECURITY_TIMEOUT` fails to COMPILE on the platform that has one.
+pub(crate) const KEYCHAIN_MIRROR_BUDGET: Duration = Duration::from_secs(20);
+
+/// The rotation-lock deadline a session start waits out: [`ROTATION_LOCK_TIMEOUT`],
+/// or a shorter value a test poses a wedge under. The one source of the deadline
+/// so a test can shrink the whole wait without sleeping it out, and production
+/// never sets the override — mirrors [`crate::lock::state_lock_timeout`].
+pub(crate) fn rotation_lock_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = ROTATION_LOCK_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
+        return t;
+    }
+    ROTATION_LOCK_TIMEOUT
+}
+
+// Test seam shortening `rotation_lock_timeout` so a wedge can be posed without a
+// real multi-minute wait. `None` is the production deadline. Thread-local, so a
+// test that shortens it only affects the thread it drives the acquire on.
+#[cfg(test)]
+thread_local! {
+    static ROTATION_LOCK_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set or clear the test-only deadline override. `None` restores
+/// [`ROTATION_LOCK_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_rotation_lock_timeout_override(timeout: Option<Duration>) {
+    ROTATION_LOCK_TIMEOUT_OVERRIDE.with(|c| c.set(timeout));
+}
+
+/// The profile's rotation lock could not be taken within its deadline: another
+/// clauth process is rotating this account's chain or starting a session on it.
+///
+/// A recoverable, retry-later condition kept as a distinct type (surfaced through
+/// `anyhow`) so a caller can `downcast_ref` and retry rather than read it as a
+/// fault — the same split [`crate::lock::StateLockTimeout`] draws one lock
+/// further in, and the reason `Cause::RotationLockUnavailable`'s copy insists a
+/// failed BLOCKING acquire is never contention: with a deadline in play the two
+/// outcomes are finally distinguishable, and they get different types.
+///
+/// The copy names no PROCESS, where [`crate::lock::StateLockTimeout`]'s does:
+/// that lock sits behind an in-process mutex (`THREAD_LOCK`), so reaching its
+/// flock deadline really does mean a second process. This one has no such mutex,
+/// and N same-profile `delegate` calls are N threads of one MCP server contending
+/// on it directly.
+#[derive(Debug)]
+pub(crate) struct RotationLockTimeout {
+    name: String,
+    waited: Duration,
+}
+
+impl std::fmt::Display for RotationLockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "timed out after {:.0}s taking '{}' rotation lock; a token rotation or another \
+             session start is holding it — retry, or start a different account",
+            self.waited.as_secs_f64(),
+            self.name,
+        )
+    }
+}
+
+impl std::error::Error for RotationLockTimeout {}
+
 impl RotationGuard {
-    /// Acquire the per-profile rotation lock, blocking until any in-flight
-    /// rotation or acquire for this profile releases it. Creates the
-    /// rotation-locks directory if missing; it creates no profile directory,
-    /// so a caller that needs one makes it itself.
-    pub(crate) fn acquire(name: &ProfileName) -> Result<Self> {
+    /// Open (creating if absent) this profile's rotation lock file, unlocked.
+    /// Shared by all three acquisitions so they cannot drift on where the file
+    /// lives or how it is created; it makes no profile directory, so a caller
+    /// that needs one makes it itself.
+    fn open(name: &ProfileName) -> Result<(PathBuf, File)> {
         let path = rotation_lock_path(name)?;
         if let Some(parent) = path.parent() {
             crate::profile::mkdir_700(parent)
@@ -1091,28 +1227,122 @@ impl RotationGuard {
         }
         let file =
             open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        Ok((path, file))
+    }
+
+    /// ROTATION is the outermost rank — held across the OAuth HTTP round trip,
+    /// before `config` and the state flock are ever taken. Entered only once the
+    /// flock is actually held, so a failed acquisition leaves no rank behind.
+    fn held(file: File) -> Self {
+        let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
+        Self { _file: file, _rank }
+    }
+
+    /// Acquire the per-profile rotation lock, blocking until any in-flight
+    /// rotation or acquire for this profile releases it. Creates the
+    /// rotation-locks directory if missing.
+    ///
+    /// No deadline, deliberately: every caller left on this form would rather
+    /// wait a rotation out than act around it, and their own docs rest on the
+    /// blocking (`oauth::LockWait::Block`, `claude::arm_rolling_from_disk`).
+    /// A session start is the one caller that cannot — see
+    /// [`acquire_with_timeout`](Self::acquire_with_timeout).
+    pub(crate) fn acquire(name: &ProfileName) -> Result<Self> {
+        let (path, file) = Self::open(name)?;
         file.lock()
             .with_context(|| format!("failed to lock {}", path.display()))?;
-        // ROTATION is the outermost rank — held across the OAuth HTTP round
-        // trip, before `config` and the state flock are ever taken.
-        let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
-        Ok(Self { _file: file, _rank })
+        Ok(Self::held(file))
+    }
+
+    /// [`acquire`](Self::acquire) with a deadline: a wait that reaches `timeout`
+    /// fails with a [`RotationLockTimeout`] instead of parking forever.
+    ///
+    /// The session-start form. A start has a caller waiting on it — an operator
+    /// at a spinner, or an MCP `delegate` whose pre-spawn window sends no
+    /// progress notification at all — and an unbounded park there is
+    /// indistinguishable from a hang, with nothing on the wire to say which. The
+    /// deadline turns it into a named condition the caller can retry.
+    ///
+    /// The wait itself is still the BLOCKING `File::lock()`, moved onto a helper
+    /// thread, rather than the `try_lock` poll `crate::lock` uses on the state
+    /// flock. Polling would have been the smaller diff and is the wrong shape
+    /// here: waiters do not randomize phase, so they all fail one `try_lock`
+    /// together, all sleep, and one wins per wake — making every handoff cost a
+    /// full poll interval and the queue cost `interval x position`, independent
+    /// of how long the hold actually is. That floor is the thing this task exists
+    /// to lower. A kernel wakeup keeps the queue exactly as fast as it is today,
+    /// which is what makes "the wait is now bounded" cost nothing rather than
+    /// something too small to have noticed.
+    ///
+    /// The helper is deliberately not joined. It resolves no path and reads no
+    /// config — it holds an already-open fd and calls `lock()` — so it cannot
+    /// reach a real `~/.clauth` after a test's home override clears, which is
+    /// what `testutil::HomeSandbox`'s join is for. On the timeout path the send
+    /// finds no receiver, the `File` drops with the `SendError`, and the flock
+    /// releases the moment the wedge does.
+    ///
+    /// The cost of not joining, stated rather than left to be discovered: one
+    /// parked thread and one open fd per TIMED-OUT acquisition, for the wedge's
+    /// lifetime, with no cap. An uncontended acquire spawns nothing and a waited-out
+    /// one drains at the handoff, so only a caller retrying against a wedge
+    /// accumulates — a `clauth mcp` agent re-issuing `delegate` is the shape.
+    /// Releasing the wedge drains every one of them promptly, and each drains by
+    /// taking the flock for an instant, which a concurrent `try_acquire` reads as
+    /// contention. The ceiling that matters is the process fd limit: at a 1024 soft
+    /// `RLIMIT_NOFILE` it takes roughly a thousand timed-out retries, each waiting
+    /// out [`ROTATION_LOCK_TIMEOUT`], to reach it.
+    pub(crate) fn acquire_with_timeout(name: &ProfileName, timeout: Duration) -> Result<Self> {
+        let (path, file) = Self::open(name)?;
+        match file.try_lock() {
+            Ok(()) => return Ok(Self::held(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(e).with_context(|| format!("failed to lock {}", path.display()));
+            }
+        }
+        let (tx, rx) = crossbeam_channel::bounded::<std::io::Result<File>>(1);
+        let display = path.display().to_string();
+        thread::Builder::new()
+            .name(format!("clauth-rotwait-{name}"))
+            .spawn(move || {
+                let taken = file.lock();
+                let _ = tx.send(taken.map(|()| file));
+            })
+            .with_context(|| format!("failed to spawn the wait for {display}"))?;
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(file)) => Ok(Self::held(file)),
+            Ok(Err(e)) => Err(e).with_context(|| format!("failed to lock {display}")),
+            // Disconnected can only mean the helper panicked before sending;
+            // treating it as the deadline would claim a wait that never happened.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                anyhow::bail!(
+                    "waiting for {display} ended with no verdict; the thread holding the \
+                     wait died — retry the command"
+                )
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                let timed_out = RotationLockTimeout {
+                    name: name.to_string(),
+                    waited: timeout,
+                };
+                // Carries the lock PATH, which the error deliberately does not:
+                // off a TTY the logline and the error both land on stderr, and a
+                // verbatim copy of the sentence the caller is about to render
+                // helps nobody. What a wedge diagnosis wants is the file.
+                logline!("clauth: {timed_out} ({display})");
+                Err(anyhow::Error::new(timed_out))
+            }
+        }
     }
 
     /// Like [`RotationGuard::acquire`], but `Ok(None)` when another holder has
     /// the lock instead of parking behind it. For callers on threads that must
-    /// never wait an unbounded time — the scheduler's tick thread above all,
-    /// where a `clauth start` holding this lock across its recursive
-    /// `~/.claude` copy would otherwise stall every account's poll while the
-    /// heartbeat (stamped in the main loop, not here) stays fresh.
+    /// never wait at all — the scheduler's tick thread above all, where a
+    /// `clauth start` holding this lock across its recursive `~/.claude` copy
+    /// would otherwise stall every account's poll while the heartbeat (stamped
+    /// in the main loop, not here) stays fresh.
     pub(crate) fn try_acquire(name: &ProfileName) -> Result<Option<Self>> {
-        let path = rotation_lock_path(name)?;
-        if let Some(parent) = path.parent() {
-            crate::profile::mkdir_700(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        let file =
-            open_pid_file(&path).with_context(|| format!("failed to open {}", path.display()))?;
+        let (path, file) = Self::open(name)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
@@ -1120,8 +1350,7 @@ impl RotationGuard {
                 return Err(e).with_context(|| format!("failed to lock {}", path.display()));
             }
         }
-        let _rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Rotation>();
-        Ok(Some(Self { _file: file, _rank }))
+        Ok(Some(Self::held(file)))
     }
 }
 
@@ -1940,7 +2169,8 @@ pub(crate) struct ProfileRuntime {
 /// Refuse a session for a name the on-disk record no longer carries.
 ///
 /// Every caller hands [`ProfileRuntime::acquire`] a `&Profile` borrowed from a
-/// config loaded earlier, and `RotationGuard::acquire` BLOCKS, so an
+/// config loaded earlier, and its rotation-lock acquisition WAITS (bounded by
+/// [`ROTATION_LOCK_TIMEOUT`], but a wait either way), so an
 /// `actions::delete_profile` or `actions::rename_profile` can land in between —
 /// leaving the acquire to re-create the profile dir, build a tree, stamp markers
 /// and register a live row for an account nothing configures.
@@ -1951,8 +2181,9 @@ pub(crate) struct ProfileRuntime {
 ///
 /// TWO mechanisms keep the window shut and they are not interchangeable. A
 /// SAME-VERSION mutation cannot reach it at all: `acquire` holds its
-/// `RotationGuard` to the end of the function, and all three mutation call sites
-/// take their own through `actions::rotation_guard_for_mutation`, a
+/// `RotationGuard` through the register-and-stamp window this gate opens, and all
+/// three mutation call sites take their own through
+/// `actions::rotation_guard_for_mutation`, a
 /// `try_acquire` that REFUSES rather than queues. That is the rotation guard's
 /// doing, not the flock's — against that actor this gate's placement changes no
 /// outcome at all. What the flock placement buys is the mutation holding NO
@@ -1982,8 +2213,9 @@ pub(crate) struct ProfileRuntime {
 /// a flock hold. This reached for `load_config` first, on the argument that both
 /// production callers ran it moments earlier so its adopt and rewrite legs were
 /// already converged. That argument is refuted one paragraph up: the guard
-/// BLOCKS behind a rotation, and a rotation is precisely what stages a
-/// `credentials.json.pending` sidecar for the next load to adopt.
+/// WAITS behind a rotation, and a rotation is precisely what stages a
+/// `credentials.json.pending` sidecar for the next load to adopt. The wait's
+/// deadline does not soften that: a bounded wait is still a wait.
 fn refuse_if_unconfigured(name: &ProfileName) -> Result<()> {
     // Deliberately NOT the `cfg!(test) ||` form its two neighbours in this file
     // carry. Their escape exists because their unit tests drive them with no home
@@ -1996,6 +2228,15 @@ fn refuse_if_unconfigured(name: &ProfileName) -> Result<()> {
         crate::lockorder::holds::<crate::lockorder::rank::State>(),
         "the account-record re-read must happen under the state flock, or a \
          mutation holding no rotation lock can land between the read and the hold"
+    );
+    // The other half of the pair the paragraph above splits, and the FLOOR under
+    // the shortened hold: the guard may end with this window but never before it.
+    // Same debug-only reach as its neighbour, and the same call site — one, inside
+    // both holds — so neither carries the `cfg!(test) ||` escape.
+    debug_assert!(
+        crate::lockorder::holds::<crate::lockorder::rank::Rotation>(),
+        "the account-record re-read must happen under the profile's rotation lock, \
+         or a same-version mutation is queued behind nothing"
     );
     if !crate::profile::is_configured(name)
         .with_context(|| format!("failed to re-read the account list while starting '{name}'"))?
@@ -2015,15 +2256,24 @@ impl ProfileRuntime {
         active_env_keys: &[String],
         follows_chain: bool,
     ) -> Result<Self> {
-        Self::acquire_synced(profile, isolation, active_env_keys, follows_chain, || {})
+        Self::acquire_synced(
+            profile,
+            isolation,
+            active_env_keys,
+            follows_chain,
+            || {},
+            |_, _| {},
+            || {},
+        )
     }
 
-    /// The injected closure runs after `RotationGuard::acquire` and immediately
-    /// before the state flock — a sync point for the regression test that
-    /// removes the account's record there, so "the gate reads the record from
-    /// INSIDE the hold" is pinned by construction rather than by a thread race
-    /// nothing can schedule. Production passes a no-op, the same shape
+    /// Two injected sync points, both no-ops in production — the same shape
     /// `claude::arm_rolling_from_disk_synced` already uses.
+    ///
+    /// `pre_lock_done` runs after the rotation guard and immediately before the
+    /// state flock, for the regression test that removes the account's record
+    /// there, so "the gate reads the record from INSIDE the hold" is pinned by
+    /// construction rather than by a thread race nothing can schedule.
     ///
     /// It poses ONE window — a record removal between the rotation guard and the
     /// flock acquisition — and a second thread cannot pose that one, because a
@@ -2032,12 +2282,37 @@ impl ProfileRuntime {
     /// narrower window on the other side of the flock acquisition; that one wants
     /// a thread holding the flock, and the `debug_assert!` in
     /// `refuse_if_unconfigured` is what covers it today.
+    ///
+    /// `stamp_window_closing` and `hold_released` are the two halves of the
+    /// shortened hold's pin, and they are separate because one question can only be
+    /// asked from inside the hold and the other only from outside it.
+    ///
+    /// `stamp_window_closing` is the LAST statement of the flock closure, handed
+    /// this session's own paths and id. It asks whether the two artifacts
+    /// `rotation_blocked_for` reads — the marker's flock and the registry row — are
+    /// on disk while the rotation lock is still held. Inside the closure is the
+    /// only place that question has a stable answer: asked after the drop it cannot
+    /// tell "stamped before the lock went" from "stamped just after", so any
+    /// hoist out of the closure satisfies it. Measured, both ways.
+    ///
+    /// The paths and the id rather than the profile name, for the same reason: the
+    /// profile-wide `has_live_session` and a `start_profile` scan over the registry
+    /// are each satisfied by artifacts this closure stamps for OTHER reasons — the
+    /// compat marker, a sibling session's row — so a probe written against them
+    /// passes with this session's own marker unclaimed. Measured, it did.
+    ///
+    /// `hold_released` runs after the drop and asks the one thing the other cannot:
+    /// that the lock is free by then. It needs no fixed position now that the
+    /// artifacts are pinned inside the closure — restoring the long hold makes it
+    /// see the lock HELD wherever it sits.
     fn acquire_synced(
         profile: &Profile,
         isolation: Isolation,
         active_env_keys: &[String],
         follows_chain: bool,
         pre_lock_done: impl FnOnce(),
+        stamp_window_closing: impl FnOnce(&SessionPaths, &SessionId),
+        hold_released: impl FnOnce(),
     ) -> Result<Self> {
         let name = &profile.name;
         let claude_home = claude_dir()?;
@@ -2051,10 +2326,15 @@ impl ProfileRuntime {
         // a concurrent `oauth::rotate_one_inner` for this profile cannot spend the
         // single-use refresh token while we are starting up. Ordering rule
         // (matches `oauth::rotate_one_inner`): RotationGuard OUTERMOST, then the
-        // state flock inside. Held to the end of this function — everything past
-        // the marker flock only needs the marker itself, but the guard costs
-        // nothing to keep and a shorter scope would need re-proving.
-        let _rotation_guard = RotationGuard::acquire(name)?;
+        // state flock inside.
+        //
+        // Bounded, unlike every other blocking acquisition of this lock: this is
+        // the one with a caller waiting on it and no channel to say "still
+        // queued" — an operator at a spinner, or an MCP `delegate` whose pre-spawn
+        // window emits no progress notification — so an unbounded park is
+        // indistinguishable from a hang. `ROTATION_LOCK_TIMEOUT` derives the
+        // deadline from what a healthy holder can spend.
+        let rotation_guard = RotationGuard::acquire_with_timeout(name, rotation_lock_timeout())?;
         pre_lock_done();
 
         let (session, paths, pid_lock, legacy_lock, mode) = with_state_lock(|_held| {
@@ -2188,8 +2468,59 @@ impl ProfileRuntime {
             if let Err(e) = crate::live_sessions::register(&row) {
                 logline!("clauth: registering the live session failed: {e}");
             }
+            stamp_window_closing(&paths, &session);
             Ok::<_, anyhow::Error>((session, paths, file, legacy_lock, mode))
         })?;
+        // Released at the end of the register-and-stamp window rather than at the
+        // end of this function, so a queued peer waits out that window and not the
+        // watchdog arming behind it.
+        //
+        // What the hold must still cover, and does: the credential
+        // materialization inside `build_runtime_dir_with_active_env` (which
+        // samples the chain — a byte copy under `LinkMode::Fake`, a relink plus a
+        // possible adopt under `Real`), the marker `try_lock`, and the registry
+        // row. Those last two are the whole of what `rotation_blocked_for` reads
+        // — `has_live_session` walks the marker dirs, `live_session_holds_rotatable`
+        // reads the row's `launch_store` — so a rotation taking this lock one
+        // instruction after the drop already sees this session and refuses on
+        // macOS exactly as before. They are also what the `has_live_session` gate
+        // on rename and disable reads, so those two are refused in the gap by
+        // that gate rather than by this lock. Delete is the exception and stays
+        // one: `actions::delete_profile` reads that gate only when `!force`, so a
+        // `--force` delete lands in the gap where the base's `try_acquire` would
+        // have refused it. `--force` against a live session is an outcome its
+        // operator already owns; the gap only moves it earlier.
+        //
+        // What sits past it needs none of it, which is why the shorter scope
+        // holds: `SessionSwap::new` is construction over values already computed;
+        // `watch_specs` + `try_start` arm an FS watcher over paths and touch no
+        // credential; and the watchdog thread starts with an empty rank stack and
+        // takes its OWN `with_state_lock` per tick, so it never ran under this
+        // guard even when the hold reached this far. No token can be double-spent
+        // across the gap: every leg that spends takes this same lock first, and
+        // the acquire itself spends nothing — it reads and links, never refreshes.
+        //
+        // The gap is not free. `watchdog::run_with_watcher`
+        // records that a write landing while the watcher is still arming (18-34 ms
+        // on macOS, per its own measurement) produces no event, so an armed
+        // watcher then waits out its whole 30 s fallback; the hold reaching past
+        // `try_start` was one of the two things making that race unwritable, and
+        // this drop gives it up. Reachable by a same-profile holder that writes on
+        // pure disk right after taking the lock: `claude::arm_rolling_from_disk`'s
+        // sidecar stamp, `SessionSwap::swap_to`'s relink, and
+        // `oauth::gate_under_guard`'s `roll_from_stored_chain` leg, which stamps
+        // from the chain already on disk with no HTTP in front of it. A rotation
+        // that refreshes is the one shape that cannot: its write comes after a
+        // network round trip. It costs nothing under
+        // `LinkMode::Real`, where the runtime credential file is a symlink onto
+        // the store and a write needs no reconcile at all; under `Fake` it is up
+        // to 30 s of stale mirrored bytes. `Real` is the norm on unix and `Fake`
+        // the norm on Windows, so the exposure is mostly Windows'; macOS reaches
+        // it only through `detect_link_mode`'s failure arm — `try_real_symlink`
+        // is a real `symlink(2)`, not an infallible call — which is a `$HOME` on a
+        // volume without symlink support or a denial on the probe write.
+        drop(rotation_guard);
+        hold_released();
         // Built from `paths` rather than from locals moved out of it, so the
         // runtime dir the swap repoints and the marker it must recognize as its
         // own come from one source.
@@ -2238,9 +2569,9 @@ impl ProfileRuntime {
         // 18-34 ms on macOS (FSEvents resolves and registers each directory),
         // and a caller that spawned first had no way to learn when its watch
         // went up: a credential write landing in that window produced no event
-        // and waited out the whole 30 s fallback. Costs ~15-26 ms inside this
-        // profile's rotation-guard hold, against a guard already held across
-        // OAuth round trips.
+        // and waited out the whole 30 s fallback. It is outside the rotation-lock
+        // hold, which the drop above ends at the register-and-stamp window, so a
+        // same-profile peer queued behind this start no longer waits it out.
         let specs = crate::watchdog::watch_specs(
             swap.runtime.as_path(),
             swap.canonical().as_path(),

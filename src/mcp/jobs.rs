@@ -73,16 +73,20 @@ pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// heartbeats at all, would be reaped by every reader for the rest of its life.
 ///
 /// What CAN sit silent that long under a server that is still alive is the
-/// pre-spawn delay: `ProfileRuntime::acquire` blocks behind a `clauth start`
-/// session on the same profile, for as long as that session lasts, and the
+/// pre-spawn delay: `ProfileRuntime::acquire` waits out a same-profile rotation
+/// or sibling session start, and the
 /// reader thread that writes the beats has not spawned yet. Both background
 /// shapes spend that delay silent-since-mint — a streaming run is still inside
 /// the acquire with no child, while a pinned-format one can be well past it,
-/// since the same block plus a wall at the 3600 s ceiling already sits a long
-/// run past the old window with the child spending. The day covers both where
-/// 3600+600 s could not, for a block under roughly a day; `acquire` blocks for
-/// as long as that session lasts, so a block past the day can still overrun it
-/// and a live run's record then reads as a corpse. A blocking run's
+/// since the same wait plus its 3600 s wall already sits a long run past the
+/// old window with the child spending. The day covers both where 3600+600 s
+/// could not. The delay's two legs are the wait for another holder's rotation
+/// lock, bounded by `runtime::ROTATION_LOCK_TIMEOUT` at tens of seconds, and this
+/// acquire's OWN recursive `~/.claude` copy, which runs inside its own hold and is
+/// bounded by nothing but the disk — so a wait past the day is no longer a
+/// session's lifetime away, as this used to claim, but this run's own tree copy
+/// taking a day, at which point a live run's record does read as a corpse.
+/// A blocking run's
 /// [`RecordKind::Liveness`] record is minted at
 /// the spawn, so the delay is outside its clock entirely and its silence is
 /// bounded by the run's own guards. A handed-off run adds no third exposure:

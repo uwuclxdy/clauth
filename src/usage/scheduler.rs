@@ -2439,11 +2439,14 @@ fn tick(state: &SchedulerState) {
     // profile per chain lifetime (~hours), so the fan-out's reason to exist
     // (one slow account stalling every other account's poll, every tick) has
     // no analogue here. What makes inline SAFE is `LockWait::NoWait`: the
-    // gate's rotation-lock acquisition is a try-lock on this leg, because
-    // the rotation lock itself has no timeout of any kind and a `clauth start`
-    // holding it across its recursive `~/.claude` copy would otherwise park
+    // gate's rotation-lock acquisition is a try-lock on this leg, because its
+    // waiting form carries no deadline and a `clauth start`
+    // holding the lock across its recursive `~/.claude` copy would otherwise park
     // this thread — and with it every account's poll — while the heartbeat
-    // (stamped in the main loop, not here) kept reading fresh. What remains
+    // (stamped in the main loop, not here) kept reading fresh. The session
+    // start's own `runtime::ROTATION_LOCK_TIMEOUT` is no substitute: it bounds
+    // that caller, not this one, and it waits tens of seconds — a tick budget many
+    // times over. What remains
     // is one token round trip on a cold re-stamp, which delays a single tick.
     // Anyone adding per-tick work to this leg inherits the fan-out question.
     claude_rolling_tick(&state.config, &state.claude_rolling, now_ms(), &|name| {

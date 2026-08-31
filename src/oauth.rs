@@ -289,10 +289,50 @@ fn token_parse_error(e: &serde_json::Error, status: u16, body_len: usize) -> Tok
     }
 }
 
+/// Connect deadline for every token/kick call [`AGENT`] makes.
+const HTTP_CONNECT_SECS: u64 = 4;
+/// Response-HEADER deadline for the same. An IDLE deadline, re-armed from `now`
+/// before every wait, not a phase bound measured from the connect — see
+/// [`TOKEN_HTTP_DEADLINES`] below for what that difference costs.
+const HTTP_RECV_HEADERS_SECS: u64 = 15;
+
+/// The two deadlines a token call carries, added. Named for the deadlines rather
+/// than for a phase because neither spelling of "the time a call may spend" is
+/// true of it: one term bounds a phase and the other does not. It bounds NO PHASE of a token call end to end, and
+/// reading it as a ceiling is the mistake the doc below exists to prevent.
+///
+/// `timeout_connect` is a true phase bound — upstream's wording is "Max duration
+/// for establishing the connection. For a TLS connection this includes opening
+/// the socket and doing the TLS handshake."
+///
+/// `timeout_recv_response` is NOT, despite reading like one. ureq 3.4.0 re-arms it
+/// from `now` before every wait (`CallTimings::next_timeout`, re-called inside the
+/// receive loop), so it caps the gap between two header bytes, never the phase. A
+/// server dribbling one header byte every 3 s ran 135 s to a 200 under exactly
+/// this agent config, against a 15.3 s timeout on a server that sent nothing —
+/// measured 2026-08-31, which is also what proves the deadline is armed at all.
+///
+/// Of ureq's five per-phase deadlines the other three are left at their `None`
+/// default here — `timeout_resolve`, `timeout_send_request` and
+/// `timeout_send_body`, the last live rather than hypothetical since a refresh
+/// POSTs a body — and so are `timeout_recv_body` and `timeout_global`. So every
+/// phase of the call is unbounded: DNS, the request send, header receipt and the
+/// response body alike.
+///
+/// Named rather than left as two literals inside [`AGENT`] because a caller that
+/// must OUTLAST a refresh derives its own deadline from it —
+/// [`crate::runtime::ROTATION_LOCK_TIMEOUT`], which waits out a rotation holding
+/// the per-profile flock across this window. Building the agent from the same two
+/// terms is what keeps the two from drifting: retuning either moves the waiter
+/// with it. The unbounded phases are named there too, as legs that constant
+/// cannot cover.
+pub(crate) const TOKEN_HTTP_DEADLINES: Duration =
+    Duration::from_secs(HTTP_CONNECT_SECS + HTTP_RECV_HEADERS_SECS);
+
 static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(4)))
-        .timeout_recv_response(Some(Duration::from_secs(15)))
+        .timeout_connect(Some(Duration::from_secs(HTTP_CONNECT_SECS)))
+        .timeout_recv_response(Some(Duration::from_secs(HTTP_RECV_HEADERS_SECS)))
         // ureq 3 defaults non-2xx to `Err(Error::StatusCode)`, which `kick`'s
         // error mapping collapsed into `KickError::Other` — making the
         // 401 → rotate-and-retry leg unreachable. With the flag off, `kick`
@@ -1842,12 +1882,14 @@ enum LockWait {
     /// `acquire`'s blocking is what makes their pre/post-guard re-reads exact.
     Block,
     /// Never park. The scheduler's re-stamp leg runs INLINE on the tick
-    /// thread, and the rotation lock has no timeout of any kind — a `clauth
-    /// start` holding it across its recursive `~/.claude` copy would stall
+    /// thread, and this gate's own acquisition carries no deadline — a `clauth
+    /// start` holding the lock across its recursive `~/.claude` copy would stall
     /// every account's poll while the heartbeat (stamped in the main loop)
-    /// stays fresh. A held lock returns Transient instead; the holder's own
-    /// path re-stamps, or the scan retries in minutes on an hours-wide
-    /// horizon.
+    /// stays fresh. `runtime::ROTATION_LOCK_TIMEOUT` is no help here: it bounds
+    /// the SESSION START's wait, not this one, and it waits tens of seconds anyway,
+    /// which is a poll tick's whole budget many times over. A held lock returns
+    /// Transient instead; the holder's own path re-stamps, or the scan retries
+    /// in minutes on an hours-wide horizon.
     NoWait,
 }
 

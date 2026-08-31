@@ -81,6 +81,22 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// refusing outright has half as long to be answered before that.
 const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
+// A mirror is TWO invocations, so one costs `2 x SECURITY_TIMEOUT` at worst, and
+// that is the quantity `runtime::ROTATION_LOCK_TIMEOUT`'s floor budgets for this
+// leg. It is spelled over there because this module is macOS-gated while that
+// deadline is one number on every host; the check is a compile error rather than
+// a test because the quantity exists only in this build, so this is the only
+// build that can make it.
+//
+// Deliberately not `lock::SUBPROCESS_BUDGET`, which the two coincide with today:
+// that bounds one state-flock hold's shell-outs in aggregate, and
+// `oauth::apply_rotated_tokens_locked` runs its mirror after the closure ends,
+// where `security_deadline` clamps nothing.
+const _: () = assert!(
+    SECURITY_TIMEOUT.as_millis() * 2 == crate::runtime::KEYCHAIN_MIRROR_BUDGET.as_millis(),
+    "runtime::KEYCHAIN_MIRROR_BUDGET must stay two security invocations wide"
+);
+
 /// The deadline for the next `security` invocation: [`SECURITY_TIMEOUT`], clamped
 /// to whatever the state-lock hold this call sits inside has left to spend
 /// (`lock::clamp_to_hold_budget`). Outside a hold — `oauth.rs` mirrors a rotation
