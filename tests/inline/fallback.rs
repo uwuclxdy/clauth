@@ -53,6 +53,7 @@ fn canceled_usage() -> UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
+            codex_plan: None,
         }),
         ..UsageInfo::default()
     }
@@ -5283,5 +5284,94 @@ fn weekly_override_on_a_sink_active_still_stays_put_over_paying() {
         next_target(&config, None),
         None,
         "a serving-sink active stays parked free regardless of its override"
+    );
+}
+
+// ── the codex chain ─────────────────────────────────────────────────────────
+
+fn codex_state(active: &str, chain: &[&str], wrap_off: bool) -> crate::codex_profiles::CodexState {
+    let toml = format!(
+        "active_profile = \"{active}\"\nprofiles = [{list}]\nfallback_chain = [{list}]\nwrap_off = {wrap_off}\n",
+        list = chain
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    toml::from_str(&toml).expect("codex state fixture")
+}
+
+/// The codex chain is built from `codex-profiles.toml` ALONE — its own active
+/// slot, its own order, its own wrap-off (decision 4). Nothing claude-side
+/// reaches it, which is what keeps the two harnesses' rotations independent.
+#[test]
+fn the_codex_chain_reads_only_the_codex_state() {
+    let state = codex_state("cx1", &["cx1", "cx2"], true);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000)
+        .expect("an active member of its own chain");
+    assert_eq!(snap.active.as_str(), "cx1");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        ["cx1", "cx2"]
+    );
+    assert!(
+        snap.switch_off_when_spent,
+        "the codex wrap-off, not claude's"
+    );
+    assert_eq!(snap.chain[0].weekly_line, 95.0);
+}
+
+/// `check_scoped` is DISARMED on every codex member: per-model weekly windows
+/// are an anthropic `limits[]` concept and `wham/usage` has no equivalent, so
+/// an armed gate would judge codex against windows that can never appear.
+#[test]
+fn codex_members_never_arm_the_scoped_gate() {
+    let state = codex_state("cx1", &["cx1", "cx2"], false);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000).expect("snapshot");
+    assert!(
+        snap.chain.iter().all(|m| !m.check_scoped),
+        "no codex member arms a gate its harness cannot answer"
+    );
+}
+
+/// An active slot that is not a chain member yields no snapshot — the same
+/// short-circuit the claude builder takes, so the caller skips evaluation
+/// instead of walking a chain the active is not on.
+#[test]
+fn a_codex_active_outside_its_chain_yields_no_snapshot() {
+    let state = codex_state("cx9", &["cx1", "cx2"], false);
+    assert!(crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000).is_none());
+    let empty = crate::codex_profiles::CodexState::default();
+    assert!(crate::fallback::snapshot_codex_chain(&empty, 95.0, 60_000).is_none());
+}
+
+/// The codex chain walks on the SAME predicates the claude one does, over the
+/// same shared store — which is what makes a codex reading actionable at all.
+/// A spent active moves to the next member; the reading comes straight from
+/// the `wham/usage` mapping.
+#[test]
+fn a_spent_codex_active_moves_to_the_next_member() {
+    let state = codex_state("cx1", &["cx1", "cx2"], false);
+    let snap = crate::fallback::snapshot_codex_chain(&state, 95.0, 60_000).expect("snapshot");
+    let spent = crate::usage::map_codex_usage(
+        r#"{"rate_limit":{"limit_reached":true,"primary_window":{"used_percent":99,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    let idle = crate::usage::map_codex_usage(
+        r#"{"rate_limit":{"primary_window":{"used_percent":3,"limit_window_seconds":18000,"reset_after_seconds":3600}}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    let store: std::collections::HashMap<String, crate::usage::UsageInfo> =
+        [("cx1".to_string(), spent), ("cx2".to_string(), idle)]
+            .into_iter()
+            .collect();
+    assert_eq!(
+        crate::fallback::next_auto_switch_target_for_test(&snap, &store),
+        Some(crate::fallback::SwitchAction::To("cx2".to_string()))
     );
 }

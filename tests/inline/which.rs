@@ -622,6 +622,7 @@ fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
         plan: Some(PlanInfo {
             tier,
             subscription_status: status.map(str::to_string),
+            codex_plan: None,
         }),
         ..Default::default()
     };

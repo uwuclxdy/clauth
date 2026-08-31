@@ -195,6 +195,7 @@ fn account_type_label_keeps_every_known_tier() {
             plan: Some(crate::usage::PlanInfo {
                 tier,
                 subscription_status: None,
+                codex_plan: None,
             }),
             ..Default::default()
         })

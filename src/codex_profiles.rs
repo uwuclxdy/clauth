@@ -92,6 +92,18 @@ impl CodexState {
         self.active_profile.as_ref()
     }
 
+    /// The codex fallback chain, in walk order — the codex twin of
+    /// `AppState.fallback_chain`, read by [`crate::fallback::snapshot_codex_chain`].
+    pub(crate) fn fallback_chain(&self) -> &[ProfileName] {
+        &self.fallback_chain
+    }
+
+    /// Whether the codex chain switches OFF rather than wrapping when every
+    /// member is spent — the codex twin of `AppState.switch_off_when_spent`.
+    pub(crate) fn switch_off_when_spent(&self) -> bool {
+        self.switch_off_when_spent
+    }
+
     /// Exact-match membership, same semantics as `AppConfig::find` answering
     /// `is_some`.
     pub(crate) fn holds(&self, name: &str) -> bool {

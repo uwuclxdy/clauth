@@ -38,6 +38,7 @@ fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
             plan: Some(PlanInfo {
                 tier: PlanTier::Max(Some(5)),
                 subscription_status: None,
+                codex_plan: None,
             }),
             five_hour: Some(UsageWindow {
                 utilization: five_h,
@@ -121,6 +122,7 @@ fn warm_canceled(name: &str) {
             plan: Some(PlanInfo {
                 tier: PlanTier::Free,
                 subscription_status: Some("canceled".to_string()),
+                codex_plan: None,
             }),
             ..Default::default()
         },

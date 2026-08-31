@@ -440,13 +440,19 @@ struct KickState {
 
 const KICK_BREAKER: u32 = 2;
 
-/// A wham/usage 401 for `name`: queue ONE forced refresh. The codex usage
-/// leg — the next commit in this series — is the production caller; until it
-/// lands, the standby tests drive the whole kick path.
-#[allow(
-    dead_code,
-    reason = "wired by the codex usage leg's 401 arm, the next commit in this series"
-)]
+/// The profile store's chain, read-only and guard-free. The usage leg needs the
+/// access token and the account id to poll `wham/usage`, and reading takes no
+/// rotation guard because it writes nothing — a torn read from codex's in-place
+/// writer simply yields `None` and the poll is skipped for one interval, which
+/// is the same "short or unparseable is RETRY, never gone" rule every reader
+/// here follows.
+pub(crate) fn read_store_auth(name: &str) -> Option<CodexAuth> {
+    let store = profile_subpath(&ProfileName::from(name), "auth.json").ok()?;
+    CodexAuth::parse(&std::fs::read(&store).ok()?).ok()
+}
+
+/// A wham/usage 401 for `name`: queue ONE forced refresh. The codex usage leg's
+/// 401 arm is the production caller.
 pub(crate) fn kick_codex(name: &str) {
     if let Ok(mut g) = KICKED.lock() {
         let m = g.get_or_insert_with(HashMap::new);
