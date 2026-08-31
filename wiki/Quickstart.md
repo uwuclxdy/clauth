@@ -70,7 +70,7 @@ clauth list           # account table with cached usage, no network
 | `clauth enable <profile>` | | put a disabled profile back |
 | `clauth which` | `--json` | print the profile owning the loaded credentials |
 | `clauth list` | `--all` (`--disabled`) | account table from the on-disk caches, never fetches |
-| `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, next deadline, live runs first |
+| `clauth jobs` | `--json` | what the delegates are doing: account, elapsed, last output, next deadline, live runs first; `--json` also carries each run's `session_id`, the handle `delegate({resume})` takes after a crash |
 | `clauth sessions` | `--json`, `--tokens` | list Claude Code sessions, newest first |
 | `clauth resume <id\|latest>` | `--profile <name>` | resume a session under a chosen account |
 | `clauth info <id\|latest>` | | print a session's resume command, workspace, and storage path |
