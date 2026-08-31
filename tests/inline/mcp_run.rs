@@ -7595,6 +7595,33 @@ fn the_profile_not_found_builder_names_the_fix() {
 /// The sentence is composed in ONE place: the builder. Scanning the source
 /// keeps a site that re-inlines its own spelling red — the defensive re-finds
 /// (`run_delegate` and `resolve_fanout`'s pre-flight) fire only on a re-find
+/// A codex name resolves to nothing in the MCP surface and to a real account
+/// everywhere else, so the refusal must say WHICH it hit: "not found" and "not
+/// managed here" are different facts, and only one of them is the caller's
+/// mistake.
+#[test]
+fn the_refusal_tells_a_codex_name_apart_from_an_unknown_one() {
+    let home = crate::testutil::HomeSandbox::new();
+    let dir = home.home().join(".clauth");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
+        .expect("write codex state");
+
+    let real = profile_not_found_cross_harness("cx", ProfileNotFoundFix::CallProfiles);
+    assert!(real.contains("CODEX account"), "{real}");
+    assert!(
+        real.contains("clauth switch"),
+        "the fix names the surface that CAN: {real}"
+    );
+
+    let unknown = profile_not_found_cross_harness("ghost", ProfileNotFoundFix::CallProfiles);
+    assert!(
+        unknown.contains("call `profiles` for valid names"),
+        "an actually-unknown name keeps the ordinary clause: {unknown}"
+    );
+    assert!(!unknown.contains("CODEX"), "{unknown}");
+}
+
 /// race no tool-level pin can drive, so without the scan a dropped pointer
 /// there reds nothing. Comment lines are out: the scanned contract is about
 /// code, and the docs around the builder name the refusal in prose.

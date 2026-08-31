@@ -135,6 +135,13 @@ pub(crate) struct ProfileEntry {
     /// Human tier label for an anthropic account (`Max 5x`); `None` for
     /// third-party/api-key profiles.
     pub(crate) tier: Option<String>,
+    /// Additive (schema stays 1): which harness this profile belongs to,
+    /// `claude` or `codex`. Membership of a state file is the authority
+    /// (decision 1) and names are globally unique (decision 2), so one flat
+    /// `profiles[]` still reads unambiguously — a reader that predates codex
+    /// ignores the field and sees the claude accounts it always saw, because
+    /// codex entries are appended after them.
+    pub(crate) harness: String,
     /// A live `clauth start` session runs for this profile.
     pub(crate) has_live_session: bool,
     /// `ok` / `expiring` / `broken` (see [`auth_status_str`]).
@@ -304,6 +311,7 @@ pub(crate) fn build_profile_entries(
                 provider: provider_label(p),
                 base_url: p.base_url.clone(),
                 tier: tier_label(p),
+                harness: "claude".to_string(),
                 has_live_session: crate::runtime::has_live_session(name),
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
@@ -320,6 +328,66 @@ pub(crate) fn build_profile_entries(
         .collect()
 }
 
+/// The codex half of `profiles[]`, appended after the claude entries.
+///
+/// Built from `codex-profiles.toml` plus the per-profile usage cache the codex
+/// leg writes, and nothing else: a codex profile has no `Profile` record (the
+/// file split leaves `profiles.toml` untouched), so every claude-only field is
+/// its no-data form rather than a fabricated one. `tier` carries the ChatGPT
+/// plan verbatim — never a `Claude <tier>` label, which is what `tier_label`
+/// would produce.
+pub(crate) fn build_codex_entries(interval_ms: u64) -> Vec<ProfileEntry> {
+    let Ok(codex) = crate::codex_profiles::CodexState::load() else {
+        return Vec::new();
+    };
+    let now = now_ms();
+    let active = codex.active_profile().cloned();
+    codex
+        .profiles()
+        .iter()
+        .map(|name| {
+            let mtime_ms = profile_cache_mtime_ms(name, USAGE_CACHE_FILE);
+            let cached: Option<UsageInfo> = load_profile_cache(name, USAGE_CACHE_FILE);
+            ProfileEntry {
+                name: name.clone(),
+                active: active.as_ref().is_some_and(|a| a == name),
+                // Rolling tokens are a claude-side mechanism (a `session-token`
+                // sidecar); codex holds one chain in one auth.json.
+                rolling_token: false,
+                provider: "openai".to_string(),
+                base_url: None,
+                tier: cached
+                    .as_ref()
+                    .and_then(|u| u.plan.as_ref())
+                    .and_then(|p| p.codex_plan.clone()),
+                harness: "codex".to_string(),
+                has_live_session: crate::runtime::has_live_session(name),
+                // The claude auth grades read `.credentials.json` and the
+                // keychain, neither of which a codex profile has. A chain that
+                // cannot be read at all is the only codex-side "broken", and
+                // the usage leg reports that as a missing reading.
+                auth_status: if cached.is_some() { "ok" } else { "unknown" }.to_string(),
+                fetch_status: mtime_ms.map(|mt| {
+                    if now.saturating_sub(mt) < interval_ms {
+                        "Fresh"
+                    } else {
+                        "Cached"
+                    }
+                    .to_string()
+                }),
+                stale: false,
+                fetched_at: mtime_ms.map(iso_from_ms),
+                next_refresh_at: mtime_ms.map(|mt| iso_from_ms(mt.saturating_add(interval_ms))),
+                auto_start: false,
+                bell_threshold: None,
+                fallback: None,
+                windows: published_windows(name),
+                third_party: None,
+            }
+        })
+        .collect()
+}
+
 /// Build the full `status.json` body. `interval_ms` is the live refresh interval
 /// (daemon) or `config.state.refresh_interval_ms` (single-shot). `live` carries
 /// the scheduler's in-memory freshness/countdown stores when a daemon is running.
@@ -329,7 +397,11 @@ pub(crate) fn build_status(
     live: Option<&LiveSignals>,
     include_disabled: bool,
 ) -> serde_json::Value {
-    let profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    let mut profiles = build_profile_entries(config, interval_ms, live, include_disabled);
+    // Appended, never interleaved: a reader that predates codex takes the
+    // prefix it always took.
+    profiles.extend(build_codex_entries(interval_ms));
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
     // Stamped after the entries build (each entry reads its own clock) so
     // `generated_at` never precedes the instant a per-entry verdict was judged at.
     let now = now_ms();
@@ -340,7 +412,17 @@ pub(crate) fn build_status(
         "active_profile": config.state.active_profile.as_deref(),
         "pending_switch": live.and_then(|s| s.pending_switch),
         "wrap_off": config.state.switch_off_when_spent,
+        // Additive per-harness slots (decision 10): the top-level
+        // `active_profile` / `wrap_off` above stay the CLAUDE ones, so nothing
+        // that reads them today changes meaning.
+        "active_codex_profile": codex.active_profile().map(ProfileName::as_str),
+        "codex_fallback_chain": codex.fallback_chain(),
+        "codex_wrap_off": codex.switch_off_when_spent(),
         "refresh_interval_ms": interval_ms,
+        // The daemon that wrote this feed. A reader can tell an old daemon —
+        // one with no codex support at all — from a new one reporting an empty
+        // codex roster, which are otherwise byte-identical.
+        "clauth_version": env!("CARGO_PKG_VERSION"),
         "profiles": profiles,
     })
 }

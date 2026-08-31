@@ -2717,6 +2717,12 @@ fn codex_usage_tick(state: &SchedulerState) {
         match outcome {
             Ok(info) => {
                 crate::codex_auth::kick_reset(name.as_str());
+                // Persist through the same per-profile cache the claude leg
+                // writes, so every reader that resolves a window BY NAME —
+                // `published_windows`, the Usage tab's seed, a `status --json`
+                // taken with no daemon running — answers for codex without one
+                // line of harness awareness.
+                write_profile_cache(name, USAGE_CACHE_FILE, &info);
                 if let Ok(mut store) = state.store.lock() {
                     store.insert(name.to_string(), info);
                 }

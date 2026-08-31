@@ -318,11 +318,42 @@ fn delegate_refusal(reason: &str) -> CallToolResult {
 /// carry the whole lesson, and the clause is a closed set composed HERE so the
 /// call sites cannot split the server's refusal vocabulary.
 fn profile_not_found(names: &str, fix: ProfileNotFoundFix) -> String {
-    let clause = match fix {
-        ProfileNotFoundFix::CallProfiles => "call `profiles` for valid names",
-        ProfileNotFoundFix::OmitFilter => "omit `names` for every account",
+    let clause = match &fix {
+        ProfileNotFoundFix::CallProfiles => "call `profiles` for valid names".to_string(),
+        ProfileNotFoundFix::OmitFilter => "omit `names` for every account".to_string(),
+        ProfileNotFoundFix::CodexAccount(held) => format!(
+            "{held} names a CODEX account, which these tools do not manage — they are Claude \
+             Code only. Switch it with `clauth switch <name>`"
+        ),
     };
     format!("profile not found: {names}; {clause}")
+}
+
+/// [`profile_not_found`] for the surfaces a human names a profile at, where a
+/// bare "not found" is the one wrong answer: a codex name resolves to nothing
+/// HERE and to a real account everywhere else. These tools are Claude-Code-only
+/// by construction (`load_config` builds from `profiles.toml` alone), which is a
+/// different fact from the name being unknown, and only the refusal can say
+/// which one the caller hit.
+///
+/// Split from the builder rather than folded into it because the builder is a
+/// pure sentence composer — reading the codex roster is IO, and every call site
+/// that composes a refusal from a name it already validated should not pay for
+/// a state read it cannot use.
+fn profile_not_found_cross_harness(names: &str, fix: ProfileNotFoundFix) -> String {
+    let base = profile_not_found(names, fix);
+    let Ok(codex) = crate::codex_profiles::CodexState::load() else {
+        return base;
+    };
+    let held: Vec<&str> = names
+        .split(',')
+        .map(str::trim)
+        .filter(|n| codex.holds(n))
+        .collect();
+    if held.is_empty() {
+        return base;
+    }
+    profile_not_found(names, ProfileNotFoundFix::CodexAccount(held.join(", ")))
 }
 
 /// The fix clause a [`profile_not_found`] refusal ends with. Closed, so the
@@ -332,6 +363,9 @@ enum ProfileNotFoundFix {
     /// The caller is outside the roster: the `profiles` tool is the source of
     /// valid names.
     CallProfiles,
+    /// The name IS a real account — on the other harness. Carries the codex
+    /// names the caller spelled, so the refusal names them back.
+    CodexAccount(String),
     /// The caller is INSIDE the `profiles` tool, filtering it: dropping the
     /// filter shows every account.
     OmitFilter,
@@ -995,7 +1029,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
         let raw: Vec<String> = profiles.unwrap_or_default();
         let target = if raw.len() == 1 {
             let Some(name) = config.canonical_name(&raw[0]) else {
-                return Ok(delegate_refusal(&profile_not_found(
+                return Ok(delegate_refusal(&profile_not_found_cross_harness(
                     &raw[0],
                     ProfileNotFoundFix::CallProfiles,
                 )));
@@ -1013,7 +1047,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                 Some(id) => match crate::hook_note::told_account(id) {
                     Some(name) => {
                         let Some(name) = config.canonical_name(&name) else {
-                            return Ok(delegate_refusal(&profile_not_found(
+                            return Ok(delegate_refusal(&profile_not_found_cross_harness(
                                 &name,
                                 ProfileNotFoundFix::CallProfiles,
                             )));
