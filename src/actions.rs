@@ -1060,8 +1060,19 @@ pub(crate) fn capture_into_profile(
         config.set_auth_broken(&name, false);
 
         if config.state.active_profile.is_none() {
+            // BEFORE `set_active`, like `finish_switch`: once the marker names
+            // the incoming profile the helper answers with its keys, which
+            // strips nothing that was already in the file.
+            let stale_env_keys = outgoing_env_keys(config);
             link_profile_credentials(&name)?;
             config.state.set_active(Some(name.clone()), held);
+            // Same settings write the reauth auto-activate arm makes, for the
+            // same reason: this profile IS the active one now, and the live
+            // settings may still carry the departed account's entries —
+            // `switch_off` clears the marker without touching the file. The
+            // strip list captured above removes them.
+            let profile = config.find(&name).context("profile not found")?;
+            apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
         save_app_state(&config.state)
     })?;
@@ -1097,8 +1108,17 @@ pub(crate) fn create_profile_from_login(
         config.add(profile);
 
         if config.state.active_profile.is_none() {
+            // BEFORE `set_active`, like `finish_switch`: once the marker names
+            // the incoming profile the helper answers with its keys, which
+            // strips nothing that was already in the file.
+            let stale_env_keys = outgoing_env_keys(config);
             link_profile_credentials(&name)?;
             config.state.set_active(Some(name.clone()), held);
+            // Same settings write + rationale as `capture_into_profile`'s
+            // arm: the departed account's entries are still in the live
+            // settings, and this profile is the active one now.
+            let profile = config.find(&name).context("profile not found")?;
+            apply_profile_to_claude_settings(profile, &stale_env_keys)?;
         }
         save_app_state(&config.state)
     })?;

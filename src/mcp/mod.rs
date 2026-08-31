@@ -3585,7 +3585,7 @@ fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Re
 }
 
 /// Compose a delegate's environment on `command`: drop inherited provider
-/// routing + the active profile's custom env
+/// routing + the outgoing activation's custom env keys
 /// ([`crate::runtime::scrub_profile_env`]), layer the caller's `env`, then
 /// clauth's own keys which always win. `CLAUDE_CONFIG_DIR` and the depth guard
 /// can't be overridden, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when
@@ -3593,11 +3593,11 @@ fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Re
 fn apply_delegate_env(
     command: &mut Command,
     caller_env: &HashMap<String, String>,
-    active_env_keys: &[String],
+    stale_env_keys: &[String],
     config_dir: &std::path::Path,
     depth: u32,
 ) {
-    crate::runtime::scrub_profile_env(command, active_env_keys);
+    crate::runtime::scrub_profile_env(command, stale_env_keys);
     command.envs(caller_env);
     if !caller_env.contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
         command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
@@ -3656,20 +3656,17 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         None => None,
     };
 
-    // Strip the active profile's custom env so a delegate for `<target>` does
-    // not inherit whoever is globally active (mirrors `clauth start`).
-    let active_env_keys: Vec<String> = config
-        .state
-        .active_profile
-        .as_ref()
-        .and_then(|n| config.find(n))
-        .map(|p| p.env.keys().cloned().collect())
-        .unwrap_or_default();
+    // Strip the outgoing profile's custom env so a delegate for `<target>` does
+    // not inherit whoever was globally active — or, with no marker to read
+    // (`switch_off` clears it without touching the file), the departed
+    // account whose entries are still in the live settings (mirrors
+    // `clauth start`).
+    let stale_env_keys = crate::actions::outgoing_env_keys(&config);
 
     // Guard kept alive across spawn+wait; dropped on return for RAII teardown.
     // A delegate is a one-shot headless run against a named account, so it never
     // follows the chain — moving it mid-prompt would change who answered.
-    let runtime = ProfileRuntime::acquire(target, opts.isolation, &active_env_keys, false)
+    let runtime = ProfileRuntime::acquire(target, opts.isolation, &stale_env_keys, false)
         .map_err(|e| format!("failed to acquire runtime: {e}"))?;
 
     // The acquire above is the longest thing that can happen before a child
@@ -3701,7 +3698,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     apply_delegate_env(
         &mut command,
         &opts.env,
-        &active_env_keys,
+        &stale_env_keys,
         runtime.config_dir(),
         opts.depth,
     );

@@ -2253,13 +2253,13 @@ impl ProfileRuntime {
     pub(crate) fn acquire(
         profile: &Profile,
         isolation: Isolation,
-        active_env_keys: &[String],
+        stale_env_keys: &[String],
         follows_chain: bool,
     ) -> Result<Self> {
         Self::acquire_synced(
             profile,
             isolation,
-            active_env_keys,
+            stale_env_keys,
             follows_chain,
             || {},
             |_, _| {},
@@ -2308,7 +2308,7 @@ impl ProfileRuntime {
     fn acquire_synced(
         profile: &Profile,
         isolation: Isolation,
-        active_env_keys: &[String],
+        stale_env_keys: &[String],
         follows_chain: bool,
         pre_lock_done: impl FnOnce(),
         stamp_window_closing: impl FnOnce(&SessionPaths, &SessionId),
@@ -2413,7 +2413,7 @@ impl ProfileRuntime {
                 &canonical,
                 mode,
                 isolation,
-                active_env_keys,
+                stale_env_keys,
             )?;
             let file = open_pid_file(pid_file)
                 .with_context(|| format!("failed to open {}", pid_file.display()))?;
@@ -2805,16 +2805,17 @@ pub(crate) const MANAGED_ENV_KEYS: &[&str] = &[
     "CLAUDE_CODE_SUBAGENT_MODEL",
 ];
 
-/// Drop [`MANAGED_ENV_KEYS`] plus the active profile's custom env keys from
-/// `command`'s inherited env, so the target's runtime `settings.json` is the
-/// sole source for them. Shared by `clauth start` and the MCP delegate. Call
-/// before layering any caller-supplied env, so a caller can still set a key
-/// back deliberately.
-pub(crate) fn scrub_profile_env(command: &mut std::process::Command, active_env_keys: &[String]) {
+/// Drop [`MANAGED_ENV_KEYS`] plus the outgoing activation's custom env keys
+/// ([`crate::actions::outgoing_env_keys`]: the active profile's, or every
+/// configured profile's with no marker to read) from `command`'s inherited
+/// env, so the target's runtime `settings.json` is the sole source for them.
+/// Shared by `clauth start` and the MCP delegate. Call before layering any
+/// caller-supplied env, so a caller can still set a key back deliberately.
+pub(crate) fn scrub_profile_env(command: &mut std::process::Command, stale_env_keys: &[String]) {
     for key in MANAGED_ENV_KEYS {
         command.env_remove(key);
     }
-    for key in active_env_keys {
+    for key in stale_env_keys {
         command.env_remove(key);
     }
 }
@@ -3011,11 +3012,13 @@ fn is_session_alive(pid_file: &Path) -> bool {
 /// and, critically, no writable store: its CC (empty settings → default
 /// `cleanupPeriodDays`) can never write or clean the operator's `projects/`.
 ///
-/// `active_env_keys` (the live-active profile's custom env) are stripped from
-/// the shared `settings.json` base before this profile's overrides are merged,
-/// so a `clauth start <other>` session does not inherit the active profile's
-/// custom `[env]`. Model + endpoint keys are re-derived per profile in
-/// `build_claude_settings_json`, so only custom `[env]` needs this strip.
+/// `stale_env_keys` (the outgoing activation's custom env: the active
+/// profile's, or every configured profile's with no marker to read) are
+/// stripped from the shared `settings.json` base before this profile's
+/// overrides are merged, so a `clauth start <other>` session does not inherit
+/// a departed account's custom `[env]`. Model + endpoint keys are re-derived
+/// per profile in `build_claude_settings_json`, so only custom `[env]` needs
+/// this strip.
 fn build_runtime_dir_with_active_env(
     runtime: &Path,
     claude_home: &Path,
@@ -3023,7 +3026,7 @@ fn build_runtime_dir_with_active_env(
     canonical: &Path,
     mode: LinkMode,
     isolation: Isolation,
-    active_env_keys: &[String],
+    stale_env_keys: &[String],
 ) -> Result<()> {
     // Drop any top-level symlink whose `~/.claude/` target has vanished before
     // the re-walk. A prior session's link can dangle once the operator moves the
@@ -3071,7 +3074,7 @@ fn build_runtime_dir_with_active_env(
         pending.push((entry.path(), dst));
     }
     materialize_entries(pending, mode)?;
-    write_merged_settings(runtime, claude_home, profile, isolation, active_env_keys)?;
+    write_merged_settings(runtime, claude_home, profile, isolation, stale_env_keys)?;
 
     let creds_link = runtime.join(".credentials.json");
     reconcile_credentials(&creds_link, canonical, mode)?;
@@ -3081,9 +3084,11 @@ fn build_runtime_dir_with_active_env(
     Ok(())
 }
 
-/// Test-only convenience over [`build_runtime_dir_with_active_env`]: no active
-/// profile, so nothing is stripped from the inherited base. Inline runtime
-/// tests build dirs directly without a live active profile in scope.
+/// Test-only convenience over [`build_runtime_dir_with_active_env`]: passes
+/// an empty strip list, because inline runtime tests build a tree for the one
+/// profile under test and have no other profile's `[env]` to keep out. The
+/// empty list is NOT the production no-marker shape — with no marker to read,
+/// production strips every configured profile's keys.
 #[cfg(test)]
 fn build_runtime_dir(
     runtime: &Path,
@@ -3158,12 +3163,13 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
 /// hooks/permissions/statusline/plugin config), keeping only the profile's own
 /// env + model routing.
 ///
-/// `active_env_keys` (the live-active profile's custom env) are stripped from
-/// the shared base first, so a `clauth start <other>` session does not inherit
-/// the active profile's custom `[env]`. Model + endpoint keys are re-derived
-/// per profile in `build_claude_settings_json`, so only custom `[env]` needs
-/// this. Callers with no active profile pass empty; starting the active profile
-/// itself passes its own keys, which the merge re-inserts (a no-op strip).
+/// `stale_env_keys` (the outgoing activation's custom env: the active
+/// profile's, or every configured profile's with no marker to read) are
+/// stripped from the shared base first, so a `clauth start <other>` session
+/// does not inherit a departed account's custom `[env]`. Model + endpoint keys
+/// are re-derived per profile in `build_claude_settings_json`, so only custom
+/// `[env]` needs this. Starting the active profile itself passes its own keys,
+/// which the merge re-inserts (a no-op strip).
 ///
 /// This computes the copy; `crate::settings_sync` then keeps it converged with
 /// the base and every sibling runtime for the session's lifetime. The two agree
@@ -3174,14 +3180,14 @@ fn write_merged_settings(
     claude_home: &Path,
     profile: &Profile,
     isolation: Isolation,
-    active_env_keys: &[String],
+    stale_env_keys: &[String],
 ) -> Result<()> {
     let settings_src = claude_home.join("settings.json");
     let base = match isolation {
         Isolation::Shared => Some(settings_src.as_path()),
         Isolation::Isolated => None,
     };
-    let merged = build_claude_settings_json(base, profile, active_env_keys)?;
+    let merged = build_claude_settings_json(base, profile, stale_env_keys)?;
     let settings_dst = runtime.join("settings.json");
     // This file carries the api-key profile's top-level `apiKeyHelper` command
     // string (plus the base_url/model env keys), so it must land 0o600 like

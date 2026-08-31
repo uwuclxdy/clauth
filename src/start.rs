@@ -192,32 +192,30 @@ pub(crate) fn run(
     // uninstalled plugin heals to a one-read no-op.
     crate::plugin_host::preflight();
 
-    // Strip the active profile's custom env from the inherited base so a
+    // Strip the outgoing profile's custom env from the inherited base so a
     // `clauth start <other>` session doesn't inherit it. The live
     // `settings.json` is owned by whoever is active; starting that same profile
-    // passes its own keys, which the merge re-inserts (no-op).
-    let active_env_keys: Vec<String> = config
-        .state
-        .active_profile
-        .as_ref()
-        .and_then(|n| config.find(n))
-        .map(|p| p.env.keys().cloned().collect())
-        .unwrap_or_default();
+    // passes its own keys, which the merge re-inserts (no-op). With no active
+    // marker to read (`switch_off` clears it without touching the file) the
+    // helper answers every configured profile's keys, so a departed account's
+    // entries are stripped too rather than landing in front of the started
+    // account's endpoint.
+    let stale_env_keys = crate::actions::outgoing_env_keys(config);
 
     let runtime = {
         let _spinner = Spinner::start("clauth: preparing runtime");
-        ProfileRuntime::acquire(profile, isolation, &active_env_keys, follows_chain)?
+        ProfileRuntime::acquire(profile, isolation, &stale_env_keys, follows_chain)?
     };
 
     #[cfg(unix)]
     let signal_watcher = SignalWatcher::new()?;
 
     let mut command = crate::runtime::claude_command();
-    // Scrub clauth-managed + active custom env so a session started under
+    // Scrub clauth-managed + outgoing custom env so a session started under
     // profile B doesn't inherit profile A's endpoint/auth/model overrides from
     // the parent process env. The target's runtime settings.json re-supplies
     // whichever it defines. Mirrors the delegate path (run_delegate).
-    crate::runtime::scrub_profile_env(&mut command, &active_env_keys);
+    crate::runtime::scrub_profile_env(&mut command, &stale_env_keys);
     // A resume pins `claude` to the session's workspace; a normal start inherits
     // this process's cwd. Either way the resolved dir feeds the home-project
     // settings guard: when it is the real `$HOME`, its project-tier settings

@@ -1160,6 +1160,108 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
     );
 }
 
+// ---- the delegate runtime merge's strip list -----------------------------
+
+/// The delegate's runtime settings merge strips the OUTGOING activation's
+/// custom env from the shared base — `actions::outgoing_env_keys`, which with
+/// no marker to read answers every configured profile's keys. Passing an
+/// empty list there (what the site did before) leaves the departed account's
+/// `[env]` entries in the base untouched, and the merge then pairs them with
+/// the delegate target's endpoint in the runtime settings. Reach: `switch_off`
+/// (clears the marker, never the file), then any `delegate`.
+///
+/// Drives the real `run_delegate` against a slow shim, so the list under test
+/// is the one the delegate path itself computes, and reads the runtime
+/// settings.json MID-run: the drop removes the tree once the child exits,
+/// leaving nothing to assert.
+#[cfg(unix)]
+#[test]
+fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_endpoint() {
+    use crate::testutil::HomeSandbox;
+
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude_home).expect("~/.claude");
+
+    let mut departing = crate::profile::Profile::new("departing".to_string(), None, None);
+    departing.env.insert(
+        "ANTHROPIC_API_KEY".to_string(),
+        "departing-token".to_string(),
+    );
+    departing.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-departing".to_string(),
+            refresh_token: Some("rt-departing".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let target = crate::profile::Profile::new(
+        "ds-target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-target".to_string()),
+    );
+    crate::profile::save_profile(&departing).expect("save departing");
+    crate::profile::save_profile(&target).expect("save target");
+    let mut config = crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["departing".into(), "ds-target".into()],
+            active_profile: Some("departing".into()),
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![departing, target],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let departing_ref = config
+        .find(&crate::profile::ProfileName::from("departing"))
+        .expect("profile");
+    crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
+        .expect("seed the departing account's env into the live settings");
+
+    crate::actions::switch_off(&mut config).expect("switch off");
+    assert_eq!(
+        config.state.active_profile, None,
+        "fixture: the marker must be cleared, which is what the delegate then reads"
+    );
+
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let target_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("ds-target"))
+        .expect("profile dir");
+    let observer = std::thread::spawn(move || crate::testutil::runtime_settings_until(&target_dir));
+    let _ = run_delegate(DelegateOpts {
+        profile: "ds-target",
+        prompt: "hello",
+        model: None,
+        cwd: None,
+        env: HashMap::new(),
+        extra_args: Vec::new(),
+        timeout_secs: Some(30),
+        idle_secs: None,
+        resume: None,
+        isolation: Isolation::Shared,
+        depth: 0,
+        handoff: None,
+    });
+    let settings = observer
+        .join()
+        .expect("observer thread")
+        .expect("the runtime settings never appeared");
+    drop(shim);
+
+    let json: serde_json::Value = serde_json::from_str(&settings).expect("parse settings");
+    assert_eq!(
+        json["env"]["ANTHROPIC_BASE_URL"],
+        serde_json::json!("https://api.deepseek.com/anthropic"),
+        "fixture: the merge ran, pointing the runtime at the delegate target's endpoint"
+    );
+    assert!(
+        json["env"].get("ANTHROPIC_API_KEY").is_none(),
+        "a departed account's env key must not survive in front of the delegate \
+         target's endpoint: {settings}"
+    );
+}
+
 // ---- background delegation + monitor ----
 
 /// The reserved running record a test seeds a job from, in the shape a real

@@ -1410,6 +1410,155 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
     assert_eq!(live.api_key.as_deref(), Some("sk-live"));
 }
 
+/// `capture_into_profile` auto-activates on a live login and wrote NO settings
+/// while doing it: after a `switch_off` the departed account's `[env]` entries
+/// are still sitting in the live file (the marker was cleared, never the
+/// file), so the freshly captured account activated in front of a stale key.
+/// The auto-activate arm must write, stripping the departed account's keys.
+///
+/// NOT `ANTHROPIC_AUTH_TOKEN`: `build_claude_settings_json` clears that one
+/// unconditionally, so it is the single key that cannot leak.
+#[test]
+fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
+    let _home = HomeSandbox::new();
+
+    let mut departing = Profile::new("departing".to_string(), None, None);
+    departing.env.insert(
+        "ANTHROPIC_API_KEY".to_string(),
+        "departing-token".to_string(),
+    );
+    departing.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-departing".to_string(),
+            refresh_token: Some("rt-departing".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&departing).expect("save departing");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["departing".into()],
+            active_profile: Some("departing".into()),
+            ..AppState::default()
+        },
+        profiles: vec![departing],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let departing_ref = config
+        .find(&crate::profile::ProfileName::from("departing"))
+        .expect("profile");
+    crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
+        .expect("seed the departing account's env into the live settings");
+
+    switch_off(&mut config).expect("switch off");
+    assert_eq!(
+        config.state.active_profile, None,
+        "fixture: the marker must be cleared, which is what the capture then reads"
+    );
+
+    capture_into_profile(
+        &mut config,
+        "incoming".to_string(),
+        login_snapshot("rt-incoming", None),
+    )
+    .expect("capture the incoming account");
+
+    assert_eq!(
+        config.state.active_profile.as_deref(),
+        Some("incoming"),
+        "fixture: the arm under test is the auto-activating one"
+    );
+    let settings = crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    assert!(
+        !settings.contains("departing-token"),
+        "a departed account's env entry must not survive under the incoming \
+         account: {settings}"
+    );
+}
+
+/// The TUI's create-account commit (`create_profile_from_login`) auto-activates
+/// exactly like `capture_into_profile`, and wrote NO settings either — the same
+/// reach: `switch_off`, then create a new account from the Setup tab.
+#[test]
+fn a_tui_create_account_after_a_switch_off_strips_the_departed_accounts_env() {
+    let _home = HomeSandbox::new();
+
+    let mut departing = Profile::new("departing".to_string(), None, None);
+    departing.env.insert(
+        "ANTHROPIC_API_KEY".to_string(),
+        "departing-token".to_string(),
+    );
+    departing.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-departing".to_string(),
+            refresh_token: Some("rt-departing".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&departing).expect("save departing");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["departing".into()],
+            active_profile: Some("departing".into()),
+            ..AppState::default()
+        },
+        profiles: vec![departing],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let departing_ref = config
+        .find(&crate::profile::ProfileName::from("departing"))
+        .expect("profile");
+    crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
+        .expect("seed the departing account's env into the live settings");
+
+    switch_off(&mut config).expect("switch off");
+    assert_eq!(
+        config.state.active_profile, None,
+        "fixture: the marker must be cleared, which is what the commit then reads"
+    );
+
+    create_profile_from_login(
+        &mut config,
+        "incoming".to_string(),
+        None,
+        ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-incoming".to_string(),
+                refresh_token: Some("rt-incoming".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        },
+        None,
+    )
+    .expect("create account");
+
+    assert_eq!(
+        config.state.active_profile.as_deref(),
+        Some("incoming"),
+        "fixture: the arm under test is the auto-activating one"
+    );
+    let settings = crate::profile::claude_dir()
+        .ok()
+        .map(|d| d.join("settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default();
+    assert!(
+        !settings.contains("departing-token"),
+        "a departed account's env entry must not survive under the incoming \
+         account: {settings}"
+    );
+}
+
 /// The preserve is PAIR-WISE: a snapshot carrying one endpoint field but not
 /// the other takes both from the snapshot. Per-field fallback would marry one
 /// vendor's stored key to another vendor's incoming host and then transmit it

@@ -997,3 +997,122 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
         .map(|y| (0..w).map(|x| buf.content[y * w + x].symbol()).collect())
         .collect()
 }
+
+// A fake `claude` on a PATH prefix whose final-run invocation holds the child
+// alive for a few seconds, so a test can read a session's runtime
+// `settings.json` MID-run: `ProfileRuntime`'s drop removes the tree once the
+// child exits, so nothing written there survives to be asserted afterwards.
+
+/// The poll helper: wait until a runtime settings.json appears under
+/// `profile_dir`, then return its content. Bounded so a fixture that never
+/// merges fails the test instead of hanging the suite.
+pub(crate) fn runtime_settings_until(profile_dir: &std::path::Path) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let mut found = None;
+        if let Ok(entries) = std::fs::read_dir(profile_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("runtime-") {
+                    let settings = entry.path().join("settings.json");
+                    if settings.is_file() {
+                        found = Some(settings);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(settings) = found {
+            return std::fs::read_to_string(settings).ok();
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A stateful slow `claude` shim: `--version` and `plugin` probes answer
+/// instantly (the start pre-flight's heal calls them), the session spawn
+/// itself sleeps a bounded five seconds so the poll above can observe the
+/// tree, then exits 0. Mutates process-global env, so it borrows the
+/// [`HomeSandbox`] whose `HOME_TEST_LOCK` serializes every other env pin in
+/// the suite — the same shape `FakeClaude` uses; this one differs only in
+/// keeping the final child alive.
+pub(crate) struct SlowClaude<'a> {
+    _home: std::marker::PhantomData<&'a HomeSandbox>,
+    _tmp: tempfile::TempDir,
+    prev_path: std::ffi::OsString,
+    prev_home: Option<std::ffi::OsString>,
+    prev_data: Option<std::ffi::OsString>,
+    prev_runtime: Option<std::ffi::OsString>,
+}
+
+impl<'a> SlowClaude<'a> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
+    )]
+    pub(crate) fn new(home: &'a HomeSandbox) -> Self {
+        let tmp = tempfile::tempdir_in(home.home()).expect("shim dir");
+        let shim = tmp.path().join("claude");
+        std::fs::write(
+            &shim,
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo \"2.1.220 (Claude Code)\"; exit 0;;\n  plugin) exit 0;;\nesac\nsleep 5\nexit 0\n",
+        )
+        .expect("write shim");
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&shim).expect("shim meta").permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&shim, perms).expect("chmod shim");
+
+        let prev_path = std::env::var_os("PATH").expect("PATH is set");
+        let mut path = std::ffi::OsString::from(tmp.path());
+        path.push(":");
+        path.push(&prev_path);
+        // The `dirs`-crate pins keep agentgear's data/runtime resolution off
+        // the operator's real dirs, exactly like `FakeClaude::stage`.
+        let pin = |key: &str, value: &std::path::Path| {
+            let prev = std::env::var_os(key);
+            // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+            unsafe { std::env::set_var(key, value) };
+            prev
+        };
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var("PATH", path) };
+        let prev_data = pin("XDG_DATA_HOME", &tmp.path().join("data"));
+        let prev_home = pin("HOME", home.home());
+        let prev_runtime = pin("XDG_RUNTIME_DIR", &tmp.path().join("run"));
+        Self {
+            _home: std::marker::PhantomData,
+            _tmp: tmp,
+            prev_path,
+            prev_home,
+            prev_data,
+            prev_runtime,
+        }
+    }
+}
+
+impl Drop for SlowClaude<'_> {
+    #[expect(
+        unsafe_code,
+        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, still held here"
+    )]
+    fn drop(&mut self) {
+        // SAFETY: restore the prior values under the same lock the sandbox holds.
+        unsafe {
+            std::env::set_var("PATH", &self.prev_path);
+            for (key, value) in [
+                ("XDG_DATA_HOME", &self.prev_data),
+                ("HOME", &self.prev_home),
+                ("XDG_RUNTIME_DIR", &self.prev_runtime),
+            ] {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
