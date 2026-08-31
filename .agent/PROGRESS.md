@@ -2729,6 +2729,63 @@ uncommitted batch once, recovered by replay); seal on the FULL suite not a name
 filter (a grammar-drift + a GC-neutrality test only fire there); fmt reflows
 multi-line anchors (re-read before re-mutating).
 
+## CXH-2 — the isolation-escape sweep, and the rebase onto current mommy (2026-08-23)
+
+Six more commits on `feat/codex-harness`, then the whole 25-commit series
+rebased onto mommy `eb6cbb8`.
+
+The round started from ONE finding — codex resolves its sqlite state DBs
+through `sqlite_home`, which is a config KEY as well as `CODEX_SQLITE_HOME`,
+and our session config.toml is a verbatim copy of the operator's, so every
+profile's goals/logs/memories/state could land in one directory with the home's
+durable links never opened through. Generalizing that defect class over the
+whole codex surface (6-lens adversarial workflow, 66 agents, 20 raw → 18
+upheld) found the rest:
+
+- the env CREDENTIALS that outrank the linked auth.json. codex's own `load_auth`
+  resolves CODEX_API_KEY → ephemeral → CODEX_ACCESS_TOKEN → then the persistent
+  store, its comment reading "API key via env var takes precedence over any
+  other auth method". We scrubbed OPENAI_API_KEY for that exact reason and had
+  missed its two siblings, so `clauth start <p>` could spend a different account
+  than it named. Three endpoint overrides joined them.
+- the copied config is SANITIZED now, not merely overridden: `debug.config_lockfile.load_path`
+  makes codex rebuild from `ConfigLayerStack::new(vec![lock_layer], ..)`, which
+  ERASES the `-c` layer rather than losing to it — taking decision 6's store pin
+  with it.
+- the acquire-side stale-home wipe demands a session id (Fake names are all
+  sid-free, so the isolated home — a physical auth.json COPY — was being deleted
+  after a crash and the SPENT store token converged back out).
+- `gc_codex_homes` takes the state lock; its "the acquire flocks the marker
+  before the home exists" comment was false, so the whole build window read as
+  dead and starting sessions were reaped.
+- the capture refusal stopped prescribing chain destruction: codex login goes
+  through `logout_with_revoke`, which reads through the adopted symlink and
+  POSTs the refresh token to the revoke endpoint before minting.
+- inventory: archived_sessions/ joins the sync-back (archiving was deleting at
+  teardown), `<name>.config.toml` profile-v2 layers are copied+sanitized,
+  plugins/ is linked, the durable store heals from codex's own corrupt-DB
+  recovery, Fake refuses a second FLAVOR of one profile, and the dual-claim skip
+  is claude-first like every other site.
+
+Six design items that touch the maintainer's pinned decisions went upstream
+instead (#51 issuecomment-5471926707), two of them unfixable locally: MDM /
+`/etc/codex/managed_config.toml` outranks `-c` (SessionFlags 30 vs 40/50), and
+the write-only `sessions/` sync-back whose fix contradicts his runtime table.
+
+23/23 targeted mutations killed. Post-rebase 2798 passed / 0 failed, and
+`git rebase --exec 'cargo check'` verified every one of the 25 commits builds.
+
+REBASE NOTES for next time: the 169-commit gap cost a `ProfileName` newtype
+migration across every codex call site, a `&StateLockHeld` witness parameter on
+`with_state_lock`, the deletion of `--rescue`/`--no-rescue`, a
+`__CLATHA_LOGIN_FLAGS__` completions template fed by `cli::LOGIN_FLAGS`, and a
+`testutil::live_row` fixture builder. Two gotchas worth carrying: a mechanical
+"union" conflict resolution stitches two function bodies together whenever the
+closing brace sits in the SHARED context after the marker (compile-check
+immediately after every union), and adapting only at the tip means a second
+pass — each adaptation has to move back to the commit that first needs it, or
+the series does not build commit-by-commit.
+
 **REMAINING: P5 usage leg** (wham/usage → named 5h/7d slots, chain member,
 disarm check_scoped for codex, fold fix 1, wire kick_codex to the 401 arm — the
 last #[allow(dead_code)]) and **P6 published surface** (status.json/which
