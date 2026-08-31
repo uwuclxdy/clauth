@@ -53,7 +53,7 @@ Every request clauth makes, and what rides along with it:
 | `api.anthropic.com/api/oauth/profile` | plan-tier detection, and reading which account a token belongs to (so a live re-login can be told apart) | access token |
 | `api.anthropic.com/v1/messages` | auto-start kick (opt-in, off by default) | access token; a 1-token Haiku request |
 | `status.claude.com/api/v2/incidents.json` | Status tab and background poll | no credentials |
-| `raw.githubusercontent.com/pydantic/genai-prices/...` | model price table for the Tokens tab cost lens, fetched and disk-cached | no credentials |
+| `raw.githubusercontent.com/uwuclxdy/ai-pricelog/...` | model price table for the Tokens tab cost lens, fetched and disk-cached | no credentials |
 | `api.deepseek.com/user/balance` | only for profiles whose base URL is DeepSeek | that provider's API key |
 | `api.z.ai/api/monitor/usage/...` | only for profiles whose base URL is Z.ai | that provider's API key |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |

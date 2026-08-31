@@ -173,7 +173,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 ```
 ~/.clauth/
   profiles.toml            # everything in the table above
-  genai_price_cache.json  # genai-prices model prices for the cost lens
+  ai_pricelog_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
   clauth.log, daemon.log   # event lines from the TUI and the daemon
