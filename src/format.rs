@@ -350,7 +350,7 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 /// behind it proves: `has_inference_auth` is satisfied by a well-formed key OR
 /// an `[env]` token, and well-formed is not live — clauth even records a
 /// per-credential `AuthExpired` verdict no refusal site consults. An honest
-/// re-wording is an open copy question (`docs/todo.md`).
+/// re-wording is an open copy question the owner has not ruled yet.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
 /// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
