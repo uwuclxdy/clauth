@@ -2275,6 +2275,100 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
     );
 }
 
+/// Usage `r` and the action menu's "refresh usage" share one gate. A generic
+/// api-key endpoint (litellm: `provider` is `None`, so `is_third_party` is
+/// false) is fetched every cadence by the same leg a recognised provider runs
+/// on, so its row queues the same refetch instead of the nothing-to-refresh
+/// toast. The OAuth and recognised-provider arms stay as they were; only an
+/// endpoint with no credential either leg can use (keyless, no pair) keeps the
+/// toast.
+#[test]
+fn usage_refresh_queues_a_generic_api_key_account() {
+    use super::{ActionMenuAction, KeyCode, Tab, dispatch_action_menu_action, handle_key};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with(vec![
+        Profile::new("oauth".to_string(), None, None),
+        Profile::new(
+            "vendor".to_string(),
+            Some("https://api.deepseek.com/anthropic".to_string()),
+            Some("sk-fixture".to_string()),
+        ),
+        Profile::new(
+            "litellm".to_string(),
+            Some("http://127.0.0.1:4000".to_string()),
+            Some("sk-fixture".to_string()),
+        ),
+        Profile::new(
+            "keyless".to_string(),
+            Some("http://127.0.0.1:9999".to_string()),
+            None,
+        ),
+    ]);
+    app.tab = Tab::Usage;
+
+    let queued = |app: &App| -> Vec<String> {
+        app.refetch_queue
+            .lock()
+            .expect("queue lock")
+            .iter()
+            .cloned()
+            .collect()
+    };
+    let last_toast = |app: &App| -> String {
+        app.toasts
+            .back()
+            .map(|t| t.body.clone())
+            .unwrap_or_default()
+    };
+
+    // The generic row the fix is about: queued, not toasted away.
+    app.profile_cursor = 2;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert!(
+        queued(&app).contains(&"litellm".to_string()),
+        "the third-party leg fetches this account, so `r` queues it: {:?}",
+        queued(&app)
+    );
+    assert_eq!(last_toast(&app), "refreshing 'litellm'");
+
+    // The two arms that must not move.
+    app.profile_cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert!(
+        queued(&app).contains(&"oauth".to_string()),
+        "the OAuth arm queues as before: {:?}",
+        queued(&app)
+    );
+    assert_eq!(last_toast(&app), "refreshing 'oauth'");
+
+    app.profile_cursor = 1;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert!(
+        queued(&app).contains(&"vendor".to_string()),
+        "the recognised-provider arm queues as before: {:?}",
+        queued(&app)
+    );
+    assert_eq!(last_toast(&app), "refreshing 'vendor'");
+
+    // A keyless endpoint has no credential either leg can fetch with: the
+    // toast arm is unchanged for it.
+    app.profile_cursor = 3;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert!(
+        !queued(&app).contains(&"keyless".to_string()),
+        "a keyless endpoint queues nothing: {:?}",
+        queued(&app)
+    );
+    assert_eq!(last_toast(&app), "'keyless' has no usage to refresh");
+
+    // The menu entry rides the same gate.
+    app.profile_cursor = 2;
+    dispatch_action_menu_action(&mut app, ActionMenuAction::RefreshUsage);
+    assert_eq!(last_toast(&app), "refreshing 'litellm'");
+}
+
 /// The console link is offered for exactly the accounts clauth knows a page
 /// for. An OAuth account has none, so the entry is absent above rather than
 /// present-and-inert — the assertions there are the other direction of this one.

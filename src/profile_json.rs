@@ -30,13 +30,20 @@ pub(crate) fn is_canceled_cached(name: &ProfileName) -> bool {
     cached_plan(name).is_some_and(|p| p.is_canceled())
 }
 
-/// Display provider for a profile: a recognised third-party name, else
-/// `anthropic` for an OAuth profile.
+/// Display provider for a profile, one of three cases: a recognised
+/// provider's name, `"anthropic"` for a profile with no endpoint of its own,
+/// `"generic"` for every other endpoint (owner ruling 2026-08-31). The OAuth
+/// test is [`Profile::is_oauth`] — the managed `base_url` field alone, so the
+/// label can never contradict the `base_url` it publishes beside, which was
+/// the defect shape (`"anthropic"` next to a litellm URL). An operator-authored
+/// `ANTHROPIC_BASE_URL` reroutes requests without retyping the account, the
+/// same managed-field-only rule [`crate::profile::stored_provider`] applies.
 pub(crate) fn provider_label(profile: &Profile) -> String {
-    profile
-        .provider
-        .map(|p| p.display_name().to_string())
-        .unwrap_or_else(|| "anthropic".to_string())
+    match profile.provider {
+        Some(p) => p.display_name().to_string(),
+        None if profile.is_oauth() => "anthropic".to_string(),
+        None => "generic".to_string(),
+    }
 }
 
 /// Human account-tier label for an OAuth profile, preferring the fetched plan
@@ -236,7 +243,17 @@ pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
 /// when there is no cache. The rows of the published `status.json` `windows`
 /// array — hence this flat spelling rather than [`ProfileWindows`]'s
 /// discriminated one, which the MCP surface renders.
+///
+/// Empty TOO for an account whose figures live in the third-party cache, the
+/// shared cache selector's name-only form
+/// ([`crate::profile::stored_usage_cache_is_third_party`]): whatever
+/// `usage_cache.json` still holds for one is a leftover from an earlier OAuth
+/// life, and publishing it rendered a stale 100% Anthropic window beside
+/// `"third_party":{"available":true}` for an account with no Anthropic window.
 pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
+    if crate::profile::stored_usage_cache_is_third_party(name) {
+        return Vec::new();
+    }
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
         .as_ref()
         .map(oauth_windows)

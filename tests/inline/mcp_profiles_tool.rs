@@ -415,7 +415,7 @@ fn session_scope_resolves_the_tier_through_the_which_tiers() {
 }
 
 /// A GENERIC api-key endpoint — no typed integration, so `provider` is `None`
-/// and `provider_label` renders it `anthropic` — is still an api-key account:
+/// and `provider_label` renders it `generic` — is still an api-key account:
 /// the same scheduler leg caches its usage, it has no Anthropic pool, and it has
 /// no Anthropic plan tier. A roster keyed on the display label or on
 /// `is_third_party` tells the picker both of those are unknown while holding the
@@ -445,7 +445,7 @@ fn a_generic_api_key_row_reports_its_own_figures_and_claims_no_anthropic_plan() 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert_eq!(
         row,
-        "- litellm (global active) [anthropic, 127.0.0.1:4000, local endpoint]: \
+        "- litellm (global active) [generic, 127.0.0.1:4000, local endpoint]: \
          no 5h/7d limits; total: 31.45 CNY",
         "the account's own cached figures, no claim about a plan it cannot have, and the \
          locality marker its loopback base url earns — pinned here on a row the production \
@@ -613,7 +613,7 @@ fn a_userinfo_base_url_puts_no_credentials_on_the_profiles_row() {
 
     let row = lines(&call_profiles(None, None)).remove(0);
     assert!(
-        row.contains("[anthropic, evil.tld]"),
+        row.contains("[generic, evil.tld]"),
         "the row names the host the request resolves to: {row}",
     );
     assert!(
@@ -656,11 +656,12 @@ fn an_env_authored_endpoint_renders_its_host_in_the_roster_row() {
 }
 
 /// Finding 11: the retired `which` prose mapped a null tier to `unknown`
-/// unconditionally, while `profile_line` guards the same null on
-/// `provider == "anthropic"` — a third-party account has no plan tier to lose.
-/// The session row inherits that guard by being rendered through `profile_line`,
-/// and this is what holds the inheritance: a row built any other way says
-/// `tier unknown` about an account that structurally has none.
+/// unconditionally, while `profile_line` guards the same null on the headroom
+/// payload's kind (`third_party`) — a third-party account has no plan tier to
+/// lose, whatever its provider label says. The session row inherits that guard
+/// by being rendered through `profile_line`, and this is what holds the
+/// inheritance: a row built any other way says `tier unknown` about an account
+/// that structurally has none.
 #[test]
 fn a_third_party_session_row_claims_no_unknown_it_structurally_has_none_of() {
     let home = HomeSandbox::new();

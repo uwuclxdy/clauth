@@ -274,3 +274,70 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
 
     assert_eq!(tier_label(&profile), Some("Max 5x".to_string()));
 }
+
+/// The published `provider` field names exactly one of three cases: the
+/// recognised provider's display name, `"anthropic"` for a profile with no
+/// managed endpoint of its own, and `"generic"` for every other endpoint.
+/// The generic arm is what a litellm/LM Studio/ollama fleet reads: the pre-fix
+/// answer published `"anthropic"` beside the account's own `base_url`, the
+/// OAuth label contradicting the endpoint the account really calls. The
+/// fourth arm is the endpoint-without-a-pair shape (a blank profile plus a
+/// `base_url`, no key, no credentials): its endpoint is generic, so the label
+/// follows the endpoint. A pair+endpoint-no-key hybrid never reaches this
+/// arm — `effective_base_url` drops a managed `base_url` behind a stored pair
+/// with no usable key at load, so it reads as an OAuth account.
+#[test]
+fn provider_label_names_all_three_cases() {
+    let _home = HomeSandbox::new();
+
+    let oauth = blank_profile(&crate::profile::ProfileName::from("kerry"));
+    assert_eq!(provider_label(&oauth), "anthropic");
+
+    assert_eq!(provider_label(&vendor_profile("vendor")), "DeepSeek");
+
+    let mut generic = blank_profile(&crate::profile::ProfileName::from("litellm"));
+    generic.base_url = Some("http://127.0.0.1:4000".to_string());
+    generic.api_key = Some("k".to_string());
+    assert_eq!(provider_label(&generic), "generic");
+
+    let mut keyless = blank_profile(&crate::profile::ProfileName::from("keyless"));
+    keyless.base_url = Some("https://proxy.example/anthropic".to_string());
+    assert_eq!(provider_label(&keyless), "generic");
+}
+
+/// The published `windows` array carries an account's OAuth windows only
+/// while its figures live in the OAuth cache. A CONVERTED profile — a
+/// `base_url` + key saved on disk, the `edit_profile_endpoint` shape —
+/// publishes empty windows even with a maxed `usage_cache.json` from its
+/// earlier OAuth life still on disk: publishing that leftover rendered a
+/// stale 100% Anthropic window beside `"third_party":{"available":true}` for
+/// an account with no Anthropic window.
+#[test]
+fn published_windows_is_empty_for_a_converted_profile() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "litellm".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("k".to_string()),
+    ))
+    .expect("save the converted profile");
+    seed_usage_cache("litellm", &five_hour_at(100.0), Duration::from_secs(100));
+
+    assert!(
+        published_windows(&crate::profile::ProfileName::from("litellm")).is_empty(),
+        "a converted account publishes no Anthropic window"
+    );
+}
+
+/// The guard's other direction: an account whose figures do live in the OAuth
+/// cache keeps publishing its real rows off that cache.
+#[test]
+fn published_windows_carries_an_oauth_accounts_windows() {
+    let _home = HomeSandbox::new();
+    seed_usage_cache("kerry", &five_hour_at(42.0), Duration::from_secs(100));
+
+    let windows = published_windows(&crate::profile::ProfileName::from("kerry"));
+    assert_eq!(windows.len(), 1);
+    assert_eq!(windows[0].label, "5h");
+    assert_eq!(windows[0].utilization_pct, 42.0);
+}

@@ -2800,22 +2800,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             if app.tab == Tab::Usage {
-                let selected = {
-                    let cfg = app.config();
-                    cfg.profiles
-                        .get(app.profile_cursor)
-                        .map(|p| (p.name.clone(), p.login_is_oauth(), p.is_third_party()))
-                };
-                match selected {
-                    Some((name, true, _)) | Some((name, _, true)) => {
-                        app.manual_refresh_one(&name);
-                        app.toast(ToastKind::Info, format!("refreshing '{name}'"));
-                    }
-                    Some((name, false, false)) => {
-                        app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
-                    }
-                    None => {}
-                }
+                queue_focused_usage_refresh(app);
             } else {
                 app.manual_refresh();
                 app.toast(ToastKind::Info, "refreshing every account");
@@ -5998,36 +5983,55 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The account under the cursor as `(name, has_oauth_login, is_third_party)`.
-/// `profile_cursor` is shared across Overview, Usage, and Setup, so this resolves
-/// the focused account on any of them. `None` when the cursor sits past the
-/// profile list (e.g. `+ new`).
+/// The account under the cursor as `(name, has_oauth_login,
+/// usage_cache_is_third_party)`. `profile_cursor` is shared across Overview,
+/// Usage, and Setup, so this resolves the focused account on any of them.
+/// `None` when the cursor sits past the profile list (e.g. `+ new`).
 ///
 /// The OAuth bool is credential typing ([`Profile::login_is_oauth`]), not endpoint
 /// routing: the actions it gates (rotate, refresh) act on the stored token chain,
 /// so a hybrid holding a real pair behind a `base_url` can rotate it, and an
 /// endpoint-only profile cannot.
+///
+/// The third bool is the shared cache selector, not `is_third_party`: the
+/// refresh gate asks whether the account has a usage fetch leg, and the
+/// third-party leg fetches generic api-key endpoints too — `is_third_party`
+/// would refuse a litellm row the scheduler refreshes every cadence.
 fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
     let cfg = app.config();
-    cfg.profiles
-        .get(app.profile_cursor)
-        .map(|p| (p.name.clone(), p.login_is_oauth(), p.is_third_party()))
+    cfg.profiles.get(app.profile_cursor).map(|p| {
+        (
+            p.name.clone(),
+            p.login_is_oauth(),
+            p.usage_cache_is_third_party(),
+        )
+    })
+}
+
+/// Queue a usage refetch for the account under the cursor, or toast why not.
+/// One shape for both entry points (Usage `r`, the action menu's refresh
+/// entry): the OAuth arm and the third-party-cache arm both queue
+/// [`App::manual_refresh_one`] — the same refetch the cadence legs would run —
+/// and only an endpoint-only account with no credential either leg can use
+/// falls through to the nothing-to-refresh toast.
+fn queue_focused_usage_refresh(app: &mut App) {
+    match focused_account(app) {
+        Some((name, true, _)) | Some((name, _, true)) => {
+            app.manual_refresh_one(&name);
+            app.toast(ToastKind::Info, format!("refreshing '{name}'"));
+        }
+        Some((name, false, false)) => {
+            app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
+        }
+        None => {}
+    }
 }
 
 /// Dispatch a selected action menu item to its handler.
 fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
     match action {
         ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshUsage => match focused_account(app) {
-            Some((name, _, true)) | Some((name, true, _)) => {
-                app.manual_refresh_one(&name);
-                app.toast(ToastKind::Info, format!("refreshing '{name}'"));
-            }
-            Some((name, false, false)) => {
-                app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
-            }
-            None => {}
-        },
+        ActionMenuAction::RefreshUsage => queue_focused_usage_refresh(app),
         ActionMenuAction::RotateTokens => match focused_account(app) {
             // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
             // say why up front instead of arming a confirm that no-ops.

@@ -1969,8 +1969,9 @@ fn usage_cache_is_third_party(
 /// [`effective_base_url`] then KEEPS a `base_url` that a full load would drop
 /// (the pair would reach the endpoint), so this answers `true` where
 /// `load_profile` answers `false`, and a reader watches
-/// `third_party_cache.json` for what is really an OAuth account. Only
-/// [`crate::mcp::digest`]'s sample can observe it — every other caller runs
+/// `third_party_cache.json` for what is really an OAuth account. Only the
+/// callers that skip the full load — [`crate::mcp::digest`]'s sample and
+/// [`crate::profile_json::published_windows`] — can observe it; every other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
 /// and it costs at most one digest call reporting no refresh. Pinned, in that
 /// direction, by `the_lock_free_third_party_read_agrees_with_a_full_load`.

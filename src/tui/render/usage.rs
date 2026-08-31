@@ -182,10 +182,13 @@ fn build_usage_lines(
     lines.extend(header_lines(profile, header, inner_w));
     lines.push(Line::from(""));
 
-    // Api-key/provider accounts (recognised or generic) render via the third-party
-    // rows/bars path; OAuth accounts — including OAuth run against a custom
-    // base_url — fall through to their live window bars.
-    if profile.api_key.is_some() || profile.is_third_party() {
+    // Accounts whose usage figures live in the third-party cache — a recognised
+    // provider or a generic api-key endpoint — render via the third-party
+    // rows/bars path, the shared cache selector (`usage_cache_is_third_party`,
+    // the same predicate the profile load seeds `third_party_usage` with);
+    // OAuth accounts — including OAuth run against a custom base_url — fall
+    // through to their live window bars.
+    if profile.usage_cache_is_third_party() {
         lines.extend(build_tp_rows(
             profile,
             inner_w,
@@ -728,7 +731,7 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         // plus a custom endpoint) reads "api" directly above the live Anthropic
         // windows its own `usage` fed.
         .or_else(|| {
-            if profile.api_key.is_some() || profile.is_third_party() {
+            if profile.usage_cache_is_third_party() {
                 Some("api".to_string())
             } else {
                 account_tier(profile).and_then(|t| t.display())

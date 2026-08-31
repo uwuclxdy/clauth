@@ -496,8 +496,8 @@ fn header_lines_plan_falls_back_to_account_tier() {
 /// A HYBRID profile — an OAuth pair AND a custom `base_url`, no api key, no
 /// recognised provider — renders its FETCHED tier, not the bare "api" literal.
 /// `is_oauth()` keys on `base_url`, so a hybrid reads false there while the body
-/// this header heads still draws its live OAuth window bars (the `api_key ||
-/// is_third_party` fork this file uses for the body). Reading `api` directly
+/// this header heads still draws its live OAuth window bars (the shared
+/// cache-selector fork this file uses for the body). Reading `api` directly
 /// above Anthropic 5h/7d bars sourced from the very `UsageInfo` whose tier was
 /// discarded is the disagreement; the header and the body must share one fork.
 ///
@@ -591,6 +591,62 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
     assert!(
         !plan_row.contains("Claude"),
         "an unfetched plan must not name a tier, got {plan_row:?}"
+    );
+}
+
+/// A stored key with NO base_url — reachable from a captured `~/.claude`
+/// settings.json that carried a key but no endpoint (the pre-helper env
+/// residual `read_claude_endpoint_config` still reads), or from a hand-edited
+/// config.toml — renders through the OAUTH arm: its figures would live in the
+/// OAuth cache, the same answer the shared cache selector gives and the one
+/// the profile load seeds `third_party_usage` with. The old site-local
+/// spelling (`api_key.is_some() || is_third_party`) rendered the third-party
+/// arm over a `third_party_usage` load had seeded `None`, the disagreement
+/// this fork keys out.
+#[test]
+fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyonly"));
+    profile.api_key = Some("sk-orphan".to_string());
+    assert!(
+        profile.api_key.is_some() && !profile.usage_cache_is_third_party(),
+        "fixture must be the state the two spellings disagree on",
+    );
+
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        diag: DiagFlags::default(),
+    };
+    let plan_row: String = header_lines(&profile, &header, 52)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    assert!(
+        !plan_row.contains("api"),
+        "a key with no endpoint has no third-party arm to head: {plan_row:?}"
+    );
+
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    });
+    let body: String =
+        build_usage_lines(&profile, 52, &header, &app, true, true, ResetFmt::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect();
+    assert!(
+        body.contains("not logged in"),
+        "the body takes the OAuth arm's empty message, got {body:?}"
     );
 }
 
