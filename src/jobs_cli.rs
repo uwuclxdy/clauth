@@ -74,6 +74,13 @@ pub(crate) struct JobRow {
     /// where every countdown it would carry has already stopped meaning
     /// anything.
     pub(crate) live: Option<RunningLiveness>,
+    /// The run's own session id — the handle `delegate({resume})` takes. Read
+    /// here because a record outlives the server that wrote it, so after a
+    /// crash `--json` is the only thing naming the transcript the spend went
+    /// into; the table prints no session column. The `None` cases are
+    /// [`jobs::JobRecord::session_id`]'s; on this surface the key is always
+    /// present, `null` where the record carries none.
+    pub(crate) session_id: Option<String>,
     /// The delegate's own last words, already bounded by the writer. Empty on a
     /// finished record: its envelope carries the whole result, so a tail beside
     /// it says nothing new.
@@ -103,6 +110,7 @@ fn row(job: &StoredJob, now: u64) -> JobRow {
         phase,
         age_secs: job.age_secs(now),
         live: phase.is_live().then(|| jobs::running_liveness(record, now)),
+        session_id: record.session_id.clone(),
         tail: match phase {
             JobPhase::Done => String::new(),
             _ => record.tail.clone(),
@@ -348,6 +356,7 @@ fn row_json(row: &JobRow) -> serde_json::Value {
         "profile": row.profile,
         "state": row.phase.label(),
         "collectable": row.phase.is_collectable(),
+        "session_id": row.session_id,
         "age_secs": row.age_secs,
         "elapsed_secs": row.live.map(|l| l.elapsed_secs),
         "last_output_secs_ago": row.live.and_then(|l| l.last_output_secs_ago),

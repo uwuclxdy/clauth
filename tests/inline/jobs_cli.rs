@@ -5,7 +5,9 @@
 //! record lands in a tempdir, never the operator's real `~/.clauth/jobs`.
 
 use super::*;
-use crate::mcp::jobs::{RecordKind, RunningSpec, jobs_dir, write_heartbeat, write_running};
+use crate::mcp::jobs::{
+    RecordKind, RunningSpec, jobs_dir, write_heartbeat, write_heartbeat_with_session, write_running,
+};
 use crate::testutil::HomeSandbox;
 
 /// Epoch ms every fixture is dated against. A real 2026 clock rather than a
@@ -260,6 +262,67 @@ fn an_empty_store_renders_a_named_empty_state_and_an_empty_json_array() {
     );
 }
 
+/// A record OUTLIVES the server that wrote it, and this is what that buys: the
+/// row for a job a dead `clauth mcp` left behind still carries the session id
+/// linking it to its transcript, which is the whole reason the heartbeat stamps
+/// one onto a running record.
+///
+/// Driven through the PRODUCTION writer rather than hand-built bytes: a fixture
+/// spelling the field itself would pass while the beat wrote nothing.
+#[test]
+fn a_dead_servers_row_still_carries_the_session_id_its_record_kept() {
+    let _home = HomeSandbox::new();
+    const HANDLE: &str = "8fbb04c1-2e3d-4a55-9c17-6d0e2b7a1f39";
+    // Silent past the corpse window: the shape a killed server leaves behind.
+    let dead = spec("d-dead-0", NOW - crate::mcp::jobs::RUNNING_TTL_MS - 60_000);
+    write_heartbeat_with_session(
+        &dead,
+        NOW - crate::mcp::jobs::RUNNING_TTL_MS - 30_000,
+        "halfway through",
+        Some(HANDLE),
+    )
+    .unwrap();
+    // A streaming run whose first event has not named a session yet.
+    write_running(&spec("d-quiet-0", NOW - 3_000)).unwrap();
+    seed_done("d-fin-0", NOW - 600_000, NOW - 120_000);
+
+    let rows = rows(NOW);
+    assert_eq!(
+        row_for(&rows, "d-dead-0").phase.label(),
+        "orphaned",
+        "the fixture is the dead-server shape, not a live run"
+    );
+
+    let json: serde_json::Value = serde_json::from_str(&rows_json(&rows)).unwrap();
+    let array = json.as_array().expect("a JSON array").clone();
+    let by_id = |id: &str| {
+        array
+            .iter()
+            .find(|r| r["job_id"] == id)
+            .unwrap_or_else(|| panic!("no row for {id} in {json}"))
+            .clone()
+    };
+
+    assert_eq!(
+        by_id("d-dead-0")["session_id"],
+        serde_json::json!(HANDLE),
+        "the orphan's row hands back the handle `delegate({{resume}})` takes"
+    );
+    // These pin the VALUE; the key's presence on every row is
+    // `the_json_row_carries_every_key_on_every_state`'s, one test down, since
+    // serde answers a missing key with `Null` too.
+    assert_eq!(
+        by_id("d-quiet-0")["session_id"],
+        serde_json::Value::Null,
+        "a run no event has named a session for yet claims no handle"
+    );
+    assert_eq!(
+        by_id("d-fin-0")["session_id"],
+        serde_json::Value::Null,
+        "a finished run's handle rides its envelope, never this key"
+    );
+}
+
 /// The `--json` field set is FIXED: every key is present on every row, and a
 /// figure the record does not have is `null`.
 ///
@@ -277,11 +340,12 @@ fn the_json_row_carries_every_key_on_every_state() {
     let array = json.as_array().expect("a JSON array");
     assert_eq!(array.len(), 2);
 
-    const KEYS: [&str; 10] = [
+    const KEYS: [&str; 11] = [
         "job_id",
         "profile",
         "state",
         "collectable",
+        "session_id",
         "age_secs",
         "elapsed_secs",
         "last_output_secs_ago",
