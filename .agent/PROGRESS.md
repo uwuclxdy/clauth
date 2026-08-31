@@ -2786,7 +2786,55 @@ immediately after every union), and adapting only at the tip means a second
 pass — each adaptation has to move back to the commit that first needs it, or
 the series does not build commit-by-commit.
 
-**REMAINING: P5 usage leg** (wham/usage → named 5h/7d slots, chain member,
+## CXH-3 — phases 5 and 6: the series is complete (2026-08-23)
+
+`948bd39` / `c8ce233` / `0790896`, 28 commits on mommy `eb6cbb8`.
+
+**P5, the usage leg.** `wham/usage` is DURATION-keyed, never name-keyed — it
+says "a window of N seconds is P percent spent", never "this is the weekly
+one" — so `src/usage/codex.rs` is where a duration becomes one of clauth's two
+named slots. Over a day is weekly, under it is 5h, position breaks a tie, and
+two windows naming one slot do not overwrite each other (the second takes the
+free slot, because dropping it loses the tighter of two real limits).
+`limit_reached` is a HARD verdict outranking the percentages it came with, lands
+on the fuller window, and is never fabricated onto one the body omitted.
+`plan_type` gets its own `PlanInfo.codex_plan` rather than a `PlanTier`, whose
+every label spells "Claude <tier>". Banked reset credits ride the same response.
+
+Readings land in the SHARED `UsageStore` keyed by name — safe by construction,
+not convention: names are globally unique across both state files, and the
+claude walk only ever indexes its own members. The chain comes from
+`codex-profiles.toml` alone with `check_scoped` disarmed, and a switch moves the
+codex active slot to land at the NEXT session, because codex binds auth.json at
+start. Folded fix 1 is answered by filling the freshness pass for codex instead
+of changing a shared predicate, keeping claude behavior-preserving.
+
+**P6, the published surface.** Four additive top-level fields and a per-entry
+`harness`, schema still 1; the existing `active_profile`/`wrap_off` stay the
+claude slots and codex entries are appended, so a reader that predates codex
+takes exactly the prefix it always took. `clauth_version` is what lets a reader
+tell an old daemon from a new one with an empty codex roster. The TUI gains a
+read-only codex section and a `c` harness filter — read-only because the cursor
+and every action are bound to `config.profiles`, and a filter that could hide
+the selected row is a footgun. Copy fixed in four places that had quietly
+claimed clauth manages only Claude Code.
+
+**The bug a test caught, worth remembering:** `write_profile_cache` gated on
+`is_configured`, which reads `profiles.toml` alone by design. Every codex usage
+reading was therefore dropped silently — the fetch succeeded, the in-memory
+store filled, and the by-name cache the feed and the Overview resolve stayed
+empty forever. The gate means "is this still an account", and a codex profile is
+one; it just lives in the other roster.
+
+2815 passed / 0 failed, 15/15 targeted mutations killed.
+
+**NEXT: cut the PR series to uwuclxdy/clauth.** The six-part delivery is
+implemented; what remains is presenting it, plus the two design items parked
+upstream (#51 issuecomment-5471926707): the managed-config layer that outranks
+`-c`, and the write-only `sessions/` sync-back whose fix contradicts the
+runtime table.
+
+**SUPERSEDED — the P5/P6 checklist above shipped. Original scope note:** (wham/usage → named 5h/7d slots, chain member,
 disarm check_scoped for codex, fold fix 1, wire kick_codex to the 401 arm — the
 last #[allow(dead_code)]) and **P6 published surface** (status.json/which
 --json/list_profiles additive codex fields, TUI c-codex/c-claude filter + header
