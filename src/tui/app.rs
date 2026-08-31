@@ -1925,10 +1925,10 @@ impl App {
             drop((tokens_sender, tokens_refresh_rx));
         }
 
-        // Pricing loader: fetches the genai-prices v2 distilled model rates for
-        // the Tokens tab's cost lens, disk-cached under `~/.clauth`. Same
-        // test-skip rationale as the status/token workers — a detached thread
-        // could outlive a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
+        // Pricing loader: fetches the ai-pricelog index rates for the Tokens
+        // tab's cost lens, disk-cached under `~/.clauth`. Same test-skip
+        // rationale as the status/token workers — a detached thread could
+        // outlive a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
         let (pricing_sender, pricing_events) =
             std::sync::mpsc::channel::<crate::pricing::PricingEvent>();
         let (pricing_refresh, pricing_refresh_rx) = std::sync::mpsc::channel::<()>();

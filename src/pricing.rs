@@ -5,18 +5,19 @@
 //!
 //! # Source
 //!
-//! pydantic's genai-prices v2 dataset (`prices/new_data/v2/data.json` on
-//! `main`): provider-generated price pages distilled into one machine-readable
-//! file. Each entry is a model with a match clause (which ids route to it) and
-//! one or more price entries, optionally constraint-gated by start date or
-//! time of day — so dated price cuts and peak/off-peak schedules resolve
-//! exactly instead of being approximated by a flat table. Only first-party
-//! providers are kept; resellers (OpenRouter, AWS, Azure, Fireworks, Together,
-//! Novita, OVH, Hugging Face's hosted providers, …) are dropped, so a bare id
-//! never prices through a reseller's markup. Resold model rows inside a kept
-//! provider (google's Vertex claude listings) are dropped the same way — their
-//! CONTAINS clauses would price a local fine-tune whose name merely embeds a
-//! claude model id at Anthropic API rates.
+//! The ai-pricelog index (`data/index.json` on the `mommy` branch of
+//! uwuclxdy/ai-pricelog, version 3): a `sources` object mapping provider name
+//! → model id → a flat rate row (`input_mtok`, `output_mtok`,
+//! `cache_read_mtok`, `cache_write_mtok`, USD per million tokens). A row may
+//! carry `effective_at` (prices apply from that date on; earlier dates price
+//! nothing) and `window_rates` entries (an `[HHMM, HHMM]` window, an optional
+//! UTC-weekday `days` set, and override rate keys whose absent fields inherit
+//! the row's base price; later entries override earlier matching ones). A row
+//! carrying `removed_at` is delisted and prices nothing. Only first-party
+//! providers are kept; resellers (OpenRouter, Novita, Together, Avian, …) are
+//! dropped, so a bare id never prices through a reseller's markup. Resold
+//! model rows inside a kept provider (a claude id under a non-anthropic
+//! provider) are dropped the same way.
 //!
 //! # Design (mirrors `status.rs`)
 //!
@@ -48,16 +49,18 @@ use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
+use chrono::{Datelike, NaiveDate, Weekday};
 use serde::{Deserialize, Serialize};
 
+use crate::logline::logline;
 use crate::poll::{first_delay, run_polling_loop};
 use crate::profile::{atomic_write_600, clauth_dir};
 use crate::tokens::{ModelTokens, today_date};
 use crate::usage::now_ms;
 
-/// Live price feed (genai-prices v2 generated data, fetched from GitHub `main`).
+/// Live price feed (the ai-pricelog index, fetched from GitHub raw `mommy`).
 const FEED_URL: &str =
-    "https://raw.githubusercontent.com/pydantic/genai-prices/main/prices/new_data/v2/data.json";
+    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/index.json";
 
 /// Background refresh cadence. Prices move rarely, so this is deliberately slow;
 /// a manual refresh signal short-circuits the wait.
@@ -67,23 +70,26 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// HTTP response-receive timeout.
 const RECV_TIMEOUT: Duration = Duration::from_secs(15);
-/// Hard cap on the response body. The real feed is ~365 KiB; 8 MiB is generous
+/// Hard cap on the response body. The real feed is ~298 KiB; 8 MiB is generous
 /// headroom while still bounding a hostile / runaway response.
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Snapshot history cap: the newest 180 fetches survive, older ones drop.
 const HISTORY_CAP: usize = 180;
 
+/// The ai-pricelog index version this table parses. An unknown version warns
+/// through [`logline!`] and parses best-effort.
+const INDEX_VERSION: u64 = 3;
+
 /// First-party providers distilled into the table. Every other provider id in
-/// the feed resells another vendor's models (OpenRouter, AWS Bedrock, Azure,
-/// Fireworks, Together, Novita, OVHcloud, Hugging Face's hosted providers,
-/// Modal, Avian, Doubleword); keeping them would let a bare id price through a
-/// reseller's markup.
+/// the index resells another vendor's models (openrouter, novita, together,
+/// avian, baseten, cloudflare, deepinfra, …); keeping them would let a bare id
+/// price through a reseller's markup. zhipuai and voyageai are closed upstream
+/// (their pages no longer publish rates) and stay out.
 const FIRST_PARTY_PROVIDERS: &[&str] = &[
     "anthropic",
     "deepseek",
     "zai",
-    "zhipuai",
     "minimax",
     "moonshotai",
     "x-ai",
@@ -94,7 +100,7 @@ const FIRST_PARTY_PROVIDERS: &[&str] = &[
     "cohere",
     "cerebras",
     "perplexity",
-    "voyageai",
+    "dashscope",
 ];
 
 // ── Data model ──────────────────────────────────────────────────────────────
@@ -112,14 +118,20 @@ pub(crate) struct ModelRate {
     pub(crate) cache_write: f64,
 }
 
-/// When a [`PriceEntry`] applies, mirroring genai-prices' constraints.
+/// When a [`PriceEntry`] applies.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Constraint {
-    /// Active from this calendar date on, inclusive.
-    StartDate(String), // "YYYY-MM-DD"
     /// Active inside this daily interval; see [`window_contains`] for the
     /// hour-granularity semantics.
-    TimeWindow { start: String, end: String }, // "HH:MM[:SS]Z"
+    TimeWindow { start: String, end: String }, // "HH:MM"
+    /// Active only on the listed UTC weekdays (lowercase English names, as the
+    /// feed's `days` sets spell them), and — when a window is present — inside
+    /// it. Days without a window are active all day on those weekdays.
+    Days {
+        days: Vec<String>,
+        start: Option<String>,
+        end: Option<String>,
+    },
 }
 
 /// One price row: the four per-token rates plus an optional constraint.
@@ -134,64 +146,36 @@ pub(crate) struct PriceEntry {
 
 impl PriceEntry {
     /// Whether this entry is the pick at `(date, hour)`: unconstrained entries
-    /// are always active; a constraint must hold. A constraint whose time
-    /// strings do not parse is never active, so entry selection falls through
-    /// to the unconstrained fallback instead of failing the whole table.
+    /// are always active; a constraint must hold. A constraint whose strings do
+    /// not parse is never active, so entry selection falls through to the
+    /// unconstrained base entry instead of failing the whole table.
     fn active(&self, date: &str, hour: u8) -> bool {
         match &self.constraint {
             None => true,
-            Some(Constraint::StartDate(start)) => date >= start.as_str(),
             Some(Constraint::TimeWindow { start, end }) => window_contains(start, end, hour),
-        }
-    }
-}
-
-/// One model's match clause, mirroring genai-prices `MatchLogic`. String
-/// patterns are stored LOWERCASED at distill time and evaluated against the
-/// lowercased model id — case-insensitive either way, like upstream (which
-/// lowercases both sides per call). Regex patterns are stored verbatim and
-/// searched against the lowercased id, also like upstream (which lowercases the
-/// ref before dispatching to `ClauseRegex`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) enum MatchClause {
-    Equals(String),
-    StartsWith(String),
-    Contains(String),
-    EndsWith(String),
-    Regex(String),
-    Or(Vec<MatchClause>),
-    And(Vec<MatchClause>),
-}
-
-impl MatchClause {
-    /// Evaluated against the lowercased, bracket-stripped model id.
-    fn matches(&self, lowered: &str) -> bool {
-        match self {
-            Self::Equals(p) => lowered == p,
-            Self::StartsWith(p) => lowered.starts_with(p.as_str()),
-            Self::Contains(p) => lowered.contains(p.as_str()),
-            Self::EndsWith(p) => lowered.ends_with(p.as_str()),
-            Self::Regex(pattern) => {
-                // Compiled per evaluation: regex clauses are rare (date-stamp
-                // variants), so caching buys nothing. An unparseable pattern
-                // (which upstream's pydantic validation rejects at build time)
-                // simply never matches.
-                regex::Regex::new(pattern).is_ok_and(|re| re.is_match(lowered))
+            Some(Constraint::Days { days, start, end }) => {
+                let weekday = date_weekday(date).is_some_and(|w| days.iter().any(|d| d == w));
+                weekday
+                    && match (start, end) {
+                        (Some(s), Some(e)) => window_contains(s, e, hour),
+                        (None, None) => true,
+                        (_, _) => false,
+                    }
             }
-            Self::Or(clauses) => clauses.iter().any(|c| c.matches(lowered)),
-            Self::And(clauses) => clauses.iter().all(|c| c.matches(lowered)),
         }
     }
 }
 
-/// One distilled model: how to recognize it (match clause) plus its price
-/// entries.
+/// One distilled model: its id (the index row's `model_id` — the id IS the
+/// match, since the feed carries one row per model id) plus its price entries.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct PricedModel {
     pub(crate) id: String,
-    #[serde(rename = "match")]
-    pub(crate) match_: MatchClause,
     pub(crate) prices: Vec<PriceEntry>,
+    /// The row's `effective_at`: prices apply from this date on, inclusive;
+    /// [`entry_rate`] returns `None` before it.
+    #[serde(default)]
+    pub(crate) effective_at: Option<String>,
 }
 
 /// One fetch's distilled table: the capture date plus the models live then.
@@ -230,12 +214,12 @@ pub(crate) struct PriceTable {
 /// Match walks already done, `date → model id → index into the slice
 /// [`PriceTable::models_for`] serves that date`.
 ///
-/// A walk lowercases the id and scans every model's clause once per candidate
-/// form, and the cost lens asks for the same `(id, date)` at all 24 hours of a
-/// day on every frame — the weekly lens measured `days × 24` walks per model per
-/// frame on 2026-08-20. The pick is hour-independent (a clause chooses the
-/// MODEL, an entry's constraint chooses that model's RATE), so one walk answers
-/// every hour, and the memo carries it across frames.
+/// A walk strips and retries the id and scans every model's id once per
+/// candidate form, and the cost lens asks for the same `(id, date)` at all 24
+/// hours of a day on every frame — the weekly lens measured `days × 24` walks
+/// per model per frame on 2026-08-20. The pick is hour-independent (the walk
+/// chooses the MODEL, an entry's constraint chooses that model's RATE), so one
+/// walk answers every hour, and the memo carries it across frames.
 #[derive(Debug, Default)]
 struct Memo {
     by_date: HashMap<String, HashMap<String, Option<usize>>>,
@@ -284,32 +268,31 @@ impl PriceTable {
         }
     }
 
-    /// Rate for a model id at `(date, hour)`, mirroring the upstream reference
-    /// resolver (`genai_prices/types.py`):
+    /// Rate for a model id at `(date, hour)`:
     ///
     /// 1. The id is bracket-stripped (a trailing `[<digits>k|m]` context
-    ///    suffix, case-insensitive) and lowercased.
-    /// 2. The first [`PricedModel`] (in distilled order) whose match clause
-    ///    holds wins — upstream's `is_match` on the lowercased ref.
+    ///    suffix, case-insensitive).
+    /// 2. The first [`PricedModel`] (in distilled order) whose id equals the
+    ///    form, case-insensitively, wins.
     /// 3. Its entries are tried in REVERSE order; the first whose constraint
-    ///    is `None` or active is the pick, falling back to `prices[0]` when
-    ///    nothing matches.
+    ///    is active is the pick — later entries override earlier matching
+    ///    ones. A row whose `effective_at` is after `date` prices nothing.
     ///
-    /// When no clause matches the primary form, derived forms retry in order —
+    /// When no model matches the primary form, derived forms retry in order —
     /// colon strip, then up to two leading `id/` segment strips, then repeated
     /// trailing `-<8 digits>` date-stamp strips — first match wins. Each form
-    /// re-enters the full clause walk, so a retry prices only what a clause
-    /// names; these restore the spellings the old LiteLLM walk's
-    /// colon/suffix strips priced (`minimax/minimax-m2.5:free`,
-    /// `anthropic/claude-opus-5`). A stripped form whose spelling no clause
-    /// names stays unpriced: `glm-4.7-flash-20250801` strips to
-    /// `glm-4.7-flash`, which the feed carries no rate for today.
+    /// re-enters the full walk, so a retry prices only what a row names; these
+    /// restore the spellings the old LiteLLM walk's colon/suffix strips priced
+    /// (`minimax/minimax-m2.5:free`, `anthropic/claude-opus-5`). A stripped
+    /// form whose spelling no row carries stays unpriced: `glm-4.7-flash-20250801`
+    /// strips to `glm-4.7-flash`, which the feed carries no rate for today.
     ///
     /// Steps 1-2 and the retry ladder are [`ladder_index`], memoized per
     /// `(id, date)`; step 3 is [`entry_rate`], the only half the hour reaches.
     ///
     /// Rates come from the snapshot live on `date` (see
-    /// [`PriceTable::models_for`]); `None` when no model matches.
+    /// [`PriceTable::models_for`]); `None` when no model matches, and `None`
+    /// for a matched row whose `effective_at` is after `date`.
     pub(crate) fn rate_at(&self, model: &str, date: &str, hour: u8) -> Option<ModelRate> {
         entry_rate(self.matched(model, date)?, date, hour)
     }
@@ -381,8 +364,9 @@ impl PriceTable {
 
     /// Cost of one model across a full day of hourly token buckets, pricing
     /// each hour at its own `(date, hour)` rate (peak/off-peak). `None` when
-    /// the model has no matching rate — a model's match clause is
-    /// time-independent, so a match at hour 0 guarantees one at every hour.
+    /// the model has no matching rate or its row's `effective_at` is after
+    /// `date` — a model's match is time-independent, so a match at hour 0
+    /// guarantees one at every hour.
     pub(crate) fn cost_day(
         &self,
         model: &str,
@@ -447,26 +431,30 @@ fn ladder_index(models: &[PricedModel], id: &str) -> Option<usize> {
     None
 }
 
-/// One candidate form through the match walk: lowercase, then the first
-/// [`PricedModel`] in distilled order whose clause holds. An empty `prices` list
-/// can price nothing, so a model carrying one is not a match and the ladder
-/// moves on to the next form.
+/// One candidate form through the match walk: the first [`PricedModel`] in
+/// distilled order whose id equals the form, case-insensitively. An empty
+/// `prices` list can price nothing, so a model carrying one is not a match and
+/// the ladder moves on to the next form.
 fn form_index(models: &[PricedModel], id: &str) -> Option<usize> {
-    let lowered = id.to_lowercase();
-    let idx = models.iter().position(|m| m.match_.matches(&lowered))?;
+    let idx = models.iter().position(|m| m.id.eq_ignore_ascii_case(id))?;
     (!models.get(idx)?.prices.is_empty()).then_some(idx)
 }
 
 /// What one matched model charges at `(date, hour)`: entries in REVERSE order,
-/// the first whose constraint is `None` or active, falling back to `prices[0]`.
-/// The only half of resolution the hour reaches.
+/// the first whose constraint is active — later entries override earlier
+/// matching ones, so a window entry beats the flat base entry it overlaps.
+/// `None` when the row's `effective_at` is after `date` (the row prices
+/// nothing yet) or no entry is active. The only half of resolution the hour
+/// reaches.
 fn entry_rate(priced: &PricedModel, date: &str, hour: u8) -> Option<ModelRate> {
-    let entry = priced
-        .prices
-        .iter()
-        .rev()
-        .find(|e| e.active(date, hour))
-        .or_else(|| priced.prices.first())?;
+    if priced
+        .effective_at
+        .as_deref()
+        .is_some_and(|effective| date < effective)
+    {
+        return None;
+    }
+    let entry = priced.prices.iter().rev().find(|e| e.active(date, hour))?;
     Some(ModelRate {
         input: entry.input,
         output: entry.output,
@@ -489,7 +477,7 @@ fn strip_date_stamp(id: &str) -> Option<&str> {
 /// Strip a trailing `[<digits>k|m]` context suffix (case-insensitive):
 /// `deepseek-v4-pro[1m]` → `deepseek-v4-pro`. Anything else — no closing
 /// bracket, no digits, an unknown unit letter — is left alone, so an id with a
-/// bracketed segment that is NOT a context suffix still matches its clauses on
+/// bracketed segment that is NOT a context suffix still matches its row on
 /// the full string.
 fn strip_bracket_suffix(id: &str) -> &str {
     let Some(body) = id.strip_suffix(']') else {
@@ -508,12 +496,9 @@ fn strip_bracket_suffix(id: &str) -> &str {
 }
 
 /// Half-open daily window at HOUR granularity: active when
-/// `(start_h, start_m) <= (hour, 0) < (end_h, end_m)` — the upstream
-/// `TimeOfDateConstraint.active` sampled at the hour's start. Exact for
-/// whole-hour windows; the deepseek-chat/reasoner `:30` boundaries are
-/// half-mispriced by construction (hour 00 prices the whole hour off-peak
-/// though its second half is peak, hour 16 the whole hour peak though its
-/// second half is off-peak), accepted per the settled design. Unparseable
+/// `(start_h, start_m) <= (hour, 0) < (end_h, end_m)` — sampled at the hour's
+/// start, like the generator's window semantics. Exact for whole-hour windows
+/// (`"24:00"` parses as the exclusive end of the last hour). Unparseable
 /// times make the window never active.
 fn window_contains(start: &str, end: &str, hour: u8) -> bool {
     let Some((sh, sm)) = parse_hhmm(start) else {
@@ -525,10 +510,39 @@ fn window_contains(start: &str, end: &str, hour: u8) -> bool {
     (sh, sm) <= (hour, 0) && (hour, 0) < (eh, em)
 }
 
-/// Parse the `HH:MM` prefix of a `"HH:MM[:SS]Z"` string (seconds optional).
+/// Parse the `HH:MM` prefix of a `"HH:MM"` string (the legacy peak-window
+/// shape carried plain pairs; seconds were tolerated by the previous feed and
+/// still parse).
 fn parse_hhmm(s: &str) -> Option<(u8, u8)> {
     let (hh, mm) = s.split_once(':')?;
     Some((hh.parse().ok()?, mm.get(..2)?.parse().ok()?))
+}
+
+/// The UTC weekday name of a "YYYY-MM-DD" date, lowercase like the feed's
+/// `days` sets spell them. `None` when the date does not parse — the
+/// constraint is then never active, so entry selection falls through to the
+/// base entry like any unparseable constraint.
+fn date_weekday(date: &str) -> Option<&'static str> {
+    let parsed = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    Some(match parsed.weekday() {
+        Weekday::Mon => "monday",
+        Weekday::Tue => "tuesday",
+        Weekday::Wed => "wednesday",
+        Weekday::Thu => "thursday",
+        Weekday::Fri => "friday",
+        Weekday::Sat => "saturday",
+        Weekday::Sun => "sunday",
+    })
+}
+
+/// An HHMM clock number (`100` = 01:00) formatted as `"HH:MM"`; `2400`
+/// becomes `"24:00"`, which [`window_contains`] reads as the exclusive end of
+/// the last hour. `None` when the minutes exceed 59 or the hour exceeds 24 —
+/// the generator validates the same bounds, and a malformed window skips its
+/// entry rather than failing the row.
+fn fmt_hhmm(clock: u32) -> Option<String> {
+    let (hh, mm) = (clock / 100, clock % 100);
+    (hh <= 24 && mm < 60).then(|| format!("{hh:02}:{mm:02}"))
 }
 
 // ── Background thread ────────────────────────────────────────────────────────
@@ -597,18 +611,22 @@ fn run_fetch(tx: &Sender<PricingEvent>, cache_file: &Path, stale_cleaned: &mut b
     }
 }
 
-/// One-time best-effort removal of the LiteLLM-era `price_cache.json`, run
-/// after the first successful save of the new cache. The new table never reads
-/// the old file, so this is pure cleanup; errors (including NotFound, the
-/// expected steady state) are ignored on purpose. The flag is set BEFORE the
-/// delete so a reappearing file is never re-deleted.
+/// One-time best-effort removal of the pre-ai-pricelog cache files
+/// (`price_cache.json` from the LiteLLM era, `genai_price_cache.json` from the
+/// genai-prices era), run after the first successful save of the new cache.
+/// The new table never reads the old files, so this is pure cleanup; errors
+/// (including NotFound, the expected steady state) are ignored on purpose. The
+/// flag is set BEFORE the deletes so a reappearing file is never re-deleted.
 fn delete_stale_cache_once(cache_file: &Path, done: &mut bool) {
     if *done {
         return;
     }
     *done = true;
-    if let Some(stale) = cache_file.parent().map(|d| d.join("price_cache.json")) {
-        let _ = std::fs::remove_file(stale);
+    let Some(dir) = cache_file.parent() else {
+        return;
+    };
+    for stale in ["price_cache.json", "genai_price_cache.json"] {
+        let _ = std::fs::remove_file(dir.join(stale));
     }
 }
 
@@ -643,50 +661,73 @@ fn fetch_models() -> anyhow::Result<Vec<PricedModel>> {
 
 // ── Distill ──────────────────────────────────────────────────────────────────
 
-/// Parse the genai-prices v2 JSON into distilled [`PricedModel`]s. Tolerant at
-/// every level: malformed providers, models, and price entries are skipped; the
-/// fetch fails only when ZERO models survive (an empty table would price
-/// nothing and look like a healthy load). Only [`FIRST_PARTY_PROVIDERS`] are
-/// kept — resellers are dropped here, so no lookup path can land on a
-/// reseller's markup; resold model rows inside a kept provider (a claude id
-/// under a non-anthropic provider) are dropped for the same reason.
+/// Parse the ai-pricelog index JSON into distilled [`PricedModel`]s.
+/// Tolerant at every level: malformed sources, rows, and window entries are
+/// skipped; the fetch fails only when ZERO models survive (an empty table
+/// would price nothing and look like a healthy load). Only
+/// [`FIRST_PARTY_PROVIDERS`] are kept — resellers are dropped here, so no
+/// lookup path can land on a reseller's markup; resold model rows inside a
+/// kept provider (a claude id under a non-anthropic provider) are dropped for
+/// the same reason. An unknown `version` warns through [`logline!`] and parses
+/// best-effort.
+///
+/// A row carrying `removed_at` is delisted and skipped the same way — it
+/// prices nothing at any date. The index's removal convention keeps the row
+/// in place with its last prices and stamps it, so the skip is what makes a
+/// delisting effective in clauth (the dashscope resold deepseek/glm/kimi
+/// copies carry the stamp since 2026-08-31).
+///
+/// Sources iterate in the file's own key order (serde_json's `preserve_order`
+/// feature) — deterministic, and carrying no precedence contract: a delisted
+/// copy under another source is skipped at distill, so a live first-party row
+/// is never shadowed and iteration order cannot pick a price.
 fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
     let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
-    let providers = root
-        .as_array()
-        .ok_or_else(|| anyhow::anyhow!("price feed root is not a JSON array"))?;
+    let root = root
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("price feed root is not a JSON object"))?;
+    let version = root.get("version").and_then(serde_json::Value::as_u64);
+    if version != Some(INDEX_VERSION) {
+        let found = version.map_or_else(|| "missing".to_owned(), |v| v.to_string());
+        logline!(
+            "price feed: ai-pricelog index version {found} (expected {INDEX_VERSION}): parsing best-effort"
+        );
+    }
+    let sources = root
+        .get("sources")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("price feed has no sources object"))?;
 
     let mut models = Vec::new();
-    for provider in providers {
-        let Ok(provider) = serde_json::from_value::<RawProvider>(provider.clone()) else {
-            continue; // malformed provider — skip, don't fail the feed
-        };
-        if !FIRST_PARTY_PROVIDERS.contains(&provider.id.as_str()) {
+    for (source_name, rows) in sources {
+        let canonical = canonical_source(source_name);
+        if !FIRST_PARTY_PROVIDERS.contains(&canonical) {
             continue;
         }
-        for model in provider.models {
-            let Ok(model) = serde_json::from_value::<RawModel>(model) else {
-                continue; // malformed model — skip, don't fail the provider
+        let Some(rows) = rows.as_object() else {
+            continue; // malformed source — skip, don't fail the feed
+        };
+        for (model_id, row) in rows {
+            let Ok(row) = serde_json::from_value::<RawRow>(row.clone()) else {
+                continue; // malformed row — skip, don't fail the source
             };
-            // A kept provider can still resell another vendor's models: google
-            // (Vertex) carries claude-* rows whose CONTAINS clauses price local
-            // fine-tune ids that merely EMBED a claude model name
-            // (`qwable-9b-claude-fable-5-shq8`) at Anthropic API rates — a
-            // false-positive class the reseller-provider drop alone cannot
-            // catch. Anthropic's own rows are the only legitimate claude rows.
-            // The drop is keyed on the model ID prefix: a resold row whose id
-            // does not start with `claude` but whose clause patterns embed one
-            // (none in the current feed, verified 2026-08-20) would slip
-            // through.
-            if provider.id != "anthropic"
-                && model
-                    .id
+            // A delisted row (`removed_at` stamped) is out of the index's
+            // current price set and prices nothing.
+            if row.removed_at.is_some() {
+                continue;
+            }
+            // A kept provider can still resell another vendor's models: a
+            // claude id under a non-anthropic provider is a resold listing and
+            // drops, case-insensitively on the id prefix. Anthropic's own rows
+            // are the only legitimate claude rows.
+            if canonical != "anthropic"
+                && model_id
                     .get(..6)
                     .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude"))
             {
                 continue;
             }
-            if let Some(priced) = model.into_priced() {
+            if let Some(priced) = row.into_priced(model_id.clone()) {
                 models.push(priced);
             }
         }
@@ -697,110 +738,182 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
     Ok(models)
 }
 
-/// Feed-level provider row. `models` stays raw JSON so one malformed model
-/// skips itself instead of sinking its whole provider. The feed's
-/// `fallback_model_providers` chain is intentionally NOT modeled: it exists
-/// only on azure (a dropped reseller) and google (→ anthropic), and the flat
-/// cross-provider distilled list already scans every kept provider's models,
-/// so the chain is structurally redundant — upstream uses it for provider
-/// attribution, which clauth does not track.
+/// The index's source spelling → clauth's canonical provider name; the
+/// allowlist tests the canonical name. Only moonshot and xai differ today.
+fn canonical_source(source: &str) -> &str {
+    match source {
+        "moonshot" => "moonshotai",
+        "xai" => "x-ai",
+        other => other,
+    }
+}
+
+/// One index row. The four `_mtok` keys are USD per million tokens; missing
+/// keys are `None` (→ 0.0 per token). `cache_write_1h_mtok` is deliberately
+/// NOT declared (the hourly axis has no TTL data), and index-only extras
+/// (`first_seen`, `timezone`, `observed_at`, …) are ignored the same way. A
+/// declared field of the wrong shape fails the whole row, which the caller
+/// then skips.
 #[derive(Deserialize)]
-struct RawProvider {
-    id: String,
+struct RawRow {
     #[serde(default)]
-    models: Vec<serde_json::Value>,
-}
-
-/// One model row. Every field the resolver needs is required; a model missing
-/// any of them is skipped by the caller.
-#[derive(Deserialize)]
-struct RawModel {
-    id: String,
-    #[serde(rename = "match")]
-    match_: RawClause,
-    prices: RawPrices,
-}
-
-/// The two serializations of `prices`: a bare object for flat models, an array
-/// of conditional entries for constrained ones. The array stays raw JSON so one
-/// malformed entry skips itself instead of sinking its whole model.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawPrices {
-    Flat(RawPriceSet),
-    Conditional(Vec<serde_json::Value>),
-}
-
-#[derive(Deserialize)]
-struct RawConditional {
+    input_mtok: Option<f64>,
     #[serde(default)]
-    constraint: Option<RawConstraint>,
-    prices: RawPriceSet,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawConstraint {
-    StartDate {
-        start_date: String,
-    },
-    TimeWindow {
-        start_time: String,
-        end_time: String,
-    },
-}
-
-/// The four token rates; a missing/null field is `None` (→ 0.0). A field of
-/// any other shape fails the whole model, which the caller then skips.
-#[derive(Deserialize)]
-struct RawPriceSet {
+    output_mtok: Option<f64>,
     #[serde(default)]
-    input_mtok: Option<RawPrice>,
+    cache_read_mtok: Option<f64>,
     #[serde(default)]
-    output_mtok: Option<RawPrice>,
+    cache_write_mtok: Option<f64>,
+    /// Present = the row is delisted (the index's removal convention keeps
+    /// the row with its last prices and stamps it); the caller skips it, so
+    /// it prices nothing at any date.
     #[serde(default)]
-    cache_read_mtok: Option<RawPrice>,
+    removed_at: Option<String>,
     #[serde(default)]
-    cache_write_mtok: Option<RawPrice>,
+    effective_at: Option<String>,
+    #[serde(default)]
+    window_rates: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    peak_windows: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    peak_input_mtok: Option<f64>,
+    #[serde(default)]
+    peak_output_mtok: Option<f64>,
+    #[serde(default)]
+    peak_cache_read_mtok: Option<f64>,
+    #[serde(default)]
+    peak_cache_write_mtok: Option<f64>,
 }
 
-/// `_mtok` fields are USD per million tokens — either a flat number or a
-/// `{base, tiers}` ladder. clauth has no per-request context-window input, so a
-/// tiered field resolves to its `base` (the rate below the tier threshold;
-/// documented approximation).
+/// The four token rates one entry can carry. A window entry holds OVERRIDE
+/// rates only: a key it leaves absent inherits the row's base value at
+/// distill time.
+#[derive(Debug, Default, Clone, Copy)]
+struct RawRateSet {
+    input_mtok: Option<f64>,
+    output_mtok: Option<f64>,
+    cache_read_mtok: Option<f64>,
+    cache_write_mtok: Option<f64>,
+}
+
+impl RawRateSet {
+    /// Per-token entry; `base` fills the keys this set leaves absent. `None`
+    /// values price 0.0.
+    fn entry(&self, base: &Self, constraint: Option<Constraint>) -> PriceEntry {
+        PriceEntry {
+            input: to_per_token(self.input_mtok.or(base.input_mtok).unwrap_or(0.0)),
+            output: to_per_token(self.output_mtok.or(base.output_mtok).unwrap_or(0.0)),
+            cache_read: to_per_token(self.cache_read_mtok.or(base.cache_read_mtok).unwrap_or(0.0)),
+            cache_write: to_per_token(
+                self.cache_write_mtok
+                    .or(base.cache_write_mtok)
+                    .unwrap_or(0.0),
+            ),
+            constraint,
+        }
+    }
+}
+
+/// One `window_rates` entry: an HHMM `[start, end]` window, an optional
+/// UTC-weekday `days` set (absent = every day), and override rate keys. The
+/// `quota_multiplier` key is deliberately NOT declared: it is a consumption
+/// weight, never a rate, and an entry with no rate keys of its own is skipped
+/// by the caller.
 #[derive(Deserialize)]
-#[serde(untagged)]
-enum RawPrice {
-    Number(f64),
-    Tiered { base: f64 },
+struct RawWindowEntry {
+    #[serde(default)]
+    window: Option<[u32; 2]>,
+    #[serde(default)]
+    days: Option<Vec<String>>,
+    #[serde(default)]
+    input_mtok: Option<f64>,
+    #[serde(default)]
+    output_mtok: Option<f64>,
+    #[serde(default)]
+    cache_read_mtok: Option<f64>,
+    #[serde(default)]
+    cache_write_mtok: Option<f64>,
 }
 
-/// The match logic; variants mirror the schema. `or`/`and` nest arbitrarily.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RawClause {
-    Equals { equals: String },
-    StartsWith { starts_with: String },
-    Contains { contains: String },
-    EndsWith { ends_with: String },
-    Regex { regex: String },
-    Or { or: Vec<RawClause> },
-    And { and: Vec<RawClause> },
-}
-
-impl RawModel {
-    fn into_priced(self) -> Option<PricedModel> {
-        let prices = match self.prices {
-            RawPrices::Flat(set) => vec![set.into_entry(None)],
-            RawPrices::Conditional(entries) => entries
-                .into_iter()
-                .filter_map(|e| serde_json::from_value::<RawConditional>(e).ok())
-                .map(|e| {
-                    e.prices
-                        .into_entry(e.constraint.map(RawConstraint::into_constraint))
-                })
-                .collect(),
+impl RawWindowEntry {
+    /// `None` for an entry with no rate keys of its own (a quota-only entry)
+    /// or a malformed window — both are dropped, never widened into an
+    /// always-active entry.
+    fn to_entry(&self, base: &RawRateSet) -> Option<PriceEntry> {
+        if !self.any_rate() {
+            return None;
+        }
+        let window = match self.window {
+            None => None,
+            Some([start, end]) => Some((fmt_hhmm(start)?, fmt_hhmm(end)?)),
         };
+        let constraint = match (window, self.days.as_deref()) {
+            (Some((start, end)), Some(days)) => Some(Constraint::Days {
+                days: days.to_vec(),
+                start: Some(start),
+                end: Some(end),
+            }),
+            (Some((start, end)), None) => Some(Constraint::TimeWindow { start, end }),
+            (None, Some(days)) => Some(Constraint::Days {
+                days: days.to_vec(),
+                start: None,
+                end: None,
+            }),
+            (None, None) => None,
+        };
+        Some(self.rates().entry(base, constraint))
+    }
+
+    fn any_rate(&self) -> bool {
+        self.input_mtok.is_some()
+            || self.output_mtok.is_some()
+            || self.cache_read_mtok.is_some()
+            || self.cache_write_mtok.is_some()
+    }
+
+    fn rates(&self) -> RawRateSet {
+        RawRateSet {
+            input_mtok: self.input_mtok,
+            output_mtok: self.output_mtok,
+            cache_read_mtok: self.cache_read_mtok,
+            cache_write_mtok: self.cache_write_mtok,
+        }
+    }
+}
+
+impl RawRow {
+    fn into_priced(self, id: String) -> Option<PricedModel> {
+        let base = RawRateSet {
+            input_mtok: self.input_mtok,
+            output_mtok: self.output_mtok,
+            cache_read_mtok: self.cache_read_mtok,
+            cache_write_mtok: self.cache_write_mtok,
+        };
+        let mut prices = vec![base.entry(&RawRateSet::default(), None)];
+        for raw in self.window_rates.into_iter().flatten() {
+            let Ok(entry) = serde_json::from_value::<RawWindowEntry>(raw) else {
+                continue; // malformed entry — skip, don't fail the row
+            };
+            if let Some(entry) = entry.to_entry(&base) {
+                prices.push(entry);
+            }
+        }
+        // The legacy peak shape: `peak_windows` as ["HH:MM","HH:MM"] STRING
+        // pairs plus flat `peak_*` rate keys (absent peak keys inherit the
+        // base, like window entries). No live row carries it; the generator
+        // may regress to it.
+        let peak = RawRateSet {
+            input_mtok: self.peak_input_mtok,
+            output_mtok: self.peak_output_mtok,
+            cache_read_mtok: self.peak_cache_read_mtok,
+            cache_write_mtok: self.peak_cache_write_mtok,
+        };
+        for raw in self.peak_windows.into_iter().flatten() {
+            let Ok([start, end]) = serde_json::from_value::<[String; 2]>(raw) else {
+                continue; // malformed pair — skip
+            };
+            prices.push(peak.entry(&base, Some(Constraint::TimeWindow { start, end })));
+        }
         // A model with no input AND no output rate anywhere (per-request /
         // web-search pricing) cannot price tokens; keeping it would render a
         // $0 "priced" row instead of an unpriced dash.
@@ -808,64 +921,16 @@ impl RawModel {
             return None;
         }
         Some(PricedModel {
-            id: self.id,
-            match_: self.match_.into_clause(),
+            id,
             prices,
+            effective_at: self.effective_at,
         })
     }
 }
 
-impl RawPriceSet {
-    fn into_entry(self, constraint: Option<Constraint>) -> PriceEntry {
-        PriceEntry {
-            input: to_per_token(self.input_mtok),
-            output: to_per_token(self.output_mtok),
-            cache_read: to_per_token(self.cache_read_mtok),
-            cache_write: to_per_token(self.cache_write_mtok),
-            constraint,
-        }
-    }
-}
-
 /// USD-per-million → per-token.
-fn to_per_token(price: Option<RawPrice>) -> f64 {
-    match price {
-        Some(RawPrice::Number(mtok)) => mtok / 1e6,
-        Some(RawPrice::Tiered { base }) => base / 1e6,
-        None => 0.0,
-    }
-}
-
-impl RawClause {
-    /// String patterns are lowercased here so evaluation stays allocation-free
-    /// and case-insensitive (upstream lowercases per call; storing pre-lowered
-    /// is equivalent).
-    fn into_clause(self) -> MatchClause {
-        match self {
-            Self::Equals { equals } => MatchClause::Equals(equals.to_lowercase()),
-            Self::StartsWith { starts_with } => MatchClause::StartsWith(starts_with.to_lowercase()),
-            Self::Contains { contains } => MatchClause::Contains(contains.to_lowercase()),
-            Self::EndsWith { ends_with } => MatchClause::EndsWith(ends_with.to_lowercase()),
-            Self::Regex { regex } => MatchClause::Regex(regex),
-            Self::Or { or } => MatchClause::Or(or.into_iter().map(Self::into_clause).collect()),
-            Self::And { and } => MatchClause::And(and.into_iter().map(Self::into_clause).collect()),
-        }
-    }
-}
-
-impl RawConstraint {
-    fn into_constraint(self) -> Constraint {
-        match self {
-            Self::StartDate { start_date } => Constraint::StartDate(start_date),
-            Self::TimeWindow {
-                start_time,
-                end_time,
-            } => Constraint::TimeWindow {
-                start: start_time,
-                end: end_time,
-            },
-        }
-    }
+fn to_per_token(mtok: f64) -> f64 {
+    mtok / 1e6
 }
 
 // ── Disk cache ───────────────────────────────────────────────────────────────
@@ -878,10 +943,13 @@ struct CacheFile {
     history: Vec<RateSnapshot>,
 }
 
-/// `~/.clauth/genai_price_cache.json`. Resolved ONCE at spawn time and passed
-/// into the worker so the detached thread never re-resolves `home_dir()` later.
+/// `~/.clauth/ai_pricelog_price_cache.json`. Resolved ONCE at spawn time and
+/// passed into the worker so the detached thread never re-resolves
+/// `home_dir()` later.
 fn cache_path() -> Option<PathBuf> {
-    clauth_dir().ok().map(|d| d.join("genai_price_cache.json"))
+    clauth_dir()
+        .ok()
+        .map(|d| d.join("ai_pricelog_price_cache.json"))
 }
 
 /// Synchronous one-shot read of the on-disk price cache, off the background

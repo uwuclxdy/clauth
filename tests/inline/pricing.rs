@@ -1,16 +1,21 @@
-//! Inline tests for `crate::pricing` — genai-prices distill, match-clause
-//! resolution, constraint selection, snapshot history, and per-model cost
-//! math. No network: tables are built from literals and the trimmed real-data
+//! Inline tests for `crate::pricing` — ai-pricelog distill, id resolution,
+//! constraint selection, snapshot history, and per-model cost math. No
+//! network: tables are built from literals and the trimmed real-index
 //! fixture.
 
 use super::*;
 
+use crate::logline::LogLines;
 use crate::testutil::HomeSandbox;
 
-/// Trimmed real genai-prices v2 feed (`tests/fixtures/genai-v2-trimmed.json`):
-/// four first-party providers plus two resellers, keeping the real `match`
-/// clauses and price shapes.
-const FIXTURE: &str = include_str!("../fixtures/genai-v2-trimmed.json");
+/// Trimmed real ai-pricelog index
+/// (`tests/fixtures/ai-pricelog-index-trimmed.json`): real rows for the
+/// claude / gpt / qwen / glm / deepseek / moonshot / grok first-party
+/// representatives, dashscope's six `removed_at`-stamped resold rows, one
+/// reseller source, and rows marked `"synthetic": true` for shapes no live
+/// row exercises (the legacy peak_windows shape, a future `effective_at`, an
+/// overlapping window pair).
+const FIXTURE: &str = include_str!("../fixtures/ai-pricelog-index-trimmed.json");
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -29,8 +34,8 @@ fn entry(input: f64, output: f64) -> PriceEntry {
 fn eq_model(id: &str, input: f64, output: f64) -> PricedModel {
     PricedModel {
         id: id.to_owned(),
-        match_: MatchClause::Equals(id.to_lowercase()),
         prices: vec![entry(input, output)],
+        effective_at: None,
     }
 }
 
@@ -48,12 +53,11 @@ fn table(models: Vec<PricedModel>) -> PriceTable {
     }
 }
 
-/// The future deepseek-v4 shape: off-peak is half price; peak 01:00–04:00 and
+/// The deepseek-v4 window shape: off-peak is half price; peak 01:00–04:00 and
 /// 06:00–10:00Z — two whole-hour windows, i.e. two entries.
 fn two_window_model() -> PricedModel {
     PricedModel {
         id: "deepseek-v4-pro".to_owned(),
-        match_: MatchClause::StartsWith("deepseek-v4-pro".to_owned()),
         prices: vec![
             entry(0.2175e-6, 0.435e-6), // off-peak fallback
             PriceEntry {
@@ -62,8 +66,8 @@ fn two_window_model() -> PricedModel {
                 cache_read: 0.0,
                 cache_write: 0.0,
                 constraint: Some(Constraint::TimeWindow {
-                    start: "01:00Z".to_owned(), // missing seconds tolerated
-                    end: "04:00Z".to_owned(),
+                    start: "01:00".to_owned(),
+                    end: "04:00".to_owned(),
                 }),
             },
             PriceEntry {
@@ -72,11 +76,12 @@ fn two_window_model() -> PricedModel {
                 cache_read: 0.0,
                 cache_write: 0.0,
                 constraint: Some(Constraint::TimeWindow {
-                    start: "06:00:00Z".to_owned(),
-                    end: "10:00:00Z".to_owned(),
+                    start: "06:00".to_owned(),
+                    end: "10:00".to_owned(),
                 }),
             },
         ],
+        effective_at: None,
     }
 }
 
@@ -90,226 +95,346 @@ fn model(id: &str, input: u64, output: u64, cache_read: u64, cache_create: u64) 
     }
 }
 
+/// `got` is a resolved rate, `expected` the same rate written as a literal —
+/// compared with tolerance, since `mtok / 1e6` and a `x e-N` literal do not
+/// always round to the same bits.
+fn assert_rate(got: Option<f64>, expected: f64) {
+    let got = got.unwrap_or_else(|| panic!("expected {expected}, got None"));
+    assert!(
+        (got - expected).abs() < 1e-12,
+        "got {got}, expected {expected}"
+    );
+}
+
 // ── distill ──────────────────────────────────────────────────────────────────
 
 #[test]
 fn distill_converts_mtok_to_per_token() {
-    // Real deepseek-v4-pro entry: 0.435 USD/Mtok in → 4.35e-7 per token.
-    let json = r#"[
-        {"id": "deepseek", "models": [
-            {"id": "deepseek-v4-pro",
-             "match": {"or": [{"starts_with": "deepseek-v4-pro"}]},
-             "prices": {"input_mtok": 0.435, "output_mtok": 0.87, "cache_read_mtok": 0.003625}}
-        ]}
-    ]"#;
+    // Real deepseek-v4-pro row: 0.66 USD/Mtok in → 6.6e-7 per token.
+    let json = r#"{"version": 3, "sources": {"deepseek": {
+        "deepseek-v4-pro": {"input_mtok": 0.66, "output_mtok": 1.98, "cache_read_mtok": 0.022}
+    }}}"#;
     let models = distill(json).expect("distill ok");
     assert_eq!(models.len(), 1);
     let rate = &models[0].prices[0];
-    assert!((rate.input - 4.35e-7).abs() < 1e-12, "got {}", rate.input);
-    assert!((rate.output - 8.7e-7).abs() < 1e-12, "got {}", rate.output);
-    assert!((rate.cache_read - 3.625e-9).abs() < 1e-15);
+    assert!((rate.input - 6.6e-7).abs() < 1e-12, "got {}", rate.input);
+    assert!((rate.output - 1.98e-6).abs() < 1e-12, "got {}", rate.output);
+    assert!((rate.cache_read - 2.2e-8).abs() < 1e-15);
     assert_eq!(rate.cache_write, 0.0); // missing field defaults to 0
 }
 
 #[test]
-fn distill_tiered_price_takes_base() {
-    // claude-opus-4-6's real first entry is a {base, tiers} ladder; without a
-    // per-request context window clauth prices the base (below-tier) rate.
-    let json = r#"[
-        {"id": "anthropic", "models": [
-            {"id": "claude-opus-4-6",
-             "match": {"or": [{"starts_with": "claude-opus-4-6"}]},
-             "prices": [{"prices": {
-                 "input_mtok": {"base": 5, "tiers": [{"start": 200000, "price": 10}]},
-                 "output_mtok": 25}}]}
-        ]}
-    ]"#;
-    let models = distill(json).expect("distill ok");
-    assert!((models[0].prices[0].input - 5e-6).abs() < 1e-12);
-    assert!((models[0].prices[0].output - 25e-6).abs() < 1e-12);
-}
-
-#[test]
-fn distill_keeps_first_party_drops_resellers() {
-    let json = r#"[
-        {"id": "deepseek", "models": [
-            {"id": "deepseek-v3.2", "match": {"equals": "deepseek-v3.2"},
-             "prices": {"input_mtok": 0.28, "output_mtok": 0.42}}
-        ]},
-        {"id": "openrouter", "models": [
-            {"id": "anthropic/claude-sonnet-4.5", "match": {"equals": "anthropic/claude-sonnet-4.5"},
-             "prices": {"input_mtok": 3, "output_mtok": 15}}
-        ]},
-        {"id": "aws", "models": [
-            {"id": "bedrock/claude-opus-4-8", "match": {"equals": "bedrock/claude-opus-4-8"},
-             "prices": {"input_mtok": 5, "output_mtok": 25}}
-        ]},
-        {"id": "huggingface_together", "models": [
-            {"id": "Qwen/Qwen3-Coder-480B-A35B-Instruct", "match": {"equals": "Qwen/Qwen3-Coder-480B-A35B-Instruct"},
-             "prices": {"input_mtok": 1, "output_mtok": 2}}
-        ]}
-    ]"#;
+fn distill_skips_rows_with_malformed_price_fields() {
+    // The index carries no tiered ladders (verified against the live index);
+    // a declared rate key of any non-numeric shape fails the whole row, which
+    // the caller skips — the sibling row survives.
+    let json = r#"{"version": 3, "sources": {"deepseek": {
+        "bad-price-shape": {"input_mtok": "garbage", "output_mtok": 0.42},
+        "deepseek-v3.2": {"input_mtok": 0.28, "output_mtok": 0.42}
+    }}}"#;
     let models = distill(json).expect("distill ok");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["deepseek-v3.2"]);
 }
 
 #[test]
+fn distill_keeps_first_party_drops_resellers() {
+    let json = r#"{"version": 3, "sources": {
+        "deepseek": {
+            "deepseek-v3.2": {"input_mtok": 0.28, "output_mtok": 0.42}
+        },
+        "openrouter": {
+            "deepseek/deepseek-v3.2": {"input_mtok": 3, "output_mtok": 15}
+        },
+        "novita": {
+            "deepseek/deepseek-v3.2": {"input_mtok": 5, "output_mtok": 25}
+        },
+        "avian": {
+            "deepseek/deepseek-v3.2": {"input_mtok": 1, "output_mtok": 2}
+        }
+    }}"#;
+    let models = distill(json).expect("distill ok");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["deepseek-v3.2"]);
+}
+
+#[test]
+fn distill_maps_source_names_and_drops_closed_sources() {
+    // The index spells the two renamed providers differently from clauth's
+    // canonical names; the map applies at distill. zhipuai and voyageai are
+    // closed upstream and stay out of the allowlist.
+    let json = r#"{"version": 3, "sources": {
+        "moonshot": {"kimi-k2.6": {"input_mtok": 0.95, "output_mtok": 4.0}},
+        "xai": {"grok-4.6": {"input_mtok": 2.0, "output_mtok": 6.0}},
+        "zhipuai": {"glm-4.7": {"input_mtok": 0.5, "output_mtok": 1.0}},
+        "voyageai": {"voyage-3": {"input_mtok": 0.1, "output_mtok": 0.1}}
+    }}"#;
+    let models = distill(json).expect("distill ok");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["kimi-k2.6", "grok-4.6"]);
+}
+
+#[test]
+fn distill_drops_resold_claude_rows() {
+    // A kept provider reselling another vendor's models: its claude rows drop
+    // and anthropic's own row is the only legitimate one. The live index
+    // carries no such rows today; the guard stays against upstream regress.
+    let json = r#"{"version": 3, "sources": {
+        "anthropic": {
+            "claude-opus-5": {"input_mtok": 5, "output_mtok": 25}
+        },
+        "google": {
+            "claude-opus-5": {"input_mtok": 3, "output_mtok": 15},
+            "gemini-3.7-flash": {"input_mtok": 0.1, "output_mtok": 0.4}
+        }
+    }}"#;
+    let models = distill(json).expect("distill ok");
+    let count = |id: &str| models.iter().filter(|m| m.id == id).count();
+    assert_eq!(count("claude-opus-5"), 1); // anthropic's row survives
+    assert_eq!(count("gemini-3.7-flash"), 1);
+}
+
+#[test]
 fn distill_drops_capitalized_resold_claude_rows() {
     // The prefix check is case-insensitive; a capitalized resold id must
-    // drop exactly like its lowercase twin. The current feed carries none —
-    // defensive pin against upstream casing drift.
-    let json = r#"[
-        {"id": "google", "models": [
-            {"id": "Claude-3-5-Sonnet", "match": {"contains": "Claude-3-5-Sonnet"},
-             "prices": {"input_mtok": 3, "output_mtok": 15}},
-            {"id": "gemini-3.7-flash", "match": {"equals": "gemini-3.7-flash"},
-             "prices": {"input_mtok": 0.1, "output_mtok": 0.4}}
-        ]}
-    ]"#;
+    // drop exactly like its lowercase twin.
+    let json = r#"{"version": 3, "sources": {
+        "google": {
+            "Claude-3-5-Sonnet": {"input_mtok": 3, "output_mtok": 15},
+            "gemini-3.7-flash": {"input_mtok": 0.1, "output_mtok": 0.4}
+        }
+    }}"#;
     let models = distill(json).expect("distill ok");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["gemini-3.7-flash"]);
 }
 
 #[test]
-fn distill_drops_resold_claude_rows() {
-    // google (Vertex) resells anthropic's models; its claude rows carry
-    // CONTAINS clauses. The fixture keeps both google's `claude-opus-4-6`
-    // and anthropic's, so the drop must leave exactly ONE.
-    let models = distill(FIXTURE).expect("fixture distills");
-    let count = |id: &str| models.iter().filter(|m| m.id == id).count();
-    assert_eq!(count("claude-fable-5"), 0); // google-only in the fixture
-    assert_eq!(count("claude-opus-4-6"), 1); // anthropic's row survives
-    // The rule is claude-specific: google's own models stay.
-    assert_eq!(count("gemini-3.7-flash"), 1);
-}
-
-#[test]
-fn resold_claude_drop_unprices_local_fine_tunes() {
-    // google's resold rows priced local fine-tune names at Anthropic API
-    // rates (`claude-fable-5` contains, `claude-4.6-opus` contains). With
-    // them dropped, no kept clause matches these ids.
-    let t = PriceTable::capture(
-        distill(FIXTURE).expect("fixture distills"),
-        "2026-08-19".to_owned(),
-        0,
-        Vec::new(),
+fn distill_parses_window_rates_and_effective_at() {
+    // deepseek-v4-pro's real shape: flat base rates, a row-level effective
+    // date, and two weekday window entries with HHMM windows.
+    let json = r#"{"version": 3, "sources": {"deepseek": {
+        "deepseek-v4-pro": {
+            "input_mtok": 0.66, "output_mtok": 1.98, "cache_read_mtok": 0.022,
+            "effective_at": "2026-08-23",
+            "window_rates": [
+                {"window": [100, 400],
+                 "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                 "input_mtok": 1.32, "output_mtok": 3.96, "cache_read_mtok": 0.044},
+                {"window": [600, 1000],
+                 "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                 "input_mtok": 1.32, "output_mtok": 3.96, "cache_read_mtok": 0.044}
+            ]
+        }
+    }}}"#;
+    let models = distill(json).expect("distill ok");
+    assert_eq!(models.len(), 1);
+    let m = &models[0];
+    assert_eq!(m.effective_at.as_deref(), Some("2026-08-23"));
+    assert_eq!(m.prices.len(), 3);
+    assert_eq!(m.prices[0].constraint, None);
+    assert!((m.prices[0].input - 6.6e-7).abs() < 1e-12);
+    let weekdays: Vec<&str> = vec!["monday", "tuesday", "wednesday", "thursday", "friday"];
+    assert_eq!(
+        m.prices[1].constraint,
+        Some(Constraint::Days {
+            days: weekdays.iter().map(|d| (*d).to_owned()).collect(),
+            start: Some("01:00".to_owned()),
+            end: Some("04:00".to_owned()),
+        })
     );
-    for id in [
-        "qwable-9b-claude-fable-5-shq8",
-        "qwable-9b-claude-fable-5",
-        "qwen3.5-2b-claude-4.6-opus-reasoning-distilled@q8_0",
-    ] {
-        assert!(t.rate_at(id, "2026-08-19", 0).is_none(), "{id}");
-    }
-}
-
-#[test]
-fn bare_claude_stays_unpriced() {
-    // `claude` itself names no priced model: no kept clause matches it and
-    // no retry derives a different name from it.
-    let t = PriceTable::capture(
-        distill(FIXTURE).expect("fixture distills"),
-        "2026-08-19".to_owned(),
-        0,
-        Vec::new(),
+    assert_eq!(
+        m.prices[2].constraint,
+        Some(Constraint::Days {
+            days: weekdays.iter().map(|d| (*d).to_owned()).collect(),
+            start: Some("06:00".to_owned()),
+            end: Some("10:00".to_owned()),
+        })
     );
-    assert!(t.rate_at("claude", "2026-08-19", 0).is_none());
+    assert!((m.prices[2].input - 1.32e-6).abs() < 1e-12);
+    assert!((m.prices[2].cache_read - 4.4e-8).abs() < 1e-15);
 }
 
 #[test]
-fn distill_parses_flat_and_conditional_prices() {
-    // o3's real chain: an unconstrained entry then a start_date-constrained one.
-    let json = r#"[
-        {"id": "openai", "models": [
-            {"id": "gpt-5", "match": {"equals": "gpt-5"},
-             "prices": {"input_mtok": 1.25, "output_mtok": 10}},
-            {"id": "o3", "match": {"or": [{"equals": "o3"}, {"equals": "o3-2025-04-16"}]},
-             "prices": [
-                {"prices": {"input_mtok": 10, "output_mtok": 40}},
-                {"constraint": {"start_date": "2025-06-10"},
-                 "prices": {"input_mtok": 2, "output_mtok": 8}}
-             ]}
-        ]}
-    ]"#;
+fn distill_window_entry_inherits_missing_keys_from_base() {
+    // A window entry carries override rates only; the keys it leaves absent
+    // price at the row's base.
+    let json = r#"{"version": 3, "sources": {"zai": {
+        "m": {
+            "input_mtok": 0.1, "output_mtok": 0.2, "cache_read_mtok": 0.01,
+            "window_rates": [
+                {"window": [100, 400], "input_mtok": 0.3}
+            ]
+        }
+    }}}"#;
+    let models = distill(json).expect("distill ok");
+    let entries = &models[0].prices;
+    assert_eq!(entries.len(), 2);
+    assert!((entries[1].input - 3e-7).abs() < 1e-12);
+    assert!(
+        (entries[1].output - 2e-7).abs() < 1e-12,
+        "output inherits base"
+    );
+    assert!(
+        (entries[1].cache_read - 1e-8).abs() < 1e-15,
+        "cache_read inherits base"
+    );
+    assert_eq!(entries[1].cache_write, 0.0, "absent on row and entry");
+}
+
+#[test]
+fn distill_skips_quota_only_entries() {
+    // `quota_multiplier` is a consumption weight, never a rate: an entry with
+    // no rate keys of its own is skipped at distill (the zai glm rows carry
+    // these), while a quota key ON a rated entry is ignored and the rates
+    // still contribute.
+    let json = r#"{"version": 3, "sources": {"zai": {
+        "glm-5.3-flash": {
+            "input_mtok": 0.075, "output_mtok": 0.25, "cache_read_mtok": 0.015,
+            "window_rates": [
+                {"quota_multiplier": 0.4},
+                {"quota_multiplier": 1.2,
+                 "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                 "window": [600, 1000]}
+            ]
+        },
+        "quota-plus-rates": {
+            "input_mtok": 0.1, "output_mtok": 0.2,
+            "window_rates": [
+                {"quota_multiplier": 1.5, "window": [100, 400], "input_mtok": 0.5}
+            ]
+        }
+    }}}"#;
     let models = distill(json).expect("distill ok");
     assert_eq!(models.len(), 2);
-    let o3 = &models[1];
-    assert_eq!(o3.prices.len(), 2);
-    assert_eq!(o3.prices[0].constraint, None);
+    assert_eq!(models[0].prices.len(), 1, "both quota entries skipped");
+    assert!((models[0].prices[0].input - 7.5e-8).abs() < 1e-15);
+    let rated = &models[1].prices;
+    assert_eq!(rated.len(), 2, "the rated entry survives");
+    assert!((rated[1].input - 5e-7).abs() < 1e-12);
     assert_eq!(
-        o3.prices[1].constraint,
-        Some(Constraint::StartDate("2025-06-10".to_owned()))
+        rated[1].constraint,
+        Some(Constraint::TimeWindow {
+            start: "01:00".to_owned(),
+            end: "04:00".to_owned(),
+        })
     );
-    assert!((o3.prices[1].input - 2e-6).abs() < 1e-12);
 }
 
 #[test]
-fn distill_skips_malformed_entries_not_the_model() {
-    // A malformed CONDITIONAL entry (unknown constraint key) skips only
-    // itself; the good sibling entry keeps the model priced.
-    let json = r#"[
-        {"id": "deepseek", "models": [
-            {"id": "probe", "match": {"equals": "probe"},
-             "prices": [
-                {"prices": {"input_mtok": 10, "output_mtok": 20}},
-                {"constraint": {"end_date": "2026-01-01"},
-                 "prices": {"input_mtok": 30, "output_mtok": 40}}
-             ]}
-        ]}
-    ]"#;
-    let models = distill(json).expect("good entry survives");
+fn distill_skips_malformed_entries_not_the_row() {
+    // A window entry whose window violates the generator's bounds (hours
+    // > 24) skips only itself; the base entry and the good sibling keep the
+    // row priced.
+    let json = r#"{"version": 3, "sources": {"deepseek": {
+        "probe": {
+            "input_mtok": 0.1, "output_mtok": 0.2,
+            "window_rates": [
+                {"window": [9000, 9500], "input_mtok": 0.3},
+                {"window": [100, 400], "input_mtok": 0.4}
+            ]
+        }
+    }}}"#;
+    let models = distill(json).expect("good entries survive");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "probe");
-    assert_eq!(models[0].prices.len(), 1);
+    assert_eq!(models[0].prices.len(), 2);
     assert_eq!(models[0].prices[0].constraint, None);
-    assert!((models[0].prices[0].input - 10e-6).abs() < 1e-12);
+    assert_eq!(
+        models[0].prices[1].constraint,
+        Some(Constraint::TimeWindow {
+            start: "01:00".to_owned(),
+            end: "04:00".to_owned(),
+        })
+    );
+    assert!((models[0].prices[1].input - 4e-7).abs() < 1e-12);
 }
 
 #[test]
 fn distill_fails_when_no_models_survive() {
     // Only resellers → zero models → the fetch fails rather than shipping an
     // empty table.
-    let json = r#"[
-        {"id": "openrouter", "models": [
-            {"id": "z-ai/glm-4.7", "match": {"equals": "z-ai/glm-4.7"},
-             "prices": {"input_mtok": 0.5, "output_mtok": 1}}
-        ]}
-    ]"#;
+    let json = r#"{"version": 3, "sources": {
+        "openrouter": {"z-ai/glm-4.7": {"input_mtok": 0.5, "output_mtok": 1}}
+    }}"#;
     assert!(distill(json).is_err());
-    assert!(distill("{}").is_err()); // object root (old format) is rejected
-    assert!(distill("[]").is_err());
+    // The genai-prices shape (an array root) is not this feed's shape.
+    assert!(distill(r#"[{"id": "deepseek", "models": []}]"#).is_err());
+    assert!(distill("{}").is_err());
     assert!(distill("not json").is_err());
 }
 
 #[test]
-fn distill_skips_unparseable_models_and_providers() {
-    let json = r#"[
-        {"id": "deepseek", "models": [
-            {"id": "good", "match": {"equals": "good"},
-             "prices": {"input_mtok": 0.28, "output_mtok": 0.42}},
-            {"id": "bad-price-shape", "match": {"equals": "bad-price-shape"},
-             "prices": {"input_mtok": "garbage"}},
-            {"id": "no-match",
-             "prices": {"input_mtok": 1}}
-        ]},
-        {"id": 42, "models": []},
-        "not-a-provider",
-        {"id": "zhipuai", "models": [
-            {"id": "no-token-price", "match": {"equals": "no-token-price"},
-             "prices": {"web_searches_kcount": 10}}
-        ]}
-    ]"#;
+fn distill_skips_unparseable_rows_and_sources() {
+    let json = r#"{"version": 3, "sources": {
+        "deepseek": {
+            "good": {"input_mtok": 0.28, "output_mtok": 0.42},
+            "bad-price-shape": {"input_mtok": "garbage"},
+            "no-token-price": {"web_search_usd": 10}
+        },
+        "not-an-object-source": 42,
+        "zhipuai": {
+            "no-token-price": {"input_mtok": 1, "output_mtok": 1}
+        }
+    }}"#;
     let models = distill(json).expect("one good model survives");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["good"]);
 }
 
-// ── match clauses ────────────────────────────────────────────────────────────
+#[test]
+fn unknown_index_version_warns_and_still_parses() {
+    let lines = LogLines::new();
+    let _guard = lines.capture_here();
+    let json = r#"{"version": 99, "sources": {
+        "openai": {"gpt-4.1": {"input_mtok": 2.0, "output_mtok": 8.0}}
+    }}"#;
+    let models = distill(json).expect("parses best-effort");
+    assert_eq!(models.len(), 1);
+    let missing = r#"{"sources": {
+        "openai": {"gpt-4.1": {"input_mtok": 2.0, "output_mtok": 8.0}}
+    }}"#;
+    assert_eq!(distill(missing).expect("parses best-effort").len(), 1);
+    let got = lines.snapshot();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(
+        got[0].contains("version 99") && got[0].contains("parsing best-effort"),
+        "{got:?}"
+    );
+    assert!(got[1].contains("version missing"), "{got:?}");
+}
 
 #[test]
-fn match_equals_is_case_insensitive() {
+fn legacy_peak_windows_map_to_window_entries() {
+    // The legacy shape: `peak_windows` as ["HH:MM","HH:MM"] STRING pairs plus
+    // flat `peak_*` rate keys. No live row carries it (verified against the
+    // live index); the fixture row is synthetic.
+    let json = r#"{"version": 3, "sources": {"deepseek": {
+        "legacy": {
+            "input_mtok": 0.1, "output_mtok": 0.2, "cache_read_mtok": 0.01,
+            "peak_windows": [["01:00", "04:00"]],
+            "peak_input_mtok": 0.2, "peak_output_mtok": 0.4
+        }
+    }}}"#;
+    let models = distill(json).expect("distill ok");
+    let t = table(models);
+    let at = |hour: u8| t.rate_at("legacy", "2026-08-29", hour).expect("priced");
+    assert!((at(2).input - 2e-7).abs() < 1e-12);
+    assert!((at(2).output - 4e-7).abs() < 1e-12);
+    assert!(
+        (at(2).cache_read - 1e-8).abs() < 1e-15,
+        "absent peak key inherits base"
+    );
+    assert!(
+        (at(5).input - 1e-7).abs() < 1e-12,
+        "outside the peak window"
+    );
+}
+
+// ── id resolution ────────────────────────────────────────────────────────────
+
+#[test]
+fn ids_match_case_insensitively() {
     let t = table(vec![eq_model("gpt-5.6-luna", 1e-6, 6e-6)]);
     assert_eq!(
         t.rate_at("gpt-5.6-luna", "2026-08-19", 0).map(|r| r.input),
@@ -323,133 +448,10 @@ fn match_equals_is_case_insensitive() {
 }
 
 #[test]
-fn match_starts_with() {
-    let m = PricedModel {
-        id: "deepseek-v4-pro".to_owned(),
-        match_: MatchClause::StartsWith("deepseek-v4-pro".to_owned()),
-        prices: vec![entry(4.35e-7, 8.7e-7)],
-    };
-    let t = table(vec![m]);
-    assert!(t.rate_at("deepseek-v4-pro", "2026-08-19", 0).is_some());
-    assert!(
-        t.rate_at("deepseek-v4-pro-thinking", "2026-08-19", 0)
-            .is_some()
-    );
-    assert!(t.rate_at("deepseek-v4", "2026-08-19", 0).is_none());
-    assert!(t.rate_at("xdeepseek-v4-pro", "2026-08-19", 0).is_none());
-}
-
-#[test]
-fn match_contains() {
-    let m = PricedModel {
-        id: "claude-opus-4-8".to_owned(),
-        match_: MatchClause::Contains("opus".to_owned()),
-        prices: vec![entry(5e-6, 25e-6)],
-    };
-    let t = table(vec![m]);
-    assert!(t.rate_at("claude-opus-4-8", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("anthropic-opus-x", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("claude-sonnet-4-5", "2026-08-19", 0).is_none());
-}
-
-#[test]
-fn match_ends_with() {
-    let m = PricedModel {
-        id: "glm-4.7-flash".to_owned(),
-        match_: MatchClause::EndsWith("flash".to_owned()),
-        prices: vec![entry(1e-6, 2e-6)],
-    };
-    let t = table(vec![m]);
-    assert!(t.rate_at("glm-4.7-flash", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("flash", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("glm-4.7-flashx", "2026-08-19", 0).is_none());
-}
-
-#[test]
-fn match_or() {
-    let m = PricedModel {
-        id: "either".to_owned(),
-        match_: MatchClause::Or(vec![
-            MatchClause::Equals("a".to_owned()),
-            MatchClause::StartsWith("b".to_owned()),
-        ]),
-        prices: vec![entry(1e-6, 2e-6)],
-    };
-    let t = table(vec![m]);
-    assert!(t.rate_at("a", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("b-1", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("c", "2026-08-19", 0).is_none());
-}
-
-#[test]
-fn match_and() {
-    let m = PricedModel {
-        id: "glm-5.2".to_owned(),
-        match_: MatchClause::And(vec![
-            MatchClause::StartsWith("glm".to_owned()),
-            MatchClause::Contains("5.2".to_owned()),
-        ]),
-        prices: vec![entry(1.4e-6, 4.4e-6)],
-    };
-    let t = table(vec![m]);
-    assert!(t.rate_at("glm-5.2", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("glm-5.2-pro", "2026-08-19", 0).is_some());
-    assert!(t.rate_at("glm-5", "2026-08-19", 0).is_none());
-    assert!(t.rate_at("qwen-5.2", "2026-08-19", 0).is_none());
-}
-
-#[test]
-fn match_first_wins_in_distilled_order() {
-    // Both clauses hold for "overlap"; the FIRST model in distilled order wins.
-    let first = PricedModel {
-        id: "first".to_owned(),
-        match_: MatchClause::StartsWith("over".to_owned()),
-        prices: vec![entry(1e-6, 2e-6)],
-    };
-    let second = PricedModel {
-        id: "second".to_owned(),
-        match_: MatchClause::Equals("overlap".to_owned()),
-        prices: vec![entry(3e-6, 4e-6)],
-    };
-    let t = table(vec![first, second]);
-    assert_eq!(
-        t.rate_at("overlap", "2026-08-19", 0).map(|r| r.input),
-        Some(1e-6)
-    );
-}
-
-#[test]
-fn match_regex_dates_stamped_ids() {
-    // gpt-5.6-luna's real or-clause: an exact id plus a date-stamp regex for
-    // `gpt-5.6-luna-YYYY-MM-DD` variants.
-    let luna = PricedModel {
-        id: "gpt-5.6-luna".to_owned(),
-        match_: MatchClause::Or(vec![
-            MatchClause::Equals("gpt-5.6-luna".to_owned()),
-            MatchClause::Regex(r"^gpt-5\.6-luna-\d{4}-\d{2}-\d{2}$".to_owned()),
-        ]),
-        prices: vec![entry(1e-6, 6e-6)],
-    };
-    let t = table(vec![luna]);
-    assert!(t.rate_at("gpt-5.6-luna", "2026-08-19", 0).is_some());
-    assert!(
-        t.rate_at("gpt-5.6-luna-2026-05-14", "2026-08-19", 0)
-            .is_some()
-    );
-    // Not a date stamp → the regex arm fails and nothing else matches.
-    assert!(t.rate_at("gpt-5.6-luna-2026-05", "2026-08-19", 0).is_none());
-    assert!(t.rate_at("gpt-5.5", "2026-08-19", 0).is_none());
-}
-
-#[test]
 fn rate_strips_bracket_suffix_before_match() {
-    // A real starts_with clause prices the bracketed context ids.
-    let ds = PricedModel {
-        id: "deepseek-v4-pro".to_owned(),
-        match_: MatchClause::StartsWith("deepseek-v4-pro".to_owned()),
-        prices: vec![entry(4.35e-7, 8.7e-7)],
-    };
-    // An exact clause must NOT match a non-context bracket, so the strip has
+    // A real model id prices the bracketed context ids.
+    let ds = eq_model("deepseek-v4-pro", 4.35e-7, 8.7e-7);
+    // An exact match must NOT match a non-context bracket, so the strip has
     // to be selective (digits + k/m only).
     let glm = eq_model("glm-5.2", 1.4e-6, 4.4e-6);
     let t = table(vec![ds, glm]);
@@ -463,7 +465,7 @@ fn rate_strips_bracket_suffix_before_match() {
     ] {
         assert!(t.rate_at(id, "2026-08-19", 0).is_some(), "{id}");
     }
-    // Non-context brackets are left alone → the full id misses the clause.
+    // Non-context brackets are left alone → the full id misses the row.
     assert!(t.rate_at("glm-5.2[xm]", "2026-08-19", 0).is_none());
     assert!(t.rate_at("glm-5.2[1x]", "2026-08-19", 0).is_none());
     assert!(t.rate_at("glm-5.2[]", "2026-08-19", 0).is_none());
@@ -483,7 +485,7 @@ fn rate_retries_colon_strip_bare() {
 #[test]
 fn rate_retries_colon_strip_namespaced() {
     // The colon-stripped form still carries its namespace and must match a
-    // clause on that full form.
+    // row on that full form.
     let t = table(vec![eq_model("zai/glm-4.7", 1.4e-6, 4.4e-6)]);
     assert_eq!(
         t.rate_at("zai/glm-4.7:free", "2026-08-19", 0)
@@ -511,7 +513,7 @@ fn rate_retries_provider_strip_one_segment() {
 
 #[test]
 fn rate_retries_provider_strip_two_segments() {
-    // Each intermediate retries: with a clause on the ONE-segment form,
+    // Each intermediate retries: with a row on the ONE-segment form,
     // that form must win before the bare id is ever tried.
     let one_segment = eq_model("anthropic/claude-opus-5", 5e-6, 25e-6);
     let bare = eq_model("claude-opus-5", 6e-6, 26e-6);
@@ -521,7 +523,7 @@ fn rate_retries_provider_strip_two_segments() {
             .map(|r| r.input),
         Some(5e-6)
     );
-    // And when the intermediate has no clause, the second strip prices.
+    // And when the intermediate has no row, the second strip prices.
     let t2 = table(vec![eq_model("claude-opus-5", 6e-6, 26e-6)]);
     assert_eq!(
         t2.rate_at("openrouter/anthropic/claude-opus-5", "2026-08-19", 0)
@@ -549,7 +551,7 @@ fn rate_retries_date_stamp_strip() {
 #[test]
 fn rate_retries_date_stamp_strip_repeated() {
     // `m-20250801-20250802` strips BOTH trailing groups, retrying each
-    // intermediate; only the fully-stripped `m` has a clause here.
+    // intermediate; only the fully-stripped `m` has a row here.
     let t = table(vec![eq_model("m", 1e-6, 2e-6)]);
     assert_eq!(
         t.rate_at("m-20250801-20250802", "2026-08-19", 0)
@@ -583,10 +585,9 @@ fn rate_bracket_strip_applies_to_original_only() {
 fn rate_retries_propagate_date_and_hour() {
     // The retry ladder must hand its (date, hour) through to entry selection
     // unchanged: an id that matches ONLY after a strip still prices
-    // peak/off-peak and dated entries by the queried (date, hour).
+    // peak/off-peak and effective-gated rows by the queried (date, hour).
     let m = PricedModel {
         id: "m".to_owned(),
-        match_: MatchClause::Equals("m".to_owned()),
         prices: vec![
             entry(0.2175e-6, 0.435e-6), // off-peak fallback
             PriceEntry {
@@ -595,11 +596,12 @@ fn rate_retries_propagate_date_and_hour() {
                 cache_read: 0.0,
                 cache_write: 0.0,
                 constraint: Some(Constraint::TimeWindow {
-                    start: "01:00Z".to_owned(),
-                    end: "04:00Z".to_owned(),
+                    start: "01:00".to_owned(),
+                    end: "04:00".to_owned(),
                 }),
             },
         ],
+        effective_at: None,
     };
     let t = table(vec![m]);
     // `m:free` matches only via the colon strip, so the hour used comes
@@ -608,43 +610,20 @@ fn rate_retries_propagate_date_and_hour() {
     assert_eq!(input(2), Some(0.435e-6)); // peak
     assert_eq!(input(4), Some(0.2175e-6)); // off-peak (04:00 half-open)
 
-    // Date propagation: o3's start_date chain through a colon retry.
+    // Effective-gate propagation: the fixture's windowed deepseek-v4-pro row
+    // is effective from 2026-08-23; a colon-stripped id respects the gate.
     let ft = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
-        "2026-08-19".to_owned(),
+        "2026-08-30".to_owned(),
         0,
         Vec::new(),
     );
-    let o3 = |date: &str| ft.rate_at("o3:free", date, 0).map(|r| r.input);
-    assert_eq!(o3("2025-01-01"), Some(10e-6)); // before the cut: fallback
-    assert_eq!(o3("2026-08-19"), Some(2e-6)); // after: start_date entry
+    let ds = |date: &str| ft.rate_at("deepseek-v4-pro:free", date, 5).map(|r| r.input);
+    assert_eq!(ds("2026-08-19"), None); // before the effective date: nothing
+    assert_rate(ds("2026-08-28"), 6.6e-7); // after: base rate
 }
 
 // ── constraint resolution ────────────────────────────────────────────────────
-
-#[test]
-fn start_date_chain_before_on_after() {
-    // o3's real shape: unconstrained entry first, cheaper start_date entry last.
-    let o3 = PricedModel {
-        id: "o3".to_owned(),
-        match_: MatchClause::Equals("o3".to_owned()),
-        prices: vec![
-            entry(10e-6, 40e-6),
-            PriceEntry {
-                input: 2e-6,
-                output: 8e-6,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                constraint: Some(Constraint::StartDate("2025-06-10".to_owned())),
-            },
-        ],
-    };
-    let t = table(vec![o3]);
-    let input = |date: &str| t.rate_at("o3", date, 0).map(|r| r.input);
-    assert_eq!(input("2025-06-09"), Some(10e-6)); // before: fallback entry
-    assert_eq!(input("2025-06-10"), Some(2e-6)); // on the date: active
-    assert_eq!(input("2026-08-19"), Some(2e-6)); // after: active
-}
 
 #[test]
 fn time_window_hour_granularity_boundaries() {
@@ -654,7 +633,6 @@ fn time_window_hour_granularity_boundaries() {
     // the :30 boundaries are half-mispriced by construction (documented).
     let chat = PricedModel {
         id: "deepseek-chat".to_owned(),
-        match_: MatchClause::StartsWith("deepseek-chat".to_owned()),
         prices: vec![
             entry(0.135e-6, 0.55e-6),
             PriceEntry {
@@ -668,6 +646,7 @@ fn time_window_hour_granularity_boundaries() {
                 }),
             },
         ],
+        effective_at: None,
     };
     let t = table(vec![chat]);
     let input = |hour: u8| {
@@ -696,6 +675,127 @@ fn two_window_peak_offpeak_peak() {
     assert_eq!(input(7), Some(0.435e-6)); // peak, second window
     assert_eq!(input(10), Some(0.2175e-6)); // 10:00 excluded
     assert_eq!(input(23), Some(0.2175e-6)); // off-peak
+}
+
+#[test]
+fn no_active_entry_prices_nothing() {
+    // The old resolver served `prices[0]` when nothing matched — the leak
+    // that would have priced a row before its effective date. A model whose
+    // entries are ALL inactive now prices nothing.
+    let m = PricedModel {
+        id: "windowed-only".to_owned(),
+        prices: vec![
+            PriceEntry {
+                input: 3e-6,
+                output: 4e-6,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "01:00".to_owned(),
+                    end: "04:00".to_owned(),
+                }),
+            },
+            PriceEntry {
+                input: 9e-6,
+                output: 10e-6,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "06:00".to_owned(),
+                    end: "10:00".to_owned(),
+                }),
+            },
+        ],
+        effective_at: None,
+    };
+    let t = table(vec![m]);
+    assert!(t.rate_at("windowed-only", "2026-08-19", 5).is_none());
+    assert!(
+        t.rate_at("windowed-only", "2026-08-19", 2).is_some(),
+        "an active window still prices"
+    );
+}
+
+// ── effective_at gating ──────────────────────────────────────────────────────
+
+#[test]
+fn effective_at_gates_the_whole_row() {
+    // The fixture's real deepseek-v4-pro row: effective 2026-08-23, weekday
+    // peak windows 01:00-04:00 and 06:00-10:00 UTC. A query before the date
+    // prices NOTHING — the gate covers the window entries, not only the base.
+    let t = PriceTable::capture(
+        distill(FIXTURE).expect("fixture distills"),
+        "2026-08-30".to_owned(),
+        0,
+        Vec::new(),
+    );
+    let input = |date: &str, hour: u8| t.rate_at("deepseek-v4-pro", date, hour).map(|r| r.input);
+    // 2026-08-19 is a Wednesday: the 01:00 window would match hour 2 — but
+    // the row is not yet effective.
+    assert_eq!(input("2026-08-19", 2), None);
+    // The effective date itself prices: 2026-08-23 is a Sunday, so hour 2
+    // is base rate.
+    assert_rate(input("2026-08-23", 2), 6.6e-7);
+    // 2026-08-28 is a Friday: peak hours price the window entries.
+    assert_rate(input("2026-08-28", 2), 1.32e-6);
+    assert_rate(input("2026-08-28", 5), 6.6e-7);
+    assert_rate(input("2026-08-28", 8), 1.32e-6);
+    assert_rate(input("2026-08-28", 23), 6.6e-7);
+    // 2026-08-30 is a Sunday: the weekday windows do not apply.
+    assert_rate(input("2026-08-30", 8), 6.6e-7);
+}
+
+#[test]
+fn future_effective_row_prices_nothing_until_its_date() {
+    // The fixture's synthetic future-effective row (no live row exercises
+    // this): flat base rates apply from 2026-12-31 on.
+    let t = PriceTable::capture(
+        distill(FIXTURE).expect("fixture distills"),
+        "2026-08-30".to_owned(),
+        0,
+        Vec::new(),
+    );
+    let input = |date: &str| {
+        t.rate_at("synth-future-effective", date, 0)
+            .map(|r| r.input)
+    };
+    assert_eq!(input("2026-12-30"), None);
+    assert_rate(input("2026-12-31"), 2.5e-7);
+    assert_rate(input("2027-01-01"), 2.5e-7);
+}
+
+// ── window overlap precedence ────────────────────────────────────────────────
+
+#[test]
+fn later_window_entry_wins_when_both_match() {
+    // The fixture's synthetic overlap row (no live kept-source pair overlaps;
+    // the zai glm-5.3-flash canonical case is quota-only and skipped at
+    // distill, so it cannot serve as the pin): a weekday whole-day entry,
+    // then a weekday 08:00-20:00 entry. Friday hour 10 matches BOTH — the
+    // later entry wins.
+    let t = PriceTable::capture(
+        distill(FIXTURE).expect("fixture distills"),
+        "2026-08-30".to_owned(),
+        0,
+        Vec::new(),
+    );
+    let rate = |date: &str, hour: u8| t.rate_at("synth-overlap", date, hour).expect("priced");
+    assert!(
+        (rate("2026-08-28", 10).input - 5e-7).abs() < 1e-12,
+        "later entry wins"
+    );
+    assert!(
+        (rate("2026-08-28", 5).input - 3e-7).abs() < 1e-12,
+        "only the whole-day entry"
+    );
+    assert!(
+        (rate("2026-08-28", 10).output - 2e-7).abs() < 1e-12,
+        "output inherits base"
+    );
+    assert!(
+        (rate("2026-08-30", 10).input - 1e-7).abs() < 1e-12,
+        "Sunday: base rate"
+    );
 }
 
 // ── snapshot history ─────────────────────────────────────────────────────────
@@ -819,7 +919,7 @@ fn cache_round_trip_preserves_history() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("genai_price_cache.json");
+        .join("ai_pricelog_price_cache.json");
     save_cache(&path, &table);
 
     let loaded = load_cached().expect("cache loads");
@@ -841,108 +941,128 @@ fn load_cache_rejects_empty_history() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("genai_price_cache.json");
+        .join("ai_pricelog_price_cache.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(&path, r#"{"fetched_at_ms": 1, "history": []}"#).expect("write");
     assert!(load_cached().is_none());
 }
 
 #[test]
-fn stale_litellm_cache_deleted_once() {
+fn stale_caches_deleted_once() {
+    // Both pre-ai-pricelog cache files go in one cleanup pass after the first
+    // successful new-cache write; the flag is set before the deletes, so a
+    // reappearing file is never re-deleted.
     let sandbox = HomeSandbox::new();
     let new_path = sandbox
         .home()
         .join(".clauth")
+        .join("ai_pricelog_price_cache.json");
+    let lite = sandbox.home().join(".clauth").join("price_cache.json");
+    let genai = sandbox
+        .home()
+        .join(".clauth")
         .join("genai_price_cache.json");
-    let stale = sandbox.home().join(".clauth").join("price_cache.json");
-    std::fs::create_dir_all(stale.parent().expect("parent")).expect("mkdir");
-    std::fs::write(&stale, "{}").expect("write");
+    std::fs::create_dir_all(lite.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&lite, "{}").expect("write");
+    std::fs::write(&genai, "{}").expect("write");
 
     let mut done = false;
     delete_stale_cache_once(&new_path, &mut done);
     assert!(done);
-    assert!(!stale.exists());
+    assert!(!lite.exists());
+    assert!(!genai.exists());
 
-    // A second call is a no-op — the flag is set before the delete, so a
-    // reappearing file is never re-deleted.
-    std::fs::write(&stale, "{}").expect("write");
+    std::fs::write(&lite, "{}").expect("write");
+    std::fs::write(&genai, "{}").expect("write");
     delete_stale_cache_once(&new_path, &mut done);
-    assert!(stale.exists());
+    assert!(lite.exists());
+    assert!(genai.exists());
 }
 
-#[test]
-fn all_constrained_entries_fall_back_to_first() {
-    // Upstream get_prices: when NO conditional entry is active, prices[0]
-    // serves (never None, never a panic).
-    let m = PricedModel {
-        id: "future-only".to_owned(),
-        match_: MatchClause::Equals("future-only".to_owned()),
-        prices: vec![
-            PriceEntry {
-                input: 3e-6,
-                output: 4e-6,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                constraint: Some(Constraint::StartDate("2030-01-01".to_owned())),
-            },
-            PriceEntry {
-                input: 9e-6,
-                output: 10e-6,
-                cache_read: 0.0,
-                cache_write: 0.0,
-                constraint: Some(Constraint::StartDate("2031-01-01".to_owned())),
-            },
-        ],
-    };
-    let t = table(vec![m]);
-    let rate = t
-        .rate_at("future-only", "2026-08-19", 0)
-        .expect("falls back to the first entry");
-    assert_eq!(rate.input, 3e-6);
-    assert_eq!(rate.output, 4e-6);
-}
-
-// ── real-data fixture ────────────────────────────────────────────────────────
+// ── real-index fixture ───────────────────────────────────────────────────────
 
 #[test]
 fn fixture_distills_resolvers_and_excludes_resellers() {
     let models = distill(FIXTURE).expect("fixture distills");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    // Resellers (openrouter, huggingface_together) are dropped entirely.
-    assert!(!ids.contains(&"anthropic/claude-sonnet-4.5"));
-    assert!(!ids.contains(&"Qwen/Qwen3-Coder-480B-A35B-Instruct"));
-    assert!(ids.contains(&"deepseek-v4-pro"));
-    assert!(ids.contains(&"GLM-5.2"));
+    // The reseller source is dropped entirely.
+    assert!(!ids.contains(&"aion-labs/aion-2.0"));
+    // The kept first-party representatives survive, the mapped spellings
+    // included.
+    for id in [
+        "claude-opus-5",
+        "gpt-4.1",
+        "qwen3.8-max",
+        "glm-5.3-flash",
+        "kimi-k2.6",
+        "grok-4.6",
+        "deepseek-v4-pro",
+        "synth-future-effective",
+        "synth-legacy-peak-windows",
+        "synth-overlap",
+    ] {
+        assert!(ids.contains(&id), "{id} missing");
+    }
+    // The six dashscope resold rows carry `removed_at` in the fixture (the
+    // post-fix index shape) and delist at distill.
+    for id in [
+        "deepseek-v3.2",
+        "deepseek-v4-flash",
+        "glm-5.1",
+        "glm-5.2",
+        "kimi-k2.7-code",
+    ] {
+        assert!(!ids.contains(&id), "removed row {id} must delist");
+    }
 
-    let t = PriceTable::capture(models, "2026-08-19".to_owned(), 0, Vec::new());
-    // Bracket-stripped ids resolve.
-    assert!(
-        (t.rate_at("deepseek-v4-pro[1m]", "2026-08-19", 0)
-            .expect("rate")
-            .input
-            - 4.35e-7)
-            .abs()
-            < 1e-12
-    );
-    assert!(t.rate_at("glm-5.2[1m]", "2026-08-19", 0).is_some());
-    // o3's start_date chain.
-    let o3 = |d: &str| t.rate_at("o3", d, 0).map(|r| r.input);
-    assert_eq!(o3("2025-01-01"), Some(10e-6));
-    assert_eq!(o3("2026-08-19"), Some(2e-6));
-    // deepseek-chat's time window.
-    let chat = |h: u8| t.rate_at("deepseek-chat", "2026-08-19", h).map(|r| r.input);
-    assert_eq!(chat(0), Some(0.135e-6));
-    assert_eq!(chat(5), Some(0.27e-6));
-    // The regex clause keeps the date-stamped luna id priced.
-    assert!(
-        t.rate_at("gpt-5.6-luna-2026-08-01", "2026-08-19", 0)
-            .is_some()
-    );
-    // claude-opus-4-6's tiered base resolves through the full path.
-    assert_eq!(
-        t.rate_at("claude-opus-4-6", "2026-08-19", 0)
+    let t = PriceTable::capture(models, "2026-08-30".to_owned(), 0, Vec::new());
+    // One claude-* row prices.
+    let claude = t
+        .rate_at("claude-opus-5", "2026-08-30", 0)
+        .expect("claude row prices");
+    assert!((claude.input - 5e-6).abs() < 1e-12);
+    assert!((claude.output - 25e-6).abs() < 1e-12);
+    assert!((claude.cache_read - 5e-7).abs() < 1e-12);
+    // The 1-hour cache-write field stays unused: the 5-minute rate wins.
+    assert!((claude.cache_write - 6.25e-6).abs() < 1e-12);
+    // One gpt-* row prices.
+    let gpt = t
+        .rate_at("gpt-4.1", "2026-08-30", 0)
+        .expect("gpt row prices");
+    assert!((gpt.input - 2e-6).abs() < 1e-12);
+    assert!((gpt.output - 8e-6).abs() < 1e-12);
+    // One qwen-* row prices.
+    let qwen = t
+        .rate_at("qwen3.8-max", "2026-08-30", 0)
+        .expect("qwen row prices");
+    assert!((qwen.input - 2e-6).abs() < 1e-12);
+    assert!((qwen.output - 6e-6).abs() < 1e-12);
+
+    // The ruling's regression guard: deepseek-v4-pro prices deepseek's OWN
+    // row and never the dashscope resold copy — the dashscope row carries
+    // `removed_at` and is delisted at distill, so exactly one distilled model
+    // carries the id, and its rates are deepseek's own.
+    let ds_models: Vec<&PricedModel> = t
+        .models
+        .iter()
+        .filter(|m| m.id.eq_ignore_ascii_case("deepseek-v4-pro"))
+        .collect();
+    assert_eq!(ds_models.len(), 1, "the delisted copy must not shadow");
+    assert_eq!(ds_models[0].prices[0].constraint, None);
+    assert!((ds_models[0].prices[0].input - 6.6e-7).abs() < 1e-12);
+    assert!((ds_models[0].prices[0].output - 1.98e-6).abs() < 1e-12);
+    // Bracket-stripped ids resolve through the same row.
+    assert_rate(
+        t.rate_at("deepseek-v4-pro[1m]", "2026-08-28", 5)
             .map(|r| r.input),
-        Some(5e-6)
+        6.6e-7,
+    );
+
+    // The synthetic legacy row prices through its peak window.
+    assert_rate(
+        t.rate_at("synth-legacy-peak-windows", "2026-08-29", 2)
+            .map(|r| r.input),
+        2e-7,
     );
 }
 
@@ -953,7 +1073,6 @@ fn cost_sums_all_four_buckets() {
     // Clean rates: $1/$2/$0.10/$1.25 per million.
     let t = table(vec![PricedModel {
         id: "m".to_owned(),
-        match_: MatchClause::Equals("m".to_owned()),
         prices: vec![PriceEntry {
             input: 1e-6,
             output: 2e-6,
@@ -961,6 +1080,7 @@ fn cost_sums_all_four_buckets() {
             cache_write: 1.25e-6,
             constraint: None,
         }],
+        effective_at: None,
     }]);
     let m = model("m", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
     // 1.0 + 2.0 + 0.10 + 1.25 = 4.35
@@ -972,7 +1092,6 @@ fn cost_sums_all_four_buckets() {
 fn cost_none_for_unpriced_model() {
     let t = table(vec![PricedModel {
         id: "m".to_owned(),
-        match_: MatchClause::Equals("m".to_owned()),
         prices: vec![PriceEntry {
             input: 1e-6,
             output: 2e-6,
@@ -980,6 +1099,7 @@ fn cost_none_for_unpriced_model() {
             cache_write: 1.25e-6,
             constraint: None,
         }],
+        effective_at: None,
     }]);
     assert!(
         t.cost_at(&model("unknown", 1000, 0, 0, 0), "2026-08-19", 0)
@@ -1092,7 +1212,7 @@ fn the_cost_lens_walks_each_model_and_date_once() {
 
 #[test]
 fn an_unpriced_id_is_remembered_as_unpriced() {
-    // A miss costs the FULL ladder — every candidate form against every clause —
+    // A miss costs the FULL ladder — every candidate form against every model —
     // so it is the walk least worth repeating. Unpriced ids reach the lens on
     // every frame too: a local fine-tune the feed carries no rate for.
     let t = table(vec![eq_model("m", 1e-6, 2e-6)]);
@@ -1131,4 +1251,57 @@ fn the_memo_keys_on_the_date_so_two_snapshots_do_not_bleed() {
         2,
         "one walk per date, since the snapshots differ"
     );
+}
+
+// ── the zai quota rows ───────────────────────────────────────────────────────
+
+#[test]
+fn zai_quota_entries_are_skipped() {
+    // The fixture's real glm-5.3-flash row: quota_multiplier-only window
+    // entries distill to nothing, so a weekday peak hour prices the flat base.
+    let models = distill(FIXTURE).expect("fixture distills");
+    let flash = models
+        .iter()
+        .find(|m| m.id == "glm-5.3-flash")
+        .expect("row distills");
+    assert_eq!(flash.prices.len(), 1, "quota entries contribute no rates");
+    let t = PriceTable::capture(models, "2026-08-30".to_owned(), 0, Vec::new());
+    let rate = t.rate_at("glm-5.3-flash", "2026-08-28", 8).expect("priced");
+    assert!(
+        (rate.input - 7.5e-8).abs() < 1e-15,
+        "no peak multiplier applies"
+    );
+    assert!((rate.output - 2.5e-7).abs() < 1e-15);
+}
+
+// ── delisted rows ────────────────────────────────────────────────────────────
+
+#[test]
+fn removed_at_stamped_entries_price_nothing() {
+    // The fixture's dashscope resold rows are real post-fix rows: the index
+    // keeps them with their last prices and a `removed_at` stamp. A delisted
+    // row prices nothing at any date or hour — the ids with no live
+    // first-party twin stay unpriced.
+    let t = PriceTable::capture(
+        distill(FIXTURE).expect("fixture distills"),
+        "2026-08-30".to_owned(),
+        0,
+        Vec::new(),
+    );
+    for id in [
+        "deepseek-v3.2",
+        "deepseek-v4-flash",
+        "glm-5.1",
+        "glm-5.2",
+        "kimi-k2.7-code",
+    ] {
+        for date in ["2026-01-01", "2026-08-30", "2027-01-01"] {
+            for hour in [0, 12, 23] {
+                assert!(
+                    t.rate_at(id, date, hour).is_none(),
+                    "delisted {id} priced at {date} hour {hour}"
+                );
+            }
+        }
+    }
 }

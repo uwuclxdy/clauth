@@ -6,9 +6,7 @@ use super::{
     determinate_bar, hour_lines, indeterminate_bar, model_detail_cost, model_lines, today_cost,
     today_lines, total_lines, trend_lines, window_cost,
 };
-use crate::pricing::{
-    Constraint, HourTokens, MatchClause, PriceEntry, PriceTable, PricedModel, RateSnapshot,
-};
+use crate::pricing::{Constraint, HourTokens, PriceEntry, PriceTable, PricedModel, RateSnapshot};
 use crate::profile::{AppConfig, AppState};
 use crate::tokens::{
     DayActivity, DaySummary, DayTokens, HourlyModel, ModelTokens, PeriodDay, PeriodModel,
@@ -28,12 +26,12 @@ fn line_text(line: &Line<'_>) -> String {
 // ── price-table builders ─────────────────────────────────────────────────────
 
 /// One exact-match model from its price entries (ids resolve
-/// case-insensitively via `MatchClause::Equals` on the lowered id).
+/// case-insensitively).
 fn priced_model(id: &str, entries: Vec<PriceEntry>) -> PricedModel {
     PricedModel {
         id: id.to_owned(),
-        match_: MatchClause::Equals(id.to_lowercase()),
         prices: entries,
+        effective_at: None,
     }
 }
 

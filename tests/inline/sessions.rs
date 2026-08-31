@@ -103,8 +103,8 @@ fn flat_entry(input: f64, output: f64) -> crate::pricing::PriceEntry {
 fn priced_model(id: &str, entries: Vec<crate::pricing::PriceEntry>) -> crate::pricing::PricedModel {
     crate::pricing::PricedModel {
         id: id.to_owned(),
-        match_: crate::pricing::MatchClause::Equals(id.to_lowercase()),
         prices: entries,
+        effective_at: None,
     }
 }
 
