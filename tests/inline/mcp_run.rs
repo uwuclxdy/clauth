@@ -1176,6 +1176,7 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
 /// leaving nothing to assert.
 #[cfg(unix)]
 #[test]
+#[cfg(unix)]
 fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_endpoint() {
     use crate::testutil::HomeSandbox;
 

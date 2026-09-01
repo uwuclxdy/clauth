@@ -792,6 +792,7 @@ fn start_heals_the_plugin_registry_only_when_it_is_broken() {
 /// the drop removes the tree once the child exits, leaving nothing to assert.
 #[cfg(unix)]
 #[test]
+#[cfg(unix)]
 fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_endpoint() {
     use crate::testutil::HomeSandbox;
 
