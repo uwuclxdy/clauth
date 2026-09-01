@@ -600,11 +600,14 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
 /// The `usage auto-start in …` countdown on the `plan` row, flush right: gray,
 /// shown for ANY account with `auto_start` on, queue toggle on or off (owner
 /// 2026-09-01 — the text moved off the Fallback card, then right onto the plan
-/// row). With a queue slot the value is the queue's shared next-open estimate;
-/// without one it is the account's own window reset, the instant its lapsed-leg
-/// kick fires. Either way a due queue reads `usage auto-start due now`.
+/// row). The value is THIS account's next kick: with a queue slot, the LATER of
+/// the queue's next-opening estimate and the account's own 5h window reset —
+/// the kick fires once the queue gate has cleared AND this window has lapsed,
+/// so either can delay it. Without a slot (toggle off, or the profile is
+/// excluded from the queue) it is the account's own reset alone. A kick due on
+/// both clocks reads `usage auto-start due now`.
 #[test]
-fn header_lines_auto_start_kick_text_reads_the_queue_then_the_own_reset() {
+fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
     let lines_of = |auto_start: bool, reset_in: Option<i64>, slot: Option<QueueSlot>| {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.auto_start = auto_start;
@@ -653,14 +656,41 @@ fn header_lines_auto_start_kick_text_reads_the_queue_then_the_own_reset() {
         )
     };
 
-    // Queue slot wins while it holds one: the queue's shared estimate, not
-    // this account's own reset.
+    // Gate and own reset tie: either estimate reads the same value.
     assert_eq!(
         lines_of(true, Some(8880), slot(Some(8880)))[0],
         row("usage auto-start in 2h 28m")
     );
 
-    // A slot with nothing left to wait for: the queue is due.
+    // Own reset LATER than the gate: the window is live past the gate, so the
+    // kick waits for the reset — the gate value alone would name an instant no
+    // kick fires at.
+    assert_eq!(
+        lines_of(true, Some(8880), slot(Some(3600)))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Gate LATER than the own reset: the window lapsed (or lapses) inside the
+    // gap, so the queue gate holds the kick.
+    assert_eq!(
+        lines_of(true, Some(3600), slot(Some(8880)))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Own window already lapsed with the gate still closed: the gate is the
+    // estimate.
+    assert_eq!(
+        lines_of(true, Some(-60), slot(Some(8880)))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Gate cleared, window still live: the reset is the estimate.
+    assert_eq!(
+        lines_of(true, Some(8880), slot(None))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Both clocks due: due now.
     assert_eq!(
         lines_of(true, None, slot(None))[0],
         row("usage auto-start due now")

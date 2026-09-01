@@ -774,30 +774,33 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
 }
 
 /// The `usage auto-start in …` value, shown for ANY account that opted into
-/// `auto_start`, queue toggle on or off. The value is the queue's shared
-/// next-opening estimate while this profile holds a slot; without one (toggle
-/// off, or the profile is excluded from the queue) it is the account's own
-/// window reset — the lapsed-leg kick fires the moment that reset passes.
+/// `auto_start`, queue toggle on or off. The value is THIS account's next
+/// kick: with a queue slot, the LATER of the queue's next-opening estimate
+/// and the account's own 5h window reset — the kick fires once the queue
+/// gate has cleared AND this window has lapsed, so either clock can delay
+/// it, and the gate alone would name an instant no kick fires at. Without a
+/// slot (toggle off, or the profile is excluded from the queue) it is the
+/// account's own reset alone — the lapsed-leg kick fires the moment that
+/// reset passes.
 fn kick_text(profile: &Profile, header: &HeaderState) -> String {
     let now = now_epoch_secs();
-    match header.queue_slot {
-        Some(slot) => match slot.next_in {
-            Some(secs) => format!("usage auto-start in {}", humanize_duration(secs)),
-            None => "usage auto-start due now".to_string(),
+    let own_reset_in = profile
+        .usage
+        .as_ref()
+        .and_then(|u| u.five_hour.as_ref())
+        .and_then(|w| reset_in_secs_at(w, now))
+        .filter(|secs| *secs > 0);
+    let next_in = match header.queue_slot {
+        Some(slot) => match (slot.next_in, own_reset_in) {
+            (Some(gate), Some(reset)) => Some(gate.max(reset)),
+            (Some(gate), None) => Some(gate),
+            (None, reset) => reset,
         },
-        None => {
-            let until_reset = profile
-                .usage
-                .as_ref()
-                .and_then(|u| u.five_hour.as_ref())
-                .and_then(|w| reset_in_secs_at(w, now));
-            match until_reset {
-                Some(secs) if secs > 0 => {
-                    format!("usage auto-start in {}", humanize_duration(secs))
-                }
-                _ => "usage auto-start due now".to_string(),
-            }
-        }
+        None => own_reset_in,
+    };
+    match next_in {
+        Some(secs) => format!("usage auto-start in {}", humanize_duration(secs)),
+        None => "usage auto-start due now".to_string(),
     }
 }
 
