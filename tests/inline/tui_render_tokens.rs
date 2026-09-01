@@ -76,14 +76,20 @@ fn windowed_model(id: &str, peak: (f64, f64), off_peak: (f64, f64)) -> PricedMod
 
 /// A table from `models`, captured today with no history.
 fn table_of(models: Vec<PricedModel>) -> PriceTable {
-    PriceTable::capture(models, crate::tokens::today_date(), 0, Vec::new())
+    PriceTable::capture(
+        models,
+        Vec::new(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
 }
 
 /// A table whose newest snapshot is `models` and whose older snapshots are
 /// given explicitly (`capture` appends nothing — the last history entry must
 /// equal `models`).
 fn table_with_history(models: Vec<PricedModel>, history: Vec<RateSnapshot>) -> PriceTable {
-    PriceTable::capture(models, crate::tokens::today_date(), 0, history)
+    PriceTable::capture(models, Vec::new(), crate::tokens::today_date(), 0, history)
 }
 
 // ── period-row builders ──────────────────────────────────────────────────────

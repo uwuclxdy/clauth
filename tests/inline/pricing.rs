@@ -48,6 +48,7 @@ fn table(models: Vec<PricedModel>) -> PriceTable {
             captured: "2026-01-01".to_owned(),
             models,
         }],
+        store: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     }
@@ -614,6 +615,7 @@ fn rate_retries_propagate_date_and_hour() {
     // is effective from 2026-08-23; a colon-stripped id respects the gate.
     let ft = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -725,6 +727,7 @@ fn effective_at_gates_the_whole_row() {
     // prices NOTHING — the gate covers the window entries, not only the base.
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -751,6 +754,7 @@ fn future_effective_row_prices_nothing_until_its_date() {
     // this): flat base rates apply from 2026-12-31 on.
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -775,6 +779,7 @@ fn later_window_entry_wins_when_both_match() {
     // later entry wins.
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -815,6 +820,7 @@ fn snapshot_picks_rate_live_on_date() {
     let t = PriceTable {
         models: history[1].models.clone(),
         history,
+        store: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -834,6 +840,7 @@ fn date_before_first_snapshot_uses_first() {
 fn capture_appends_only_on_change() {
     let t = PriceTable::capture(
         vec![eq_model("m", 1e-6, 2e-6)],
+        Vec::new(),
         "2026-08-19".to_owned(),
         42,
         Vec::new(),
@@ -843,6 +850,7 @@ fn capture_appends_only_on_change() {
     // Identical refetch: same models → no new snapshot, capture date dropped.
     let t2 = PriceTable::capture(
         vec![eq_model("m", 1e-6, 2e-6)],
+        Vec::new(),
         "2026-08-20".to_owned(),
         43,
         t.history.clone(),
@@ -853,6 +861,7 @@ fn capture_appends_only_on_change() {
     // A rate change appends.
     let t3 = PriceTable::capture(
         vec![eq_model("m", 2e-6, 4e-6)],
+        Vec::new(),
         "2026-08-20".to_owned(),
         44,
         t2.history.clone(),
@@ -870,6 +879,7 @@ fn capture_appends_only_on_change() {
 fn capture_caps_history_at_180() {
     let mut t = PriceTable::capture(
         vec![eq_model("m", 0.0, 0.0)],
+        Vec::new(),
         "2026-01-01".to_owned(),
         0,
         Vec::new(),
@@ -878,6 +888,7 @@ fn capture_caps_history_at_180() {
         let rate = f64::from(i) * 1e-6;
         t = PriceTable::capture(
             vec![eq_model("m", rate, 0.0)],
+            Vec::new(),
             format!("2026-{i:03}"),
             u64::from(i),
             t.history,
@@ -913,6 +924,7 @@ fn cache_round_trip_preserves_history() {
     let table = PriceTable {
         models: history[1].models.clone(),
         history,
+        store: Vec::new(),
         fetched_at_ms: 12345,
         memo: Mutex::default(),
     };
@@ -1015,7 +1027,7 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
         assert!(!ids.contains(&id), "removed row {id} must delist");
     }
 
-    let t = PriceTable::capture(models, "2026-08-30".to_owned(), 0, Vec::new());
+    let t = PriceTable::capture(models, Vec::new(), "2026-08-30".to_owned(), 0, Vec::new());
     // One claude-* row prices.
     let claude = t
         .rate_at("claude-opus-5", "2026-08-30", 0)
@@ -1123,6 +1135,7 @@ fn cost_at_uses_dated_rate() {
     let t = PriceTable {
         models: history[1].models.clone(),
         history,
+        store: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1240,6 +1253,7 @@ fn the_memo_keys_on_the_date_so_two_snapshots_do_not_bleed() {
     let t = PriceTable {
         models: history[1].models.clone(),
         history,
+        store: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1265,7 +1279,7 @@ fn zai_quota_entries_are_skipped() {
         .find(|m| m.id == "glm-5.3-flash")
         .expect("row distills");
     assert_eq!(flash.prices.len(), 1, "quota entries contribute no rates");
-    let t = PriceTable::capture(models, "2026-08-30".to_owned(), 0, Vec::new());
+    let t = PriceTable::capture(models, Vec::new(), "2026-08-30".to_owned(), 0, Vec::new());
     let rate = t.rate_at("glm-5.3-flash", "2026-08-28", 8).expect("priced");
     assert!(
         (rate.input - 7.5e-8).abs() < 1e-15,
@@ -1284,6 +1298,7 @@ fn removed_at_stamped_entries_price_nothing() {
     // first-party twin stay unpriced.
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -1303,5 +1318,380 @@ fn removed_at_stamped_entries_price_nothing() {
                 );
             }
         }
+    }
+}
+
+// ── store-history dating ──────────────────────────────────────────────────────
+
+/// Trimmed real ai-pricelog history
+/// (`tests/fixtures/ai-pricelog-history-trimmed.ndjson`): five of deepseek's
+/// seven deepseek-v4-pro rows (the 2026-08-30 retro-effective windowed row,
+/// the 2026-08-26 legacy `peak_windows` row, the 08-16 / 05-22 / 04-24 flat
+/// rows), minimax's MiniMax-M2.5-Lightning
+/// price + bare-removal pair, two of together's four deepseek-v4-pro rows (the
+/// 06-09 markup and the 08-28 removal), one of avian's two (the 05-04
+/// markup), cloudflare's one row of its forty
+/// (`@cf/deepseek-ai/deepseek-v4-pro-0813`, the dropped source's id behind the
+/// reseller-dash pin), dashscope's resold deepseek-v3.2 price +
+/// removal pair beside deepseek's own row (the delisted-copy shadow case:
+/// dashscope's key is first-seen earlier), and zai's glm-4.5 same-day pair
+/// (a kept-key tie group that differs in rates at its key's newest observed
+/// day). Every line is verbatim store bytes, in store order.
+const HISTORY_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-history-trimmed.ndjson");
+
+/// A table whose only dating source is the history fixture — no snapshot log,
+/// so every date resolves through the store walk.
+fn store_table() -> PriceTable {
+    PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    }
+}
+
+#[test]
+fn history_distills_first_party_keys_only() {
+    let keys = distill_history(HISTORY_FIXTURE).expect("history distills");
+    let ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+    // First-seen store order (dashscope's resold deepseek-v3.2 key before
+    // deepseek's own); together / avian / cloudflare rows never enter, so a
+    // non-kept source's row can neither price an id nor delist it.
+    assert_eq!(
+        ids,
+        [
+            "MiniMax-M2.5-Lightning",
+            "deepseek-v4-pro",
+            "glm-4.5",
+            "deepseek-v3.2",
+            "deepseek-v3.2"
+        ]
+    );
+    let ds = keys
+        .iter()
+        .find(|k| k.id == "deepseek-v4-pro")
+        .expect("deepseek key");
+    assert_eq!(ds.rows.len(), 5);
+    // The bare removal row is kept as a terminator although it has no prices.
+    let mm = keys
+        .iter()
+        .find(|k| k.id == "MiniMax-M2.5-Lightning")
+        .expect("minimax key");
+    assert_eq!(mm.rows.len(), 2);
+    assert!(mm.rows[1].removed && mm.rows[1].model.is_none());
+
+    // Tolerance: malformed lines skip beside a good one; zero keys fail.
+    let mixed = "{\"source\":\"deepseek\",\"model_id\":\"m\",\"observed_at\":\"2026-01-01\",\"input_mtok\":1,\"output_mtok\":2}\nnot json\n{}\n";
+    assert_eq!(distill_history(mixed).expect("one key").len(), 1);
+    assert!(distill_history("").is_err());
+    assert!(distill_history("not json at all").is_err());
+}
+
+#[test]
+fn store_walk_prices_the_weekday_peak_windows_per_hour() {
+    // 2026-08-26 is a Wednesday inside the windowed row's retro span: the
+    // 01:00–04:00 and 06:00–10:00 weekday windows price their hours at the
+    // peak rate, every other hour at half.
+    let t = store_table();
+    let input = |hour: u8| {
+        t.rate_at("deepseek-v4-pro", "2026-08-26", hour)
+            .map(|r| r.input)
+    };
+    assert_rate(input(2), 1.32e-6); // first window
+    assert_rate(input(3), 1.32e-6);
+    assert_rate(input(4), 6.6e-7); // 04:00 excluded (half-open)
+    assert_rate(input(5), 6.6e-7); // gap between windows
+    assert_rate(input(7), 1.32e-6); // second window
+    assert_rate(input(10), 6.6e-7); // 10:00 excluded
+    assert_rate(input(23), 6.6e-7);
+}
+
+#[test]
+fn store_walk_prices_weekend_days_in_the_retro_span_off_peak() {
+    // The windowed row's windows are weekday-only: 2026-08-23 (Sun), 08-29
+    // (Sat) and 08-30 (Sun) price base at peak hours. An observed-at-only
+    // walk would pick the 08-26 legacy `peak_windows` row instead — its
+    // windows carry no day set, so every day peaks — and this is the pin
+    // that reds there.
+    let t = store_table();
+    for date in ["2026-08-23", "2026-08-29", "2026-08-30"] {
+        assert_rate(
+            t.rate_at("deepseek-v4-pro", date, 2).map(|r| r.input),
+            6.6e-7,
+        );
+    }
+}
+
+#[test]
+fn store_walk_retro_dates_the_windowed_row_before_its_observation() {
+    // The 2026-08-30 row applies from its effective_at (2026-08-23): the day
+    // before prices the 08-16 row (no cache-read rate), the day itself prices
+    // the windowed row's base — same input, the cache-read key flips.
+    let t = store_table();
+    let cache_read = |date: &str| t.rate_at("deepseek-v4-pro", date, 0).map(|r| r.cache_read);
+    assert_eq!(cache_read("2026-08-22"), Some(0.0));
+    assert_rate(cache_read("2026-08-23"), 2.2e-8);
+    assert_rate(
+        t.rate_at("deepseek-v4-pro", "2026-08-23", 0)
+            .map(|r| r.input),
+        6.6e-7,
+    );
+}
+
+#[test]
+fn store_walk_prices_each_side_of_a_reprice_at_its_own_rate() {
+    // deepseek repriced 1.74 → 0.435 → 0.66 (2026-05-22, 2026-08-16): each
+    // side of a reprice date prices at its own rate.
+    let t = store_table();
+    let input = |date: &str| t.rate_at("deepseek-v4-pro", date, 0).map(|r| r.input);
+    assert_rate(input("2026-04-24"), 1.74e-6);
+    assert_rate(input("2026-05-22"), 4.35e-7);
+    assert_rate(input("2026-08-15"), 4.35e-7);
+    assert_rate(input("2026-08-16"), 6.6e-7);
+}
+
+#[test]
+fn store_walk_dash_before_the_oldest_row() {
+    // A day before the store's oldest row for a key prices nothing:
+    // pre-install days price from the store's own rows and dash only where
+    // the store has none.
+    let t = store_table();
+    assert!(t.rate_at("deepseek-v4-pro", "2026-04-23", 5).is_none());
+    assert_rate(
+        t.rate_at("deepseek-v4-pro", "2026-04-24", 5)
+            .map(|r| r.input),
+        1.74e-6,
+    );
+}
+
+#[test]
+fn store_walk_keeps_pricing_past_the_newest_observation() {
+    // 2026-08-31 (Mon) is past the newest observed row (08-30): the windowed
+    // row keeps pricing, peak windows included — observed dates never go
+    // stale the way snapshot capture dates did.
+    let t = store_table();
+    assert_rate(
+        t.rate_at("deepseek-v4-pro", "2026-08-31", 2)
+            .map(|r| r.input),
+        1.32e-6,
+    );
+}
+
+#[test]
+fn removal_row_terminates_the_key_from_its_date() {
+    // MiniMax-M2.5-Lightning's 2026-08-27 row is a bare removal (no prices):
+    // earlier days keep pricing its 2026-02-12 row, the removal date and
+    // everything after price nothing, whatever case the ledger spells the id
+    // in.
+    let t = store_table();
+    assert_rate(
+        t.rate_at("MiniMax-M2.5-Lightning", "2026-08-26", 0)
+            .map(|r| r.input),
+        3e-7,
+    );
+    assert!(
+        t.rate_at("MiniMax-M2.5-Lightning", "2026-08-27", 0)
+            .is_none()
+    );
+    assert!(
+        t.rate_at("minimax-m2.5-lightning", "2026-12-31", 12)
+            .is_none()
+    );
+}
+
+#[test]
+fn reseller_history_rows_neither_price_nor_delist() {
+    // together's rows for deepseek-v4-pro (markup 1.74 on 06-09, removal on
+    // 08-28) and avian's (1.305 on 05-04) are reseller copies: the id prices
+    // deepseek's own rows at deepseek's rates, and together's removal row
+    // cannot terminate deepseek's key.
+    let t = store_table();
+    let input = |date: &str| t.rate_at("deepseek-v4-pro", date, 0).map(|r| r.input);
+    assert_rate(input("2026-06-01"), 4.35e-7); // not avian's 1.305
+    assert_rate(input("2026-06-09"), 4.35e-7); // not together's 1.74
+    assert_rate(input("2026-08-29"), 6.6e-7); // past together's removal
+}
+
+#[test]
+fn reseller_only_id_stays_a_dash() {
+    // cloudflare is not a kept source, so the `@cf/` copy prices nothing
+    // under any ladder form (the two-segment strip lands on
+    // `deepseek-v4-pro-0813`, which no row carries).
+    let t = store_table();
+    assert!(
+        t.rate_at("@cf/deepseek-ai/deepseek-v4-pro-0813", "2026-08-30", 0)
+            .is_none()
+    );
+}
+
+#[test]
+fn store_history_dates_today_not_the_snapshot_log() {
+    // Dating is the store walk for EVERY day, today included: a snapshot log
+    // holding different rates never overrides it.
+    let t = PriceTable::capture(
+        vec![eq_model("deepseek-v4-pro", 9e-6, 9e-6)],
+        distill_history(HISTORY_FIXTURE).expect("history distills"),
+        "2026-08-31".to_owned(),
+        0,
+        Vec::new(),
+    );
+    assert_rate(
+        t.rate_at("deepseek-v4-pro", "2026-08-31", 0)
+            .map(|r| r.input),
+        6.6e-7,
+    );
+
+    // The snapshot log keeps its offline role: a table with no store history
+    // still prices through the snapshot walk.
+    let offline = PriceTable::capture(
+        vec![eq_model("deepseek-v4-pro", 9e-6, 9e-6)],
+        Vec::new(),
+        "2026-08-31".to_owned(),
+        0,
+        Vec::new(),
+    );
+    assert_rate(
+        offline
+            .rate_at("deepseek-v4-pro", "2026-08-31", 0)
+            .map(|r| r.input),
+        9e-6,
+    );
+}
+
+#[test]
+fn cache_round_trips_the_store_dating_source() {
+    let sandbox = HomeSandbox::new();
+    let table = PriceTable {
+        models: vec![eq_model("m", 1e-6, 2e-6)],
+        history: vec![RateSnapshot {
+            captured: "2026-01-01".to_owned(),
+            models: vec![eq_model("m", 1e-6, 2e-6)],
+        }],
+        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        fetched_at_ms: 5,
+        memo: Mutex::default(),
+    };
+    let path = sandbox
+        .home()
+        .join(".clauth")
+        .join("ai_pricelog_price_cache.json");
+    save_cache(&path, &table);
+
+    let loaded = load_cached().expect("cache loads");
+    assert_eq!(loaded.fetched_at_ms, 5);
+    // Offline dating survives the round trip: a weekday peak inside the retro
+    // span, and a dash before the store's oldest row.
+    assert_rate(
+        loaded
+            .rate_at("deepseek-v4-pro", "2026-08-26", 2)
+            .map(|r| r.input),
+        1.32e-6,
+    );
+    assert!(loaded.rate_at("deepseek-v4-pro", "2026-04-23", 2).is_none());
+    // With a store held, nothing prices off the snapshot log: an id only the
+    // snapshot carries stays a dash.
+    assert!(loaded.rate_at("m", "2026-08-19", 0).is_none());
+
+    // An old cache (written before the store half existed) loads unchanged and
+    // prices through the snapshot walk until the next fetch upgrades it.
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        r#"{"fetched_at_ms": 7, "history": [{"captured": "2026-01-01", "models": [{"id": "m", "prices": [{"input": 1e-6, "output": 2e-6, "cache_read": 0.0, "cache_write": 0.0, "constraint": null}], "effective_at": null}]}]}"#,
+    )
+    .expect("write");
+    let old = load_cached().expect("old cache loads");
+    assert_eq!(old.fetched_at_ms, 7);
+    assert_eq!(
+        old.rate_at("m", "2026-08-19", 0).map(|r| r.input),
+        Some(1e-6)
+    );
+    // No store rows, so store-only dating cannot resolve.
+    assert!(old.rate_at("deepseek-v4-pro", "2026-08-26", 2).is_none());
+}
+
+#[test]
+fn a_delisted_keys_copy_never_shadows_the_live_first_party_row() {
+    // dashscope (kept: it owns qwen) resells other vendors' ids; the store
+    // delisted the copies on 2026-08-31, and dashscope's deepseek-v3.2 key is
+    // FIRST-SEEN before deepseek's own. The delisting is the evidence the key
+    // was reselling: live keys materialize first, so the delisted copy's
+    // pre-removal days (08-29, 08-30) price deepseek's own row — 0.28 in,
+    // 0.028 cache-read — never dashscope's 0.57 markup — and dashscope's
+    // removal cannot touch deepseek's key.
+    let t = store_table();
+    for date in ["2026-08-29", "2026-08-30", "2026-09-05"] {
+        let rate = t.rate_at("deepseek-v3.2", date, 0).expect("priced");
+        assert!(
+            (rate.input - 2.8e-7).abs() < 1e-12,
+            "{date}: {}",
+            rate.input
+        );
+        assert!((rate.output - 4.2e-7).abs() < 1e-12, "{date}");
+        assert!((rate.cache_read - 2.8e-8).abs() < 1e-15, "{date}");
+    }
+}
+
+#[test]
+fn a_price_row_after_a_removal_relists_the_key_from_its_date() {
+    // The store's promised reappearance shape (its plan row 14): a fresh
+    // price row appended after a removal. The index un-stamps the key then,
+    // and the walk agrees — the removal wins (and dashes) the days it is
+    // newest for, the fresh row re-lives the key from its own applies day.
+    // Synthetic rows on the fixture's pattern; no store row exercises the
+    // shape yet (verified against the 1971-row history, 2026-08-31).
+    let rows = vec![
+        dated_row(
+            "2026-01-01",
+            "2026-01-01",
+            false,
+            Some(eq_model("m", 1e-6, 2e-6)),
+        ),
+        dated_row("2026-02-01", "2026-02-01", true, None),
+        dated_row(
+            "2026-03-01",
+            "2026-03-01",
+            false,
+            Some(eq_model("m", 3e-6, 6e-6)),
+        ),
+    ];
+    let t = PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: vec![StoreKey {
+            id: "m".to_owned(),
+            rows,
+        }],
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    };
+    let input = |date: &str| t.rate_at("m", date, 0).map(|r| r.input);
+    assert_rate(input("2026-01-15"), 1e-6);
+    assert_eq!(input("2026-02-15"), None); // removal is newest: dash
+    assert_eq!(input("2026-02-28"), None);
+    assert_rate(input("2026-03-01"), 3e-6); // reapplied: live again
+}
+
+#[test]
+fn a_same_day_observed_tie_goes_to_the_later_append() {
+    // zai's real glm-4.5 pair, both observed 2026-08-26 (the later append
+    // added the cache-read key): the tie sits at the key's newest observed
+    // day, so the pair is the walk's winner for every date from 08-26 on.
+    let t = store_table();
+    for date in ["2026-08-26", "2026-09-05"] {
+        let rate = t.rate_at("glm-4.5", date, 0).expect("priced");
+        assert!((rate.input - 6e-7).abs() < 1e-12, "{date}");
+        assert!((rate.cache_read - 1.1e-7).abs() < 1e-15, "{date}");
+    }
+}
+
+/// A literal history row for the synthetic-shape tests.
+fn dated_row(observed: &str, applies: &str, removed: bool, model: Option<PricedModel>) -> StoreRow {
+    StoreRow {
+        observed: observed.to_owned(),
+        applies: applies.to_owned(),
+        removed,
+        model,
     }
 }

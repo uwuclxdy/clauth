@@ -19,6 +19,20 @@
 //! model rows inside a kept provider (a claude id under a non-anthropic
 //! provider) are dropped the same way.
 //!
+//! Dated rates come from the store's history ndjson (`data/history.ndjson`),
+//! fetched alongside the index: one JSON row per line, every row carrying
+//! `observed_at` (the day the scraper saw it), optionally `effective_at` (the
+//! day the price applies FROM — a retro-dated change) and `removed: true`
+//! (the model delisted from that day on). A query date prices at the row with
+//! the greatest `observed_at` among that `(source, model_id)` key's rows whose
+//! `effective_at ?? observed_at` falls on or before the date, back to the
+//! store's oldest row. A removal row winning a day's walk prices nothing for
+//! that day, and a price row appended after a removal re-lives the key from
+//! its own applies day. The same first-party allowlist and resold-row guards
+//! apply to history rows, so a reseller's copy of an id can neither price it
+//! nor delist it; a kept source's DELISTED copy of a foreign id (dashscope's
+//! resales) never shadows the live first-party key that owns the id.
+//!
 //! # Design (mirrors `status.rs`)
 //!
 //! TUI-free: owns the data model, the HTTP fetch, the distill step, and the
@@ -28,11 +42,14 @@
 //! thread reads [`PricingEvent`]s and holds the latest [`PriceTable`]; no shared
 //! lock crosses the thread boundary, only the channel does.
 //!
-//! Every successful fetch appends a snapshot to the table's history (skipped
-//! when the distilled models are byte-identical to the last snapshot's, capped
-//! at [`HISTORY_CAP`] snapshots), so a past day re-prices at the rates live on
-//! that day. Snapshot selection for a query date: the newest snapshot with
-//! `captured <= date`; a date older than every snapshot uses the oldest one.
+//! Every successful fetch appends a snapshot to the table's local snapshot
+//! log (skipped when the distilled models are byte-identical to the last
+//! snapshot's, capped at [`HISTORY_CAP`] snapshots). The snapshot log is the
+//! offline cache only — nothing dates off it: dating is the store walk above.
+//! A table holding no store history (a cache written before this split) keeps
+//! the snapshot walk — newest snapshot with `captured <= date`, oldest
+//! snapshot for older dates — until the next successful fetch persists the
+//! store.
 //!
 //! # Cost basis
 //!
@@ -45,6 +62,7 @@
 use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
@@ -62,6 +80,12 @@ use crate::usage::now_ms;
 const FEED_URL: &str =
     "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/index.json";
 
+/// The store's append-only price history, one JSON row per line. Fetched on
+/// the same cadence as the index; both files must arrive for a fetch to
+/// succeed, so a fresh table never mixes a new index with stale dating.
+const HISTORY_URL: &str =
+    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/history.ndjson";
+
 /// Background refresh cadence. Prices move rarely, so this is deliberately slow;
 /// a manual refresh signal short-circuits the wait.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -70,8 +94,10 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// HTTP response-receive timeout.
 const RECV_TIMEOUT: Duration = Duration::from_secs(15);
-/// Hard cap on the response body. The real feed is ~298 KiB; 8 MiB is generous
-/// headroom while still bounding a hostile / runaway response.
+/// Hard cap on a response body. The real feeds are ~298 KiB (index) and
+/// ~433 KiB (history; largest observed single-day batch: 608 rows on
+/// 2026-08-29); 8 MiB is generous headroom while still bounding a hostile /
+/// runaway response.
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Snapshot history cap: the newest 180 fetches survive, older ones drop.
@@ -186,6 +212,33 @@ pub(crate) struct RateSnapshot {
     pub(crate) models: Vec<PricedModel>,
 }
 
+/// One `(source, model_id)` key of the store's history: the model id (the id
+/// IS the match, as in the index) plus the key's rows in store append order.
+/// Two kept sources can carry the same id; [`PriceTable::dated_models`]
+/// materializes live keys ahead of delisted ones, and within each group the
+/// earlier key in [`PriceTable::store`] order wins the ladder.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoreKey {
+    id: String,
+    rows: Vec<StoreRow>,
+}
+
+/// One history row. `applies` is the day the row starts applying — its
+/// `effective_at` when present (a retro-dated price), else its `observed_at`.
+/// A `removed` row is a delisting: it prices nothing itself, and it wins the
+/// walk for the days it is newest for. `model` is absent on removal rows and
+/// on rows that carry no per-token rates, and a winning row without one
+/// prices nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct StoreRow {
+    observed: String,
+    applies: String,
+    #[serde(default)]
+    removed: bool,
+    #[serde(default)]
+    model: Option<PricedModel>,
+}
+
 /// Per-hour token buckets behind [`PriceTable::cost_day`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HourTokens {
@@ -195,24 +248,30 @@ pub(crate) struct HourTokens {
     pub(crate) cache_create: u64,
 }
 
-/// Resolved price table: the newest snapshot's models, the full snapshot
-/// history (oldest first), and the wall-clock time the feed was fetched (for a
+/// Resolved price table: the store's distilled history (the dating source for
+/// every day), the newest snapshot's models plus the local snapshot log (the
+/// offline cache), and the wall-clock time the feed was fetched (for a
 /// freshness badge).
 #[derive(Debug)]
 pub(crate) struct PriceTable {
-    /// Latest snapshot's models — the working set for "today" queries.
+    /// Latest snapshot's models — the head of the snapshot log.
     models: Vec<PricedModel>,
-    /// Oldest-first snapshot history; [`PriceTable::models_for`] picks the
-    /// one applicable to a query date.
+    /// Oldest-first local snapshot log; [`PriceTable::models_for`] walks it
+    /// only for a table holding no store history.
     history: Vec<RateSnapshot>,
+    /// The store's distilled history rows, first-seen key order — the dating
+    /// source for every day, today included. Empty while no store history has
+    /// been fetched or cached (a pre-store cache).
+    store: Vec<StoreKey>,
     pub(crate) fetched_at_ms: u64,
     /// Memoized match walks (see [`Memo`]). A table is immutable once built, so
     /// a remembered index cannot go stale.
     memo: Mutex<Memo>,
 }
 
-/// Match walks already done, `date → model id → index into the slice
-/// [`PriceTable::models_for`] serves that date`.
+/// Match walks and dated model sets already computed, `date →` both halves
+/// ([`DatedSet`]). A table is immutable once built, so a remembered set or
+/// index cannot go stale.
 ///
 /// A walk strips and retries the id and scans every model's id once per
 /// candidate form, and the cost lens asks for the same `(id, date)` at all 24
@@ -222,11 +281,20 @@ pub(crate) struct PriceTable {
 /// walk answers every hour, and the memo carries it across frames.
 #[derive(Debug, Default)]
 struct Memo {
-    by_date: HashMap<String, HashMap<String, Option<usize>>>,
+    by_date: HashMap<String, DatedSet>,
     /// Cold walks performed. The memo's only observable, so the tests that pin
     /// "once per (model, date)" have something to count.
     #[cfg(test)]
     walks: usize,
+}
+
+/// One date's materialized model set plus the id walks already done against
+/// it. `by_id` indexes only ever resolve against `models` of the same date,
+/// so the pair cannot be crossed up by a caller.
+#[derive(Debug, Default)]
+struct DatedSet {
+    models: Arc<[PricedModel]>,
+    by_id: HashMap<String, Option<usize>>,
 }
 
 impl PriceTable {
@@ -234,9 +302,11 @@ impl PriceTable {
     /// snapshot dated `captured` ONLY when the distilled models differ from the
     /// last snapshot's (serialize-and-compare — a byte-identical refetch does
     /// not grow the history), and cap the history at [`HISTORY_CAP`], dropping
-    /// the oldest snapshots.
+    /// the oldest snapshots. `store` is the fetch's complete distilled history
+    /// — the file is cumulative — and replaces any cached store wholesale.
     pub(crate) fn capture(
         models: Vec<PricedModel>,
+        store: Vec<StoreKey>,
         captured: String,
         fetched_at_ms: u64,
         mut history: Vec<RateSnapshot>,
@@ -263,6 +333,7 @@ impl PriceTable {
         Self {
             models,
             history,
+            store,
             fetched_at_ms,
             memo: Mutex::default(),
         }
@@ -290,37 +361,42 @@ impl PriceTable {
     /// Steps 1-2 and the retry ladder are [`ladder_index`], memoized per
     /// `(id, date)`; step 3 is [`entry_rate`], the only half the hour reaches.
     ///
-    /// Rates come from the snapshot live on `date` (see
-    /// [`PriceTable::models_for`]); `None` when no model matches, and `None`
-    /// for a matched row whose `effective_at` is after `date`.
+    /// Rates come from the models applicable to `date` (see
+    /// [`PriceTable::dated_models`]: the store walk, or the snapshot walk for
+    /// a table holding no store history); `None` when no model matches, and
+    /// `None` for a matched row whose `effective_at` is after `date`.
     pub(crate) fn rate_at(&self, model: &str, date: &str, hour: u8) -> Option<ModelRate> {
-        entry_rate(self.matched(model, date)?, date, hour)
+        let (models, idx) = self.matched(model, date)?;
+        entry_rate(&models[idx], date, hour)
     }
 
-    /// The [`PricedModel`] that prices `model` on `date`, answered from [`Memo`]
-    /// when the pair has been asked before. The memoized index is only ever
-    /// resolved against the slice this same call took from
-    /// [`PriceTable::models_for`], so the index and its date cannot be paired up
-    /// wrongly by a caller. A poisoned memo walks rather than failing a price —
-    /// it holds derived state and nothing else.
-    fn matched(&self, model: &str, date: &str) -> Option<&PricedModel> {
-        let models = self.models_for(date)?;
+    /// The [`PricedModel`] that prices `model` on `date`, as an index into the
+    /// date's model set returned ALONGSIDE that set — the set is owned by
+    /// [`Memo`], so the caller needs the clone to hold the reference. Answered
+    /// from the memo when the pair has been asked before; the memoized index
+    /// only ever resolves against the same date's set, so the two cannot be
+    /// crossed up by a caller. A poisoned memo walks rather than failing a
+    /// price — it holds derived state and nothing else.
+    fn matched(&self, model: &str, date: &str) -> Option<(Arc<[PricedModel]>, usize)> {
+        let models = self.dated_models(date)?;
         let Ok(mut memo) = self.memo.lock() else {
-            return models.get(ladder_index(models, model)?);
+            let idx = ladder_index(&models, model)?;
+            return Some((models, idx));
         };
-        if let Some(hit) = memo.by_date.get(date).and_then(|by_id| by_id.get(model)) {
-            return models.get((*hit)?);
-        }
-        let found = ladder_index(models, model);
+        let found = {
+            let set = memo.by_date.entry(date.to_owned()).or_default();
+            if let Some(hit) = set.by_id.get(model) {
+                return Some((models, (*hit)?));
+            }
+            let found = ladder_index(&models, model);
+            set.by_id.insert(model.to_owned(), found);
+            found
+        };
         #[cfg(test)]
         {
             memo.walks += 1;
         }
-        memo.by_date
-            .entry(date.to_owned())
-            .or_default()
-            .insert(model.to_owned(), found);
-        models.get(found?)
+        Some((models, found?))
     }
 
     /// Cold match walks performed so far — what pins the memo, since a warm
@@ -330,9 +406,54 @@ impl PriceTable {
         self.memo.lock().expect("memo lock").walks
     }
 
-    /// The models applicable to `date`: the newest snapshot with `captured <=
-    /// date` (served straight from `models`, the newest snapshot's working
-    /// set); a date older than every snapshot uses the oldest one.
+    /// The models applicable to `date`: the store walk ([`StoreKey::row_for`],
+    /// one winning row per key, first-seen key order) when store history is
+    /// held — for every date, today included — else the snapshot walk
+    /// ([`models_for`]) for a pre-store cache. Materialized once per date and
+    /// shared through [`Memo`]; a poisoned memo recomputes rather than failing
+    /// a price.
+    fn dated_models(&self, date: &str) -> Option<Arc<[PricedModel]>> {
+        if let Ok(memo) = self.memo.lock()
+            && let Some(set) = memo.by_date.get(date)
+        {
+            return Some(Arc::clone(&set.models));
+        }
+        let models: Arc<[PricedModel]> = if self.store.is_empty() {
+            self.models_for(date)?.into()
+        } else {
+            // Shared-id precedence: two kept sources can carry the same model
+            // id (dashscope, kept for qwen, resells other vendors' ids). The
+            // store's delisting is the evidence a key was reselling, so LIVE
+            // keys materialize first and the ladder's first match lands on the
+            // first-party row instead of a markup — every date, including the
+            // delisted key's pre-removal days. Two LIVE keys sharing an id
+            // keep first-seen order; resolving cross-source id ownership
+            // beyond that is the canonical-mapping todo row's, not this
+            // walk's.
+            let (live, delisted): (Vec<_>, Vec<_>) =
+                self.store.iter().partition(|key| !key.delisted());
+            live.iter()
+                .chain(delisted.iter())
+                .filter_map(|key| key.row_for(date))
+                .cloned()
+                .collect::<Vec<_>>()
+                .into()
+        };
+        if let Ok(mut memo) = self.memo.lock() {
+            memo.by_date
+                .entry(date.to_owned())
+                .or_insert_with(|| DatedSet {
+                    models: Arc::clone(&models),
+                    by_id: HashMap::new(),
+                });
+        }
+        Some(models)
+    }
+
+    /// The snapshot walk: the newest snapshot with `captured <= date` (served
+    /// straight from `models`, the newest snapshot's working set); a date
+    /// older than every snapshot uses the oldest one. Only reached for a table
+    /// holding no store history.
     fn models_for(&self, date: &str) -> Option<&[PricedModel]> {
         if self
             .history
@@ -373,7 +494,8 @@ impl PriceTable {
         date: &str,
         hours: &[HourTokens; 24],
     ) -> Option<f64> {
-        let priced = self.matched(model, date)?;
+        let (models, idx) = self.matched(model, date)?;
+        let priced = &models[idx];
         let mut total = 0.0;
         for (hour, h) in hours.iter().enumerate() {
             let r = entry_rate(priced, date, hour as u8)?;
@@ -383,6 +505,37 @@ impl PriceTable {
                 + h.cache_create as f64 * r.cache_write;
         }
         Some(total)
+    }
+}
+
+impl StoreKey {
+    /// The row that prices `date`: the greatest `observed_at` among the key's
+    /// rows whose `applies` day is on or before `date` — a tie on `observed_at`
+    /// goes to the later row in store append order, the newer write. The
+    /// terminator is per-date: a REMOVAL row winning the walk prices nothing
+    /// for that day (whatever prices the row still carries are never read),
+    /// and a price row appended after a removal re-lives the key from its own
+    /// `applies` day — the store's index un-stamps the same key when its
+    /// newest row is priced again. `None` = the day prices nothing (no
+    /// candidate, the winner is a removal, or the winner carries no per-token
+    /// rates).
+    fn row_for(&self, date: &str) -> Option<&PricedModel> {
+        let winner = self
+            .rows
+            .iter()
+            .filter(|r| r.applies.as_str() <= date)
+            .max_by(|a, b| a.observed.cmp(&b.observed))?;
+        if winner.removed {
+            return None;
+        }
+        winner.model.as_ref()
+    }
+
+    /// Whether the store's own index regeneration stamps this key `removed_at`
+    /// (its newest row is a removal): the store's evidence the key was
+    /// reselling another vendor's id.
+    fn delisted(&self) -> bool {
+        self.rows.last().is_some_and(|r| r.removed)
     }
 }
 
@@ -590,12 +743,12 @@ pub(crate) fn spawn(tx: Sender<PricingEvent>, refresh_rx: Receiver<()>) {
 /// cache, send `Loaded`. On failure: fall back to the cache when one exists
 /// (`Loaded`); only when nothing is cached do we surface `Failed`.
 fn run_fetch(tx: &Sender<PricingEvent>, cache_file: &Path, stale_cleaned: &mut bool) {
-    match fetch_models() {
-        Ok(models) => {
+    match fetch_table() {
+        Ok((models, store)) => {
             let history = load_cache(cache_file)
                 .map(|t| t.history)
                 .unwrap_or_default();
-            let table = PriceTable::capture(models, today_date(), now_ms(), history);
+            let table = PriceTable::capture(models, store, today_date(), now_ms(), history);
             save_cache(cache_file, &table);
             delete_stale_cache_once(cache_file, stale_cleaned);
             let _ = tx.send(PricingEvent::Loaded(Box::new(table)));
@@ -630,8 +783,18 @@ fn delete_stale_cache_once(cache_file: &Path, done: &mut bool) {
     }
 }
 
-/// Fetch and distill the live feed. The body is capped at [`MAX_BODY_BYTES`].
-fn fetch_models() -> anyhow::Result<Vec<PricedModel>> {
+/// Fetch and distill the live feed: the index (the current price set, folded
+/// into the snapshot log) and the history ndjson (the dating source). Either
+/// fetch failing fails the whole attempt, so the cache fallback serves a
+/// coherent table rather than half of one.
+fn fetch_table() -> anyhow::Result<(Vec<PricedModel>, Vec<StoreKey>)> {
+    let index = distill(&fetch_body(FEED_URL)?)?;
+    let store = distill_history(&fetch_body(HISTORY_URL)?)?;
+    Ok((index, store))
+}
+
+/// GET one feed URL as text, capped at [`MAX_BODY_BYTES`].
+fn fetch_body(url: &str) -> anyhow::Result<String> {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_response(Some(RECV_TIMEOUT))
@@ -639,7 +802,7 @@ fn fetch_models() -> anyhow::Result<Vec<PricedModel>> {
         .into();
 
     let reader = agent
-        .get(FEED_URL)
+        .get(url)
         .header("User-Agent", "clauth-pricing")
         .call()
         .map_err(anyhow::Error::from)?
@@ -653,10 +816,9 @@ fn fetch_models() -> anyhow::Result<Vec<PricedModel>> {
         .read_to_end(&mut bytes)
         .map_err(anyhow::Error::from)?;
     if bytes.len() as u64 > MAX_BODY_BYTES {
-        anyhow::bail!("price feed exceeded {MAX_BODY_BYTES} byte cap");
+        anyhow::bail!("price feed exceeded {MAX_BODY_BYTES} byte cap: {url}");
     }
-    let json = String::from_utf8(bytes).map_err(anyhow::Error::from)?;
-    distill(&json)
+    String::from_utf8(bytes).map_err(anyhow::Error::from)
 }
 
 // ── Distill ──────────────────────────────────────────────────────────────────
@@ -748,6 +910,72 @@ fn canonical_source(source: &str) -> &str {
     }
 }
 
+/// Distill the store's history ndjson into per-key dated rows ([`StoreKey`]).
+/// Line-tolerant like the index distill: a malformed line, or a line with no
+/// `observed_at`, skips. The same source rules apply — [`canonical_source`],
+/// the [`FIRST_PARTY_PROVIDERS`] allowlist, the resold-claude guard — so a
+/// reseller's rows for an id never enter the walk: they can neither price the
+/// id nor delist it (together's 2026-08-28 removal row for deepseek-v4-pro
+/// cannot terminate deepseek's own key). A `removed: true` row is kept as a
+/// terminator although it carries no distilled prices; a price row that
+/// distills to nothing is kept as an unpriced row — the index delists a key
+/// whose newest row has no per-token rates, and the walk agrees for that day.
+/// Fails when zero keys survive (nothing could ever resolve).
+fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    let mut keys: Vec<StoreKey> = Vec::new();
+    for line in ndjson.lines() {
+        let Ok(raw) = serde_json::from_str::<RawHistoryRow>(line) else {
+            continue; // malformed line — skip, don't fail the feed
+        };
+        let canonical = canonical_source(&raw.source);
+        if !FIRST_PARTY_PROVIDERS.contains(&canonical) {
+            continue;
+        }
+        if canonical != "anthropic"
+            && raw
+                .model_id
+                .get(..6)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude"))
+        {
+            continue;
+        }
+        let removed = raw.removed == Some(true);
+        let applies = raw
+            .row
+            .effective_at
+            .clone()
+            .unwrap_or_else(|| raw.observed_at.clone());
+        let row = StoreRow {
+            observed: raw.observed_at.clone(),
+            applies,
+            removed,
+            model: if removed {
+                None
+            } else {
+                raw.row.into_priced(raw.model_id.clone())
+            },
+        };
+        let key = (canonical.to_owned(), raw.model_id.clone());
+        let slot = match index.get(&key) {
+            Some(&slot) => slot,
+            None => {
+                keys.push(StoreKey {
+                    id: raw.model_id,
+                    rows: Vec::new(),
+                });
+                index.insert(key, keys.len() - 1);
+                keys.len() - 1
+            }
+        };
+        keys[slot].rows.push(row);
+    }
+    if keys.is_empty() {
+        anyhow::bail!("price history distilled to zero keys");
+    }
+    Ok(keys)
+}
+
 /// One index row. The four `_mtok` keys are USD per million tokens; missing
 /// keys are `None` (→ 0.0 per token). `cache_write_1h_mtok` is deliberately
 /// NOT declared (the hourly axis has no TTL data), and index-only extras
@@ -783,6 +1011,21 @@ struct RawRow {
     peak_cache_read_mtok: Option<f64>,
     #[serde(default)]
     peak_cache_write_mtok: Option<f64>,
+}
+
+/// One history-ndjson line: the index row shape plus the line's own
+/// bookkeeping keys. `observed_at` is mandatory — a row with no date cannot
+/// date. The row half reuses [`RawRow`], so every legacy shape the index
+/// parser tolerates (flat `peak_*`, `peak_windows`) parses here too.
+#[derive(Deserialize)]
+struct RawHistoryRow {
+    source: String,
+    model_id: String,
+    observed_at: String,
+    #[serde(default)]
+    removed: Option<bool>,
+    #[serde(flatten)]
+    row: RawRow,
 }
 
 /// The four token rates one entry can carry. A window entry holds OVERRIDE
@@ -935,10 +1178,15 @@ fn to_per_token(mtok: f64) -> f64 {
 
 // ── Disk cache ───────────────────────────────────────────────────────────────
 
-/// On-disk cache shape: the fetch time plus the snapshot history.
+/// On-disk cache shape: the fetch time, the store-derived dating source, and
+/// the local snapshot history. A cache written before the store half exists
+/// loads with an empty `store` (serde default) and upgrades on the next
+/// successful fetch.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     fetched_at_ms: u64,
+    #[serde(default)]
+    store: Vec<StoreKey>,
     #[serde(default)]
     history: Vec<RateSnapshot>,
 }
@@ -971,6 +1219,7 @@ fn load_cache(path: &Path) -> Option<PriceTable> {
     Some(PriceTable {
         models,
         history: cache.history,
+        store: cache.store,
         fetched_at_ms: cache.fetched_at_ms,
         memo: Mutex::default(),
     })
@@ -980,6 +1229,7 @@ fn load_cache(path: &Path) -> Option<PriceTable> {
 fn save_cache(path: &Path, table: &PriceTable) {
     let cache = CacheFile {
         fetched_at_ms: table.fetched_at_ms,
+        store: table.store.clone(),
         history: table.history.clone(),
     };
     if let Ok(json) = serde_json::to_string(&cache) {
