@@ -1,6 +1,6 @@
 [package]
 name = "clauth"
-version = "0.14.1"
+version = "0.15.0"
 edition = "2024"
 description = "Manage multiple Claude Code accounts, monitor 5h/7d usage with configurable auto-switch and delegation with an MCP plugin. CLI + TUI."
 license = "MIT"
