@@ -185,6 +185,15 @@ pub(crate) struct TokenEntry {
     /// Persisted `auth_broken` quarantine at snapshot time; widens the poll
     /// cadence by [`AUTH_BROKEN_BACKOFF_MS`] while set.
     pub(crate) auth_broken: bool,
+    /// Elected by [`tick`] before the fan-out: this profile is the one queue
+    /// member allowed to OPEN a 5h window this tick (`usage::auto_start_queue`). Decided
+    /// centrally because [`fetch_oauth_due_with`] runs one worker per profile,
+    /// and two workers reading the queue anchor in the same tick would both kick.
+    ///
+    /// `true` from [`collect_tokens`], which builds the snapshot rather than the
+    /// work-list: a caller with no queue (the single-shot paths) must not have
+    /// its kick silently suppressed. Only `tick` narrows it.
+    pub(crate) may_open_window: bool,
 }
 
 /// Snapshot of one third-party profile identity used by the refresher.
@@ -1127,11 +1136,28 @@ fn streak_snapshot(streaks: &PollStreaks) -> HashMap<String, StreakCounts> {
 ///     to ~15min; honoring it here would leave the chain refusing to switch back
 ///     in long after the account recovered, so a reopened window re-tests every
 ///     poll (~one refresh interval) until a kick lands or 429s afresh.
-fn should_open_window(streak: u32, window_lapsed: bool, kick_due: bool, has_block: bool) -> bool {
+///
+/// `queue_due` (the interleaved queue gate, `usage::auto_start_queue`) narrows the
+/// LAPSED leg only. The re-test leg stays ungated on purpose: it is a health
+/// probe on an already-open window whose verdict the fallback chain routes on
+/// (`kick_block_switch_grade`), not a window open, so delaying it by up to
+/// `5h / N` would leave the chain refusing to switch back to an account that
+/// had already recovered.
+fn should_open_window(
+    streak: u32,
+    window_lapsed: bool,
+    kick_due: bool,
+    has_block: bool,
+    queue_due: bool,
+) -> bool {
     if streak != 0 {
         return false;
     }
-    if window_lapsed { kick_due } else { has_block }
+    if window_lapsed {
+        kick_due && queue_due
+    } else {
+        has_block
+    }
 }
 
 /// The auto-start firing decision for `run_fetch`, factored out so it has a test
@@ -1145,6 +1171,7 @@ fn auto_start_should_kick(
     kick_blocks: &KickBlocks,
     name: &ProfileName,
     now_secs: i64,
+    queue_due: bool,
 ) -> bool {
     let block = kick_block(kick_blocks, name);
     should_open_window(
@@ -1152,6 +1179,7 @@ fn auto_start_should_kick(
         window_lapsed(store, name, now_secs),
         kick_retry_due(block.as_ref(), now_secs),
         block.is_some(),
+        queue_due,
     )
 }
 
@@ -1305,12 +1333,185 @@ fn sync_kick_blocks_from_cache(blocks: &KickBlocks, names: &[String]) {
     }
 }
 
+/// The switch-grade kick blocks read off DISK rather than a live scheduler's
+/// memory — the daemonless mirror of [`kick_rejected_names`], over the same
+/// `kick_block.json` files [`sync_kick_blocks_from_cache`] bootstraps from and
+/// the same [`kick_block_switch_grade`] predicate.
+///
+/// Exists for the auto-start queue's membership rule
+/// ([`crate::usage::auto_start_queue_members`]), which every surface must answer
+/// identically or publish a queue the election is not running. `clauth status
+/// --json` has no scheduler to ask, and a blocked member left in would take a
+/// position and inflate `N` for as long as the limiter's advertised ceiling
+/// stands — hours — shortening every OTHER member's published `next_open_at`
+/// against a gap the election never applies (review round 4).
+pub(crate) fn switch_grade_kick_blocked_from_cache(
+    names: &[ProfileName],
+    now_secs: i64,
+) -> Vec<ProfileName> {
+    names
+        .iter()
+        .filter(|n| {
+            load_profile_cache::<KickBlock>(n, KICK_BLOCK_CACHE_FILE)
+                .is_some_and(|b| kick_block_switch_grade(&b, now_secs))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Elect this tick's single queue opener and stamp it onto `due`.
+///
+/// The interleaved auto-start queue (`usage::auto_start_queue`): with several accounts on
+/// `auto_start` every window reopens the instant it lapses, so they stay in
+/// whatever phase they booted with and all reset together. Spacing their opens
+/// by `5h / N` instead puts a fresh window within reach every `5h / N`.
+///
+/// Two decisions live here rather than in the worker, and both need the whole
+/// picture at once:
+///
+///   * **Queue SIZE** comes from [`crate::usage::auto_start_queue_members`] — every member
+///     that participates over time — not from `due` (only those whose cadence
+///     slot came up this tick). Sizing off `due` would swing `N`, and with it
+///     the gap, every tick. That rule also drops the members that cannot open a
+///     window at all, so the queue never reserves a slot for a corpse and
+///     spreads the live members too thin. One exclusion comes free on top: a
+///     spent account under `refresh_spent_accounts = false` was already dropped
+///     from `due`, so it can be a member but never the winner.
+///   * **The winner** is elected from the queue members due THIS tick, because
+///     [`fetch_oauth_due_with`] fans out one worker per profile and two workers
+///     consulting the queue anchor concurrently would both kick.
+///
+/// Candidates are built BEFORE the anchor is read, so a tick with nothing lapsed
+/// answers without one. That ordering is what pays for
+/// [`crate::usage::queue_anchor`]'s history replay: the two paths agree (an
+/// election no one can win stamps every member shut, exactly as the gap branch
+/// does), and the replay is left to the ticks where a window is actually wanted.
+///
+/// With the toggle off `auto_start_queue_members` is empty, so every entry keeps the
+/// permissive `may_open_window` that [`collect_tokens`] set — exactly the pre-queue
+/// behaviour.
+fn elect_auto_start_queue(
+    state: &SchedulerState,
+    due: &mut [TokenEntry],
+    interval_ms: u64,
+    now_secs: i64,
+) {
+    // Kick blocks first (KickBlockState 230), then the config (400) — read and
+    // released before the store below, since Config outranks UsageStore(300)
+    // and the two must not nest.
+    let blocked = kick_rejected_names(&state.kick_blocks, now_secs);
+    let queue = state
+        .config
+        .lock()
+        .map(|c| crate::usage::auto_start_queue_members(&c, &blocked))
+        .unwrap_or_default();
+    if queue.is_empty() {
+        return;
+    }
+
+    // Non-members are never stamped by any of the three loops below:
+    // `auto_start_queue_members` excludes `auth_broken` and switch-grade-blocked
+    // profiles, which can never be elected, so writing them `false` would deny
+    // them the lapsed leg on every tick — and since only a landed kick clears a
+    // block, permanently. They keep [`collect_tokens`]'s permissive default and
+    // retry on the `kick_retry_due` ladder exactly as before the queue.
+    let shut = |due: &mut [TokenEntry]| {
+        for entry in due.iter_mut().filter(|e| queue.contains(&e.name)) {
+            entry.may_open_window = false;
+        }
+    };
+
+    let candidates: Vec<crate::usage::Candidate<'_>> = queue
+        .iter()
+        .filter(|name| due.iter().any(|d| &d.name == *name))
+        .map(|name| crate::usage::Candidate {
+            name: name.as_str(),
+            lapsed: window_lapsed(&state.store, name, now_secs),
+            failures: crate::usage::queue_failures(&state.auto_start_queue, name, now_secs),
+        })
+        .collect();
+    // Nothing lapsed, so nothing wants a window: `elect_queue_member` elects on
+    // `lapsed` alone, so the election below could only return `None` and stamp
+    // every member shut — which is what the gap branch does too. Answering here
+    // is the same outcome by both paths, and it is what keeps the anchor's
+    // history replay off the ticks it could not change: this is the majority of
+    // every cycle (all windows live, the gap long since elapsed), and an idle
+    // window's sliding `resets_at` appends history on every single poll.
+    if !candidates.iter().any(|c| c.lapsed) {
+        shut(due);
+        return;
+    }
+
+    let gap = crate::usage::queue_gap_secs(queue.len(), interval_ms);
+    let anchor = crate::usage::queue_anchor(&state.auto_start_queue, &queue, now_secs, gap);
+    if !crate::usage::queue_due(anchor, now_secs, gap) {
+        // Inside the gap: no MEMBER opens a window this tick. The re-test leg
+        // is untouched — `should_open_window` only consults the queue on the
+        // lapsed leg, so a standing kick block still gets probed on the poll
+        // cadence.
+        shut(due);
+        return;
+    }
+
+    let elected = crate::usage::elect_queue_member(&candidates).map(str::to_string);
+    // Members only, same as `shut` above: a non-member stamped by this loop
+    // could never win it back.
+    for entry in due.iter_mut().filter(|e| queue.contains(&e.name)) {
+        entry.may_open_window = elected.as_deref() == Some(entry.name.as_str());
+    }
+}
+
+/// The one line that says a queue open FIRED.
+///
+/// [`note_kick_outcome`] speaks on state TRANSITIONS only — it logs a kick that
+/// cleared a standing block and stays silent on the happy path — so a landed
+/// queue open was invisible on every surface: nothing in the daemon log,
+/// nothing in the TUI's. This is the line that answers "did the queue
+/// open fire?".
+///
+/// `next in` is the gap itself, because [`crate::usage::note_queue_open`] has
+/// just moved the anchor to `now`: the queue's next opening is exactly one gap
+/// out. Silent when the profile holds no queue slot, which is also how the
+/// queue toggle turns this off — with it off there is no queue to report a
+/// position in, and every lapsed window simply reopens as it did before the
+/// feature existed.
+///
+/// Locks ascend and never nest: KickBlockState(230), then Config(400), each
+/// released before the next.
+fn log_queue_open(
+    config: &crate::profile::ConfigHandle,
+    kick_blocks: &KickBlocks,
+    name: &str,
+    interval_ms: u64,
+    now_secs: i64,
+) {
+    let blocked = kick_rejected_names(kick_blocks, now_secs);
+    let queue = config
+        .lock()
+        .map(|c| crate::usage::auto_start_queue_members(&c, &blocked))
+        .unwrap_or_default();
+    let Some(slot) = crate::usage::queue_slot(&queue, name, Some(now_secs), interval_ms, now_secs)
+    else {
+        return;
+    };
+    logline!(
+        "{name}: 5h auto-start window opened (queue {}/{}, next in {})",
+        slot.position,
+        slot.total,
+        humanize_duration(slot.next_in.unwrap_or(0))
+    );
+}
+
 /// Fetch one profile's usage on the periodic tick. When the profile opted into
 /// auto-start, fire the kick first whenever `should_open_window` says to — to OPEN
 /// a lapsed window, or to RE-TEST a standing kick block on a now-live window (it
 /// may have reopened via the web app while Claude Code stays 429'd) — rotating
 /// once on 401 OR 429, mark the window open on success, then fetch with the
 /// possibly-rotated token.
+// One arg over the lint's bar, and every one of them is a distinct shared store
+// this leg writes; bundling them into a struct would only rename the same
+// coupling. `fetch_oauth_due` is the single caller.
+#[allow(clippy::too_many_arguments)]
 fn run_fetch(
     config: &crate::profile::ConfigHandle,
     mut entry: TokenEntry,
@@ -1319,6 +1520,8 @@ fn run_fetch(
     activity: &ActivityStore,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
+    auto_start_queue: &crate::usage::AutoStartQueueState,
+    interval_ms: u64,
 ) -> FetchOutcome {
     // Auto-start leg: fire the kick before fetching when this profile opted in and
     // `should_open_window` says to — to open a lapsed window, or to re-test a
@@ -1330,7 +1533,22 @@ fn run_fetch(
     let mut kick_rotated: Option<RotatedTokens> = None;
     if entry.auto_start {
         let now_secs = now_epoch_secs();
-        if auto_start_should_kick(streaks, store, kick_blocks, &entry.name, now_secs) {
+        // WHICH leg would fire, read before the kick moves the window. The
+        // queue gates the LAPSED leg only ([`should_open_window`]), so a lapsed
+        // window plus an elected member is exactly a queue open; the
+        // live-window re-test can also land a kick and it opens nothing.
+        // Naming that a auto-start would be a lie in the one line whose whole job
+        // is to say what happened.
+        let lapsed = window_lapsed(store, &entry.name, now_secs);
+        let queue_open = entry.may_open_window && lapsed;
+        if auto_start_should_kick(
+            streaks,
+            store,
+            kick_blocks,
+            &entry.name,
+            now_secs,
+            entry.may_open_window,
+        ) {
             let kicked = crate::oauth::auto_start_kick(
                 config,
                 &entry.name,
@@ -1353,7 +1571,43 @@ fn run_fetch(
             }
             if kicked.opened {
                 mark_window_open(store, &entry.name, now_secs);
+                // Anchor the queue on the kick, not on the window it produced —
+                // but only when the kick actually PRODUCED one. `kicked.opened`
+                // is a 2xx from `/v1/messages`, which the live-window re-test
+                // leg also gets while opening nothing (`mark_window_open`
+                // no-ops there for the same reason). Anchoring on that would
+                // re-phase the whole queue for a non-event, and push a lone
+                // account's own next auto-start out past its lapse. A kick that
+                // found the window LAPSED is the one that opened it, elected or
+                // not — an out-of-band open is still one the queue must space
+                // against.
+                if lapsed {
+                    crate::usage::note_queue_open(auto_start_queue, &entry.name, now_secs);
+                }
+                if queue_open {
+                    log_queue_open(config, kick_blocks, &entry.name, interval_ms, now_secs);
+                }
+            } else if entry.may_open_window {
+                // An ELECTED kick that opened nothing. Step this member toward
+                // the election's skip threshold so a permanently kick-incapable
+                // account (the macOS `rotation_blocked_for` carve-out records no
+                // `KickBlock` and never sets `auth_broken`, so nothing else sees
+                // it) cannot head-of-line block the members behind it. The
+                // anchor deliberately does NOT move: nothing opened, so the next
+                // tick re-elects immediately.
+                crate::usage::note_queue_kick_failed(auto_start_queue, &entry.name, now_secs);
             }
+        } else if entry.may_open_window && lapsed {
+            // Elected, lapsed, and REFUSED before the kick could fire — a 429
+            // streak in flight, or a standing block whose retry clock hasn't
+            // come due. The slot was still consumed with nothing opened, so it
+            // steps toward the skip threshold exactly as a failed kick does;
+            // otherwise a member stuck in refusal holds the slot on every tick,
+            // which is the head-of-line case [`crate::usage::auto_start_queue`]'s
+            // election-failure limit exists to prevent. (A lapsed NON-member
+            // can reach here too while refused — harmless: its streak is never
+            // consulted while it holds no slot, and it decays within the hour.)
+            crate::usage::note_queue_kick_failed(auto_start_queue, &entry.name, now_secs);
         }
     }
 
@@ -1898,6 +2152,8 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
                 auto_start: p.auto_start,
                 access_expires_at: oauth.expires_at,
                 auth_broken: config.is_auth_broken(&p.name),
+                // Permissive by default; `tick` is the only narrower.
+                may_open_window: true,
             })
         })
         .collect()
@@ -1974,6 +2230,8 @@ fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u6
             &state.activity,
             &state.poll_streaks,
             &state.kick_blocks,
+            &state.auto_start_queue,
+            interval_ms,
         )
     });
 }
@@ -2367,6 +2625,9 @@ pub(crate) struct SchedulerState {
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
     kick_blocks: KickBlocks,
+    /// Interleaved auto-start queue (`usage::auto_start_queue`): the anchor the 5h-window
+    /// queue spaces against, plus per-profile election health.
+    auto_start_queue: crate::usage::AutoStartQueueState,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -2560,6 +2821,10 @@ fn tick(state: &SchedulerState) {
             now,
         );
     }
+    // Elect this tick's single queue opener now that `oauth_due` is final —
+    // before the fan-out, which is what serialises the queue.
+    elect_auto_start_queue(state, &mut oauth_due, interval_ms, now_epoch_secs());
+
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
@@ -2779,6 +3044,7 @@ pub(crate) fn spawn_refresher(
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
     kick_blocks: KickBlocks,
+    auto_start_queue: crate::usage::AutoStartQueueState,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -2799,6 +3065,18 @@ pub(crate) fn spawn_refresher(
         .map(|t| t.iter().map(|e| e.name.to_string()).collect())
         .unwrap_or_default();
     sync_kick_blocks_from_cache(&kick_blocks, &names);
+    // Interleaved auto-start queue. Constructed by the CALLER and passed in, the
+    // same shape `kick_blocks` takes, because the TUI reads the anchor every
+    // frame and a queue built in here would be unreachable from render (a
+    // per-frame history replay is not an option in a render loop). Its
+    // history-derived anchor is still seeded on THIS thread, for the same
+    // home-path reason as the kick-block seed above — the derivation replays
+    // per-profile `usage_history.jsonl` files.
+    let queue_seed: Vec<crate::profile::ProfileName> = config
+        .lock()
+        .map(|c| crate::usage::auto_start_queue_members(&c, &[]))
+        .unwrap_or_default();
+    crate::usage::seed_queue_anchor(&auto_start_queue, &queue_seed);
     // Startup leg of the usage-history retention trim (the cadenced leg runs in
     // `tick`). Here rather than in the spawned closure for the same home-path
     // reason as the kick-block seed above.
@@ -2819,6 +3097,7 @@ pub(crate) fn spawn_refresher(
         last_fetched,
         poll_streaks,
         kick_blocks,
+        auto_start_queue,
         pending_switch,
         pending_switch_off,
         refetch_queue,

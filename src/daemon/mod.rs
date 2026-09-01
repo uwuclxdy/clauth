@@ -355,6 +355,19 @@ struct Daemon {
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
+    /// Per-profile kick-429 blocks. The daemon renders no pills, so this backs
+    /// only the scheduler's own gate and its write-through cache files — but it
+    /// lives on `self` rather than inside `spawn_scheduler` for the same reason
+    /// `auto_start_queue` does: the status publisher snapshots its switch-grade
+    /// subset on every write, because that subset is what the auto-start
+    /// queue's membership rule excludes on and a feed deriving membership
+    /// without it publishes a queue the election is not running.
+    kick_blocks: KickBlocks,
+    /// Interleaved auto-start queue (`usage::auto_start_queue`). On `self`, like
+    /// `kick_blocks` above, because the status publisher snapshots the anchor on
+    /// every write so `status.json`'s `next_open_at` matches the value the
+    /// election gates on.
+    auto_start_queue: crate::usage::AutoStartQueueState,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -397,6 +410,8 @@ impl Daemon {
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
             poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+            kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+            auto_start_queue: crate::usage::new_auto_start_queue_state(),
             pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
             pending_switch_off: Arc::new(RankedMutex::new(false)),
             refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -468,10 +483,6 @@ impl Daemon {
     /// TUI's `start_scheduler` makes). The suppressed-generic set is daemon-local.
     fn spawn_scheduler(&self) {
         let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
-        // Daemon-local like `suppressed`: the daemon never renders pills, so the
-        // block map only backs the scheduler's own gate + its write-through
-        // cache files (which a standdown TUI mirrors).
-        let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
         spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
@@ -482,7 +493,8 @@ impl Daemon {
             Arc::clone(&self.activity),
             Arc::clone(&self.last_fetched),
             Arc::clone(&self.poll_streaks),
-            kick_blocks,
+            Arc::clone(&self.kick_blocks),
+            Arc::clone(&self.auto_start_queue),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -625,12 +637,25 @@ impl Daemon {
             .lock()
             .ok()
             .and_then(|q| q.iter().min().cloned());
+        // The auto-start queue's in-memory anchor and the blocks its membership
+        // rule excludes on — both leaf rank, snapshot + release before the config
+        // lock like every store above. `switch_grade_kick_lifts` keys ARE the
+        // blocked set: it and the scheduler's own `kick_rejected_names` share one
+        // predicate, which is how the TUI's queue chips read it too.
+        let queue_anchor = crate::usage::queue_anchor_cached(&self.auto_start_queue);
+        let queue_blocked: Vec<crate::profile::ProfileName> =
+            crate::usage::switch_grade_kick_lifts(&self.kick_blocks)
+                .keys()
+                .map(|k| k.as_str().into())
+                .collect();
         let live = LiveSignals {
             status: &status_snap,
             third_party_status: &tp_status_snap,
             next_refresh: &next_snap,
             streaks: &streaks_snap,
             pending_switch: pending_snap.as_deref(),
+            queue_anchor,
+            queue_blocked: &queue_blocked,
         };
         let cfg_snap = {
             #[allow(

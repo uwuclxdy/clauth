@@ -113,6 +113,12 @@ pub(crate) mod rank {
         /// `PollStreak` — read/copied alone, released before any other lock,
         /// and its cache-file IO stays outside the guard.
         KickBlockState = 230;
+        /// Interleaved auto-start queue state (`usage::auto_start_queue::AutoStartQueueState`): the
+        /// anchor the 5h-window queue spaces against, plus per-profile
+        /// election health. Leaf like `KickBlockState` — read/updated alone,
+        /// released before any other lock, and the anchor's disk IO stays
+        /// outside the guard.
+        AutoStartQueue = 240;
         Tokens = 250;
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;

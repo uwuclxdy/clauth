@@ -1,3 +1,4 @@
+mod auto_start_queue;
 mod burn;
 mod fetch;
 mod scheduler;
@@ -24,7 +25,17 @@ pub(crate) use scheduler::{
     clear_activity, collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle,
     is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
     profile_credential_fingerprint, spawn_refresher, switch_gate_in_flight,
-    switch_grade_kick_lifts, third_party_credentialed,
+    switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, third_party_credentialed,
+};
+// The queue's history-pair classifier stays module-private — reached by
+// `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is
+// re-exported: the scheduler sizes the gap itself, and `status_json` derives
+// `next_open_at` through [`auto_start_queue::next_queue_open_secs`].
+pub(crate) use auto_start_queue::{
+    AutoStartQueueState, Candidate, QueueSlot, auto_start_queue_members, elect_queue_member,
+    history_anchor, new_state as new_auto_start_queue_state, next_queue_open_secs,
+    note_queue_kick_failed, note_queue_open, queue_anchor, queue_anchor_cached, queue_due,
+    queue_failures, queue_gap_secs, queue_slot, seed_queue_anchor,
 };
 // The active-cap boundary is only referenced by tests (production code reaches it
 // through `is_stuck_rate_limited`); gate the re-export behind `cfg(test)` so it

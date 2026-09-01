@@ -112,6 +112,16 @@ clauth then sends a 1-token Haiku ping on launch and on each refresh tick while 
 
 If the messages limiter is blocking Claude Code, a live 5h window will not clear it. clauth re-tests with the same ping on the poll cadence and can rotate the chain around an account whose ping keeps getting rejected.
 
+### Interleaving it across accounts
+
+With several accounts on `auto_start`, every window reopens the instant it lapses — so they stay in whatever phase they started in and all reset together, leaving you with everything at once and then nothing for five hours. `warmup_stagger` (on by default, Config tab `stagger warmup`) spaces them instead: a member may open a window only when no other member opened one in the last `5h / N`, so a freshly reset account comes within reach every `5h / N` — 2h30m with two accounts, 1h40m with three.
+
+The spacing is self-organising. Accounts that all lapse together are spread across the first cycle and stay spread, because every window is exactly five hours. Nothing needs configuring beyond turning `auto_start` on per account; `N` counts the accounts that can actually open a window, so a quarantined, kick-rejected or spent one does not hold a slot open.
+
+What it promises is **spacing of at least `5h / N`, converging on that figure** — not a reset on a fixed clock. After a lapse a member can wait up to `(N-1) x 5h / N` for its turn, and an account you actually use opens its window on demand regardless. With one account on `auto_start` nothing changes at all: the gap is the whole window, so that account still opens one the moment its last lapses.
+
+clauth records the ring's last open in `~/.clauth/warmup_ring.json`. It cannot read that from the usage cache instead, because `/usage` reports an idle window's reset a full five hours out — indistinguishable from a window that just opened, and left untreated it would wedge the ring shut permanently.
+
 ## `profiles.toml`
 
 | Key | Type | Default | Controls |
@@ -121,6 +131,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 | `fallback_chain` | list | `[]` | ordered chain members ([Auto-switch](Auto-Switch)) |
 | `refresh_interval_ms` | int | `90000` | usage poll cadence, 10 s to 1 h |
 | `refresh_spent_accounts` | bool | `true` | keep polling accounts at 100% |
+| `warmup_stagger` | bool | `true` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |
 | `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100 |
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
@@ -176,6 +187,7 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
   ai_pricelog_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
+  warmup_ring.json         # when the warm-up ring last opened a window, and by whom
   clauth.log, daemon.log   # event lines from the TUI and the daemon
   completions/             # generated shell completion scripts
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
@@ -201,6 +213,6 @@ If the messages limiter is blocking Claude Code, a live 5h window will not clear
 
 Lock files (`.lock`, `clauthd.lock`, `usage-fetch.lock`) sit alongside. Everything clauth owns is `0600`, every directory `0700`, re-tightened on each launch.
 
-Deleting any `*_cache.json`, `usage_history.jsonl`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `credentials.json` or `session-token.json` signs that profile out.
+Deleting any `*_cache.json`, `usage_history.jsonl`, `third_party_auth.json`, `warmup_ring.json`, or `status.json` costs you history and nothing else — a deleted `warmup_ring.json` re-spaces the ring over the next cycle. Deleting `credentials.json` or `session-token.json` signs that profile out.
 
 The `-<sid>` suffix appears only where the OS grants symlinks. Windows without symlink privilege builds the runtime tree by copying `~/.claude/`, so every session of one profile shares a single unsuffixed `runtime/` instead of paying for a copy each.

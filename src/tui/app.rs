@@ -358,6 +358,11 @@ pub(crate) enum GlobalConfigRow {
     /// spent account until its window resets — a fetch-leg optimization only,
     /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
     RefreshSpentAccounts,
+    /// Whether the `auto_start` auto-start kick is interleaved across accounts, so
+    /// their 5h windows open `5h / N` apart instead of all at once
+    /// (`AppState.auto_start_queue`, default OFF — for one account the queue is
+    /// a no-op, so the operator opts in). ENUMERATED on/off, ⏎ mirrors space.
+    AutoStartQueue,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -1544,6 +1549,13 @@ pub(crate) struct App {
     /// Per-profile kick-429 blocks (the messages endpoint rejecting the 5h
     /// auto-start kick) — feeds the usage tab's blocked pill.
     pub(crate) kick_blocks: KickBlocks,
+    /// Interleaved auto-start queue (`usage::auto_start_queue`): the anchor the 5h-window
+    /// queue spaces against, plus per-profile election health. Held here for
+    /// the same reason as `kick_blocks` — the Fallback card's detail render
+    /// reads it every frame, and a per-frame history replay is not an option.
+    /// Shared with the refresher this TUI spawns, so what the queue chip shows
+    /// is what the gate is actually using.
+    pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
     /// Scheduler-posted auto-switch decisions; drained in `on_tick`.
     pub(crate) pending_switch: PendingSwitch,
     /// Set by the scheduler when the whole chain is spent; `on_tick` drains it
@@ -1807,6 +1819,7 @@ struct WorkerHandles {
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
     kick_blocks: KickBlocks,
+    auto_start_queue: crate::usage::AutoStartQueueState,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1834,6 +1847,7 @@ impl WorkerHandles {
             last_fetched: Arc::clone(&app.last_fetched),
             poll_streaks: Arc::clone(&app.poll_streaks),
             kick_blocks: Arc::clone(&app.kick_blocks),
+            auto_start_queue: Arc::clone(&app.auto_start_queue),
             pending_switch: Arc::clone(&app.pending_switch),
             pending_switch_off: Arc::clone(&app.pending_switch_off),
             refetch_queue: Arc::clone(&app.refetch_queue),
@@ -1862,6 +1876,7 @@ impl App {
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
         let poll_streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+        let auto_start_queue = crate::usage::new_auto_start_queue_state();
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -1968,6 +1983,7 @@ impl App {
             last_fetched,
             poll_streaks,
             kick_blocks,
+            auto_start_queue,
             pending_switch,
             pending_switch_off,
             refetch_queue,
@@ -2304,6 +2320,7 @@ impl App {
             h.last_fetched,
             h.poll_streaks,
             h.kick_blocks,
+            h.auto_start_queue,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -2373,7 +2390,7 @@ impl App {
                 .collect::<Vec<_>>();
         }
         for (name, threshold, util, fresh) in bells {
-            // Ring or clear only on a live read — a synthetic/stale window (e.g.
+            // Queue or clear only on a live read — a synthetic/stale window (e.g.
             // a just-kicked 0%) must not clear a real bell or fire a false one.
             // Non-fresh profiles keep their prior bell state.
             if !fresh {
@@ -4418,13 +4435,14 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 14] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 15] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
+    GlobalConfigRow::AutoStartQueue,
     GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
@@ -4448,6 +4466,7 @@ impl GlobalConfigRow {
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
+            | GlobalConfigRow::AutoStartQueue
             | GlobalConfigRow::PreemptiveRotation => "scheduler",
             GlobalConfigRow::WeeklyThreshold
             | GlobalConfigRow::BurnAware
@@ -4542,6 +4561,14 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
+        // Inert while no account has `auto_start` on (rendered dimmed): a
+        // queue with no possible member spaces nothing, so it stays a true
+        // disabled row — the key is a no-op.
+        GlobalConfigRow::AutoStartQueue => {
+            if app.config().profiles.iter().any(|p| p.auto_start) {
+                toggle_auto_start_queue(app);
+            }
+        }
     }
 }
 
@@ -4857,6 +4884,17 @@ fn toggle_refresh_spent_accounts(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.refresh_spent_accounts = !cfg.state.refresh_spent_accounts;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Interleave the auto-start kick across accounts, or let every window reopen the
+/// instant it lapses (`usage::auto_start_queue`).
+fn toggle_auto_start_queue(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.auto_start_queue = !cfg.state.auto_start_queue;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();

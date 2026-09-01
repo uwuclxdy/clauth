@@ -69,6 +69,10 @@ fn build_status_top_level_shape_and_active() {
             "active",
             "auth_status",
             "auto_start",
+            // Additive under schema 1 (interleaved auto-start queue): the
+            // profile's queue slot and the queue's shared next-open estimate,
+            // `null` for a profile that holds no slot.
+            "auto_start_queue",
             "base_url",
             "bell_threshold",
             "fallback",
@@ -311,6 +315,8 @@ fn build_status_pending_switch_reflects_live_signal() {
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: Some("home"),
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
@@ -318,6 +324,90 @@ fn build_status_pending_switch_reflects_live_signal() {
         v["schema"], SCHEMA_VERSION,
         "pending_switch is part of schema 1 — no bump"
     );
+}
+
+/// The queue object is pinned by VALUE, not key presence: `position` is the
+/// member's 1-based slot in the shared order, `next_open_at` round-trips to
+/// anchor + gap, and every null shape is spelled out — toggle off, not a
+/// member, and member-with-no-anchor. Publishing `null` for every position
+/// would otherwise survive the key-list test.
+#[test]
+fn build_status_auto_start_queue_positions_and_null_cases() {
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let mut config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), oauth_profile("c")],
+    };
+
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &[],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(queue_of(&v, "b")["position"], 2);
+    // Round-trip rather than a formatted literal, so the pin is on the
+    // arithmetic (anchor + gap) and not on the ISO renderer.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+    );
+    assert_eq!(
+        queue_of(&v, "a")["next_open_at"],
+        queue_of(&v, "b")["next_open_at"],
+        "the estimate is the queue's, shared by every member"
+    );
+    // Null case 1: an OAuth profile that never opted into auto_start.
+    assert!(queue_of(&v, "c").is_null());
+
+    // Null case 2: a member with no anchor yet — the slot publishes, the
+    // stamp is null (reads as "due now").
+    let cold = LiveSignals {
+        queue_anchor: None,
+        ..live
+    };
+    let v = build_status(&config, 300_000, Some(&cold), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert!(queue_of(&v, "a")["next_open_at"].is_null());
+
+    // Null case 3: the toggle off is a real off switch on the feed too.
+    config.state.auto_start_queue = false;
+    let v = build_status(&config, 300_000, Some(&live), false);
+    for name in ["a", "b", "c"] {
+        assert!(queue_of(&v, name).is_null());
+    }
 }
 
 /// An api-key profile's freshness derives from ITS cache
@@ -372,6 +462,8 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -507,6 +599,8 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         next_refresh: &next,
         streaks: &empty_streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -573,6 +667,8 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -596,6 +692,8 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -637,6 +735,8 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -656,6 +756,8 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
@@ -683,6 +785,8 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
@@ -932,4 +1036,121 @@ fn published_entries_deserialize_into_the_typed_contract() {
         .collect();
     win_keys.sort_unstable();
     assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
+}
+
+/// The feed must publish the queue the ELECTION is running, not a wider one.
+/// `auto_start_queue_members` drops switch-grade kick-blocked profiles, and the
+/// scheduler and the TUI both supply that set — the feed used to pass an empty
+/// one, so a blocked account kept a position and inflated `N` for as long as
+/// the limiter's advertised ceiling stood (hours, not the "one poll" the code
+/// claimed). Every OTHER member's `next_open_at` is then computed off the wrong
+/// `5h / N` and reads earlier than the gap actually applied (review round 4).
+///
+/// Both legs, because the two surfaces read the set from different places: a
+/// live daemon passes its in-memory blocks through `LiveSignals`, and the
+/// daemonless `status --json` re-derives them from the same `kick_block.json`
+/// caches the scheduler writes through — on the same `kick_block_switch_grade`
+/// predicate, which the third profile below pins by NOT being excluded.
+#[test]
+fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, write_profile_cache};
+    use crate::usage::KickBlock;
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("c")],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    // Live leg: the scheduler's own blocked set, handed over.
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let blocked = [crate::profile::ProfileName::from("b")];
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &blocked,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "a kick-blocked member holds no published slot, as it holds none in the election"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "the members behind it close up rather than leaving a hole"
+    );
+    // The N the estimate is sized from, which is the half of this that a
+    // position assertion alone would miss.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+        "the gap is 5h/2, not the 5h/3 an un-excluded member would publish"
+    );
+
+    // Daemonless leg: the same verdict re-derived from disk. `c` gets a block
+    // that is NOT switch-grade (one 429, no `rejected`), so the predicate is
+    // pinned in both directions by the same run.
+    crate::testutil::register_names(&["a", "b", "c"]);
+    let far_ahead = crate::usage::now_epoch_secs() + 3600;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("b"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("c"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 1,
+            rejected: false,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    let v = build_status(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "`status --json` reads the same block off `kick_block.json`"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "a burst 429 is not switch-grade and never costs a queue slot"
+    );
 }

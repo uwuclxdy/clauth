@@ -26,7 +26,7 @@ use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resum
 use super::global_config::default_reminder;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
-    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_selector_list, head_cols,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, QueueView, bold_when, draw_selector_list, head_cols,
     help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
     name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
     wrap_words,
@@ -36,7 +36,7 @@ use crate::fallback::{
     spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
 };
 use crate::profile::AppConfig;
-use crate::usage::{humanize_duration, switch_grade_kick_lifts};
+use crate::usage::{humanize_duration, queue_anchor_cached, switch_grade_kick_lifts};
 
 /// Wide enough to read a threshold tick.
 const GAUGE_W: usize = 22;
@@ -154,9 +154,12 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
         .copied();
-    // Switch-grade kick blocks — read before the Config lock (rank order:
-    // KickBlockState 230 < Config 400).
+    // Switch-grade kick blocks and the auto-start queue anchor — both read before
+    // the Config lock (rank order: KickBlockState 230, AutoStartQueue 240 < Config
+    // 400). The anchor is the CACHED one: `queue_anchor` would fall through to a
+    // history replay, which is not something a render loop can do.
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
+    let queue_anchor = queue_anchor_cached(&app.auto_start_queue);
 
     // `Add` arm must NOT hold the `config` guard — `add_detail` re-locks it via
     // `chain_candidates`, and the mutex is non-reentrant (deadlock on `+ add` row).
@@ -173,6 +176,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 let cfg = app.config();
                 let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
                 let kick_lift = kick_lifts.get(name.as_str()).copied();
+                let queue = QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(name.as_str());
                 let (lines, rows_start) = member_detail(
                     &cfg,
                     &name,
@@ -186,6 +190,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         width: inner_w,
                         kick_lift,
                         sessions: app.live_sessions.member(&name),
+                        queue,
                     },
                 );
                 (name.to_string(), true, lines, rows_start)
@@ -499,6 +504,10 @@ struct MemberCard<'a> {
     width: usize,
     kick_lift: Option<i64>,
     sessions: crate::live_sessions::MemberSessions,
+    /// This member's auto-start queue slot (`usage::auto_start_queue`),
+    /// resolved by the caller before the Config guard via [`QueueView`];
+    /// `None` when it holds none.
+    queue: Option<crate::usage::QueueSlot>,
 }
 
 /// Live-session count, 5h gauge with threshold tick, headroom figure, and the
@@ -519,6 +528,7 @@ fn member_detail(
         width,
         kick_lift,
         sessions,
+        queue,
     } = card;
     let Some(profile) = cfg.find(name) else {
         return (
@@ -568,6 +578,43 @@ fn member_detail(
     let live_lines = live_session_lines(sessions, width);
     if !live_lines.is_empty() {
         lines.extend(live_lines);
+        lines.push(Line::from(""));
+    }
+
+    // Auto-start queue slot, on the card that already spells out every other
+    // chain fact about this member. Its own `auto-start` key rather than a
+    // pill stacked into the block above: that block is the BLOCKED-reason
+    // ladder, and a queue slot is not a reason this member is being routed
+    // around. No tooltip line — the pill and the Config row's hint already say
+    // it, and this row sits above the fold on every member's card. Same block
+    // convention as the live-session one above — the row owns no padding, the
+    // trailing blank is emitted here.
+    if let Some(slot) = &queue {
+        let mut spans = vec![Span::styled(
+            key_cell("auto-start", KEY_W, KEY_GUTTER),
+            theme::label(),
+        )];
+        spans.extend(pill(
+            format!("queue {}/{}", slot.position, slot.total),
+            theme::accent(),
+        ));
+        // The countdown — the QUEUE's shared estimate, not this member's own
+        // turn — sits flush against the card's right edge, shedding its
+        // leading words when the card narrows so the digits survive at every
+        // operable width. Rendered inline it was the tail that clipped, and
+        // `next in 2h 26m` read `next in 2` on a narrow card.
+        if let Some(secs) = slot.next_in {
+            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let eta = humanize_duration(secs);
+            let fitting = [format!("next in {eta}"), format!("in {eta}"), eta]
+                .into_iter()
+                .find(|v| used + 1 + v.chars().count() <= width);
+            if let Some(text) = fitting {
+                spans.push(Span::raw(" ".repeat(width - used - text.chars().count())));
+                spans.push(Span::styled(text, theme::faint()));
+            }
+        }
+        lines.push(Line::from(spans));
         lines.push(Line::from(""));
     }
 

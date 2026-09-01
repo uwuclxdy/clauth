@@ -56,6 +56,25 @@ pub(crate) struct LiveSignals<'a> {
     /// `pending_switch`), so a reader can show in-flight truth instead of a
     /// timing heuristic. `None` for the single-shot `status --json` (no daemon).
     pub(crate) pending_switch: Option<&'a str>,
+    /// The scheduler's in-memory auto-start queue anchor
+    /// ([`crate::usage::queue_anchor_cached`]), so the published `next_open_at`
+    /// matches the value the election gates on. `None` while nothing has
+    /// opened — published as a `null` `next_open_at`, which reads as "due
+    /// now". The single-shot `status --json` has no scheduler and derives it
+    /// from the usage-history series instead ([`crate::usage::history_anchor`])
+    /// — one replay per invocation, a cost the per-tick daemon feed must not
+    /// pay.
+    pub(crate) queue_anchor: Option<i64>,
+    /// The scheduler's switch-grade kick blocks, as the names its own election
+    /// excludes from the queue ([`crate::usage::auto_start_queue_members`]'s
+    /// `blocked`). Carried here for the same reason as `queue_anchor`: the set
+    /// lives in the scheduler's memory, this builder holds no lock, and a
+    /// published queue that disagrees with the one being gated is the exact
+    /// divergence the shared membership rule was extracted to prevent. The
+    /// single-shot `status --json` has no scheduler and reads the same blocks
+    /// off their `kick_block.json` caches instead
+    /// ([`crate::usage::switch_grade_kick_blocked_from_cache`]).
+    pub(crate) queue_blocked: &'a [ProfileName],
 }
 
 fn fetch_status_str(s: FetchStatus) -> &'static str {
@@ -107,6 +126,20 @@ fn auth_status_str(config: &AppConfig, p: &Profile, now_ms: i64) -> &'static str
     "ok"
 }
 
+/// One profile's `auto_start_queue` object in `status.json`: the 1-based slot,
+/// and the queue's shared next-open ESTIMATE — the queue gates globally, so the
+/// stamp is when the NEXT window opens, whoever opens it, and a window opened
+/// out of band moves it as soon as the gate takes that opening up
+/// ([`crate::usage::queue_anchor`]). `next_open_at` is `null` only when no anchor is
+/// derivable yet (cold history); an anchored-but-due queue publishes
+/// `anchor + gap` even once that instant is past — readers compare it to now,
+/// exactly as wiki/Daemon.md contracts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct QueueEntry {
+    pub(crate) position: usize,
+    pub(crate) next_open_at: Option<String>,
+}
+
 /// One `profiles[]` entry of the published `status.json` body — the shape both
 /// the writer ([`build_profile_entries`], serialized by [`build_status`]) and
 /// the reader (`clauth list`'s table rows) derive from, so a reader's field
@@ -154,6 +187,12 @@ pub(crate) struct ProfileEntry {
     /// pending (a spent skipped account, or no cache).
     pub(crate) next_refresh_at: Option<String>,
     pub(crate) auto_start: bool,
+    /// Additive (schema stays 1): this profile's slot in the interleaved
+    /// auto-start queue, `None`/`null` when it holds none — the toggle is off,
+    /// it never opted into `auto_start`, or it cannot open a window.
+    /// `default` so a reader stays additive-tolerant of an older writer.
+    #[serde(default)]
+    pub(crate) auto_start_queue: Option<QueueEntry>,
     pub(crate) bell_threshold: Option<f64>,
     /// The chain-membership object (`position` / `threshold` / `armed`), `None`
     /// when not a chain member.
@@ -180,6 +219,34 @@ pub(crate) fn build_profile_entries(
     include_disabled: bool,
 ) -> Vec<ProfileEntry> {
     let now = now_ms();
+    // Interleaved auto-start queue (`usage::auto_start_queue`), hoisted so the
+    // membership and anchor are resolved once rather than per profile. Both
+    // inputs come from the same places the scheduler's own election reads them,
+    // so the published slot cannot disagree with the one being gated: a live
+    // daemon passes its in-memory blocks and anchor through `LiveSignals`, and
+    // the daemonless `status --json` re-derives each from disk — the
+    // `kick_block.json` caches the scheduler writes through, and the
+    // usage-history series. Both derivations are one pass per invocation, a
+    // cost the per-tick daemon feed must not pay.
+    let blocked = match live {
+        Some(l) => l.queue_blocked.to_vec(),
+        None => crate::usage::switch_grade_kick_blocked_from_cache(
+            &config
+                .profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+            (now / 1000) as i64,
+        ),
+    };
+    let queue_members = crate::usage::auto_start_queue_members(config, &blocked);
+    let queue_anchor = match live {
+        Some(l) => l.queue_anchor,
+        None => crate::usage::history_anchor(&queue_members),
+    };
+    let next_queue_open =
+        crate::usage::next_queue_open_secs(queue_anchor, queue_members.len(), interval_ms)
+            .and_then(|s| u64::try_from(s.saturating_mul(1000)).ok());
     config
         .profiles
         .iter()
@@ -318,6 +385,13 @@ pub(crate) fn build_profile_entries(
                 fetched_at: mtime_ms.map(iso_from_ms),
                 next_refresh_at: next_refresh_ms.map(iso_from_ms),
                 auto_start: p.auto_start,
+                auto_start_queue: queue_members
+                    .iter()
+                    .position(|n| n.as_str() == name.as_str())
+                    .map(|i| QueueEntry {
+                        position: i + 1,
+                        next_open_at: next_queue_open.map(iso_from_ms),
+                    }),
                 bell_threshold: p.bell_threshold,
                 fallback: fallback_json(config, p),
                 windows: published_windows(name),

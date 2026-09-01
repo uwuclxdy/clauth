@@ -46,7 +46,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let rows = {
-        let state = &app.config().state;
+        let cfg = app.config();
+        let state = &cfg.state;
         RowState {
             switch_off_when_spent: state.switch_off_when_spent,
             burn_aware: state.burn_aware_switching,
@@ -54,6 +55,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
             refresh_spent: state.refresh_spent_accounts,
+            auto_start_queue: state.auto_start_queue,
+            any_auto_start: cfg.profiles.iter().any(|p| p.auto_start),
             reset_display: state.reset_display(),
             clock_format: state.clock_format(),
         }
@@ -170,6 +173,11 @@ struct RowState {
     switch_off_when_budget_spent: bool,
     preemptive: bool,
     refresh_spent: bool,
+    auto_start_queue: bool,
+    /// Whether ANY account has opted into `auto_start` — the queue toggle is
+    /// inert without one (there is nothing to space), so the row dims and its
+    /// key no-ops, like every other row another setting makes inert.
+    any_auto_start: bool,
     reset_display: ResetDisplay,
     clock_format: ClockFormat,
 }
@@ -270,6 +278,11 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             "keep checking accounts that are already at 100%"
         } else {
             "skip refreshing a spent account until its window resets"
+        }),
+        GlobalConfigRow::AutoStartQueue => String::from(if rows.auto_start_queue {
+            "space auto-start windows evenly, so one resets every 5h / accounts"
+        } else {
+            "auto-start usage windows as soon as possible"
         }),
     };
     Some(tip)
@@ -413,6 +426,17 @@ fn detail_row(
         }
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
+        }
+        // Inert until some account opts into `auto_start` (rendered dimmed):
+        // a queue with no possible member spaces nothing, so it stays a true
+        // disabled row — the key is a no-op, and `faint` never decouples from
+        // "not editable" (the `extra usage spent` contract above).
+        GlobalConfigRow::AutoStartQueue => {
+            if rows.any_auto_start {
+                toggle_row(arrow, "auto-start queue", rows.auto_start_queue, selected)
+            } else {
+                dimmed_toggle_row("auto-start queue", rows.auto_start_queue, selected)
+            }
         }
     }
 }
@@ -685,6 +709,28 @@ fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line
         arrow,
         Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
         Span::styled(value.to_string(), theme::faint()),
+    ])
+}
+
+/// [`dimmed_cycle_row`]'s toggle sibling: the whole row — caret, key, knob —
+/// renders `TEXT_FAINT`, keeping the current value visible with no accent even
+/// while on. Focusable but inert (the key handler no-ops it), so `TEXT_FAINT`
+/// keeps meaning "can't touch this".
+fn dimmed_toggle_row(key: &str, on: bool, selected: bool) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled("❯ ", theme::faint())
+    } else {
+        Span::raw("  ")
+    };
+    let glyph = if on {
+        theme::toggle_on()
+    } else {
+        theme::toggle_off()
+    };
+    Line::from(vec![
+        arrow,
+        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
+        Span::styled(glyph, theme::faint()),
     ])
 }
 

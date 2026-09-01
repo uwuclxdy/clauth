@@ -4369,6 +4369,51 @@ fn spend_budget_space_toggles_and_persists() {
     );
 }
 
+/// The `auto-start queue` row is inert (dimmed) until some account opts into
+/// `auto_start` — a queue with no possible member spaces nothing, so space on
+/// it must not arm a control with nothing behind it. One opted-in account
+/// makes the same key toggle and persist.
+#[test]
+fn auto_start_queue_space_noops_until_an_account_opts_in() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![Profile::new("kitty".to_string(), None, None)],
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::AutoStartQueue)
+        .unwrap();
+    assert!(
+        !app.config().state.auto_start_queue,
+        "the queue defaults off"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.auto_start_queue,
+        "space no-ops while no account has auto-start on"
+    );
+
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&"kitty".into()).unwrap().auto_start = true;
+    }
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        app.config().state.auto_start_queue,
+        "with an opted-in account space arms the queue"
+    );
+    let reloaded: AppState = toml::from_str(
+        &std::fs::read_to_string(crate::profile::clauth_dir().unwrap().join("profiles.toml"))
+            .expect("read profiles.toml"),
+    )
+    .expect("parse profiles.toml");
+    assert!(reloaded.auto_start_queue, "the toggle persists to disk");
+}
+
 // `money spent` is its own row, not an alias of `quota spent`: staying is free
 // when quota runs out and costs money when a budget does, so the two must be
 // settable in opposite directions.

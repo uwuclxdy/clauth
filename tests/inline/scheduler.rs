@@ -22,6 +22,7 @@ fn token(name: &str) -> TokenEntry {
         auto_start: false,
         access_expires_at: None,
         auth_broken: false,
+        may_open_window: true,
     }
 }
 
@@ -42,6 +43,13 @@ fn oauth_profile_disabled(name: &str, disabled: bool) -> crate::profile::Profile
     });
     p.disabled = disabled;
     p
+}
+
+/// An enabled OAuth profile that opts into both auto-start and its queue.
+fn auto_start_queue_profile(name: &str) -> crate::profile::Profile {
+    let mut profile = oauth_profile_disabled(name, false);
+    profile.auto_start = true;
+    profile
 }
 
 // A disabled account must not enter the scheduler's per-profile work list at
@@ -1271,43 +1279,53 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
 fn kick_suppressed_during_rate_limit_streak() {
     use super::should_open_window;
 
-    // args: (streak, window_lapsed, kick_due, has_block)
+    // args: (streak, window_lapsed, kick_due, has_block, queue_due)
     assert!(
-        should_open_window(0, true, true, false),
+        should_open_window(0, true, true, false, true),
         "lapsed + no streak → open"
     );
     assert!(
-        !should_open_window(1, true, true, false),
+        !should_open_window(1, true, true, false, true),
         "lapsed but 429-streaking → suppress the kick"
     );
     assert!(
-        !should_open_window(5, true, true, false),
+        !should_open_window(5, true, true, false, true),
         "deep streak → still suppressed"
     );
     assert!(
-        !should_open_window(0, false, true, false),
+        !should_open_window(0, false, true, false, true),
         "a live window with no block never kicks"
     );
     assert!(
-        should_open_window(0, false, true, true),
+        should_open_window(0, false, true, true, true),
         "a live window WITH a standing block re-tests it — the window can be a \
          Claude-web open while Claude Code stays 429'd, so only a landed kick \
          proves the block is gone"
     );
     assert!(
-        should_open_window(0, false, false, true),
+        should_open_window(0, false, false, true, true),
         "a live-window block re-tests on the POLL cadence, not the deep kick \
          backoff — the window reopened (maybe via web), so recovery may be \
          imminent and we must not wait out the ~15min ladder"
     );
     assert!(
-        !should_open_window(1, false, false, true),
+        !should_open_window(1, false, false, true, true),
         "but a /usage 429-streak still suppresses even the live-window re-test"
     );
     assert!(
-        !should_open_window(0, true, false, true),
+        !should_open_window(0, true, false, true, true),
         "a LAPSED-window kick-429 block whose retry isn't due still waits its \
          backoff — no reopened-window signal, so don't re-hit a dead endpoint"
+    );
+    assert!(
+        !should_open_window(0, true, true, false, false),
+        "the queue gate holds the LAPSED leg: an unelected member with a \
+         lapsed window and a due kick clock still may not open"
+    );
+    assert!(
+        should_open_window(0, false, true, true, false),
+        "…and only the lapsed leg: the live-window re-test is a health probe \
+         the queue must never delay"
     );
 }
 
@@ -1350,7 +1368,8 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &live_store(),
             &blocked,
             &crate::profile::ProfileName::from("a"),
-            now
+            now,
+            true
         ),
         "a live window with a standing block re-tests it — the fix"
     );
@@ -1362,7 +1381,8 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &live_store(),
             &clean,
             &crate::profile::ProfileName::from("a"),
-            now
+            now,
+            true
         ),
         "a healthy live window with no block must not kick"
     );
@@ -3968,6 +3988,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -4058,6 +4079,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -4151,6 +4173,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -4252,6 +4275,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -4366,6 +4390,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -4401,6 +4426,338 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         seen.len(),
         1,
         "a second tick inside the cadence window must not re-fetch: {seen:?}"
+    );
+}
+
+/// Production wiring pin for the queue election. Both lapsed members are due,
+/// but `tick` must elect exactly one BEFORE the OAuth fan-out; without that call
+/// both permissive `TokenEntry` snapshots kick and open together.
+#[test]
+fn auto_start_queue_election_is_wired_into_tick() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":1.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    // A correct run makes five requests (one kick, two usage, two profile).
+    // Six leaves room to record the second kick when the election wiring is
+    // removed: the listener, rather than a refused socket, then catches it.
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a"), auto_start_queue_profile("b")],
+    };
+    let tokens = super::collect_tokens(&app_config);
+    let lapsed = || UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+        }),
+        ..UsageInfo::default()
+    };
+    let store = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), lapsed()),
+        ("b".to_string(), lapsed()),
+    ])));
+    let auto_start_queue = crate::usage::new_auto_start_queue_state();
+    let state = super::SchedulerState {
+        config: Arc::new(RankedMutex::new(app_config)),
+        tokens: Arc::new(RankedMutex::new(tokens)),
+        store: store.clone(),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: auto_start_queue.clone(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+    };
+
+    super::tick(&state);
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|path| path.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "the tick elects one opener before the fan-out: {seen:?}"
+    );
+    assert!(
+        crate::usage::queue_anchor_cached(&auto_start_queue).is_some(),
+        "the elected kick moves the scheduler's shared queue anchor"
+    );
+    assert!(
+        !super::window_lapsed(&store, &"a".into(), crate::usage::now_epoch_secs()),
+        "the first queue member is elected and its stored window opens"
+    );
+}
+
+/// The landed-kick path distinguishes a live-window health re-test from a real
+/// lapsed-window open. Only the latter may move the queue anchor or emit the
+/// queue-open event, and the anchor must carry the real wall clock (not epoch 0).
+#[test]
+fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":1.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    let mut entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("queued token");
+    entry.may_open_window = true;
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 4.0,
+                resets_at: Some(epoch_secs_to_iso(now_before + 3600)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::KickBlock {
+            streak: 1,
+            rejected: false,
+            until: None,
+            next_retry: now_before + 600,
+        },
+    )])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    crate::usage::note_queue_open(&queue, &"a".into(), 42);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let _live = super::run_fetch(
+        &config,
+        entry.clone(),
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&queue),
+        Some(42),
+        "a successful live-window re-test opens nothing and cannot re-phase the queue"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .all(|line| !line.contains("5h auto-start window opened")),
+        "the live-window re-test must not claim a queue open: {:?}",
+        lines.snapshot()
+    );
+
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let lapsed_started = crate::usage::now_epoch_secs();
+    let _lapsed = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    let anchor = crate::usage::queue_anchor_cached(&queue).expect("landed lapsed kick anchor");
+    assert!(
+        anchor >= lapsed_started,
+        "the anchor carries the landed kick's wall clock, got {anchor} before {lapsed_started}"
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("5h auto-start window opened"))
+            .count(),
+        1,
+        "exactly the lapsed leg emits the queue-open event: {:?}",
+        lines.snapshot()
+    );
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|path| path.starts_with("/v1/messages"))
+            .count(),
+        2,
+        "both the health re-test and lapsed open reach the kick endpoint: {seen:?}"
+    );
+}
+
+/// A failed elected kick is health state for that exact member. Keying the
+/// streak on a sibling would let the failed head keep winning forever.
+#[test]
+fn auto_start_queue_run_fetch_keys_a_failed_kick_to_the_elected_member() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(4, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (403, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["elected".into(), "sibling".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![
+            auto_start_queue_profile("elected"),
+            auto_start_queue_profile("sibling"),
+        ],
+    };
+    let entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .find(|entry| entry.name == "elected")
+        .expect("elected token");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "elected".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let _outcome = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    let recorded_at = crate::usage::now_epoch_secs();
+    assert_eq!(
+        crate::usage::queue_failures(&queue, &"elected".into(), recorded_at),
+        1,
+        "the failed elected member owns the streak"
+    );
+    assert_eq!(
+        crate::usage::queue_failures(&queue, &"sibling".into(), recorded_at),
+        0,
+        "the untouched sibling owns no failure"
+    );
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|path| path.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "the elected member made one failed kick attempt: {seen:?}"
     );
 }
 
@@ -4604,6 +4961,7 @@ fn completion_order_state() -> super::SchedulerState {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -5280,6 +5638,7 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::clone(&kick_blocks),
+        crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -5650,6 +6009,7 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
+        crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
@@ -5792,6 +6152,7 @@ fn a_401_under_a_live_session_rotates_and_retries() {
         auto_start: false,
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
+        may_open_window: true,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -5924,6 +6285,7 @@ fn a_401_under_a_live_session_does_not_rotate_on_macos() {
         auto_start: false,
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
+        may_open_window: true,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -6040,6 +6402,7 @@ fn rotation_entry(name: &str, access_expires_at: Option<i64>) -> super::TokenEnt
         auto_start: false,
         access_expires_at,
         auth_broken: false,
+        may_open_window: true,
     }
 }
 
@@ -7276,5 +7639,316 @@ fn claude_rolling_tick_drops_retry_state_for_departed_profiles() {
     assert!(
         !p.retry_after_ms.contains_key("cl-deleted"),
         "a departed profile's stamp is swept on the next scan"
+    );
+}
+
+/// `elect_auto_start_queue`: the tick-level half of the interleaved auto-start queue
+/// (`usage::auto_start_queue`). Its whole job is to narrow the permissive `may_open_window`
+/// that `collect_tokens` sets down to at most ONE member per tick — the
+/// serialisation that stops `fetch_oauth_due_with`'s per-profile workers from
+/// each opening a window in the same tick.
+///
+/// Also pins the two sizing rules the gap depends on: queue size comes from the
+/// SNAPSHOT (every participating member) rather than from the due list (only
+/// this tick's cadence slots), and a member that cannot kick at all is excluded
+/// so the queue does not reserve a slot for a corpse.
+#[test]
+fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let now = crate::usage::now_epoch_secs();
+    let warming = |name: &str| {
+        let mut e = token(name);
+        e.auto_start = true;
+        e
+    };
+    // Queue MEMBERSHIP comes from the config (`usage::auto_start_queue::auto_start_queue_members`, the
+    // rule the `status.json` feed and the TUI's chips read too); the snapshot
+    // below is the work-list the election narrows.
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            // Opt in: the queue is default-off, and this test is the queue.
+            auto_start_queue: true,
+            ..Default::default()
+        },
+        profiles: vec![opted_in("a"), opted_in("b"), opted_in("c")],
+    }));
+
+    // All three have fetched, all three have lapsed windows: every one wants a
+    // kick, so only the queue can be what holds two of them back.
+    let lapsed = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now - 60)),
+        }),
+        ..Default::default()
+    };
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), lapsed.clone()),
+        ("b".to_string(), lapsed.clone()),
+        ("c".to_string(), lapsed.clone()),
+    ])));
+
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store,
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+    };
+
+    let snapshot = vec![warming("a"), warming("b"), warming("c")];
+
+    // Cold queue, nothing persisted: the chain head opens, the other two hold.
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    let elected: Vec<&str> = due
+        .iter()
+        .filter(|e| e.may_open_window)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        elected,
+        vec!["a"],
+        "exactly one member opens per tick, and it is the chain head"
+    );
+
+    // Inside the gap (a member opened a moment ago): NOBODY opens this tick.
+    // This is the spacing itself — without it all three reopen together and the
+    // whole feature is a no-op.
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - 60);
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| !e.may_open_window),
+        "inside the gap no member may open a window"
+    );
+
+    // One gap later the queue is due again. N=3 → 5h/3 less the tick tolerance.
+    let gap = crate::usage::queue_gap_secs(3, REFRESH_INTERVAL_MS);
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - gap);
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert_eq!(
+        due.iter().filter(|e| e.may_open_window).count(),
+        1,
+        "once the gap has passed exactly one member opens again"
+    );
+
+    // Queue size is read off the whole QUEUE, not the due list: with only one
+    // member due this tick the gap must still be 5h/3, not 5h/1. Anchored just
+    // PAST the 3-member gap and asserted in the ELECT direction: the
+    // right-sized gap elects `c`, while a gap wrongly sized off the 1-member
+    // due list (5h less tolerance) would still hold. The hold direction could
+    // not catch that mutant — `due` is a subset of the queue, so its gap is
+    // always the larger one.
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - gap - 60);
+    let mut only_c = vec![warming("c")];
+    super::elect_auto_start_queue(&state, &mut only_c, REFRESH_INTERVAL_MS, now);
+    assert!(
+        only_c[0].may_open_window,
+        "the gap is sized from the whole queue, so just past 5h/3 the lone due member opens"
+    );
+
+    // A member that cannot kick is not a queue member: quarantining the head
+    // shrinks N to 2, which widens the gap, and hands the slot to `b`. The
+    // quarantined profile itself is left UNSTAMPED — outside the queue the
+    // election neither gates nor grants, so it keeps the permissive flag
+    // `collect_tokens` set and keeps retrying on its own `kick_retry_due`
+    // ladder. Stamping it false would deny it the lapsed leg on every tick,
+    // permanently: only a landed kick clears a block.
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.set_auth_broken(&"a".into(), true);
+    }
+    state.auto_start_queue.lock().unwrap().last_open_at = None;
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    let may_open: Vec<&str> = due
+        .iter()
+        .filter(|e| e.may_open_window)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        may_open,
+        vec!["a", "b"],
+        "`b` is elected; auth-broken `a` holds no slot but keeps its \
+         permissive out-of-queue flag"
+    );
+    assert!(
+        !due.iter().any(|e| e.name == "c" && e.may_open_window),
+        "the unelected MEMBER is the one the election holds"
+    );
+
+    // Back to a whole 3-member queue for the two history-derived legs.
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.set_auth_broken(&"a".into(), false);
+    }
+    // An open NOBODY here fired: `c`'s window was opened out of band ten
+    // minutes ago (a real Claude Code session on that account), and the only
+    // record of it is the history series the poller writes. Seeded through the
+    // real writer so the bridge lines are present.
+    let reading = |reset: i64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(reset)),
+        }),
+        ..Default::default()
+    };
+    let out_of_band = now - 600;
+    let boundary = out_of_band + 5 * 3600;
+    let mut prev: Option<UsageInfo> = None;
+    for (ts, reset) in [
+        (now - 180, boundary),
+        (now - 90, boundary - 1),
+        (now, boundary),
+    ] {
+        let next = reading(reset);
+        crate::profile::append_usage_sample_at(&"c".into(), prev.as_ref(), &next, ts as u64 * 1000);
+        prev = Some(next);
+    }
+
+    // Nothing lapsed: every window is live, so no member wants one opened. The
+    // election answers without touching the anchor — an empty anchor stays
+    // empty even though the series above would have filled it. That skip is
+    // what keeps the replay off the majority of ticks (all windows live is the
+    // long middle of every cycle) while leaving the gate's answer identical:
+    // an election no one can win stamps every member shut regardless.
+    let live = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    if let Ok(mut m) = state.store.lock() {
+        for name in ["a", "b", "c"] {
+            m.insert(name.to_string(), live.clone());
+        }
+    }
+    state.auto_start_queue.lock().unwrap().last_open_at = None;
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| !e.may_open_window),
+        "with nothing lapsed no member is elected"
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&state.auto_start_queue),
+        None,
+        "and the anchor is never derived on a tick that could not elect anyone"
+    );
+
+    // Now they lapse, with our own anchor a full gap stale — the pre-fix state
+    // that let the next member kick seconds after `c`'s out-of-band open and
+    // re-collapse the two windows. The series is the only thing that knows.
+    if let Ok(mut m) = state.store.lock() {
+        for name in ["a", "b", "c"] {
+            m.insert(name.to_string(), lapsed.clone());
+        }
+    }
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - gap - 60);
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| !e.may_open_window),
+        "an out-of-band open gates the queue exactly as one of our own kicks does"
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&state.auto_start_queue),
+        Some(out_of_band),
+        "and it becomes the anchor the next gap is measured from"
+    );
+}
+
+/// The toggle is a real off switch: with `auto_start_queue` false every entry
+/// keeps the permissive `may_open_window` `collect_tokens` set, which is exactly the
+/// pre-queue behaviour (every lapsed window reopens on its own tick).
+#[test]
+fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let now = crate::usage::now_epoch_secs();
+    // Both accounts opted in and eligible: with the toggle ON they would be a
+    // real 2-member queue, so an empty `may_open_window` set below could only come
+    // from the toggle itself.
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            auto_start_queue: false,
+            ..Default::default()
+        },
+        profiles: vec![opted_in("a"), opted_in("b")],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+    };
+
+    let mut a = token("a");
+    a.auto_start = true;
+    let mut b = token("b");
+    b.auto_start = true;
+    let mut due = vec![a, b];
+    // Anchor pinned to now: with the queue ON this would hold everyone.
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now);
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| e.may_open_window),
+        "with the toggle off the queue never narrows anything"
     );
 }

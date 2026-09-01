@@ -109,6 +109,7 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
+| `auto-start queue` | space opted-in accounts' 5h window opens across one shared queue | off |
 | `rotation` | `preemptive`, `lazy` | `preemptive` |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |

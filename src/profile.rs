@@ -742,6 +742,19 @@ pub(crate) struct AppState {
     /// switch/fallback predicates. See `usage::scheduler` + `windows_maxed`.
     #[serde(default = "default_refresh_spent", skip_serializing_if = "is_true")]
     pub(crate) refresh_spent_accounts: bool,
+    /// Interleave the `auto_start` auto-start kick across accounts, so their 5h
+    /// windows open at least `5h / N` less a tick's tolerance apart instead of
+    /// all at once, and a freshly reset account is within reach every cycle
+    /// (`usage::auto_start_queue`).
+    ///
+    /// Default OFF: nobody's behaviour changes on upgrade. For N >= 2 the
+    /// toggle visibly changes what `auto_start` does — windows stop resetting
+    /// together, and a burst across every account at once waits up to
+    /// `(N-1) * gap` for the last auto-start (nothing breaks: real usage still
+    /// opens a window on demand). Accounts that never opted into `auto_start`
+    /// are untouched either way.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) auto_start_queue: bool,
     /// Config-file theme override. CLI `--theme` flag takes priority; auto-
     /// detect applies when this is `None` and no flag was passed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -976,6 +989,7 @@ impl Default for AppState {
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),
             refresh_spent_accounts: true,
+            auto_start_queue: false,
             theme: None,
             reset_display: None,
             clock_format: None,
@@ -1514,6 +1528,21 @@ fn history_append_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// a sidecar lock on both sides is the upgrade path if that ever stops being
 /// acceptable (flocking the log itself cannot work: the rename swaps the inode).
 pub(crate) fn append_usage_sample(name: &ProfileName, prev: Option<&UsageInfo>, next: &UsageInfo) {
+    append_usage_sample_at(name, prev, next, crate::usage::now_ms());
+}
+
+/// Time-injected body of [`append_usage_sample`] — the seam that lets a test
+/// seed a history file through the REAL writer, bridge lines included, at
+/// controlled timestamps. The queue classifier's pins go through here so they
+/// cover the shape the writer actually produces rather than a handwritten
+/// fixture (review round 2: the fixtures omitted bridges, and the classifier
+/// self-confirmed on real files while its tests stayed green).
+pub(crate) fn append_usage_sample_at(
+    name: &ProfileName,
+    prev: Option<&UsageInfo>,
+    next: &UsageInfo,
+    ts: u64,
+) {
     let Ok(next_json) = serde_json::to_string(next) else {
         return;
     };
@@ -1541,7 +1570,6 @@ pub(crate) fn append_usage_sample(name: &ProfileName, prev: Option<&UsageInfo>, 
     let name_json = serde_json::to_string(name).unwrap_or_else(|_| format!("\"{name}\""));
     let line =
         |ts: u64, usage: &str| format!("{{\"ts\":{ts},\"name\":{name_json},\"usage\":{usage}}}\n");
-    let ts = crate::usage::now_ms();
     let mut body = match &bridge_json {
         Some(json) => line(ts.saturating_sub(1), json),
         None => String::new(),

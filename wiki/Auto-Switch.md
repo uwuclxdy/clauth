@@ -94,6 +94,10 @@ The ceiling is a real stop, not just a gate on starting: once the account has sp
 
 An armed account with `extra usage spent` set to `stay on active` and no `last resort` member in the chain can spend without a stop. clauth marks that on the card and the daemon warns about it at boot.
 
+## Keeping the chain warm
+
+An account's 5h window opens on its first real request, so a chain member you have not touched starts its clock only when the chain lands on it — and then holds you there for a full five hours before it resets. `auto_start` ([Configuration](Configuration#auto-start-the-5-hour-window)) opens that window ahead of time with a one-token ping, and `warmup_stagger` spaces those opens `5h / N` apart across the accounts that opted in, so whichever member the chain hops to has usually been cycling already and resets sooner. Both are independent of the chain itself: warm-up never switches anything, and the walk never consults it.
+
 ## Running it
 
 The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` with the TUI closed ([Daemon](Daemon)). Only one of them decides at a time.

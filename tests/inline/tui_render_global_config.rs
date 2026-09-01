@@ -31,6 +31,8 @@ fn toggles() -> RowState {
         switch_off_when_budget_spent: true,
         preemptive: false,
         refresh_spent: true,
+        auto_start_queue: true,
+        any_auto_start: true,
         reset_display: ResetDisplay::Relative,
         clock_format: ClockFormat::H24,
     }
@@ -189,6 +191,48 @@ fn edit_line_buffer_starts_at_the_value_column() {
     }
 }
 
+/// `auto-start queue` is a pure on/off toggle, and BOTH hint strings are
+/// pinned whole: this row is the queue's only control, so a reworded hint is a
+/// user-facing change nothing else would catch.
+#[test]
+fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let on = line_text(&detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        toggles(),
+        tunables(),
+        None,
+    ));
+    assert!(on.contains("auto-start queue"), "{on}");
+    assert!(on.contains(theme::toggle_on()), "on state glyph: {on}");
+
+    let mut off = toggles();
+    off.auto_start_queue = false;
+    let off_line = line_text(&detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        off,
+        tunables(),
+        None,
+    ));
+    assert!(
+        off_line.contains(theme::toggle_off()),
+        "off state glyph: {off_line}"
+    );
+
+    assert_eq!(
+        row_hint(GlobalConfigRow::AutoStartQueue, toggles(), tunables()).as_deref(),
+        Some("space auto-start windows evenly, so one resets every 5h / accounts"),
+    );
+    let mut off = toggles();
+    off.auto_start_queue = false;
+    assert_eq!(
+        row_hint(GlobalConfigRow::AutoStartQueue, off, tunables()).as_deref(),
+        Some("auto-start usage windows as soon as possible"),
+    );
+}
+
 /// `refresh spent` is a pure on/off boolean — a cloudy-tui toggle (`─●` / `○─`),
 /// not a 2-option cycle row (`[on]  off`).
 #[test]
@@ -223,6 +267,45 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
     assert!(
         !off_line.contains("  on"),
         "must not render the cycle on-option: {off_line}"
+    );
+}
+
+/// With no account opted into `auto_start` there is nothing to space, so the
+/// queue row renders as a cloudy-tui disabled row (whole content faint, knob
+/// included) — it must never read as an armed setting. One opted-in account
+/// makes it a live toggle again.
+#[test]
+fn auto_start_queue_dims_when_no_account_opts_in() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut none_opted = toggles();
+    none_opted.any_auto_start = false;
+    let dimmed = detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        none_opted,
+        tunables(),
+        None,
+    );
+    assert!(
+        dimmed
+            .spans
+            .iter()
+            .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
+        "every content span must be faint while inert: {:?}",
+        dimmed.spans,
+    );
+
+    let live = detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        toggles(),
+        tunables(),
+        None,
+    );
+    assert!(
+        live.spans.iter().any(|s| s.style.fg == theme::accent().fg),
+        "an opted-in account brings the on-state knob back to accent: {:?}",
+        live.spans,
     );
 }
 
