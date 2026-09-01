@@ -161,9 +161,11 @@ pub(crate) type KickBlocks = Arc<RankedMutex<HashMap<String, KickBlock>, rank::K
 
 /// Profiles owed one weekly-reset re-test kick: their fresh usage body just
 /// showed the aggregate 7d window roll over while it had been pinned at the
-/// hard cap (see [`weekly_reset_pending`]). In-memory only — the mark rides
-/// one tick, and the standing re-test leg (`has_block`) still covers the
-/// account's recovery if the process dies between the rollover and the kick.
+/// hard cap (see [`weekly_reset_pending`]). In-memory only — a process death
+/// between the rollover and the kick loses the re-test until the next
+/// rollover (the rolled-over body is persisted in the same call, so nothing
+/// re-observes the crossing), and the standing re-test leg (`has_block`)
+/// continues the retry only where a block already stands.
 /// Leaf like [`KickBlocks`].
 pub(crate) type WeeklyResetKicks = Arc<RankedMutex<HashSet<ProfileName>, rank::WeeklyResetKicks>>;
 

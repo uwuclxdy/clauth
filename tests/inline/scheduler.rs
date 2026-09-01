@@ -1624,6 +1624,10 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
     );
 
     // A cached bail recycles the on-disk snapshot: never a rollover observer.
+    // The mark holds even with the store seeded with a spent prev, because
+    // `apply_outcome` reads `prev` only for fresh bodies — the same is_fresh
+    // gate the mark condition carries, so the two cannot disagree.
+    store.lock().unwrap().insert("w".to_string(), prev);
     let mut cached = rolled.clone();
     cached.seven_day = Some(week(0.0, 3600 + 7 * 86_400));
     apply_outcome(
@@ -1668,6 +1672,192 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
     assert!(
         weekly_reset_kicks.lock().unwrap().is_empty(),
         "a soft-line rollover sets no mark"
+    );
+}
+
+/// The consume is load-bearing: a fired kick (any leg) clears the weekly-reset
+/// mark, a REFUSED kick leaves it standing for the next tick. Without the
+/// clear the pending leg re-kicks every due tick for the process lifetime —
+/// the per-tick storm the scheduler doc forbids. Mutation: deleting the
+/// `pending.remove` call in `run_fetch` reds this test.
+#[test]
+fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{StreakCounts, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now_before + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    let entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("queued token");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 4.0,
+                resets_at: Some(epoch_secs_to_iso(now_before + 3600)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::from([
+        crate::profile::ProfileName::from("a"),
+    ])));
+    let queue = crate::usage::new_auto_start_queue_state();
+
+    // Live window + pending mark + no block: the pending leg fires the kick
+    // and the mark is consumed.
+    let _ = super::run_fetch(
+        &config,
+        entry.clone(),
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a fired kick consumes the weekly-reset mark"
+    );
+
+    // Re-arm the mark under a 429-streak: the kick is refused before it can
+    // fire, so the mark must survive for the next tick.
+    weekly_reset_kicks
+        .lock()
+        .unwrap()
+        .insert(crate::profile::ProfileName::from("a"));
+    streaks.lock().unwrap().insert(
+        "a".to_string(),
+        StreakCounts {
+            rate_limit: 1,
+            refresh_fail: 0,
+        },
+    );
+    let _ = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert!(
+        weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("a")),
+        "a refused kick leaves the mark standing for the next tick"
+    );
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "exactly one kick fired across both legs: {seen:?}"
+    );
+}
+
+/// The arming path production uses runs through the drain's config read: a
+/// FRESH rolled-over outcome arms the mark for the profile the CONFIG says is
+/// opted in. Guards the `(is_active, auto_start)` plumbing
+/// `apply_outcome`'s own test can't reach, since nothing else in the tree
+/// drives `drain_oauth_completions` with a live config.
+#[test]
+fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
+    use super::FetchOutcome;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    state.config.lock().unwrap().profiles = vec![auto_start_queue_profile("w")];
+    state.store.lock().unwrap().insert("w".to_string(), spent());
+
+    let run = |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        refresh_failed: false,
+        plan_override: None,
+        retry_after: None,
+    };
+    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
+    assert!(
+        state
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w")),
+        "an opted-in profile's rolled-over body arms the mark through the drain"
+    );
+
+    // Opt out and re-run: the drain's config read must hold the mark back.
+    state.weekly_reset_kicks.lock().unwrap().clear();
+    state.config.lock().unwrap().profiles = vec![oauth_profile_disabled("w", false)];
+    state.store.lock().unwrap().insert("w".to_string(), spent());
+    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
+    assert!(
+        state.weekly_reset_kicks.lock().unwrap().is_empty(),
+        "an opted-out profile arms no mark"
     );
 }
 

@@ -76,8 +76,9 @@ struct HeaderState {
     /// The shown profile's auto-start queue slot, resolved before the Config
     /// guard (rank order) like the chain card used to; `None` when the queue
     /// toggle is off or the profile holds no slot. The `usage auto-start`
-    /// countdown on the `plan` row falls back to the profile's own window reset
-    /// when it is `None`.
+    /// countdown on the `plan` row combines the slot's shared gate estimate
+    /// with the profile's own window reset (the LATER wins — see `kick_text`),
+    /// and reads the reset alone when this is `None`.
     queue_slot: Option<QueueSlot>,
 }
 
