@@ -1006,6 +1006,7 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
 /// The poll helper: wait until a runtime settings.json appears under
 /// `profile_dir`, then return its content. Bounded so a fixture that never
 /// merges fails the test instead of hanging the suite.
+#[cfg(unix)]
 pub(crate) fn runtime_settings_until(profile_dir: &std::path::Path) -> Option<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
@@ -1039,6 +1040,7 @@ pub(crate) fn runtime_settings_until(profile_dir: &std::path::Path) -> Option<St
 /// [`HomeSandbox`] whose `HOME_TEST_LOCK` serializes every other env pin in
 /// the suite — the same shape `FakeClaude` uses; this one differs only in
 /// keeping the final child alive.
+#[cfg(unix)]
 pub(crate) struct SlowClaude<'a> {
     _home: std::marker::PhantomData<&'a HomeSandbox>,
     _tmp: tempfile::TempDir,
@@ -1048,6 +1050,7 @@ pub(crate) struct SlowClaude<'a> {
     prev_runtime: Option<std::ffi::OsString>,
 }
 
+#[cfg(unix)]
 impl<'a> SlowClaude<'a> {
     #[expect(
         unsafe_code,
@@ -1094,6 +1097,7 @@ impl<'a> SlowClaude<'a> {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SlowClaude<'_> {
     #[expect(
         unsafe_code,
