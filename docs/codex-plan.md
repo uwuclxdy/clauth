@@ -163,6 +163,7 @@ The rest of the sweep has no codex multiplier; all but three rows landed 2026-08
 | burn rate + ETA | port unchanged (`burn.rs` is label-driven and names no window) |
 | `status.json` / `which --json` / `list_profiles` / completions | ADDITIVE codex fields, schema stays 1 |
 | TUI `c codex` / `c claude` filter + header chip | in scope |
+| TUI Overview active-account marker animation | in scope: `⬢`/`⬣` beside the active codex account; claude side TBD, its glyphs captured from a live CC session |
 | daemon version in the feed + an old-daemon warning line | in scope |
 | per-session fallback / `SessionSwap` / `--with-fallback` | SKIP, refuse on a codex profile |
 | settings sync / `.claude.json` sync | SKIP codex |
@@ -201,7 +202,7 @@ Both fail closed already: `load_config` builds `AppConfig.profiles` from `profil
 3. **Codex runtime.** Per-session home per the table above, `CODEX_HOME` pin, forced file store, config copy, the symlink set, the scrub list including `CODEX_HOME`, teardown sync-back, the `--with-fallback` refusal.
 4. **Codex refresh** under `RotationGuard`, with the no-replay-on-error rule and the 5-minute pre-expiry stand-down. Plus the contributor's health-triggered kick: a `PollError::Unauthorized` feeds a set the standby leg drains and force-refreshes, bypassing ONLY the age gate, with a consecutive-kick breaker (2, reset on any successful poll). Naming: this is unrelated to the claude 5h-window kick.
 5. **Codex usage leg** (`wham/usage`) plus the chain member. Windows map by duration onto the named slots: over 24h to the weekly slot, otherwise the 5h slot, with a positional fallback and a collision rule, then `rate_limit_reached_type` renamed to the slot its window landed in. `plan_type` from the response body is authoritative over the id_token claim. Disarm `check_scoped` for codex members. Fold fix 1 here. Watch `parse_nh_nd_label` (`fetch.rs:498-503`): it accepts whole-hour and whole-day labels only, so a 90-minute codex window silently drops the pace line.
-6. **Published surface and parity.** Additive codex fields in `status.json` / `which --json` / `list_profiles` / completions; the `c codex` / `c claude` view filter and header chip; the daemon version in the feed plus a one-line CLI warning when the running daemon predates codex support; the copy fixes listed above.
+6. **Published surface and parity.** Additive codex fields in `status.json` / `which --json` / `list_profiles` / completions; the `c codex` / `c claude` view filter and header chip; the daemon version in the feed plus a one-line CLI warning when the running daemon predates codex support; the copy fixes listed above. The Overview marker animation ships here too. `⬢`/`⬣` cycles beside the active codex account. The claude side cycles glyphs captured from a live CC session. Record one and capture which chars appear on the ~10th line from the bottom up while claude works. The static `●` stays until the capture lands.
 
 ## Settled questions (were "open")
 
