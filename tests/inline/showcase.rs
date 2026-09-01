@@ -315,6 +315,7 @@ fn oauth_profile(
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
+            open_at: None,
         }),
         fetch_status,
         provider: None,

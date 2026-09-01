@@ -242,7 +242,17 @@ pub(crate) fn build_profile_entries(
     let queue_members = crate::usage::auto_start_queue_members(config, &blocked);
     let queue_anchor = match live {
         Some(l) => l.queue_anchor,
-        None => crate::usage::history_anchor(&queue_members),
+        // The anchor replays every profile's history, never just the queue
+        // members' — the same full list the scheduler's own seed and per-tick
+        // gate derive from, so this published anchor cannot disagree with the
+        // one the election is gating on.
+        None => crate::usage::history_anchor(
+            &config
+                .profiles
+                .iter()
+                .map(|p| p.name.clone())
+                .collect::<Vec<_>>(),
+        ),
     };
     let next_queue_open =
         crate::usage::next_queue_open_secs(queue_anchor, queue_members.len(), interval_ms)

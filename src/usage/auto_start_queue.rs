@@ -5,39 +5,55 @@
 //! all reopen on lapse and stay in whatever phase they booted with, so every
 //! window resets at the same instant and the accounts are collectively dark
 //! between resets. This module spaces them: a queue member may open a window
-//! only when no other member opened one within `5h / N`. That converges an
-//! arbitrary starting configuration to even spacing inside one cycle and holds
-//! it there — every window is exactly 5h, so the spacing is self-preserving
-//! once established, and a lapsed window can never be the gate (it was opened
-//! at least 5h ago, and `gap <= 5h` always).
+//! only when no other PROFILE opened one within `5h / N` (the anchor replays
+//! every profile's history, member or not — a window open is a window open,
+//! whoever holds it). That converges an arbitrary starting configuration to
+//! even spacing inside one cycle and holds it there — every window is exactly
+//! 5h, so the spacing is self-preserving once established, and a lapsed
+//! window can never be the gate (it was opened at least 5h ago, and
+//! `gap <= 5h` always).
 //!
 //! ## Why the anchor is derived from the history SERIES, never one snapshot
 //!
-//! The tempting anchor is the usage cache already on disk: `max(resets_at) -
-//! 5h` over the queue. A single snapshot is NOT sound. `/usage` reports
-//! `resets_at` a full duration out for an idle 5h window that never opened
-//! ([`crate::usage::window_avg_pace_per_day`]'s contract), and the fetch layer
-//! copies that through verbatim — value-identical to a genuine just-kicked
-//! window (`utilization: 0`, `resets_at = open + 5h`). Anchoring on it would
-//! imply an open at `now` on EVERY poll, pinning the gap shut and starving
-//! the whole queue, silently and permanently.
+//! A real window's `resets_at` is a fixed wall-clock boundary held for the
+//! window's whole 5h life, so an open proves itself by PERSISTING across
+//! readings — one snapshot proves nothing, whatever its value: it can be a
+//! torn reading, a window seen exactly once, or a stale line from a lapsed
+//! window. clauth already persists that series per profile
+//! (`usage_history.jsonl`, 2-day retention, [`crate::profile::load_usage_history`]),
+//! so the anchor needs no state of its own: [`history_anchor`] replays it and
+//! keeps the newest boundary CONFIRMED by persistence ([`series_open`]).
 //!
-//! The SERIES separates what the snapshot cannot. Across two samples a real
-//! window's `resets_at` is a fixed wall-clock boundary — measured 2026-08-20
-//! over 2427 reported values, every one within a second of a minute boundary,
-//! jittering sub-second between reads — while the idle shape tracks the
-//! clock, sliding forward by exactly the time between the samples. clauth
-//! already persists that series per profile (`usage_history.jsonl`, 2-day
-//! retention, [`crate::profile::load_usage_history`]), so the anchor needs no
-//! state of its own: [`history_anchor`] replays it and keeps the newest
-//! boundary CONFIRMED by two agreeing samples.
+//! The real idle shape, measured 2026-09-01 over a live profile's
+//! `usage_history.jsonl`: an idle 5h window that never opened holds ONE
+//! minute boundary for ~4.7 hours (same parsed value, band ≤ 2s, ±1s
+//! sub-second oscillation around the minute boundary, ~80 samples, ts span
+//! 280 min), then jumps forward ~4.7h when the window rolls (re-anchor
+//! ε = 5h+ts−resets_at measured 5–26s). It does NOT slide with the clock the
+//! way the first classifier assumed, so any equality-based rule under ~4.7h
+//! reads an idle hold as a real boundary — the span pass below included. The
+//! harm of that false anchor is bounded and accepted, not a reason to change
+//! the design: the anchor is the hold's FIXED start (value − 5h ≈ the instant
+//! the previous window lapsed), it ages with the clock, the queue reads due
+//! within one gap, and the first elected kick re-anchors it exactly (its
+//! marker below).
 //!
-//! That replay is the GATE's read, not just a startup seed ([`queue_anchor`]).
-//! It has to be: the rule above is "no other member OPENED one", and an open
-//! needs no kick of ours behind it — a live Claude Code session on a member
-//! account opens that account's window, and the series is the only place that
-//! shows up. Anchoring on our own kicks alone would space the queue against
-//! half the openings it has to space against.
+//! Two passes read the series ([`series_open`]). OUR OWN kicked windows
+//! confirm on their MARKER: `mark_window_open` stamps the synthetic store
+//! entry it writes with `open_at`, the history writer bridges that stamp into
+//! the file ahead of the next fresh body, and a marked line is confirmed by
+//! the poll that reports its window back — normally the kick's own fetch
+//! seconds later, or a later poll if that fetch 429s. The anchor is the
+//! marker's exact `open_at`, never re-derived from the readings around it.
+//! Everything ELSE confirms through the SPAN pass: an unmarked boundary held
+//! within [`BOUNDARY_JITTER_SECS`] across readings at least [`SPAN_MIN_SECS`]
+//! apart. That pass is what makes the gate's rule real — the rule above is
+//! "no other PROFILE opened one", and an open needs no kick of ours behind
+//! it: a live Claude Code session on any profile, the web app, or
+//! `clauth use` opens a window that only the series shows. Anchoring on our
+//! own kicks alone would space the queue against half the openings it has to
+//! space against, so the replay is the GATE's read, not just a startup seed
+//! ([`queue_anchor`]).
 //!
 //! ## The one opening this queue does NOT gate
 //!
@@ -61,20 +77,24 @@
 //! One thing in that file is NOT an observation: the writer re-stamps the
 //! previous payload 1ms before each changed sample (a bridge, so idle
 //! stretches keep their temporal density for the burn replay). A bridge pairs
-//! old data with a new timestamp — exactly the held-still evidence the
-//! classifier trusts — so the series reader drops any entry whose 5h window
-//! repeats its predecessor's before classifying ([`member_series`]; review
-//! round 2, where idle histories self-confirmed through them).
+//! old data with a new timestamp — exactly the held-still-across-time
+//! evidence the span pass trusts — so the series reader drops any entry whose
+//! 5h window repeats its predecessor's before classifying ([`member_series`];
+//! review round 2, where idle histories self-confirmed through them). The
+//! synthetic stamp is the one bridge that carries NEW window information, so
+//! it survives the drop — and it is the line the kick marker rides in on.
 //!
-//! The trade, named: a history line lands only with a fresh `/usage` body,
-//! and `/usage` can 429 for minutes right after a kick. A process death
-//! inside that gap forgets the open — the restarted queue may elect
-//! immediately, open one window early, and re-space within a cycle. Dropping
+//! The trade, named: the kick marker lives only in the store until the next
+//! fresh `/usage` body bridges it into the history file, and `/usage` can 429
+//! for minutes right after a kick. A process death inside that gap forgets
+//! the open — the restarted queue may elect immediately, open one window
+//! early, and re-space within a cycle; a death after the body landed loses
+//! nothing, because the marked bridge line replays the exact kick. Dropping
 //! bridges is what keeps this trade honest in BOTH directions: a pre-crash
 //! idle bridge can neither stand in for the forgotten open nor hold the queue
 //! shut after a restart. One redundant ~1-token kick, self-healing, in
-//! exchange for no file of its own, no extra write path, and no trusting of
-//! single unconfirmable readings.
+//! exchange for no file of its own (the marker is a field, not a stamp file),
+//! no extra write path, and no trusting of single unconfirmable readings.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -95,26 +115,28 @@ pub(crate) const FIVE_HOUR_SECS: i64 = 5 * 3600;
 /// floor from 1h40m to 1h10m, silently undoing most of the spacing.
 const MAX_GAP_TOLERANCE_SECS: i64 = 300;
 
-/// Two samples of one real window agree on its reset to within the API's own
-/// quantization: sub-second recompute jitter, plus the one-way minute floor a
-/// landed kick exposes — the synthetic `mark_window_open` stamp is `kick + 5h`
-/// exact, and the next fresh body reports the same window floored to the
-/// minute, up to 59s earlier.
-const BOUNDARY_AGREE_SECS: i64 = 61;
+/// 61 seconds, in two roles, both pinned to the idle shape's minute
+/// quantization.
+///
+/// As the span minimum: a boundary must hold across samples at least this far
+/// apart, so the span outlasts the idle minute step of 60s — a minute-quantized
+/// idle run steps +60 at every minute boundary, so two readings 61s apart in
+/// one can never agree within [`BOUNDARY_JITTER_SECS`].
+///
+/// As the marker band's lower edge: the synthetic `mark_window_open` stamp is
+/// `kick + 5h` exact, and the API reports the same window floored to the
+/// minute — up to 59s earlier, plus one second of epoch truncation and one of
+/// sub-second recompute jitter.
+const SPAN_MIN_SECS: i64 = 61;
 
-/// How closely `resets_at` must track the clock across a pair to read as the
-/// sliding idle shape (the recompute jitter is sub-second; a real boundary
-/// does not track the clock at all).
-const SLIDE_MATCH_SECS: i64 = 15;
-
-/// Minimum spacing between two samples for the slide judgment to mean
-/// anything: the kick path writes same-instant duplicate lines (the synthetic
-/// stamp, then the fresh body), and below this spacing a slide is
-/// indistinguishable from jitter anyway. Below it a pair confirms only
-/// through the one-way kick band in [`confirmed_boundary`] — the refresh
-/// interval is settable down to 10s, inside this baseline, and a symmetric
-/// agreement test there would confirm the idle shape it cannot see slide.
-const SLIDE_BASELINE_SECS: i64 = 30;
+/// How far two resets may differ and still be one boundary: sub-second
+/// recompute jitter plus a parse-truncation straddle. Measured 2026-09-01:
+/// real boundaries hold exactly at parsed-second resolution, and idle values
+/// oscillate ±1s around their minute boundary — so 2 admits both real reads,
+/// and the span is the discriminator, not the jitter. Widening this toward
+/// the 60s minute step would re-admit the quantized idle shape the span rule
+/// exists to keep out.
+const BOUNDARY_JITTER_SECS: i64 = 2;
 
 /// Consecutive failed elected kicks before the election skips a member.
 ///
@@ -153,7 +175,7 @@ pub(crate) struct AutoStartQueue {
     /// once [`FAILURE_DECAY_SECS`] has passed (see there for why a permanent
     /// streak would be a bug rather than a safeguard).
     pub(crate) failures: HashMap<ProfileName, (u32, i64)>,
-    /// Memo for the history replay: the members' [`history_signature`] at the
+    /// Memo for the history replay: the profiles' [`history_signature`] at the
     /// last derivation, and what that derivation produced. Holds the DERIVED
     /// value, never the composed anchor — `last_open_at` moves on its own when
     /// a kick lands, and folding the two into one memo would lose that.
@@ -192,17 +214,21 @@ pub(crate) fn queue_due(last_queue_open: Option<i64>, now_secs: i64, gap_secs: i
 }
 
 /// The newest 5h window open the queue can PROVE from the usage-history
-/// series: the max over `members` of each profile's newest two-sample-confirmed
-/// boundary, less the window length. `None` when no member's history confirms
-/// one — cold start, which the gate reads as "due".
-pub(crate) fn history_anchor(members: &[ProfileName]) -> Option<i64> {
-    members
+/// series: the max over `profiles` of each profile's newest confirmed open
+/// ([`series_open`] — marker-confirmed for our own kicks, span-confirmed for
+/// everything else). `profiles` is the FULL config profile list, never the
+/// queue members: a window open is a window open, whoever holds it, and an
+/// open on a non-member gates the queue exactly like a member's. `None` when
+/// no profile's history confirms one — cold start, which the gate reads as
+/// "due".
+pub(crate) fn history_anchor(profiles: &[ProfileName]) -> Option<i64> {
+    profiles
         .iter()
         .filter_map(|name| series_open(&member_series(name)))
         .max()
 }
 
-/// A cheap fingerprint of every member's history FILE, without reading one:
+/// A cheap fingerprint of every profile's history FILE, without reading one:
 /// each `usage_history.jsonl`'s mtime folded with its length.
 ///
 /// The series cannot change while this does not, which is what lets
@@ -214,12 +240,12 @@ pub(crate) fn history_anchor(members: &[ProfileName]) -> Option<i64> {
 /// Exists for one failure mode, which the due/lapsed bounds do NOT cover: while
 /// a member's kick and its `/usage` refresh are both failing, that member stays
 /// lapsed and the queue stays due, so the election keeps probing it (by design —
-/// see [`elect_queue_member`]) and would otherwise re-parse every member's file
+/// see [`elect_queue_member`]) and would otherwise re-parse every profile's file
 /// on the refresh cadence for as long as the outage lasts. No fresh body lands
 /// during one, so nothing is appended, so this is exactly the period the
 /// fingerprint holds still (review round 4).
-fn history_signature(members: &[ProfileName]) -> u64 {
-    members.iter().fold(0u64, |acc, name| {
+fn history_signature(profiles: &[ProfileName]) -> u64 {
+    profiles.iter().fold(0u64, |acc, name| {
         let stamp = crate::profile::profile_history_path(name)
             .ok()
             .and_then(|p| std::fs::metadata(p).ok())
@@ -233,22 +259,24 @@ fn history_signature(members: &[ProfileName]) -> u64 {
                 mtime.rotate_left(17) ^ m.len()
             })
             .unwrap_or(1);
-        // Order-sensitive fold: `members` is a stable sorted order, so two
-        // profiles swapping stamps cannot collide back onto the same value.
+        // Order-sensitive fold: `profiles` is a stable declared order (the
+        // config's file order), so two profiles swapping stamps cannot collide
+        // back onto the same value.
         acc.rotate_left(7) ^ stamp
     })
 }
 
-/// One profile's `(sample_secs, resets_at_secs)` series for the 5h window,
-/// chronological, entries without a parseable reset dropped — and BRIDGE lines
-/// dropped first.
+/// One profile's `(sample_secs, resets_at_secs, open_at)` series for the 5h
+/// window, chronological, entries without a parseable reset dropped — and
+/// BRIDGE lines dropped first. `open_at` rides through so the marker pass can
+/// see it; `None` on every line except the kick's synthetic stamp.
 ///
 /// [`crate::profile::append_usage_sample`] re-stamps the store's previous
 /// payload 1ms before each changed sample so an idle stretch keeps its
 /// temporal density for the burn replay. A re-stamp is not an observation:
 /// its 5h window was read at the ORIGINAL sample time, so counting its new
 /// timestamp manufactures exactly the "boundary held still while the clock
-/// advanced" evidence the classifier trusts — an idle profile bridges on
+/// advanced" evidence the span pass trusts — an idle profile bridges on
 /// every poll, and the pair `(fresh, bridge)` has `dr = 0` (review round 2).
 ///
 /// The drop is judged on the classifier's OWN projection — the `five_hour`
@@ -260,10 +288,12 @@ fn history_signature(members: &[ProfileName]) -> u64 {
 /// to its predecessor's adds no window observation and is dropped. The one
 /// bridge that carries NEW window information — the synthetic stamp
 /// [`crate::usage::scheduler`]'s `mark_window_open` put in the store — differs
-/// in `five_hour` and stays. Dropping a real line that changed only outside
-/// the 5h window can only under-confirm, which is the safe direction (module
-/// docs: a skipped open makes the queue MORE willing to kick, once).
-fn member_series(name: &ProfileName) -> Vec<(i64, i64)> {
+/// in `five_hour` and stays, so its `open_at` marker survives on the window
+/// difference alone, never on the marker field. Dropping a real line that
+/// changed only outside the 5h window can only under-confirm, which is the
+/// safe direction (module docs: a skipped open makes the queue MORE willing to
+/// kick, once).
+fn member_series(name: &ProfileName) -> Vec<(i64, i64, Option<i64>)> {
     let mut prev_window: Option<String> = None;
     crate::profile::load_usage_history(name)
         .into_iter()
@@ -280,57 +310,92 @@ fn member_series(name: &ProfileName) -> Vec<(i64, i64)> {
                 .resets_at
                 .as_deref()
                 .and_then(crate::usage::iso_to_epoch_secs)?;
-            Some(((ts_ms / 1000) as i64, reset))
+            Some(((ts_ms / 1000) as i64, reset, info.open_at))
         })
         .collect()
 }
 
-/// Newest CONFIRMED open in one profile's series: scan the consecutive pairs
-/// newest-first for the first that fixes a boundary, then boundary → open.
+/// Newest CONFIRMED open in one profile's series, as the max of two passes —
+/// the marker pass over our own kicked windows and the span pass over every
+/// unmarked boundary. `None` when neither confirms one — cold start, which the
+/// gate reads as "due".
 ///
-/// A trailing sliding run (the profile is idle NOW) or a trailing unconfirmed
-/// jump (a window seen exactly once) is skipped in favour of the last boundary
-/// two samples agree on — a single reading is exactly what cannot be trusted
-/// (module docs). Skipping a real-but-unconfirmed open is the safe direction:
-/// it can only make the queue MORE willing to kick, once, and the kick's own
-/// history line confirms it within a poll.
-pub(crate) fn series_open(series: &[(i64, i64)]) -> Option<i64> {
-    series
-        .windows(2)
+/// The MARKER pass confirms a landed kick on the poll that reports its window
+/// back: the synthetic stamp `mark_window_open` writes carries
+/// [`crate::usage::UsageInfo::open_at`], and a marked line is confirmed once
+/// ANY later non-marked line reports a reset within [`SPAN_MIN_SECS`] below
+/// (the API's minute floor) or 1s above (epoch truncation) its own. The
+/// anchor is the marker's own `open_at` — exact by construction, never
+/// re-derived from the pair. A marked line with no such successor is
+/// UNCONFIRMED (the hedge: the kick confirms on its own fetch seconds later,
+/// or a later poll if that fetch 429s — until one lands the open is not
+/// provable, and the scan falls through to older marked lines).
+///
+/// The SPAN pass covers unmarked out-of-band opens — a live Claude Code
+/// session, the web app, `clauth use`. Over non-marked samples only, newest
+/// first: a boundary counts when two samples at least [`SPAN_MIN_SECS`] apart
+/// hold equal within [`BOUNDARY_JITTER_SECS`] with every intermediate equal
+/// within the same jitter (zero intermediates is fine — two samples 90s apart
+/// confirm); the anchor is the span's max reset less [`FIVE_HOUR_SECS`].
+///
+/// A trailing unconfirmed reading — a window seen exactly once, or a kick
+/// whose marker no poll has vouched for yet — is skipped in favour of the
+/// last boundary a pass DID confirm. Skipping a real-but-unconfirmed open is
+/// the safe direction: it can only make the queue MORE willing to kick, once,
+/// and the kick's own marker confirms it within a poll.
+pub(crate) fn series_open(series: &[(i64, i64, Option<i64>)]) -> Option<i64> {
+    // Marker pass: newest marked line first, confirmed by any later non-marked
+    // report of the same window.
+    let marker = series
+        .iter()
+        .enumerate()
         .rev()
-        .find_map(|w| confirmed_boundary(w[0], w[1]))
-        .map(|boundary| boundary - FIVE_HOUR_SECS)
+        .find_map(|(i, &(_, reset, open_at))| {
+            let open = open_at?;
+            let confirmed = series[i + 1..].iter().any(|&(_, later, later_open)| {
+                later_open.is_none() && (reset - SPAN_MIN_SECS..=reset + 1).contains(&later)
+            });
+            confirmed.then_some(open)
+        });
+    marker.into_iter().chain(span_open(series)).max()
 }
 
-/// The pair rule: `(ts, resets_at)` twice, chronological. A real boundary
-/// holds still while the clock advances; the idle shape moves WITH it.
-///
-/// At or past [`SLIDE_BASELINE_SECS`] the slide is judged first, because the
-/// two tests overlap when the samples sit less than one boundary-tolerance
-/// apart: a slide across a 45s gap advances the reset by 45s, inside
-/// [`BOUNDARY_AGREE_SECS`] — but it matches the clock, which no real window's
-/// sub-second jitter does.
-///
-/// BELOW the baseline the clock has not moved enough to judge a slide at all,
-/// so only the kick signature confirms: the exact synthetic stamp then the
-/// API's minute-floored report of the same window, `dr` in
-/// `[-BOUNDARY_AGREE_SECS, +1]` (the floor only rounds down; the +1 absorbs
-/// epoch truncation of two floored reads). The band is one-way on purpose —
-/// an idle pair this close has `dr = +dt`, at least `+10`
-/// ([`crate::profile::MIN_REFRESH_INTERVAL_MS`]), and a symmetric band would
-/// re-admit the very shape the slide test exists to reject on every cadence
-/// the interval setting allows below the baseline.
-///
-/// Of an agreeing pair the LARGER value wins: when the exact synthetic stamp
-/// and the minute-floored report disagree, the larger IS the exact one.
-fn confirmed_boundary((ts1, r1): (i64, i64), (ts2, r2): (i64, i64)) -> Option<i64> {
-    let (dr, dt) = (r2 - r1, ts2 - ts1);
-    let confirmed = if dt >= SLIDE_BASELINE_SECS {
-        (dr - dt).abs() > SLIDE_MATCH_SECS && dr.abs() <= BOUNDARY_AGREE_SECS
-    } else {
-        (-BOUNDARY_AGREE_SECS..=1).contains(&dr)
-    };
-    confirmed.then_some(r1.max(r2))
+/// The span pass: the newest run of consecutive non-marked samples whose
+/// resets all sit within [`BOUNDARY_JITTER_SECS`] of each other and whose
+/// timestamps cover at least [`SPAN_MIN_SECS`], anchored at the run's max
+/// reset less [`FIVE_HOUR_SECS`]. `None` when no run spans far enough.
+fn span_open(series: &[(i64, i64, Option<i64>)]) -> Option<i64> {
+    let non_marked: Vec<(i64, i64)> = series
+        .iter()
+        .filter_map(|&(ts, reset, open_at)| open_at.is_none().then_some((ts, reset)))
+        .collect();
+    let mut i = non_marked.len();
+    while i > 0 {
+        i -= 1;
+        let (_, reset) = non_marked[i];
+        let mut min = reset;
+        let mut max = reset;
+        // Extend backward while every added reset stays within jitter of the
+        // run's extremes — that keeps max - min <= jitter for the whole run.
+        let mut start = i;
+        while start > 0 {
+            let r = non_marked[start - 1].1;
+            if (r - min).abs() > BOUNDARY_JITTER_SECS || (max - r).abs() > BOUNDARY_JITTER_SECS {
+                break;
+            }
+            min = min.min(r);
+            max = max.max(r);
+            start -= 1;
+        }
+        // Newest run first. A run that fails on span proves nothing for any
+        // pair reaching past its start — that pair crosses the jitter break —
+        // so the scan continues below it.
+        if non_marked[i].0 - non_marked[start].0 >= SPAN_MIN_SECS {
+            return Some(max - FIVE_HOUR_SECS);
+        }
+        i = start;
+    }
+    None
 }
 
 /// Ordered queue membership: chain position first, then display order.
@@ -458,9 +523,9 @@ pub(crate) fn elect_queue_member<'a>(candidates: &[Candidate<'a>]) -> Option<&'a
 }
 
 /// Fold a landed kick into the queue: it becomes the new anchor and its
-/// member's failure streak clears. In-memory only — durability is the history
-/// line the kick's next fresh `/usage` body appends, which [`history_anchor`]
-/// replays after a restart.
+/// member's failure streak clears. In-memory only — durability is the marked
+/// bridge line the kick's next fresh `/usage` body writes into the history
+/// file, which [`history_anchor`] replays after a restart.
 pub(crate) fn note_queue_open(state: &AutoStartQueueState, name: &ProfileName, now_secs: i64) {
     if let Ok(mut queue) = state.lock() {
         queue.last_open_at = Some(now_secs);
@@ -516,7 +581,7 @@ pub(crate) fn queue_failures(
 /// An ESTIMATE, not a promise. A window opened out of band moves the anchor as
 /// soon as two history samples confirm it ([`queue_anchor`]), so a published
 /// value can shift out from under a reader. Three sources, none of them gated
-/// by this queue: a live Claude Code session on a member account, the web app,
+/// by this queue: a live Claude Code session on any profile, the web app,
 /// and `clauth use` — the CLI switch primes its target through
 /// [`crate::oauth::prime_window`], which is the OTHER caller of
 /// [`crate::oauth::auto_start_kick`] and deliberately consults neither the
@@ -527,12 +592,17 @@ pub(crate) fn next_queue_open_secs(anchor: Option<i64>, n: usize, interval_ms: u
 
 /// Load the history-derived anchor into memory.
 ///
+/// `profiles` is the FULL config profile list, not the queue members — the
+/// seed and the per-tick gate must agree on the anchor input, and
+/// [`history_anchor`] replays every profile's history (a window open is a
+/// window open, whoever holds it).
+///
 /// Called on the thread that SPAWNS the refresher, never inside it: nothing
 /// joins that thread, so a home-derived path resolved on it could outlive a
 /// test's `HOME_OVERRIDE` and read the operator's real home (the same
 /// convention `sync_kick_blocks_from_cache` follows).
-pub(crate) fn seed_queue_anchor(state: &AutoStartQueueState, members: &[ProfileName]) {
-    let Some(open) = history_anchor(members) else {
+pub(crate) fn seed_queue_anchor(state: &AutoStartQueueState, profiles: &[ProfileName]) {
+    let Some(open) = history_anchor(profiles) else {
         return;
     };
     if let Ok(mut queue) = state.lock() {
@@ -554,11 +624,18 @@ pub(crate) fn queue_anchor_cached(state: &AutoStartQueueState) -> Option<i64> {
 /// The GATE's anchor: the newer of the in-memory value and the history
 /// derivation ([`history_anchor`]), folded back into memory.
 ///
+/// `profiles` is the FULL config profile list, not the queue members — the
+/// member list still sizes the gap and elects (the caller's job), but the
+/// anchor replays every profile's history: a window open is a window open,
+/// whoever holds it, and the queue spaces against an open on a non-member
+/// exactly as it spaces against a member's. The memo and the short-circuit
+/// bounds below are keyed on that same full list.
+///
 /// The derivation is re-run rather than short-circuited on the cached value,
 /// because a window can open with no kick of ours behind it — a real Claude
-/// Code session on a member account opens one, and the queue must space
+/// Code session on any profile opens one, and the queue must space
 /// against that exactly as it spaces against its own kicks (the whole rule is
-/// "no OTHER MEMBER opened one within `5h / N`", not "no other member was
+/// "no OTHER PROFILE opened one within `5h / N`", not "no other member was
 /// kicked by us"). Only [`note_queue_open`] writes the in-memory anchor, and
 /// only for a kick this process fired, so nothing else would ever notice: the
 /// startup seed would be the last word for the life of the process, and the
@@ -578,10 +655,10 @@ pub(crate) fn queue_anchor_cached(state: &AutoStartQueueState) -> Option<i64> {
 ///     gate answers.
 ///
 /// Without those the replay would run on most ticks of every cycle, not the
-/// rare one: an idle 5h window's `resets_at` slides with the clock, so a
-/// polled account appends history on EVERY poll, and the queue sits due with
-/// nothing lapsed for the whole stretch between its last open and the next
-/// window to run out.
+/// rare one: an idle 5h window's boundary oscillates ±1s around its minute
+/// anchor on every recompute, so a polled account appends history on EVERY
+/// poll, and the queue sits due with nothing lapsed for the whole stretch
+/// between its last open and the next window to run out.
 ///
 /// Past both, a third bound covers the case they miss — an outage, where a
 /// member's kick AND its `/usage` refresh keep failing, so it stays lapsed, the
@@ -591,7 +668,7 @@ pub(crate) fn queue_anchor_cached(state: &AutoStartQueueState) -> Option<i64> {
 /// so nothing is appended, and the memo answers instead.
 pub(crate) fn queue_anchor(
     state: &AutoStartQueueState,
-    members: &[ProfileName],
+    profiles: &[ProfileName],
     now_secs: i64,
     gap_secs: i64,
 ) -> Option<i64> {
@@ -599,18 +676,18 @@ pub(crate) fn queue_anchor(
     if !queue_due(cached, now_secs, gap_secs) {
         return cached;
     }
-    // A stat per member, not a parse per member: past this the replay only runs
-    // when the files themselves moved ([`history_signature`]).
-    let signature = history_signature(members);
+    // A stat per profile, not a parse per profile: past this the replay only
+    // runs when the files themselves moved ([`history_signature`]).
+    let signature = history_signature(profiles);
     let memo = state
         .lock()
         .ok()
         .and_then(|queue| queue.derived)
         .and_then(|(seen, derived)| (seen == signature).then_some(derived));
-    // Derived outside the guard — it replays a file per member.
+    // Derived outside the guard — it replays a file per profile.
     let derived = match memo {
         Some(derived) => derived,
-        None => history_anchor(members),
+        None => history_anchor(profiles),
     };
     let anchor = derived.max(cached);
     if let Ok(mut queue) = state.lock() {

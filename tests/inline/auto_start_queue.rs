@@ -248,19 +248,19 @@ fn auto_start_queue_due_holds_until_the_gap_passes() {
     );
 }
 
-/// The idle-window shape. `/usage` reports `resets_at` a full duration out
-/// for a window that never opened — value-identical to a just-kicked window in
-/// any SINGLE sample, but across two it SLIDES with the clock while a real
-/// boundary holds still. A sliding tail yields no anchor at all, so the gate
-/// falls through to "due" rather than jamming shut.
+/// A value that tracks the clock across every reading never persists anywhere
+/// long enough to count as a boundary, so it yields no anchor at all and the
+/// gate falls through to "due" rather than jamming shut.
 #[test]
 fn auto_start_queue_series_open_rejects_the_sliding_idle_shape() {
     let t = 1_780_000_000i64;
-    // Idle profile polled every 90s: resets_at tracks now + 5h exactly.
+    // A polled window whose resets_at tracks now + 5h exactly: every reading
+    // differs from every other by the time between them, far outside the
+    // jitter, so no span ever holds.
     let sliding = [
-        (t, t + FIVE_HOUR_SECS),
-        (t + 90, t + 90 + FIVE_HOUR_SECS),
-        (t + 180, t + 180 + FIVE_HOUR_SECS),
+        (t, t + FIVE_HOUR_SECS, None),
+        (t + 90, t + 90 + FIVE_HOUR_SECS, None),
+        (t + 180, t + 180 + FIVE_HOUR_SECS, None),
     ];
     assert_eq!(series_open(&sliding), None);
     assert!(queue_due(
@@ -269,45 +269,28 @@ fn auto_start_queue_series_open_rejects_the_sliding_idle_shape() {
         queue_gap_secs(2, INTERVAL_MS)
     ));
     assert_eq!(series_open(&[]), None);
-    assert_eq!(series_open(&[(t, t + 600)]), None); // one sample proves nothing
-
-    // A 10s cadence is legal (`MIN_REFRESH_INTERVAL_MS`) and sits BELOW the
-    // slide baseline, where the slide test cannot engage. Only the kick
-    // signature's one-way band confirms there — an idle pair's `dr = +dt` is
-    // outside it. A symmetric band would confirm this pair (`dr = 10 <= 61`)
-    // and hand the idle shape back its anchor on every sub-baseline cadence.
-    let fast_idle = [(t, t + FIVE_HOUR_SECS), (t + 10, t + 10 + FIVE_HOUR_SECS)];
-    assert_eq!(series_open(&fast_idle), None);
-
-    // The band's edges, as literals: `[-61, +1]` and not a step wider. `+1`
-    // absorbs epoch truncation of two floored reads; `-61` is the one-way
-    // minute floor plus that same truncation.
-    let b = t + 600;
-    let open = |r| Some(r - FIVE_HOUR_SECS);
-    assert_eq!(series_open(&[(t, b), (t + 5, b + 1)]), open(b + 1));
-    assert_eq!(series_open(&[(t, b), (t + 5, b + 2)]), None);
-    assert_eq!(series_open(&[(t, b), (t + 5, b - 61)]), open(b));
-    assert_eq!(series_open(&[(t, b), (t + 5, b - 62)]), None);
+    assert_eq!(series_open(&[(t, t + 600, None)]), None); // one sample proves nothing
 
     // A confirmed open EARLIER in the series still anchors: the sliding tail
-    // only says the profile is idle NOW, not that it never opened.
+    // only says the profile's reading moves NOW, not that it never opened.
     let boundary = t + 600;
     let mixed = [
-        (t - 7200, boundary),
-        (t - 7110, boundary - 1), // sub-second recompute jitter, rounded
-        (t, t + FIVE_HOUR_SECS),
-        (t + 90, t + 90 + FIVE_HOUR_SECS),
+        (t - 7200, boundary, None),
+        (t - 7110, boundary - 1, None), // sub-second recompute jitter, rounded
+        (t, t + FIVE_HOUR_SECS, None),
+        (t + 90, t + 90 + FIVE_HOUR_SECS, None),
     ];
     assert_eq!(series_open(&mixed), Some(boundary - FIVE_HOUR_SECS));
 }
 
-/// A landed kick writes the exact synthetic stamp, then the next fresh body
-/// re-reports the same window minute-floored (same-instant duplicate lines
-/// included — the merge path writes both). Each agreeing pair confirms the
-/// boundary; within a mixed pair the larger value — the exact stamp — wins,
-/// and the newest confirmed pair overall decides, so an all-API tail lands
-/// within the minute floor. A NEW window seen exactly once at the tail is a
-/// single unconfirmable reading and must not move the anchor.
+/// An UNMARKED kicked window — the series shape before the marker existed, or
+/// a window opened out of band: the exact synthetic stamp and the API's
+/// minute-floored report disagree by the floor, so the same-instant pair
+/// alone proves nothing. Only once a floored reading holds still for a span
+/// of at least 61s does the boundary confirm, at the floored value — the
+/// floor's distance from the true kick instant is lost, and the queue's gap
+/// tolerance exists for exactly that. A NEW window seen exactly once at the
+/// tail is a single unconfirmable reading and must not move the anchor.
 #[test]
 fn auto_start_queue_series_open_confirms_kicked_windows_and_distrusts_a_single_reading() {
     let t = 1_780_000_000i64;
@@ -315,30 +298,257 @@ fn auto_start_queue_series_open_confirms_kicked_windows_and_distrusts_a_single_r
     let synthetic = kick + FIVE_HOUR_SECS;
     let floored = synthetic - 14; // the API floors the boundary to the minute
     let series = [
-        (t - 60, t - 30), // stale lapsed reading from the previous window
-        (kick, synthetic),
-        (kick, floored), // same-instant duplicate from the merge path
-        (kick + 95, floored),
+        (t - 60, t - 30, None), // stale lapsed reading from the previous window
+        (kick, synthetic, None),
+        (kick, floored, None), // same-instant duplicate from the merge path
+        (kick + 95, floored, None),
     ];
-    // Newest confirmed pair is the all-API one: the anchor sits on the floored
-    // boundary, inside the minute of the true kick instant.
+    // The floored reading holds still from `kick` to `kick + 95`: a confirmed
+    // span, anchored at the floored boundary — inside the minute of the true
+    // kick instant.
     assert_eq!(series_open(&series), Some(floored - FIVE_HOUR_SECS));
-    // Without the API tail, the mixed synthetic/floored pair confirms and the
-    // exact stamp wins.
-    assert_eq!(series_open(&series[..3]), Some(kick));
+    // Without the later poll the synthetic/floored pair spans zero seconds in
+    // time and 14s in value: nothing persists, nothing confirms.
+    assert_eq!(series_open(&series[..3]), None);
 
     // The newest window appears in one sample only: unconfirmed, so the
     // anchor stays on the previous confirmed boundary.
     let single = [
-        (t, t + 600),
-        (t + 90, t + 600),
-        (t + 7200, t + 7200 + FIVE_HOUR_SECS),
+        (t, t + 600, None),
+        (t + 90, t + 600, None),
+        (t + 7200, t + 7200 + FIVE_HOUR_SECS, None),
     ];
     assert_eq!(series_open(&single), Some(t + 600 - FIVE_HOUR_SECS));
 }
 
-/// The election picks one member per tick in queue order — the serialisation
-/// that stops two fetch workers from both kicking in the same tick.
+/// Minute-quantized idle at cadences BELOW the span minimum. This is the
+/// mutation pin: the old pair classifier confirmed a same-minute `dr = 0`
+/// pair on its kick band (or its slide leg) at every one of these cadences,
+/// and the span rule must not — no two samples can ever sit 61s apart without
+/// the value stepping +60 at a minute boundary, which is far outside the
+/// jitter. Several samples span ≥ 2 minutes so a 61s span WOULD exist if a
+/// pair rule were still accepting them.
+#[test]
+fn auto_start_queue_series_open_rejects_same_minute_quantized_idle_pairs() {
+    let t = 1_780_000_000i64;
+    for cadence in [10i64, 30, 59] {
+        let mut series = Vec::new();
+        let mut ts = t;
+        while ts < t + 150 {
+            // The idle report, minute-floored: it holds still inside each
+            // minute and steps +60 at the minute boundary.
+            let minute = (ts - t) / 60;
+            series.push((ts, t + FIVE_HOUR_SECS + minute * 60, None));
+            ts += cadence;
+        }
+        assert_eq!(
+            series_open(&series),
+            None,
+            "cadence {cadence}s: a same-minute dr = 0 pair must not confirm — \
+             every span of 61s+ crosses a minute step"
+        );
+    }
+}
+
+/// Minute-quantized idle at and above the minute step: at a 75–120s cadence
+/// consecutive readings always straddle a minute boundary, so the value steps
+/// +60 every sample and no two readings ever agree within the jitter — the
+/// step itself is the rejection, and it also pins the jitter bound below 60.
+#[test]
+fn auto_start_queue_series_open_rejects_minute_stepping_idle_at_default_cadences() {
+    let t = 1_780_000_000i64;
+    for cadence in [75i64, 90, 120] {
+        let mut series = Vec::new();
+        let mut ts = t;
+        while ts < t + 360 {
+            let minute = (ts - t) / 60;
+            series.push((ts, t + FIVE_HOUR_SECS + minute * 60, None));
+            ts += cadence;
+        }
+        assert_eq!(
+            series_open(&series),
+            None,
+            "cadence {cadence}s: values stepping +60 per minute must not read \
+             as a boundary"
+        );
+    }
+}
+
+/// The REAL idle hold, named as the accepted trade, not a defect: a window
+/// that never opened holds one minute boundary for ~4.7h (measured
+/// 2026-09-01), and any rule shorter than the hold — the span pass included —
+/// reads that as a real boundary. The documented bounded behavior: the anchor
+/// is the hold's FIXED start (value − 5h ≈ the instant the previous window
+/// lapsed), it ages with the clock, the queue reads due within one gap, and
+/// the first elected kick re-anchors it exactly.
+#[test]
+fn auto_start_queue_series_open_reads_the_real_idle_hold_as_the_bounded_trade() {
+    let t = 1_780_000_000i64;
+    let hold = t + FIVE_HOUR_SECS + 600; // one fixed minute boundary
+    // ~10 polls at the default 90s cadence. The measured ±1s oscillation is
+    // sub-second recompute jitter, which at parsed-second resolution
+    // (truncation) reads as the boundary or one second below — so the max is
+    // the hold's own value.
+    let oscillation = [0, -1, 0, -1, 0, -1, 0, -1, 0, -1];
+    let series: Vec<_> = oscillation
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| (t + 90 * i as i64, hold + d, None))
+        .collect();
+    assert_eq!(
+        series_open(&series),
+        Some(hold - FIVE_HOUR_SECS),
+        "an idle hold reads as a boundary whose fixed anchor ages out within \
+         one gap and re-anchors on the first elected kick"
+    );
+}
+
+/// A landed kick's durable record, written through the REAL writer so the
+/// bridge line that carries the marker lands exactly as production writes it:
+/// `mark_window_open` stamps the synthetic store entry with `open_at`, the
+/// writer bridges that stamp into the history file ahead of the next fresh
+/// body, and the marker pass confirms the open on the poll that reports its
+/// window back. The anchor is the marker's exact `open_at` — never
+/// re-derived from the (minute-floored) readings around it.
+#[test]
+fn auto_start_queue_series_open_confirms_a_kicked_window_on_its_marker() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    let _home = crate::testutil::HomeSandbox::new();
+    let t = 1_780_000_000i64;
+    let kick = t + 360 + 14;
+    let synthetic_reset = kick + FIVE_HOUR_SECS;
+    let floored_reset = synthetic_reset - 14; // the API floors to the minute
+
+    let reading = |reset: i64, open_at: Option<i64>| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(reset)),
+        }),
+        open_at,
+        ..UsageInfo::default()
+    };
+    let name: crate::profile::ProfileName = "p".into();
+    let append = |prev: Option<&UsageInfo>, next: &UsageInfo, ts: i64| {
+        crate::profile::append_usage_sample_at(&name, prev, next, ts as u64 * 1000);
+    };
+
+    // A stale lapsed reading, then the kick: the store holds the synthetic
+    // stamp when the floored fresh body arrives, so the writer bridges it.
+    let stale = reading(t - 30, None);
+    let synthetic = reading(synthetic_reset, Some(kick));
+    let floored = reading(floored_reset, None);
+    append(None, &stale, t - 60);
+    append(Some(&synthetic), &floored, kick);
+    assert_eq!(
+        crate::profile::load_usage_history(&name)
+            .iter()
+            .filter(|(_, info)| info.open_at.is_some())
+            .count(),
+        1,
+        "the writer bridged the synthetic with its marker into the file"
+    );
+    assert_eq!(
+        series_open(&super::member_series(&name)),
+        Some(kick),
+        "the marker confirms on the poll that reports its window back, at the \
+         marker's exact open_at — not the floored max"
+    );
+
+    // A later floored poll (the kick's token now visible) keeps the anchor on
+    // the marker's exact open_at. Its moved utilization keeps its line past
+    // the bridge-drop, so the span pass DOES confirm the floored pair — but it
+    // re-derives `floored − 5h`, and the marker's exact `kick` outranks it by
+    // max.
+    let mut later = reading(floored_reset, None);
+    later.five_hour.as_mut().unwrap().utilization = 0.0001;
+    append(Some(&floored), &later, kick + 95);
+    assert_eq!(
+        series_open(&super::member_series(&name)),
+        Some(kick),
+        "a later floored body changes nothing: the anchor is the marker"
+    );
+
+    // The successor band's edges, as literals: `[marked − 61, marked + 1]` and
+    // not a step wider. The low edge is the one-way minute floor (up to 59s)
+    // plus a second of epoch truncation and one of recompute jitter; the high
+    // edge absorbs epoch truncation only. Each pair has exactly one marked
+    // line and one successor, so only the marker pass can answer.
+    let r = synthetic_reset;
+    let edge = |later_reset: i64| [(t, r, Some(kick)), (t + 1, later_reset, None)];
+    assert_eq!(series_open(&edge(r - 61)), Some(kick));
+    assert_eq!(series_open(&edge(r - 62)), None);
+    assert_eq!(series_open(&edge(r + 1)), Some(kick));
+    assert_eq!(series_open(&edge(r + 2)), None);
+}
+
+/// The hedge behind the successor rule: a marked line confirms only on a
+/// LATER non-marked reading of its window, so a marked line sitting LAST —
+/// the body that would report the window never landed — proves nothing. The
+/// span pass cannot rescue the synthetic/floored pair around it either: the
+/// synthetic is marked and excluded from the pass, its value sits 59s (the
+/// full minute floor) above the floored report, outside the jitter, and the
+/// two lines are one second apart, far under the span minimum. The anchor
+/// falls back to whatever earlier boundary still confirms, else none.
+#[test]
+fn auto_start_queue_series_open_hedges_an_unconfirmed_kick_marker() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    let _home = crate::testutil::HomeSandbox::new();
+    let t = 1_780_000_000i64;
+    let kick = t + 360 + 59; // :59 past the minute: the floor's full spread
+    let synthetic_reset = kick + FIVE_HOUR_SECS;
+    let floored_reset = synthetic_reset - 59;
+
+    let reading = |reset: i64, open_at: Option<i64>| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(reset)),
+        }),
+        open_at,
+        ..UsageInfo::default()
+    };
+    let name: crate::profile::ProfileName = "p".into();
+    let append = |prev: Option<&UsageInfo>, next: &UsageInfo, ts: i64| {
+        crate::profile::append_usage_sample_at(&name, prev, next, ts as u64 * 1000);
+    };
+
+    // The kick's window: its floored report lands, then the marked synthetic
+    // stamp sits LAST with no successor — the poll that would vouch for it
+    // never arrived. (Production writes stamp-then-report; this is the
+    // projection the reader is left with when the report's line repeats the
+    // stamp's window and drops out, leaving the marker last.)
+    let stale = reading(t - 30, None);
+    let floored = reading(floored_reset, None);
+    let trailing = reading(synthetic_reset, Some(kick));
+    append(None, &stale, t - 60);
+    append(None, &floored, kick);
+    append(None, &trailing, kick + 1);
+    assert_eq!(
+        series_open(&super::member_series(&name)),
+        None,
+        "no successor vouches for the trailing marker, and the span pass does \
+         not confirm the synthetic/floored pair — marked lines are excluded, \
+         and the 59s floor spread exceeds the jitter"
+    );
+
+    // With an earlier confirmed boundary in the file, that is what the anchor
+    // falls back to.
+    let boundary = t - 7200 + 600;
+    let old = reading(boundary, None);
+    let old_again = reading(boundary - 1, None);
+    let fallback: crate::profile::ProfileName = "fallback".into();
+    crate::profile::append_usage_sample_at(&fallback, None, &old, (t - 7200) as u64 * 1000);
+    crate::profile::append_usage_sample_at(
+        &fallback,
+        Some(&old),
+        &old_again,
+        (t - 7110) as u64 * 1000,
+    );
+    assert_eq!(
+        series_open(&super::member_series(&fallback)),
+        Some(boundary - FIVE_HOUR_SECS),
+        "an earlier confirmed boundary still anchors"
+    );
+}
 #[test]
 fn auto_start_queue_election_picks_one_lapsed_member_in_queue_order() {
     assert_eq!(
@@ -501,10 +711,10 @@ fn auto_start_queue_history_seed_and_next_open_replay_real_usage_files() {
         "the seeded file must carry the writer's bridge lines"
     );
 
-    let opened = vec![crate::profile::ProfileName::from("opened")];
+    let profiles = vec![crate::profile::ProfileName::from("opened")];
     let expected = boundary - FIVE_HOUR_SECS;
     let seeded = super::new_state();
-    super::seed_queue_anchor(&seeded, &opened);
+    super::seed_queue_anchor(&seeded, &profiles);
     assert_eq!(
         super::queue_anchor_cached(&seeded),
         Some(expected),
@@ -518,7 +728,7 @@ fn auto_start_queue_history_seed_and_next_open_replay_real_usage_files() {
     let gap = super::queue_gap_secs(2, INTERVAL_MS);
     let cold = super::new_state();
     assert_eq!(
-        super::queue_anchor(&cold, &opened, now, gap),
+        super::queue_anchor(&cold, &profiles, now, gap),
         Some(expected),
         "the cold tick fallback replays the same history series"
     );
@@ -537,12 +747,12 @@ fn auto_start_queue_history_seed_and_next_open_replay_real_usage_files() {
 /// The bridge rule end to end, on the two shapes that must land on OPPOSITE
 /// sides of it. An idle stretch bridges on every poll, and the pair
 /// `(fresh@T-90, bridge@T-1)` — old payload, new timestamp, `dr = 0` — reads
-/// as a held-still boundary unless bridges are dropped; that false anchor sat
+/// as a held-still span unless bridges are dropped; that false anchor sat
 /// ~now and held the queue for a full gap after every spawn. A landed kick
 /// produces the ONE bridge that carries new information (the synthetic store
-/// stamp `mark_window_open` wrote), which differs from its predecessor,
-/// survives the drop, and confirms same-instant against the API's floored
-/// report.
+/// stamp `mark_window_open` wrote, with its `open_at` marker), which differs
+/// from its predecessor, survives the drop, and confirms through the marker
+/// pass on the poll that reports its window back.
 #[test]
 fn auto_start_queue_series_reader_drops_the_writers_bridge_lines() {
     use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
@@ -580,18 +790,20 @@ fn auto_start_queue_series_reader_drops_the_writers_bridge_lines() {
         "an idle history yields no anchor, bridges dropped"
     );
 
-    // A kick lands mid-minute: the store holds the exact synthetic stamp when
-    // the floored fresh body arrives, so the writer bridges the synthetic —
-    // byte-different from its predecessor, and the same-instant pair confirms
-    // with the exact stamp winning.
+    // A kick lands mid-minute: the store holds the exact synthetic stamp —
+    // marked with `open_at` — when the floored fresh body arrives, so the
+    // writer bridges the synthetic, marker included, byte-different from its
+    // predecessor. The marker pass confirms it on the poll that reports its
+    // window back, at the marker's exact `open_at`.
     let kick = t + 360 + 14;
-    let synthetic = reading(kick + FIVE_HOUR_SECS);
+    let mut synthetic = reading(kick + FIVE_HOUR_SECS);
+    synthetic.open_at = Some(kick);
     let floored = reading(kick + FIVE_HOUR_SECS - 14);
     append("p", Some(&synthetic), &floored, kick);
     assert_eq!(
         series_open(&super::member_series(&"p".into())),
         Some(kick),
-        "the kick's synthetic/floored pair still confirms same-instant"
+        "the kick's marker confirms on the poll that reports its window back"
     );
 }
 
@@ -688,7 +900,7 @@ fn auto_start_queue_anchor_folds_in_an_out_of_band_open() {
         prev = Some(next);
     }
 
-    let members = vec![crate::profile::ProfileName::from("held")];
+    let profiles = vec![crate::profile::ProfileName::from("held")];
     let gap = queue_gap_secs(2, INTERVAL_MS);
 
     // The anchor our own kicks left behind: four hours old, well past the gap.
@@ -700,12 +912,12 @@ fn auto_start_queue_anchor_folds_in_an_out_of_band_open() {
         "the cached anchor alone would let the next member kick right now"
     );
     assert_eq!(
-        super::queue_anchor(&state, &members, now, gap),
+        super::queue_anchor(&state, &profiles, now, gap),
         Some(opened_at),
         "the out-of-band open supersedes the older in-memory anchor"
     );
     assert!(
-        !queue_due(super::queue_anchor(&state, &members, now, gap), now, gap),
+        !queue_due(super::queue_anchor(&state, &profiles, now, gap), now, gap),
         "and the queue is held shut for a full gap after it"
     );
     assert_eq!(
@@ -719,7 +931,7 @@ fn auto_start_queue_anchor_folds_in_an_out_of_band_open() {
     let inside = super::new_state();
     super::note_queue_open(&inside, &"held".into(), now - 900);
     assert_eq!(
-        super::queue_anchor(&inside, &members, now, gap),
+        super::queue_anchor(&inside, &profiles, now, gap),
         Some(now - 900),
         "a cached anchor already inside the gap answers without a disk replay"
     );
@@ -728,7 +940,7 @@ fn auto_start_queue_anchor_folds_in_an_out_of_band_open() {
 /// The due/lapsed bounds on the replay leave one hole, and this is the patch
 /// for it: while a member's kick AND its `/usage` refresh are both failing it
 /// stays lapsed, the queue stays due, and the election keeps probing it by
-/// design — so every refresh tick would re-parse every member's history for as
+/// design — so every refresh tick would re-parse every profile's history for as
 /// long as the outage lasts. No fresh body lands during one, so nothing is
 /// appended, so memoizing the derivation against the FILES closes exactly that
 /// window (review round 4, found by an adversarial pass over the round-4 fix).
@@ -768,24 +980,24 @@ fn auto_start_queue_anchor_memoizes_the_replay_against_the_history_files() {
         }
     };
 
-    let members = vec![crate::profile::ProfileName::from("held")];
+    let profiles = vec![crate::profile::ProfileName::from("held")];
     let gap = queue_gap_secs(2, INTERVAL_MS);
     let first_open = now - 600;
     confirm_open_at(first_open, &mut prev);
 
     // Stable while the files are: the fingerprint is the whole basis for
     // skipping a parse, so a spurious change would skip nothing.
-    let signature = super::history_signature(&members);
+    let signature = super::history_signature(&profiles);
     assert_eq!(
         signature,
-        super::history_signature(&members),
+        super::history_signature(&profiles),
         "the fingerprint must not move on its own"
     );
 
     let state = super::new_state();
     super::note_queue_open(&state, &"held".into(), now - 4 * 3600);
     assert_eq!(
-        super::queue_anchor(&state, &members, now, gap),
+        super::queue_anchor(&state, &profiles, now, gap),
         Some(first_open),
         "the first derivation still folds in the out-of-band open"
     );
@@ -801,13 +1013,100 @@ fn auto_start_queue_anchor_memoizes_the_replay_against_the_history_files() {
     let second_open = later - 300;
     confirm_open_at(second_open, &mut prev);
     assert_ne!(
-        super::history_signature(&members),
+        super::history_signature(&profiles),
         signature,
         "an append has to move the fingerprint, or the memo goes stale"
     );
     assert_eq!(
-        super::queue_anchor(&state, &members, later, gap),
+        super::queue_anchor(&state, &profiles, later, gap),
         Some(second_open),
         "a newer confirmed open is picked up across the memo"
+    );
+}
+
+/// The anchor replays EVERY profile's history, never just the queue members':
+/// a window open is a window open, whoever holds it. A profile that holds no
+/// queue slot (auto-start off here) whose history carries the newest confirmed
+/// open still anchors the queue, at the startup seed AND the per-tick gate —
+/// the two take the same full-list input, so they cannot disagree.
+#[test]
+fn auto_start_queue_anchor_replays_non_member_profiles() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    let _home = crate::testutil::HomeSandbox::new();
+    let now = 1_780_000_000i64;
+    let reading = |reset: i64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(reset)),
+        }),
+        ..UsageInfo::default()
+    };
+    // Three polls holding one boundary still, through the real writer: a
+    // confirmed open at `at`.
+    let confirm_open_at = |name: &str, at: i64| {
+        let boundary = at + FIVE_HOUR_SECS;
+        let mut prev: Option<UsageInfo> = None;
+        for (ts, reset) in [
+            (at - 420, boundary),
+            (at - 330, boundary - 1),
+            (at - 240, boundary),
+        ] {
+            let next = reading(reset);
+            crate::profile::append_usage_sample_at(
+                &name.into(),
+                prev.as_ref(),
+                &next,
+                ts as u64 * 1000,
+            );
+            prev = Some(next);
+        }
+    };
+    // The MEMBER's newest confirmed open: four hours old.
+    let member_open = now - 4 * 3600;
+    confirm_open_at("member", member_open);
+    // The NON-member's (auto-start off, so it holds no queue slot): ten
+    // minutes old.
+    let outsider_open = now - 600;
+    confirm_open_at("outsider", outsider_open);
+
+    let mut outsider = warming("outsider");
+    outsider.auto_start = false;
+    let config = config_of(vec![warming("member"), outsider], vec![]);
+    assert_eq!(
+        auto_start_queue_members(&config, &[]),
+        vec!["member"],
+        "the outsider holds no queue slot"
+    );
+    let profiles: Vec<crate::profile::ProfileName> =
+        config.profiles.iter().map(|p| p.name.clone()).collect();
+
+    // Startup seed: the full profile list replays both files, and the newer
+    // non-member open wins.
+    let seeded = super::new_state();
+    super::seed_queue_anchor(&seeded, &profiles);
+    assert_eq!(
+        super::queue_anchor_cached(&seeded),
+        Some(outsider_open),
+        "the seed replays every profile's history, member or not"
+    );
+
+    // Per-tick gate: same full-list input, same anchor.
+    let gap = queue_gap_secs(1, INTERVAL_MS);
+    let state = super::new_state();
+    assert_eq!(
+        super::queue_anchor(&state, &profiles, now, gap),
+        Some(outsider_open),
+        "the per-tick gate replays the same full list and lands on the same open"
+    );
+
+    // The member list alone — the pre-ruling anchor input — would have
+    // answered with the member's older open, so the full-list input is what
+    // the two legs now agree on.
+    let members = auto_start_queue_members(&config, &[]);
+    let old_input = super::new_state();
+    assert_eq!(
+        super::queue_anchor(&old_input, &members, now, gap),
+        Some(member_open),
+        "the old member-list input would miss the non-member's newer open"
     );
 }
