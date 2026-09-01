@@ -597,14 +597,14 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
     );
 }
 
-/// The `kick in …` line under `plan`: gray, shown for ANY account with
-/// `auto_start` on, queue toggle on or off (owner 2026-09-01 — the row moved
-/// off the Fallback card). With a queue slot the value is the queue's shared
-/// next-open estimate; without one it is the account's own window reset, the
-/// instant its lapsed-leg kick fires. Either way a due queue reads
-/// `kick due now`.
+/// The `usage auto-start in …` countdown on the `plan` row, flush right: gray,
+/// shown for ANY account with `auto_start` on, queue toggle on or off (owner
+/// 2026-09-01 — the text moved off the Fallback card, then right onto the plan
+/// row). With a queue slot the value is the queue's shared next-open estimate;
+/// without one it is the account's own window reset, the instant its lapsed-leg
+/// kick fires. Either way a due queue reads `usage auto-start due now`.
 #[test]
-fn header_lines_auto_start_kick_line_reads_the_queue_then_the_own_reset() {
+fn header_lines_auto_start_kick_text_reads_the_queue_then_the_own_reset() {
     let lines_of = |auto_start: bool, reset_in: Option<i64>, slot: Option<QueueSlot>| {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.auto_start = auto_start;
@@ -643,36 +643,92 @@ fn header_lines_auto_start_kick_line_reads_the_queue_then_the_own_reset() {
             next_in,
         })
     };
+    // `plan` + no-data dash measure 11 cells; a 52-cell row pads the kick text
+    // flush right with the house 3-cell minimum gap.
+    let row = |kick: &str| {
+        format!(
+            "plan      —{}{}",
+            " ".repeat(52 - 11 - kick.chars().count()),
+            kick
+        )
+    };
 
     // Queue slot wins while it holds one: the queue's shared estimate, not
     // this account's own reset.
     assert_eq!(
-        lines_of(true, Some(8880), slot(Some(8880)))[1],
-        "          kick in 2h 28m"
+        lines_of(true, Some(8880), slot(Some(8880)))[0],
+        row("usage auto-start in 2h 28m")
     );
 
     // A slot with nothing left to wait for: the queue is due.
     assert_eq!(
-        lines_of(true, None, slot(None))[1],
-        "          kick due now"
+        lines_of(true, None, slot(None))[0],
+        row("usage auto-start due now")
     );
 
     // No slot — toggle off, or the account is excluded from the queue: the
     // account's own reset is the moment its lapsed-leg kick fires.
     assert_eq!(
-        lines_of(true, Some(8880), None)[1],
-        "          kick in 2h 28m"
+        lines_of(true, Some(8880), None)[0],
+        row("usage auto-start in 2h 28m")
     );
 
     // Own window already lapsed: due now.
-    assert_eq!(lines_of(true, Some(-60), None)[1], "          kick due now");
+    assert_eq!(
+        lines_of(true, Some(-60), None)[0],
+        row("usage auto-start due now")
+    );
 
-    // Not opted in: no line at all.
+    // Not opted in: no kick text at all.
     let lines = lines_of(false, Some(8880), None);
     assert!(
         !lines.iter().any(|l| l.contains("kick")),
-        "an account without auto_start gets no kick line, got {lines:?}"
+        "an account without auto_start gets no kick text, got {lines:?}"
     );
+}
+
+/// Tight rows: the kick text truncates with a trailing ellipsis, keeping the
+/// 3-cell gap, and drops whole when not even a hint fits.
+#[test]
+fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.auto_start = true;
+    profile.usage = Some(crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 8880,
+            )),
+        }),
+        ..Default::default()
+    });
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: Some(QueueSlot {
+            position: 1,
+            total: 2,
+            next_in: Some(8880),
+        }),
+        diag: DiagFlags::default(),
+    };
+    let row = |w: u16| {
+        header_lines(&profile, &header, w)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.clone())
+            .collect::<String>()
+    };
+
+    // 26 cells: 11 left + 3 gap leaves 12, so "usage auto-start in 2h 28m"
+    // becomes "usage auto-…" and the 3-cell gap holds.
+    assert_eq!(row(26), "plan      —   usage auto-…");
+
+    // 15 cells: the gap alone eats what remains, so the kick text drops whole.
+    assert_eq!(row(15), "plan      —");
 }
 
 /// A stored key with NO base_url — reachable from a captured `~/.claude`

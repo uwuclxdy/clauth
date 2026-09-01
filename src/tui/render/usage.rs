@@ -75,8 +75,9 @@ struct HeaderState {
     diag: DiagFlags,
     /// The shown profile's auto-start queue slot, resolved before the Config
     /// guard (rank order) like the chain card used to; `None` when the queue
-    /// toggle is off or the profile holds no slot. The `kick in` line under
-    /// `plan` falls back to the profile's own window reset when it is `None`.
+    /// toggle is off or the profile holds no slot. The `usage auto-start`
+    /// countdown on the `plan` row falls back to the profile's own window reset
+    /// when it is `None`.
     queue_slot: Option<QueueSlot>,
 }
 
@@ -752,29 +753,37 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         });
     // No tier known yet takes the house no-data dash: a bare "Claude" here read
     // as a real plan on the one row an operator checks their plan from.
+    let plan_w = plan.as_deref().map(|s| s.chars().count()).unwrap_or(1);
     let plan_span = match plan {
         Some(label) => Span::styled(label, theme::body()),
         None => Span::styled("—".to_string(), theme::faint()),
     };
-    let mut lines = vec![Line::from(vec![key_span("plan"), plan_span])];
+    let plan_key = key_span("plan");
+    let left_w = plan_key.width() + plan_w;
+    let mut plan_spans = vec![plan_key, plan_span];
     if profile.auto_start {
-        lines.push(kick_line(profile, header));
+        plan_spans.extend(kick_spans(
+            &kick_text(profile, header),
+            left_w,
+            inner_w as usize,
+        ));
     }
+    let mut lines = vec![Line::from(plan_spans)];
     lines.extend(status_lines(profile, header, inner_w));
     lines
 }
 
-/// The gray `kick in …` line under `plan`, shown for ANY account that opted
-/// into `auto_start`, queue toggle on or off. The value is the queue's shared
+/// The `usage auto-start in …` value, shown for ANY account that opted into
+/// `auto_start`, queue toggle on or off. The value is the queue's shared
 /// next-opening estimate while this profile holds a slot; without one (toggle
 /// off, or the profile is excluded from the queue) it is the account's own
 /// window reset — the lapsed-leg kick fires the moment that reset passes.
-fn kick_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
+fn kick_text(profile: &Profile, header: &HeaderState) -> String {
     let now = now_epoch_secs();
-    let text = match header.queue_slot {
+    match header.queue_slot {
         Some(slot) => match slot.next_in {
-            Some(secs) => format!("kick in {}", humanize_duration(secs)),
-            None => "kick due now".to_string(),
+            Some(secs) => format!("usage auto-start in {}", humanize_duration(secs)),
+            None => "usage auto-start due now".to_string(),
         },
         None => {
             let until_reset = profile
@@ -783,14 +792,33 @@ fn kick_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
                 .and_then(|u| u.five_hour.as_ref())
                 .and_then(|w| reset_in_secs_at(w, now));
             match until_reset {
-                Some(secs) if secs > 0 => format!("kick in {}", humanize_duration(secs)),
-                _ => "kick due now".to_string(),
+                Some(secs) if secs > 0 => {
+                    format!("usage auto-start in {}", humanize_duration(secs))
+                }
+                _ => "usage auto-start due now".to_string(),
             }
         }
-    };
-    let mut spans = vec![Span::raw(" ".repeat(KEY_W + KEY_GUTTER))];
-    spans.push(Span::styled(text, theme::faint()));
-    Line::from(spans)
+    }
+}
+
+/// Spans putting `text` flush against the pane's right edge on the `plan` row,
+/// keeping the house 3-cell minimum gap from the row's left content (cloudy-tui
+/// spacing). Truncates with `…` when the row can't hold both; drops the kick
+/// when not even a countdown hint fits.
+fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
+    let avail = inner_w.saturating_sub(left_w);
+    if avail < 3 {
+        return Vec::new();
+    }
+    let text = crate::format::truncate(text, avail - 3);
+    if text.chars().count() < 4 {
+        return Vec::new();
+    }
+    let pad = avail - text.chars().count();
+    vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(text, theme::faint()),
+    ]
 }
 
 /// One row of the `status` block paired with its optional `└`/`├` fix hint.
