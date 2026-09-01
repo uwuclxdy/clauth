@@ -118,76 +118,9 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
     assert_eq!(view.slot("a"), None);
 }
 
-/// The Fallback card's auto-start row: the queue slot as a pill, with the queue's
-/// shared next-open trailing outside the brackets — the house `[ label ]
-/// qualifier` shape the blocked-reason pills already use for a kick block's
-/// lift ETA.
-///
-/// It gets its own `auto-start` key rather than stacking into the pill block
-/// above, because that block is the BLOCKED-reason ladder and a queue slot is
-/// not a reason the chain is routing around this member.
-#[test]
-fn auto_start_queue_chip_renders_the_slot_and_the_queues_next_open() {
-    let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], Some("a"), vec!["a"]);
-    let card = |slot: Option<crate::usage::QueueSlot>, width: usize| {
-        member_detail(
-            &cfg,
-            &crate::profile::ProfileName::from("a"),
-            MemberCard {
-                width,
-                queue: slot,
-                ..Default::default()
-            },
-        )
-        .0
-        .iter()
-        .map(line_text)
-        .collect::<Vec<_>>()
-    };
-    let slot = |next_in: Option<i64>| {
-        Some(crate::usage::QueueSlot {
-            position: 1,
-            total: 2,
-            next_in,
-        })
-    };
-    let queue_row = |card: &[String]| {
-        let at = card
-            .iter()
-            .position(|t| t.contains("auto-start"))
-            .expect("a queue member's card carries the auto-start row");
-        // The row explains itself: pill + countdown, no `└` tooltip beneath —
-        // the trailing blank follows it directly.
-        assert_eq!(card[at + 1], "", "no tooltip line under the queue row");
-        card[at].clone()
-    };
-
-    // Exact-match, the house rule for a surface pin: a drifted separator,
-    // gutter, pill shape, or padding must red, not just a vanished substring.
-    // The countdown is right-aligned at the card's inner width.
-    let row = queue_row(&card(slot(Some(8880)), 60));
-    assert_eq!(
-        row,
-        "auto-start   [ queue 1/2 ]                    next in 2h 28m"
-    );
-
-    // A narrow card sheds the countdown's leading words, never its digits —
-    // rendered inline this clipped to `next in 2`.
-    let row = queue_row(&card(slot(Some(8880)), 34));
-    assert_eq!(row, "auto-start   [ queue 1/2 ]  2h 28m");
-
-    // Gap passed: the slot still renders (membership is the standing fact), the
-    // countdown does not — there is nothing left to wait for.
-    let row = queue_row(&card(slot(None), 60));
-    assert_eq!(row, "auto-start   [ queue 1/2 ]");
-
-    // A non-member's card is byte-identical to the pre-queue one: no row, no
-    // blank line reserved for one.
-    assert!(
-        !card(None, 60).iter().any(|t| t.contains("auto-start")),
-        "an account outside the queue gets no auto-start row"
-    );
-}
+// The auto-start queue line no longer renders on the Fallback card (owner
+// 2026-09-01): it moved to the Usage tab, under `plan`, and shows for any
+// account with `auto_start` on, queue toggle or no queue toggle.
 
 // Whole chain exhausted: the caption renders under whichever member is
 // selected, naming the soonest-resuming one (b resets sooner than a).

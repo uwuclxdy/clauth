@@ -17,7 +17,7 @@ use super::format::{
     spinner_style,
 };
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
     draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
     section_box, section_box_verbatim,
 };
@@ -25,8 +25,9 @@ use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRowKind};
 use crate::usage::{
-    ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, StreakCounts, UsageWindow, WindowDollars,
-    ideal_pace_pct, is_stuck_streak, kick_block_switch_grade, now_epoch_secs, now_ms,
+    ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, QueueSlot, StreakCounts, UsageWindow,
+    WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak, kick_block_switch_grade,
+    now_epoch_secs, now_ms, queue_anchor_cached, switch_grade_kick_lifts,
 };
 
 const KEY_W: usize = 8;
@@ -72,6 +73,11 @@ struct HeaderState {
     kick_block: Option<KickBlock>,
     /// Config-derived diagnostic flags driving the `└` fix hints.
     diag: DiagFlags,
+    /// The shown profile's auto-start queue slot, resolved before the Config
+    /// guard (rank order) like the chain card used to; `None` when the queue
+    /// toggle is off or the profile holds no slot. The `kick in` line under
+    /// `plan` falls back to the profile's own window reset when it is `None`.
+    queue_slot: Option<QueueSlot>,
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -96,6 +102,12 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .lock()
         .map(|m| m.clone())
         .unwrap_or_default();
+    // The queue anchor + the switch-grade lift set, both read before the Config
+    // lock (AutoStartQueue 240 and KickBlockState 230 < Config 400). The anchor
+    // is the CACHED one: `queue_anchor` would replay per-profile history files,
+    // which a render pass must not.
+    let queue_anchor = queue_anchor_cached(&app.auto_start_queue);
+    let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
     let cfg = app.config();
     let profile = cfg
         .profiles
@@ -150,6 +162,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling),
             }
         },
+        queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(&profile.name),
     };
 
     let show_estimates = cfg.state.show_estimates;
@@ -744,8 +757,40 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         None => Span::styled("—".to_string(), theme::faint()),
     };
     let mut lines = vec![Line::from(vec![key_span("plan"), plan_span])];
+    if profile.auto_start {
+        lines.push(kick_line(profile, header));
+    }
     lines.extend(status_lines(profile, header, inner_w));
     lines
+}
+
+/// The gray `kick in …` line under `plan`, shown for ANY account that opted
+/// into `auto_start`, queue toggle on or off. The value is the queue's shared
+/// next-opening estimate while this profile holds a slot; without one (toggle
+/// off, or the profile is excluded from the queue) it is the account's own
+/// window reset — the lapsed-leg kick fires the moment that reset passes.
+fn kick_line(profile: &Profile, header: &HeaderState) -> Line<'static> {
+    let now = now_epoch_secs();
+    let text = match header.queue_slot {
+        Some(slot) => match slot.next_in {
+            Some(secs) => format!("kick in {}", humanize_duration(secs)),
+            None => "kick due now".to_string(),
+        },
+        None => {
+            let until_reset = profile
+                .usage
+                .as_ref()
+                .and_then(|u| u.five_hour.as_ref())
+                .and_then(|w| reset_in_secs_at(w, now));
+            match until_reset {
+                Some(secs) if secs > 0 => format!("kick in {}", humanize_duration(secs)),
+                _ => "kick due now".to_string(),
+            }
+        }
+    };
+    let mut spans = vec![Span::raw(" ".repeat(KEY_W + KEY_GUTTER))];
+    spans.push(Span::styled(text, theme::faint()));
+    Line::from(spans)
 }
 
 /// One row of the `status` block paired with its optional `└`/`├` fix hint.

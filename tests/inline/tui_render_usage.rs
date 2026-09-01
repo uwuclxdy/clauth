@@ -473,6 +473,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let plan_row: String = header_lines(&profile, &header, 52)
@@ -536,6 +537,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let plan_row: String = header_lines(&profile, &header, 52)
@@ -576,6 +578,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let lines = header_lines(&profile, &header, 52);
@@ -591,6 +594,84 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
     assert!(
         !plan_row.contains("Claude"),
         "an unfetched plan must not name a tier, got {plan_row:?}"
+    );
+}
+
+/// The `kick in …` line under `plan`: gray, shown for ANY account with
+/// `auto_start` on, queue toggle on or off (owner 2026-09-01 — the row moved
+/// off the Fallback card). With a queue slot the value is the queue's shared
+/// next-open estimate; without one it is the account's own window reset, the
+/// instant its lapsed-leg kick fires. Either way a due queue reads
+/// `kick due now`.
+#[test]
+fn header_lines_auto_start_kick_line_reads_the_queue_then_the_own_reset() {
+    let lines_of = |auto_start: bool, reset_in: Option<i64>, slot: Option<QueueSlot>| {
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        profile.auto_start = auto_start;
+        profile.usage = reset_in.map(|secs| crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + secs,
+                )),
+            }),
+            ..Default::default()
+        });
+        let header = HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: slot,
+            diag: DiagFlags::default(),
+        };
+        header_lines(&profile, &header, 52)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let slot = |next_in: Option<i64>| {
+        Some(QueueSlot {
+            position: 1,
+            total: 2,
+            next_in,
+        })
+    };
+
+    // Queue slot wins while it holds one: the queue's shared estimate, not
+    // this account's own reset.
+    assert_eq!(
+        lines_of(true, Some(8880), slot(Some(8880)))[1],
+        "          kick in 2h 28m"
+    );
+
+    // A slot with nothing left to wait for: the queue is due.
+    assert_eq!(
+        lines_of(true, None, slot(None))[1],
+        "          kick due now"
+    );
+
+    // No slot — toggle off, or the account is excluded from the queue: the
+    // account's own reset is the moment its lapsed-leg kick fires.
+    assert_eq!(
+        lines_of(true, Some(8880), None)[1],
+        "          kick in 2h 28m"
+    );
+
+    // Own window already lapsed: due now.
+    assert_eq!(lines_of(true, Some(-60), None)[1], "          kick due now");
+
+    // Not opted in: no line at all.
+    let lines = lines_of(false, Some(8880), None);
+    assert!(
+        !lines.iter().any(|l| l.contains("kick")),
+        "an account without auto_start gets no kick line, got {lines:?}"
     );
 }
 
@@ -621,6 +702,7 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let plan_row: String = header_lines(&profile, &header, 52)
@@ -667,6 +749,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let plan_row: String = header_lines(&profile, &header, 52)
@@ -706,6 +789,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -759,6 +843,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -793,6 +878,7 @@ fn disabled_rung_header(kick: bool) -> HeaderState {
             until: Some(now_epoch_secs() + 3600),
             next_retry: now_epoch_secs() + 30,
         }),
+        queue_slot: None,
         diag: DiagFlags::default(),
     }
 }
@@ -817,6 +903,7 @@ fn status_lines_stacks_the_health_rungs_under_disabled() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("gamma"));
     let header = HeaderState {
+        queue_slot: None,
         diag: DiagFlags {
             auth_broken: true,
             ..DiagFlags::default()
@@ -922,6 +1009,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -1012,6 +1100,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
                 until: Some(now + 4 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags::default(),
         },
         52,
@@ -1091,6 +1180,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
                 until: Some(now + 3 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 auto_start: false,
                 budget_spent: true,
@@ -1150,6 +1240,7 @@ fn status_lines_single_hint_has_no_rail() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags {
             auth_broken: true,
             ..DiagFlags::default()
@@ -1197,6 +1288,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
                 until: Some(now + 3 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 auto_start: true,
                 ..DiagFlags::default()
@@ -1247,6 +1339,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
                 until: Some(now + 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 budget_spent: true,
                 ..DiagFlags::default()
@@ -1284,6 +1377,7 @@ fn rate_limited_suffix_counts_the_retry() {
             refresh_fail: 0,
         },
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -1325,6 +1419,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
             refresh_fail,
         },
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -1381,6 +1476,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         tick: 0,
         streaks,
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
 
@@ -1443,6 +1539,7 @@ fn spent_skipped_account_pill_is_bare() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let with_window = |util: f64| {
@@ -1617,6 +1714,7 @@ fn status_lines_renders_the_auto_start_divergence() {
                     until: Some(now + 4 * 60 * 60),
                     next_retry: now + 30,
                 }),
+                queue_slot: None,
                 diag: DiagFlags {
                     auto_start,
                     ..DiagFlags::default()
@@ -1650,6 +1748,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
             tick: 0,
             streaks: StreakCounts::default(),
             kick_block: None,
+            queue_slot: None,
             diag: DiagFlags {
                 spend_uncapped: true,
                 budget_spent: true,
@@ -1696,6 +1795,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
                 until: Some(now + 4 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 auth_broken: true,
                 spend_uncapped: true,
@@ -1745,6 +1845,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
             tick: 0,
             streaks: StreakCounts::default(),
             kick_block: None,
+            queue_slot: None,
             diag: DiagFlags {
                 auth_broken: true,
                 ..DiagFlags::default()
