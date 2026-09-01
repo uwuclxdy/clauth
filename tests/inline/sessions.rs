@@ -115,6 +115,7 @@ fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
             .map(|&(id, input, output)| priced_model(id, vec![flat_entry(input, output)]))
             .collect(),
         Vec::new(),
+        Vec::new(),
         crate::tokens::today_date(),
         0,
         Vec::new(),
@@ -150,6 +151,7 @@ fn windowed_table(rows: &[WindowRates<'_>]) -> crate::pricing::PriceTable {
                 )
             })
             .collect(),
+        Vec::new(),
         Vec::new(),
         crate::tokens::today_date(),
         0,
@@ -687,6 +689,7 @@ fn annotate_prices_each_day_at_its_dated_rate() {
     let dear = priced_model("m", vec![flat_entry(2e-6, 0.0)]);
     let table = crate::pricing::PriceTable::capture(
         vec![dear.clone()],
+        Vec::new(),
         Vec::new(),
         crate::tokens::today_date(),
         0,

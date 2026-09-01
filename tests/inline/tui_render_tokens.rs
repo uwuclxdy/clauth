@@ -79,6 +79,7 @@ fn table_of(models: Vec<PricedModel>) -> PriceTable {
     PriceTable::capture(
         models,
         Vec::new(),
+        Vec::new(),
         crate::tokens::today_date(),
         0,
         Vec::new(),
@@ -89,7 +90,14 @@ fn table_of(models: Vec<PricedModel>) -> PriceTable {
 /// given explicitly (`capture` appends nothing — the last history entry must
 /// equal `models`).
 fn table_with_history(models: Vec<PricedModel>, history: Vec<RateSnapshot>) -> PriceTable {
-    PriceTable::capture(models, Vec::new(), crate::tokens::today_date(), 0, history)
+    PriceTable::capture(
+        models,
+        Vec::new(),
+        Vec::new(),
+        crate::tokens::today_date(),
+        0,
+        history,
+    )
 }
 
 // ── period-row builders ──────────────────────────────────────────────────────

@@ -33,6 +33,18 @@
 //! nor delist it; a kept source's DELISTED copy of a foreign id (dashscope's
 //! resales) never shadows the live first-party key that owns the id.
 //!
+//! Api-alias ids (`deepseek-chat`, `deepseek-reasoner`) name a served model,
+//! not a page: no index row and no history key carries them, so they resolve
+//! through the store's model catalog (`data/models.json`, `aliases`) — a dated
+//! chain per alias, one record per canonical model that served it. A query
+//! day prices at the record whose `from <= day < to` window covers it, at
+//! that canonical's own store walk for the day; a day no record covers prices
+//! nothing (deepseek retired both aliases on 2026-07-24, and past that day
+//! they dash). A claude session's variant spellings (`deepseek-v4-pro-thinking`)
+//! carry a suffix no page id has; one trailing `-<suffix>` group from a known
+//! variant list strips and retries once the ladder misses, never remapping an
+//! id a row carries verbatim.
+//!
 //! # Design (mirrors `status.rs`)
 //!
 //! TUI-free: owns the data model, the HTTP fetch, the distill step, and the
@@ -86,6 +98,15 @@ const FEED_URL: &str =
 const HISTORY_URL: &str =
     "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/history.ndjson";
 
+/// The store's model catalog (`{version, models, aliases}`), fetched on the
+/// same cadence and the same all-or-nothing rule. Only its `aliases` table is
+/// distilled: the api-alias ids are not page ids, so no history key can ever
+/// price them — the table is the only place the store says what they served.
+/// The catalog's `models` half (canonical id → per-source page ids) is a
+/// mapping no lookup here reads.
+const MODELS_URL: &str =
+    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/models.json";
+
 /// Background refresh cadence. Prices move rarely, so this is deliberately slow;
 /// a manual refresh signal short-circuits the wait.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -94,10 +115,10 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// HTTP response-receive timeout.
 const RECV_TIMEOUT: Duration = Duration::from_secs(15);
-/// Hard cap on a response body. The real feeds are ~298 KiB (index) and
-/// ~433 KiB (history; largest observed single-day batch: 608 rows on
-/// 2026-08-29); 8 MiB is generous headroom while still bounding a hostile /
-/// runaway response.
+/// Hard cap on a response body. The real feeds are ~298 KiB (index), ~433 KiB
+/// (history; largest observed single-day batch: 608 rows on 2026-08-29) and
+/// ~52 KiB (models); 8 MiB is generous headroom while still bounding a hostile
+/// / runaway response.
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Snapshot history cap: the newest 180 fetches survive, older ones drop.
@@ -128,6 +149,13 @@ const FIRST_PARTY_PROVIDERS: &[&str] = &[
     "perplexity",
     "dashscope",
 ];
+
+/// Variant-suffix spellings a claude session reports that no price page id
+/// carries (`deepseek-v4-pro-thinking`): one trailing `-<suffix>` group
+/// stripped and retried after the ladder misses. Slash-prefixed reseller
+/// spellings (`qwen/qwen3.6-27b`) need no entry — the ladder's provider-strip
+/// rung already covers that class.
+const VARIANT_SUFFIXES: &[&str] = &["thinking"];
 
 // ── Data model ──────────────────────────────────────────────────────────────
 
@@ -239,6 +267,39 @@ pub(crate) struct StoreRow {
     model: Option<PricedModel>,
 }
 
+/// One dated record of an alias chain: the canonical id the alias served from
+/// `from` (inclusive) to `to` (exclusive), either bound null = open. Most
+/// chains hold a single `(null, null)` record — an alias that has always
+/// pointed at one still-live canonical (`grok-4.5-latest` → `grok-4.5`). The
+/// store's `citation` is provenance for a human, not a rate, and is not
+/// distilled.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AliasSpan {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    to: Option<String>,
+    canonical: String,
+}
+
+impl AliasSpan {
+    /// Whether this record is the alias's answer on `date`: `from <= date < to`
+    /// with either bound open when null.
+    fn covers(&self, date: &str) -> bool {
+        self.from.as_deref().is_none_or(|from| from <= date)
+            && self.to.as_deref().is_none_or(|to| date < to)
+    }
+}
+
+/// One alias id and its dated chain, in file order. A chain need not be
+/// contiguous and need not reach today: an alias past its last record is
+/// retired, and the days after it price nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct AliasKey {
+    id: String,
+    spans: Vec<AliasSpan>,
+}
+
 /// Per-hour token buckets behind [`PriceTable::cost_day`].
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HourTokens {
@@ -263,6 +324,11 @@ pub(crate) struct PriceTable {
     /// source for every day, today included. Empty while no store history has
     /// been fetched or cached (a pre-store cache).
     store: Vec<StoreKey>,
+    /// The store's distilled alias chains (models.json `aliases`). Empty until
+    /// a fetch or cache brings them (a pre-aliases cache loads empty and
+    /// upgrades on the next successful fetch), and then only reached once the
+    /// ladder and the variant strip have both missed.
+    aliases: Vec<AliasKey>,
     pub(crate) fetched_at_ms: u64,
     /// Memoized match walks (see [`Memo`]). A table is immutable once built, so
     /// a remembered index cannot go stale.
@@ -303,10 +369,12 @@ impl PriceTable {
     /// last snapshot's (serialize-and-compare — a byte-identical refetch does
     /// not grow the history), and cap the history at [`HISTORY_CAP`], dropping
     /// the oldest snapshots. `store` is the fetch's complete distilled history
-    /// — the file is cumulative — and replaces any cached store wholesale.
+    /// — the file is cumulative — and replaces any cached store wholesale, as
+    /// `aliases` does the catalog.
     pub(crate) fn capture(
         models: Vec<PricedModel>,
         store: Vec<StoreKey>,
+        aliases: Vec<AliasKey>,
         captured: String,
         fetched_at_ms: u64,
         mut history: Vec<RateSnapshot>,
@@ -334,6 +402,7 @@ impl PriceTable {
             models,
             history,
             store,
+            aliases,
             fetched_at_ms,
             memo: Mutex::default(),
         }
@@ -358,8 +427,17 @@ impl PriceTable {
     /// form whose spelling no row carries stays unpriced: `glm-4.7-flash-20250801`
     /// strips to `glm-4.7-flash`, which the feed carries no rate for today.
     ///
-    /// Steps 1-2 and the retry ladder are [`ladder_index`], memoized per
-    /// `(id, date)`; step 3 is [`entry_rate`], the only half the hour reaches.
+    /// Two stages follow a ladder miss, in [`resolve_index`]: the variant
+    /// strip (`deepseek-v4-pro-thinking` → `deepseek-v4-pro`, one trailing
+    /// `-<suffix>` group from [`VARIANT_SUFFIXES`], case-insensitively), then
+    /// the alias table ([`alias_for`]: `deepseek-chat` on a day inside one of
+    /// its records prices that record's canonical id, which itself re-enters
+    /// the full ladder). An id a row carries verbatim is never remapped by
+    /// either — both run only on a miss.
+    ///
+    /// Steps 1-2 and the retry ladder are [`ladder_index`]; the whole walk is
+    /// memoized per `(id, date)`; step 3 is [`entry_rate`], the only half the
+    /// hour reaches.
     ///
     /// Rates come from the models applicable to `date` (see
     /// [`PriceTable::dated_models`]: the store walk, or the snapshot walk for
@@ -380,7 +458,7 @@ impl PriceTable {
     fn matched(&self, model: &str, date: &str) -> Option<(Arc<[PricedModel]>, usize)> {
         let models = self.dated_models(date)?;
         let Ok(mut memo) = self.memo.lock() else {
-            let idx = ladder_index(&models, model)?;
+            let idx = resolve_index(&models, model, date, &self.aliases)?;
             return Some((models, idx));
         };
         let found = {
@@ -388,7 +466,7 @@ impl PriceTable {
             if let Some(hit) = set.by_id.get(model) {
                 return Some((models, (*hit)?));
             }
-            let found = ladder_index(&models, model);
+            let found = resolve_index(&models, model, date, &self.aliases);
             set.by_id.insert(model.to_owned(), found);
             found
         };
@@ -584,6 +662,68 @@ fn ladder_index(models: &[PricedModel], id: &str) -> Option<usize> {
     None
 }
 
+/// The full match walk for one date's model set: [`ladder_index`] first (so an
+/// id a row carries verbatim is never remapped), then the variant-suffix strip
+/// ([`variant_base`]), then the store's alias table ([`alias_for`]). Each
+/// stage's form re-enters the full ladder, so a stage prices only what a row
+/// names, and every stage missing prices nothing.
+fn resolve_index(
+    models: &[PricedModel],
+    id: &str,
+    date: &str,
+    aliases: &[AliasKey],
+) -> Option<usize> {
+    if let Some(i) = ladder_index(models, id) {
+        return Some(i);
+    }
+    // The ladder's primary form (bracket-stripped) is the id the two
+    // id-shape stages reason about.
+    let form = strip_bracket_suffix(id);
+    if let Some(base) = variant_base(form)
+        && let Some(i) = ladder_index(models, base)
+    {
+        return Some(i);
+    }
+    let canonical = alias_for(aliases, form, date)?;
+    ladder_index(models, canonical)
+}
+
+/// The canonical id an alias served on `date`: its chain's record covering the
+/// day. `None` when the id is no alias or no record covers it — an alias past
+/// its last record is retired, and the days after it price nothing.
+fn alias_for<'a>(aliases: &'a [AliasKey], id: &str, date: &str) -> Option<&'a str> {
+    let key = aliases.iter().find(|k| k.id.eq_ignore_ascii_case(id))?;
+    key.spans
+        .iter()
+        .find(|span| span.covers(date))
+        .map(|span| span.canonical.as_str())
+}
+
+/// The id with one variant-suffix group stripped: `deepseek-v4-pro-thinking`
+/// → `deepseek-v4-pro`. Only the suffixes [`VARIANT_SUFFIXES`] names strip — a
+/// loose `-<segment>` strip would walk past a real variant name into the
+/// family base id and price a different model than the id names, the same
+/// reason [`strip_date_stamp`] pins its digit width.
+fn variant_base(id: &str) -> Option<&str> {
+    VARIANT_SUFFIXES
+        .iter()
+        .find_map(|suffix| strip_variant_suffix(id, suffix))
+}
+
+/// Strip one trailing `-<suffix>` variant marker, case-insensitively.
+fn strip_variant_suffix<'a>(id: &'a str, suffix: &str) -> Option<&'a str> {
+    let cut = id.len().checked_sub(suffix.len() + 1)?;
+    // An ASCII `-` at `cut` puts both sides on char boundaries, so the slices
+    // below cannot split a multi-byte character.
+    if id.as_bytes().get(cut) != Some(&b'-') {
+        return None;
+    }
+    if !id.get(cut + 1..)?.eq_ignore_ascii_case(suffix) {
+        return None;
+    }
+    id.get(..cut)
+}
+
 /// One candidate form through the match walk: the first [`PricedModel`] in
 /// distilled order whose id equals the form, case-insensitively. An empty
 /// `prices` list can price nothing, so a model carrying one is not a match and
@@ -744,11 +884,12 @@ pub(crate) fn spawn(tx: Sender<PricingEvent>, refresh_rx: Receiver<()>) {
 /// (`Loaded`); only when nothing is cached do we surface `Failed`.
 fn run_fetch(tx: &Sender<PricingEvent>, cache_file: &Path, stale_cleaned: &mut bool) {
     match fetch_table() {
-        Ok((models, store)) => {
+        Ok((models, store, aliases)) => {
             let history = load_cache(cache_file)
                 .map(|t| t.history)
                 .unwrap_or_default();
-            let table = PriceTable::capture(models, store, today_date(), now_ms(), history);
+            let table =
+                PriceTable::capture(models, store, aliases, today_date(), now_ms(), history);
             save_cache(cache_file, &table);
             delete_stale_cache_once(cache_file, stale_cleaned);
             let _ = tx.send(PricingEvent::Loaded(Box::new(table)));
@@ -784,13 +925,14 @@ fn delete_stale_cache_once(cache_file: &Path, done: &mut bool) {
 }
 
 /// Fetch and distill the live feed: the index (the current price set, folded
-/// into the snapshot log) and the history ndjson (the dating source). Either
-/// fetch failing fails the whole attempt, so the cache fallback serves a
-/// coherent table rather than half of one.
-fn fetch_table() -> anyhow::Result<(Vec<PricedModel>, Vec<StoreKey>)> {
+/// into the snapshot log), the history ndjson (the dating source), and the
+/// model catalog (the alias table). Any one failing fails the whole attempt,
+/// so the cache fallback serves a coherent table rather than a mix of halves.
+fn fetch_table() -> anyhow::Result<(Vec<PricedModel>, Vec<StoreKey>, Vec<AliasKey>)> {
     let index = distill(&fetch_body(FEED_URL)?)?;
     let store = distill_history(&fetch_body(HISTORY_URL)?)?;
-    Ok((index, store))
+    let aliases = distill_models(&fetch_body(MODELS_URL)?)?;
+    Ok((index, store, aliases))
 }
 
 /// GET one feed URL as text, capped at [`MAX_BODY_BYTES`].
@@ -972,6 +1114,39 @@ fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
     }
     if keys.is_empty() {
         anyhow::bail!("price history distilled to zero keys");
+    }
+    Ok(keys)
+}
+
+/// Distill the store's model catalog into its alias chains. Tolerant like the
+/// other distills: a record without a `canonical` skips, an alias whose
+/// records all skip drops, and a non-array chain drops. Fails when zero
+/// aliases survive (the store's v3 catalog carries 44) — an empty table would
+/// dash every alias id while looking like a healthy load.
+fn distill_models(json: &str) -> anyhow::Result<Vec<AliasKey>> {
+    let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
+    let aliases = root
+        .get("aliases")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("models feed has no aliases object"))?;
+    let mut keys = Vec::new();
+    for (id, records) in aliases {
+        let Some(records) = records.as_array() else {
+            continue; // malformed chain — skip, don't fail the feed
+        };
+        let spans: Vec<AliasSpan> = records
+            .iter()
+            .filter_map(|r| serde_json::from_value::<AliasSpan>(r.clone()).ok())
+            .collect();
+        if !spans.is_empty() {
+            keys.push(AliasKey {
+                id: id.clone(),
+                spans,
+            });
+        }
+    }
+    if keys.is_empty() {
+        anyhow::bail!("models feed distilled to zero aliases");
     }
     Ok(keys)
 }
@@ -1178,15 +1353,17 @@ fn to_per_token(mtok: f64) -> f64 {
 
 // ── Disk cache ───────────────────────────────────────────────────────────────
 
-/// On-disk cache shape: the fetch time, the store-derived dating source, and
-/// the local snapshot history. A cache written before the store half exists
-/// loads with an empty `store` (serde default) and upgrades on the next
-/// successful fetch.
+/// On-disk cache shape: the fetch time, the store-derived dating source, the
+/// alias table, and the local snapshot history. A cache written before the
+/// store or aliases half exists loads with that half empty (serde default) and
+/// upgrades on the next successful fetch.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     fetched_at_ms: u64,
     #[serde(default)]
     store: Vec<StoreKey>,
+    #[serde(default)]
+    aliases: Vec<AliasKey>,
     #[serde(default)]
     history: Vec<RateSnapshot>,
 }
@@ -1220,6 +1397,7 @@ fn load_cache(path: &Path) -> Option<PriceTable> {
         models,
         history: cache.history,
         store: cache.store,
+        aliases: cache.aliases,
         fetched_at_ms: cache.fetched_at_ms,
         memo: Mutex::default(),
     })
@@ -1230,6 +1408,7 @@ fn save_cache(path: &Path, table: &PriceTable) {
     let cache = CacheFile {
         fetched_at_ms: table.fetched_at_ms,
         store: table.store.clone(),
+        aliases: table.aliases.clone(),
         history: table.history.clone(),
     };
     if let Ok(json) = serde_json::to_string(&cache) {

@@ -49,6 +49,7 @@ fn table(models: Vec<PricedModel>) -> PriceTable {
             models,
         }],
         store: Vec::new(),
+        aliases: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     }
@@ -616,6 +617,7 @@ fn rate_retries_propagate_date_and_hour() {
     let ft = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -728,6 +730,7 @@ fn effective_at_gates_the_whole_row() {
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -755,6 +758,7 @@ fn future_effective_row_prices_nothing_until_its_date() {
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
+        Vec::new(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -779,6 +783,7 @@ fn later_window_entry_wins_when_both_match() {
     // later entry wins.
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
+        Vec::new(),
         Vec::new(),
         "2026-08-30".to_owned(),
         0,
@@ -821,6 +826,7 @@ fn snapshot_picks_rate_live_on_date() {
         models: history[1].models.clone(),
         history,
         store: Vec::new(),
+        aliases: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -841,6 +847,7 @@ fn capture_appends_only_on_change() {
     let t = PriceTable::capture(
         vec![eq_model("m", 1e-6, 2e-6)],
         Vec::new(),
+        Vec::new(),
         "2026-08-19".to_owned(),
         42,
         Vec::new(),
@@ -850,6 +857,7 @@ fn capture_appends_only_on_change() {
     // Identical refetch: same models → no new snapshot, capture date dropped.
     let t2 = PriceTable::capture(
         vec![eq_model("m", 1e-6, 2e-6)],
+        Vec::new(),
         Vec::new(),
         "2026-08-20".to_owned(),
         43,
@@ -861,6 +869,7 @@ fn capture_appends_only_on_change() {
     // A rate change appends.
     let t3 = PriceTable::capture(
         vec![eq_model("m", 2e-6, 4e-6)],
+        Vec::new(),
         Vec::new(),
         "2026-08-20".to_owned(),
         44,
@@ -880,6 +889,7 @@ fn capture_caps_history_at_180() {
     let mut t = PriceTable::capture(
         vec![eq_model("m", 0.0, 0.0)],
         Vec::new(),
+        Vec::new(),
         "2026-01-01".to_owned(),
         0,
         Vec::new(),
@@ -888,6 +898,7 @@ fn capture_caps_history_at_180() {
         let rate = f64::from(i) * 1e-6;
         t = PriceTable::capture(
             vec![eq_model("m", rate, 0.0)],
+            Vec::new(),
             Vec::new(),
             format!("2026-{i:03}"),
             u64::from(i),
@@ -925,6 +936,7 @@ fn cache_round_trip_preserves_history() {
         models: history[1].models.clone(),
         history,
         store: Vec::new(),
+        aliases: Vec::new(),
         fetched_at_ms: 12345,
         memo: Mutex::default(),
     };
@@ -1027,7 +1039,14 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
         assert!(!ids.contains(&id), "removed row {id} must delist");
     }
 
-    let t = PriceTable::capture(models, Vec::new(), "2026-08-30".to_owned(), 0, Vec::new());
+    let t = PriceTable::capture(
+        models,
+        Vec::new(),
+        Vec::new(),
+        "2026-08-30".to_owned(),
+        0,
+        Vec::new(),
+    );
     // One claude-* row prices.
     let claude = t
         .rate_at("claude-opus-5", "2026-08-30", 0)
@@ -1136,6 +1155,7 @@ fn cost_at_uses_dated_rate() {
         models: history[1].models.clone(),
         history,
         store: Vec::new(),
+        aliases: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1254,6 +1274,7 @@ fn the_memo_keys_on_the_date_so_two_snapshots_do_not_bleed() {
         models: history[1].models.clone(),
         history,
         store: Vec::new(),
+        aliases: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1279,7 +1300,14 @@ fn zai_quota_entries_are_skipped() {
         .find(|m| m.id == "glm-5.3-flash")
         .expect("row distills");
     assert_eq!(flash.prices.len(), 1, "quota entries contribute no rates");
-    let t = PriceTable::capture(models, Vec::new(), "2026-08-30".to_owned(), 0, Vec::new());
+    let t = PriceTable::capture(
+        models,
+        Vec::new(),
+        Vec::new(),
+        "2026-08-30".to_owned(),
+        0,
+        Vec::new(),
+    );
     let rate = t.rate_at("glm-5.3-flash", "2026-08-28", 8).expect("priced");
     assert!(
         (rate.input - 7.5e-8).abs() < 1e-15,
@@ -1298,6 +1326,7 @@ fn removed_at_stamped_entries_price_nothing() {
     // first-party twin stay unpriced.
     let t = PriceTable::capture(
         distill(FIXTURE).expect("fixture distills"),
+        Vec::new(),
         Vec::new(),
         "2026-08-30".to_owned(),
         0,
@@ -1327,14 +1356,19 @@ fn removed_at_stamped_entries_price_nothing() {
 /// (`tests/fixtures/ai-pricelog-history-trimmed.ndjson`): five of deepseek's
 /// seven deepseek-v4-pro rows (the 2026-08-30 retro-effective windowed row,
 /// the 2026-08-26 legacy `peak_windows` row, the 08-16 / 05-22 / 04-24 flat
-/// rows), minimax's MiniMax-M2.5-Lightning
+/// rows), deepseek-v4-flash's 2026-04-24 row (the alias chain's priced
+/// canonical), grok-4.5's 2026-07-09 row (the null-bound chain's canonical),
+/// minimax's MiniMax-M2.5-Lightning
 /// price + bare-removal pair, two of together's four deepseek-v4-pro rows (the
 /// 06-09 markup and the 08-28 removal), one of avian's two (the 05-04
 /// markup), cloudflare's one row of its forty
 /// (`@cf/deepseek-ai/deepseek-v4-pro-0813`, the dropped source's id behind the
-/// reseller-dash pin), dashscope's resold deepseek-v3.2 price +
+/// reseller-dash pin), openrouter's `extra`-bearing claude-3-haiku row (the
+/// legacy write-key shape: it parses, and the dropped source keeps it out of
+/// the walk), dashscope's resold deepseek-v3.2 price +
 /// removal pair beside deepseek's own row (the delisted-copy shadow case:
-/// dashscope's key is first-seen earlier), and zai's glm-4.5 same-day pair
+/// dashscope's key is first-seen earlier), deepseek-r1's and deepseek-v3's
+/// only rows (the 2025-era alias canonicals), and zai's glm-4.5 same-day pair
 /// (a kept-key tie group that differs in rates at its key's newest observed
 /// day). Every line is verbatim store bytes, in store order.
 const HISTORY_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-history-trimmed.ndjson");
@@ -1346,6 +1380,7 @@ fn store_table() -> PriceTable {
         models: Vec::new(),
         history: Vec::new(),
         store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        aliases: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     }
@@ -1356,15 +1391,19 @@ fn history_distills_first_party_keys_only() {
     let keys = distill_history(HISTORY_FIXTURE).expect("history distills");
     let ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
     // First-seen store order (dashscope's resold deepseek-v3.2 key before
-    // deepseek's own); together / avian / cloudflare rows never enter, so a
-    // non-kept source's row can neither price an id nor delist it.
+    // deepseek's own); together / avian / cloudflare / openrouter rows never
+    // enter, so a non-kept source's row can neither price an id nor delist it.
     assert_eq!(
         ids,
         [
             "MiniMax-M2.5-Lightning",
+            "deepseek-v4-flash",
             "deepseek-v4-pro",
+            "grok-4.5",
             "glm-4.5",
             "deepseek-v3.2",
+            "deepseek-r1",
+            "deepseek-v3",
             "deepseek-v3.2"
         ]
     );
@@ -1532,6 +1571,7 @@ fn store_history_dates_today_not_the_snapshot_log() {
     let t = PriceTable::capture(
         vec![eq_model("deepseek-v4-pro", 9e-6, 9e-6)],
         distill_history(HISTORY_FIXTURE).expect("history distills"),
+        Vec::new(),
         "2026-08-31".to_owned(),
         0,
         Vec::new(),
@@ -1546,6 +1586,7 @@ fn store_history_dates_today_not_the_snapshot_log() {
     // still prices through the snapshot walk.
     let offline = PriceTable::capture(
         vec![eq_model("deepseek-v4-pro", 9e-6, 9e-6)],
+        Vec::new(),
         Vec::new(),
         "2026-08-31".to_owned(),
         0,
@@ -1569,6 +1610,7 @@ fn cache_round_trips_the_store_dating_source() {
             models: vec![eq_model("m", 1e-6, 2e-6)],
         }],
         store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        aliases: Vec::new(),
         fetched_at_ms: 5,
         memo: Mutex::default(),
     };
@@ -1663,6 +1705,7 @@ fn a_price_row_after_a_removal_relists_the_key_from_its_date() {
             id: "m".to_owned(),
             rows,
         }],
+        aliases: Vec::new(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1684,6 +1727,272 @@ fn a_same_day_observed_tie_goes_to_the_later_append() {
         assert!((rate.input - 6e-7).abs() < 1e-12, "{date}");
         assert!((rate.cache_read - 1.1e-7).abs() < 1e-15, "{date}");
     }
+}
+
+// ── api aliases and variant spellings ────────────────────────────────────────
+
+/// Trimmed real ai-pricelog model catalog
+/// (`tests/fixtures/ai-pricelog-models-trimmed.json`): the two deepseek api
+/// alias chains (`deepseek-chat`, `deepseek-reasoner`), one null-bound chain
+/// (`grok-4.5-latest`), and the `models` entries for their canonicals plus
+/// deepseek-v4-pro. Every entry is verbatim store bytes; query-side ids are
+/// test literals, never fixture rows.
+const MODELS_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-models-trimmed.json");
+
+/// A store-walk table that also carries the models fixture's alias chains.
+fn aliased_table() -> PriceTable {
+    PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        aliases: distill_models(MODELS_FIXTURE).expect("aliases distill"),
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    }
+}
+
+#[test]
+fn models_fixture_distills_three_chains() {
+    let keys = distill_models(MODELS_FIXTURE).expect("aliases distill");
+    let ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        ["deepseek-chat", "deepseek-reasoner", "grok-4.5-latest"]
+    );
+    let chat = &keys[0];
+    assert_eq!(chat.spans.len(), 7);
+    assert_eq!(chat.spans[0].from.as_deref(), Some("2024-12-26"));
+    assert_eq!(chat.spans[0].to.as_deref(), Some("2025-03-24"));
+    assert_eq!(chat.spans[0].canonical, "deepseek-v3");
+    // The last record closes the chain: deepseek retired the alias 2026-07-24.
+    assert_eq!(chat.spans[6].to.as_deref(), Some("2026-07-24"));
+    assert_eq!(chat.spans[6].canonical, "deepseek-v4-flash");
+    // The null-bound shape: a chain that has always pointed at one live
+    // canonical, both ends open.
+    let grok = &keys[2];
+    assert_eq!(grok.spans.len(), 1);
+    assert_eq!(grok.spans[0].from, None);
+    assert_eq!(grok.spans[0].to, None);
+    assert_eq!(grok.spans[0].canonical, "grok-4.5");
+
+    // Tolerance: a record without a canonical skips, an empty chain drops, a
+    // non-array chain drops; zero surviving aliases fail the feed.
+    let mixed = r#"{"aliases": {
+        "a": [{"from": "2026-01-01", "canonical": "m"}],
+        "b": [{"from": "2026-01-01"}],
+        "c": [],
+        "d": 7
+    }}"#;
+    let keys = distill_models(mixed).expect("one chain survives");
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].id, "a");
+    assert_eq!(keys[0].spans[0].canonical, "m");
+    assert!(distill_models("{}").is_err());
+    assert!(distill_models(r#"{"aliases": {}}"#).is_err());
+    assert!(distill_models("not json").is_err());
+    assert!(distill_models(r#"{"models": {}}"#).is_err());
+}
+
+#[test]
+fn api_alias_prices_the_canonicals_dated_rate() {
+    // deepseek-chat's first record covers 2024-12-26 .. 2025-03-24 and names
+    // deepseek-v3: a day inside it prices deepseek-v3's own store walk, at
+    // v3's row rates.
+    let t = aliased_table();
+    let rate = t.rate_at("deepseek-chat", "2025-02-10", 0).expect("priced");
+    assert_rate(Some(rate.input), 2.7e-7);
+    assert_rate(Some(rate.cache_read), 7e-8);
+    assert_rate(Some(rate.output), 1.1e-6);
+    // The alias resolves but the canonical's walk has no row that early: the
+    // store's oldest deepseek-v3 observation is 2025-02-08, and the days
+    // before it dash like any store-less day.
+    assert!(t.rate_at("deepseek-chat", "2025-01-15", 0).is_none());
+}
+
+#[test]
+fn api_alias_walks_its_chain_by_day() {
+    let t = aliased_table();
+    // deepseek-reasoner's chain: R1 from 2025-01-20, v3.2 from 2025-12-01,
+    // v4-flash from 2026-04-24 — three priced canonicals across the chain.
+    let r1 = t
+        .rate_at("deepseek-reasoner", "2025-02-01", 0)
+        .expect("r1 priced");
+    assert_rate(Some(r1.input), 5.5e-7);
+    assert_rate(Some(r1.cache_read), 1.4e-7);
+    assert_rate(Some(r1.output), 2.19e-6);
+    // A record's `from` is inclusive and the previous record's `to`
+    // exclusive: 2026-04-23 prices v3.2, the day after prices v4-flash.
+    assert_rate(
+        t.rate_at("deepseek-reasoner", "2026-04-23", 0)
+            .map(|r| r.input),
+        2.8e-7,
+    );
+    assert_rate(
+        t.rate_at("deepseek-reasoner", "2026-04-24", 0)
+            .map(|r| r.input),
+        1.4e-7,
+    );
+}
+
+#[test]
+fn a_null_bound_alias_prices_for_every_day() {
+    // grok-4.5-latest's single record has both bounds open: it prices at
+    // grok-4.5's own walk on any day the store covers, old and new alike.
+    let t = aliased_table();
+    for date in ["2026-07-09", "2026-08-30"] {
+        assert_rate(t.rate_at("grok-4.5-latest", date, 0).map(|r| r.input), 2e-6);
+    }
+}
+
+#[test]
+fn api_alias_retired_past_its_last_record_dashes() {
+    // deepseek retired both api aliases on 2026-07-24: the retirement day
+    // itself (a `to`, exclusive) and everything after price nothing, even
+    // though the last canonical (deepseek-v4-flash) is still live.
+    let t = aliased_table();
+    for id in ["deepseek-chat", "deepseek-reasoner"] {
+        assert_rate(t.rate_at(id, "2026-07-23", 0).map(|r| r.input), 1.4e-7);
+        for date in ["2026-07-24", "2026-08-30", "2027-01-01"] {
+            assert!(t.rate_at(id, date, 0).is_none(), "{id} priced at {date}");
+        }
+    }
+}
+
+#[test]
+fn an_alias_only_resolves_once_the_ladder_misses() {
+    // A row carrying the alias id verbatim wins — the chain never remaps an
+    // id the table prices (no live row carries `deepseek-chat`; this is the
+    // guard for the store growing one whose rates differ from the chain's
+    // canonical).
+    let t = PriceTable {
+        models: vec![eq_model("deepseek-chat", 9e-6, 9e-6)],
+        history: vec![RateSnapshot {
+            captured: "2024-01-01".to_owned(),
+            models: vec![eq_model("deepseek-chat", 9e-6, 9e-6)],
+        }],
+        store: Vec::new(),
+        aliases: distill_models(MODELS_FIXTURE).expect("aliases distill"),
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    };
+    assert_rate(
+        t.rate_at("deepseek-chat", "2025-02-10", 0).map(|r| r.input),
+        9e-6,
+    );
+}
+
+#[test]
+fn variant_suffix_prices_the_base_id() {
+    // A claude session on a deepseek api profile spells the served model with
+    // a `-thinking` suffix no page id carries. The strip runs only after the
+    // ladder misses and retries the base id through the full walk,
+    // case-insensitively like the ladder; the bracket strip composes with it.
+    let t = store_table();
+    for id in [
+        "deepseek-v4-pro-thinking",
+        "DeepSeek-V4-Pro-Thinking",
+        "deepseek-v4-pro-thinking[1m]",
+    ] {
+        assert_rate(t.rate_at(id, "2026-08-16", 0).map(|r| r.input), 6.6e-7);
+    }
+}
+
+#[test]
+fn a_verbatim_id_is_never_remapped_by_the_variant_strip() {
+    // No kept first-party id ends in `-thinking` today (the store's thinking
+    // ids are all reseller spellings), so the shape is a literal table: a row
+    // that carries the suffix itself prices its own rates, never the base id
+    // under it.
+    let t = table(vec![
+        eq_model("m-thinking", 3e-6, 6e-6),
+        eq_model("m", 1e-6, 2e-6),
+    ]);
+    assert_rate(
+        t.rate_at("m-thinking", "2026-08-19", 0).map(|r| r.input),
+        3e-6,
+    );
+}
+
+#[test]
+fn openrouter_extra_rows_parse_and_stay_dropped() {
+    // The pre-2026-08-28 openrouter shape parks its cache-write prices under
+    // an `extra` object of string values. A kept source carrying the same
+    // shape must PARSE — the line's survival is the parser's tolerance, not
+    // the allowlist's drop — and price its top-level rates.
+    let kept = concat!(
+        r#"{"source":"deepseek","model_id":"m","observed_at":"2026-01-01","#,
+        r#""input_mtok":1,"output_mtok":2,"extra":{"web_search":"0.01","#,
+        r#""input_cache_write":"0.0000003","input_cache_write_1h":"0.0000005"}}"#,
+        "\n"
+    );
+    let keys = distill_history(kept).expect("extra keys do not fail the line");
+    assert_eq!(keys.len(), 1);
+    let t = PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: keys,
+        aliases: Vec::new(),
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    };
+    assert_rate(t.rate_at("m", "2026-01-01", 0).map(|r| r.input), 1e-6);
+
+    // The fixture's verbatim openrouter row parses the same way and never
+    // enters the walk: the id has no key and prices nothing.
+    let keys = distill_history(HISTORY_FIXTURE).expect("history distills");
+    assert!(!keys.iter().any(|k| k.id == "anthropic/claude-3-haiku"));
+    let t = store_table();
+    assert!(
+        t.rate_at("anthropic/claude-3-haiku", "2026-08-26", 0)
+            .is_none()
+    );
+}
+
+#[test]
+fn cache_round_trips_the_alias_table_and_old_caches_load_without_it() {
+    let sandbox = HomeSandbox::new();
+    let table = PriceTable {
+        models: vec![eq_model("m", 1e-6, 2e-6)],
+        history: vec![RateSnapshot {
+            captured: "2026-01-01".to_owned(),
+            models: vec![eq_model("m", 1e-6, 2e-6)],
+        }],
+        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        aliases: distill_models(MODELS_FIXTURE).expect("aliases distill"),
+        fetched_at_ms: 11,
+        memo: Mutex::default(),
+    };
+    let path = sandbox
+        .home()
+        .join(".clauth")
+        .join("ai_pricelog_price_cache.json");
+    save_cache(&path, &table);
+
+    let loaded = load_cached().expect("cache loads");
+    assert_eq!(loaded.fetched_at_ms, 11);
+    assert_rate(
+        loaded
+            .rate_at("deepseek-chat", "2025-02-10", 0)
+            .map(|r| r.input),
+        2.7e-7,
+    );
+    assert!(loaded.rate_at("deepseek-chat", "2026-08-30", 0).is_none());
+
+    // A cache written before the aliases half existed keeps dating through
+    // its store half but no alias resolves until the next fetch upgrades it.
+    let json = std::fs::read_to_string(&path).expect("read cache");
+    let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse cache");
+    value
+        .as_object_mut()
+        .expect("cache root object")
+        .remove("aliases");
+    std::fs::write(&path, value.to_string()).expect("write cache");
+    let old = load_cached().expect("pre-aliases cache loads");
+    assert!(old.rate_at("deepseek-chat", "2025-02-10", 0).is_none());
+    assert_rate(
+        old.rate_at("deepseek-v3", "2025-02-10", 0).map(|r| r.input),
+        2.7e-7,
+    );
 }
 
 /// A literal history row for the synthetic-shape tests.

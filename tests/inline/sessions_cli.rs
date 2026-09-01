@@ -56,6 +56,7 @@ fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
             })
             .collect(),
         Vec::new(),
+        Vec::new(),
         crate::tokens::today_date(),
         0,
         Vec::new(),

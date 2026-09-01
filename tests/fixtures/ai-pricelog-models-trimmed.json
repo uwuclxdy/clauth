@@ -1,0 +1,202 @@
+{
+  "version": 3,
+  "models": {
+    "deepseek-r1": {
+      "sources": {
+        "deepseek": "deepseek-r1",
+        "openrouter": "deepseek/deepseek-r1"
+      },
+      "name": "R1"
+    },
+    "deepseek-r1-0528": {
+      "sources": {
+        "deepinfra": "deepseek-r1-0528",
+        "deepseek": "deepseek-r1-0528",
+        "novita": "deepseek/deepseek-r1-0528",
+        "openrouter": "deepseek/deepseek-r1-0528"
+      },
+      "name": "R1"
+    },
+    "deepseek-v3": {
+      "sources": {
+        "deepinfra": "deepseek-v3",
+        "deepseek": "deepseek-v3"
+      },
+      "name": "DeepSeek V3"
+    },
+    "deepseek-v3-0324": {
+      "sources": {
+        "deepinfra": "deepseek-v3-0324",
+        "deepseek": "deepseek-v3-0324",
+        "novita": "deepseek/deepseek-v3-0324"
+      }
+    },
+    "deepseek-v3.1": {
+      "sources": {
+        "deepinfra": "deepseek-v3.1",
+        "deepseek": "deepseek-v3.1",
+        "novita": "deepseek/deepseek-v3.1",
+        "sambanova": "deepseek-v3.1"
+      }
+    },
+    "deepseek-v3.1-terminus": {
+      "sources": {
+        "deepseek": "deepseek-v3.1-terminus",
+        "novita": "deepseek/deepseek-v3.1-terminus",
+        "openrouter": "deepseek/deepseek-v3.1-terminus"
+      },
+      "name": "DeepSeek V3.1 Terminus"
+    },
+    "deepseek-v3.2": {
+      "sources": {
+        "dashscope": "deepseek-v3.2",
+        "deepinfra": "deepseek-v3.2",
+        "deepseek": "deepseek-v3.2",
+        "digitalocean": "deepseek-v3.2",
+        "novita": "deepseek/deepseek-v3.2",
+        "openrouter": "deepseek/deepseek-v3.2",
+        "sambanova": "deepseek-v3.2"
+      },
+      "name": "DeepSeek V3.2"
+    },
+    "deepseek-v3.2-exp": {
+      "sources": {
+        "deepseek": "deepseek-v3.2-exp",
+        "novita": "deepseek/deepseek-v3.2-exp",
+        "openrouter": "deepseek/deepseek-v3.2-exp"
+      },
+      "name": "DeepSeek V3.2 Exp"
+    },
+    "deepseek-v4-flash": {
+      "sources": {
+        "avian": "deepseek-v4-flash",
+        "dashscope": "deepseek-v4-flash",
+        "deepinfra": "deepseek-v4-flash",
+        "deepseek": "deepseek-v4-flash",
+        "digitalocean": "deepseek-v4-flash",
+        "novita": "deepseek/deepseek-v4-flash",
+        "openrouter": "deepseek/deepseek-v4-flash"
+      },
+      "name": "DeepSeek V4 Flash"
+    },
+    "deepseek-v4-pro": {
+      "sources": {
+        "avian": "deepseek-v4-pro",
+        "dashscope": "deepseek-v4-pro",
+        "deepinfra": "deepseek-v4-pro",
+        "deepseek": "deepseek-v4-pro",
+        "digitalocean": "deepseek-v4-pro",
+        "fireworks": "deepseek-v4-pro",
+        "novita": "deepseek/deepseek-v4-pro",
+        "openrouter": "deepseek/deepseek-v4-pro",
+        "together": "deepseek-v4-pro"
+      },
+      "name": "DeepSeek V4 Pro"
+    },
+    "grok-4.5": {
+      "sources": {
+        "openrouter": "x-ai/grok-4.5",
+        "xai": "grok-4.5"
+      },
+      "name": "Grok 4.5"
+    }
+  },
+  "aliases": {
+    "deepseek-chat": [
+      {
+        "from": "2024-12-26",
+        "to": "2025-03-24",
+        "canonical": "deepseek-v3",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2024-12-26"
+      },
+      {
+        "from": "2025-03-24",
+        "to": "2025-08-21",
+        "canonical": "deepseek-v3-0324",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-03-24"
+      },
+      {
+        "from": "2025-08-21",
+        "to": "2025-09-22",
+        "canonical": "deepseek-v3.1",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-08-21"
+      },
+      {
+        "from": "2025-09-22",
+        "to": "2025-09-29",
+        "canonical": "deepseek-v3.1-terminus",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-22"
+      },
+      {
+        "from": "2025-09-29",
+        "to": "2025-12-01",
+        "canonical": "deepseek-v3.2-exp",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-29"
+      },
+      {
+        "from": "2025-12-01",
+        "to": "2026-04-24",
+        "canonical": "deepseek-v3.2",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-12-01"
+      },
+      {
+        "from": "2026-04-24",
+        "to": "2026-07-24",
+        "canonical": "deepseek-v4-flash",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2026-04-24"
+      }
+    ],
+    "deepseek-reasoner": [
+      {
+        "from": "2025-01-20",
+        "to": "2025-05-28",
+        "canonical": "deepseek-r1",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-01-20"
+      },
+      {
+        "from": "2025-05-28",
+        "to": "2025-08-21",
+        "canonical": "deepseek-r1-0528",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-05-28"
+      },
+      {
+        "from": "2025-08-21",
+        "to": "2025-09-22",
+        "canonical": "deepseek-v3.1",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-08-21"
+      },
+      {
+        "from": "2025-09-22",
+        "to": "2025-09-29",
+        "canonical": "deepseek-v3.1-terminus",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-22"
+      },
+      {
+        "from": "2025-09-29",
+        "to": "2025-12-01",
+        "canonical": "deepseek-v3.2-exp",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-29"
+      },
+      {
+        "from": "2025-12-01",
+        "to": "2026-04-24",
+        "canonical": "deepseek-v3.2",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-12-01"
+      },
+      {
+        "from": "2026-04-24",
+        "to": "2026-07-24",
+        "canonical": "deepseek-v4-flash",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2026-04-24"
+      }
+    ],
+    "grok-4.5-latest": [
+      {
+        "from": null,
+        "to": null,
+        "canonical": "grok-4.5",
+        "citation": "https://docs.x.ai/docs/models"
+      }
+    ]
+  }
+}
