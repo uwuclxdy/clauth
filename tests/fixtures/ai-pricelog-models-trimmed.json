@@ -99,6 +99,15 @@
         "xai": "grok-4.5"
       },
       "name": "Grok 4.5"
+    },
+    "qwen3.6-27b": {
+      "sources": {
+        "deepinfra": "qwen3.6-27b",
+        "groq": "qwen/qwen3.6-27b",
+        "novita": "qwen/qwen3.6-27b",
+        "openrouter": "qwen/qwen3.6-27b"
+      },
+      "name": "Qwen3.6 27B"
     }
   },
   "aliases": {

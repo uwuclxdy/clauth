@@ -13,8 +13,7 @@ use crate::testutil::HomeSandbox;
 /// claude / gpt / qwen / glm / deepseek / moonshot / grok first-party
 /// representatives, dashscope's six `removed_at`-stamped resold rows, one
 /// reseller source, and rows marked `"synthetic": true` for shapes no live
-/// row exercises (the legacy peak_windows shape, a future `effective_at`, an
-/// overlapping window pair).
+/// row exercises (a future `effective_at`, an overlapping window pair).
 const FIXTURE: &str = include_str!("../fixtures/ai-pricelog-index-trimmed.json");
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -50,6 +49,7 @@ fn table(models: Vec<PricedModel>) -> PriceTable {
         }],
         store: Vec::new(),
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     }
@@ -407,30 +407,31 @@ fn unknown_index_version_warns_and_still_parses() {
 }
 
 #[test]
-fn legacy_peak_windows_map_to_window_entries() {
-    // The legacy shape: `peak_windows` as ["HH:MM","HH:MM"] STRING pairs plus
-    // flat `peak_*` rate keys. No live row carries it (verified against the
-    // live index); the fixture row is synthetic.
+fn index_legacy_keys_warn_once_and_price_typed_only() {
+    // The legacy index shape (flat `peak_*` keys + `peak_windows` STRING
+    // pairs) no longer feeds rates on the index path: the row prices its
+    // typed keys at every hour, and the feed warns once however many legacy
+    // rows it carries. The history path keeps feeding the same shape.
+    let lines = LogLines::new();
+    let _guard = lines.capture_here();
     let json = r#"{"version": 3, "sources": {"deepseek": {
-        "legacy": {
+        "legacy-a": {
             "input_mtok": 0.1, "output_mtok": 0.2, "cache_read_mtok": 0.01,
             "peak_windows": [["01:00", "04:00"]],
             "peak_input_mtok": 0.2, "peak_output_mtok": 0.4
+        },
+        "legacy-b": {
+            "input_mtok": 0.3, "output_mtok": 0.4, "max_tokens": 4096
         }
     }}}"#;
     let models = distill(json).expect("distill ok");
     let t = table(models);
-    let at = |hour: u8| t.rate_at("legacy", "2026-08-29", hour).expect("priced");
-    assert!((at(2).input - 2e-7).abs() < 1e-12);
-    assert!((at(2).output - 4e-7).abs() < 1e-12);
-    assert!(
-        (at(2).cache_read - 1e-8).abs() < 1e-15,
-        "absent peak key inherits base"
-    );
-    assert!(
-        (at(5).input - 1e-7).abs() < 1e-12,
-        "outside the peak window"
-    );
+    let at = |hour: u8| t.rate_at("legacy-a", "2026-08-29", hour).expect("priced");
+    assert_rate(Some(at(2).input), 1e-7); // peak hour: typed base, no peak entry
+    assert_rate(Some(at(5).input), 1e-7);
+    let got = lines.snapshot();
+    assert_eq!(got.len(), 1, "one warn for two legacy rows: {got:?}");
+    assert!(got[0].contains("legacy"), "{got:?}");
 }
 
 // ── id resolution ────────────────────────────────────────────────────────────
@@ -618,6 +619,7 @@ fn rate_retries_propagate_date_and_hour() {
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -731,6 +733,7 @@ fn effective_at_gates_the_whole_row() {
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -759,6 +762,7 @@ fn future_effective_row_prices_nothing_until_its_date() {
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -785,6 +789,7 @@ fn later_window_entry_wins_when_both_match() {
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -827,6 +832,7 @@ fn snapshot_picks_rate_live_on_date() {
         history,
         store: Vec::new(),
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -848,6 +854,7 @@ fn capture_appends_only_on_change() {
         vec![eq_model("m", 1e-6, 2e-6)],
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-19".to_owned(),
         42,
         Vec::new(),
@@ -859,6 +866,7 @@ fn capture_appends_only_on_change() {
         vec![eq_model("m", 1e-6, 2e-6)],
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-20".to_owned(),
         43,
         t.history.clone(),
@@ -871,6 +879,7 @@ fn capture_appends_only_on_change() {
         vec![eq_model("m", 2e-6, 4e-6)],
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-20".to_owned(),
         44,
         t2.history.clone(),
@@ -890,6 +899,7 @@ fn capture_caps_history_at_180() {
         vec![eq_model("m", 0.0, 0.0)],
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-01-01".to_owned(),
         0,
         Vec::new(),
@@ -900,6 +910,7 @@ fn capture_caps_history_at_180() {
             vec![eq_model("m", rate, 0.0)],
             Vec::new(),
             Vec::new(),
+            CanonicalMap::default(),
             format!("2026-{i:03}"),
             u64::from(i),
             t.history,
@@ -937,6 +948,7 @@ fn cache_round_trip_preserves_history() {
         history,
         store: Vec::new(),
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 12345,
         memo: Mutex::default(),
     };
@@ -1022,7 +1034,6 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
         "grok-4.6",
         "deepseek-v4-pro",
         "synth-future-effective",
-        "synth-legacy-peak-windows",
         "synth-overlap",
     ] {
         assert!(ids.contains(&id), "{id} missing");
@@ -1043,6 +1054,7 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
         models,
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -1087,13 +1099,6 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
         t.rate_at("deepseek-v4-pro[1m]", "2026-08-28", 5)
             .map(|r| r.input),
         6.6e-7,
-    );
-
-    // The synthetic legacy row prices through its peak window.
-    assert_rate(
-        t.rate_at("synth-legacy-peak-windows", "2026-08-29", 2)
-            .map(|r| r.input),
-        2e-7,
     );
 }
 
@@ -1156,6 +1161,7 @@ fn cost_at_uses_dated_rate() {
         history,
         store: Vec::new(),
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1275,6 +1281,7 @@ fn the_memo_keys_on_the_date_so_two_snapshots_do_not_bleed() {
         history,
         store: Vec::new(),
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1304,6 +1311,7 @@ fn zai_quota_entries_are_skipped() {
         models,
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -1328,6 +1336,7 @@ fn removed_at_stamped_entries_price_nothing() {
         distill(FIXTURE).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-30".to_owned(),
         0,
         Vec::new(),
@@ -1357,7 +1366,10 @@ fn removed_at_stamped_entries_price_nothing() {
 /// seven deepseek-v4-pro rows (the 2026-08-30 retro-effective windowed row,
 /// the 2026-08-26 legacy `peak_windows` row, the 08-16 / 05-22 / 04-24 flat
 /// rows), deepseek-v4-flash's 2026-04-24 row (the alias chain's priced
-/// canonical), grok-4.5's 2026-07-09 row (the null-bound chain's canonical),
+/// canonical) plus its 2026-08-26 legacy `peak_windows` row (the fixture's
+/// WINNING legacy row — the peak-feed pin; the full store shadows it with a
+/// typed 08-30 row, which the trim drops), grok-4.5's 2026-07-09 row (the
+/// null-bound chain's canonical),
 /// minimax's MiniMax-M2.5-Lightning
 /// price + bare-removal pair, two of together's four deepseek-v4-pro rows (the
 /// 06-09 markup and the 08-28 removal), one of avian's two (the 05-04
@@ -1381,6 +1393,7 @@ fn store_table() -> PriceTable {
         history: Vec::new(),
         store: distill_history(HISTORY_FIXTURE).expect("history distills"),
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     }
@@ -1444,6 +1457,27 @@ fn store_walk_prices_the_weekday_peak_windows_per_hour() {
     assert_rate(input(7), 1.32e-6); // second window
     assert_rate(input(10), 6.6e-7); // 10:00 excluded
     assert_rate(input(23), 6.6e-7);
+}
+
+#[test]
+fn a_winning_legacy_history_row_keeps_feeding_its_peak_windows() {
+    // The history path keeps the legacy peak shape: deepseek-v4-flash's real
+    // 2026-08-26 row (flat `peak_*` keys + `peak_windows` STRING pairs) is
+    // the fixture's NEWEST v4-flash row, so it wins the walk for 08-26 on
+    // and its peak windows price — the typed 08-30 row that shadows it in
+    // the full store is trimmed out. Deleting the peak push loop in
+    // `RawHistoryRow::into_priced` flattens every hour to the base rate and
+    // reds this pin.
+    let t = store_table();
+    let input = |date: &str, hour: u8| {
+        t.rate_at("deepseek-v4-flash", date, hour)
+            .map(|r| (r.input, r.cache_read))
+    };
+    assert_rate(input("2026-08-27", 2).map(|r| r.0), 4.4e-7); // peak window
+    assert_rate(input("2026-08-27", 5).map(|r| r.0), 2.2e-7); // off-peak
+    assert_rate(input("2026-08-27", 2).map(|r| r.1), 1.4e-8); // peak cache-read
+    // Before the legacy row's day, the 04-24 flat row still wins.
+    assert_rate(input("2026-04-25", 2).map(|r| r.0), 1.4e-7);
 }
 
 #[test]
@@ -1572,6 +1606,7 @@ fn store_history_dates_today_not_the_snapshot_log() {
         vec![eq_model("deepseek-v4-pro", 9e-6, 9e-6)],
         distill_history(HISTORY_FIXTURE).expect("history distills"),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-31".to_owned(),
         0,
         Vec::new(),
@@ -1588,6 +1623,7 @@ fn store_history_dates_today_not_the_snapshot_log() {
         vec![eq_model("deepseek-v4-pro", 9e-6, 9e-6)],
         Vec::new(),
         Vec::new(),
+        CanonicalMap::default(),
         "2026-08-31".to_owned(),
         0,
         Vec::new(),
@@ -1611,6 +1647,7 @@ fn cache_round_trips_the_store_dating_source() {
         }],
         store: distill_history(HISTORY_FIXTURE).expect("history distills"),
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 5,
         memo: Mutex::default(),
     };
@@ -1702,10 +1739,12 @@ fn a_price_row_after_a_removal_relists_the_key_from_its_date() {
         models: Vec::new(),
         history: Vec::new(),
         store: vec![StoreKey {
+            source: "deepseek".to_owned(),
             id: "m".to_owned(),
             rows,
         }],
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1729,23 +1768,312 @@ fn a_same_day_observed_tie_goes_to_the_later_append() {
     }
 }
 
+// ── canonical twin-ness ──────────────────────────────────────────────────────
+
+/// A canonical-map table over the twin scenario: a live dashscope key for
+/// `qwen3.6-27b` (the catalog does not name dashscope, so the bare id is its
+/// own canonical), groq's slash-spelled qwen copy — the catalog maps it to
+/// that same canonical — delisted beside a live deepseek-v3.2 key and
+/// dashscope's same-spelled deepseek-v3.2 copy (the catalog maps both).
+/// Synthetic rows on the fixture's pattern; the catalog entries are verbatim
+/// store bytes.
+fn twin_table() -> PriceTable {
+    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("catalog distills");
+    // A snapshot log holding one never-reached model: `load_cache` rejects a
+    // cache with no snapshot history, and the store walk overrides the
+    // snapshot for every query anyway.
+    let snapshot = vec![eq_model("m", 1e-6, 2e-6)];
+    PriceTable {
+        models: snapshot.clone(),
+        history: vec![RateSnapshot {
+            captured: "2026-01-01".to_owned(),
+            models: snapshot,
+        }],
+        store: vec![
+            StoreKey {
+                source: "dashscope".to_owned(),
+                id: "qwen3.6-27b".to_owned(),
+                rows: vec![dated_row(
+                    "2026-08-29",
+                    "2026-08-29",
+                    false,
+                    Some(eq_model("qwen3.6-27b", 0.3e-6, 0.6e-6)),
+                )],
+            },
+            StoreKey {
+                source: "groq".to_owned(),
+                id: "qwen/qwen3.6-27b".to_owned(),
+                rows: vec![
+                    dated_row(
+                        "2026-06-01",
+                        "2026-06-01",
+                        false,
+                        Some(eq_model("qwen/qwen3.6-27b", 0.6e-6, 1.2e-6)),
+                    ),
+                    dated_row("2026-06-15", "2026-06-15", true, None),
+                ],
+            },
+            StoreKey {
+                source: "deepseek".to_owned(),
+                id: "deepseek-v3.2".to_owned(),
+                rows: vec![dated_row(
+                    "2026-08-01",
+                    "2026-08-01",
+                    false,
+                    Some(eq_model("deepseek-v3.2", 0.28e-6, 0.42e-6)),
+                )],
+            },
+            StoreKey {
+                source: "dashscope".to_owned(),
+                id: "deepseek-v3.2".to_owned(),
+                rows: vec![
+                    dated_row(
+                        "2026-06-01",
+                        "2026-06-01",
+                        false,
+                        Some(eq_model("deepseek-v3.2", 0.57e-6, 1.71e-6)),
+                    ),
+                    dated_row("2026-06-15", "2026-06-15", true, None),
+                ],
+            },
+        ],
+        aliases,
+        canonical,
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    }
+}
+
+#[test]
+fn a_delisted_copy_whose_canonical_a_live_key_holds_never_prices() {
+    // Cross-source twin-ness through the catalog's `models` half. The raw
+    // (source, id) walk prices each copy's own rows on its pre-removal days
+    // (06-01..06-14: 0.6 in for the slash copy, 0.57 for the bare one) — the
+    // shape this row kills. With canonical twin-ness neither copy ever
+    // materializes: those days dash, and the slash spelling reprices through
+    // the live first-party row's own walk via the ladder's strip.
+    let t = twin_table();
+    for date in ["2026-06-05", "2026-06-14", "2026-06-20"] {
+        assert!(
+            t.rate_at("qwen/qwen3.6-27b", date, 0).is_none(),
+            "the slash copy priced {date}"
+        );
+        assert!(
+            t.rate_at("deepseek-v3.2", date, 0).is_none(),
+            "the bare copy priced {date}"
+        );
+    }
+    assert_rate(
+        t.rate_at("qwen/qwen3.6-27b", "2026-08-30", 0)
+            .map(|r| r.input),
+        0.3e-6,
+    );
+    assert_rate(
+        t.rate_at("deepseek-v3.2", "2026-08-30", 0).map(|r| r.input),
+        0.28e-6,
+    );
+}
+
+#[test]
+fn two_live_keys_on_one_canonical_keep_first_seen_order() {
+    // Two live keys on one canonical id: the earlier key in store order wins
+    // the ladder where both have candidates, and the later key still prices
+    // the dates only it covers — canonical twin-ness never drops or reorders
+    // live keys.
+    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("catalog distills");
+    let t = PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: vec![
+            StoreKey {
+                source: "dashscope".to_owned(),
+                id: "deepseek-v3.2".to_owned(),
+                rows: vec![dated_row(
+                    "2026-08-29",
+                    "2026-08-29",
+                    false,
+                    Some(eq_model("deepseek-v3.2", 0.57e-6, 1.71e-6)),
+                )],
+            },
+            StoreKey {
+                source: "deepseek".to_owned(),
+                id: "deepseek-v3.2".to_owned(),
+                rows: vec![dated_row(
+                    "2025-12-01",
+                    "2025-12-01",
+                    false,
+                    Some(eq_model("deepseek-v3.2", 0.28e-6, 0.42e-6)),
+                )],
+            },
+        ],
+        aliases,
+        canonical,
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    };
+    // 2026-08-30: both keys have a candidate — first-seen wins the ladder.
+    assert_rate(
+        t.rate_at("deepseek-v3.2", "2026-08-30", 0).map(|r| r.input),
+        0.57e-6,
+    );
+    // 2026-03-01: only the later key's row applies — it still prices.
+    assert_rate(
+        t.rate_at("deepseek-v3.2", "2026-03-01", 0).map(|r| r.input),
+        0.28e-6,
+    );
+}
+
+#[test]
+fn an_unknown_pair_stays_its_own_key() {
+    // (dashscope, "qwen/qwen3.6-27b") is a pair the catalog does not name —
+    // its qwen3.6-27b entry lists groq's slash spelling, not dashscope's —
+    // so the identity fallback keeps the copy its own canonical: it still
+    // prices its own raw id on its pre-removal days beside the live bare
+    // key. The two are NOT twins.
+    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("catalog distills");
+    let t = PriceTable {
+        models: Vec::new(),
+        history: Vec::new(),
+        store: vec![
+            StoreKey {
+                source: "dashscope".to_owned(),
+                id: "qwen3.6-27b".to_owned(),
+                rows: vec![dated_row(
+                    "2026-08-29",
+                    "2026-08-29",
+                    false,
+                    Some(eq_model("qwen3.6-27b", 0.3e-6, 0.6e-6)),
+                )],
+            },
+            StoreKey {
+                source: "dashscope".to_owned(),
+                id: "qwen/qwen3.6-27b".to_owned(),
+                rows: vec![
+                    dated_row(
+                        "2026-06-01",
+                        "2026-06-01",
+                        false,
+                        Some(eq_model("qwen/qwen3.6-27b", 0.9e-6, 1.8e-6)),
+                    ),
+                    dated_row("2026-06-15", "2026-06-15", true, None),
+                ],
+            },
+        ],
+        aliases,
+        canonical,
+        fetched_at_ms: 0,
+        memo: Mutex::default(),
+    };
+    assert_rate(
+        t.rate_at("qwen/qwen3.6-27b", "2026-06-05", 0)
+            .map(|r| r.input),
+        0.9e-6,
+    );
+    // The bare id prices the live key's own row on its dates.
+    assert_rate(
+        t.rate_at("qwen3.6-27b", "2026-08-30", 0).map(|r| r.input),
+        0.3e-6,
+    );
+}
+
+#[test]
+fn canonical_map_round_trips_and_old_caches_load_identity() {
+    let sandbox = HomeSandbox::new();
+    let table = twin_table();
+    let path = sandbox
+        .home()
+        .join(".clauth")
+        .join("ai_pricelog_price_cache.json");
+    save_cache(&path, &table);
+
+    let loaded = load_cached().expect("cache loads");
+    // Twin-ness survives the round trip: neither copy prices 06-05.
+    assert!(
+        loaded
+            .rate_at("qwen/qwen3.6-27b", "2026-06-05", 0)
+            .is_none()
+    );
+    assert!(loaded.rate_at("deepseek-v3.2", "2026-06-05", 0).is_none());
+
+    // A cache written before the canonical half existed loads empty and
+    // behaves identity until the next fetch upgrades it: the slash copy — a
+    // pair the map no longer resolves — prices its own rows again, while the
+    // same-raw-id copy still loses to the live twin (both fall back to the
+    // bare id).
+    let json = std::fs::read_to_string(&path).expect("read cache");
+    let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse cache");
+    value
+        .as_object_mut()
+        .expect("cache root object")
+        .remove("canonical");
+    std::fs::write(&path, value.to_string()).expect("write cache");
+    let old = load_cached().expect("pre-canonical cache loads");
+    assert_rate(
+        old.rate_at("qwen/qwen3.6-27b", "2026-06-05", 0)
+            .map(|r| r.input),
+        0.6e-6,
+    );
+    assert!(old.rate_at("deepseek-v3.2", "2026-06-05", 0).is_none());
+}
+
+#[test]
+fn a_pre_source_cache_loads_with_empty_sources_and_stays_identity() {
+    // The serde-default upgrade path: a cache written before `StoreKey` grew
+    // its `source` field loads with every key's source empty, so the
+    // canonical lookup misses and twin-ness falls back to the raw id — the
+    // pre-map behavior, until the next fetch persists sources. Dropping the
+    // `#[serde(default)]` on the field makes this cache fail to load and
+    // reds the pin.
+    let sandbox = HomeSandbox::new();
+    let table = twin_table();
+    let path = sandbox
+        .home()
+        .join(".clauth")
+        .join("ai_pricelog_price_cache.json");
+    save_cache(&path, &table);
+
+    let json = std::fs::read_to_string(&path).expect("read cache");
+    let mut value: serde_json::Value = serde_json::from_str(&json).expect("parse cache");
+    for key in value["store"].as_array_mut().expect("store array") {
+        key.as_object_mut()
+            .expect("store key object")
+            .remove("source");
+    }
+    std::fs::write(&path, value.to_string()).expect("write cache");
+    let old = load_cached().expect("pre-source cache loads");
+    // Empty sources: the same-raw-id copy still loses to the live twin (both
+    // canonicalize to the bare id), and the slash copy prices again (its raw
+    // id differs from the live key's).
+    assert!(old.rate_at("deepseek-v3.2", "2026-06-05", 0).is_none());
+    assert_rate(
+        old.rate_at("qwen/qwen3.6-27b", "2026-06-05", 0)
+            .map(|r| r.input),
+        0.6e-6,
+    );
+}
+
 // ── api aliases and variant spellings ────────────────────────────────────────
 
 /// Trimmed real ai-pricelog model catalog
 /// (`tests/fixtures/ai-pricelog-models-trimmed.json`): the two deepseek api
 /// alias chains (`deepseek-chat`, `deepseek-reasoner`), one null-bound chain
 /// (`grok-4.5-latest`), and the `models` entries for their canonicals plus
-/// deepseek-v4-pro. Every entry is verbatim store bytes; query-side ids are
+/// deepseek-v4-pro and qwen3.6-27b (the canonical-twin pins' cross-source
+/// spelling pair: groq's slash id, the one kept-source slash spelling the
+/// catalog names). Every entry is verbatim store bytes; query-side ids are
 /// test literals, never fixture rows.
 const MODELS_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-models-trimmed.json");
 
-/// A store-walk table that also carries the models fixture's alias chains.
+/// A store-walk table that also carries the models fixture's alias chains and
+/// canonical map.
 fn aliased_table() -> PriceTable {
+    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("aliases distill");
     PriceTable {
         models: Vec::new(),
         history: Vec::new(),
         store: distill_history(HISTORY_FIXTURE).expect("history distills"),
-        aliases: distill_models(MODELS_FIXTURE).expect("aliases distill"),
+        aliases,
+        canonical,
         fetched_at_ms: 0,
         memo: Mutex::default(),
     }
@@ -1753,7 +2081,7 @@ fn aliased_table() -> PriceTable {
 
 #[test]
 fn models_fixture_distills_three_chains() {
-    let keys = distill_models(MODELS_FIXTURE).expect("aliases distill");
+    let (keys, _) = distill_models(MODELS_FIXTURE).expect("aliases distill");
     let ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -1776,19 +2104,33 @@ fn models_fixture_distills_three_chains() {
     assert_eq!(grok.spans[0].canonical, "grok-4.5");
 
     // Tolerance: a record without a canonical skips, an empty chain drops, a
-    // non-array chain drops; zero surviving aliases fail the feed.
+    // non-array chain drops; zero surviving aliases or canonical pairs fail
+    // the feed.
     let mixed = r#"{"aliases": {
         "a": [{"from": "2026-01-01", "canonical": "m"}],
         "b": [{"from": "2026-01-01"}],
         "c": [],
         "d": 7
-    }}"#;
-    let keys = distill_models(mixed).expect("one chain survives");
+    }, "models": {"m": {"sources": {"deepseek": "m"}}}}"#;
+    let (keys, canonical) = distill_models(mixed).expect("one chain survives");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].id, "a");
     assert_eq!(keys[0].spans[0].canonical, "m");
+    assert_eq!(
+        canonical.get("deepseek").and_then(|m| m.get("m")),
+        Some(&"m".to_owned())
+    );
+    // A catalog source name maps to the canonical provider name, like the
+    // history's (the fixture's grok entry spells xai).
+    let (_, canonical) = distill_models(MODELS_FIXTURE).expect("fixture distills");
+    assert_eq!(
+        canonical.get("x-ai").and_then(|m| m.get("grok-4.5")),
+        Some(&"grok-4.5".to_owned())
+    );
     assert!(distill_models("{}").is_err());
     assert!(distill_models(r#"{"aliases": {}}"#).is_err());
+    assert!(distill_models(r#"{"aliases": {"a": [{"canonical": "m"}]}}"#).is_err());
+    assert!(distill_models(r#"{"aliases": {"a": [{"canonical": "m"}]}, "models": {}}"#).is_err());
     assert!(distill_models("not json").is_err());
     assert!(distill_models(r#"{"models": {}}"#).is_err());
 }
@@ -1864,6 +2206,7 @@ fn an_alias_only_resolves_once_the_ladder_misses() {
     // id the table prices (no live row carries `deepseek-chat`; this is the
     // guard for the store growing one whose rates differ from the chain's
     // canonical).
+    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("aliases distill");
     let t = PriceTable {
         models: vec![eq_model("deepseek-chat", 9e-6, 9e-6)],
         history: vec![RateSnapshot {
@@ -1871,7 +2214,8 @@ fn an_alias_only_resolves_once_the_ladder_misses() {
             models: vec![eq_model("deepseek-chat", 9e-6, 9e-6)],
         }],
         store: Vec::new(),
-        aliases: distill_models(MODELS_FIXTURE).expect("aliases distill"),
+        aliases,
+        canonical,
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1932,6 +2276,7 @@ fn openrouter_extra_rows_parse_and_stay_dropped() {
         history: Vec::new(),
         store: keys,
         aliases: Vec::new(),
+        canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
         memo: Mutex::default(),
     };
@@ -1951,6 +2296,7 @@ fn openrouter_extra_rows_parse_and_stay_dropped() {
 #[test]
 fn cache_round_trips_the_alias_table_and_old_caches_load_without_it() {
     let sandbox = HomeSandbox::new();
+    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("aliases distill");
     let table = PriceTable {
         models: vec![eq_model("m", 1e-6, 2e-6)],
         history: vec![RateSnapshot {
@@ -1958,7 +2304,8 @@ fn cache_round_trips_the_alias_table_and_old_caches_load_without_it() {
             models: vec![eq_model("m", 1e-6, 2e-6)],
         }],
         store: distill_history(HISTORY_FIXTURE).expect("history distills"),
-        aliases: distill_models(MODELS_FIXTURE).expect("aliases distill"),
+        aliases,
+        canonical,
         fetched_at_ms: 11,
         memo: Mutex::default(),
     };

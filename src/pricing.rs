@@ -32,6 +32,10 @@
 //! apply to history rows, so a reseller's copy of an id can neither price it
 //! nor delist it; a kept source's DELISTED copy of a foreign id (dashscope's
 //! resales) never shadows the live first-party key that owns the id.
+//! Cross-source twin-ness resolves through the catalog's `models` half
+//! (canonical id → each source's spelling of it): a delisted key whose
+//! canonical id a live key holds never prices any date, and a pair the
+//! catalog does not name stays its own key.
 //!
 //! Api-alias ids (`deepseek-chat`, `deepseek-reasoner`) name a served model,
 //! not a page: no index row and no history key carries them, so they resolve
@@ -99,11 +103,11 @@ const HISTORY_URL: &str =
     "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/history.ndjson";
 
 /// The store's model catalog (`{version, models, aliases}`), fetched on the
-/// same cadence and the same all-or-nothing rule. Only its `aliases` table is
-/// distilled: the api-alias ids are not page ids, so no history key can ever
-/// price them — the table is the only place the store says what they served.
-/// The catalog's `models` half (canonical id → per-source page ids) is a
-/// mapping no lookup here reads.
+/// same cadence and the same all-or-nothing rule. Both halves are distilled:
+/// `aliases` chains the api-alias ids — no history key can ever price them,
+/// so the table is the only place the store says what they served — and
+/// `models` maps every `(source, id)` spelling to its canonical id, the
+/// cross-source twin-ness basis of the store walk.
 const MODELS_URL: &str =
     "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/models.json";
 
@@ -240,13 +244,25 @@ pub(crate) struct RateSnapshot {
     pub(crate) models: Vec<PricedModel>,
 }
 
-/// One `(source, model_id)` key of the store's history: the model id (the id
-/// IS the match, as in the index) plus the key's rows in store append order.
-/// Two kept sources can carry the same id; [`PriceTable::dated_models`]
-/// materializes live keys ahead of delisted ones, and within each group the
-/// earlier key in [`PriceTable::store`] order wins the ladder.
+/// The catalog's canonical map (`models.json` `models`): source → model id →
+/// the canonical id every source's spelling of that model shares. Only
+/// catalog-named pairs are held; a lookup miss is the identity fallback (see
+/// [`PriceTable::canonical_of`]).
+pub(crate) type CanonicalMap = HashMap<String, HashMap<String, String>>;
+
+/// One `(source, model_id)` key of the store's history: the canonical source
+/// name plus the model id (the id IS the match, as in the index) plus the
+/// key's rows in store append order. Two kept sources can carry the same id;
+/// [`PriceTable::dated_models`] materializes live keys ahead of delisted ones
+/// and drops a delisted key whose canonical id a live key holds, and within
+/// each group the earlier key in [`PriceTable::store`] order wins the ladder.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StoreKey {
+    /// Canonical provider name. Empty on a cache written before this field
+    /// existed; the canonical lookup then misses and falls back to the raw
+    /// id, the pre-map behavior.
+    #[serde(default)]
+    source: String,
     id: String,
     rows: Vec<StoreRow>,
 }
@@ -311,7 +327,8 @@ pub(crate) struct HourTokens {
 
 /// Resolved price table: the store's distilled history (the dating source for
 /// every day), the newest snapshot's models plus the local snapshot log (the
-/// offline cache), and the wall-clock time the feed was fetched (for a
+/// offline cache), the catalog's two distilled halves (alias chains + the
+/// canonical map), and the wall-clock time the feed was fetched (for a
 /// freshness badge).
 #[derive(Debug)]
 pub(crate) struct PriceTable {
@@ -329,6 +346,12 @@ pub(crate) struct PriceTable {
     /// upgrades on the next successful fetch), and then only reached once the
     /// ladder and the variant strip have both missed.
     aliases: Vec<AliasKey>,
+    /// The catalog's canonical `(source, id)` → canonical-id map (models.json
+    /// `models`): the twin-ness basis of [`PriceTable::dated_models`]. Empty
+    /// until a fetch or cache brings it (a pre-map cache loads empty and
+    /// upgrades on the next successful fetch); an empty map is the identity
+    /// behavior — every key canonicalizes to its raw id.
+    canonical: CanonicalMap,
     pub(crate) fetched_at_ms: u64,
     /// Memoized match walks (see [`Memo`]). A table is immutable once built, so
     /// a remembered index cannot go stale.
@@ -370,11 +393,12 @@ impl PriceTable {
     /// not grow the history), and cap the history at [`HISTORY_CAP`], dropping
     /// the oldest snapshots. `store` is the fetch's complete distilled history
     /// — the file is cumulative — and replaces any cached store wholesale, as
-    /// `aliases` does the catalog.
+    /// `aliases` and `canonical` do the catalog's two halves.
     pub(crate) fn capture(
         models: Vec<PricedModel>,
         store: Vec<StoreKey>,
         aliases: Vec<AliasKey>,
+        canonical: CanonicalMap,
         captured: String,
         fetched_at_ms: u64,
         mut history: Vec<RateSnapshot>,
@@ -403,6 +427,7 @@ impl PriceTable {
             history,
             store,
             aliases,
+            canonical,
             fetched_at_ms,
             memo: Mutex::default(),
         }
@@ -499,19 +524,25 @@ impl PriceTable {
         let models: Arc<[PricedModel]> = if self.store.is_empty() {
             self.models_for(date)?.into()
         } else {
-            // Shared-id precedence: two kept sources can carry the same model
-            // id (dashscope, kept for qwen, resells other vendors' ids). The
-            // store's delisting is the evidence a key was reselling, so LIVE
-            // keys materialize first and the ladder's first match lands on the
-            // first-party row instead of a markup — every date, including the
-            // delisted key's pre-removal days. Two LIVE keys sharing an id
-            // keep first-seen order; resolving cross-source id ownership
-            // beyond that is the canonical-mapping todo row's, not this
-            // walk's.
+            // Twin-ness is canonical (the catalog's `models` half): two kept
+            // sources can carry the same model under different spellings
+            // (groq's `qwen/qwen3.6-27b` beside dashscope's `qwen3.6-27b`).
+            // LIVE keys materialize first, and the ladder's first match lands
+            // on the first-party row instead of a markup. A DELISTED key
+            // whose canonical id a live key holds is a resale of a model the
+            // live key owns — it never prices any date, its own pre-removal
+            // days included. Two live keys on one canonical keep first-seen
+            // order, unchanged.
             let (live, delisted): (Vec<_>, Vec<_>) =
                 self.store.iter().partition(|key| !key.delisted());
+            let resold = |key: &StoreKey| {
+                live.iter().any(|live_key| {
+                    self.canonical_of(live_key)
+                        .eq_ignore_ascii_case(self.canonical_of(key))
+                })
+            };
             live.iter()
-                .chain(delisted.iter())
+                .chain(delisted.iter().filter(|key| !resold(key)))
                 .filter_map(|key| key.row_for(date))
                 .cloned()
                 .collect::<Vec<_>>()
@@ -526,6 +557,17 @@ impl PriceTable {
                 });
         }
         Some(models)
+    }
+
+    /// The key's canonical id per the catalog's `models` half: the
+    /// `(source, id)` pair's mapped canonical id — the id every source's
+    /// spelling of the model shares. A pair the catalog does not name is its
+    /// own canonical (the identity fallback).
+    fn canonical_of<'a>(&'a self, key: &'a StoreKey) -> &'a str {
+        self.canonical
+            .get(&key.source)
+            .and_then(|ids| ids.get(&key.id))
+            .map_or(key.id.as_str(), String::as_str)
     }
 
     /// The snapshot walk: the newest snapshot with `captured <= date` (served
@@ -884,12 +926,19 @@ pub(crate) fn spawn(tx: Sender<PricingEvent>, refresh_rx: Receiver<()>) {
 /// (`Loaded`); only when nothing is cached do we surface `Failed`.
 fn run_fetch(tx: &Sender<PricingEvent>, cache_file: &Path, stale_cleaned: &mut bool) {
     match fetch_table() {
-        Ok((models, store, aliases)) => {
+        Ok(feed) => {
             let history = load_cache(cache_file)
                 .map(|t| t.history)
                 .unwrap_or_default();
-            let table =
-                PriceTable::capture(models, store, aliases, today_date(), now_ms(), history);
+            let table = PriceTable::capture(
+                feed.models,
+                feed.store,
+                feed.aliases,
+                feed.canonical,
+                today_date(),
+                now_ms(),
+                history,
+            );
             save_cache(cache_file, &table);
             delete_stale_cache_once(cache_file, stale_cleaned);
             let _ = tx.send(PricingEvent::Loaded(Box::new(table)));
@@ -924,15 +973,31 @@ fn delete_stale_cache_once(cache_file: &Path, done: &mut bool) {
     }
 }
 
+/// One successful fetch, distilled: the index's priced models (folded into the
+/// snapshot log), the store's dated history keys, and the catalog's two halves
+/// (alias chains + canonical map).
+struct DistilledFeed {
+    models: Vec<PricedModel>,
+    store: Vec<StoreKey>,
+    aliases: Vec<AliasKey>,
+    canonical: CanonicalMap,
+}
+
 /// Fetch and distill the live feed: the index (the current price set, folded
 /// into the snapshot log), the history ndjson (the dating source), and the
-/// model catalog (the alias table). Any one failing fails the whole attempt,
-/// so the cache fallback serves a coherent table rather than a mix of halves.
-fn fetch_table() -> anyhow::Result<(Vec<PricedModel>, Vec<StoreKey>, Vec<AliasKey>)> {
-    let index = distill(&fetch_body(FEED_URL)?)?;
+/// model catalog (the alias chains + the canonical map). Any one failing
+/// fails the whole attempt, so the cache fallback serves a coherent table
+/// rather than a mix of halves.
+fn fetch_table() -> anyhow::Result<DistilledFeed> {
+    let models = distill(&fetch_body(FEED_URL)?)?;
     let store = distill_history(&fetch_body(HISTORY_URL)?)?;
-    let aliases = distill_models(&fetch_body(MODELS_URL)?)?;
-    Ok((index, store, aliases))
+    let (aliases, canonical) = distill_models(&fetch_body(MODELS_URL)?)?;
+    Ok(DistilledFeed {
+        models,
+        store,
+        aliases,
+        canonical,
+    })
 }
 
 /// GET one feed URL as text, capped at [`MAX_BODY_BYTES`].
@@ -973,7 +1038,10 @@ fn fetch_body(url: &str) -> anyhow::Result<String> {
 /// lookup path can land on a reseller's markup; resold model rows inside a
 /// kept provider (a claude id under a non-anthropic provider) are dropped for
 /// the same reason. An unknown `version` warns through [`logline!`] and parses
-/// best-effort.
+/// best-effort. A kept-source row carrying a legacy-shape key (flat
+/// `max_tokens`, `peak_*`, `peak_windows`, `extra`) warns once per fetch and
+/// prices its typed keys alone — the legacy shapes no longer feed the index
+/// path (the history path keeps them).
 ///
 /// A row carrying `removed_at` is delisted and skipped the same way — it
 /// prices nothing at any date. The index's removal convention keeps the row
@@ -1003,6 +1071,7 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
         .ok_or_else(|| anyhow::anyhow!("price feed has no sources object"))?;
 
     let mut models = Vec::new();
+    let mut warned_legacy = false;
     for (source_name, rows) in sources {
         let canonical = canonical_source(source_name);
         if !FIRST_PARTY_PROVIDERS.contains(&canonical) {
@@ -1012,6 +1081,16 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
             continue; // malformed source — skip, don't fail the feed
         };
         for (model_id, row) in rows {
+            // A legacy key on a kept-source row is a shape the typed parser
+            // no longer feeds; warn ONCE per fetch (a regressed feed would
+            // otherwise flood the log with one line per row) and price the
+            // typed keys alone.
+            if !warned_legacy && legacy_keys_present(row) {
+                warned_legacy = true;
+                logline!(
+                    "price feed: ai-pricelog index row {model_id} carries legacy keys (max_tokens / peak_* / peak_windows / extra): legacy keys ignored"
+                );
+            }
             let Ok(row) = serde_json::from_value::<RawRow>(row.clone()) else {
                 continue; // malformed row — skip, don't fail the source
             };
@@ -1052,6 +1131,18 @@ fn canonical_source(source: &str) -> &str {
     }
 }
 
+/// Whether an index row object carries a legacy-shape key — flat
+/// `max_tokens`, flat `peak_*`, `peak_windows`, or the `extra` modality
+/// object. The typed parser declares none of them, so the row distills from
+/// its typed keys alone; the warn is the only trace the keys were there.
+fn legacy_keys_present(row: &serde_json::Value) -> bool {
+    let Some(obj) = row.as_object() else {
+        return false;
+    };
+    obj.keys()
+        .any(|key| key == "max_tokens" || key == "extra" || key.starts_with("peak_"))
+}
+
 /// Distill the store's history ndjson into per-key dated rows ([`StoreKey`]).
 /// Line-tolerant like the index distill: a malformed line, or a line with no
 /// `observed_at`, skips. The same source rules apply — [`canonical_source`],
@@ -1070,8 +1161,8 @@ fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
         let Ok(raw) = serde_json::from_str::<RawHistoryRow>(line) else {
             continue; // malformed line — skip, don't fail the feed
         };
-        let canonical = canonical_source(&raw.source);
-        if !FIRST_PARTY_PROVIDERS.contains(&canonical) {
+        let canonical = canonical_source(&raw.source).to_owned();
+        if !FIRST_PARTY_PROVIDERS.contains(&canonical.as_str()) {
             continue;
         }
         if canonical != "anthropic"
@@ -1088,22 +1179,20 @@ fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
             .effective_at
             .clone()
             .unwrap_or_else(|| raw.observed_at.clone());
+        let key = (canonical.clone(), raw.model_id.clone());
+        let id = key.1.clone();
         let row = StoreRow {
             observed: raw.observed_at.clone(),
             applies,
             removed,
-            model: if removed {
-                None
-            } else {
-                raw.row.into_priced(raw.model_id.clone())
-            },
+            model: if removed { None } else { raw.into_priced() },
         };
-        let key = (canonical.to_owned(), raw.model_id.clone());
         let slot = match index.get(&key) {
             Some(&slot) => slot,
             None => {
                 keys.push(StoreKey {
-                    id: raw.model_id,
+                    source: canonical.clone(),
+                    id,
                     rows: Vec::new(),
                 });
                 index.insert(key, keys.len() - 1);
@@ -1118,12 +1207,17 @@ fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
     Ok(keys)
 }
 
-/// Distill the store's model catalog into its alias chains. Tolerant like the
-/// other distills: a record without a `canonical` skips, an alias whose
-/// records all skip drops, and a non-array chain drops. Fails when zero
-/// aliases survive (the store's v3 catalog carries 44) — an empty table would
-/// dash every alias id while looking like a healthy load.
-fn distill_models(json: &str) -> anyhow::Result<Vec<AliasKey>> {
+/// Distill the store's model catalog into its alias chains plus the canonical
+/// `(source, id)` map (the `models` half: canonical id → the id each source
+/// spells it as; the source names are canonicalized like the history's).
+/// Tolerant like the other distills: a record without a `canonical` skips, an
+/// alias whose records all skip drops, a non-array chain drops, and a model
+/// entry with no `sources` object (or no string source ids) skips. Fails when
+/// zero aliases survive or the canonical map distills empty (the store's v3
+/// catalog carries 44 aliases and 191 models) — an empty half would dash
+/// every alias id / leave cross-source twins raw while looking like a healthy
+/// load.
+fn distill_models(json: &str) -> anyhow::Result<(Vec<AliasKey>, CanonicalMap)> {
     let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
     let aliases = root
         .get("aliases")
@@ -1148,13 +1242,40 @@ fn distill_models(json: &str) -> anyhow::Result<Vec<AliasKey>> {
     if keys.is_empty() {
         anyhow::bail!("models feed distilled to zero aliases");
     }
-    Ok(keys)
+
+    let models = root
+        .get("models")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("models feed has no models object"))?;
+    let mut canonical = CanonicalMap::new();
+    for (canonical_id, entry) in models {
+        let Some(sources) = entry.get("sources").and_then(serde_json::Value::as_object) else {
+            continue; // malformed entry — skip, don't fail the feed
+        };
+        for (source, source_id) in sources {
+            let Some(source_id) = source_id.as_str() else {
+                continue; // malformed pair — skip
+            };
+            canonical
+                .entry(canonical_source(source).to_owned())
+                .or_default()
+                .insert(source_id.to_owned(), canonical_id.clone());
+        }
+    }
+    if canonical.is_empty() {
+        anyhow::bail!("models feed distilled to zero canonical pairs");
+    }
+    Ok((keys, canonical))
 }
 
 /// One index row. The four `_mtok` keys are USD per million tokens; missing
 /// keys are `None` (→ 0.0 per token). `cache_write_1h_mtok` is deliberately
 /// NOT declared (the hourly axis has no TTL data), and index-only extras
-/// (`first_seen`, `timezone`, `observed_at`, …) are ignored the same way. A
+/// (`first_seen`, `timezone`, `observed_at`, …) are ignored the same way.
+/// The legacy-shape keys (flat `max_tokens`, `peak_*`, `peak_windows`,
+/// `extra`) are deliberately NOT declared either: the index path no longer
+/// feeds them — [`distill`] warns on them once per fetch — while the history
+/// path declares its own copy on [`RawHistoryRow`] and keeps feeding them. A
 /// declared field of the wrong shape fails the whole row, which the caller
 /// then skips.
 #[derive(Deserialize)]
@@ -1176,6 +1297,21 @@ struct RawRow {
     effective_at: Option<String>,
     #[serde(default)]
     window_rates: Option<Vec<serde_json::Value>>,
+}
+
+/// One history-ndjson line: the index row shape plus the line's own
+/// bookkeeping keys. `observed_at` is mandatory — a row with no date cannot
+/// date. The row half reuses [`RawRow`], and the legacy peak shape (flat
+/// `peak_*` keys, `peak_windows` STRING pairs) is declared HERE, not on the
+/// index row: history rows keep feeding it (the store's own 2026-08-26 rows
+/// carry it), while the index path ignores the same keys and warns.
+#[derive(Deserialize)]
+struct RawHistoryRow {
+    source: String,
+    model_id: String,
+    observed_at: String,
+    #[serde(default)]
+    removed: Option<bool>,
     #[serde(default)]
     peak_windows: Option<Vec<serde_json::Value>>,
     #[serde(default)]
@@ -1186,19 +1322,6 @@ struct RawRow {
     peak_cache_read_mtok: Option<f64>,
     #[serde(default)]
     peak_cache_write_mtok: Option<f64>,
-}
-
-/// One history-ndjson line: the index row shape plus the line's own
-/// bookkeeping keys. `observed_at` is mandatory — a row with no date cannot
-/// date. The row half reuses [`RawRow`], so every legacy shape the index
-/// parser tolerates (flat `peak_*`, `peak_windows`) parses here too.
-#[derive(Deserialize)]
-struct RawHistoryRow {
-    source: String,
-    model_id: String,
-    observed_at: String,
-    #[serde(default)]
-    removed: Option<bool>,
     #[serde(flatten)]
     row: RawRow,
 }
@@ -1299,7 +1422,43 @@ impl RawWindowEntry {
     }
 }
 
+/// One row's entries: the flat base entry plus the row's window entries, in
+/// order — later entries override earlier matching ones at selection time.
+fn row_entries(base: RawRateSet, window_rates: Option<Vec<serde_json::Value>>) -> Vec<PriceEntry> {
+    let mut prices = vec![base.entry(&RawRateSet::default(), None)];
+    for raw in window_rates.into_iter().flatten() {
+        let Ok(entry) = serde_json::from_value::<RawWindowEntry>(raw) else {
+            continue; // malformed entry — skip, don't fail the row
+        };
+        if let Some(entry) = entry.to_entry(&base) {
+            prices.push(entry);
+        }
+    }
+    prices
+}
+
+/// The priced model an entry set names, or `None` for a model with no input
+/// AND no output rate anywhere (per-request / web-search pricing): keeping it
+/// would render a $0 "priced" row instead of an unpriced dash.
+fn finish_priced(
+    id: String,
+    prices: Vec<PriceEntry>,
+    effective_at: Option<String>,
+) -> Option<PricedModel> {
+    if !prices.iter().any(|e| e.input != 0.0 || e.output != 0.0) {
+        return None;
+    }
+    Some(PricedModel {
+        id,
+        prices,
+        effective_at,
+    })
+}
+
 impl RawRow {
+    /// Distill the typed half of a row: the flat base entry plus the window
+    /// entries. Legacy peak keys are not declared on the index row, so they
+    /// never feed here; [`distill`] warns when they show.
     fn into_priced(self, id: String) -> Option<PricedModel> {
         let base = RawRateSet {
             input_mtok: self.input_mtok,
@@ -1307,19 +1466,24 @@ impl RawRow {
             cache_read_mtok: self.cache_read_mtok,
             cache_write_mtok: self.cache_write_mtok,
         };
-        let mut prices = vec![base.entry(&RawRateSet::default(), None)];
-        for raw in self.window_rates.into_iter().flatten() {
-            let Ok(entry) = serde_json::from_value::<RawWindowEntry>(raw) else {
-                continue; // malformed entry — skip, don't fail the row
-            };
-            if let Some(entry) = entry.to_entry(&base) {
-                prices.push(entry);
-            }
-        }
-        // The legacy peak shape: `peak_windows` as ["HH:MM","HH:MM"] STRING
-        // pairs plus flat `peak_*` rate keys (absent peak keys inherit the
-        // base, like window entries). No live row carries it; the generator
-        // may regress to it.
+        let prices = row_entries(base, self.window_rates);
+        finish_priced(id, prices, self.effective_at)
+    }
+}
+
+impl RawHistoryRow {
+    /// Distill the line's price half: the typed entries plus the legacy peak
+    /// entries (`peak_windows` ["HH:MM","HH:MM"] STRING pairs plus flat
+    /// `peak_*` keys; absent peak keys inherit the base, like window
+    /// entries). The index path never reaches this.
+    fn into_priced(self) -> Option<PricedModel> {
+        let base = RawRateSet {
+            input_mtok: self.row.input_mtok,
+            output_mtok: self.row.output_mtok,
+            cache_read_mtok: self.row.cache_read_mtok,
+            cache_write_mtok: self.row.cache_write_mtok,
+        };
+        let mut prices = row_entries(base, self.row.window_rates);
         let peak = RawRateSet {
             input_mtok: self.peak_input_mtok,
             output_mtok: self.peak_output_mtok,
@@ -1332,17 +1496,7 @@ impl RawRow {
             };
             prices.push(peak.entry(&base, Some(Constraint::TimeWindow { start, end })));
         }
-        // A model with no input AND no output rate anywhere (per-request /
-        // web-search pricing) cannot price tokens; keeping it would render a
-        // $0 "priced" row instead of an unpriced dash.
-        if !prices.iter().any(|e| e.input != 0.0 || e.output != 0.0) {
-            return None;
-        }
-        Some(PricedModel {
-            id,
-            prices,
-            effective_at: self.effective_at,
-        })
+        finish_priced(self.model_id, prices, self.row.effective_at)
     }
 }
 
@@ -1354,9 +1508,9 @@ fn to_per_token(mtok: f64) -> f64 {
 // ── Disk cache ───────────────────────────────────────────────────────────────
 
 /// On-disk cache shape: the fetch time, the store-derived dating source, the
-/// alias table, and the local snapshot history. A cache written before the
-/// store or aliases half exists loads with that half empty (serde default) and
-/// upgrades on the next successful fetch.
+/// catalog's two distilled halves, and the local snapshot history. A cache
+/// written before the store, aliases, or canonical half exists loads with
+/// that half empty (serde default) and upgrades on the next successful fetch.
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheFile {
     fetched_at_ms: u64,
@@ -1364,6 +1518,8 @@ struct CacheFile {
     store: Vec<StoreKey>,
     #[serde(default)]
     aliases: Vec<AliasKey>,
+    #[serde(default)]
+    canonical: CanonicalMap,
     #[serde(default)]
     history: Vec<RateSnapshot>,
 }
@@ -1398,6 +1554,7 @@ fn load_cache(path: &Path) -> Option<PriceTable> {
         history: cache.history,
         store: cache.store,
         aliases: cache.aliases,
+        canonical: cache.canonical,
         fetched_at_ms: cache.fetched_at_ms,
         memo: Mutex::default(),
     })
@@ -1409,6 +1566,7 @@ fn save_cache(path: &Path, table: &PriceTable) {
         fetched_at_ms: table.fetched_at_ms,
         store: table.store.clone(),
         aliases: table.aliases.clone(),
+        canonical: table.canonical.clone(),
         history: table.history.clone(),
     };
     if let Ok(json) = serde_json::to_string(&cache) {

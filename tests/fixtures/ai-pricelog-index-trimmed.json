@@ -133,23 +133,6 @@
           }
         ],
         "timezone": "Asia/Shanghai"
-      },
-      "synth-legacy-peak-windows": {
-        "synthetic": true,
-        "source": "deepseek",
-        "model_id": "synth-legacy-peak-windows",
-        "observed_at": "2026-08-29",
-        "input_mtok": 0.1,
-        "output_mtok": 0.2,
-        "cache_read_mtok": 0.01,
-        "peak_windows": [
-          [
-            "01:00",
-            "04:00"
-          ]
-        ],
-        "peak_input_mtok": 0.2,
-        "peak_output_mtok": 0.4
       }
     },
     "zai": {
