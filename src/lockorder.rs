@@ -113,6 +113,12 @@ pub(crate) mod rank {
         /// `PollStreak` — read/copied alone, released before any other lock,
         /// and its cache-file IO stays outside the guard.
         KickBlockState = 230;
+        /// Pending weekly-reset re-test marks
+        /// (`usage::scheduler::WeeklyResetKicks`): the set of profiles owed one
+        /// kick because their 7d window just rolled over from the hard cap.
+        /// Leaf like `KickBlockState` — inserted/removed alone, released
+        /// before any other lock.
+        WeeklyResetKicks = 235;
         /// Interleaved auto-start queue state (`usage::auto_start_queue::AutoStartQueueState`): the
         /// anchor the 5h-window queue spaces against, plus per-profile
         /// election health. Leaf like `KickBlockState` — read/updated alone,

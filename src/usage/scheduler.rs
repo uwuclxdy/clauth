@@ -159,6 +159,14 @@ pub(crate) struct KickBlock {
 /// read/copied alone, released before any other lock, file IO outside the guard.
 pub(crate) type KickBlocks = Arc<RankedMutex<HashMap<String, KickBlock>, rank::KickBlockState>>;
 
+/// Profiles owed one weekly-reset re-test kick: their fresh usage body just
+/// showed the aggregate 7d window roll over while it had been pinned at the
+/// hard cap (see [`weekly_reset_pending`]). In-memory only — the mark rides
+/// one tick, and the standing re-test leg (`has_block`) still covers the
+/// account's recovery if the process dies between the rollover and the kick.
+/// Leaf like [`KickBlocks`].
+pub(crate) type WeeklyResetKicks = Arc<RankedMutex<HashSet<ProfileName>, rank::WeeklyResetKicks>>;
+
 /// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
 
@@ -1102,6 +1110,36 @@ fn window_lapsed(store: &UsageStore, name: &ProfileName, now_secs: i64) -> bool 
     !five_hour_live(info, now_secs)
 }
 
+/// A fresh body shows the aggregate 7d window rolled over from the hard cap
+/// while the 5h window is live: the account was dead on weekly quota and is
+/// fresh again, so one re-test kick is owed ([`should_open_window`]'s pending
+/// arm). Pure — the caller owns the store reads and the flag write.
+///
+/// The HARD cap ([`crate::fallback::WEEKLY_HARD_BLOCK_PCT`]) is the gate, not
+/// the soft switch line: below the cap the messages endpoint still serves, so
+/// a kick re-tests nothing, and the recovery scans own the soft-line return.
+/// The 5h liveness gate keeps the LAPSED case on the lapsed leg — there the
+/// kick OPENS a window and belongs behind the queue's spacing.
+fn weekly_reset_pending(prev: &UsageInfo, info: &UsageInfo, now_secs: i64) -> bool {
+    let Some(prev_week) = prev
+        .seven_day
+        .as_ref()
+        .filter(|w| w.utilization >= crate::fallback::WEEKLY_HARD_BLOCK_PCT)
+    else {
+        return false;
+    };
+    let (Some(prev_reset), Some(new_reset)) = (
+        prev_week.resets_at.as_deref().and_then(iso_to_epoch_secs),
+        info.seven_day
+            .as_ref()
+            .and_then(|w| w.resets_at.as_deref())
+            .and_then(iso_to_epoch_secs),
+    ) else {
+        return false;
+    };
+    new_reset > prev_reset && five_hour_live(info, now_secs)
+}
+
 /// Current consecutive-429 streak for `name` (0 when absent or poisoned). Read
 /// alone and released before any higher-ranked lock — POLL_STREAK(220)
 /// sits below USAGE_STORE(300), so it must not be held across `window_lapsed`.
@@ -1143,18 +1181,26 @@ fn streak_snapshot(streaks: &PollStreaks) -> HashMap<String, StreakCounts> {
 /// (`kick_block_switch_grade`), not a window open, so delaying it by up to
 /// `5h / N` would leave the chain refusing to switch back to an account that
 /// had already recovered.
+///
+/// The pending leg is the re-test's event-driven twin: a live window whose
+/// weekly quota just reset gets ONE kick on the poll cadence (no backoff, no
+/// queue — the kick opens nothing). A landed kick proves the account; a 429
+/// records a block the `has_block` leg continues from.
 fn should_open_window(
     streak: u32,
     window_lapsed: bool,
     kick_due: bool,
     has_block: bool,
     queue_due: bool,
+    weekly_reset_pending: bool,
 ) -> bool {
     if streak != 0 {
         return false;
     }
     if window_lapsed {
         kick_due && queue_due
+    } else if weekly_reset_pending {
+        true
     } else {
         has_block
     }
@@ -1169,17 +1215,23 @@ fn auto_start_should_kick(
     streaks: &PollStreaks,
     store: &UsageStore,
     kick_blocks: &KickBlocks,
+    weekly_reset_kicks: &WeeklyResetKicks,
     name: &ProfileName,
     now_secs: i64,
     queue_due: bool,
 ) -> bool {
     let block = kick_block(kick_blocks, name);
+    let weekly_reset_pending = weekly_reset_kicks
+        .lock()
+        .ok()
+        .is_some_and(|m| m.contains(name));
     should_open_window(
         rate_limit_streak(streaks, name),
         window_lapsed(store, name, now_secs),
         kick_retry_due(block.as_ref(), now_secs),
         block.is_some(),
         queue_due,
+        weekly_reset_pending,
     )
 }
 
@@ -1537,6 +1589,7 @@ fn run_fetch(
     activity: &ActivityStore,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
+    weekly_reset_kicks: &WeeklyResetKicks,
     auto_start_queue: &crate::usage::AutoStartQueueState,
     interval_ms: u64,
 ) -> FetchOutcome {
@@ -1562,6 +1615,7 @@ fn run_fetch(
             streaks,
             store,
             kick_blocks,
+            weekly_reset_kicks,
             &entry.name,
             now_secs,
             entry.may_open_window,
@@ -1574,6 +1628,12 @@ fn run_fetch(
                 entry.access_expires_at,
                 Some(activity),
             );
+            // Whatever leg fired it, the kick consumed the weekly-reset
+            // re-test: a landed kick proved the account, a 429 recorded a
+            // block the standing re-test leg continues from.
+            if let Ok(mut pending) = weekly_reset_kicks.lock() {
+                pending.remove(&entry.name);
+            }
             note_kick_outcome(
                 kick_blocks,
                 &entry.name,
@@ -1762,6 +1822,9 @@ fn update_streaks(
 /// Write one outcome into the shared stores; returns the stamped next-fetch base
 /// (`last_fetched`) so the caller republishes this profile's countdown the instant
 /// it lands. Disk cache written on every live response.
+// One arg over the lint's bar; each is a distinct shared store or decision input
+// this leg reads alone, and bundling them would only rename the same coupling.
+#[allow(clippy::too_many_arguments)]
 fn apply_outcome(
     outcome: FetchOutcome,
     store: &UsageStore,
@@ -1770,6 +1833,8 @@ fn apply_outcome(
     streaks: &PollStreaks,
     interval_ms: u64,
     is_active: bool,
+    auto_start: bool,
+    weekly_reset_kicks: &WeeklyResetKicks,
 ) -> EpochMs {
     let now = EpochMs::from_millis(now_ms());
 
@@ -1815,6 +1880,20 @@ fn apply_outcome(
         }
         preserve_live_window(info.clone(), prev.as_ref(), now_epoch_secs())
     });
+
+    // The weekly-reset re-test mark: a fresh body whose aggregate 7d window
+    // rolled over from the hard cap while the 5h window is live (see
+    // [`weekly_reset_pending`]). Set for opted-in profiles only — run_fetch
+    // consults the mark under `entry.auto_start`, and a mark on a profile
+    // that never opts in would sit in the set for the process lifetime.
+    if is_fresh
+        && auto_start
+        && let (Some(prev), Some(info)) = (prev.as_ref(), merged.as_ref())
+        && weekly_reset_pending(prev, info, now_epoch_secs())
+        && let Ok(mut pending) = weekly_reset_kicks.lock()
+    {
+        pending.insert(outcome.name.clone());
+    }
 
     // A profile added while ALREADY canceled 429s `/usage` from its first poll and
     // never gets a `usage_cache.json`, so `cached()` yields `info=None` and there
@@ -2258,6 +2337,7 @@ fn fetch_oauth_due(state: &SchedulerState, due: Vec<TokenEntry>, interval_ms: u6
             &state.activity,
             &state.poll_streaks,
             &state.kick_blocks,
+            &state.weekly_reset_kicks,
             &state.auto_start_queue,
             interval_ms,
         )
@@ -2341,11 +2421,22 @@ fn drain_oauth_completions(
         }
         // The active profile's 429 ladder caps low (see `next_slot_deferral`);
         // read the flag at apply time so a switch mid-flight lands the right cadence.
-        let is_active = state
+        // `auto_start` rides the same lock: the weekly-reset mark below only
+        // matters for profiles run_fetch would kick.
+        let (is_active, auto_start) = state
             .config
             .lock()
-            .map(|c| c.is_active(&outcome.name))
-            .unwrap_or(false);
+            .map(|c| {
+                let profile = c
+                    .profiles
+                    .iter()
+                    .find(|p| p.name.as_str() == outcome.name.as_str());
+                (
+                    c.is_active(&outcome.name),
+                    profile.is_some_and(|p| p.auto_start),
+                )
+            })
+            .unwrap_or((false, false));
         let name = outcome.name.clone();
         let stamped = apply_outcome(
             outcome,
@@ -2355,6 +2446,8 @@ fn drain_oauth_completions(
             &state.poll_streaks,
             interval_ms,
             is_active,
+            auto_start,
+            &state.weekly_reset_kicks,
         );
         publish_one_countdown(&state.next_refresh_per_profile, &name, stamped, interval_ms);
     }
@@ -2653,6 +2746,8 @@ pub(crate) struct SchedulerState {
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
     kick_blocks: KickBlocks,
+    /// Pending weekly-reset re-test kicks (see [`weekly_reset_pending`]).
+    weekly_reset_kicks: WeeklyResetKicks,
     /// Interleaved auto-start queue (`usage::auto_start_queue`): the anchor the 5h-window
     /// queue spaces against, plus per-profile election health.
     auto_start_queue: crate::usage::AutoStartQueueState,
@@ -3130,6 +3225,7 @@ pub(crate) fn spawn_refresher(
         last_fetched,
         poll_streaks,
         kick_blocks,
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue,
         pending_switch,
         pending_switch_off,

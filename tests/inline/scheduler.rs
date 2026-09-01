@@ -793,6 +793,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         plan_override: None,
         retry_after,
     };
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     let before = now_ms();
     apply_outcome(
@@ -803,6 +804,8 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
     let after = now_ms();
 
@@ -940,6 +943,7 @@ fn cached_fallback_does_not_clobber_store() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     let live = UsageInfo {
         five_hour: Some(UsageWindow {
@@ -968,6 +972,8 @@ fn cached_fallback_does_not_clobber_store() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
     assert!(
         store.lock().unwrap().get("a").unwrap().five_hour.is_some(),
@@ -997,6 +1003,8 @@ fn cached_fallback_does_not_clobber_store() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
     assert!(
         store.lock().unwrap().contains_key("b"),
@@ -1018,6 +1026,7 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     // Prior state: a live 5h window under a (now stale) Pro tier, in both the
     // store and the disk cache the bail loads from.
@@ -1058,6 +1067,8 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
 
     let got = store.lock().unwrap().get("a").cloned().unwrap();
@@ -1103,6 +1114,7 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     // No prior store entry and no usage_cache.json: `cached()` yields info=None.
     crate::testutil::register_names(&["cold"]);
@@ -1124,6 +1136,8 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
 
     let got = store.lock().unwrap().get("cold").cloned();
@@ -1279,63 +1293,83 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
 fn kick_suppressed_during_rate_limit_streak() {
     use super::should_open_window;
 
-    // args: (streak, window_lapsed, kick_due, has_block, queue_due)
+    // args: (streak, window_lapsed, kick_due, has_block, queue_due,
+    //        weekly_reset_pending)
     assert!(
-        should_open_window(0, true, true, false, true),
+        should_open_window(0, true, true, false, true, false),
         "lapsed + no streak → open"
     );
     assert!(
-        !should_open_window(1, true, true, false, true),
+        !should_open_window(1, true, true, false, true, false),
         "lapsed but 429-streaking → suppress the kick"
     );
     assert!(
-        !should_open_window(5, true, true, false, true),
+        !should_open_window(5, true, true, false, true, false),
         "deep streak → still suppressed"
     );
     assert!(
-        !should_open_window(0, false, true, false, true),
+        !should_open_window(0, false, true, false, true, false),
         "a live window with no block never kicks"
     );
     assert!(
-        should_open_window(0, false, true, true, true),
+        should_open_window(0, false, true, true, true, false),
         "a live window WITH a standing block re-tests it — the window can be a \
          Claude-web open while Claude Code stays 429'd, so only a landed kick \
          proves the block is gone"
     );
     assert!(
-        should_open_window(0, false, false, true, true),
+        should_open_window(0, false, false, true, true, false),
         "a live-window block re-tests on the POLL cadence, not the deep kick \
          backoff — the window reopened (maybe via web), so recovery may be \
          imminent and we must not wait out the ~15min ladder"
     );
     assert!(
-        !should_open_window(1, false, false, true, true),
+        !should_open_window(1, false, false, true, true, false),
         "but a /usage 429-streak still suppresses even the live-window re-test"
     );
     assert!(
-        !should_open_window(0, true, false, true, true),
+        !should_open_window(0, true, false, true, true, false),
         "a LAPSED-window kick-429 block whose retry isn't due still waits its \
          backoff — no reopened-window signal, so don't re-hit a dead endpoint"
     );
     assert!(
-        !should_open_window(0, true, true, false, false),
+        !should_open_window(0, true, true, false, false, false),
         "the queue gate holds the LAPSED leg: an unelected member with a \
          lapsed window and a due kick clock still may not open"
     );
     assert!(
-        should_open_window(0, false, true, true, false),
+        should_open_window(0, false, true, true, false, false),
         "…and only the lapsed leg: the live-window re-test is a health probe \
          the queue must never delay"
+    );
+    assert!(
+        should_open_window(0, false, false, false, false, true),
+        "a pending weekly-reset mark kicks a live window on the poll cadence: \
+         no block, no backoff, and the queue never delays a re-test"
+    );
+    assert!(
+        should_open_window(0, false, false, false, true, true),
+        "queue due or not, the pending leg is ungated"
+    );
+    assert!(
+        !should_open_window(1, false, false, false, false, true),
+        "a 429-streak suppresses the pending leg like every other"
+    );
+    assert!(
+        !should_open_window(0, true, false, false, false, true),
+        "pending does NOT bypass the queue for a LAPSED window: there the \
+         kick OPENS a window, and opens belong behind the spacing"
     );
 }
 
 // The `run_fetch` wiring seam: a LIVE 5h window with a standing block must
-// re-test (the fix), a healthy live window stays quiet. Guards the
-// `block.is_some()` → `has_block` plumbing `should_open_window`'s own test can't
-// reach, since `run_fetch` is HTTP-bound.
+// re-test (the fix), a healthy live window stays quiet, and a pending
+// weekly-reset mark fires the same re-test with no block at all. Guards the
+// `block.is_some()` → `has_block` and pending-set plumbing
+// `should_open_window`'s own test can't reach, since `run_fetch` is HTTP-bound.
 #[test]
 fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
-    use super::{KickBlock, KickBlocks, PollStreaks, auto_start_should_kick};
+    use super::{KickBlock, KickBlocks, PollStreaks, WeeklyResetKicks, auto_start_should_kick};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso};
 
     let now = 3_000_000;
@@ -1352,6 +1386,7 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             },
         )])))
     };
+    let no_pending = || -> WeeklyResetKicks { Arc::new(RankedMutex::new(HashSet::new())) };
 
     let blocked: KickBlocks = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -1367,6 +1402,7 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &streaks,
             &live_store(),
             &blocked,
+            &no_pending(),
             &crate::profile::ProfileName::from("a"),
             now,
             true
@@ -1380,11 +1416,258 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             &streaks,
             &live_store(),
             &clean,
+            &no_pending(),
             &crate::profile::ProfileName::from("a"),
             now,
             true
         ),
         "a healthy live window with no block must not kick"
+    );
+
+    // The pending weekly-reset mark fires the same re-test with no block: the
+    // 7d window just rolled over from the hard cap, so the account is fresh
+    // again and one kick proves it (or records the block to continue from).
+    let pending: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::from([
+        crate::profile::ProfileName::from("a"),
+    ])));
+    assert!(
+        auto_start_should_kick(
+            &streaks,
+            &live_store(),
+            &clean,
+            &pending,
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "a pending weekly-reset mark kicks a live window with no block"
+    );
+    assert!(
+        !auto_start_should_kick(
+            &streaks,
+            &live_store(),
+            &clean,
+            &no_pending(),
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "without the mark the same healthy window stays quiet"
+    );
+}
+
+/// The weekly-reset predicate: a fresh body whose aggregate 7d window rolled
+/// over from the hard cap while the 5h window is live. Every arm of the gate
+/// has a pin — below the cap the messages endpoint still serves (a kick
+/// re-tests nothing), and a lapsed 5h window belongs to the queue-gated
+/// lapsed leg, never this one.
+#[test]
+fn weekly_reset_pending_reads_the_rollover_the_hard_cap_and_the_live_window() {
+    use super::weekly_reset_pending;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let now = 3_000_000;
+    let week = |util: f64, reset_in: i64| UsageWindow {
+        utilization: util,
+        resets_at: Some(epoch_secs_to_iso(now + reset_in)),
+    };
+    let five = |reset_in: i64| UsageWindow {
+        utilization: 1.0,
+        resets_at: Some(epoch_secs_to_iso(now + reset_in)),
+    };
+    let pair = |prev_util: f64, prev_reset_in: i64, new_reset_in: i64, five_reset_in: i64| {
+        let prev = UsageInfo {
+            seven_day: Some(week(prev_util, prev_reset_in)),
+            ..Default::default()
+        };
+        let info = UsageInfo {
+            seven_day: Some(week(0.0, new_reset_in)),
+            five_hour: Some(five(five_reset_in)),
+            ..Default::default()
+        };
+        (prev, info)
+    };
+
+    let (prev, info) = pair(100.0, 3600, 3600 + 7 * 86_400, 3600);
+    assert!(
+        weekly_reset_pending(&prev, &info, now),
+        "a rollover from the hard cap with a live 5h window is owed a re-test"
+    );
+
+    let (prev, info) = pair(99.99, 3600, 3600 + 7 * 86_400, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "below the hard cap the endpoint still serves — no re-test owed"
+    );
+
+    let (prev, info) = pair(100.0, 3600, 3600, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "same reset: no rollover"
+    );
+
+    let (prev, info) = pair(100.0, 3600, 0, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "a reset moving BACKWARD is not a rollover"
+    );
+
+    let (prev, info) = pair(100.0, 3600, 3600 + 7 * 86_400, -60);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "a lapsed 5h window stays on the queue-gated lapsed leg"
+    );
+
+    let prev = UsageInfo::default();
+    let (_, info) = pair(100.0, 3600, 3600 + 7 * 86_400, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "no prior weekly window: nothing to roll over from"
+    );
+
+    let (prev, mut info) = pair(100.0, 3600, 3600 + 7 * 86_400, 3600);
+    info.seven_day = None;
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "no new weekly window: no rollover observed"
+    );
+}
+
+/// The mark lands end to end through `apply_outcome`: only a FRESH body on an
+/// opted-in profile with a hard-cap rollover and a live 5h window sets it;
+/// a cached bail, an opted-out profile, and a soft-line rollover leave the
+/// set empty.
+#[test]
+fn apply_outcome_marks_the_weekly_reset_re_test() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, WeeklyResetKicks, apply_outcome};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let week = |util: f64, reset_in: i64| UsageWindow {
+        utilization: util,
+        resets_at: Some(epoch_secs_to_iso(now + reset_in)),
+    };
+    let live_five = UsageWindow {
+        utilization: 1.0,
+        resets_at: Some(epoch_secs_to_iso(now + 3600)),
+    };
+    let prev = UsageInfo {
+        seven_day: Some(week(100.0, 3600)),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(week(0.0, 3600 + 7 * 86_400)),
+        five_hour: Some(live_five.clone()),
+        ..Default::default()
+    };
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "w".to_string(),
+        prev.clone(),
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+
+    let fresh = |info: UsageInfo| FetchOutcome {
+        name: crate::profile::ProfileName::from("w"),
+        info: Some(info),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        refresh_failed: false,
+        plan_override: None,
+        retry_after: None,
+    };
+
+    // The one shape that sets the mark: fresh, opted in, hard-cap rollover,
+    // 5h live.
+    apply_outcome(
+        fresh(rolled.clone()),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        true,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w")),
+        "the rollover marks the profile for one re-test kick"
+    );
+    weekly_reset_kicks.lock().unwrap().clear();
+
+    // Opted out: the mark would sit unconsumed for the process lifetime.
+    apply_outcome(
+        fresh(rolled.clone()),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a profile without auto_start gets no mark"
+    );
+
+    // A cached bail recycles the on-disk snapshot: never a rollover observer.
+    let mut cached = rolled.clone();
+    cached.seven_day = Some(week(0.0, 3600 + 7 * 86_400));
+    apply_outcome(
+        FetchOutcome {
+            from_fetch: false,
+            ..fresh(cached)
+        },
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        true,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a non-fresh outcome never sets the mark"
+    );
+
+    // Below the hard cap: the endpoint still serves, nothing to re-test.
+    let soft_prev = UsageInfo {
+        seven_day: Some(week(98.0, 3600)),
+        ..Default::default()
+    };
+    let soft_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "w".to_string(),
+        soft_prev,
+    )])));
+    apply_outcome(
+        fresh(rolled),
+        &soft_store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        true,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a soft-line rollover sets no mark"
     );
 }
 
@@ -2701,6 +2984,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     let extra = 300_000 - REFRESH_INTERVAL_MS;
@@ -2746,6 +3031,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     let floor = RATE_LIMIT_MIN_BACKOFF_MS;
@@ -2764,6 +3051,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     assert!(
@@ -2781,6 +3070,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     let capped = MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;
@@ -2803,6 +3094,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     assert!(
@@ -2861,6 +3154,8 @@ fn consecutive_rate_limits_back_off_exponentially() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
         let after = now_ms();
         assert!(
@@ -2879,6 +3174,8 @@ fn consecutive_rate_limits_back_off_exponentially() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let before = now_ms();
     apply_outcome(
@@ -2889,6 +3186,8 @@ fn consecutive_rate_limits_back_off_exponentially() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     assert!(
@@ -2951,6 +3250,8 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
         let after = now_ms();
         assert!(
@@ -2994,6 +3295,8 @@ fn transient_errors_preserve_rate_limit_streak() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
     };
     let stamp = || {
@@ -3988,6 +4291,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -4079,6 +4383,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -4173,6 +4478,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -4275,6 +4581,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -4390,6 +4697,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -4496,6 +4804,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: auto_start_queue.clone(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -4597,6 +4906,7 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
             next_retry: now_before + 600,
         },
     )])));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
     let queue = crate::usage::new_auto_start_queue_state();
     crate::usage::note_queue_open(&queue, &"a".into(), 42);
     let lines = crate::logline::LogLines::new();
@@ -4610,6 +4920,7 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
         &activity,
         &streaks,
         &blocks,
+        &weekly_reset_kicks,
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -4646,6 +4957,7 @@ fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
         &activity,
         &streaks,
         &blocks,
+        &weekly_reset_kicks,
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -4736,6 +5048,7 @@ fn auto_start_queue_run_fetch_keys_a_failed_kick_to_the_elected_member() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -4843,6 +5156,7 @@ fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick()
             next_retry: now_before + 600,
         },
     )])));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
     let queue = crate::usage::new_auto_start_queue_state();
 
     let _outcome = super::run_fetch(
@@ -4853,6 +5167,7 @@ fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick()
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &blocks,
+        &weekly_reset_kicks,
         &queue,
         REFRESH_INTERVAL_MS,
     );
@@ -5000,6 +5315,8 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         &streaks,
         REFRESH_INTERVAL_MS,
         true,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     apply_outcome(
         outcome("idle"),
@@ -5009,6 +5326,8 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
 
@@ -5062,6 +5381,7 @@ fn completion_order_state() -> super::SchedulerState {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -5844,6 +6164,8 @@ fn a_live_fetch_appends_the_sample_and_its_bridge() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     let samples = recorded_samples("alice");
@@ -5923,6 +6245,8 @@ fn a_cached_body_appends_no_sample() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -5953,6 +6277,8 @@ fn an_unchanged_live_sample_appends_nothing() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
     };
 
@@ -5996,6 +6322,8 @@ fn a_cold_store_does_not_re_append_the_last_recorded_sample() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
     };
 
@@ -7811,6 +8139,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
@@ -8025,6 +8354,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
         auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),

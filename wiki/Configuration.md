@@ -110,7 +110,7 @@ auto_start = true    # per profile; older spelling kick_timer still reads
 
 clauth then sends a 1-token Haiku ping on launch and on each refresh tick while no window is running. On a cold start it fetches usage before the first ping, so it never fires over a window that might already be live. That costs a fraction of a cent and it is a real billed `/v1/messages` call under your own token. Default off, OAuth accounts only.
 
-If the messages limiter is blocking Claude Code, a live 5h window will not clear it. clauth re-tests with the same ping on the poll cadence and can rotate the chain around an account whose ping keeps getting rejected.
+If the messages limiter is blocking Claude Code, a live 5h window will not clear it. clauth re-tests with the same ping on the poll cadence and can rotate the chain around an account whose ping keeps getting rejected. The weekly (7d) window gets the same treatment at its own boundary: when an account's week was fully spent and its 7d window resets with the 5h window still live, clauth pings once to prove the account serves again, so the chain can return to it without waiting for a failed request.
 
 ### Interleaving it across accounts
 
