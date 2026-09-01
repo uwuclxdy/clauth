@@ -1400,10 +1400,21 @@ fn elect_auto_start_queue(
     // released before the store below, since Config outranks UsageStore(300)
     // and the two must not nest.
     let blocked = kick_rejected_names(&state.kick_blocks, now_secs);
-    let queue = state
+    // Two lists from the one config read: `queue` (members, minus the real
+    // blocked set) sizes the gap and elects, `profiles` (the FULL list) is
+    // the anchor input — a window open is a window open, whoever holds it.
+    let (queue, profiles) = state
         .config
         .lock()
-        .map(|c| crate::usage::auto_start_queue_members(&c, &blocked))
+        .map(|c| {
+            (
+                crate::usage::auto_start_queue_members(&c, &blocked),
+                c.profiles
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect::<Vec<_>>(),
+            )
+        })
         .unwrap_or_default();
     if queue.is_empty() {
         return;
@@ -1436,14 +1447,18 @@ fn elect_auto_start_queue(
     // is the same outcome by both paths, and it is what keeps the anchor's
     // history replay off the ticks it could not change: this is the majority of
     // every cycle (all windows live, the gap long since elapsed), and an idle
-    // window's sliding `resets_at` appends history on every single poll.
+    // window's boundary oscillates ±1s around its minute anchor on every
+    // recompute, so a polled account appends history on every single poll.
     if !candidates.iter().any(|c| c.lapsed) {
         shut(due);
         return;
     }
 
     let gap = crate::usage::queue_gap_secs(queue.len(), interval_ms);
-    let anchor = crate::usage::queue_anchor(&state.auto_start_queue, &queue, now_secs, gap);
+    // The anchor replays every profile's history (the full list), while the
+    // member list keeps sizing the gap and electing — so an open on a
+    // non-member still gates the queue.
+    let anchor = crate::usage::queue_anchor(&state.auto_start_queue, &profiles, now_secs, gap);
     if !crate::usage::queue_due(anchor, now_secs, gap) {
         // Inside the gap: no MEMBER opens a window this tick. The re-test leg
         // is untouched — `should_open_window` only consults the queue on the
@@ -1903,6 +1918,13 @@ fn apply_outcome(
 /// re-arm a profile whose window is already running. Utilization starts at 0
 /// (the kick is ~1 token); the next live fetch overwrites the synthetic entry
 /// with API truth. No-op while the stored window is still live.
+///
+/// The `open_at` stamp is the kick's durable record: it rides this synthetic
+/// entry into the history file when the next fresh body lands (the writer
+/// bridges the value it replaces), and the auto-start queue's marker pass
+/// confirms the kicked window on it. Stamped ONLY here — every other
+/// `UsageInfo` (wire parses, `prime_window`'s out-of-band opens) carries
+/// `None`, so a history line with a marker is provably a kick of ours.
 fn mark_window_open(store: &UsageStore, name: &ProfileName, now_secs: i64) {
     let Ok(mut s) = store.lock() else {
         return;
@@ -1921,6 +1943,7 @@ fn mark_window_open(store: &UsageStore, name: &ProfileName, now_secs: i64) {
         utilization: 0.0,
         resets_at: Some(epoch_secs_to_iso(now_secs + 5 * 3600)),
     });
+    info.open_at = Some(now_secs);
 }
 
 /// Startup usage seed — never blocks on HTTP. Each profile with an on-disk cache is
@@ -3072,11 +3095,16 @@ pub(crate) fn spawn_refresher(
     // history-derived anchor is still seeded on THIS thread, for the same
     // home-path reason as the kick-block seed above — the derivation replays
     // per-profile `usage_history.jsonl` files.
-    let queue_seed: Vec<crate::profile::ProfileName> = config
+    // The anchor replays EVERY profile's history — a window open is a window
+    // open, whoever holds it — so the seed takes the full config profile list
+    // and the per-tick gate does the same: the two agree on the anchor input
+    // by construction (the blocked set and the auto-start toggle only ever
+    // shaped the member list, which the anchor no longer takes).
+    let anchor_seed: Vec<crate::profile::ProfileName> = config
         .lock()
-        .map(|c| crate::usage::auto_start_queue_members(&c, &[]))
+        .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
         .unwrap_or_default();
-    crate::usage::seed_queue_anchor(&auto_start_queue, &queue_seed);
+    crate::usage::seed_queue_anchor(&auto_start_queue, &anchor_seed);
     // Startup leg of the usage-history retention trim (the cadenced leg runs in
     // `tick`). Here rather than in the spawned closure for the same home-path
     // reason as the kick-block seed above.

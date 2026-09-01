@@ -1519,6 +1519,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
+            open_at: None,
         });
         collect_stats(&profile, ResetFmt::default())
     };

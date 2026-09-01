@@ -457,6 +457,14 @@ pub(crate) struct UsageInfo {
     pub(crate) extra_usage: Option<ExtraUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spend: Option<SpendInfo>,
+    /// The authoritative 5h-window open instant, in epoch seconds. Present only
+    /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
+    /// `mark_window_open`): a history line carrying it is clauth's own durable
+    /// record of that kick, and the auto-start queue confirms the window on it.
+    /// Every API-read sample carries `None`, so the field stays absent from
+    /// those lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) open_at: Option<i64>,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -1149,6 +1157,7 @@ fn assemble_usage(
                 window_dollars: windows.window_dollars,
                 extra_usage: raw.extra_usage,
                 spend,
+                open_at: None,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
