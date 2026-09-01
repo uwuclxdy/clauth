@@ -95,9 +95,10 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             // Interleaved auto-start: membership, gap arithmetic, the
             // history-series classifier, the per-tick election, and the chip.
             // ONE prefix, and every test of the feature is rooted at it, so a
-            // deleted test reds this row while nothing else in the tree can
-            // match by accident — a bare `queue_` would hit `enqueue_refetch`,
-            // a bare `election_` hits `selection_caret_…`.
+            // deleted test reds this row while nothing else in the test tree
+            // can match by accident — a bare `queue_` would also match the
+            // `build_status_auto_start_queue_` status tests, and `queue` alone
+            // matches every name carrying that substring.
             "auto_start_queue_",
         ],
     ),

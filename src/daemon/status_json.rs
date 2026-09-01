@@ -58,12 +58,15 @@ pub(crate) struct LiveSignals<'a> {
     pub(crate) pending_switch: Option<&'a str>,
     /// The scheduler's in-memory auto-start queue anchor
     /// ([`crate::usage::queue_anchor_cached`]), so the published `next_open_at`
-    /// matches the value the election gates on. `None` while nothing has
-    /// opened — published as a `null` `next_open_at`, which reads as "due
-    /// now". The single-shot `status --json` has no scheduler and derives it
-    /// from the usage-history series instead ([`crate::usage::history_anchor`])
-    /// — one replay per invocation, a cost the per-tick daemon feed must not
-    /// pay.
+    /// carries the anchor the scheduler holds. The gate composes this CACHED
+    /// value by `max` with a per-tick history derivation, so the published
+    /// stamp can only be EARLIER than the anchor a tick will gate on — a
+    /// reader acting on it is early at worst, never late. `None` while
+    /// nothing has opened — published as a `null` `next_open_at`, which reads
+    /// as "due now". The single-shot `status --json` has no scheduler and
+    /// derives it from the usage-history series instead
+    /// ([`crate::usage::history_anchor`]) — one replay per invocation, a cost
+    /// the per-tick daemon feed must not pay.
     pub(crate) queue_anchor: Option<i64>,
     /// The scheduler's switch-grade kick blocks, as the names its own election
     /// excludes from the queue ([`crate::usage::auto_start_queue_members`]'s

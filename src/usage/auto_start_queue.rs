@@ -50,19 +50,19 @@
 //! apart. That pass is what makes the gate's rule real — the rule above is
 //! "no other PROFILE opened one", and an open needs no kick of ours behind
 //! it: a live Claude Code session on any profile, the web app, or
-//! `clauth use` opens a window that only the series shows. Anchoring on our
+//! the switch prime opens a window that only the series shows. Anchoring on our
 //! own kicks alone would space the queue against half the openings it has to
 //! space against, so the replay is the GATE's read, not just a startup seed
 //! ([`queue_anchor`]).
 //!
 //! ## The one opening this queue does NOT gate
 //!
-//! `clauth use <name>` primes its target's window through
+//! The switch action primes its target's window through
 //! [`crate::oauth::prime_window`] — the second caller of
 //! [`crate::oauth::auto_start_kick`] — and that path checks neither the toggle
-//! nor the anchor. It is an override on purpose: the operator typed a switch
-//! because they are about to work on that account, and a `use` that silently
-//! declined to prime would be a worse lie than a collapsed gap. It also cannot
+//! nor the anchor. It is an override on purpose: the operator switched because
+//! they are about to work on that account, and a switch that silently declined
+//! to prime would be a worse lie than a collapsed gap. It also cannot
 //! practically be gated, because the CLI is a one-shot process with no
 //! scheduler and no share of this queue's memory.
 //!
@@ -199,6 +199,12 @@ pub(crate) fn new_state() -> AutoStartQueueState {
 /// whole feature a no-op for a single account: that member's own window start
 /// IS the last queue open, so at lapse `now - last_open == 5h`, comfortably past
 /// the gap. Nothing about a one-account setup changes.
+///
+/// At `n >= 60` the capped tolerance swallows the whole share
+/// (`5h / 60 == 300s == MAX_GAP_TOLERANCE_SECS`), so the gap saturates at the
+/// 1s floor: a 60+ member queue degenerates to back-to-back opens. Named, not
+/// prevented — nobody runs 60 accounts, and the floor keeps the gate
+/// arithmetic total.
 pub(crate) fn queue_gap_secs(n: usize, interval_ms: u64) -> i64 {
     let members = n.max(1) as i64;
     let tolerance = ((interval_ms / 1000) as i64).min(MAX_GAP_TOLERANCE_SECS);
@@ -332,7 +338,7 @@ fn member_series(name: &ProfileName) -> Vec<(i64, i64, Option<i64>)> {
 /// provable, and the scan falls through to older marked lines).
 ///
 /// The SPAN pass covers unmarked out-of-band opens — a live Claude Code
-/// session, the web app, `clauth use`. Over non-marked samples only, newest
+/// session, the web app, the switch prime. Over non-marked samples only, newest
 /// first: a boundary counts when two samples at least [`SPAN_MIN_SECS`] apart
 /// hold equal within [`BOUNDARY_JITTER_SECS`] with every intermediate equal
 /// within the same jitter (zero intermediates is fine — two samples 90s apart
@@ -582,7 +588,7 @@ pub(crate) fn queue_failures(
 /// soon as two history samples confirm it ([`queue_anchor`]), so a published
 /// value can shift out from under a reader. Three sources, none of them gated
 /// by this queue: a live Claude Code session on any profile, the web app,
-/// and `clauth use` — the CLI switch primes its target through
+/// and the switch prime — the CLI switch primes its target through
 /// [`crate::oauth::prime_window`], which is the OTHER caller of
 /// [`crate::oauth::auto_start_kick`] and deliberately consults neither the
 /// toggle nor the anchor (see the module header's override paragraph).

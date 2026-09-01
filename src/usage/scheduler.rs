@@ -1509,11 +1509,13 @@ fn log_queue_open(
     else {
         return;
     };
+    // `next in` is the gap itself: the anchor was just set to `now`, so the
+    // recomputed slot's countdown is exactly one gap — no fallback exists.
     logline!(
         "{name}: 5h auto-start window opened (queue {}/{}, next in {})",
         slot.position,
         slot.total,
-        humanize_duration(slot.next_in.unwrap_or(0))
+        humanize_duration(crate::usage::queue_gap_secs(slot.total, interval_ms))
     );
 }
 
@@ -1620,8 +1622,11 @@ fn run_fetch(
             // otherwise a member stuck in refusal holds the slot on every tick,
             // which is the head-of-line case [`crate::usage::auto_start_queue`]'s
             // election-failure limit exists to prevent. (A lapsed NON-member
-            // can reach here too while refused — harmless: its streak is never
-            // consulted while it holds no slot, and it decays within the hour.)
+            // can reach here too while refused — harmless while it holds no
+            // slot: its streak is never consulted. If it rejoins the queue
+            // within the hour, the recorded refusal still counts, so a freshly
+            // re-admitted member can carry one stale failure toward the skip
+            // limit.)
             crate::usage::note_queue_kick_failed(auto_start_queue, &entry.name, now_secs);
         }
     }

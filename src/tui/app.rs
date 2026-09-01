@@ -2390,7 +2390,7 @@ impl App {
                 .collect::<Vec<_>>();
         }
         for (name, threshold, util, fresh) in bells {
-            // Queue or clear only on a live read — a synthetic/stale window (e.g.
+            // Ring or clear only on a live read — a synthetic/stale window (e.g.
             // a just-kicked 0%) must not clear a real bell or fire a false one.
             // Non-fresh profiles keep their prior bell state.
             if !fresh {
