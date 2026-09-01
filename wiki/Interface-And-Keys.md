@@ -109,7 +109,7 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 | `on mismatch` | `ask`, `overwrite`, `new`, `discard` | `ask` |
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
-| `auto-start queue` | space opted-in accounts' 5h window opens across one shared queue | off |
+| `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
 | `rotation` | `preemptive`, `lazy` | `preemptive` |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
@@ -119,7 +119,7 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 | `allow extra usage` | `off`, `pay-as-you-go` | `off` |
 | `extra usage spent` | `stay on active`, `switch off all` | `switch off all` |
 
-`clock` is inert unless `reset display` shows one. `burn floor` and `burn horizon` are inert unless `switch mode` is `burn-aware`. `extra usage spent` is inert unless `allow extra usage` is on. What each of the auto-switch rows does: [Auto-switch](Auto-Switch).
+`clock` is inert unless `reset display` shows one. `burn floor` and `burn horizon` are inert unless `switch mode` is `burn-aware`. `extra usage spent` is inert unless `allow extra usage` is on. `auto-start queue` is inert until some account has `auto_start` on. What each of the auto-switch rows does: [Auto-switch](Auto-Switch).
 
 ## Plugin tab
 
