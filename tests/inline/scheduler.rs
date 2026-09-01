@@ -4772,6 +4772,107 @@ fn auto_start_queue_run_fetch_keys_a_failed_kick_to_the_elected_member() {
 // capped re-polls keep the window pinned. Idle profiles always keep the full
 // ladder.
 
+/// The pre-kick refusal arm records the consumed slot: an ELECTED lapsed
+/// member refused before the kick could fire (a standing block whose retry
+/// clock has not come due) steps toward the skip threshold exactly like a
+/// failed kick does, with zero `/v1/messages` hits. Mutation: deleting the
+/// record call in `run_fetch`'s refusal arm reds this test.
+#[test]
+fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":0.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":0.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    let kick_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_hits = kick_hits.clone();
+    let (base, _server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            served_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    let mut entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("queued token");
+    entry.may_open_window = true; // elected this tick
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now_before - 60)), // lapsed
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    // A standing block whose retry clock has not come due: the refusal the
+    // arm exists for, distinct from the 429-streak refusal.
+    let blocks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::KickBlock {
+            streak: 1,
+            rejected: false,
+            until: None,
+            next_retry: now_before + 600,
+        },
+    )])));
+    let queue = crate::usage::new_auto_start_queue_state();
+
+    let _outcome = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &blocks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert_eq!(
+        crate::usage::queue_failures(&queue, &"a".into(), crate::usage::now_epoch_secs()),
+        1,
+        "a refused pre-kick consumes the slot and records the failure"
+    );
+    assert_eq!(
+        kick_hits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the refusal must not fire a kick"
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&queue),
+        None,
+        "nothing opened: the anchor does not move"
+    );
+}
+
 #[test]
 fn active_profile_rate_limit_ladder_caps_at_one_extra_interval() {
     use super::{IntervalMs, MAX_RETRY_AFTER_MS, next_slot_deferral};
