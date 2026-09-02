@@ -122,11 +122,33 @@ fn active_of(d: &Daemon) -> Option<String> {
 
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
+/// Seed a plugin registration the heal gate must act on: a `clauth@clauth`
+/// user-scope row whose `installPath` is gone. The registry lives under the
+/// sandboxed claude dir, so this touches nothing outside it.
+#[cfg(unix)]
+fn seed_broken_plugin_registration() {
+    let dir = claude_dir().expect("claude dir").join("plugins");
+    std::fs::create_dir_all(&dir).expect("plugins dir");
+    std::fs::write(dir.join("known_marketplaces.json"), "{}").expect("marketplaces");
+    std::fs::write(
+        dir.join("installed_plugins.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
+        }))
+        .expect("seed json"),
+    )
+    .expect("installed");
+}
+
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes
-/// nothing else — the pure no-op characterization of one loop iteration.
+/// nothing else — the pure no-op characterization of one loop iteration. Stays
+/// cross-platform: the armed throttle is what keeps the tick's heal inert here,
+/// since the gate's pointer read cannot be sandboxed on Windows.
 #[test]
 fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
     let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha")],
         Some("alpha"),
@@ -146,6 +168,37 @@ fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
         active_of(&daemon).as_deref(),
         Some("alpha"),
         "no queued switch → active profile is unchanged by a tick"
+    );
+}
+
+/// The tick is a heal call site: one tick over a broken registration reaches
+/// `claude` through the detached heal. Deleting the call from `tick` reds here,
+/// which a healthy-registration variant could never do — that one is green
+/// whether or not the tick calls anything. Unix-only: the fake `claude` is a
+/// shell shim.
+#[cfg(unix)]
+#[test]
+fn tick_heals_a_broken_plugin_registration() {
+    use crate::testutil::{FakeClaude, join_background_tasks};
+
+    let home = HomeSandbox::new();
+    let fake = FakeClaude::new(&home);
+    crate::plugin_host::reset_heal_throttle_for_test();
+    seed_broken_plugin_registration();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+    join_background_tasks();
+
+    assert!(
+        !fake.log().is_empty(),
+        "one tick over a broken registration must reach the heal"
     );
 }
 

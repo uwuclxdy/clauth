@@ -5105,6 +5105,17 @@ fn hold_bare_session_marker() -> Option<std::fs::File> {
 pub(crate) fn serve() -> Result<()> {
     crate::runtime::gc_stale_runtimes();
     jobs::gc(now_ms());
+    // Converge a broken plugin registration without ever blocking the stdio
+    // handshake: the gate is two registry reads inline, and a needed heal runs
+    // on its own thread (throttled inside `heal_detached`), never on stdout.
+    //
+    // Not under the Plugin tab's boot probe, which spawns a real `clauth mcp`
+    // and kills it within seconds: a heal started there is a mutating lifecycle
+    // call the tab never confirmed, torn off mid-sequence, with the `claude`
+    // grandchild left to finish its registry write unsignalled.
+    if std::env::var_os(MCP_PROBE_ENV).is_none() {
+        crate::plugin_host::heal_detached();
+    }
     // Held across `block_on`, so the flock drops with the process however it dies
     // — a bare `claude` runs no clauth teardown, SIGKILL least of all.
     let _bare_marker = hold_bare_session_marker();

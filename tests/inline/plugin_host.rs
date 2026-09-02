@@ -314,12 +314,14 @@ fn preflight_gate_ignores_project_scope_entries() {
     );
 }
 
-/// An unreadable or absent registry is "cannot tell", which heals: the heal is
-/// idempotent, and a first-run machine (no registry files yet) is exactly the
-/// migration case the gate exists to catch.
+/// ABSENT registry files are the never-installed box, not "cannot tell": a
+/// config dir that has never held a plugin has no `plugins/` directory at all,
+/// so a gate keyed only on "parses, names nothing" would heal for exactly the
+/// population the carve-out exists for. agentgear converges nothing there (no
+/// marker, no entry), so the spawn buys a session-boot cost and no repair.
 #[cfg(unix)]
 #[test]
-fn preflight_gate_heals_when_the_registry_files_are_missing() {
+fn preflight_gate_stays_shut_when_the_registry_files_are_absent() {
     use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
 
     let home = HomeSandbox::new();
@@ -328,7 +330,217 @@ fn preflight_gate_heals_when_the_registry_files_are_missing() {
     let _config = ConfigDirSandbox::new(&home, &claude);
     let _fake = FakeClaude::new(&home);
     assert!(
-        super::preflight_gate(),
-        "an unreadable registry must heal, conservatively"
+        !super::preflight_gate(),
+        "no plugins dir at all is a never-installed box, not a broken one"
     );
+}
+
+/// UNREADABLE is the other verdict and keeps healing: a truncated or
+/// permission-denied registry says only that this pass cannot tell, and the heal
+/// is idempotent. The pair is what makes the absent case above safe to carve out.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_heals_when_a_registry_file_is_unparseable() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let home = HomeSandbox::new();
+    let claude = home.home().join(".claude-config");
+    std::fs::create_dir_all(&claude).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &claude);
+    let _fake = FakeClaude::new(&home);
+    let dir = claude.join("plugins");
+    std::fs::create_dir_all(&dir).expect("plugins dir");
+    std::fs::write(dir.join("known_marketplaces.json"), "{\"clauth\":").expect("truncated");
+    std::fs::write(dir.join("installed_plugins.json"), "{}").expect("installed");
+    assert!(
+        super::preflight_gate(),
+        "a registry file this pass cannot parse must heal, conservatively"
+    );
+}
+
+// ── the detached heal ──────────────────────────────────────────────────────
+
+/// The migration's own first-run gate: a box that never installed the plugin
+/// (both registry files parse, neither names `clauth`) must read "nothing to
+/// heal", not "heal". A false positive here makes every `clauth mcp` boot and
+/// daemon tick spawn `claude plugin list --json` for nothing.
+#[cfg(unix)]
+#[test]
+fn preflight_gate_stays_shut_when_nothing_of_ours_is_registered() {
+    let verdict = gate_verdict(|_claude, _expected| {
+        (
+            serde_json::json!({"other": {"source": {"source": "github", "repo": "x/y"}}}),
+            serde_json::json!({"version": 2, "plugins": {"other@other": [{"scope": "user"}]}}),
+        )
+    });
+    assert!(
+        !verdict,
+        "no clauth marketplace + no clauth@clauth row must not heal"
+    );
+}
+
+/// The detached heal's "only when the gate says heal" half: a healthy
+/// registration makes `heal_detached()` a no-op that spawns no `claude`. This is
+/// the shape `clauth mcp` and the daemon hit on a working box.
+#[cfg(unix)]
+#[test]
+fn heal_detached_skips_when_the_gate_says_healthy() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox, join_background_tasks};
+
+    // Without this the throttle any earlier test in the process stamped refuses
+    // the heal on its own, and the assertion below goes green over a gate that
+    // spawns on every call. Tests share one process under `cargo test`.
+    super::reset_heal_throttle_for_test();
+    let home = HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    let fake = FakeClaude::new(&home);
+
+    let expected = super::expected_pointer().expect("pointer");
+    let (marketplaces, plugins) = healthy_registry(&config, &expected);
+    let dir = config.join("plugins");
+    std::fs::create_dir_all(&dir).expect("plugins dir");
+    for (name, value) in [
+        ("known_marketplaces.json", &marketplaces),
+        ("installed_plugins.json", &plugins),
+    ] {
+        std::fs::write(
+            dir.join(name),
+            serde_json::to_vec_pretty(value).expect("seed json"),
+        )
+        .expect("seed registry");
+    }
+
+    super::heal_detached();
+    join_background_tasks();
+    assert!(
+        fake.log().is_empty(),
+        "a healthy registration must spawn no claude, got:\n{}",
+        fake.log()
+    );
+}
+
+/// The throttle the detached heal holds so no call site can forget it: one heal
+/// may run, and a fresh attempt is refused within the 30-minute floor whether the
+/// attempt succeeded or failed. The spawn decision is synchronous (the atomics
+/// are set on the calling thread before any worker spawns), so pinning the
+/// timestamps is deterministic. The shim log is the second half: it reds if the
+/// worker stops reaching the heal at all, which a timestamp assertion alone
+/// cannot see.
+#[cfg(unix)]
+#[test]
+fn heal_detached_throttles_to_one_heal_per_window() {
+    use std::sync::atomic::Ordering;
+
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox, join_background_tasks};
+
+    super::reset_heal_throttle_for_test();
+    let home = HomeSandbox::new();
+    let config = home.home().join(".claude-config");
+    std::fs::create_dir_all(&config).expect("config dir");
+    let _config = ConfigDirSandbox::new(&home, &config);
+    // The worker shells out for real, so the fake `claude` must be on `PATH`
+    // before the spawn — without it the heal reaches the operator's own binary.
+    let fake = FakeClaude::new(&home);
+
+    // Broken: a user-scope row whose installPath is gone, so the gate says heal.
+    let dir = config.join("plugins");
+    std::fs::create_dir_all(&dir).expect("plugins dir");
+    std::fs::write(dir.join("known_marketplaces.json"), "{}").expect("marketplaces");
+    std::fs::write(
+        dir.join("installed_plugins.json"),
+        serde_json::to_vec(
+            &serde_json::json!({
+                "version": 2,
+                "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
+            }),
+        )
+        .expect("seed json"),
+    )
+    .expect("installed");
+
+    // First attempt: the spawn path is entered, so the floor timestamp advances.
+    super::heal_detached();
+    assert!(
+        super::LAST_HEAL_START_MS.load(Ordering::Relaxed) > 0,
+        "the first heal must enter the spawn path"
+    );
+    join_background_tasks();
+    let first_start = super::LAST_HEAL_START_MS.load(Ordering::Relaxed);
+    let after_first = fake.log();
+    assert!(
+        !after_first.is_empty(),
+        "the worker must actually reach the heal and spawn `claude`"
+    );
+    // Advance past the millisecond resolution of `now_ms` so a broken floor
+    // (which would re-stamp the timestamp) can't hide behind a same-ms collision.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+
+    // A fresh attempt within the window is refused before spawning: the floor
+    // timestamp does not advance.
+    super::heal_detached();
+    assert_eq!(
+        super::LAST_HEAL_START_MS.load(Ordering::Relaxed),
+        first_start,
+        "the 30-minute floor must refuse a fresh attempt"
+    );
+    join_background_tasks();
+    assert_eq!(
+        fake.log(),
+        after_first,
+        "a refused attempt must spawn nothing, got:\n{}",
+        fake.log()
+    );
+
+    // An in-flight heal also refuses. The floor is CLEARED first, so the flag is
+    // the only guard left standing: with the floor still armed, disabling the
+    // swap changes nothing and this block pins nothing.
+    super::LAST_HEAL_START_MS.store(0, Ordering::Relaxed);
+    super::HEAL_IN_FLIGHT.store(true, Ordering::Release);
+    super::heal_detached();
+    assert_eq!(
+        super::LAST_HEAL_START_MS.load(Ordering::Relaxed),
+        0,
+        "an in-flight heal must refuse before it stamps the floor"
+    );
+    join_background_tasks();
+    assert_eq!(
+        fake.log(),
+        after_first,
+        "an in-flight heal must spawn nothing, got:\n{}",
+        fake.log()
+    );
+    super::HEAL_IN_FLIGHT.store(false, Ordering::Release);
+}
+
+/// The committed root marketplace manifest must stay agentgear-conformant, or a
+/// directory-source install silently drifts. The marketplace name is the install
+/// key, the single entry's `source` names the embedded tree, and — agentgear
+/// versioning rule 1 — a marketplace entry must NOT carry its own `version`
+/// (that would mask drift in `plugins/.claude-plugin/plugin.json`, the one
+/// version that must equal the crate).
+#[test]
+fn committed_root_marketplace_matches_agentgear_rules() {
+    let marketplace: serde_json::Value =
+        serde_json::from_str(include_str!("../../.claude-plugin/marketplace.json"))
+            .expect("marketplace.json parses");
+    assert_eq!(marketplace["name"].as_str(), Some("clauth"));
+    let plugins = marketplace["plugins"]
+        .as_array()
+        .expect("plugins is an array");
+    assert_eq!(plugins.len(), 1, "exactly one marketplace entry");
+    let entry = &plugins[0];
+    assert_eq!(entry["name"].as_str(), Some("clauth"));
+    assert_eq!(entry["source"].as_str(), Some("./plugins"));
+    assert!(
+        entry.get("version").is_none(),
+        "a marketplace-entry version would mask drift (agentgear versioning rule 1)"
+    );
+
+    let plugin: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/.claude-plugin/plugin.json"))
+            .expect("plugin.json parses");
+    assert_eq!(plugin["name"].as_str(), Some("clauth"));
+    assert_eq!(plugin["version"].as_str(), Some(env!("CARGO_PKG_VERSION")));
 }
