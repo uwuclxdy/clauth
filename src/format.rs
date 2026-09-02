@@ -398,8 +398,10 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 /// consults the per-credential `AuthExpired` verdict and renders
 /// [`third_party_keyless`] instead when the record matches the profile's
 /// current credential, except on Alibaba, whose verdict records a dead console
-/// session, not a key. The `[env]`-token half and the Alibaba console half
-/// stay unguarded: open copy questions the owner has not ruled yet.
+/// session, not a key. The `[env]`-token half is guarded too (owner ruling
+/// 2026-09-02): a profile with no usable api key — field or env-carried —
+/// renders [`third_party_keyless`] instead. The Alibaba console half stays
+/// unguarded: an open copy question the owner has not ruled yet.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
 /// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
