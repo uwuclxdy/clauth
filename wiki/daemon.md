@@ -127,6 +127,8 @@ key**: names, tiers, percentages, timestamps only.
 
 ### Field notes
 
+> Fork-only additive fields — `harness`, `account_email`, `session_feed` (post-#59: `rolling_token`), `codex_snapshot_at`, `codex_rate_limit_reached`, `codex_reset_credits`, top-level `active_codex_profile` / `codex_fallback_chain` / `forecast` / `burn_aware` — and the full socket verb list are specified in [docs/ccsbar/DESIGN.md](../docs/ccsbar/DESIGN.md), the contract both GUI clients (ccsbar, Pulse) read. The table below is the upstream core.
+
 | Field | Semantics |
 |---|---|
 | `schema` | Integer, currently `1`. Bumped ONLY on a breaking change; additive fields do not bump it (evolution rule below). |

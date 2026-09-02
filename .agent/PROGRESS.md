@@ -2828,11 +2828,19 @@ one; it just lives in the other roster.
 
 2815 passed / 0 failed, 15/15 targeted mutations killed.
 
-**NEXT: cut the PR series to uwuclxdy/clauth.** The six-part delivery is
-implemented; what remains is presenting it, plus the two design items parked
-upstream (#51 issuecomment-5471926707): the managed-config layer that outranks
-`-c`, and the write-only `sessions/` sync-back whose fix contradicts the
-runtime table.
+**PR OPEN 2026-08-31: https://github.com/uwuclxdy/clauth/pull/69** (28 commits on
+mommy eb6cbb8, MERGEABLE; #51 stays the design thread). Awaiting the
+maintainer on the two parked design items (#51 issuecomment-5471926707): the
+managed-config layer that outranks `-c`, and the write-only `sessions/`
+sync-back whose fix contradicts the runtime table.
+
+**WHAM-1 2026-09-02 (fork main f6744ba, deployed):** the live `wham/usage`
+verdict became an object (`{"type":"rate_limit_reached",…}`), sent only once
+an account is blocked — fork main's string-only parser failed every poll of a
+limited account. Fixed (untagged string|object), `rate_limit_reset_credits.
+available_count` carried through as status.json `codex_reset_credits`. The PR
+branch already parses the object shape; it does not publish the count (spec
+never named it) — fork-sync keeps main's publish.
 
 **SUPERSEDED — the P5/P6 checklist above shipped. Original scope note:** (wham/usage → named 5h/7d slots, chain member,
 disarm check_scoped for codex, fold fix 1, wire kick_codex to the 401 arm — the
