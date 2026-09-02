@@ -4882,22 +4882,21 @@ fn mark_auth_broken_does_not_resurrect_a_deleted_profiles_row() {
 /// Fixture for the dead-chain splitter tests: a recognised third-party
 /// profile (provider derived from the base_url) whose own-endpoint arm the
 /// splitter reaches, persisted so a verdict can be seeded against it
-/// (`write_auth_expired` lands only for configured profiles).
+/// (`write_auth_expired` lands only for configured profiles). `env` seeds an
+/// env auth entry (`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`).
 fn dead_chain_copy_fixture(
     name: &str,
     base_url: &str,
     key: Option<&str>,
-    env_token: bool,
+    env: Option<(&str, &str)>,
 ) -> Profile {
     let mut profile = Profile::new(
         name.to_string(),
         Some(base_url.to_string()),
         key.map(str::to_string),
     );
-    if env_token {
-        profile
-            .env
-            .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "env-tok".to_string());
+    if let Some((k, v)) = env {
+        profile.env.insert(k.to_string(), v.to_string());
     }
     crate::profile::save_profile(&profile).expect("save fixture profile");
     let mut config = AppConfig {
@@ -4922,7 +4921,7 @@ fn dead_chain_copy_renders_keyless_when_the_verdict_matches_the_current_key() {
         name,
         "https://api.deepseek.com/anthropic",
         Some("sk-fixture"),
-        false,
+        None,
     );
     let fp = crate::usage::profile_credential_fingerprint(&profile)
         .expect("the fixture must carry a third-party credential");
@@ -4946,7 +4945,7 @@ fn dead_chain_copy_without_a_verdict_keeps_the_dead_chain_sentence() {
         name,
         "https://api.deepseek.com/anthropic",
         Some("sk-fixture"),
-        false,
+        None,
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
@@ -4965,7 +4964,7 @@ fn dead_chain_copy_ignores_a_verdict_for_another_credential() {
         name,
         "https://api.deepseek.com/anthropic",
         Some("sk-current"),
-        false,
+        None,
     );
     let old = Profile::new(
         "tp-stale-verdict-old".to_string(),
@@ -4989,19 +4988,56 @@ fn dead_chain_copy_ignores_a_verdict_for_another_credential() {
     );
 }
 
-/// An `[env]`-token profile with no api key has no third-party credential to
-/// fingerprint, so no verdict can match it and the sentence is unchanged.
-/// That the unchanged sentence overclaims for this profile ("its api key
-/// still works") is the open copy question the owner has not ruled; this pin
-/// only bounds the verdict fix's blast radius.
+/// An `[env]`-token profile with no api key has no key the split sentence
+/// could claim still works, and no third-party credential to fingerprint, so
+/// no verdict consult can reach the shape: the own-endpoint arm renders the
+/// keyless sentence for it outright, without one (owner ruling 2026-09-02 —
+/// the sentence is literally true for this profile).
 #[test]
-fn dead_chain_copy_env_token_without_a_key_keeps_the_dead_chain_sentence() {
+fn dead_chain_copy_env_token_without_a_key_renders_the_keyless_sentence() {
     let _home = HomeSandbox::new();
     let name = "tp-env-token";
-    let profile = dead_chain_copy_fixture(name, "https://api.deepseek.com/anthropic", None, true);
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        None,
+        Some(("ANTHROPIC_AUTH_TOKEN", "env-tok")),
+    );
+    assert!(
+        !crate::claude::has_usable_api_key(&profile),
+        "the fixture must hold no usable api key for the keyless leg to reach"
+    );
     assert!(
         crate::usage::profile_credential_fingerprint(&profile).is_none(),
         "an env-token-only profile must have no third-party credential to fingerprint"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_keyless(&profile.name))
+    );
+}
+
+/// An env-carried `ANTHROPIC_API_KEY` is a key, so the keyless sentence is
+/// not literally true for that shape: it keeps the pre-fix dead-chain
+/// sentence, byte-identical (owner ruling 2026-09-02: env-key keeps
+/// dead-chain).
+#[test]
+fn dead_chain_copy_env_carried_api_key_keeps_the_dead_chain_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-env-key";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        None,
+        Some(("ANTHROPIC_API_KEY", "env-key")),
+    );
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "the fixture must reach the own-endpoint arm"
+    );
+    assert!(
+        !crate::claude::has_usable_api_key(&profile),
+        "the fixture must hold no field api key for the leg to reach the env discriminator"
     );
     assert_eq!(
         third_party_dead_chain_copy(Some(&profile), &profile.name),
@@ -5023,7 +5059,7 @@ fn dead_chain_copy_alibaba_keeps_the_dead_chain_sentence_on_a_console_verdict() 
         name,
         "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
         Some("sk-fixture"),
-        false,
+        None,
     );
     assert_eq!(
         profile.provider,

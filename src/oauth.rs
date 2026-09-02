@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -902,6 +902,18 @@ enum RotateOutcome {
     Persisted(bool),
 }
 
+/// Whether `env` carries an api key. An env-carried `ANTHROPIC_API_KEY` is a
+/// key (owner ruling 2026-09-02: env-key keeps dead-chain), so the splitter
+/// renders the keyless sentence only where neither the field
+/// ([`crate::claude::has_usable_api_key`]) nor the env holds one — the
+/// `[env]`-token shape. Same key and trim-non-empty test as the env half of
+/// [`crate::claude::has_inference_auth`], which matches both env keys at
+/// once, so no exact helper exists to reuse.
+fn env_has_api_key(env: &BTreeMap<String, String>) -> bool {
+    env.get("ANTHROPIC_API_KEY")
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
 /// How a profile's dead chain reads when the chain is not the whole of what it
 /// has, or `None` when the caller's own `login_expired` rendering applies. The
 /// one place that split is decided — the rotate toast, the quarantine's own
@@ -927,15 +939,28 @@ enum RotateOutcome {
 /// pronounces dead is no credential and the arm renders the keyless sentence.
 /// Alibaba is excluded: its verdict records a dead console session, which says
 /// nothing about the key the keyless sentence names (what a dead-console
-/// Alibaba profile should read is an open copy question). A profile that
-/// fingerprints no credential (an `[env]`-token profile with no api key) skips
-/// the consult: there is no fingerprint for a record to match.
+/// Alibaba profile should read is an open copy question). The consult needs a
+/// credential to fingerprint, so a profile holding none
+/// ([`crate::claude::has_usable_api_key`] false and no env-carried
+/// `ANTHROPIC_API_KEY` — the `[env]`-token shape) skips it and renders the
+/// keyless sentence: for that profile the sentence is literally true, not a
+/// verdict's claim. An env-carried key keeps the split sentence (owner ruling
+/// 2026-09-02).
 pub(crate) fn third_party_dead_chain_copy(
     profile: Option<&crate::profile::Profile>,
     name: &ProfileName,
 ) -> Option<String> {
     let profile = profile?;
     if crate::claude::has_own_inference_endpoint(profile) {
+        // A profile holding no usable api key has no key the split sentence
+        // could claim still works — provided the env carries none either
+        // (owner ruling 2026-09-02: an env-carried key keeps the split
+        // sentence). The keyless sentence is literally true only for the
+        // `[env]`-token shape, so render it there without a verdict (the
+        // consult has no fingerprint to match for that shape anyway).
+        if !crate::claude::has_usable_api_key(profile) && !env_has_api_key(&profile.env) {
+            return Some(crate::format::third_party_keyless(name));
+        }
         // Alibaba's usage fetch authenticates with the console session, never
         // the api key, so its verdict cannot mean what the keyless sentence
         // claims: consulting it would tell a profile with a live key it has

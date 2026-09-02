@@ -1752,7 +1752,10 @@ fn shell_quote(s: &str) -> String {
 /// whitespace/control chars. Hoisted from [`build_claude_settings_json`], which
 /// gates its `apiKeyHelper` wiring on exactly this test — sharing the function
 /// keeps the delegate guard from drifting from the real wiring.
-fn has_usable_api_key(profile: &Profile) -> bool {
+/// [`crate::oauth::third_party_dead_chain_copy`] shares it: the split sentence
+/// claims the key still works, and a profile this returns false for with no
+/// env-carried key has no key it could.
+pub(crate) fn has_usable_api_key(profile: &Profile) -> bool {
     profile
         .api_key
         .as_deref()
