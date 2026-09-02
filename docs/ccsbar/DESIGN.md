@@ -383,7 +383,10 @@ the shape cannot drift between producers.
 → {"cmd":"fallback_move","profile":"work","dir":"up"}  ← {"ok":true}   (dir: up|down)
 → {"cmd":"set_threshold","profile":"work","value":90}  ← {"ok":true}   (0..=100)
 → {"cmd":"set_last_resort","profile":"work","value":true} ← {"ok":true}   (exclusive last-resort mark)
-→ {"cmd":"set_wrap_off","value":true}       ← {"ok":true}
+→ {"cmd":"set_member_weekly","profile":"work","value":90}  ← {"ok":true}   (per-member weekly line 0..=100; value null or absent CLEARS back to the chain-wide line)
+→ {"cmd":"set_check_weekly","profile":"work","value":true} ← {"ok":true}   (member's weekly gate on/off)
+→ {"cmd":"set_check_scoped","profile":"work","value":true} ← {"ok":true}   (member's scoped per-model gate on/off)
+→ {"cmd":"set_wrap_off","value":true}       ← {"ok":true}   (ONE global value — there is no per-harness wrap-off)
 → {"cmd":"set_weekly_threshold","value":95} ← {"ok":true}   (wrap-off walk's weekly cap, 50..=100)
 → {"cmd":"rename","profile":"work","new_name":"work2"} ← {"ok":true} | {"ok":false,"error":"...","error_code":"..."}
 ```
