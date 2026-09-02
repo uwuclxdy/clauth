@@ -1302,6 +1302,18 @@ pub(crate) fn apply_rotated_tokens_locked(
         let Some(profile) = cfg.find_mut(name) else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         };
+        // CLA-ROLL: the flag is adopted from DISK before the whole-profile
+        // save below — the in-memory profile can predate a completed
+        // `static-token --clear` (a separate process this snapshot never
+        // sees), and `save_profile` persists the WHOLE profile, so the stale
+        // flag would resurrect the disarm and the stamp below would re-create
+        // the sidecar the operator was just told is gone. The read is stable
+        // under the state flock and the RotationGuard every caller holds
+        // across this function; an unreadable profile keeps the in-memory
+        // flag, the same fallback as `rolling_install_gate`'s disk re-read.
+        if let Ok(disk) = crate::profile::load_profile(name) {
+            profile.rolling_token = disk.rolling_token;
+        }
         let Some(creds) = profile.credentials_mut(held) else {
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         };

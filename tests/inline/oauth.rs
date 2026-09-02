@@ -3458,6 +3458,56 @@ fn rotation_hook_stamps_enabled_profiles_and_preserves_the_mint() {
     );
 }
 
+/// The rotation hook's stamp decision is the same disk re-read as the install
+/// gate's: the in-memory profile a rotation leg persists from can predate a
+/// completed `static-token --clear` (a separate process the daemon's snapshot
+/// never sees), and stamping from that stale routing re-creates the very
+/// sidecar the operator was just told is gone — with the flag now off so
+/// nothing ever re-stamps it. The hook's whole-profile save must not
+/// resurrect the cleared flag either, or the daemon's next reload re-arms it.
+#[test]
+fn rotation_hook_disk_disarm_stops_the_stamp() {
+    let _home = HomeSandbox::new();
+    let name = "test-hook-cleared";
+    // In-memory: ARMED, with a comfortable chain a roll would happily stamp.
+    let config = rolling_config(name, Some("rt-live"), Some(future_expiry()));
+    // On disk: the clear already landed — flag off, no sidecar.
+    let mut on_disk = config.profiles[0].clone();
+    on_disk.rolling_token = false;
+    crate::profile::save_profile(&on_disk).expect("save profile");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "fixture: the profile is cleared"
+    );
+    let handle = Arc::new(RankedMutex::new(config));
+    // Every production caller holds the RotationGuard across the hook — the
+    // lock the clear serializes on.
+    let _guard =
+        RotationGuard::acquire(&crate::profile::ProfileName::from(name)).expect("rotation guard");
+    apply_rotated_tokens_locked(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared through the rotation hook"
+    );
+    assert!(
+        !crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("disk profile")
+            .rolling_token,
+        "the hook's whole-profile save did not resurrect the cleared flag"
+    );
+}
+
 /// Same rotation on a split profile WITHOUT the rolling token: the sidecar is the
 /// static mint and stays byte-identical (the designed quiet steady state).
 #[test]
