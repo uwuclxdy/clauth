@@ -6,10 +6,11 @@
 //! from `status`. Presentation only: it reads the on-disk usage caches
 //! `build_status` reads and never fetches.
 //!
-//! Two facts do NOT come from the entries, because they carry neither: the
-//! `disabled` flag (read off `config`) and the `canceled` flag (read off the
-//! per-profile usage cache). Both surface in the trailing state marker, so this
-//! table shows two states `status --json` does not expose.
+//! Three facts do NOT come from the entries, because they carry neither: the
+//! `disabled` and `keyless` flags (both read off `config`) and the `canceled`
+//! flag (read off the per-profile usage cache). All three surface in the
+//! trailing state marker, so this table shows three states `status --json`
+//! does not expose.
 
 use anyhow::Result;
 
@@ -36,8 +37,8 @@ pub(crate) fn run(include_disabled: bool) -> Result<()> {
 
 /// One rendered table row. Three sources, because the status entry carries only
 /// the first: a single `build_profile_entries` profile entry, `config` for the
-/// disabled flag, and the profile's own `usage_cache.json` for the canceled one
-/// (via `profile_json::is_canceled_cached`).
+/// disabled and keyless flags, and the profile's own `usage_cache.json` for the
+/// canceled one (via `profile_json::is_canceled_cached`).
 struct Row {
     /// `*` for the active profile, a space otherwise.
     marker: char,
@@ -54,6 +55,9 @@ struct Row {
     /// The third-party base url, or `-` for the default Anthropic endpoint.
     endpoint: String,
     disabled: bool,
+    /// The MCP roster's own `keyless` flag, spelled the same so the two
+    /// surfaces cannot drift.
+    keyless: bool,
     canceled: bool,
     /// Label for a usage credential that is dead and will not self-heal
     /// (`fetch_status: "AuthExpired"`), or `None` when it is fine. This table
@@ -86,6 +90,9 @@ impl Row {
             seven_d: window_pct(&entry.windows, crate::usage::LABEL_7D),
             endpoint: entry.base_url.as_deref().unwrap_or("-").to_string(),
             disabled: config.find(typed_name).is_some_and(|p| p.is_disabled()),
+            keyless: config
+                .find(typed_name)
+                .is_some_and(|p| p.is_third_party() && !crate::claude::has_inference_auth(p)),
             canceled: crate::profile_json::is_canceled_cached(typed_name),
             usage_login: (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
                 let p = config.find(typed_name);
@@ -103,7 +110,8 @@ impl Row {
         }
     }
 
-    /// Trailing state marker: `(disabled)`, `(canceled)`, `(login expired)` /
+    /// Trailing state marker: `(disabled)`, `(keyless)`, `(canceled)`,
+    /// `(login expired)` /
     /// `(login needed)`, or
     /// any combination. All render rather than one winning — an operator usually
     /// disables an account BECAUSE it died, so letting `disabled` mask
@@ -111,11 +119,15 @@ impl Row {
     /// to prevent. This table has no status column, so the suffix is the only
     /// place any of these facts can appear.
     fn state_suffix(&self) -> String {
-        let states: Vec<&str> = [(self.disabled, "disabled"), (self.canceled, "canceled")]
-            .into_iter()
-            .filter_map(|(on, label)| on.then_some(label))
-            .chain(self.usage_login)
-            .collect();
+        let states: Vec<&str> = [
+            (self.disabled, "disabled"),
+            (self.keyless, "keyless"),
+            (self.canceled, "canceled"),
+        ]
+        .into_iter()
+        .filter_map(|(on, label)| on.then_some(label))
+        .chain(self.usage_login)
+        .collect();
         if states.is_empty() {
             return String::new();
         }

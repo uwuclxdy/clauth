@@ -245,6 +245,77 @@ fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party
     );
 }
 
+/// A third-party profile with no inference auth source reads as viable —
+/// indistinguishable from a keyed one — unless the row names the state. The
+/// word is the MCP roster's own `keyless` flag, so the two surfaces cannot
+/// spell one state two ways.
+#[test]
+fn list_table_marks_a_keyless_third_party_profile() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let zai = Profile::new("z.ai".to_string(), Some(url.to_string()), None);
+    assert!(
+        zai.is_third_party(),
+        "fixture must be a third-party account"
+    );
+    assert!(
+        !crate::claude::has_inference_auth(&zai),
+        "fixture must have no inference auth source"
+    );
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H  7D  ENDPOINT",
+            "  z.ai     Z.ai   -   -  https://api.z.ai/api/anthropic (keyless)",
+        ],
+        "a keyless third-party row names the state"
+    );
+}
+
+/// An env token is an inference auth source too: the predicate is the delegate
+/// guard's own (`has_inference_auth`), not `api_key.is_some()`, so an
+/// env-keyed third-party row must read exactly like an api-keyed one.
+#[test]
+fn list_table_leaves_an_env_keyed_third_party_profile_unmarked() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), None);
+    zai.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "sk-env-token".to_string(),
+    );
+    assert!(
+        crate::claude::has_inference_auth(&zai),
+        "fixture must have an inference auth source via env"
+    );
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H  7D  ENDPOINT",
+            "  z.ai     Z.ai   -   -  https://api.z.ai/api/anthropic",
+        ],
+        "an env token keys the row, so it carries no marker"
+    );
+}
+
 #[test]
 fn list_table_reports_no_accounts_when_empty() {
     let _home = HomeSandbox::new();
