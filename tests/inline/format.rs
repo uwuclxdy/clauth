@@ -95,26 +95,32 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
 }
 
 /// The pairing rule is structural, not a convention: a `Cause` whose copy
-/// names the operator's next step refuses `Retry::Wait` at construction. The
-/// appended `retry in a moment` would duplicate the cause's advice
-/// (`RotationLockHeld`) or contradict it (a permissions check or a re-login,
-/// which a moment's wait never fixes). An `ends_with` guard cannot reach
-/// this — the cause text ends in a comma and the suffix begins with a colon
-/// — so the refusal has to sit in the constructor itself.
+/// names the operator's next step refuses every retry that appends advice —
+/// `Wait`, `Connection`, `Restart` — at construction. The appended hint would
+/// duplicate the cause's advice (`RotationLockHeld`) or contradict it (a
+/// permissions check followed by `check your connection and retry`). An
+/// `ends_with` guard cannot reach this — the cause text ends in a comma and
+/// the suffix begins with a colon — so the refusal has to sit in the
+/// constructor itself. `Stated` appends nothing and pairs with every arm.
 #[test]
-fn self_prescribing_arm_refuses_retry_wait_at_construction() {
-    let caught = std::panic::catch_unwind(|| {
-        Transient::new(Cause::RotationLockHeld("work".to_string()), Retry::Wait);
-    });
-    let msg = caught
-        .expect_err("a self-prescribing arm paired with Retry::Wait must refuse at construction");
-    let msg = msg
-        .downcast_ref::<String>()
-        .expect("refusal message as String");
-    assert!(
-        msg.contains("RotationLockHeld") && msg.contains("Wait"),
-        "the refusal must name the arm and the retry, got: {msg}"
-    );
+fn self_prescribing_arm_refuses_every_suffixed_retry_at_construction() {
+    for retry in [Retry::Wait, Retry::Connection, Retry::Restart] {
+        let retry_name = format!("{retry:?}");
+        let caught = std::panic::catch_unwind(|| {
+            Transient::new(Cause::RotationLockHeld("work".to_string()), retry);
+        });
+        let msg = caught.expect_err(
+            "a self-prescribing arm paired with a suffix-bearing retry must refuse at \
+             construction",
+        );
+        let msg = msg
+            .downcast_ref::<String>()
+            .expect("refusal message as String");
+        assert!(
+            msg.contains("RotationLockHeld") && msg.contains(&retry_name),
+            "the refusal must name the arm and the retry, got: {msg}"
+        );
+    }
 
     // `with_status` is the same construction with a status in the middle, and
     // the same pairing rule: the stutter still ships on the status-bearing
@@ -180,12 +186,12 @@ fn only_the_status_bearing_form_names_the_status() {
 /// added, this is where its copy has to be stated rather than passed in — ALL
 /// of it, or a blanked-out arm ships mute.
 ///
-/// The table also pins the pairing rule per arm, against more than one
-/// `Retry`: `Stated` renders the bare copy, and `Wait` is refused when the
-/// arm's copy names its own next step (`names_next_step` — the row states it
-/// independently of the constructor's own classification, so a dropped arm
-/// reds here instead of silently accepting the stutter) and appended when it
-/// does not.
+/// The table also pins the pairing rule per arm, against every `Retry`:
+/// `Stated` renders the bare copy, and each suffix-bearing retry (`Wait`,
+/// `Connection`, `Restart`) is refused when the arm's copy names its own next
+/// step (`names_next_step` — the row states it independently of the
+/// constructor's own classification, so a dropped arm reds here instead of
+/// silently accepting the stutter) and appended when it does not.
 #[test]
 fn every_transient_cause_renders_its_own_copy() {
     struct Row {
@@ -260,20 +266,27 @@ fn every_transient_cause_renders_its_own_copy() {
         },
     ] {
         assert_eq!(Transient::new(cause.clone(), Retry::Stated).text(), bare);
-        if names_next_step {
-            let caught = std::panic::catch_unwind(|| {
-                Transient::new(cause.clone(), Retry::Wait);
-            });
-            assert!(
-                caught.is_err(),
-                "a self-prescribing arm must refuse Retry::Wait: {bare}"
-            );
-        } else {
-            assert_eq!(
-                Transient::new(cause.clone(), Retry::Wait).text(),
-                format!("{bare}: retry in a moment"),
-                "an arm that names no next step takes Wait's advice: {bare}"
-            );
+        for (retry, suffix) in [
+            (Retry::Wait, ": retry in a moment"),
+            (Retry::Connection, ": check your connection and retry"),
+            (Retry::Restart, ": run clauth login again for a fresh code"),
+        ] {
+            let retry_name = format!("{retry:?}");
+            if names_next_step {
+                let caught = std::panic::catch_unwind(|| {
+                    Transient::new(cause.clone(), retry);
+                });
+                assert!(
+                    caught.is_err(),
+                    "a self-prescribing arm must refuse {retry_name}: {bare}"
+                );
+            } else {
+                assert_eq!(
+                    Transient::new(cause.clone(), retry).text(),
+                    format!("{bare}{suffix}"),
+                    "an arm that names no next step takes {retry_name}'s advice: {bare}"
+                );
+            }
         }
     }
 }

@@ -190,13 +190,13 @@ pub(crate) enum Cause {
 impl Cause {
     /// Whether the arm's rendered copy already names the operator's next step,
     /// so an appended retry hint would duplicate it (`RotationLockHeld` ends in
-    /// `retry in a moment`) or contradict it (a permissions check or a re-login,
-    /// which waiting never fixes). [`Transient`]'s constructors enforce the
-    /// pairing against this rather than leaving it to convention.
+    /// `retry in a moment`) or contradict it (a permissions check followed by
+    /// `check your connection and retry`). [`Transient`]'s constructors enforce
+    /// the pairing against this rather than leaving it to convention.
     ///
     /// New arms default to self-prescribing: an arm joins the list below only
-    /// by an explicit edit, so an unclassified arm refuses `Wait` loudly at
-    /// construction instead of shipping the stutter.
+    /// by an explicit edit, so an unclassified arm refuses every suffix-bearing
+    /// retry loudly at construction instead of shipping the stutter.
     fn names_its_own_next_step(&self) -> bool {
         !matches!(
             self,
@@ -274,14 +274,15 @@ pub(crate) struct Transient {
 impl Transient {
     /// # Panics
     ///
-    /// If `cause` names its own next step and `retry` is [`Retry::Wait`]: the
-    /// appended `retry in a moment` would duplicate or contradict the cause's
-    /// own advice. Pair with [`Retry::Stated`] instead. Unreachable from every
-    /// production site today — each passes a literal retry and none pairs a
-    /// self-prescribing arm with `Wait` — so a wrong pairing fails here rather
-    /// than shipping a stutter.
+    /// If `cause` names its own next step and `retry` appends advice
+    /// ([`Retry::Wait`], [`Retry::Connection`], [`Retry::Restart`]): the
+    /// appended hint would duplicate or contradict the cause's own advice.
+    /// Pair with [`Retry::Stated`] instead. Unreachable from every production
+    /// site today — each passes a literal retry and none pairs a
+    /// self-prescribing arm with a suffix-bearing retry — so a wrong pairing
+    /// fails here rather than shipping a stutter.
     pub(crate) fn new(cause: Cause, retry: Retry) -> Self {
-        Self::refuse_contradicting_wait(&cause, &retry);
+        Self::refuse_contradicting_suffix(&cause, &retry);
         Self {
             cause,
             status: None,
@@ -292,7 +293,7 @@ impl Transient {
     /// [`Self::new`] with an HTTP status. The same pairing rule applies: the
     /// status sits between the two clauses but does not un-stutter them.
     pub(crate) fn with_status(cause: Cause, status: u16, retry: Retry) -> Self {
-        Self::refuse_contradicting_wait(&cause, &retry);
+        Self::refuse_contradicting_suffix(&cause, &retry);
         Self {
             cause,
             status: Some(status),
@@ -300,9 +301,9 @@ impl Transient {
         }
     }
 
-    fn refuse_contradicting_wait(cause: &Cause, retry: &Retry) {
+    fn refuse_contradicting_suffix(cause: &Cause, retry: &Retry) {
         assert!(
-            !cause.names_its_own_next_step() || !matches!(retry, Retry::Wait),
+            !cause.names_its_own_next_step() || matches!(retry, Retry::Stated),
             "cause {cause:?} names its own next step; retry {retry:?} would duplicate or \
              contradict it"
         );
