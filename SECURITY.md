@@ -116,7 +116,7 @@ Every command below goes through an argument vector, never a shell, so there is 
 |---------|------|
 | `claude` (from `PATH`) | `clauth start`, `clauth resume`, and the MCP `delegate` tool, with `CLAUDE_CONFIG_DIR` pointed at that session's runtime and your extra args forwarded |
 | `clauth mcp`, `claude --version` | Plugin-tab checks: a JSON-RPC handshake against clauth's own server, and Claude Code's version |
-| `claude plugin …` (`marketplace add`, `install`, `list --json`) | registering the bundled plugin and repairing a broken registration: the Plugin tab's install, the `clauth self-heal` hook, and a `clauth start` pre-flight that runs only when a registry read says the registration is broken |
+| `claude plugin …` (`marketplace add`, `install`, `list --json`) | registering the bundled plugin and repairing a broken registration: the Plugin tab's install, the `clauth self-heal` hook, and the gated heal `clauth start`, `clauth mcp` and the daemon tick share, which runs only when a registry read says the registration is broken |
 | `herdr` (from `HERDR_BIN_PATH`, else `PATH`) | `clauth herdr install` / `uninstall`, which drive herdr's own plugin installer and let herdr validate the config before it is written; plus `pane report-metadata` during a `delegate` run, with the herdr pane knobs on |
 | `/usr/bin/security` | macOS only: writing and clearing the Keychain item above |
 | `xdg-open` (Linux), `open` (macOS), `rundll32` (Windows) | opening a URL: the browser login page, or a status incident from the Status tab. The URL is passed as one argument |
