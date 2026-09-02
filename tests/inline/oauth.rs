@@ -3056,11 +3056,12 @@ fn oauth_error_types_have_no_printable_escape_hatch() {
 // ── every Retry selection, pinned at the CALL SITE that chooses it ───────────
 //
 // `format.rs` pins the Retry→copy MAPPING. That is not the same thing and does
-// not defend it: flipping `Retry::Stated` to `Retry::Connection` at a call site
-// leaves the mapping correct and restores the exact defect the enum exists to
-// remove — two contradictory reasons to retry in one sentence. Four of the six
-// selections survived the whole suite until these landed, so each one below
-// reaches its real call site and asserts the sentence an operator reads.
+// not defend it: flipping `Retry::Stated` to a suffix-bearing retry at a call
+// site leaves the mapping correct and now fails loudly at construction (the
+// guard) instead of rendering two contradictory reasons to retry in one
+// sentence. Four of the six selections survived the whole suite until these
+// landed, so each one below reaches its real call site and asserts the
+// sentence an operator reads.
 
 /// The guard-refusal copy must describe the condition that actually produces
 /// it, and name one next step rather than two.
