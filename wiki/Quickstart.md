@@ -59,7 +59,7 @@ clauth list           # account table with cached usage, no network
 
 | Command | Flags | Does |
 |---------|-------|------|
-| `clauth` | | open the TUI |
+| `clauth` | | open the TUI (with stdout not a terminal: command help on stderr, exit 2) |
 | `clauth <profile>` | | switch to that profile and exit |
 | `clauth start <profile> [claude args…]` | `--isolated`, `--with-fallback` | run `claude` under that profile's own config dir |
 | `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |

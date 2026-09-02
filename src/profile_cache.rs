@@ -53,6 +53,8 @@ pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 /// and `clauth status --json` — which otherwise derive freshness from the usage
 /// cache's mtime alone and so report a warm cache behind a dead session as
 /// `Fresh`: a live measurement, over a credential that will never come back.
+/// The refusal splitter `oauth::third_party_dead_chain_copy` is a third reader:
+/// a matched verdict demotes the dead-chain sentence to the keyless one.
 ///
 /// This is NOT a freshness claim and cannot go stale in the dangerous
 /// direction: it is a terminal verdict BOUND to one credential, so a re-login
