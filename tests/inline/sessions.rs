@@ -871,6 +871,124 @@ fn contested_shared_session_reads_back_unknown() {
     );
 }
 
+/// Stage the exact per-conversation record the hook writes:
+/// `~/.clauth/conversations/<id>.json`, carrying the account the hook resolved.
+/// `resolved: null` is the shape of a record that never attributed an account.
+fn stage_record(sb: &HomeSandbox, id: &str, resolved: Option<&str>) {
+    let dir = sb.home().join(".clauth/conversations");
+    fs::create_dir_all(&dir).unwrap();
+    crate::profile::atomic_write_600(
+        &dir.join(format!("{id}.json")),
+        serde_json::to_vec(&json!({ "resolved": resolved })).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn exact_observation_survives_both_runs_and_shows_in_listing() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let s = projects.join("-w-exact/exactE.jsonl");
+    write_jsonl(&s, &[user_line("exactE", "/w/exact", "one profile's work")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&s, t0);
+    stage_record(&sb, "exactE", Some("exact"));
+
+    // Both concurrent runs' exits sweep the same shared-store transcript: its
+    // mtime is inside each run's window, so each sweep would claim it.
+    stamp_run_sessions("A", &projects, false, t0);
+    stamp_run_sessions("B", &projects, false, t0);
+
+    // The exact per-conversation observation is the attribution, whatever the
+    // sweeps saw — and the listing shows it.
+    let mut groups = groups_of(&["exactE"]);
+    annotate_owners(&mut groups);
+    assert_eq!(
+        find(&groups, "exactE").unwrap().last_ran_profile.as_deref(),
+        Some("exact")
+    );
+    assert_eq!(owner_of("exactE").as_deref(), Some("exact"));
+    // The sweep skipped the id: no Known, no Contested stamp for it at all.
+    let store = load_store(&store_path().unwrap());
+    assert_eq!(store.sessions.get("exactE"), None);
+}
+
+#[test]
+fn exact_observation_outranks_a_stale_store_entry() {
+    let sb = HomeSandbox::new();
+    // A store entry a pre-fix sweep stamped, naming a different profile than
+    // the exact observation does today.
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("exactE".into(), SessionOwner::Known("old".into()));
+    save_store(&path, &store).unwrap();
+    stage_record(&sb, "exactE", Some("exact"));
+
+    let mut groups = groups_of(&["exactE"]);
+    annotate_owners(&mut groups);
+    assert_eq!(
+        find(&groups, "exactE").unwrap().last_ran_profile.as_deref(),
+        Some("exact"),
+        "the exact observation is authoritative over a stale stored stamp"
+    );
+}
+
+#[test]
+fn sweep_still_stamps_ids_the_exact_writer_never_saw() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let main = projects.join("-w-nr/never.jsonl");
+    let agent = projects.join("-w-nr/agent-1a2b3c4d.jsonl");
+    write_jsonl(&main, &[user_line("never", "/w/nr", "unrecorded")]);
+    write_jsonl(&agent, &[user_line("agent-1a2b3c4d", "/w/nr", "sub work")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&main, t0);
+    set_mtime(&agent, t0);
+
+    // No record for either id — the exact writer never saw them, so the sweep
+    // stays their only observer, including the contested fold.
+    stamp_run_sessions("A", &projects, false, t0);
+    stamp_run_sessions("B", &projects, false, t0);
+
+    let mut groups = groups_of(&["never", "agent-1a2b3c4d"]);
+    annotate_owners(&mut groups);
+    assert_eq!(find(&groups, "never").unwrap().last_ran_profile, None);
+    assert_eq!(
+        find(&groups, "agent-1a2b3c4d").unwrap().last_ran_profile,
+        None
+    );
+    let store = load_store(&store_path().unwrap());
+    assert_eq!(store.sessions.get("never"), Some(&SessionOwner::Contested));
+    assert_eq!(
+        store.sessions.get("agent-1a2b3c4d"),
+        Some(&SessionOwner::Contested)
+    );
+}
+
+#[test]
+fn record_without_attribution_does_not_skip_the_sweep() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let s = projects.join("-w-bl/blankB.jsonl");
+    write_jsonl(&s, &[user_line("blankB", "/w/bl", "attribution failed")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&s, t0);
+    // The record exists but never attributed an account (an unattributable
+    // reading): the exact writer does not own the id, so the sweep stamps it.
+    stage_record(&sb, "blankB", None);
+
+    stamp_run_sessions("B", &projects, false, t0);
+
+    let store = load_store(&store_path().unwrap());
+    assert_eq!(
+        store.sessions.get("blankB"),
+        Some(&SessionOwner::Known("B".into()))
+    );
+    assert_eq!(owner_of("blankB").as_deref(), Some("B"));
+}
+
 #[test]
 fn annotate_owners_sets_only_known_entries() {
     let _sb = HomeSandbox::new();

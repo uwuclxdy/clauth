@@ -824,6 +824,13 @@ fn touched_since(path: &Path, since: SystemTime) -> bool {
 /// resumed-during-this-run sessions without claiming another profile's untouched
 /// ones).
 ///
+/// Ids the exact per-conversation writer attributed are skipped outright
+/// (owner ruling 2026-09-02): the hook record IS their attribution, and a
+/// sweep fold could only contest it or stamp a rival account beside it. The
+/// mtime sweep stays for ids the exact writer never saw — subagent
+/// transcripts, hook-less conversations, and ids it saw but never
+/// attributed. Read [`owner_of`] for the skip's other half.
+///
 /// The read-modify-write runs under the state flock so two concurrent
 /// `clauth start` runs fold their stamps in serially instead of clobbering each
 /// other. Best-effort throughout: the session already ran, so any IO error is
@@ -834,7 +841,10 @@ pub(crate) fn stamp_run_sessions(
     isolated: bool,
     run_start: SystemTime,
 ) {
-    let ids = run_session_ids(projects_dir, isolated, run_start);
+    let ids: Vec<String> = run_session_ids(projects_dir, isolated, run_start)
+        .into_iter()
+        .filter(|id| crate::hook_note::resolved_account(id).is_none())
+        .collect();
     if ids.is_empty() {
         return;
     }
@@ -866,13 +876,15 @@ fn owner_in(store: &SessionProfiles, session_id: &str) -> Option<String> {
 /// The profile one session last ran under — the single-id counterpart to
 /// [`annotate_owners`], for a caller holding an id rather than an index.
 pub(crate) fn owner_of(session_id: &str) -> Option<String> {
-    owner_in(&load_store(&store_path()?), session_id)
+    crate::hook_note::resolved_account(session_id)
+        .or_else(|| owner_in(&load_store(&store_path()?), session_id))
 }
 
-/// Annotate each session's `last_ran_profile` from the global owner store.
-/// Loads the store once, so a caller can attach owners without paying the
-/// per-session full-transcript parse [`annotate`] costs. Leaves `None` for a
-/// session that is absent or `Contested` (both mean "unknown").
+/// Annotate each session's `last_ran_profile`. The exact per-conversation
+/// observation wins where it exists; the global owner store answers for ids it
+/// never saw. Loads the store once, so a caller can attach owners without
+/// paying the per-session full-transcript parse [`annotate`] costs. Leaves
+/// `None` for a session that is absent or `Contested` (both mean "unknown").
 pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
     let Some(path) = store_path() else {
         return;
@@ -880,7 +892,8 @@ pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
     let store = load_store(&path);
     for group in groups.iter_mut() {
         for session in group.sessions.iter_mut() {
-            session.last_ran_profile = owner_in(&store, &session.id);
+            session.last_ran_profile = crate::hook_note::resolved_account(&session.id)
+                .or_else(|| owner_in(&store, &session.id));
         }
     }
 }

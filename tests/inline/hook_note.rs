@@ -528,6 +528,55 @@ fn a_note_that_cannot_be_recorded_is_not_emitted() {
     );
 }
 
+/// The read the session→profile attribution takes as the exact per-conversation
+/// observation: the last account the hook actually attributed, and nothing else.
+#[test]
+fn resolved_account_reads_the_main_scope_record() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        resolved_account("never-filed"),
+        None,
+        "no record, no account"
+    );
+
+    let path = record_path("conv-res", None).expect("record path");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    store_record(
+        &path,
+        &NoteRecord {
+            resolved: Some("cld".to_string()),
+            ..NoteRecord::default()
+        },
+    )
+    .expect("write record");
+    assert_eq!(
+        resolved_account("conv-res").as_deref(),
+        Some("cld"),
+        "the attributed account comes back",
+    );
+
+    let blank = record_path("conv-blank", None).expect("record path");
+    store_record(
+        &blank,
+        &NoteRecord {
+            told: Some("kerry".to_string()),
+            ..NoteRecord::default()
+        },
+    )
+    .expect("write record");
+    assert_eq!(
+        resolved_account("conv-blank"),
+        None,
+        "a record that never attributed an account answers None, not its told baseline",
+    );
+
+    assert_eq!(
+        resolved_account("../evil"),
+        None,
+        "a non-bare id never reaches a filename",
+    );
+}
+
 // ── the account-changed note's headroom figure (r9) ─────────────────────────
 
 /// A blank profile whose disk usage cache holds a live 5h window at `pct` —

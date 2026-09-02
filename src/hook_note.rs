@@ -559,6 +559,20 @@ pub(crate) fn told_account(session_id: &str) -> Option<String> {
     load_record(&path)?.told
 }
 
+/// The account the hook last resolved for a conversation's main scope — the
+/// exact per-conversation observation the session→profile attribution consults
+/// in place of the mtime sweep. `resolved` is the last account actually
+/// attributed, where `told` is the note-suppression baseline. Same shape as
+/// [`told_account`]: a bare id only, `None` when no record exists or the
+/// record never attributed an account, which the sweep then covers.
+pub(crate) fn resolved_account(session_id: &str) -> Option<String> {
+    if !is_bare_id(session_id) {
+        return None;
+    }
+    let path = record_path(session_id, None).ok()?;
+    load_record(&path)?.resolved
+}
+
 /// Decide what this fire says and store what it learned.
 ///
 /// `resolve` is taken by reference so a test can count how often the gate lets it
