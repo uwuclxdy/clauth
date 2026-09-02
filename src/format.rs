@@ -63,6 +63,7 @@ impl Message {
 /// Travels INSIDE [`Transient`] rather than arriving as a parameter: three
 /// surfaces render [`refresh_transient`], and a `kind` argument would re-scatter
 /// this choice across exactly the call sites this module exists to unify.
+#[derive(Debug)]
 pub(crate) enum Retry {
     /// A transport failure — the connection is the thing worth checking.
     Connection,
@@ -98,6 +99,7 @@ pub(crate) enum Retry {
 /// a profile name, so a body passed there would read as an account name and
 /// nothing else. Sealing all four means a newtype only the callers can mint;
 /// worth doing if a fifth arm ever needs a runtime value that is not a name.
+#[derive(Clone, Debug)]
 pub(crate) enum Cause {
     /// Already-canned copy from `oauth::TokenFailure`.
     Endpoint(&'static str),
@@ -186,6 +188,22 @@ pub(crate) enum Cause {
 }
 
 impl Cause {
+    /// Whether the arm's rendered copy already names the operator's next step,
+    /// so an appended retry hint would duplicate it (`RotationLockHeld` ends in
+    /// `retry in a moment`) or contradict it (a permissions check or a re-login,
+    /// which waiting never fixes). [`Transient`]'s constructors enforce the
+    /// pairing against this rather than leaving it to convention.
+    ///
+    /// New arms default to self-prescribing: an arm joins the list below only
+    /// by an explicit edit, so an unclassified arm refuses `Wait` loudly at
+    /// construction instead of shipping the stutter.
+    fn names_its_own_next_step(&self) -> bool {
+        !matches!(
+            self,
+            Self::Endpoint(_) | Self::PersistFailed(_) | Self::StateLockBusy(_)
+        )
+    }
+
     fn text(&self) -> String {
         match self {
             Self::Endpoint(canned) => (*canned).to_string(),
@@ -254,7 +272,16 @@ pub(crate) struct Transient {
 }
 
 impl Transient {
+    /// # Panics
+    ///
+    /// If `cause` names its own next step and `retry` is [`Retry::Wait`]: the
+    /// appended `retry in a moment` would duplicate or contradict the cause's
+    /// own advice. Pair with [`Retry::Stated`] instead. Unreachable from every
+    /// production site today — each passes a literal retry and none pairs a
+    /// self-prescribing arm with `Wait` — so a wrong pairing fails here rather
+    /// than shipping a stutter.
     pub(crate) fn new(cause: Cause, retry: Retry) -> Self {
+        Self::refuse_contradicting_wait(&cause, &retry);
         Self {
             cause,
             status: None,
@@ -262,12 +289,23 @@ impl Transient {
         }
     }
 
+    /// [`Self::new`] with an HTTP status. The same pairing rule applies: the
+    /// status sits between the two clauses but does not un-stutter them.
     pub(crate) fn with_status(cause: Cause, status: u16, retry: Retry) -> Self {
+        Self::refuse_contradicting_wait(&cause, &retry);
         Self {
             cause,
             status: Some(status),
             retry,
         }
+    }
+
+    fn refuse_contradicting_wait(cause: &Cause, retry: &Retry) {
+        assert!(
+            !cause.names_its_own_next_step() || !matches!(retry, Retry::Wait),
+            "cause {cause:?} names its own next step; retry {retry:?} would duplicate or \
+             contradict it"
+        );
     }
 
     fn suffix(&self) -> &'static str {

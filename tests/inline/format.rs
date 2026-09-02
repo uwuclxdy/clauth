@@ -94,6 +94,44 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
     );
 }
 
+/// The pairing rule is structural, not a convention: a `Cause` whose copy
+/// names the operator's next step refuses `Retry::Wait` at construction. The
+/// appended `retry in a moment` would duplicate the cause's advice
+/// (`RotationLockHeld`) or contradict it (a permissions check or a re-login,
+/// which a moment's wait never fixes). An `ends_with` guard cannot reach
+/// this — the cause text ends in a comma and the suffix begins with a colon
+/// — so the refusal has to sit in the constructor itself.
+#[test]
+fn self_prescribing_arm_refuses_retry_wait_at_construction() {
+    let caught = std::panic::catch_unwind(|| {
+        Transient::new(Cause::RotationLockHeld("work".to_string()), Retry::Wait);
+    });
+    let msg = caught
+        .expect_err("a self-prescribing arm paired with Retry::Wait must refuse at construction");
+    let msg = msg
+        .downcast_ref::<String>()
+        .expect("refusal message as String");
+    assert!(
+        msg.contains("RotationLockHeld") && msg.contains("Wait"),
+        "the refusal must name the arm and the retry, got: {msg}"
+    );
+
+    // `with_status` is the same construction with a status in the middle, and
+    // the same pairing rule: the stutter still ships on the status-bearing
+    // form.
+    let caught = std::panic::catch_unwind(|| {
+        Transient::with_status(
+            Cause::SidecarMisfilled("work".to_string()),
+            400,
+            Retry::Wait,
+        );
+    });
+    assert!(
+        caught.is_err(),
+        "the status-bearing constructor must refuse the pairing too"
+    );
+}
+
 /// The CLI/daemon surfaces name the HTTP status; the toast and MCP forms do not.
 /// Asserted together so neither half can drift alone — a status that silently
 /// stops reaching stderr looks exactly like one that was never added.
@@ -141,59 +179,102 @@ fn only_the_status_bearing_form_names_the_status() {
 /// `cause: String` that would have accepted a response body: if an arm is ever
 /// added, this is where its copy has to be stated rather than passed in — ALL
 /// of it, or a blanked-out arm ships mute.
+///
+/// The table also pins the pairing rule per arm, against more than one
+/// `Retry`: `Stated` renders the bare copy, and `Wait` is refused when the
+/// arm's copy names its own next step (`names_next_step` — the row states it
+/// independently of the constructor's own classification, so a dropped arm
+/// reds here instead of silently accepting the stutter) and appended when it
+/// does not.
 #[test]
 fn every_transient_cause_renders_its_own_copy() {
-    for (cause, want) in [
-        (
-            Cause::Endpoint("anthropic is throttling requests"),
-            "anthropic is throttling requests",
-        ),
-        (
-            Cause::RotationLockUnavailable("work".to_string()),
-            "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
-        ),
-        (
-            Cause::InternalLock,
-            "clauth hit an internal lock error, restart clauth",
-        ),
-        (
-            Cause::PersistFailed("work".to_string()),
-            "refreshed 'work' but failed to persist the rotated tokens",
-        ),
-        (
-            Cause::SidecarWriteFailed("work".to_string()),
-            "could not write 'work' session token · check permissions on ~/.clauth",
-        ),
-        (
-            Cause::LiveSessionOnRotatingChain("work".to_string()),
-            "'work' has a live clauth start session holding its rotating chain (it started \
-             before the rolling token was armed); restart that session or retry once it ends",
-        ),
-        (
-            Cause::RotationLockHeld("work".to_string()),
-            "'work' has a token rotation in progress, retry in a moment",
-        ),
-        (
-            Cause::RollingGrantUnrecorded("work".to_string()),
-            "'work' usage chain has no recorded grant beyond the setup-token scopes, so a \
-             rolling bearer cannot be told from a mint · run `clauth login work` to record \
-             the chain's real grant",
-        ),
-        (
-            Cause::SidecarMisfilled("work".to_string()),
-            "'work' session token holds a rotating pair and no live mint backup exists to \
-             heal it · re-capture with `clauth login work --setup-token`",
-        ),
-        (
-            Cause::StateLockBusy("work".to_string()),
-            "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
-        ),
-        (
-            Cause::StateLockUnavailable("work".to_string()),
-            "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
-        ),
+    struct Row {
+        cause: Cause,
+        bare: &'static str,
+        names_next_step: bool,
+    }
+    for Row {
+        cause,
+        bare,
+        names_next_step,
+    } in [
+        Row {
+            cause: Cause::Endpoint("anthropic is throttling requests"),
+            bare: "anthropic is throttling requests",
+            names_next_step: false,
+        },
+        Row {
+            cause: Cause::RotationLockUnavailable("work".to_string()),
+            bare: "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::InternalLock,
+            bare: "clauth hit an internal lock error, restart clauth",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::PersistFailed("work".to_string()),
+            bare: "refreshed 'work' but failed to persist the rotated tokens",
+            names_next_step: false,
+        },
+        Row {
+            cause: Cause::SidecarWriteFailed("work".to_string()),
+            bare: "could not write 'work' session token · check permissions on ~/.clauth",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::LiveSessionOnRotatingChain("work".to_string()),
+            bare: "'work' has a live clauth start session holding its rotating chain (it \
+                    started before the rolling token was armed); restart that session or \
+                    retry once it ends",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::RotationLockHeld("work".to_string()),
+            bare: "'work' has a token rotation in progress, retry in a moment",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::RollingGrantUnrecorded("work".to_string()),
+            bare: "'work' usage chain has no recorded grant beyond the setup-token scopes, \
+                    so a rolling bearer cannot be told from a mint · run `clauth login work` \
+                    to record the chain's real grant",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::SidecarMisfilled("work".to_string()),
+            bare: "'work' session token holds a rotating pair and no live mint backup exists \
+                    to heal it · re-capture with `clauth login work --setup-token`",
+            names_next_step: true,
+        },
+        Row {
+            cause: Cause::StateLockBusy("work".to_string()),
+            bare: "another clauth process holds ~/.clauth's state lock · 'work' left unchanged",
+            names_next_step: false,
+        },
+        Row {
+            cause: Cause::StateLockUnavailable("work".to_string()),
+            bare: "could not lock 'work' for a token refresh; check permissions on ~/.clauth",
+            names_next_step: true,
+        },
     ] {
-        assert_eq!(Transient::new(cause, Retry::Stated).text(), want);
+        assert_eq!(Transient::new(cause.clone(), Retry::Stated).text(), bare);
+        if names_next_step {
+            let caught = std::panic::catch_unwind(|| {
+                Transient::new(cause.clone(), Retry::Wait);
+            });
+            assert!(
+                caught.is_err(),
+                "a self-prescribing arm must refuse Retry::Wait: {bare}"
+            );
+        } else {
+            assert_eq!(
+                Transient::new(cause.clone(), Retry::Wait).text(),
+                format!("{bare}: retry in a moment"),
+                "an arm that names no next step takes Wait's advice: {bare}"
+            );
+        }
     }
 }
 
