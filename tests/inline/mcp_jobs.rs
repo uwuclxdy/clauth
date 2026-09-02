@@ -27,6 +27,7 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
     }
@@ -51,6 +52,47 @@ fn pinned_format_spec(job_id: &str, profile: &str, started_at: u64) -> RunningSp
     }
 }
 
+/// The isolation flag rides the mint like `endpoint` does: resolved once at
+/// the reserve, carried through every heartbeat, and kept on the finalized
+/// record, so the orphan arm can split shared from isolated off the corpse
+/// itself — a heartbeat must not drop it back to the default.
+#[test]
+fn the_isolation_flag_rides_the_mint_through_heartbeats_and_the_finish() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    let isolated = RunningSpec {
+        isolated: true,
+        ..spec(&id, "work", 1000)
+    };
+    write_running(&isolated).unwrap();
+    assert!(read(&id).unwrap().isolated, "the mint stamps it");
+    write_heartbeat_with_session(&isolated, 41_000, "mid-run", Some("sess-1")).unwrap();
+    assert!(
+        read(&id).unwrap().isolated,
+        "a heartbeat rewrites the record and keeps it"
+    );
+    write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        true,
+        serde_json::json!({"result": "ok"}),
+    )
+    .unwrap();
+    assert!(
+        read(&id).unwrap().isolated,
+        "the finalized record keeps it too"
+    );
+
+    let shared = new_job_id(2000);
+    write_running(&spec(&shared, "work", 2000)).unwrap();
+    assert!(
+        !read(&shared).unwrap().isolated,
+        "the default shape writes shared explicitly"
+    );
+}
+
 #[test]
 fn write_read_roundtrip_running_then_done() {
     let _home = HomeSandbox::new();
@@ -63,7 +105,7 @@ fn write_read_roundtrip_running_then_done() {
     assert!(r.envelope.is_none());
 
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
-    write_done(&id, "work", 1000, None, env.clone()).unwrap();
+    write_done(&id, "work", 1000, None, false, env.clone()).unwrap();
     let r = read(&id).expect("done record");
     assert_eq!(r.state, JobState::Done);
     assert_eq!(r.envelope, Some(env));
@@ -105,6 +147,11 @@ fn a_job_file_from_an_older_server_still_parses() {
     assert_eq!(r.tail, "");
     assert_eq!(r.done_at, 0, "no finish stamp either");
     assert_eq!(r.session_id, None, "and no session id");
+    assert!(
+        !r.isolated,
+        "a record written before the isolation field existed reads as shared, \
+         which is the delegate default"
+    );
 }
 
 /// A heartbeat rewrites the SAME running record: the identity and whichever
@@ -768,6 +815,7 @@ fn job_files_and_dir_are_owner_only() {
         "work",
         1000,
         None,
+        false,
         serde_json::json!({"result": "secret output"}),
     )
     .unwrap();

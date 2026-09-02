@@ -1114,6 +1114,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         idle_secs,
                         streaming,
                         endpoint.clone(),
+                        isolation,
                     )
                     .map_err(|e| ErrorData::internal_error(e, None))?;
                     let job_id = reserved.spec.job_id.clone();
@@ -1177,6 +1178,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                             idle_secs,
                             streaming,
                             delegate_call_endpoint(name, &opts.env),
+                            isolation,
                         ) {
                             Ok(job) => reserved.push(job),
                             Err(reason) => {
@@ -1273,6 +1275,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         idle_secs,
                         streaming,
                         endpoint: delegate_call_endpoint(name, &opts.env),
+                        isolation,
                     });
                     handles.push(spawn_delegate(
                         name.clone(),
@@ -1392,6 +1395,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
             idle_secs,
             streaming,
             endpoint: endpoint.clone(),
+            isolation,
         });
         // Commits to spawn: from here the delegate is in flight. `begin` marks
         // one in flight; the matching `idle` is `herdr_report::InFlightGuard`'s.
@@ -2456,16 +2460,36 @@ async fn monitor_one(
     // runs before this one and which refuses a one-id list that is not a safe
     // path component.
     debug_assert!(jobs::is_safe_job_id(&job_id));
+    let now = now_ms();
+    // READ FIRST: the sweep below destroys the very record this call came for
+    // when that record is a corpse, and the `session_id` it carried is the
+    // handle the caller needs. Captured before the sweep, it is what answers
+    // the `Unknown` arm below instead of the aged branch.
+    let before_sweep = jobs::read(&job_id);
     // A collect is the other moment a corpse matters — see
     // `jobs::gc_running_corpses`.
-    jobs::gc_running_corpses(now_ms());
+    jobs::gc_running_corpses(now);
     let outcome = wait_for_done(&job_id, wait, progress, watch).await;
 
     match outcome {
         WaitOutcome::Unknown => {
+            // A corpse the sweep just reaped answers with the handle it carried;
+            // anything else keeps the hedged branches. The silence check is the
+            // sweep's own predicate, so this arm names exactly what the sweep
+            // removed and nothing a concurrent collect made vanish.
+            let reason = match &before_sweep {
+                Some(record)
+                    if record.state == jobs::JobState::Running
+                        && jobs::running_is_silent(record, now) =>
+                {
+                    orphan_job_reason(&job_id, record)
+                        .unwrap_or_else(|| unknown_job_reason(&job_id, now))
+                }
+                _ => unknown_job_reason(&job_id, now),
+            };
             let payload = serde_json::json!({
                 "is_error": true,
-                "result": unknown_job_reason(&job_id, now_ms()),
+                "result": reason,
             });
             let prose = render::monitor_job_prose(&payload);
             Ok(CallToolResult::error(single_block(prose)))
@@ -2511,18 +2535,40 @@ async fn monitor_batch(
     // caller before this one and before any cancel.
     debug_assert!(job_ids_refusal(&job_ids).is_none());
 
+    let now = now_ms();
+    // READ FIRST, for the same reason the one-id arm does: the sweep below
+    // reaps a corpse before the wait reads it, and the handle it carried is
+    // the whole point of polling the id. An unsafe id can never name a job
+    // file and resolves `Unknown` like the wait resolves it, so it is not
+    // read at all here — the join below must stay off a caller's string.
+    let before_sweep: Vec<Option<jobs::JobRecord>> = job_ids
+        .iter()
+        .map(|id| jobs::is_safe_job_id(id).then(|| jobs::read(id)).flatten())
+        .collect();
     // Same reason as the one-id arm, and the same narrow scope.
-    jobs::gc_running_corpses(now_ms());
+    jobs::gc_running_corpses(now);
     let outcomes = wait_for_batch(&job_ids, wait, return_on, progress, watch).await;
 
     let mut results = Vec::with_capacity(outcomes.len());
     let mut delivered = Vec::new();
     let mut any_error = false;
     let mut unknown_job_id_count = 0u64;
-    for (id, outcome) in outcomes {
+    // The owner-ruled orphan copy, one line per reaped corpse with a handle,
+    // in the order asked. Rendered after the rows because the row for a
+    // missing file is the batch's bare `unknown` verdict — which stays TRUE,
+    // the sweep did remove it — and this line says why it is missing.
+    let mut orphan_reasons: Vec<String> = Vec::new();
+    for ((id, outcome), prior) in outcomes.into_iter().zip(&before_sweep) {
         let entry = match outcome {
             WaitOutcome::Unknown => {
                 unknown_job_id_count += 1;
+                if let Some(record) = prior
+                    && record.state == jobs::JobState::Running
+                    && jobs::running_is_silent(record, now)
+                    && let Some(reason) = orphan_job_reason(&id, record)
+                {
+                    orphan_reasons.push(reason);
+                }
                 serde_json::json!({ "job_id": id, "status": "unknown" })
             }
             WaitOutcome::Running(record) => running_payload(&id, &record, now_ms()),
@@ -2568,7 +2614,11 @@ async fn monitor_batch(
     if let Some(delta) = DigestMode::Report(digest).folded() {
         payload["since_your_last_call"] = delta;
     }
-    let prose = render::monitor_batch_prose(&payload);
+    let mut prose = render::monitor_batch_prose(&payload);
+    for reason in &orphan_reasons {
+        prose.push('\n');
+        prose.push_str(reason);
+    }
     let blocks = single_block(prose);
     for id in delivered {
         jobs::remove(&id);
@@ -2702,6 +2752,38 @@ fn job_id_minted_at(token: &str) -> Option<u64> {
         .then(|| token.split('-').nth(1))
         .flatten()
         .and_then(|ms| u64::from_str_radix(ms, 36).ok())
+}
+
+/// Why a `monitor` call naming a corpse's id is answered after the collect's
+/// sweep reaped the record. The caller polls a run whose server died without
+/// finishing it: the sweep removed the record the moment before the read, so
+/// this answers for that sweep where [`unknown_job_reason`] would have hedged
+/// "already collected … swept a day after it finished" — false for a crash —
+/// and dropped the handle with it.
+///
+/// `None` when the record carries no `session_id` (a file written before the
+/// field existed): the caller then keeps the existing [`unknown_job_reason`]
+/// branch unchanged (owner ruling 2026-09-02), since the orphan copy names a
+/// handle it has nothing to put there.
+///
+/// The copy is owner-ruled (2026-09-02, verbatim), never reworded. The split is
+/// the record's own isolation flag: a shared run's transcript is in the global
+/// store and its handle resolves, an isolated one's left with its throwaway
+/// tree — the crash skipped the rescue — so offering that handle would promise
+/// a resume `delegate` then refuses.
+fn orphan_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> {
+    let session_id = record.session_id.as_deref()?;
+    Some(if record.isolated {
+        format!(
+            "unknown job_id: {job_id}. it died without finishing and its record was removed; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        )
+    } else {
+        format!(
+            "unknown job_id: {job_id}. it died without finishing and its record was removed. \
+             it's still resumable from its session id: {session_id}"
+        )
+    })
 }
 
 /// Why an id names no job file, and what the caller can do about it.
@@ -4294,6 +4376,9 @@ struct MintSpec {
     /// The call's resolved endpoint, so a record minted at the hand-off carries
     /// the same answer the blocking reply folded with.
     endpoint: Option<String>,
+    /// Whether the run launches isolated, so a record minted at the hand-off
+    /// carries the same answer the run itself launched under.
+    isolation: Isolation,
 }
 
 /// Record ONE background job's `running` file and return the reservation. This
@@ -4315,6 +4400,7 @@ fn reserve_background_job(
     idle_secs: Option<u64>,
     streaming: bool,
     endpoint: Option<String>,
+    isolation: Isolation,
 ) -> std::result::Result<ReservedJob, String> {
     reserve_job(
         &MintSpec {
@@ -4324,6 +4410,7 @@ fn reserve_background_job(
             idle_secs,
             streaming,
             endpoint,
+            isolation,
         },
         std::sync::Arc::new(AtomicBool::new(false)),
     )
@@ -4355,6 +4442,7 @@ fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
         // such deadline to count down to rather than an unknown one.
         idle_secs: mint.streaming.then_some(idle.as_secs()),
         endpoint: mint.endpoint.clone(),
+        isolated: mint.isolation == Isolation::Isolated,
         kind,
     }
 }
@@ -4629,6 +4717,7 @@ impl Handoff {
                 &spec.profile,
                 spec.started_at,
                 spec.endpoint.clone(),
+                spec.isolated,
                 envelope.clone(),
             );
             // Deregistered only now, AFTER the result is on disk: a cancel

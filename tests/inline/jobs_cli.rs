@@ -25,6 +25,7 @@ fn spec(job_id: &str, started_at: u64) -> RunningSpec {
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
     }

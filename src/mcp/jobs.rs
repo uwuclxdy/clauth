@@ -171,6 +171,15 @@ pub(crate) struct JobRecord {
     /// endpoint could not be resolved at the call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) endpoint: Option<String>,
+    /// Whether this run launched isolated (`delegate({isolated: true})`): its
+    /// transcript lived in a throwaway tree that dies with the run, so a
+    /// `session_id` on such a record is NOT a handle `delegate({resume})`
+    /// accepts — only `rescue_teardown` lifts an isolated store, and a crash
+    /// skips it. `false` on a record an older server wrote: shared is the
+    /// delegate default either way, and the serde default keeps those records
+    /// parseable without a migration.
+    #[serde(default)]
+    pub(crate) isolated: bool,
     /// The child's own session id, off the first streamed event that carried
     /// one: the resume handle a crashed run's record must outlive its server
     /// for. The stdout reader captures it long before any crash and the
@@ -253,6 +262,10 @@ pub(crate) struct RunningSpec {
     /// hand-off and the final [`write_done`] record the same answer the mint
     /// resolved once.
     pub(crate) endpoint: Option<String>,
+    /// Whether the run launched isolated, carried the same way and for the
+    /// same reason: a heartbeat rewrites the whole record, and a hand-off
+    /// must keep the answer the mint resolved once.
+    pub(crate) isolated: bool,
     /// Which spelling every write of this record lands under. A background job
     /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
     /// caller walks away and [`promote`] renames it.
@@ -382,6 +395,7 @@ pub(crate) fn write_heartbeat_with_session(
             timeout_secs: spec.timeout_secs,
             idle_secs: spec.idle_secs,
             endpoint: spec.endpoint.clone(),
+            isolated: spec.isolated,
             session_id: session_id.map(str::to_string),
             last_output_at,
             recorded_at: spec.recorded_at,
@@ -426,6 +440,7 @@ pub(crate) fn write_done(
     profile: &str,
     started_at: u64,
     endpoint: Option<String>,
+    isolated: bool,
     envelope: serde_json::Value,
 ) -> Result<()> {
     write_atomic(
@@ -436,6 +451,7 @@ pub(crate) fn write_done(
             started_at,
             envelope: Some(envelope),
             endpoint,
+            isolated,
             session_id: None,
             timeout_secs: 0,
             idle_secs: None,
@@ -572,8 +588,10 @@ fn retention_anchor(record: &JobRecord) -> u64 {
 /// Whether a `running` record has been SILENT past [`RUNNING_TTL_MS`] — the one
 /// question [`gc_running_corpses`] reaps on. [`list`] classifies with it too, so
 /// a reader drawing a corpse and the sweep destroying one cannot disagree about
-/// which records are dead.
-fn running_is_silent(record: &JobRecord, now: u64) -> bool {
+/// which records are dead, and the `monitor` arms read the SAME predicate on the
+/// record they captured before the sweep, so the answer they give about it is
+/// the sweep's own verdict rather than a re-derivation that can drift.
+pub(crate) fn running_is_silent(record: &JobRecord, now: u64) -> bool {
     now.saturating_sub(retention_anchor(record)) > RUNNING_TTL_MS
 }
 

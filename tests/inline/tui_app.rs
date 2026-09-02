@@ -135,6 +135,7 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
                 recorded_at: now - 900_000,
                 timeout_secs: 0,
                 endpoint: None,
+                isolated: false,
                 idle_secs: Some(300),
                 kind: jobs::RecordKind::Collectable,
             },

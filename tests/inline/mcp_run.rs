@@ -1280,6 +1280,7 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSp
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        isolated: false,
         idle_secs: Some(300),
         // A background job's record is collectable from its reserve; the
         // liveness spelling belongs to a blocking run alone.
@@ -1691,6 +1692,7 @@ fn an_endpointless_done_record_collects_as_endpoint_unknown() {
         "work",
         1,
         None,
+        false,
         parse_delegate_envelope(
             r#"{"profile":"work","is_error":false,"result":"ok","total_cost_usd":2.06}"#,
         )
@@ -1958,6 +1960,7 @@ fn return_on_all_waits_for_the_slowest_lane_and_any_does_not() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "first"}),
     )
     .unwrap();
@@ -2194,7 +2197,7 @@ fn monitor_refuses_a_cross_mode_return_on() {
 fn monitor_done_returns_envelope_and_evicts() {
     let _home = HomeSandbox::new();
     let env = serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" });
-    jobs::write_done("d-done-0", "work", 1, None, env).unwrap();
+    jobs::write_done("d-done-0", "work", 1, None, false, env).unwrap();
 
     let result = call_monitor("d-done-0", Some(0));
     assert_ne!(result.is_error, Some(true));
@@ -2222,6 +2225,7 @@ fn monitor_done_scalar_envelope_is_wrapped_not_panicked() {
         "work",
         1,
         None,
+        false,
         serde_json::json!("unauthorized"),
     )
     .unwrap();
@@ -2258,7 +2262,7 @@ fn monitor_done_scalar_envelope_is_wrapped_not_panicked() {
 #[test]
 fn monitor_done_keeps_the_job_until_the_result_renders() {
     let _home = HomeSandbox::new();
-    jobs::write_done("d-keep-0", "work", 1, None, serde_json::json!(42)).unwrap();
+    jobs::write_done("d-keep-0", "work", 1, None, false, serde_json::json!(42)).unwrap();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         call_monitor("d-keep-0", Some(0))
@@ -2300,6 +2304,7 @@ fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
         "work",
         1,
         None,
+        false,
         serde_json::json!("unauthorized"),
     )
     .unwrap();
@@ -2334,6 +2339,7 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
     )
     .unwrap();
@@ -2402,6 +2408,7 @@ fn monitor_batch_names_an_unknown_cause_once_at_the_tail() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
     )
     .unwrap();
@@ -2493,6 +2500,7 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "line one\nline two"}),
     )
     .unwrap();
@@ -2599,6 +2607,7 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
         "work",
         minted,
         None,
+        false,
         serde_json::json!({
             "profile": "work",
             "is_error": true,
@@ -2613,6 +2622,7 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
         "work",
         minted,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "someone else's answer"}),
     )
     .unwrap();
@@ -2671,6 +2681,7 @@ fn return_on_any_returns_before_the_slowest_lane() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "first"}),
     )
     .unwrap();
@@ -2712,6 +2723,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": true, "result": "boom"}),
     )
     .unwrap();
@@ -2720,6 +2732,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "fine"}),
     )
     .unwrap();
@@ -2755,6 +2768,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "fine"}),
     )
     .unwrap();
@@ -2777,6 +2791,7 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "decoy"}),
     )
     .unwrap();
@@ -2901,6 +2916,7 @@ fn monitor_single_spelling_keeps_the_pre_merge_done_bytes_and_names_its_unknown_
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
     )
     .unwrap();
@@ -3279,6 +3295,7 @@ fn await_job_outcomes_delivers_each_and_drops_absent() {
         "solo",
         1,
         None,
+        false,
         serde_json::json!({ "profile": "solo", "is_error": false, "result": "a" }),
     )
     .unwrap();
@@ -3287,6 +3304,7 @@ fn await_job_outcomes_delivers_each_and_drops_absent() {
         "vendor",
         1,
         None,
+        false,
         serde_json::json!({ "profile": "vendor", "is_error": false, "result": "b" }),
     )
     .unwrap();
@@ -3340,6 +3358,7 @@ fn the_await_job_hook_delivers_the_collect_replys_cost_qualification() {
         None,
         true,
         Some("api.deepseek.com".to_string()),
+        Isolation::Shared,
     )
     .expect("reserve");
     let job_id = reserved.spec.job_id.clone();
@@ -3351,6 +3370,7 @@ fn the_await_job_hook_delivers_the_collect_replys_cost_qualification() {
         "work",
         reserved.spec.started_at,
         reserved.spec.endpoint.clone(),
+        reserved.spec.isolated,
         envelope,
     )
     .expect("finalize the record");
@@ -3387,7 +3407,7 @@ fn monitor_long_poll_sees_completion() {
         std::thread::sleep(std::time::Duration::from_millis(150));
         let env =
             serde_json::json!({ "profile": "work", "is_error": false, "result": "late finish" });
-        jobs::write_done("d-poll-0", "work", 1, None, env).unwrap();
+        jobs::write_done("d-poll-0", "work", 1, None, false, env).unwrap();
     });
     let result = call_monitor("d-poll-0", Some(5));
     writer.join().unwrap();
@@ -4382,6 +4402,7 @@ fn an_abandoned_blocking_fanout_hands_every_member_off() {
                     endpoint: None,
                     idle_secs: None,
                     streaming: true,
+                    isolation: Isolation::Shared,
                 });
                 handoff.mark_spawned();
                 handoff
@@ -4815,6 +4836,197 @@ fn an_unknown_job_id_names_which_cause_it_was() {
             "every cause keeps the lead the caller greps for: {reason}"
         );
     }
+}
+
+/// Seed a `running` record silent past the corpse window — the file a dead
+/// server leaves behind — with the session id the test names, under an id whose
+/// stamp really decodes that old. The real clock rather than a synthetic one:
+/// the collect path's sweep stamps its own `now`, and a seed relative to that
+/// is the only way to be silent past the window at the instant the call runs.
+fn seed_corpse(job_id: &str, session_id: Option<&str>, isolated: bool) {
+    let started_at = now_ms() - jobs::RUNNING_TTL_MS - 60_000;
+    let spec = jobs::RunningSpec {
+        started_at,
+        isolated,
+        ..running_spec(job_id, "work", started_at)
+    };
+    jobs::write_heartbeat_with_session(&spec, 0, "", session_id).unwrap();
+}
+
+/// A caller polling a crashed run past the 24h+600 s window used to be answered
+/// by the aged branch — "most likely already collected … swept a day after it
+/// finished" — which is false for a crash, and handed back in place of the
+/// `session_id` the sweep had just deleted. The handle read before the sweep
+/// must survive it and ride the reply (owner-ruled copy, never reworded).
+#[test]
+fn a_corpse_polled_past_the_window_is_answered_with_its_session_id_not_the_aged_copy() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms() - jobs::RUNNING_TTL_MS - 60_000;
+    let id = jobs::new_job_id(started_at);
+    seed_corpse(&id, Some("sess-orph-1"), false);
+
+    let result = call_monitor(&id, Some(0));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a corpse's id is still a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: unknown job_id: {id}. it died without finishing and its record was removed. \
+             it's still resumable from its session id: sess-orph-1"
+        ),
+        "the reply is the owner's orphan copy with the surviving handle: {text}"
+    );
+    assert!(
+        jobs::read(&id).is_none(),
+        "the sweep really reaped the record before the wait read it, so the pin \
+         drives the real ordering, not a stubbed one"
+    );
+}
+
+/// The owner ruling's fallback: a corpse whose record carries no session id (a
+/// file written before the field existed) keeps the existing aged branch,
+/// byte-for-byte as shipped — the orphan copy names a handle and must not fire
+/// with nothing to name.
+#[test]
+fn a_handleless_corpse_falls_back_to_the_aged_branch() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms() - jobs::RUNNING_TTL_MS - 60_000;
+    let id = jobs::new_job_id(started_at);
+    seed_corpse(&id, None, false);
+
+    let result = call_monitor(&id, Some(0));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains("stamp reads over a day old")
+            && text.contains("swept a day after it finished")
+            && text.contains("already collected"),
+        "a corpse without a session id keeps the aged branch unchanged: {text}"
+    );
+    assert!(
+        !text.contains("died without finishing"),
+        "and the orphan copy, which names a handle, stays silent: {text}"
+    );
+}
+
+/// The several-ids arm runs the same sweep before the same wait, so a corpse
+/// there lost its handle the same way and its row read a bare `unknown`. The
+/// pre-sweep read covers both arms: the row keeps its `unknown` verdict — the
+/// file really is missing — and the owner's copy rides the tail with the
+/// surviving session id.
+#[test]
+fn a_batch_polling_a_corpse_names_the_crash_and_hands_back_the_session_id() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms() - jobs::RUNNING_TTL_MS - 60_000;
+    let orphan = jobs::new_job_id(started_at);
+    seed_corpse(&orphan, Some("sess-orph-1"), false);
+    let isolated = jobs::new_job_id(started_at);
+    seed_corpse(&isolated, Some("sess-orph-2"), true);
+
+    let result = call_monitor_batch(vec![&orphan, &isolated, "d-away-9"], Some(0));
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "absent ids never make a batch an error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!("job `{orphan}` unknown"),
+        "the corpse's row keeps the batch's bare unknown verdict: {text}"
+    );
+    assert_eq!(
+        lines[1],
+        format!("job `{isolated}` unknown"),
+        "and so does the isolated one's: {text}"
+    );
+    assert_eq!(lines[2], "job `d-away-9` unknown");
+    assert_eq!(
+        lines[3], "3 unknown job id(s): use monitor without `job_ids` to list the existing jobs.",
+        "the tail clause counts every unknown row, the corpses' included: {text}"
+    );
+    assert_eq!(
+        lines[4],
+        format!(
+            "unknown job_id: {orphan}. it died without finishing and its record was removed. \
+             it's still resumable from its session id: sess-orph-1"
+        ),
+        "the owner's copy names the crash and hands back the handle: {text}"
+    );
+    assert_eq!(
+        lines[5],
+        format!(
+            "unknown job_id: {isolated}. it died without finishing and its record was removed; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        ),
+        "the isolated copy ships for an isolated corpse, in the order asked: {text}"
+    );
+    assert_eq!(
+        lines.len(),
+        6,
+        "one orphan line per reaped corpse with a handle, never per unknown row: {text}"
+    );
+    assert!(
+        jobs::read(&orphan).is_none() && jobs::read(&isolated).is_none(),
+        "the sweep really reaped the corpses before the wait read them"
+    );
+}
+
+/// The isolation split: a crashed ISOLATED delegate's transcript lived in a
+/// throwaway tree that left with the run, so offering its `session_id` as a
+/// resume handle would send the caller on a round trip `delegate({resume})`
+/// refuses ("no transcript for it"). The owner's isolated copy says the run
+/// cannot be resumed instead, and never names the handle.
+#[test]
+fn an_isolated_corpse_offers_no_resume_handle() {
+    let _home = HomeSandbox::new();
+    let started_at = now_ms() - jobs::RUNNING_TTL_MS - 60_000;
+    let id = jobs::new_job_id(started_at);
+    seed_corpse(&id, Some("sess-orph-2"), true);
+
+    let result = call_monitor(&id, Some(0));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a corpse's id is still a tool error"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "error: unknown job_id: {id}. it died without finishing and its record was removed; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        ),
+        "the isolated copy ships, and offers no handle it cannot honour: {text}"
+    );
+    assert!(
+        !text.contains("resumable from its session id"),
+        "the resumable promise is the shared arm's alone: {text}"
+    );
 }
 
 /// The shortened id is minted and parsed at opposite ends of one shape; pin that
@@ -5550,6 +5762,7 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": true, "result": "half an answer"}),
     )
     .unwrap();
@@ -5612,6 +5825,7 @@ fn cancelling_a_job_this_server_does_not_hold_names_it_and_hedges_why() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "landed first"}),
     )
     .unwrap();
@@ -5664,7 +5878,7 @@ fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
 
     // The finalize `launch_background_delegate` runs on every outcome.
     let id = "d-780000-0";
-    jobs::write_done(id, "work", 1, None, envelope).unwrap();
+    jobs::write_done(id, "work", 1, None, false, envelope).unwrap();
     let record = jobs::read(id).expect("the job file is finalized");
     assert_eq!(
         record.state,
@@ -5791,6 +6005,7 @@ fn the_cancel_report_claims_the_ask_and_only_the_verdicts_it_observed() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "done long ago"}),
     )
     .unwrap();
@@ -5811,6 +6026,7 @@ fn the_cancel_report_claims_the_ask_and_only_the_verdicts_it_observed() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "done mid-wait"}),
     )
     .unwrap();
@@ -5890,6 +6106,7 @@ fn a_death_observed_mid_wait_reports_its_own_elapsed() {
                 "work",
                 1,
                 None,
+                false,
                 serde_json::json!({"profile": "work", "is_error": false, "result": "mid-wait"}),
             )
             .unwrap();
@@ -5949,6 +6166,7 @@ fn a_batch_cancel_renders_one_verdict_per_asked_job_and_the_hedge_last() {
                 "work",
                 1,
                 None,
+                false,
                 serde_json::json!({"profile": "work", "is_error": false, "result": "half an answer"}),
             )
             .unwrap();
@@ -6055,6 +6273,7 @@ fn a_death_far_older_than_the_call_renders_no_verdict() {
         "work",
         1,
         None,
+        false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "ancient"}),
     )
     .unwrap();
@@ -6079,7 +6298,8 @@ fn a_death_far_older_than_the_call_renders_no_verdict() {
 #[test]
 fn a_reserved_job_is_cancellable_before_its_task_starts() {
     let _home = HomeSandbox::new();
-    let reserved = reserve_background_job("work", None, None, true, None).expect("reserve");
+    let reserved =
+        reserve_background_job("work", None, None, true, None, Isolation::Shared).expect("reserve");
     let job_id = reserved.spec.job_id.clone();
     assert!(
         super::cancel_job(&job_id),
@@ -6101,7 +6321,8 @@ fn a_reserved_job_is_cancellable_before_its_task_starts() {
 #[test]
 fn a_reserved_job_records_a_deadline_pair_a_reader_can_tell_apart() {
     let _home = HomeSandbox::new();
-    let streaming = reserve_background_job("work", Some(1800), None, true, None).expect("reserve");
+    let streaming = reserve_background_job("work", Some(1800), None, true, None, Isolation::Shared)
+        .expect("reserve");
     let record = jobs::read(&streaming.spec.job_id).expect("running record");
     assert_eq!(
         record.timeout_secs, 0,
@@ -6113,7 +6334,8 @@ fn a_reserved_job_records_a_deadline_pair_a_reader_can_tell_apart() {
         "the idle guard is what it does have, so the zero above is not a missing field",
     );
 
-    let pinned = reserve_background_job("work", Some(1800), None, false, None).expect("reserve");
+    let pinned = reserve_background_job("work", Some(1800), None, false, None, Isolation::Shared)
+        .expect("reserve");
     let record = jobs::read(&pinned.spec.job_id).expect("running record");
     assert_eq!(
         record.timeout_secs, 1800,
@@ -6394,6 +6616,7 @@ fn mint_spec(profile: &str) -> super::MintSpec {
         endpoint: None,
         idle_secs: None,
         streaming: true,
+        isolation: Isolation::Shared,
     }
 }
 
@@ -6805,7 +7028,8 @@ fn a_spawn_write_that_lost_the_race_to_the_crossing_is_cleared_too() {
 #[test]
 fn a_reserved_run_is_already_across_the_seam_and_a_hand_off_cannot_move_it() {
     let _home = HomeSandbox::new();
-    let reserved = reserve_background_job("work", None, None, true, None).expect("reserve");
+    let reserved =
+        reserve_background_job("work", None, None, true, None, Isolation::Shared).expect("reserve");
     let job_id = reserved.spec.job_id.clone();
     let handoff = super::Handoff::reserved(reserved);
 

@@ -154,6 +154,7 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64, kind: RecordKind) 
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        isolated: false,
         idle_secs: Some(300),
         kind,
     }
