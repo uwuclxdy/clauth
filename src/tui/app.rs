@@ -7282,8 +7282,10 @@ fn enter_env_add_edit(app: &mut App) {
     }
 }
 
-/// ⏎ in an env value editor: fold the trimmed buffer into the entry (key
-/// unchanged), persist via [`edit_profile_env`], then reseed from the saved value.
+/// ⏎ in an env value editor: fold the trimmed buffer into the entry,
+/// persist via [`edit_profile_env`], then reseed from the saved value.
+/// An emptied value is an unset — the entry is dropped, so neither the
+/// profile's config.toml nor the live settings.json keeps `key = ""`.
 fn commit_env_value(app: &mut App, i: usize) {
     let Some(name) = app
         .config_draft
@@ -7303,7 +7305,13 @@ fn commit_env_value(app: &mut App, i: usize) {
         cfg.find(&name).map(|p| {
             let mut env = p.env.clone();
             if let Some(key) = p.env.keys().nth(i).cloned() {
-                env.insert(key, value.clone());
+                if value.is_empty() {
+                    // Unset, not blank: `edit_profile_env` strips the dropped
+                    // key from the live settings on its own (prev-key removal).
+                    env.remove(&key);
+                } else {
+                    env.insert(key, value.clone());
+                }
             }
             env
         })
@@ -7320,7 +7328,11 @@ fn commit_env_value(app: &mut App, i: usize) {
     };
     match result {
         Ok(()) => {
-            let saved = {
+            let saved = if value.is_empty() {
+                // The entry is gone; `values().nth(i)` would now read the
+                // SIBLING that slid into its slot.
+                String::new()
+            } else {
                 let cfg = app.config();
                 cfg.find(&name)
                     .and_then(|p| p.env.values().nth(i).cloned())

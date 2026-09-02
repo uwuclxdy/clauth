@@ -5006,6 +5006,79 @@ mod env_editor {
             "focus drops into the new entry's value editor"
         );
     }
+
+    /// Emptying a custom env entry's value and committing is an unset, not a
+    /// blank: the key must disappear from the profile's config.toml AND from
+    /// the live settings.json (owner ruling 2026-09-02).
+    #[test]
+    fn committing_an_emptied_env_value_removes_the_key_everywhere() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.env = env;
+        crate::profile::save_profile(&profile).expect("seed the profile on disk");
+
+        // The owner-reported pre-state: the key is ALREADY in the live settings
+        // with its old value, so the settings assert below exercises the
+        // prev-key strip, not an empty fixture (an unseeded assert stays green
+        // under a strip break — mutation M1a, 2026-09-02 review).
+        let claude_dir = crate::profile::claude_dir().expect("claude dir");
+        crate::profile::atomic_write(
+            &claude_dir.join("settings.json"),
+            "{\"env\":{\"FOO\":\"bar\"}}",
+        )
+        .expect("seed the live settings with the pre-existing key");
+
+        // Active marker on: the commit must also re-apply the live settings.
+        let state = AppState {
+            active_profile: Some(name.clone()),
+            ..AppState::default()
+        };
+        let mut app = App::new(AppConfig {
+            state,
+            profiles: vec![profile],
+        });
+        enter_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_value = InputState::new("");
+            d.active = Some(ConfigRow::EnvEntry(0));
+        }
+        super::super::commit_env_value(&mut app, 0);
+
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("FOO").cloned()),
+            None,
+            "the emptied entry is gone from the in-memory profile"
+        );
+
+        let cfg_path =
+            crate::profile::profile_subpath(&name, "config.toml").expect("config.toml path");
+        let cfg_text = std::fs::read_to_string(&cfg_path).expect("read config.toml");
+        assert!(
+            !cfg_text.contains("FOO"),
+            "no key and no empty value survive in config.toml: {cfg_text}"
+        );
+
+        let settings_path = crate::profile::claude_dir()
+            .expect("claude dir")
+            .join("settings.json");
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).expect("read settings.json"),
+        )
+        .expect("settings.json parses");
+        let env_block = settings
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .expect("settings.json has an env object");
+        assert!(
+            !env_block.contains_key("FOO"),
+            "no key and no empty value survive in settings.json: {settings}"
+        );
+    }
 }
 
 /// The action menu's rotate/refresh gate is credential typing, not endpoint
