@@ -12,11 +12,12 @@ Only the latest release. Binary installs stay current through the verified auto-
 
 ## Data at rest
 
-Per-profile state lives under `~/.clauth/`. On Unix the whole tree is owner-only: every clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of date. The one copy that lives elsewhere is the macOS Keychain item below.
+Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-only: every clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of date. The only credential copy outside it is the macOS Keychain item below. clauth's one other tree of its own is `~/.local/share/clauth/`, which holds the bundled plugin and no credentials; what a switch writes into Claude Code's own `~/.claude/` is listed at the end of this section.
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
 | `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/mcp-logins.json` | Claude Code's MCP-server OAuth logins, parked here whenever the profile stores no Claude login of its own and merged back once it regains one. Live bearer credentials, minted against each server and belonging to no Claude account | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/session-token.static.json` | the `claude setup-token` mint a rolling token superseded, kept so `clauth static-token <p>` (or a dead chain) can restore it | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/quarantine/<ts>-<seq>.<basename>` | credential files moved aside before repair, kept as evidence — a mis-filled sidecar (`….session-token.json`, which by definition carries a refresh token: that is what made it a mis-fill) or a backup slot whose content was not a mint (`….session-token.static.json`). Evidence can hold live credentials, which is why the dir is `0700`, why nothing prunes it automatically, and why it lives under the profile so `clauth delete` removes it with everything else that account owns | file `0600`, dir `0700` |
@@ -26,6 +27,7 @@ Per-profile state lives under `~/.clauth/`. On Unix the whole tree is owner-only
 | `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
 | `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
 | usage and price caches, session history, logs, lock files (`~/.clauth/`) | last-known usage, third-party state, burn samples, event log, advisory locks | file `0600`, dir `0700` |
+| `~/.local/share/clauth/` (macOS `~/Library/Application Support/clauth/`, Windows `%APPDATA%\clauth\`) | the bundled Claude Code plugin, laid down where `claude plugin` can register it: `plugin.json`, the `hooks/` dir, a generated `marketplace.json`, and an install marker under `markers/`. Content-keyed under `versions/`, with a `current@claude` pointer at the live one. No credentials | your umask; not re-tightened |
 
 On macOS a second copy of the active login lives outside this tree, in the login Keychain, because that is where Claude Code reads it from:
 
@@ -36,7 +38,7 @@ On macOS a second copy of the active login lives outside this tree, in the login
 clauth writes and clears that item; it never reads it back during normal operation. The command line goes to `security -i` over stdin rather than argv, so the token never appears in the process table. Access is whatever the login Keychain grants, not `0600`.
 
 - Writes are atomic. The temp file gets mode `0600` at creation, not a chmod afterward, so a loose umask never leaves a readable window; it's fsynced, then renamed into place. A rotation caught mid-write lands as `credentials.json.pending` and is promoted only once it's durable.
-- Modes are enforced on Unix two ways. Each writer creates its file owner-only. Every launch re-tightens the whole tree, so a store from an older build (or a loose umask) is repaired the next time clauth runs. The repair never follows a symlink out of the tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the default user-profile ACLs, which clauth does not loosen.
+- Modes are enforced on Unix two ways. Each writer creates its file owner-only. Every launch re-tightens the whole `~/.clauth` tree, so a store from an older build (or a loose umask) is repaired the next time clauth runs. The repair never follows a symlink out of the tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the default user-profile ACLs, which clauth does not loosen.
 - A switch rewrites three files: `~/.claude/.credentials.json`, parts of `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`), and `~/.claude.json`, where the stale account-identity block is dropped so Claude Code re-derives identity from the new token. The rest of `~/.claude/` is left alone. On macOS it writes the Keychain item above as well, because Claude Code reads the Keychain before the file there.
 
 ## Network activity
@@ -56,9 +58,12 @@ Every request clauth makes, and what rides along with it:
 | `raw.githubusercontent.com/uwuclxdy/ai-pricelog/...` | model price table for the Tokens tab cost lens, fetched and disk-cached | no credentials |
 | `api.deepseek.com/user/balance` | only for profiles whose base URL is DeepSeek | that provider's API key |
 | `api.z.ai/api/monitor/usage/...` | only for profiles whose base URL is Z.ai | that provider's API key |
+| `openrouter.ai/api/v1/credits` and `/api/v1/key` | only for profiles whose base URL is OpenRouter | that provider's API key |
+| an Alibaba console gateway (`bailian-cs.console.aliyun.com` or its regional twin for your site) | usage poll for a Model Studio profile, whose API key cannot read its own quota | that profile's stored `[console]` session, never its API key |
+| `bailian.console.aliyun.com` or `modelstudio.console.alibabacloud.com` | `clauth login` on a Model Studio profile, opened in your browser to capture that console session | no credentials; the callback comes back to a loopback listener |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |
 
-Your stored access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
 
 ## What acts on your behalf
 
@@ -81,7 +86,7 @@ User-invoked, only when you run the command:
 Agent-invoked, only when the Claude Code plugin is installed:
 
 - **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account. It fires only when an agent calls the tool, and is hard-capped at recursion depth 1 (a delegated session cannot call `delegate` again).
-- **`switch` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write `clauth switch` performs. It changes which account the global session refreshes onto; it sends no inference itself.
+- **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write `clauth switch` performs. It changes which account the global session refreshes onto; it sends no inference itself.
 
 Nothing else sends inference or writes to your account.
 
@@ -111,6 +116,8 @@ Every command below goes through an argument vector, never a shell, so there is 
 |---------|------|
 | `claude` (from `PATH`) | `clauth start`, `clauth resume`, and the MCP `delegate` tool, with `CLAUDE_CONFIG_DIR` pointed at that session's runtime and your extra args forwarded |
 | `clauth mcp`, `claude --version` | Plugin-tab checks: a JSON-RPC handshake against clauth's own server, and Claude Code's version |
+| `claude plugin …` (`marketplace add`, `install`, `list --json`) | registering the bundled plugin and repairing a broken registration: the Plugin tab's install, the `clauth self-heal` hook, and a `clauth start` pre-flight that runs only when a registry read says the registration is broken |
+| `herdr` (from `HERDR_BIN_PATH`, else `PATH`) | `clauth herdr install` / `uninstall`, which drive herdr's own plugin installer and let herdr validate the config before it is written; plus `pane report-metadata` during a `delegate` run, with the herdr pane knobs on |
 | `/usr/bin/security` | macOS only: writing and clearing the Keychain item above |
 | `xdg-open` (Linux), `open` (macOS), `rundll32` (Windows) | opening a URL: the browser login page, or a status incident from the Status tab. The URL is passed as one argument |
 | `kill` / `taskkill`, plus `ps` on macOS and `tasklist` on Windows | `clauth daemon --replace` only: the pid is checked against a running clauth daemon before it is signalled (Linux reads `/proc/<pid>/cmdline` instead of shelling out) |
@@ -124,9 +131,9 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 ## Build and supply chain
 
 - `unsafe` is denied across the crate (`unsafe_code = "deny"`, `unsafe_op_in_unsafe_fn = "deny"`).
-- CI runs `cargo fmt --check`, `cargo clippy --all-targets --all-features -D warnings`, and the test suite (`--all-features`) on Linux, macOS, Windows for every push and PR.
+- CI runs `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and the test suite (`--all-features`) on Linux, macOS, Windows for every push to `mommy` and every pull request that touches code.
 - `cargo-deny` (advisories denied by default, license allowlist, sources locked to crates.io, `openssl` banned in favor of rustls) and `cargo-audit` both run in CI.
-- `Cargo.lock` is committed and dependency versions are pinned.
+- `Cargo.lock` is committed, so builds resolve the versions it records rather than whatever is newest.
 
 ## Switching behaviors off
 

@@ -7,10 +7,11 @@ This page covers where your logins sit and how they move between accounts. The t
 | Path | Holds |
 |------|-------|
 | `~/.clauth/profiles/<name>/credentials.json` | that account's OAuth token pair, plus the MCP-server logins described below |
+| `~/.clauth/profiles/<name>/mcp-logins.json` | those MCP-server logins alone, parked whenever the account stores no Claude login of its own and merged back once it regains one |
 | `~/.clauth/profiles/<name>/session-token.json` | a long-lived `claude setup-token` login, when captured |
 | `~/.clauth/profiles/<name>/config.toml` | the endpoint API key, for endpoint accounts |
 
-Every file clauth writes is `0600` and every directory `0700` on Unix, created that way rather than chmod'd afterwards, and re-tightened on each launch. Windows falls back to the default user-profile ACLs, which clauth does not loosen. Writes are atomic: temp file, fsync, rename. A rotation caught mid-write lands as `credentials.json.pending` and is promoted only once it is durable.
+Every file clauth writes under `~/.clauth` is `0600` and every directory `0700` on Unix, created that way rather than chmod'd afterwards, and re-tightened on each launch. Windows falls back to the default user-profile ACLs, which clauth does not loosen. Writes are atomic: temp file, fsync, rename. A rotation caught mid-write lands as `credentials.json.pending` and is promoted only once it is durable.
 
 An endpoint account's API key reaches Claude Code through `apiKeyHelper`, so it never lands in `settings.json`.
 

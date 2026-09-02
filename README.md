@@ -120,7 +120,7 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 
 ## Claude Code plugin
 
-clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. The plugin's `SessionStart` hook self-heals a broken registration on every session start.
+clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is no marketplace to add by hand. A registration that later breaks repairs itself on the next session start, and `clauth start` covers the one case that hook cannot: a marketplace too broken to load means the plugin never loads, so its hooks never fire.
 
 | Tool | What it does | Quota |
 |------|--------------|-------|
@@ -183,9 +183,11 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 
 ```bash
 cargo build --release
-cargo clippy --all-targets   # CI gates clippy -D warnings + fmt --check + test on every push
+cargo clippy --all-targets
 cargo test
 ```
+
+CI gates `fmt --check`, `clippy -D warnings`, the test suite, `cargo-deny` and `cargo audit` on every push to `mommy` and every pull request; a doc-only change is skipped.
 
 > [!TIP] `cargo test showcase -- --ignored --nocapture` drives the real interactive TUI on fake data against a throwaway home dir (no network, never compiled into the binary). Handy for screenshots.
 

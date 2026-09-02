@@ -5,7 +5,7 @@ Two files, both TOML, both safe to hand-edit while clauth runs (it reloads on ex
 - `~/.clauth/profiles.toml` for everything program-wide: profile order, the active marker, the fallback chain, appearance, the scheduler.
 - `~/.clauth/profiles/<name>/config.toml` for one account: endpoint, key, env, model routing, its chain settings.
 
-Every key below has a TUI equivalent on the Setup, Fallback, or Config tab ([Interface and keys](Interface-And-Keys#config-tab-rows)).
+Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which.
 
 ## Account types
 
@@ -195,6 +195,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
     work/
       config.toml          # everything in the table above
       credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
+      mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
@@ -208,9 +209,14 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
       runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
+
+~/.local/share/clauth/     # macOS ~/Library/Application Support/, Windows %APPDATA%
+  current@claude           # points at the version dir Claude Code registers
+  versions/<ver>-<hash>@claude/  # the bundled plugin: plugin.json, hooks/, marketplace.json
+  markers/<hash>           # the install record `clauth self-heal` keys on
 ```
 
-Lock files (`.lock`, `clauthd.lock`, `usage-fetch.lock`) sit alongside. Everything clauth owns is `0600`, every directory `0700`, re-tightened on each launch.
+Lock files (`.lock`, `clauthd.lock`, `usage-fetch.lock`) sit alongside. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
 Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `credentials.json` or `session-token.json` signs that profile out.
 

@@ -1,6 +1,6 @@
 # Install
 
-Linux, macOS, and Windows (Git Bash / MSYS2). clauth needs `claude` on `PATH` for `clauth start`, `resume`, and the MCP `delegate` tool. Everything else works without it.
+Linux, macOS, and Windows (Git Bash / MSYS2). clauth needs `claude` on `PATH` for `clauth start`, `resume`, the MCP `delegate` tool, and the Claude Code plugin's install and self-heal, both of which drive the `claude plugin` CLI. Everything else works without it.
 
 ## Cargo
 
@@ -61,4 +61,4 @@ clauth completions bash             # print the script to stdout instead
 
 ## Claude Code plugin
 
-The plugin is a separate install inside Claude Code, covered on [Claude Code plugin](Claude-Code-Plugin).
+The plugin is a separate step, installed from the TUI's Plugin tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants.

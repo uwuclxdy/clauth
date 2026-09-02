@@ -52,6 +52,7 @@ Written each scheduler tick and immediately after a switch lands. Atomic (`tmp` 
     {
       "name": "kitty",
       "active": true,
+      "rolling_token": false,
       "provider": "anthropic",
       "base_url": null,
       "tier": "Max 5x",
@@ -62,6 +63,7 @@ Written each scheduler tick and immediately after a switch lands. Atomic (`tmp` 
       "fetched_at": "2026-07-03T19:04:20+00:00",
       "next_refresh_at": "2026-07-03T19:09:20+00:00",
       "auto_start": true,
+      "auto_start_queue": { "position": 1, "next_open_at": "2026-07-03T21:34:20+00:00" },
       "bell_threshold": 90,
       "fallback": { "position": 1, "threshold": 95.0, "armed": true },
       "windows": [

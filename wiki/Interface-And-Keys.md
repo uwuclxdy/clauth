@@ -7,13 +7,13 @@
 | Tab | Holds | You can |
 |-----|-------|---------|
 | **Overview** | account table, live 5h / 7d bars, chain position | switch accounts, reorder them |
-| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend, endpoint, merged env | refresh one account, toggle estimates and the pace marker |
+| **Usage** | per-account window breakdown: 5h, 7d, per-model weeks, extra-usage spend | refresh one account, toggle estimates and the pace marker |
 | **Tokens** | global Claude Code token stats and API-equivalent cost | drill into models, change the period lens, count cache tokens |
 | **Setup** | per-account endpoint, key, env, model routing, auto-start | edit any of it, log in, log out, disable, delete |
 | **Fallback** | the auto-switch chain | reorder members, edit thresholds, flip gates, set a spend ceiling |
 | **Config** | program-wide settings | change any of the rows in the table below |
 | **Status** | incidents from status.claude.com with per-component health | open an incident's timeline or its page in a browser |
-| **Plugin** | Claude Code wiring health and per-profile runtime state | apply one-key fixes |
+| **Plugin** | Claude Code wiring health, per-profile runtime state, running delegates | apply one-key fixes |
 
 The active account is orange. Usage numbers are cached on disk, so they stay on screen when the API is rate-limited or unreachable.
 
@@ -23,12 +23,12 @@ The active account is orange. Usage numbers are cached on disk, so they stay on 
 
 | Key | Action |
 |-----|--------|
-| <kbd>←</kbd> <kbd>→</kbd> (<kbd>tab</kbd> / <kbd>⇧tab</kbd> at the top level) | previous / next tab |
+| <kbd>←</kbd> <kbd>→</kbd> (or <kbd>tab</kbd> / <kbd>⇧tab</kbd>) | previous / next tab |
 | <kbd>↑</kbd> <kbd>↓</kbd> | move the selection, or scroll a detail pane |
 | <kbd>⏎</kbd> | act on the selected row (see below) |
 | <kbd>n</kbd> | new account |
 | <kbd>d</kbd> | open the divergence resolver, when one is pending |
-| <kbd>x</kbd> | dismiss the newest toast, then the footer alert |
+| <kbd>x</kbd> | dismiss the oldest toast, then the footer alert |
 | <kbd>a</kbd> | action menu for the current row |
 | <kbd>?</kbd> | keybinding help for this tab |
 | <kbd>esc</kbd> | step back out of a sub-pane |
@@ -68,7 +68,7 @@ Entries above the rule act on the account named in the menu's title bar; entries
 
 The active period or model filter is omitted from the Tokens menu, so the entries you see are the ones that would change something. `open provider console` follows the same idea from the other direction: it appears only on an account whose endpoint clauth knows a key page for, so an OAuth account's menu is one entry shorter.
 
-The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is what works on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account yet, so nothing opens.
+The Setup detail pane is itself a list of actions, so <kbd>⏎</kbd> on a row is the action. What the menu adds is what works on the account as a whole, from either the account list or a settings row. On the `+ new` form there is no account to duplicate or save, so the menu is `apply preset` alone, stamping the draft's endpoint and model fields.
 
 | Entry | Does |
 |-------|------|
@@ -85,6 +85,7 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 
 | Row | Sets |
 |-----|------|
+| `token` | read-only state of a stored long-lived setup token, above the editable rows: its remaining life, or `expired` / `mis-filled` with the fix beneath it ([Configuration](Configuration#account-types)) |
 | `name` | the profile name |
 | `auto-start` | whether clauth opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
 | `base url` | the API endpoint; blank means an OAuth account |
@@ -92,11 +93,10 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 | `model` | the account's default model; <kbd>space</kbd> cycles presets, <kbd>⏎</kbd> types a full id |
 | `+ model override` | expands to `opus`, `sonnet`, `haiku`, `fable`, `subagent` id overrides |
 | env entries | extra environment variables merged into `settings.json` while this account is active; <kbd>⏎</kbd> edits a value, and an empty one keeps the key |
-| `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
 | `+ login` / `re-login` | what it runs depends on the account, the same three-way split `clauth login` has: an OAuth account mints a browser login, an api-key account re-enters its base url and key inline, and a Model Studio account opens the Alibaba console to capture the usage session its api key cannot stand in for ([Configuration](Configuration#the-alibaba-console-session)). That last one replaces the session and nothing else, since the endpoint and api key keep their own rows. A browser login onto an account that already has an endpoint and a working key leaves both standing too, and replaces the subscription login alone |
 | `log out` | drops the stored credentials, keeps the profile |
-| `token` | read-only state of a stored long-lived setup token: its remaining life, or `expired` / `mis-filled` with the fix beneath it ([Configuration](Configuration#account-types)) |
 | `clear long-lived token` | drops that token so the account's own OAuth login installs again, or signs Claude Code out when the account has only an api key behind it; the row's hint names which. Appears while ANY long-lived piece exists — the token, the preserved mint backup, or a set `rolling_token` flag — arms on the first press, clears on the second (the full exit: flag, sidecar, and backup together). Faint and inert when clearing would strip the account's last credential; a flag-only account disarms regardless, since no credential is touched |
+| `disable account` / `enable account` | hides the account from auto-switch and polling, keeping its files |
 | `delete account` | removes the profile; arms on the first press, deletes on the second |
 
 ## Config tab rows
@@ -110,10 +110,10 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 | `refresh` | 15 / 30 / 60 / 90 / 120 / 300 s, or a typed value from 10 s to 1 h | `90s` |
 | `refresh spent` | keep polling accounts already at 100% | on |
 | `auto-start queue` | space `auto_start` accounts' 5h window opens `5h / N` apart | off |
-| `rotation` | `preemptive`, `lazy` | `preemptive` |
+| `rotation` | `lazy`, `preemptive` | `preemptive` |
 | `weekly limit` | chain-wide 7d exhaustion line, 50-100% | `98%` |
 | `switch mode` | `static`, `burn-aware` | `static` |
-| `burn floor` | earliest projected-switch point, 90-100% | `98%` |
+| `burn floor` | earliest projected-switch point: 97 / 98 / 99 / 100% | `98%` |
 | `burn horizon` | how far ahead burn-aware projects | `60s` |
 | `quota spent` | `stay on active`, `switch off all` | `stay on active` |
 | `allow extra usage` | `off`, `pay-as-you-go` | `off` |
@@ -123,7 +123,7 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 
 ## Plugin tab
 
-Each row is a check on your Claude Code wiring: `clauth` on `PATH`, the `mcpServers` entry, the plugin install record, `claude --version`, and each profile's runtime state. A `herdr` row joins them when [herdr](Herdr-Plugin) is installed. <kbd>f</kbd> applies a fix on rows that offer one, behind a confirm that defaults to cancel:
+Each row is a check on your Claude Code wiring: `clauth` on `PATH` and `claude --version`, the `mcpServers` entry and whether `clauth mcp` boots, the plugin install record, and each profile's runtime state. A `herdr` row joins them when [herdr](Herdr-Plugin) is installed. <kbd>f</kbd> applies a fix on rows that offer one, behind a confirm that defaults to cancel:
 
 | Fix | When it appears |
 |-----|-----------------|
@@ -134,3 +134,5 @@ Each row is a check on your Claude Code wiring: `clauth` on `PATH`, the `mcpServ
 | `install the clauth plugin` | the plugin row reads not installed, or installed project-local only; confirming runs the real `claude plugin` installer at user scope |
 
 The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel.
+
+The `delegates` pane underneath lists the plugin's running `delegate` jobs. It binds no key: a delegate is stopped through the plugin's `monitor` tool ([Claude Code plugin](Claude-Code-Plugin)).

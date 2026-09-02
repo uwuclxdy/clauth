@@ -109,7 +109,9 @@ clauth list           # account table with cached usage, no network
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completions prompt |
 | `CLAUDE_CONFIG_DIR` | scopes `which` and `start` to that config dir's credentials |
 | `SHELL` | how `completions install` detects your shell when you do not name one |
+| `COLORTERM` | what the TUI auto-detects its color depth from: `truecolor` or `24bit` picks `full`, anything else `compatible`. `--theme` and the `theme` key in `profiles.toml` both beat it |
 | `HERDR_CONFIG_PATH` | which config file `herdr install` writes into, matching how herdr itself reads the override |
+| `HERDR_BIN_PATH` | which `herdr` binary clauth runs, else `herdr` on `PATH`. herdr injects it into every pane process itself |
 
 ### Exit codes
 
