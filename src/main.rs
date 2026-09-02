@@ -102,19 +102,38 @@ impl std::fmt::Display for UsageError {
 
 impl std::error::Error for UsageError {}
 
+/// The bare-invocation help was already printed to stderr (clap's
+/// missing-subcommand convention); [`exit_code`] maps it to the usage code
+/// with no extra `Error:` line, since the help IS the message.
+#[derive(Debug)]
+struct HelpRendered;
+
+impl std::fmt::Display for HelpRendered {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("help printed on stderr (bare clauth with piped stdout)")
+    }
+}
+
+impl std::error::Error for HelpRendered {}
+
 /// Build a [`UsageError`] as an `anyhow::Error` for a dispatch arm to return.
 fn usage_error(msg: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(UsageError(msg.into()))
 }
 
 /// Map a dispatch outcome to a process exit code: 0 on success, 2 for a
-/// [`UsageError`] (bad flag/args), 1 for any other failure. Prints the error
-/// exactly as anyhow's `Result` `Termination` did (`Error: {:?}`), so the
-/// message surface is unchanged now that `main` maps the code itself.
+/// [`UsageError`] (bad flag/args) or an already-printed [`HelpRendered`], 1
+/// for any other failure. Prints the error exactly as anyhow's `Result`
+/// `Termination` did (`Error: {:?}`) — except the [`HelpRendered`] arm, whose
+/// message already reached stderr — so the message surface is unchanged now
+/// that `main` maps the code itself.
 pub(crate) fn exit_code(result: Result<()>) -> i32 {
     match result {
         Ok(()) => 0,
         Err(e) => {
+            if e.downcast_ref::<HelpRendered>().is_some() {
+                return 2;
+            }
             // `errln!`, so a reader that walked away from `2>&1 | head` still
             // gets this code rather than the 101 `eprintln!` panicked with.
             errln!("Error: {e:?}");
@@ -136,7 +155,11 @@ fn dispatch(cli: Cli) -> Result<()> {
     });
 
     let Some(command) = cli.command else {
-        return cmd_tui(theme_override);
+        use std::io::IsTerminal as _;
+        if std::io::stdout().is_terminal() {
+            return cmd_tui(theme_override);
+        }
+        return cmd_bare_help();
     };
 
     match command {
@@ -1641,6 +1664,29 @@ fn api_key_for_profile(name: &str) -> Result<Option<String>> {
         claude::validate_api_key(k)?;
     }
     Ok(key.map(str::to_string))
+}
+
+/// A bare `clauth` reached with stdout not a terminal: the full-screen TUI has
+/// nowhere to draw, so this arm renders the command help the way clap renders
+/// a missing subcommand — help on stderr, usage exit code 2 (owner ruling).
+/// `cmd_tui` stays the whole terminal path.
+fn cmd_bare_help() -> Result<()> {
+    use clap::CommandFactory as _;
+    let mut command = Cli::command();
+    let mut buf = Vec::new();
+    command
+        .write_help(&mut buf)
+        .context("rendering the command help")?;
+    let help = String::from_utf8(buf).context("clap rendered non-UTF-8 help")?;
+    // The stderr half of `out`'s contract: a reader that left drops the line
+    // and the run keeps its own exit code.
+    let _ = crate::out::write_chunk(
+        &mut std::io::stderr().lock(),
+        format_args!("{help}"),
+        false,
+        "stderr",
+    );
+    Err(HelpRendered.into())
 }
 
 fn cmd_tui(theme_override: Option<tui::theme::Tier>) -> Result<()> {

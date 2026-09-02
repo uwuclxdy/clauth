@@ -37,7 +37,10 @@ fn parse_exit_code(args: &[&str]) -> i32 {
 // ── the three shapes that are not plain subcommands ─────────────────────────
 
 /// A bare `clauth` selects no subcommand, which is what routes `dispatch` to
-/// the TUI.
+/// the TUI (on a terminal; a piped stdout prints the help instead — pinned
+/// against the real binary in `tests/bare_non_tty.rs`, since the arm reads
+/// `stdout().is_terminal()` live and an in-process pin would depend on the
+/// runner's own terminal).
 #[test]
 fn bare_invocation_selects_no_subcommand() {
     let cli = parse(&[]).expect("bare clauth must parse");
