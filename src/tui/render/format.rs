@@ -430,8 +430,8 @@ fn month_label(month: u32) -> &'static str {
 
 /// Relative age of an epoch-ms timestamp per the cloudy-tui Time-formatting
 /// contract: single largest unit under 30 days (`4m ago`, `2h ago`, `3d ago`,
-/// `2w ago`); the absolute ISO date (`2026-04-12`) at 30 days and beyond.
-/// `< 1 minute` reads `just now`.
+/// `2w ago`); the local prose stamp (`2026-04-12 14:03:07`) at 30 days and
+/// beyond. `< 1 minute` reads `just now`.
 pub(super) fn relative_age(epoch_ms: u64) -> String {
     let now = crate::usage::now_ms();
     let age_secs = (now.saturating_sub(epoch_ms) / 1000) as i64;
@@ -454,8 +454,10 @@ pub(super) fn relative_age(epoch_ms: u64) -> String {
             format!("{weeks}w ago")
         }
     } else {
-        let iso = crate::usage::epoch_secs_to_iso((epoch_ms / 1000) as i64);
-        iso.split('T').next().unwrap_or(&iso).to_string()
+        // Local wall clock per the 2026-08-22 ruling: the bare UTC date read
+        // as local off UTC. Same formatter as the status tab's incident
+        // stamps; an instant chrono cannot represent renders no-data, never UTC.
+        crate::format::local_stamp((epoch_ms / 1000) as i64).unwrap_or_else(|| NO_DATA.to_string())
     }
 }
 

@@ -439,8 +439,8 @@ fn live_session_lines(
     let Some(at) = sessions.last_swap_at else {
         return lines;
     };
-    // An AGE, so it reads through `relative_age` (single largest unit, ISO date
-    // past 30 days) rather than the two-unit `humanize_duration` the countdowns
+    // An AGE, so it reads through `relative_age` (single largest unit, local
+    // stamp past 30 days) rather than the two-unit `humanize_duration` the countdowns
     // use — a countdown is a duration, this is a point in the past.
     lines.push(Line::from(vec![
         Span::styled(key_cell("last swap", KEY_W, KEY_GUTTER), theme::label()),
