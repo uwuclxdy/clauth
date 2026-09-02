@@ -1106,7 +1106,7 @@ mod bad_profile_name_is_a_usage_error {
 
 #[test]
 fn collect_api_endpoint_trims_flag_values() {
-    let (base, key) = collect_api_endpoint(Some("  https://api.x  "), Some("  sk-y  "))
+    let (base, key) = collect_api_endpoint(Some("  https://api.x  "), Some("  sk-y  "), false)
         .expect("both flags present, no prompt");
     assert_eq!(base.as_deref(), Some("https://api.x"));
     assert_eq!(key.as_deref(), Some("sk-y"));
@@ -1115,11 +1115,11 @@ fn collect_api_endpoint_trims_flag_values() {
 #[test]
 fn collect_api_endpoint_rejects_empty_flag_values() {
     assert!(
-        collect_api_endpoint(Some("   "), Some("sk")).is_err(),
+        collect_api_endpoint(Some("   "), Some("sk"), false).is_err(),
         "a blank --base-url must bail, not create an empty-endpoint profile"
     );
     assert!(
-        collect_api_endpoint(Some("https://x"), Some("")).is_err(),
+        collect_api_endpoint(Some("https://x"), Some(""), false).is_err(),
         "a blank --api-key must bail, not store an empty key"
     );
 }
@@ -1128,12 +1128,194 @@ fn collect_api_endpoint_rejects_empty_flag_values() {
 fn collect_api_endpoint_rejects_control_chars_in_key() {
     // The key is minted verbatim into a request header; a CRLF would inject one.
     assert!(
-        collect_api_endpoint(Some("https://x"), Some("sk-a\r\nX-Evil: 1")).is_err(),
+        collect_api_endpoint(Some("https://x"), Some("sk-a\r\nX-Evil: 1"), false).is_err(),
         "a control-char key must bail at capture, not persist a header-injecting value"
     );
     assert!(
-        collect_api_endpoint(Some("https://x"), Some("sk a b")).is_err(),
+        collect_api_endpoint(Some("https://x"), Some("sk a b"), false).is_err(),
         "interior whitespace in a key is a bad paste"
+    );
+}
+
+// ── api-mode reauth arm: pure routing pins ──────────────────────────────────
+// The arm's two decisions are extracted pure (`resolve_reauth_base_url`,
+// `api_reauth_snapshot`) so the routing is pinned without touching stdin: a
+// test whose outcome depended on the runner's terminal red under a pty
+// (the confirm prompt eats libtest's capture and declines) and hung on a
+// developer terminal.
+
+fn acme_with_chain() -> crate::profile::Profile {
+    let mut acme = crate::profile::Profile::new(
+        "acme".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    acme.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "stored-access".to_string(),
+            refresh_token: Some("stored-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    acme
+}
+
+#[test]
+fn resolve_reauth_base_url_flag_wins_empty_included_and_ignores_the_terminal() {
+    let acme = acme_with_chain();
+    for tty in [false, true] {
+        assert_eq!(
+            resolve_reauth_base_url(Some("https://flag"), Some(&acme), tty).as_deref(),
+            Some("https://flag"),
+            "the flag wins over the stored endpoint, TTY or not"
+        );
+        assert_eq!(
+            resolve_reauth_base_url(Some(""), Some(&acme), tty).as_deref(),
+            Some(""),
+            "an empty flag passes through; collect_api_endpoint's empty-reject turns it into the bail"
+        );
+    }
+}
+
+#[test]
+fn resolve_reauth_base_url_a_tty_prompts() {
+    let acme = acme_with_chain();
+    assert_eq!(
+        resolve_reauth_base_url(None, Some(&acme), true),
+        None,
+        "a TTY keeps the prompt: None lets collect_api_endpoint ask"
+    );
+}
+
+#[test]
+fn resolve_reauth_base_url_headless_reuses_the_stored_endpoint() {
+    let acme = acme_with_chain();
+    assert_eq!(
+        resolve_reauth_base_url(None, Some(&acme), false).as_deref(),
+        Some("https://api.deepseek.com/anthropic"),
+        "a non-TTY re-key without --base-url takes the stored endpoint (owner ruling)"
+    );
+}
+
+#[test]
+fn resolve_reauth_base_url_headless_with_no_stored_endpoint_bails() {
+    let bare = crate::profile::Profile::new("acme".to_string(), None, None);
+    assert_eq!(
+        resolve_reauth_base_url(None, Some(&bare), false),
+        None,
+        "None reaches collect_api_endpoint, whose non-interactive refusal fires"
+    );
+    assert_eq!(
+        resolve_reauth_base_url(None, None, false),
+        None,
+        "a vanished profile reads the same as one with no endpoint stored"
+    );
+}
+
+#[test]
+fn api_reauth_snapshot_carries_the_stored_chain_through() {
+    let acme = acme_with_chain();
+    let snap = api_reauth_snapshot(
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-new".to_string()),
+        Some(&acme),
+    );
+    let carried = snap
+        .credentials
+        .as_ref()
+        .expect("the stored chain rides the snapshot");
+    assert_eq!(carried.access_token(), Some("stored-access"));
+    assert_eq!(carried.refresh_token(), Some("stored-refresh"));
+    assert_eq!(
+        carried.access_token(),
+        acme.access_token(),
+        "the carried chain is the stored profile's own, not a restated constant"
+    );
+    assert_eq!(
+        snap.base_url.as_deref(),
+        Some("https://api.deepseek.com/anthropic")
+    );
+    assert_eq!(snap.api_key.as_deref(), Some("sk-new"));
+    assert_eq!(snap.account_uuid, None);
+}
+
+#[test]
+fn api_reauth_snapshot_without_a_stored_chain_carries_none() {
+    let bare = crate::profile::Profile::new(
+        "acme".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    assert!(
+        api_reauth_snapshot(
+            Some("https://x".to_string()),
+            Some("sk-new".to_string()),
+            Some(&bare)
+        )
+        .credentials
+        .is_none(),
+        "a profile with no chain contributes none"
+    );
+    assert!(
+        api_reauth_snapshot(
+            Some("https://x".to_string()),
+            Some("sk-new".to_string()),
+            None
+        )
+        .credentials
+        .is_none(),
+        "a vanished profile reads the same"
+    );
+}
+
+// The composed helper, driving the real collect_api_endpoint so its
+// validation actually fires. interactive = false throughout: the helper
+// passes its own tty param through to collect_api_endpoint, so these pins
+// exercise the non-interactive arms under ANY runner stdin (pinned under a
+// pseudo-TTY, where the old stdin-keyed arm read the prompt leg instead).
+// The interactive arms (prompt, read stdin) stay pinned at the router level
+// only — driving them here would hang the suite.
+
+#[test]
+fn collect_api_reauth_snapshot_headless_reuses_endpoint_key_and_chain() {
+    let acme = acme_with_chain();
+    let snap = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&acme), false)
+        .expect("a headless re-key with a stored endpoint must not prompt");
+    assert_eq!(
+        snap.base_url.as_deref(),
+        acme.base_url.as_deref(),
+        "the snapshot carries the STORED endpoint"
+    );
+    assert_eq!(snap.api_key.as_deref(), Some("sk-new"), "and the fresh key");
+    let carried = snap
+        .credentials
+        .as_ref()
+        .expect("and the stored chain rides through the composition");
+    assert_eq!(carried.access_token(), acme.access_token());
+}
+
+#[test]
+fn collect_api_reauth_snapshot_headless_with_no_stored_endpoint_refuses() {
+    let bare = crate::profile::Profile::new("acme".to_string(), None, None);
+    let err = collect_api_reauth_snapshot(None, Some("sk-new"), Some(&bare), false)
+        .expect_err("nothing to reuse and no way to prompt must refuse");
+    assert!(
+        err.to_string()
+            .contains("non-interactive stdin: pass --base-url"),
+        "the refusal must name the non-interactive bail: {err}"
+    );
+}
+
+#[test]
+fn collect_api_reauth_snapshot_empty_flag_refuses() {
+    let acme = acme_with_chain();
+    let err = collect_api_reauth_snapshot(Some(""), Some("sk-new"), Some(&acme), false)
+        .expect_err("an empty --base-url must bail, not store an empty endpoint");
+    assert!(
+        err.to_string().contains("base url is required"),
+        "the refusal must name the empty-reject: {err}"
     );
 }
 

@@ -1771,7 +1771,7 @@ fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
 /// The uniform replace survives everywhere the preserve arm does not apply:
 /// a profile with NO stored endpoint has its stray key replaced by a browser
 /// snapshot as before, and an api-mode snapshot — which carries both endpoint
-/// fields — still replaces the whole set on an endpoint profile.
+/// fields — still replaces the endpoint set on an endpoint profile.
 #[test]
 fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
     let _home = HomeSandbox::new();
@@ -1862,7 +1862,64 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
     assert_eq!(
         ds.access_token(),
         None,
-        "an api-mode reauth clears the OAuth pair"
+        "a credentials-less snapshot clears the OAuth pair (only cmd_login's \
+         api-mode reauth carries a stored chain through)"
+    );
+}
+
+/// The chain-preserve must key on api-mode reauth ALONE (owner ruling): a
+/// credentials-less endpoint-pair snapshot committed by any other producer is
+/// the recapture shape, and its drop of the stored OAuth chain is a
+/// deliberate sign-out. `cmd_login`'s api-mode arm carries the stored chain in
+/// the snapshot, so `overwrite_captured_profile` itself must keep replacing
+/// credentials with exactly what it holds.
+#[test]
+fn a_credentials_less_recapture_still_drops_the_stored_chain() {
+    let _home = HomeSandbox::new();
+
+    let mut acme = Profile::new(
+        "acme".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    acme.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&acme).expect("save acme");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["acme".into()],
+            ..AppState::default()
+        },
+        profiles: vec![acme],
+    };
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("acme"),
+        CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://api.z.ai/api/anthropic".to_string()),
+            api_key: Some("zai-key".to_string()),
+            account_uuid: None,
+        },
+    )
+    .expect("recapture");
+
+    let acme = config
+        .find(&crate::profile::ProfileName::from("acme"))
+        .expect("profile");
+    assert_eq!(
+        acme.access_token(),
+        None,
+        "the recapture is a sign-out: only the api-mode reauth arm preserves a chain"
     );
 }
 

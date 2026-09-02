@@ -352,15 +352,16 @@ fn confirm_reauth(target: &str, is_api: bool, keeps_endpoint: bool) -> Result<bo
 
 /// Collect the base_url + api_key pair for API-key mode. Each value comes from
 /// its `--flag` when given; otherwise a prompt: base_url on a normal echo'ing
-/// line, api_key echo-off (it's a secret). A non-TTY stdin that still owes a
-/// value bails — a script must pass both flags explicitly.
+/// line, api_key echo-off (it's a secret). `interactive` is the caller's
+/// decision (its stdin is a terminal), never re-read here: the arms key on the
+/// parameter alone, so the routing is pin-able under any runner. A
+/// non-interactive call that still owes a value bails — a script must pass
+/// both flags explicitly.
 fn collect_api_endpoint(
     base_url: Option<&str>,
     api_key: Option<&str>,
+    interactive: bool,
 ) -> Result<(Option<String>, Option<String>)> {
-    use std::io::IsTerminal as _;
-    let interactive = std::io::stdin().is_terminal();
-
     let base_url = match base_url {
         // A flag value gets the same trim + empty-reject as the prompt, so
         // `--base-url ""` or a space-padded value can't slip through unvalidated.
@@ -416,6 +417,66 @@ fn collect_api_endpoint(
     Ok((base_url, api_key))
 }
 
+/// The base_url for an api-mode reauth, decided before any prompt so the
+/// TTY-vs-headless routing is unit-pinned without touching stdin: the flag
+/// wins as typed (an empty one passes through — `collect_api_endpoint` rejects
+/// it), a TTY with no flag keeps the prompt (`None`), a non-TTY reuses the
+/// stored endpoint (owner ruling), and a non-TTY with nothing stored bails
+/// through `collect_api_endpoint`'s non-interactive refusal.
+fn resolve_reauth_base_url(
+    flag: Option<&str>,
+    stored: Option<&crate::profile::Profile>,
+    tty: bool,
+) -> Option<String> {
+    match (flag, tty) {
+        (Some(flag), _) => Some(flag.to_string()),
+        (None, true) => None,
+        (None, false) => stored.and_then(|p| p.base_url.clone()),
+    }
+}
+
+/// The reauth snapshot for api mode. Carries the STORED OAuth chain when the
+/// profile has one: `overwrite_captured_profile` replaces credentials with
+/// exactly what the snapshot holds, so a credentials-less snapshot here would
+/// silently drop the chain `rolling-token` and usage polling roll from (owner
+/// ruling). Keyed on api-mode reauth alone — every other credentials-less
+/// snapshot keeps replacing (a third-party recapture is a deliberate
+/// sign-out). `account_uuid` stays `None`: an api-key login proves no
+/// Anthropic identity, and seeding `None` leaves the existing anchor alone.
+fn api_reauth_snapshot(
+    base_url: Option<String>,
+    api_key: Option<String>,
+    stored: Option<&crate::profile::Profile>,
+) -> actions::CaptureSnapshot {
+    actions::CaptureSnapshot {
+        credentials: stored.and_then(|p| p.credentials.as_ref().cloned()),
+        base_url,
+        api_key,
+        account_uuid: None,
+    }
+}
+
+/// The is_api reauth arm in one call: resolve the endpoint
+/// ([`resolve_reauth_base_url`]), run the same validate/trim
+/// [`collect_api_endpoint`] every api capture takes (called, never re-spelled),
+/// then build the chain-carrying snapshot ([`api_reauth_snapshot`]). The
+/// composition lives here so the arm itself holds no wiring a bad edit could
+/// silently miscompose. Interactivity is this helper's own `tty` param, passed
+/// through to `collect_api_endpoint`, so the pins drive the `interactive =
+/// false` arms under ANY runner stdin. The `interactive = true` arms (prompt,
+/// read stdin) are pinned at the router level only
+/// ([`resolve_reauth_base_url`]) — driving them here would hang the suite.
+fn collect_api_reauth_snapshot(
+    flag: Option<&str>,
+    key_flag: Option<&str>,
+    stored: Option<&crate::profile::Profile>,
+    tty: bool,
+) -> Result<actions::CaptureSnapshot> {
+    let base_url = resolve_reauth_base_url(flag, stored, tty);
+    let (base_url, api_key) = collect_api_endpoint(base_url.as_deref(), key_flag, tty)?;
+    Ok(api_reauth_snapshot(base_url, api_key, stored))
+}
+
 /// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
 /// tokens, login summary, identity-anchor seed) and wrap it in a capture
 /// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
@@ -460,19 +521,23 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
 /// OAuth flow (`oauth_login`) and writes the minted tokens straight into the
 /// profile's `.credentials.json`, identically on every platform; passing either
 /// endpoint flag switches to API-key mode and captures a base_url + api_key pair
-/// instead, prompting (echo-off for the key) for whatever a flag omitted.
+/// instead, prompting (echo-off for the key) for whatever a flag omitted. On a
+/// reauth, a non-TTY stdin cannot answer the endpoint prompt, so `--api-key`
+/// without `--base-url` reuses the stored endpoint; a TTY keeps the prompt.
 ///
 /// A NEW name captures into a fresh profile; an EXISTING name routes through
 /// [`actions::overwrite_captured_profile`] — the fresh credential set (tokens OR
 /// endpoint + key) replaces the old in place (chain slot, env, and model
 /// settings survive; stale per-account fetch caches are dropped; when it is the
 /// ACTIVE profile the live link is re-run so a running `claude` picks the new
-/// login up). A reauth that crosses types (OAuth ↔ API) is allowed: the
-/// snapshot overwrites all three of credentials/base_url/api_key — except that
-/// a browser reauth onto a profile with a stored endpoint and working
-/// inference auth preserves the endpoint + key the snapshot omits, whether or
-/// not clauth recognises the provider (see
-/// [`actions::overwrite_captured_profile`]). Neither
+/// login up). A reauth that crosses types (OAuth ↔ API) is allowed, with two
+/// preserves: a browser reauth onto a profile with a stored endpoint and
+/// working inference auth keeps the endpoint + key the snapshot omits, whether
+/// or not clauth recognises the provider (see
+/// [`actions::overwrite_captured_profile`]), and an api-mode reauth keeps the
+/// stored OAuth chain (the credential usage polling and `rolling-token` roll
+/// from) by carrying it in the snapshot, which
+/// [`actions::overwrite_captured_profile`] then writes back unchanged. Neither
 /// path switches to the profile (`clauth <name>` does that). `--model` is
 /// persisted onto the profile after capture.
 /// Tokens are never printed — only a sha256 prefix.
@@ -536,15 +601,13 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 
     if reauth {
         let snapshot = if is_api {
-            let (base_url, api_key) =
-                collect_api_endpoint(args.base_url.as_deref(), args.api_key.as_deref())?;
-            actions::CaptureSnapshot {
-                credentials: None,
-                base_url,
-                api_key,
-                // An api-key login authenticates no Anthropic account.
-                account_uuid: None,
-            }
+            use std::io::IsTerminal as _;
+            collect_api_reauth_snapshot(
+                args.base_url.as_deref(),
+                args.api_key.as_deref(),
+                config.find(&target),
+                std::io::stdin().is_terminal(),
+            )?
         } else {
             run_oauth_browser(true, &target)?
         };
@@ -565,8 +628,16 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         // "active" before it's wired. The user switches explicitly (the print
         // below), which writes settings.json. `create_blank_profile` also
         // takes the model inline, so no separate model write is needed here.
-        let (base_url, api_key) =
-            collect_api_endpoint(args.base_url.as_deref(), args.api_key.as_deref())?;
+        // `interactive` is this site's ruling: a TTY prompts, headless bails.
+        // Unpin-able in-suite — driving this arm with `interactive = true`
+        // reads stdin, which hangs the runner — so the arg's value is carried
+        // by review, not a test.
+        use std::io::IsTerminal as _;
+        let (base_url, api_key) = collect_api_endpoint(
+            args.base_url.as_deref(),
+            args.api_key.as_deref(),
+            std::io::stdin().is_terminal(),
+        )?;
         actions::create_blank_profile(
             &mut config,
             target.to_string(),
