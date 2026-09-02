@@ -324,7 +324,8 @@ fn tier_label_is_none_for_a_converted_profile() {
 /// `base_url`, no key, no credentials): its endpoint is generic, so the label
 /// follows the endpoint. A pair+endpoint-no-key hybrid never reaches this
 /// arm — `effective_base_url` drops a managed `base_url` behind a stored pair
-/// with no usable key at load, so it reads as an OAuth account.
+/// with no usable key and no env token at load (an env-token hybrid keeps the
+/// endpoint), so it reads as an OAuth account.
 #[test]
 fn provider_label_names_all_three_cases() {
     let _home = HomeSandbox::new();

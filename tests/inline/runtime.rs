@@ -2904,7 +2904,7 @@ fn acquire_refuses_a_profile_deleted_after_the_config_load() {
         // own side effects ran. It reaches wider than M2's placement claim: the
         // legs that run BEFORE the gate (`arm_rolling_from_disk` -> `load_profile`
         // -> `maybe_rewrite_config_toml`) are inert for a cleanly deleted name
-        // only by CONVENTION — `effective_base_url(None, false, None)` returning
+        // only by CONVENTION — `effective_base_url(None, false, None, &BTreeMap::new())` returning
         // `None` and the default render round-tripping — and `atomic_write_600`
         // creates the missing parent. Should either drift, `load_profile` becomes
         // a resurrector sitting ahead of the gate and this assertion is what
