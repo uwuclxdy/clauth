@@ -401,6 +401,14 @@ pub(crate) fn build_status(
                     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
                         .and_then(|u| u.codex_rate_limit_reached)
                 }).flatten(),
+                // Additive, codex-only: banked reset credits from the CDX-6
+                // poll (`rate_limit_reset_credits.available_count`). Null on
+                // claude profiles and until a poll has carried the count —
+                // a reader that finds null says nothing, never "0 banked".
+                "codex_reset_credits": p.is_codex().then(|| {
+                    load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
+                        .and_then(|u| u.codex_reset_credits)
+                }).flatten(),
             })
         })
         .collect();

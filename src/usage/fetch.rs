@@ -392,6 +392,14 @@ pub(crate) struct UsageInfo {
     /// codex chain scan, the status serializer, and ccu with a single source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_rate_limit_reached: Option<String>,
+    /// Banked reset credits (`rate_limit_reset_credits.available_count` on the
+    /// `wham/usage` body): passes the account can spend to reopen a window
+    /// early. Codex profiles polled by CDX-6 only; the passive JSONL leg has
+    /// no such field and leaves it unset. clauth reads it and never spends
+    /// one — the value exists so a surface can say "1 reset banked" beside a
+    /// spent window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_reset_credits: Option<i64>,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -1048,8 +1056,9 @@ fn assemble_usage(
                 window_dollars: windows.window_dollars,
                 extra_usage: raw.extra_usage,
                 spend,
-                // Anthropic leg: the codex passive reader is the only writer.
+                // Anthropic leg: the codex legs are the only writers.
                 codex_rate_limit_reached: None,
+                codex_reset_credits: None,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {

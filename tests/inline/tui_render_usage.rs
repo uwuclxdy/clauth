@@ -368,6 +368,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.usage = Some(UsageInfo {
         codex_rate_limit_reached: None,
+        codex_reset_credits: None,
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
@@ -409,6 +410,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
     let mut profile = crate::testutil::blank_profile("a");
     profile.usage = Some(UsageInfo {
         codex_rate_limit_reached: None,
+        codex_reset_credits: None,
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
@@ -1201,6 +1203,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
         let mut profile = crate::testutil::blank_profile("a");
         profile.usage = Some(crate::usage::UsageInfo {
             codex_rate_limit_reached: None,
+            codex_reset_credits: None,
             plan: None,
             five_hour: None,
             seven_day: None,

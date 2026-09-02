@@ -65,6 +65,7 @@ fn build_status_top_level_shape_and_active() {
             "base_url",
             "bell_threshold",
             "codex_rate_limit_reached",
+            "codex_reset_credits",
             "codex_snapshot_at",
             "fallback",
             "fetch_status",
@@ -616,6 +617,10 @@ fn build_status_publishes_codex_fields() {
         "claude slot truth for claude profiles"
     );
     assert!(work["codex_snapshot_at"].is_null());
+    assert!(
+        work["codex_reset_credits"].is_null(),
+        "reset credits are a codex reading; claude profiles publish null"
+    );
 
     let cdx = by_name("cdx-a");
     assert_eq!(cdx["harness"], "codex");
@@ -627,6 +632,32 @@ fn build_status_publishes_codex_fields() {
         cdx["codex_snapshot_at"].as_str().unwrap().contains('T'),
         "snapshot stamp is ISO 8601"
     );
+    assert!(
+        cdx["codex_reset_credits"].is_null(),
+        "no poll has carried a count yet: null, never a fabricated 0"
+    );
+
+    // Once the CDX-6 poll has cached a count it is published verbatim, next
+    // to the verdict from the same body.
+    crate::profile_cache::write_profile_cache(
+        "cdx-a",
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            codex_rate_limit_reached: Some("rate_limit_reached".to_string()),
+            codex_reset_credits: Some(1),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    let v = build_status(&config, 300_000, None, false);
+    let cdx = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "cdx-a")
+        .unwrap()
+        .clone();
+    assert_eq!(cdx["codex_reset_credits"], 1);
+    assert_eq!(cdx["codex_rate_limit_reached"], "rate_limit_reached");
 }
 
 // The two active slots are independent in the published truth: a codex switch

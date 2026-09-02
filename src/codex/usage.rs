@@ -261,6 +261,8 @@ fn snapshot_from_lines<'a>(
                 // struct — stronger than the percent heuristic for the chain
                 // scan, and the signal ccu's RATE-LIMITED badge keys on.
                 codex_rate_limit_reached: verdict,
+                // The rollout snapshot carries no reset-credit block.
+                codex_reset_credits: None,
                 ..UsageInfo::default()
             },
             snapshot_at_ms: parsed.timestamp.as_deref().and_then(rfc3339_to_ms),

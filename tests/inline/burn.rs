@@ -72,6 +72,7 @@ fn make_info(five_h: Option<f64>, seven_d: Option<f64>) -> UsageInfo {
         extra_usage: None,
         spend: None,
         codex_rate_limit_reached: None,
+        codex_reset_credits: None,
     }
 }
 

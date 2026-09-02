@@ -312,6 +312,7 @@ fn oauth_profile(
             extra_usage: extra,
             spend,
             codex_rate_limit_reached: None,
+            codex_reset_credits: None,
         }),
         fetch_status,
         provider: None,

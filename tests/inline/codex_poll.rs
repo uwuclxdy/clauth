@@ -51,6 +51,75 @@ fn parses_the_live_backend_shape() {
         Some("pro"),
         "the live plan tier rides the same response"
     );
+    assert_eq!(
+        info.codex_reset_credits,
+        Some(0),
+        "a reported zero is a reading, distinct from no block at all"
+    );
+}
+
+/// The live backend's CURRENT verdict spelling (captured 2026-09-02 against
+/// a blocked account): an OBJECT, `{"type": "rate_limit_reached", "details":
+/// "default"}`, sent only once the account is actually blocked. The
+/// string-only parser failed exactly then ("invalid type: map, expected a
+/// string"), so the poll of a limited account — the one reading the chain
+/// walk needs — was the one that never landed. The `type` collapses to the
+/// name consumers key on (`codex_limiter_blocked` reads an unrecognised name
+/// as "blocked while either window is live"), and the reset-credit count
+/// riding the same body is carried through.
+#[test]
+fn object_shaped_verdict_and_reset_credits_parse() {
+    let now = 1_788_000_000i64;
+    let body = r#"{
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": false,
+            "limit_reached": true,
+            "primary_window": {
+                "used_percent": 100,
+                "limit_window_seconds": 604800,
+                "reset_after_seconds": 374033,
+                "reset_at": 1788747964
+            },
+            "secondary_window": null
+        },
+        "rate_limit_reached_type": {"type": "rate_limit_reached", "details": "default"},
+        "rate_limit_upsell": {"banner_type": "pro_rate_limit_reached", "reset_at": 1788747964},
+        "rate_limit_reset_credits": {"available_count": 1, "applicable_available_count": 1}
+    }"#;
+    let polled = parse_wham_usage(body.as_bytes(), now).expect("the object verdict parses");
+    assert_eq!(
+        polled.info.codex_rate_limit_reached.as_deref(),
+        Some("rate_limit_reached"),
+        "the object's `type` is the verdict"
+    );
+    assert_eq!(polled.info.codex_reset_credits, Some(1));
+    let seven_day = polled.info.seven_day.as_ref().expect("weekly slot");
+    assert!((seven_day.utilization - 100.0).abs() < f64::EPSILON);
+    // And the verdict is what actually blocks the chain walk, through the
+    // same predicate the store scan uses.
+    assert!(crate::fallback::codex_info_exhausted(
+        &polled.info,
+        now,
+        100.0
+    ));
+}
+
+/// An object verdict with no `type` — or an explicit null — is no verdict,
+/// and a body with no reset-credit block leaves the count unset rather than
+/// publishing a zero nobody reported.
+#[test]
+fn typeless_verdict_object_is_no_verdict() {
+    let now = 1_788_000_000i64;
+    let body = r#"{
+        "rate_limit": {
+            "primary_window": {"used_percent": 3, "limit_window_seconds": 604800, "reset_at": 1788747964}
+        },
+        "rate_limit_reached_type": {"details": "default"}
+    }"#;
+    let polled = parse_wham_usage(body.as_bytes(), now).expect("parse");
+    assert!(polled.info.codex_rate_limit_reached.is_none());
+    assert!(polled.info.codex_reset_credits.is_none());
 }
 
 /// A top-level verdict (the live shape's spelling) reaches the published

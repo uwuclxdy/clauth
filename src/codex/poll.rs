@@ -62,12 +62,18 @@ struct WhamUsage {
     #[serde(alias = "rate_limits")]
     rate_limit: Option<WhamRateLimit>,
     #[serde(default)]
-    rate_limit_reached_type: Option<String>,
+    rate_limit_reached_type: Option<ReachedType>,
     /// Top-level plan tier (`pro`/`plus`/`free`/…) — the LIVE counterpart of
     /// the stored id_token's `chatgpt_plan_type` claim, which goes stale on a
     /// plan change until codex re-mints.
     #[serde(default)]
     plan_type: Option<String>,
+    /// Banked "reset credits" the account can spend to reopen a window early
+    /// (`{available_count, applicable_available_count}`). Rides this same
+    /// body, so reading it costs no extra request — and the reading is all
+    /// clauth does with it: the redeem endpoint stays on the banned list.
+    #[serde(default)]
+    rate_limit_reset_credits: Option<ResetCredits>,
 }
 
 #[derive(Deserialize)]
@@ -77,7 +83,42 @@ struct WhamRateLimit {
     #[serde(alias = "secondary")]
     secondary_window: Option<WhamWindow>,
     #[serde(default)]
-    rate_limit_reached_type: Option<String>,
+    rate_limit_reached_type: Option<ReachedType>,
+}
+
+/// The limiter verdict in either spelling. The 2026-07-22 capture had a bare
+/// string (`"primary"`), and the JSONL `token_count` events still carry a
+/// bare string (codex's `RateLimitReachedType` enum, snake_case); the live
+/// backend now sends `{"type": "rate_limit_reached", "details": "default"}`
+/// once an account is actually blocked — and `null` until then, which is why
+/// the string-only parser kept working right up to the moment the reading
+/// mattered (2026-09-02: every poll of a limited account failed with
+/// "invalid type: map, expected a string", leaving the chain walk on the
+/// cached reading). Either spelling collapses to the one name the consumers
+/// key on; an object with no `type` is no verdict.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ReachedType {
+    Name(String),
+    Typed {
+        #[serde(rename = "type", default)]
+        kind: Option<String>,
+    },
+}
+
+impl ReachedType {
+    fn into_name(self) -> Option<String> {
+        match self {
+            Self::Name(s) => Some(s),
+            Self::Typed { kind } => kind,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ResetCredits {
+    #[serde(default)]
+    available_count: i64,
 }
 
 /// A limiter window in either dialect. Absolute `reset_at`/`resets_at` wins;
@@ -126,7 +167,10 @@ pub(crate) struct PolledUsage {
 pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<PolledUsage, PollError> {
     let parsed: WhamUsage = serde_json::from_slice(body)
         .map_err(|e| PollError::Other(format!("unrecognized wham/usage shape: {e}")))?;
-    let top_verdict = parsed.rate_limit_reached_type;
+    let top_verdict = parsed
+        .rate_limit_reached_type
+        .and_then(ReachedType::into_name);
+    let reset_credits = parsed.rate_limit_reset_credits.map(|c| c.available_count);
     let Some(rl) = parsed.rate_limit else {
         return Err(PollError::Other(
             "wham/usage response carries no rate_limit block".to_string(),
@@ -137,7 +181,9 @@ pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<PolledUsage
         rl.secondary_window.map(|w| w.into_limiter(now_secs)),
         // The live shape stamps the verdict at the TOP level; the JSONL
         // dialect inside the block. Block-level wins when both exist.
-        rl.rate_limit_reached_type.or(top_verdict),
+        rl.rate_limit_reached_type
+            .and_then(ReachedType::into_name)
+            .or(top_verdict),
     );
     if five_hour.is_none() && seven_day.is_none() {
         return Err(PollError::Other(
@@ -149,6 +195,7 @@ pub(crate) fn parse_wham_usage(body: &[u8], now_secs: i64) -> Result<PolledUsage
             five_hour,
             seven_day,
             codex_rate_limit_reached: verdict,
+            codex_reset_credits: reset_credits,
             ..UsageInfo::default()
         },
         plan_type: parsed.plan_type.filter(|p| !p.trim().is_empty()),
