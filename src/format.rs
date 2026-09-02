@@ -381,7 +381,9 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// line, so the surfaces cannot spell one state two ways. Those last three
 /// render it for a key the profile's `AuthExpired` verdict pronounces dead,
 /// too — Alibaba excepted, whose verdict records a dead console session:
-/// `oauth::third_party_dead_chain_copy` treats such a key as no credential.
+/// `oauth::third_party_dead_chain_copy` treats such a key as no credential, and
+/// routes a console-carrying Alibaba profile to [`third_party_dead_console`]
+/// instead, which says the opposite about the key.
 pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
     format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
 }
@@ -400,8 +402,10 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 /// current credential, except on Alibaba, whose verdict records a dead console
 /// session, not a key. The `[env]`-token half is guarded too (owner ruling
 /// 2026-09-02): a profile with no usable api key — field or env-carried —
-/// renders [`third_party_keyless`] instead. The Alibaba console half stays
-/// unguarded: an open copy question the owner has not ruled yet.
+/// renders [`third_party_keyless`] instead. The Alibaba console half renders
+/// [`third_party_dead_console`] when the verdict matches its current credential
+/// AND a console was captured; a console-less Alibaba profile whose verdict
+/// matches lands on this sentence instead, since "expired" would be false.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
 /// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,
@@ -417,6 +421,38 @@ pub(crate) fn third_party_dead_chain(name: &crate::profile::ProfileName) -> Stri
     format!(
         "stored OAuth chain is dead, its api key still works: {name} \
          (run `clauth login {name} --api-key <key>` to clear the quarantine)"
+    )
+}
+
+/// An Alibaba profile whose stored OAuth chain is dead while its console
+/// session has expired too: the split state, named so the reader learns both
+/// halves — the api key still serves inference, and one command restores the
+/// console. `cmd_login` diverts a bare `clauth login <name>` on Alibaba to the
+/// console capture flow, so the command is exactly that.
+///
+/// Rendered only by `oauth::third_party_dead_chain_copy`'s own-endpoint arm,
+/// where the profile's stored `AuthExpired` verdict matches its current
+/// credential fingerprint AND a console was actually captured: an Alibaba
+/// verdict records a dead console session, never a dead key, so this sentence
+/// replaces the dead-chain one the other providers render there. Without a
+/// console the verdict means "never captured", where "expired" and "re-capture"
+/// are both false, so that profile keeps [`third_party_dead_chain`].
+///
+/// The key clause claims what its sibling's does and is guarded no further: the
+/// arm proves a well-formed key, or merely a non-empty `[env]` token, never a
+/// live one, and an Alibaba verdict cannot speak to the key at all since its
+/// usage fetch never sends one. The gate is also wider than the verdict:
+/// `credential_fingerprint` hashes the api key as well as the console, so a key
+/// change alone retires a still-true console verdict and this sentence stops
+/// rendering. A running scheduler re-writes the verdict on its next tick;
+/// `cmd_rolling_token` loads a config and fetches nothing, so with no daemon and
+/// no TUI that window has no bound.
+/// The command is backticked to match [`third_party_keyless`] and
+/// [`third_party_dead_chain`] (owner ruling: house style).
+pub(crate) fn third_party_dead_console(name: &crate::profile::ProfileName) -> String {
+    format!(
+        "console session expired, stored OAuth chain is dead: {name} \
+         (run `clauth login {name}` to re-capture the console; the api key still serves inference)"
     )
 }
 

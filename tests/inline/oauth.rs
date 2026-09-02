@@ -5046,22 +5046,35 @@ fn dead_chain_copy_env_carried_api_key_keeps_the_dead_chain_sentence() {
     );
 }
 
-/// The verdict consult is excluded for Alibaba: its usage fetch authenticates
-/// with the console session, never the api key, so a matching verdict records
-/// a dead console while the key may be live — the keyless sentence would
-/// mis-claim the key. A live-key profile whose console died keeps the
-/// dead-chain sentence, byte-identical to pre-fix; what a dead-console
-/// Alibaba profile should read instead is an open copy question.
+/// Attach a console session to a fixture profile, so the shape the dead-console
+/// sentence describes — a console that was actually captured — is the one under
+/// test. In memory only: the splitter reads the profile it is handed, and
+/// `auth_expired_matches` is keyed by name and takes the fingerprint as an
+/// argument, so nothing here re-reads the profile from disk.
+fn with_console(profile: &mut Profile, token: &str) {
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+}
+
+/// The verdict consult is re-pointed for Alibaba: its usage fetch
+/// authenticates with the console session, never the api key, so a matching
+/// verdict records a dead console while the key may be live. The dead-console
+/// sentence renders — the dead-chain one would name the wrong half, and the
+/// keyless one would mis-claim a live key.
 #[test]
-fn dead_chain_copy_alibaba_keeps_the_dead_chain_sentence_on_a_console_verdict() {
+fn dead_chain_copy_alibaba_renders_the_dead_console_sentence_on_a_matching_verdict() {
     let _home = HomeSandbox::new();
     let name = "tp-alibaba-console-verdict";
-    let profile = dead_chain_copy_fixture(
+    let mut profile = dead_chain_copy_fixture(
         name,
         "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
         Some("sk-fixture"),
         None,
     );
+    with_console(&mut profile, "console-captured");
     assert_eq!(
         profile.provider,
         Some(crate::providers::Provider::Alibaba),
@@ -5070,6 +5083,72 @@ fn dead_chain_copy_alibaba_keeps_the_dead_chain_sentence_on_a_console_verdict() 
     assert!(
         crate::claude::has_own_inference_endpoint(&profile),
         "the fixture must reach the own-endpoint arm"
+    );
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("an Alibaba profile always carries a fetchable credential");
+    crate::profile_cache::write_auth_expired(&profile.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "the seeded verdict must land before the choice is pinned"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_console(&profile.name))
+    );
+}
+
+/// A verdict recorded against a console the profile has since replaced is
+/// inert: a re-capture moves the console token, so nothing measured the CURRENT
+/// session as dead and the split sentence stays, byte-identical. The stale
+/// credential varied here is the console rather than the api key, because the
+/// console is the only half an Alibaba verdict is ever about.
+#[test]
+fn dead_chain_copy_alibaba_ignores_a_verdict_for_a_replaced_console() {
+    let _home = HomeSandbox::new();
+    let name = "tp-alibaba-stale-verdict";
+    let mut profile = dead_chain_copy_fixture(
+        name,
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
+        Some("sk-current"),
+        None,
+    );
+    with_console(&mut profile, "console-expired");
+    let old_fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("the stale fixture must carry a fetchable credential");
+    crate::profile_cache::write_auth_expired(&profile.name, old_fp);
+    with_console(&mut profile, "console-recaptured");
+    assert!(
+        !crate::profile_cache::auth_expired_matches(
+            &profile.name,
+            crate::usage::profile_credential_fingerprint(&profile)
+                .expect("the fixture must carry a fetchable credential")
+        ),
+        "a verdict for the replaced console must not match the current one"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// `alibaba::fetch` collapses "no console" into "dead console" because neither
+/// is worth a request, and the verdict inherits that collapse. Copy is where
+/// the two states differ: "expired" and "re-capture" are both false for a
+/// profile that never captured one, so it keeps the dead-chain sentence even
+/// though its verdict matches.
+#[test]
+fn dead_chain_copy_alibaba_without_a_console_keeps_the_dead_chain_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-alibaba-never-captured";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
+        Some("sk-fixture"),
+        None,
+    );
+    assert!(
+        profile.console.is_none(),
+        "the fixture must model a profile that never captured a console"
     );
     let fp = crate::usage::profile_credential_fingerprint(&profile)
         .expect("an Alibaba profile always carries a fetchable credential");

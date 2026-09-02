@@ -541,3 +541,28 @@ fn account_tier_still_renders_every_known_tier() {
     });
     assert_eq!(account_tier(&token_only), Some(PlanTier::Pro));
 }
+
+/// The splitter family's bytes, pinned here because every routing test asserts
+/// `third_party_dead_chain_copy`'s output against a call of the same
+/// constructor: those pin WHICH sentence is selected and nothing about what it
+/// renders, so a reword ships green through all of them. The two older
+/// sentences carry end-to-end literal pins at their routing sites; this is the
+/// third one's only guard, and all three are owner-ruled verbatim.
+#[test]
+fn the_split_state_sentences_render_their_ruled_bytes() {
+    let name = crate::profile::ProfileName::from("qwen");
+    assert_eq!(
+        third_party_keyless(&name),
+        "profile has no api key: qwen (run `clauth login qwen --api-key <key>`)"
+    );
+    assert_eq!(
+        third_party_dead_chain(&name),
+        "stored OAuth chain is dead, its api key still works: qwen \
+         (run `clauth login qwen --api-key <key>` to clear the quarantine)"
+    );
+    assert_eq!(
+        third_party_dead_console(&name),
+        "console session expired, stored OAuth chain is dead: qwen \
+         (run `clauth login qwen` to re-capture the console; the api key still serves inference)"
+    );
+}
