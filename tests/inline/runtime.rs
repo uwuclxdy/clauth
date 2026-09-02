@@ -7466,6 +7466,109 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
     });
 }
 
+// One payload is `REPEATS` copies of an 8-byte token, so a partially
+// published file is detectable by shape alone rather than by guessing which
+// writer's round should have won.
+const TOKEN: usize = 8;
+const REPEATS: usize = 512;
+fn payload(writer: usize, round: usize) -> Vec<u8> {
+    format!("w{writer}r{round:05}").repeat(REPEATS).into_bytes()
+}
+fn intact(bytes: &[u8]) -> bool {
+    bytes.len() == TOKEN * REPEATS && bytes.chunks(TOKEN).all(|c| c == &bytes[..TOKEN])
+}
+
+/// Every published entry on one side, as `(name, len, mtime)`. What a write
+/// loop moves and a converged mirror does not — including a rewrite of
+/// identical bytes, which `copy_file`'s rename stamps with a fresh mtime.
+/// Staging siblings are excluded for the same reason production excludes
+/// them: they are not published yet.
+fn shape(side: &Path) -> Vec<(std::ffi::OsString, u64, SystemTime)> {
+    let mut out: Vec<_> = fs::read_dir(side)
+        .expect("read side")
+        .flatten()
+        .filter(|e| !crate::watchdog::is_staging(&e.file_name()))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            Some((e.file_name(), meta.len(), meta.modified().ok()?))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+struct Mirror {
+    home: PathBuf,
+    runtime: PathBuf,
+    /// Passes that actually PUBLISHED something. Counting passes instead
+    /// cannot tell a self-feeding loop from a notify reader draining a
+    /// backlog in dribs — the latter reconciles at the cooldown cap for as
+    /// long as the backlog lasts, which is correct behavior.
+    writes: std::sync::atomic::AtomicUsize,
+    torn: std::sync::Mutex<Vec<String>>,
+}
+impl Mirror {
+    fn writes(&self) -> usize {
+        self.writes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    fn torn(&self) -> Vec<String> {
+        self.torn.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+impl crate::watchdog::Reconcile for Mirror {
+    fn config(&self) {}
+    fn credentials(&self) {
+        let before = (shape(&self.home), shape(&self.runtime));
+        mirror_tree(&self.home, &self.runtime).expect("mirror");
+        let after = (shape(&self.home), shape(&self.runtime));
+        if before != after {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        for side in [&self.home, &self.runtime] {
+            for entry in fs::read_dir(side).expect("read side").flatten() {
+                // A staging sibling a concurrent `copy_file` is mid-copy into
+                // is half-written by definition and not yet published, so it
+                // is not torn — the same filter production applies.
+                if crate::watchdog::is_staging(&entry.file_name()) {
+                    continue;
+                }
+                let path = entry.path();
+                let Ok(bytes) = fs::read(&path) else { continue };
+                if !intact(&bytes) {
+                    self.torn
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push(path.display().to_string());
+                }
+            }
+        }
+    }
+    fn swap_poll(&self) {}
+}
+
+/// The convergence fixture's one publish step: stage the round's payload, then
+/// publish it atomically into `near` — the one primitive fake mode uses,
+/// whichever side of the mirror the round targets. `far` is first held at an
+/// explicit past mtime: a 1 s-granularity filesystem stamps a same-second
+/// publish with the value the mirror and the snapshots already read, so the
+/// write would stay invisible to both (`mtime_newer` is strict, and the
+/// counter's before/after shapes compare equal). An explicitly old `far` makes
+/// the publish strictly newer at any granularity, so the pass that propagates
+/// it moves the snapshot and the write is counted.
+fn publish_round(src: &Path, near: &Path, far: &Path, writer: usize, round: usize) {
+    let staged = src.join(format!("w{writer}"));
+    fs::write(&staged, payload(writer, round)).expect("stage");
+    let name = format!("shared-{writer}.json");
+    let far_file = far.join(&name);
+    // The first round has no far side yet; its seeding pass is counted by the
+    // entry appearing in the snapshot, not by an mtime move.
+    if far_file.exists() {
+        set_mtime(&far_file, SystemTime::now() - Duration::from_secs(600));
+    }
+    copy_file(&staged, &near.join(name)).expect("publish");
+}
+
 /// `LinkMode::Fake` shares ONE tree across every session of a profile, so
 /// `copy_tree`, `merge_path` and `mirror_credentials` publish into it
 /// concurrently — one set per live session. Under a storm of those publishes the
@@ -7476,87 +7579,6 @@ fn a_relogin_reaches_a_sibling_session_without_waiting_for_the_fallback() {
 fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
     const WRITERS: usize = 3;
     const ROUNDS: usize = 24;
-    const TOKEN: usize = 8;
-    const REPEATS: usize = 512;
-
-    /// One payload is `REPEATS` copies of an 8-byte token, so a partially
-    /// published file is detectable by shape alone rather than by guessing which
-    /// writer's round should have won.
-    fn payload(writer: usize, round: usize) -> Vec<u8> {
-        format!("w{writer}r{round:05}").repeat(REPEATS).into_bytes()
-    }
-    fn intact(bytes: &[u8]) -> bool {
-        bytes.len() == TOKEN * REPEATS && bytes.chunks(TOKEN).all(|c| c == &bytes[..TOKEN])
-    }
-
-    /// Every published entry on one side, as `(name, len, mtime)`. What a write
-    /// loop moves and a converged mirror does not — including a rewrite of
-    /// identical bytes, which `copy_file`'s rename stamps with a fresh mtime.
-    /// Staging siblings are excluded for the same reason production excludes
-    /// them: they are not published yet.
-    fn shape(side: &Path) -> Vec<(std::ffi::OsString, u64, SystemTime)> {
-        let mut out: Vec<_> = fs::read_dir(side)
-            .expect("read side")
-            .flatten()
-            .filter(|e| !crate::watchdog::is_staging(&e.file_name()))
-            .filter_map(|e| {
-                let meta = e.metadata().ok()?;
-                Some((e.file_name(), meta.len(), meta.modified().ok()?))
-            })
-            .collect();
-        out.sort();
-        out
-    }
-
-    struct Mirror {
-        home: PathBuf,
-        runtime: PathBuf,
-        /// Passes that actually PUBLISHED something. Counting passes instead
-        /// cannot tell a self-feeding loop from a notify reader draining a
-        /// backlog in dribs — the latter reconciles at the cooldown cap for as
-        /// long as the backlog lasts, which is correct behavior.
-        writes: std::sync::atomic::AtomicUsize,
-        torn: std::sync::Mutex<Vec<String>>,
-    }
-    impl Mirror {
-        fn writes(&self) -> usize {
-            self.writes.load(std::sync::atomic::Ordering::Relaxed)
-        }
-        fn torn(&self) -> Vec<String> {
-            self.torn.lock().unwrap_or_else(|p| p.into_inner()).clone()
-        }
-    }
-    impl crate::watchdog::Reconcile for Mirror {
-        fn config(&self) {}
-        fn credentials(&self) {
-            let before = (shape(&self.home), shape(&self.runtime));
-            mirror_tree(&self.home, &self.runtime).expect("mirror");
-            let after = (shape(&self.home), shape(&self.runtime));
-            if before != after {
-                self.writes
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            for side in [&self.home, &self.runtime] {
-                for entry in fs::read_dir(side).expect("read side").flatten() {
-                    // A staging sibling a concurrent `copy_file` is mid-copy into
-                    // is half-written by definition and not yet published, so it
-                    // is not torn — the same filter production applies.
-                    if crate::watchdog::is_staging(&entry.file_name()) {
-                        continue;
-                    }
-                    let path = entry.path();
-                    let Ok(bytes) = fs::read(&path) else { continue };
-                    if !intact(&bytes) {
-                        self.torn
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .push(path.display().to_string());
-                    }
-                }
-            }
-        }
-        fn swap_poll(&self) {}
-    }
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let home = tmp.path().join(".claude");
@@ -7604,13 +7626,13 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
                 let (home, runtime, src) = (&home, &runtime, &src);
                 scope.spawn(move || {
                     for round in 0..ROUNDS {
-                        let staged = src.join(format!("w{writer}"));
-                        fs::write(&staged, payload(writer, round)).expect("stage");
-                        // The one publish primitive fake mode uses, into
-                        // whichever side of the mirror this round targets.
-                        let side = if round % 2 == 0 { home } else { runtime };
-                        copy_file(&staged, &side.join(format!("shared-{writer}.json")))
-                            .expect("publish");
+                        // Into whichever side of the mirror this round targets.
+                        let (near, far) = if round % 2 == 0 {
+                            (home, runtime)
+                        } else {
+                            (runtime, home)
+                        };
+                        publish_round(src, near, far, writer, round);
                         std::thread::sleep(Duration::from_millis(5));
                     }
                 })
@@ -7693,6 +7715,57 @@ fn the_fake_mode_mirror_converges_under_concurrent_publishes() {
             side.display()
         );
     }
+}
+
+/// A same-second write under 1 s mtime granularity: the coarse stamp leaves the
+/// mirror's `(name, len, mtime)` snapshots equal and the write uncounted, so a
+/// publish the fixture just made is read as no write — `mtime_newer` is strict,
+/// so the mirror cannot see the publish either. The fixture's answer is its own
+/// clock: `publish_round` holds the far side at an explicit past before the
+/// publish, so the publish reads strictly newer at any granularity and the pass
+/// that propagates it counts. The coarse stamp is simulated by pinning both
+/// sides to the same second before and after the publish.
+#[test]
+fn the_mirror_write_counter_counts_a_same_second_publish() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let home = tmp.path().join(".claude");
+    let runtime = tmp.path().join("runtime");
+    let src = tmp.path().join("src");
+    for dir in [&home, &runtime, &src] {
+        fs::create_dir_all(dir).expect("mkdir");
+    }
+    let name = "shared-0.json";
+    fs::write(home.join(name), payload(0, 0)).expect("seed home");
+    fs::write(runtime.join(name), payload(0, 0)).expect("seed runtime");
+    // Both sides in the SAME second — the coarse stamp the defect is about. The
+    // publish is re-pinned to it below, standing in for a 1 s-granularity
+    // filesystem stamping a real write into the second the snapshot already read.
+    let second = SystemTime::now();
+    set_mtime(&home.join(name), second);
+    set_mtime(&runtime.join(name), second);
+
+    let mirror = Mirror {
+        home: home.clone(),
+        runtime: runtime.clone(),
+        writes: std::sync::atomic::AtomicUsize::new(0),
+        torn: std::sync::Mutex::new(Vec::new()),
+    };
+
+    publish_round(&src, &home, &runtime, 0, 1);
+    set_mtime(&home.join(name), second);
+
+    crate::watchdog::Reconcile::credentials(&mirror);
+
+    assert_eq!(
+        mirror.writes(),
+        1,
+        "the same-second publish must be counted as a write"
+    );
+    assert_eq!(
+        fs::read(runtime.join(name)).expect("read runtime"),
+        payload(0, 1),
+        "and the pass that was counted must have propagated the publish"
+    );
 }
 
 /// A staging sibling is a publish in flight, on its way to being renamed away.
