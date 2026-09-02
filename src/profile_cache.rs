@@ -25,6 +25,15 @@ pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
 pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
 
+/// The last adopt refusal announced for this profile, as one of the reason
+/// keys `oauth::try_adopt_live_rotation` refuses with (a bare JSON string).
+/// The refusal is a STANDING state while the live slot stays unadoptable, and
+/// the rotation legs that reach it run in DIFFERENT processes (the daemon
+/// scheduler and the TUI's in-process scheduler), so the once-per-state
+/// announcement is recorded on disk where every process reads it instead of
+/// in either process's memory.
+pub(crate) const ADOPT_REFUSAL_FILE: &str = "adopt_refusal.json";
+
 /// Epoch-ms of this profile's last `/profile` fetch attempt (a bare JSON number).
 /// Derived data: the durable half of `usage::fetch`'s once-per-hour-per-profile
 /// TTL clock, so a relaunch reuses the cached plan instead of re-pulling

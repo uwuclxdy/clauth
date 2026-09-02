@@ -1528,13 +1528,52 @@ fn set_stored_probe_not_before_for_test(key: &[u8; 32], not_before: u64) {
     }
 }
 
+/// Dedupe keys recorded in [`crate::profile_cache::ADOPT_REFUSAL_FILE`]. Each
+/// refusal extends its reason key with the live account id (a failed or blank
+/// probe falls back to the bare reason), so a DIFFERENT live login under
+/// either standing state is a state change worth a line while the same
+/// login's token churn (CC rewriting the mirror on every launch) stays silent.
+const REFUSAL_UNPROVABLE_IDENTITY: &str = "unprovable-identity";
+const REFUSAL_FOREIGN_ACCOUNT: &str = "foreign-account";
+
+/// Whether this refusal is news. The refusal is a standing state — the
+/// classify gate keeps reading `Diverged` while the live slot stays
+/// unadoptable, and the leg re-fires every poll — so announcing unconditionally
+/// writes one identical line per leg per process and drowns the daemon and TUI
+/// logs; a refusal that never re-announces hides a NEW state. The last
+/// announced key is therefore recorded beside the profile's other caches
+/// (in-memory would not cross the daemon/TUI process boundary): the same
+/// record-what-you-return-true-for contract as `SessionSwap::should_announce`,
+/// returning `true` only when the key differs from the recorded one. The
+/// record is dropped the moment a leg observes the state resolved — the
+/// classify gate reading healthy, an adopt landing, or the session-token
+/// regime switch — so a later standing state announces again; only a
+/// resolution that re-diverges between two legs to the SAME account goes
+/// unseen, and with it the new state's first line.
+fn adopt_refusal_should_announce(name: &ProfileName, key: &str) -> bool {
+    if crate::profile_cache::load_profile_cache::<String>(
+        name,
+        crate::profile_cache::ADOPT_REFUSAL_FILE,
+    )
+    .as_deref()
+        == Some(key)
+    {
+        return false;
+    }
+    crate::profile_cache::write_profile_cache(name, crate::profile_cache::ADOPT_REFUSAL_FILE, &key);
+    true
+}
+
 pub(crate) fn try_adopt_live_rotation(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
     _rotation_guard: &crate::runtime::RotationGuard,
     identity: &dyn Fn(&str) -> Option<AccountId>,
 ) -> Option<(String, Option<String>)> {
-    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache, write_profile_cache};
+    use crate::profile_cache::{
+        ACCOUNT_ID_CACHE_FILE, ADOPT_REFUSAL_FILE, load_profile_cache, remove_profile_cache,
+        write_profile_cache,
+    };
 
     // CLA-SPLIT: this profile's live slot holds its STATIC session token, so
     // `classify_credentials_link` judges it against `session-token.json` while
@@ -1544,6 +1583,10 @@ pub(crate) fn try_adopt_live_rotation(
     // with a login that is not it. Same invariant
     // `snapshot_active_credentials_unchecked` carries for the capture sinks.
     if crate::claude::has_session_token(name) {
+        // The adopt refusals are unreachable behind this gate, so a record
+        // from this profile's OAuth era must not outlive the regime switch:
+        // cleared here, a later OAuth re-divergence announces fresh.
+        remove_profile_cache(name, ADOPT_REFUSAL_FILE);
         return None;
     }
 
@@ -1565,6 +1608,10 @@ pub(crate) fn try_adopt_live_rotation(
         crate::claude::classify_credentials_link(name),
         Ok(crate::claude::LinkState::Diverged)
     ) {
+        // The live slot reads healthy again: whatever refusal state stood is
+        // resolved. Drop the once-per-state record so a FUTURE standing
+        // refusal — the same reason included — is news again.
+        remove_profile_cache(name, ADOPT_REFUSAL_FILE);
         return None;
     }
     let Ok(Some(live)) = crate::claude::read_claude_credentials() else {
@@ -1602,11 +1649,22 @@ pub(crate) fn try_adopt_live_rotation(
             }
         });
     let Some(expected) = expected else {
-        logline!(
-            "clauth: live login for '{name}' is newer but its identity can't be proven \
-             (no cached account id and the stored token is dead). Not adopting; \
-             resolve in the clauth TUI or re-run clauth login {name}"
-        );
+        // The live token is probed for the ANNOUNCEMENT key, not for the
+        // verdict (none is needed — no expectation to compare). The live
+        // mirror is the fresher working login, so its probe succeeds and
+        // memoizes like the foreign arm's; a failed or blank probe falls back
+        // to the bare reason key.
+        let key = identity(&live_oauth.access_token)
+            .filter(|id| !id.trim().is_empty())
+            .map(|id| format!("{REFUSAL_UNPROVABLE_IDENTITY}:{id}"))
+            .unwrap_or_else(|| REFUSAL_UNPROVABLE_IDENTITY.to_string());
+        if adopt_refusal_should_announce(name, &key) {
+            logline!(
+                "clauth: live login for '{name}' is newer but its identity can't be proven \
+                 (no cached account id and the stored token is dead). Not adopting; \
+                 resolve in the clauth TUI or re-run clauth login {name}"
+            );
+        }
         return None;
     };
     let live_id = identity(&live_oauth.access_token)?;
@@ -1616,10 +1674,13 @@ pub(crate) fn try_adopt_live_rotation(
         return None;
     }
     if live_id != expected {
-        logline!(
-            "clauth: live login for '{name}' belongs to a DIFFERENT account. Not adopting; \
-             capture it via the clauth TUI divergence flow if that was intentional"
-        );
+        let refusal_key = format!("{REFUSAL_FOREIGN_ACCOUNT}:{live_id}");
+        if adopt_refusal_should_announce(name, &refusal_key) {
+            logline!(
+                "clauth: live login for '{name}' belongs to a DIFFERENT account. Not adopting; \
+                 capture it via the clauth TUI divergence flow if that was intentional"
+            );
+        }
         return None;
     }
 
@@ -1657,6 +1718,10 @@ pub(crate) fn try_adopt_live_rotation(
     if !adopted {
         return None;
     }
+    // This adopt IS the resolution of the divergence the refusal announced:
+    // drop the once-per-state record so a future standing refusal — same
+    // reason included — is news again.
+    remove_profile_cache(name, ADOPT_REFUSAL_FILE);
     // The adopted pair proves the chain is alive, so a standing `auth_broken`
     // is stale — the flag was set while CC held the fresher pair. Same lift as
     // the scheduler's `carry_external_rotation` (inlined here because the

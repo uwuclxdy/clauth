@@ -1169,8 +1169,8 @@ mod adopt_live_rotation {
         );
         assert_eq!(
             mirror_calls.get(),
-            0,
-            "a missing expected identity short-circuits before the mirror is probed"
+            1,
+            "the live token is probed for the announcement key, not for the verdict"
         );
 
         let second = try_adopt_live_rotation(
@@ -1184,6 +1184,11 @@ mod adopt_live_rotation {
             stored_calls.get(),
             1,
             "a second leg must not re-spend a /profile on the same dead stored token"
+        );
+        assert_eq!(
+            mirror_calls.get(),
+            2,
+            "the raw test closure re-probes per leg; production memoizes per token"
         );
     }
 
@@ -1234,6 +1239,503 @@ mod adopt_live_rotation {
             2,
             "after the TTL lapses the stored token is probed again"
         );
+    }
+
+    /// A standing refusal is announced once, not once per rotation leg: while
+    /// the live slot stays unadoptable the classify gate keeps reading
+    /// `Diverged`, so every leg reaches the same refusal and an unconditional
+    /// line drowns the daemon and TUI logs in identical copies.
+    #[test]
+    fn a_standing_adopt_refusal_is_announced_once_per_state() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-once";
+        // Stored token dead + no cached anchor → identity unprovable, the
+        // standing state this pins.
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        for _ in 0..3 {
+            assert_eq!(
+                try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name),
+                    &guard(name),
+                    &identity,
+                ),
+                None
+            );
+        }
+
+        assert_eq!(
+            sink.snapshot(),
+            vec![
+                "clauth: live login for 'adopt-refusal-once' is newer but its identity can't \
+                 be proven (no cached account id and the stored token is dead). Not adopting; \
+                 resolve in the clauth TUI or re-run clauth login adopt-refusal-once"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// A state CHANGE — the refusal reason flips — announces again: the dedupe
+    /// key carries the reason (plus the live account for the foreign arm), so
+    /// a new standing state is never mistaken for the one already announced,
+    /// and each state still announces only once.
+    #[test]
+    fn a_refusal_reason_flip_announces_the_new_state_once() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-flip";
+        // Dead stored token + no cached anchor → unprovable; the anchor
+        // written mid-test flips later legs onto the provably-foreign arm.
+        let handle = setup(name, past_expiry(), future_expiry());
+        let unprovable: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        for _ in 0..2 {
+            assert_eq!(
+                try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name),
+                    &guard(name),
+                    &unprovable,
+                ),
+                None
+            );
+        }
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &"uuid-1".to_string(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name),
+                    &guard(name),
+                    &foreign,
+                ),
+                None
+            );
+        }
+
+        assert_eq!(
+            sink.snapshot(),
+            vec![
+                "clauth: live login for 'adopt-refusal-flip' is newer but its identity can't \
+                 be proven (no cached account id and the stored token is dead). Not adopting; \
+                 resolve in the clauth TUI or re-run clauth login adopt-refusal-flip"
+                    .to_string(),
+                "clauth: live login for 'adopt-refusal-flip' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 intentional"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// The once-per-state record lives beside the other per-profile caches,
+    /// not in process memory: the rotation leg runs in TWO processes (the
+    /// daemon scheduler and the TUI's in-process scheduler), so a memory
+    /// record would let each process announce the same standing state anew.
+    #[test]
+    fn the_adopt_refusal_record_is_durable_on_disk() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-durable";
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "nothing announced yet, so no record"
+        );
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .as_deref(),
+            Some("unprovable-identity:uuid-1"),
+            "the announcement is recorded on disk, where the other process reads it"
+        );
+    }
+
+    /// A successful adopt resolves the divergence the refusal announced, so
+    /// the record drops and a future standing refusal is news again.
+    #[test]
+    fn a_resolving_adopt_clears_the_refusal_record() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-clear";
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            ),
+            None,
+            "identity unprovable until the anchor lands"
+        );
+        assert!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .is_some(),
+            "the standing refusal is recorded"
+        );
+
+        // The cached anchor lands (a re-login's backfill): the same live
+        // mirror is now provably the profile's own account, so it adopts.
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &"uuid-1".to_string(),
+        );
+        assert!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "the resolved state no longer suppresses a future announcement"
+        );
+    }
+
+    /// A leg that observes the link healthy again drops the record, so a
+    /// re-occurring standing state announces like the first one.
+    #[test]
+    fn a_resolved_link_clears_the_record_so_a_recurrence_announces_again() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-recur";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .as_deref(),
+            Some("foreign-account:uuid-2"),
+        );
+
+        // Resolution without an adopt: the live slot is rewritten to the
+        // profile's own pair, so the link classifies LinkedTo again.
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with("at-old", Some(future_expiry()))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "the healthy leg observed the resolution and dropped the record"
+        );
+
+        // Re-divergence: the SAME foreign mirror returns, and the state is
+        // news again.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with("at-mirror", Some(future_expiry() + 3_600_000)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            sink.snapshot(),
+            vec![
+                "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 intentional"
+                    .to_string(),
+                "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 intentional"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// A DIFFERENT foreign login is a state change worth a line, while the
+    /// same login's token churn (CC rewriting the mirror on every launch) is
+    /// not: the dedupe key carries the live account id for this reason.
+    #[test]
+    fn a_different_foreign_login_announces_while_same_account_churn_stays_silent() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-swap";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                match tok {
+                    "at-mirror-3" => "uuid-3",
+                    tok if tok.starts_with("at-mirror") => "uuid-2",
+                    _ => "uuid-1",
+                }
+                .into(),
+            )
+        };
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        let leg = || {
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            )
+        };
+
+        assert_eq!(leg(), None, "uuid-2 mirror is foreign to the stored uuid-1");
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // Same account, fresh pair: the standing state did not change.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with(
+                "at-mirror-2",
+                Some(future_expiry() + 7_200_000),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(leg(), None);
+        assert_eq!(sink.snapshot().len(), 1, "same-account churn stays silent");
+
+        // A different foreign account lands: news again.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with(
+                "at-mirror-3",
+                Some(future_expiry() + 10_800_000),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(leg(), None);
+        assert_eq!(
+            sink.snapshot().len(),
+            2,
+            "a different foreign login announces"
+        );
+        assert_eq!(leg(), None);
+        assert_eq!(sink.snapshot().len(), 2, "and it announces only once");
+    }
+
+    /// A profile that gains a session token leaves the adopt story entirely
+    /// (the refusal sites are unreachable behind the first gate), so a record
+    /// from its OAuth era must not outlive the regime switch: cleared here, a
+    /// later OAuth re-divergence announces fresh.
+    #[test]
+    fn a_session_token_regime_switch_clears_a_stale_refusal_record() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-regime";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .is_some(),
+            "the standing refusal is recorded"
+        );
+
+        // Regime switch: a long-lived session-token sidecar (no refresh
+        // token) engages the split, and the adopt gates stop applying.
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "static-mint".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(future_expiry() + 86_400_000),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "the OAuth-era record does not outlive the regime switch"
+        );
+    }
+
+    /// The unprovable refusal keys on the live account too: a different login
+    /// under the same anchorless state is a state change worth a line, while
+    /// the same login's token churn stays silent.
+    #[test]
+    fn a_different_login_under_an_unprovable_state_announces_again() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-unprovable-swap";
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror-2" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        let leg = || {
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            )
+        };
+
+        assert_eq!(leg(), None, "uuid-1 mirror is unprovable");
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // A different live login under the same anchorless state: news.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with(
+                "at-mirror-2",
+                Some(future_expiry() + 7_200_000),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(leg(), None);
+        assert_eq!(
+            sink.snapshot().len(),
+            2,
+            "a different login under the unprovable state announces"
+        );
+        assert_eq!(leg(), None);
+        assert_eq!(sink.snapshot().len(), 2, "and it announces only once");
     }
 
     #[test]
