@@ -5079,6 +5079,295 @@ mod env_editor {
             "no key and no empty value survive in settings.json: {settings}"
         );
     }
+
+    /// Escaping a just-added env entry removes the row (cancel semantics,
+    /// owner ruling 2026-09-02): the add only persisted an empty placeholder,
+    /// so backing out restores the pre-add state everywhere.
+    #[test]
+    fn escaping_a_just_added_env_entry_removes_the_row_everywhere() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let profile = Profile::new("acct".to_string(), None, None);
+        crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        let state = AppState {
+            active_profile: Some(name.clone()),
+            ..AppState::default()
+        };
+        let mut app = App::new(AppConfig {
+            state,
+            profiles: vec![profile],
+        });
+        enter_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_new_key = InputState::new("FOO");
+            d.active = Some(ConfigRow::EnvAdd);
+        }
+        super::super::commit_env_new_key(&mut app);
+
+        // The add persists the empty placeholder to both files — the seed the
+        // escape's strip must actually remove, not an empty fixture.
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("FOO").cloned()),
+            Some(String::new()),
+            "the add persists the empty placeholder for the value editor"
+        );
+        let cfg_path =
+            crate::profile::profile_subpath(&name, "config.toml").expect("config.toml path");
+        assert!(
+            std::fs::read_to_string(&cfg_path)
+                .expect("read config.toml")
+                .contains("FOO"),
+            "the placeholder is on disk before the escape"
+        );
+        let settings_path = crate::profile::claude_dir()
+            .expect("claude dir")
+            .join("settings.json");
+        let env_block = || {
+            let settings: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&settings_path).expect("read settings.json"),
+            )
+            .expect("settings.json parses");
+            settings
+                .get("env")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .expect("settings.json has an env object")
+        };
+        assert!(
+            env_block().contains_key("FOO"),
+            "the live settings hold the key before the escape"
+        );
+
+        super::super::cancel_config_edit(&mut app, ConfigRow::EnvEntry(0));
+
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("FOO").cloned()),
+            None,
+            "the just-added entry is gone from the in-memory profile"
+        );
+        assert!(
+            app.config_draft.as_ref().and_then(|d| d.active).is_none(),
+            "the escape ends the value edit"
+        );
+        let cfg_text = std::fs::read_to_string(&cfg_path).expect("read config.toml");
+        assert!(
+            !cfg_text.contains("FOO"),
+            "no key and no empty value survive in config.toml: {cfg_text}"
+        );
+        assert!(
+            !env_block().contains_key("FOO"),
+            "no key and no empty value survive in settings.json: {:?}",
+            env_block()
+        );
+    }
+
+    /// Escape on an EXISTING entry discards the edit only: the saved value
+    /// survives in memory, on disk, and in the live settings, even when the
+    /// operator had emptied the buffer — the remove must key on the just-added
+    /// state, never on an empty buffer.
+    #[test]
+    fn escape_on_an_existing_env_entry_keeps_the_saved_value() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar".to_string());
+        let mut profile = Profile::new("acct".to_string(), None, None);
+        profile.env = env;
+        crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        crate::claude::apply_profile_to_claude_settings(&profile, &[])
+            .expect("seed the live settings");
+        let state = AppState {
+            active_profile: Some(name.clone()),
+            ..AppState::default()
+        };
+        let mut app = App::new(AppConfig {
+            state,
+            profiles: vec![profile],
+        });
+        enter_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            // The operator emptied the buffer — escape must discard that edit.
+            d.env_value = InputState::new("");
+            d.active = Some(ConfigRow::EnvEntry(0));
+        }
+        super::super::cancel_config_edit(&mut app, ConfigRow::EnvEntry(0));
+
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("FOO").cloned()),
+            Some("bar".to_string()),
+            "the existing entry keeps its saved value in memory"
+        );
+        assert_eq!(
+            app.config_draft
+                .as_ref()
+                .map(|d| d.env_value.trimmed().to_string()),
+            Some("bar".to_string()),
+            "the buffer reseeds from the saved value"
+        );
+        let cfg_path =
+            crate::profile::profile_subpath(&name, "config.toml").expect("config.toml path");
+        let cfg_text = std::fs::read_to_string(&cfg_path).expect("read config.toml");
+        assert!(
+            cfg_text.contains("FOO"),
+            "the existing entry stays in config.toml: {cfg_text}"
+        );
+        let settings_path = crate::profile::claude_dir()
+            .expect("claude dir")
+            .join("settings.json");
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).expect("read settings.json"),
+        )
+        .expect("settings.json parses");
+        let env_block = settings
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .expect("settings.json has an env object");
+        assert_eq!(
+            env_block.get("FOO").and_then(serde_json::Value::as_str),
+            Some("bar"),
+            "the existing entry keeps its value in the live settings: {settings}"
+        );
+    }
+
+    /// The just-added cancel arms only until the entry's own value commit:
+    /// after committing a value, an escape is the plain edit-cancel and must
+    /// keep the committed value (the disarm in `commit_env_value`).
+    #[test]
+    fn escape_after_a_value_commit_keeps_the_committed_value() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let profile = Profile::new("acct".to_string(), None, None);
+        crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        let state = AppState {
+            active_profile: Some(name.clone()),
+            ..AppState::default()
+        };
+        let mut app = App::new(AppConfig {
+            state,
+            profiles: vec![profile],
+        });
+        enter_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_new_key = InputState::new("FOO");
+            d.active = Some(ConfigRow::EnvAdd);
+        }
+        super::super::commit_env_new_key(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_value = InputState::new("qux");
+        }
+        super::super::commit_env_value(&mut app, 0);
+
+        // Re-open the entry's editor and escape: the commit disarmed the
+        // just-added cancel, so the generic cancel runs and keeps "qux".
+        super::super::run_config_row(&mut app, ConfigRow::EnvEntry(0));
+        super::super::cancel_config_edit(&mut app, ConfigRow::EnvEntry(0));
+
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("FOO").cloned()),
+            Some("qux".to_string()),
+            "the committed value survives the escape in memory"
+        );
+        assert_eq!(
+            app.config_draft
+                .as_ref()
+                .map(|d| d.env_value.trimmed().to_string()),
+            Some("qux".to_string()),
+            "the buffer reseeds from the committed value"
+        );
+        let cfg_path =
+            crate::profile::profile_subpath(&name, "config.toml").expect("config.toml path");
+        let cfg_text = std::fs::read_to_string(&cfg_path).expect("read config.toml");
+        assert!(
+            cfg_text.contains("FOO") && cfg_text.contains("qux"),
+            "the committed entry stays in config.toml: {cfg_text}"
+        );
+        let settings_path = crate::profile::claude_dir()
+            .expect("claude dir")
+            .join("settings.json");
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&settings_path).expect("read settings.json"),
+        )
+        .expect("settings.json parses");
+        let env_block = settings
+            .get("env")
+            .and_then(serde_json::Value::as_object)
+            .expect("settings.json has an env object");
+        assert_eq!(
+            env_block.get("FOO").and_then(serde_json::Value::as_str),
+            Some("qux"),
+            "the committed entry keeps its value in the live settings: {settings}"
+        );
+    }
+
+    /// A failed cancel-persist restores the placeholder into memory (the Err
+    /// arm of `cancel_just_added_env`): `edit_profile_env` mutates the profile
+    /// before its disk writes, so without the restore memory would drop the
+    /// key the disk still holds and the retry's index lookup would miss the
+    /// row it cancelled.
+    #[test]
+    fn a_failed_cancel_persist_restores_the_placeholder_for_retry() {
+        let _home = HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("acct");
+        let profile = Profile::new("acct".to_string(), None, None);
+        crate::profile::save_profile(&profile).expect("seed the profile on disk");
+        let state = AppState {
+            active_profile: Some(name.clone()),
+            ..AppState::default()
+        };
+        let mut app = App::new(AppConfig {
+            state,
+            profiles: vec![profile],
+        });
+        enter_detail(&mut app);
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_new_key = InputState::new("FOO");
+            d.active = Some(ConfigRow::EnvAdd);
+        }
+        super::super::commit_env_new_key(&mut app);
+
+        // Block the config.toml write (a directory at its path makes the
+        // atomic rename fail), so the cancel's persist errors.
+        let cfg_path =
+            crate::profile::profile_subpath(&name, "config.toml").expect("config.toml path");
+        std::fs::remove_file(&cfg_path).expect("drop the seed config.toml");
+        std::fs::create_dir(&cfg_path).expect("block the config.toml path with a directory");
+
+        super::super::cancel_config_edit(&mut app, ConfigRow::EnvEntry(0));
+
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("FOO").cloned()),
+            Some(String::new()),
+            "a failed persist restores the placeholder in memory"
+        );
+        assert_eq!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.env_just_added.as_deref()),
+            Some("FOO"),
+            "the cancel stays armed for the retry"
+        );
+
+        // Lift the block; the retry finds the same row and removes it.
+        std::fs::remove_dir(&cfg_path).expect("lift the block");
+        super::super::cancel_config_edit(&mut app, ConfigRow::EnvEntry(0));
+        assert_eq!(
+            app.config()
+                .find(&name)
+                .and_then(|p| p.env.get("FOO").cloned()),
+            None,
+            "the retry removes the just-added entry"
+        );
+    }
 }
 
 /// The action menu's rotate/refresh gate is credential typing, not endpoint

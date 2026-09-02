@@ -386,6 +386,11 @@ pub(crate) struct ConfigDraft {
     pub(crate) env_value: InputState,
     /// Key buffer for the `+ add env` row's key editor.
     pub(crate) env_new_key: InputState,
+    /// Key of an env entry added this draft whose value has had no commit
+    /// since the add. Escape on that entry's editor removes the row (cancel
+    /// semantics) instead of keeping the empty placeholder; any value commit
+    /// on the key clears it.
+    pub(crate) env_just_added: Option<String>,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
     /// The account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
@@ -6352,6 +6357,7 @@ fn build_draft_new() -> ConfigDraft {
         subagent_model: InputState::new(""),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
+        env_just_added: None,
         active: None,
         armed_action: None,
         relogin_chain: false,
@@ -6377,6 +6383,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
+        env_just_added: None,
         active: None,
         armed_action: None,
         relogin_chain: false,
@@ -7021,12 +7028,34 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
 
 /// ⎋ inside a field: existing accounts revert from the live profile;
 /// new drafts keep the typed value. Either way, editing ends.
+///
+/// Escape on a just-added env entry removes the row instead: the add only
+/// persisted an empty placeholder, so backing out restores the pre-add state.
 fn cancel_config_edit(app: &mut App, field: ConfigRow) {
     let editing_name = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
         .map(ProfileName::from);
+    if let Some(name) = editing_name.clone() {
+        let just_added = app
+            .config_draft
+            .as_ref()
+            .and_then(|d| d.env_just_added.clone());
+        if let (Some(added), ConfigRow::EnvEntry(i)) = (just_added, field) {
+            let key = {
+                let cfg = app.config();
+                cfg.find(&name).and_then(|p| p.env.keys().nth(i).cloned())
+            };
+            // Keyed on the just-added state, never on an empty buffer: an
+            // existing entry the operator is merely editing empty must keep
+            // its saved value.
+            if key.as_deref() == Some(added.as_str()) {
+                cancel_just_added_env(app, &name, &added);
+                return;
+            }
+        }
+    }
     if let Some(name) = editing_name {
         let value = {
             let cfg = app.config();
@@ -7043,6 +7072,58 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
         // current field.
         d.relogin_chain = false;
         d.active = None;
+    }
+}
+
+/// Escape on a just-added env entry: drop the placeholder and persist through
+/// [`edit_profile_env`] — the same writer the value-commit unset uses — so the
+/// active profile's live settings lose the key too. On a failed persist the
+/// editor and the flag stay, so a retry still removes the row.
+fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
+    let new_env = {
+        let cfg = app.config();
+        cfg.find(name).map(|p| {
+            let mut env = p.env.clone();
+            env.remove(key);
+            env
+        })
+    };
+    let Some(new_env) = new_env else {
+        // The profile vanished from the in-memory config (an out-of-band
+        // delete/rename); disarm the cancel and end the edit instead of
+        // leaving the editor stuck open with a zombie flag.
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_just_added = None;
+            d.active = None;
+        }
+        return;
+    };
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_env(&mut cfg, name, new_env)
+    };
+    match result {
+        Ok(()) => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.env_just_added = None;
+                d.env_value = InputState::new("");
+                d.active = None;
+            }
+        }
+        Err(e) => {
+            // `edit_profile_env` mutates the in-memory profile BEFORE its
+            // disk writes, so a failed persist leaves memory without the key
+            // while the placeholder stays on disk — put it back so memory
+            // matches disk and a retry's index lookup finds the same row it
+            // cancelled.
+            {
+                let mut cfg = app.config();
+                if let Some(p) = cfg.find_mut(name) {
+                    p.env.insert(key.to_string(), String::new());
+                }
+            }
+            app.toast(ToastKind::Danger, format!("env update failed\n{e}"))
+        }
     }
 }
 
@@ -7300,11 +7381,15 @@ fn commit_env_value(app: &mut App, i: usize) {
         .as_ref()
         .map(|d| d.env_value.trimmed().to_string())
         .unwrap_or_default();
+    let key = {
+        let cfg = app.config();
+        cfg.find(&name).and_then(|p| p.env.keys().nth(i).cloned())
+    };
     let new_env = {
         let cfg = app.config();
         cfg.find(&name).map(|p| {
             let mut env = p.env.clone();
-            if let Some(key) = p.env.keys().nth(i).cloned() {
+            if let Some(key) = key.clone() {
                 if value.is_empty() {
                     // Unset, not blank: `edit_profile_env` strips the dropped
                     // key from the live settings on its own (prev-key removal).
@@ -7339,6 +7424,12 @@ fn commit_env_value(app: &mut App, i: usize) {
                     .unwrap_or_default()
             };
             if let Some(d) = app.config_draft.as_mut() {
+                if d.env_just_added.as_deref() == key.as_deref() {
+                    // A value commit resolves the just-added state: the entry
+                    // is either kept with its value or dropped by the unset
+                    // gate above — either way the cancel arm disarms.
+                    d.env_just_added = None;
+                }
                 d.env_value = InputState::new(&saved);
                 d.active = None;
             }
@@ -7424,6 +7515,11 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
         } {
             app.toast(ToastKind::Danger, format!("env update failed\n{e}"));
             return;
+        }
+        // The add persisted an empty placeholder; arm the cancel so an escape
+        // in the value editor removes the row instead of keeping `key = ""`.
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_just_added = Some(key.to_string());
         }
     }
     let idx = {
