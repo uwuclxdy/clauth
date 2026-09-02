@@ -447,6 +447,11 @@ impl Profile {
     /// discovered usage is cached the same way: `third_party_entry_for` builds a
     /// `ThirdPartyTarget::Generic` whenever `provider` is `None` and a
     /// `base_url` is set, so that leg genuinely fetches and caches for it.
+    /// A stored pair with an env token serving inference and nothing that leg
+    /// could fetch with answers false: the chain feeds usage polling for such
+    /// an account (the env-token account's inference spends on the token
+    /// while the pair serves usage), and the OAuth leg writes the figures
+    /// this reader should read.
     /// Keying a reader on [`Profile::is_third_party`] instead answers a
     /// DIFFERENT question and renders a generic account, refreshed hourly, as
     /// never fetched.
@@ -455,6 +460,8 @@ impl Profile {
             self.provider,
             self.base_url.as_deref(),
             self.api_key.as_deref(),
+            self.credentials.is_some(),
+            &self.env,
         )
     }
 
@@ -1929,14 +1936,29 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// The managed endpoint a profile actually routes to, given what its
 /// `config.toml` stores and whether it holds an OAuth pair.
 ///
-/// The OAuth-bearer leak needs BOTH a stored pair AND no api key: CC would send
-/// that bearer to the third-party base_url. Gate on the pair so a PURE api
-/// account (no pair) with a cleared key keeps its base_url shell and stays
-/// re-loginable (`clear_profile_api_key`). Normalized at the LOAD boundary, same
-/// discipline as the `max_auto_spend` case. This governs the managed base_url
-/// FIELD only: clauth never copies `ANTHROPIC_BASE_URL` into `profile.env`, so an
-/// env override is always operator-authored and is never normalized here —
-/// normalize the state clauth authors, not an explicit one.
+/// The OAuth-bearer leak needs BOTH a stored pair AND no other inference
+/// auth: with nothing else, CC would send that bearer to the third-party
+/// base_url. Gate on the pair so a PURE api account (no pair) with a cleared
+/// key keeps its base_url shell and stays re-loginable
+/// (`clear_profile_api_key`). An `[env] ANTHROPIC_AUTH_TOKEN` /
+/// `ANTHROPIC_API_KEY` entry counts too, the same env reading
+/// [`crate::claude::has_inference_auth`] applies: the settings writer clears
+/// its own token and applies `profile.env` LAST, so the env token is what the
+/// spawned process authenticates with and the bearer never reaches the
+/// endpoint. Both boundaries must count the same ENV shapes — the preserve
+/// arm (`actions::overwrite_captured_profile`) keys on
+/// [`crate::claude::has_own_inference_endpoint`], which is built on
+/// [`crate::claude::has_inference_auth`], so an endpoint that predicate
+/// preserves must survive the load. The api-key halves deliberately differ:
+/// the preserve side validates the key ([`crate::claude::validate_api_key`],
+/// the test that wires the `apiKeyHelper`), while this keeps a trim-non-empty
+/// key so the CLI's keyless-refusal surface has an endpoint to name its fix
+/// (`rolling_token_on_a_flagged_third_party_hybrid_names_the_split_state`).
+/// Normalized at the LOAD boundary, same discipline as the `max_auto_spend`
+/// case. This governs the managed base_url FIELD only: clauth never copies
+/// `ANTHROPIC_BASE_URL` into `profile.env`, so an env override is always
+/// operator-authored and is never normalized here — normalize the state
+/// clauth authors, not an explicit one.
 ///
 /// "Never normalized" is not "never read". An env override still ROUTES the
 /// account (`build_claude_settings_json` applies `profile.env` last), so a
@@ -1944,38 +1966,72 @@ fn console_config(cred: Option<&ConsoleCredential>) -> ConsoleConfig {
 /// both sources. This function alone answers only the managed half, which is
 /// why a `None` from it does not mean Anthropic.
 ///
-/// One rule, three readers: [`load_profile`],
-/// [`stored_usage_cache_is_third_party`], which answers the same question
-/// without the side effects, and [`stored_endpoint`]'s managed half.
+/// One rule, four readers: [`load_profile`], and
+/// [`stored_usage_cache_is_third_party`], [`stored_provider`] and
+/// [`stored_endpoint`]'s managed half, which answer the same question without
+/// the side effects.
 fn effective_base_url(
     configured: Option<String>,
     has_credentials: bool,
     api_key: Option<&str>,
+    env: &BTreeMap<String, String>,
 ) -> Option<String> {
     let has_usable_key = api_key.map(str::trim).is_some_and(|k| !k.is_empty());
+    let has_env_token = env_has_inference_token(env);
     match configured {
-        Some(_) if has_credentials && !has_usable_key => None,
+        Some(_) if has_credentials && !has_usable_key && !has_env_token => None,
         other => other,
     }
 }
 
+/// Whether `env` carries an inference auth token: the env half of
+/// [`crate::claude::has_inference_auth`] — the predicate the preserve arm's
+/// gate ([`crate::claude::has_own_inference_endpoint`]) is built on — spelled
+/// at the load boundary, same keys, same trimmed-non-empty test, so the env
+/// halves cannot drift apart again. The one load-side spelling, shared by the
+/// two load-side predicates that count it ([`effective_base_url`] and
+/// [`usage_cache_is_third_party`]).
+fn env_has_inference_token(env: &BTreeMap<String, String>) -> bool {
+    ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"]
+        .iter()
+        .any(|k| env.get(*k).map(|v| v.trim()).is_some_and(|v| !v.is_empty()))
+}
+
 /// Whether an account's usage figures live in `third_party_cache.json` rather
-/// than the OAuth `usage_cache.json`, given the three stored fields that decide
-/// it. THE answer to "which cache holds this account's figures": every reader of
+/// than the OAuth `usage_cache.json`, given the stored fields that decide it.
+/// THE answer to "which cache holds this account's figures": every reader of
 /// a cached figure asks this, and [`load_profile`]'s own seeding branch — the
 /// step that decides whether a `Profile` carries `third_party_usage` at all — is
 /// the producer, so it calls this rather than spelling the rule again.
 ///
 /// A recognised provider, or a generic api-key endpoint whose discovered usage
-/// the same leg caches. `api_key.is_some()` rather than a trimmed-non-empty
-/// test, deliberately: whether a blank key can AUTHENTICATE a fetch
-/// (`third_party_credentialed`) is a different question from where the figures
-/// would be written.
+/// the same leg caches. A stored pair with an env token serving inference and
+/// nothing the third-party leg could fetch with answers OAuth-cache instead:
+/// the chain is what feeds usage polling for such an account (the ruling's
+/// model — the env-token account's inference spends on the token while the
+/// pair serves usage), and a third-party reading would point every usage
+/// surface at a cache nothing writes. Scoped to the env-token shape: a
+/// pair+provider hybrid with no key and no env token keeps the provider arm
+/// (pinned by the `which` tier test and the TUI's hybrid typing), however
+/// unreachable that shape is past the load boundary, which drops its endpoint
+/// for the bearer leak. The fetchability test mirrors
+/// [`crate::usage::third_party_credentialed`], the fetch leg's own gate,
+/// spelled off the fields because the lock-free readers hold no [`Profile`].
+/// `api_key.is_some()` rather than a trimmed-non-empty test for the generic
+/// disjunct, deliberately: whether a blank key can AUTHENTICATE a fetch is a
+/// different question from where the figures would be written.
 fn usage_cache_is_third_party(
     provider: Option<Provider>,
     base_url: Option<&str>,
     api_key: Option<&str>,
+    has_credentials: bool,
+    env: &BTreeMap<String, String>,
 ) -> bool {
+    let fetchable = matches!(provider, Some(Provider::Alibaba))
+        || api_key.map(str::trim).is_some_and(|k| !k.is_empty());
+    if has_credentials && !fetchable && env_has_inference_token(env) {
+        return false;
+    }
     provider.is_some() || (base_url.is_some() && api_key.is_some())
 }
 
@@ -1997,12 +2053,18 @@ fn usage_cache_is_third_party(
 /// [`effective_base_url`] then KEEPS a `base_url` that a full load would drop
 /// (the pair would reach the endpoint), so this answers `true` where
 /// `load_profile` answers `false`, and a reader watches
-/// `third_party_cache.json` for what is really an OAuth account. Only the
+/// `third_party_cache.json` for what is really an OAuth account. An env-token
+/// profile keeps the ENDPOINT on both readers (the pair never reaches it),
+/// but the classification still disagrees: this read sees no pair and answers
+/// third-party where the adopting load answers OAuth-cache. Only the
 /// callers that skip the full load — [`crate::mcp::digest`]'s sample and
 /// [`crate::profile_json::published_windows`] — can observe it; every other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
 /// and it costs at most one digest call reporting no refresh. Pinned, in that
-/// direction, by `the_lock_free_third_party_read_agrees_with_a_full_load`.
+/// direction, by
+/// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
+/// spellings), and pinned agreeing everywhere else by
+/// `the_lock_free_third_party_read_agrees_with_a_full_load`.
 pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
     let Ok(config_path) = profile_config_path(name) else {
         return false;
@@ -2014,11 +2076,18 @@ pub(crate) fn stored_usage_cache_is_third_party(name: &ProfileName) -> bool {
         return false;
     };
     let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
-    let base_url = effective_base_url(config.base_url, has_credentials, config.api_key.as_deref());
+    let base_url = effective_base_url(
+        config.base_url,
+        has_credentials,
+        config.api_key.as_deref(),
+        &config.env,
+    );
     usage_cache_is_third_party(
         base_url.as_deref().and_then(Provider::from_base_url),
         base_url.as_deref(),
         config.api_key.as_deref(),
+        has_credentials,
+        &config.env,
     )
 }
 
@@ -2042,7 +2111,12 @@ pub(crate) fn stored_provider(name: &ProfileName) -> Option<Provider> {
         return None;
     };
     let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
-    let base_url = effective_base_url(config.base_url, has_credentials, config.api_key.as_deref());
+    let base_url = effective_base_url(
+        config.base_url,
+        has_credentials,
+        config.api_key.as_deref(),
+        &config.env,
+    );
     base_url.as_deref().and_then(Provider::from_base_url)
 }
 
@@ -2096,7 +2170,9 @@ pub(crate) enum StoredEndpoint {
 /// fails safe: a profile whose OAuth pair exists only as a staged
 /// `credentials.pending` sidecar reads here as having none, so
 /// [`effective_base_url`] KEEPS a `base_url` a full load would drop and the
-/// caller qualifies a figure it need not have.
+/// caller qualifies a figure it need not have. A profile whose `[env]` carries
+/// an auth token keeps the endpoint on both readers, so the divergence is the
+/// no-env-auth shape alone.
 pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
     let Ok(config_path) = profile_config_path(name) else {
         return StoredEndpoint::Unknown;
@@ -2116,7 +2192,12 @@ pub(crate) fn stored_endpoint(name: &ProfileName) -> StoredEndpoint {
         return StoredEndpoint::Custom(url.to_string());
     }
     let has_credentials = profile_credentials_path(name).is_ok_and(|p| p.exists());
-    match effective_base_url(config.base_url, has_credentials, config.api_key.as_deref()) {
+    match effective_base_url(
+        config.base_url,
+        has_credentials,
+        config.api_key.as_deref(),
+        &config.env,
+    ) {
         Some(url) => StoredEndpoint::Custom(url),
         None => StoredEndpoint::Anthropic,
     }
@@ -2149,20 +2230,26 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         config.base_url,
         credentials.is_some(),
         config.api_key.as_deref(),
+        &config.env,
     );
 
     let provider = base_url.as_deref().and_then(Provider::from_base_url);
     // Seed third-party usage from disk for every account whose figures live in
     // that cache — the predicate is named there so no reader has to restate it.
-    let third_party_usage =
-        if usage_cache_is_third_party(provider, base_url.as_deref(), config.api_key.as_deref()) {
-            crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
-                name,
-                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-            )
-        } else {
-            None
-        };
+    let third_party_usage = if usage_cache_is_third_party(
+        provider,
+        base_url.as_deref(),
+        config.api_key.as_deref(),
+        credentials.is_some(),
+        &config.env,
+    ) {
+        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+            name,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        )
+    } else {
+        None
+    };
 
     let profile = Profile {
         name: name.clone(),

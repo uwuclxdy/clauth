@@ -682,9 +682,13 @@ fn non_finite_percent_fields_read_as_unset_at_load() {
 }
 
 /// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
-/// to it (pair present + no usable key). A pure api account with a cleared key
-/// keeps its base_url shell so `clear_profile_api_key` stays re-loginable — the
-/// same normalize-at-load discipline as `max_auto_spend`, scoped to the leak.
+/// to it (pair present + no usable key AND no env token — an
+/// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` env entry authenticates the
+/// spawned `claude`, so the bearer never reaches the endpoint; the same env
+/// reading `has_inference_auth` applies on the preserve side). A pure api
+/// account with a cleared key keeps its base_url shell so
+/// `clear_profile_api_key` stays re-loginable — the same normalize-at-load
+/// discipline as `max_auto_spend`, scoped to the leak.
 #[test]
 fn base_url_dropped_only_when_a_stored_pair_could_leak() {
     let _home = HomeSandbox::new();
@@ -750,6 +754,47 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
     assert!(
         keyed.provider.is_some(),
         "a keyed z.ai endpoint keeps its provider"
+    );
+
+    // An env token is the third credential shape the pair cannot leak through:
+    // the settings writer applies `profile.env` last, so the spawned claude
+    // authenticates with the token and the bearer never reaches the endpoint.
+    // The preserve arm counts this shape (`has_inference_auth`), so the load
+    // boundary must keep it too, or a preserved endpoint dies at the next load.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"env-bearer\"\n"),
+    )
+    .expect("write config");
+    let env_token = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert_eq!(
+        env_token.base_url.as_deref(),
+        Some(endpoint),
+        "an env token authenticates the endpoint, so the pair cannot leak"
+    );
+
+    // The `ANTHROPIC_API_KEY` env spelling counts the same way.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_API_KEY = \"env-key\"\n"),
+    )
+    .expect("write config");
+    let env_key = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert_eq!(env_key.base_url.as_deref(), Some(endpoint));
+
+    // A whitespace-only env token is no token, the same trim test the
+    // preserve side applies — the pair would still reach the endpoint.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"   \"\n"),
+    )
+    .expect("write config");
+    assert_eq!(
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .base_url,
+        None,
+        "a blank env token is no credential, so the pair would still leak"
     );
 }
 
@@ -839,12 +884,83 @@ fn the_lock_free_third_party_read_agrees_with_a_full_load() {
     );
 }
 
+/// The ruled preserve shape must keep reading the figures the chain feeds:
+/// an env-token account's inference spends on the token, and the pair serves
+/// usage polling — so the load boundary classifies it OAuth-cache even though
+/// the endpoint (and its provider) survive. The third-party leg can never
+/// fetch it (`third_party_credentialed` is api-key-only), so classifying it
+/// third-party would leave every usage surface reading a cache nothing
+/// writes, over the chain-fed figures the ruling assigns it.
+#[test]
+fn an_env_token_profile_with_a_stored_pair_reads_usage_from_the_chain_cache() {
+    let _home = HomeSandbox::new();
+    let name = "env-token-usage";
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let endpoint = "https://api.z.ai/anthropic";
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"env-bearer\"\n"),
+    )
+    .expect("write config");
+    std::fs::write(
+        &cred_path,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write credentials.json");
+
+    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert_eq!(
+        loaded.base_url.as_deref(),
+        Some(endpoint),
+        "fixture: the endpoint survives (the env token authenticates it)"
+    );
+    assert!(
+        loaded.provider.is_some(),
+        "fixture: the recognised provider derives from the surviving endpoint"
+    );
+    assert!(
+        !loaded.usage_cache_is_third_party(),
+        "the chain feeds usage polling for an env-token account, so the \
+         figures live in the OAuth cache"
+    );
+    assert!(
+        loaded.third_party_usage.is_none(),
+        "and the load seeds no third-party figures from a cache nothing writes"
+    );
+    assert!(
+        !stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(name)),
+        "the lock-free reader answers the same"
+    );
+
+    // The pairless env-token shape stays third-party: with no chain there are
+    // no chain figures, so the third-party reading — and its keyless hint — is
+    // what remains.
+    let _ = std::fs::remove_file(&cred_path);
+    let pairless = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert!(
+        pairless.usage_cache_is_third_party(),
+        "no chain means no chain figures, so the third-party reading (and its \
+         keyless hint) is the honest answer"
+    );
+}
+
 /// The one state the two readers do NOT agree on, pinned in its direction so it
 /// stays a known cost rather than a surprise: a pair staged as
 /// `credentials.json.pending` and never committed. The lock-free read stats the
 /// COMMITTED file only, so it sees no credentials, keeps the `base_url` that a
 /// full load would drop (the pair would otherwise reach the endpoint), and
-/// answers `true` where `load_profile` answers `false`.
+/// answers `true` where `load_profile` answers `false`. Both spellings are
+/// pinned in the same direction: with an env token the endpoint survives BOTH
+/// reads (the pair never reaches it) and the disagreement is the
+/// classification alone — the adopting load reads the chain cache, the stored
+/// read still answers third-party.
 ///
 /// Only the MCP digest's sample can observe it — every other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
@@ -885,6 +1001,50 @@ fn a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently() {
             .expect("load_profile")
             .usage_cache_is_third_party(),
         "the full load adopts the staged pair and drops the endpoint with it",
+    );
+
+    // The env-token spelling of the same state, in the same direction. Its own
+    // name: the first leg's adopt commits `credentials.json`, which would read
+    // as "has credentials" and there would be nothing to disagree about.
+    let env_name = "endpoint-staged-env";
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(env_name),
+    ))
+    .expect("save env profile");
+    let env_config = profile_subpath(&crate::profile::ProfileName::from(env_name), "config.toml")
+        .expect("env config path");
+    let env_pending = profile_subpath(
+        &crate::profile::ProfileName::from(env_name),
+        "credentials.json.pending",
+    )
+    .expect("env pending path");
+    std::fs::write(
+        &env_config,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"env-bearer\"\n"),
+    )
+    .expect("write env config");
+    std::fs::write(
+        &env_pending,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write env pending sidecar");
+
+    assert!(
+        stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(env_name)),
+        "the committed file is empty, so this read answers third-party",
+    );
+    let env_loaded =
+        load_profile(&crate::profile::ProfileName::from(env_name)).expect("load_profile");
+    assert_eq!(
+        env_loaded.base_url.as_deref(),
+        Some(endpoint),
+        "the env token keeps the endpoint on both readers — only the \
+         classification disagrees"
+    );
+    assert!(
+        !env_loaded.usage_cache_is_third_party(),
+        "the adopting load reads the chain cache, the same answer the ruled \
+         shape gets with a committed pair"
     );
 }
 

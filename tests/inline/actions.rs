@@ -1306,6 +1306,103 @@ fn browser_reauth_keeps_a_generic_endpoint_and_key() {
     );
 }
 
+/// The preserve arm and the load boundary must count the same credential
+/// shapes. The preserve gate (`has_own_inference_endpoint`) counts an
+/// `[env] ANTHROPIC_AUTH_TOKEN` as working inference auth; the load
+/// boundary's `effective_base_url` once counted only the api key, so an
+/// env-token profile kept its endpoint through the reauth and then had it
+/// nulled at the next `load_profile` — the freshly stored pair read as the
+/// bearer-leak shape. The ruled preserve outcome must hold DURABLY: this
+/// drives the whole shape end to end, preserve result first, then the load
+/// that must agree with it. Both env spellings `has_inference_auth` counts
+/// run the same drive, so the preserve arm's env half is pinned for each
+/// key, not just the one the defect was filed on.
+#[test]
+fn an_env_token_profiles_endpoint_survives_reauth_and_the_next_load() {
+    let _home = HomeSandbox::new();
+
+    for (name, env_key) in [
+        ("env-token", "ANTHROPIC_AUTH_TOKEN"),
+        ("env-api-key", "ANTHROPIC_API_KEY"),
+    ] {
+        let mut profile = Profile::new(
+            name.to_string(),
+            Some("http://127.0.0.1:4000".to_string()),
+            None,
+        );
+        profile
+            .env
+            .insert(env_key.to_string(), "env-bearer".to_string());
+        save_profile(&profile).expect("save profile");
+        assert_eq!(
+            config_provider_of(&profile),
+            None,
+            "fixture: the endpoint must be one clauth has no provider for, so \
+             the preserve gate cannot pass through provider recognition"
+        );
+
+        let mut config = AppConfig {
+            state: AppState {
+                profiles: vec![name.into()],
+                ..AppState::default()
+            },
+            profiles: vec![profile],
+        };
+
+        // A browser reauth snapshot: the minted pair, nothing else. The
+        // profile's inference auth is the env entry, so the endpoint must
+        // survive the overwrite (`has_own_inference_endpoint`).
+        overwrite_captured_profile(
+            &mut config,
+            &crate::profile::ProfileName::from(name),
+            CaptureSnapshot {
+                credentials: Some(ClaudeCredentials {
+                    claude_ai_oauth: Some(crate::profile::OAuthToken {
+                        access_token: "new-access".to_string(),
+                        refresh_token: Some("new-refresh".to_string()),
+                        expires_at: None,
+                        scopes: None,
+                        subscription_type: None,
+                    }),
+                }),
+                base_url: None,
+                api_key: None,
+                account_uuid: None,
+            },
+        )
+        .expect("reauth");
+
+        let after_reauth = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("profile");
+        assert_eq!(
+            after_reauth.base_url.as_deref(),
+            Some("http://127.0.0.1:4000"),
+            "[{env_key}] the env entry is working inference auth, so the \
+             preserve arm keeps the endpoint"
+        );
+
+        // The reauth stored a pair, so the next load reads pair + endpoint +
+        // no api key — and must still keep the endpoint, because the env
+        // entry, not the bearer, is what the spawned claude authenticates
+        // with.
+        let loaded = crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile");
+        assert_eq!(
+            loaded.base_url.as_deref(),
+            Some("http://127.0.0.1:4000"),
+            "[{env_key}] the load boundary counts the env entry too: the \
+             preserved endpoint must survive the next load_profile"
+        );
+        assert_eq!(
+            loaded.env.get(env_key).map(String::as_str),
+            Some("env-bearer"),
+            "the surviving credential shape is the env entry, not a key"
+        );
+        assert_eq!(loaded.api_key.as_deref(), None);
+    }
+}
+
 /// The provider a profile's endpoint resolves to, for a fixture control.
 fn config_provider_of(profile: &Profile) -> Option<crate::providers::Provider> {
     profile

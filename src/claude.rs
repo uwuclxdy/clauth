@@ -1773,6 +1773,12 @@ fn has_usable_api_key(profile: &Profile) -> bool {
 /// fetch predicate: that one treats Alibaba's console session as a credential,
 /// and the console session authenticates the quota gateway only, never
 /// inference. A keyless Alibaba profile fails THIS test.
+///
+/// The load boundary reads the same env half:
+/// `crate::profile`'s `effective_base_url` keeps a managed `base_url` behind a
+/// stored pair when an `[env]` auth entry is present, so an endpoint the
+/// preserve arm keeps (`has_own_inference_endpoint` below) survives the next
+/// `load_profile`. Change one and the other must follow.
 pub(crate) fn has_inference_auth(profile: &Profile) -> bool {
     has_usable_api_key(profile)
         || profile.env.iter().any(|(k, v)| {
