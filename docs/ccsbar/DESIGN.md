@@ -188,11 +188,22 @@ use `decodeIfPresent`; schema stays 1):
   moving off-slot); `fetch_status` reads `Fresh` on a live publish. Codex
   profiles are never members of `fallback_chain` (chains are per-harness).
 - per-profile `codex_rate_limit_reached` (CDX-4, codex-only, else `null`) —
-  codex's OWN limiter verdict from the session-log snapshot: which window
-  (`"primary"` = 5h, `"secondary"` = 7d) rejected the last request. Readers
-  cross-check the named window's `resets_at`: a lapsed window means the
-  verdict has expired (render no badge). Stronger than a percent heuristic —
+  codex's OWN limiter verdict: which window (`"primary"` = 5h, `"secondary"`
+  = 7d) rejected the last request — or, since the backend's 2026-09 shape, a
+  bare reason that names no window (`"rate_limit_reached"`,
+  `"workspace_owner_credits_depleted"`, …). Readers cross-check `resets_at`:
+  for a named window that window's, for a bare reason either window's — a
+  lapsed window means the verdict has expired (render no badge). A reader
+  that wants to NAME the window under a bare reason uses the percentages
+  (a live window at 100%), never a guess. Stronger than a percent heuristic —
   it is the daemon's codex-chain exhaustion input too.
+- per-profile `codex_reset_credits` (CDX-6, codex-only, else `null`) — banked
+  rate-limit reset credits (`rate_limit_reset_credits.available_count` on the
+  same `wham/usage` body the poll reads). `null` until a poll has carried a
+  count (older daemons, or no poll yet): render nothing, never "0 banked".
+  clauth READS the count and nothing more — redeeming is OpenAI's surface
+  (the Codex app's "Reset usage"); the redeem endpoint stays on the banned
+  list in `docs/codex-support/`.
 - top-level `codex_fallback_chain` (CDX-4) — the codex auto-switch order,
   same shape as `fallback_chain`; empty on codex-less installs. Codex chain
   members carry the same per-profile `fallback` block (`position` within the
