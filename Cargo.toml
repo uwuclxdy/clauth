@@ -12,16 +12,16 @@ categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache", "underline-color"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = { version = "1.0.150", features = ["preserve_order"] }
-toml = "1.1.2"
-anyhow = "1.0.103"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+toml = "1.1.4"
+anyhow = "1.0.104"
 dirs = "6.0.0"
-ureq = "3.3.0"
+ureq = "3.4.0"
 self-replace = "1.5.0"
 signal-hook = "0.4.4"
 tempfile = "3.27.0"
-libc = "0.2.186"
+libc = "0.2.189"
 sha2 = "0.11.0"
 minisign-verify = "0.2.5"
 # CSPRNG bytes for the OAuth PKCE code_verifier + state (already in the tree
@@ -30,48 +30,48 @@ getrandom = "0.4.3"
 # Echo-off prompt for the API key in `clauth login --base-url/--api-key`, so the
 # key never routes through argv / shell history / process listings. Cross-
 # platform; no transitive deps beyond libc (already in the tree).
-rpassword = "7"
+rpassword = "7.5.4"
 # Local wall-clock stamps on the TUI's reset countdowns (`resets in 40m
 # (21:20)`, issue #39) — std has no timezone. chrono already compiles in the
 # tree via rmcp → schemars; only the `clock` feature is new, which adds
 # `iana-time-zone` for the zone lookup. Its `unsafe` stays inside chrono.
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
-rmcp = { version = "3.1.2", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.2.0", features = ["server", "macros", "transport-io"] }
 # Filesystem event watcher — drives credential/config reconcile off inotify /
 # FSEvents instead of wall-clock polling. Non-recursive watches only.
-notify = { version = "7", default-features = false, features = ["macos_fsevent"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 # Multi-producer multi-consumer channels with select!. Already pulled in as a
 # transitive dep of notify; pinned here so the watchdog loop can use
 # crossbeam_channel::select! to multiplex events, fallback timer, and shutdown.
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.16"
 # `time` is what `enable_all()` needs to arm the timer rmcp's service loop
 # starts — without it the MCP server panics right after its first reply. It
 # reaches the graph transitively via rmcp → tokio-util today; pinned here so a
 # dependency dropping it fails the build instead of the stdio session.
-tokio = { version = "1.52.3", features = ["rt", "io-std", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "io-std", "time"] }
 # `CancellationToken` — the type rmcp puts on `RequestContext.ct` and fires when
 # a client sends `notifications/cancelled`. rmcp awaits the tool handler bare
 # rather than racing it against that token, so `monitor`'s wait loops have to
 # read it themselves or an abandoned call runs out its full hour. Already in the
 # tree via rmcp → tokio-util; named here because the type is now in clauth's own
 # signatures. No default features: `sync` is unconditional.
-tokio-util = { version = "0.7.18", default-features = false }
+tokio-util = { version = "0.7.19", default-features = false }
 regex = "1.13.1"
 # CLI grammar + generated help. `wrap_help` is what keeps the command table and
 # the per-subcommand prose wrapping to the real terminal width instead of the
 # hand-padded block it replaced; it adds only `terminal_size` (rustix is already
 # in the tree via crossterm).
-clap = { version = "4.6.4", features = ["derive", "wrap_help"] }
+clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
 # agentgear `PluginHost` derive + lifecycle: the Plugin tab's one-key install and
 # the SessionStart self-heal hook drive `claude plugin` through it instead of a
 # copy-paste hint. Default features (derive + claude + embed) are exactly the
 # claude-only host clauth is; the embedded tree is the committed `plugins/` dir.
-agentgear = "0.1"
+agentgear = "0.1.2"
 
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/
 # plugin.json` and CARGO_PKG_VERSION disagree (CC caches on that version).
-agentgear = "0.1"
+agentgear = "0.1.2"
 
 [dev-dependencies]
 # `test-util` alone, for `Builder::start_paused`. The blocking `delegate`'s
@@ -80,12 +80,12 @@ agentgear = "0.1"
 # scheduler for an exact tick count; a paused clock makes the same assertion
 # exact and instant. No new crate — tokio is already a dependency above — and
 # resolver 3 keeps a dev-dependency's features out of the normal build.
-tokio = { version = "1.52.3", features = ["test-util"] }
+tokio = { version = "1.53.1", features = ["test-util"] }
 
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.
 [target.'cfg(windows)'.dependencies]
-which = "8"
+which = "8.0.6"
 
 [profile.release]
 opt-level = 3

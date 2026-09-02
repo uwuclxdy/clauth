@@ -1425,7 +1425,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
             // so the run went on as a background job instead of throwing its
             // result away.
             //
-            // This reply is never sent: rmcp (3.1.2, `service.rs`) removes the
+            // This reply is never sent: rmcp (3.2.0, `service.rs`) removes the
             // request from `local_ct_pool` when the `notifications/cancelled`
             // arrives, and the response path drops any message whose id is no
             // longer in that pool — "dropping response for cancelled request" —

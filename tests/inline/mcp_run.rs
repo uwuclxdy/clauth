@@ -1995,7 +1995,7 @@ fn return_on_all_waits_for_the_slowest_lane_and_any_does_not() {
 
 /// A client that abandons a call sends `notifications/cancelled`, and rmcp
 /// cancels `RequestContext.ct` — it does NOT abort the handler future, which it
-/// awaits bare (rmcp 3.1.2 `service.rs`). So every wait loop has to race its own
+/// awaits bare (rmcp 3.2.0 `service.rs`). So every wait loop has to race its own
 /// sleep against the token, or an abandoned `monitor` leaks for the full ceiling
 /// this slice raised to an hour, emitting notifications at a torn-down request
 /// id the whole time.
