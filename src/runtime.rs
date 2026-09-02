@@ -2274,7 +2274,7 @@ impl ProfileRuntime {
         follows_chain: bool,
     ) -> Result<Self> {
         Self::acquire_synced(
-            profile,
+            &profile.name,
             isolation,
             stale_env_keys,
             follows_chain,
@@ -2288,17 +2288,26 @@ impl ProfileRuntime {
     /// `claude::arm_rolling_from_disk_synced` already uses.
     ///
     /// `pre_lock_done` runs after the rotation guard and immediately before the
-    /// state flock, for the regression test that removes the account's record
-    /// there, so "the gate reads the record from INSIDE the hold" is pinned by
-    /// construction rather than by a thread race nothing can schedule.
+    /// state flock, for the regression tests that pose the window there — a
+    /// record removal, and a profile-field edit — so "the gate reads the record
+    /// from INSIDE the hold" and "the tree is fed the re-read copy" are each
+    /// pinned by construction rather than by a thread race nothing can
+    /// schedule.
     ///
-    /// It poses ONE window — a record removal between the rotation guard and the
-    /// flock acquisition — and a second thread cannot pose that one, because a
-    /// same-version mutation is refused by the rotation guard rather than queued
-    /// behind it (see `refuse_if_unconfigured`). It says nothing about the
-    /// narrower window on the other side of the flock acquisition; that one wants
-    /// a thread holding the flock, and the `debug_assert!` in
-    /// `refuse_if_unconfigured` is what covers it today.
+    /// Each poses ONE window — a record removal, or a profile-field edit —
+    /// between the rotation guard and the flock acquisition. What shuts each
+    /// window differs, and the difference is why the edit test exists at all:
+    /// a same-version REMOVAL cannot be posed from a second thread, because
+    /// delete/rename `try_acquire` the rotation guard and give up rather than
+    /// queue (see `refuse_if_unconfigured`), while a field edit persists
+    /// through `save_profile` under the state flock alone and never touches
+    /// the rotation guard — so a concurrent edit is ordinary, not exotic, and
+    /// the thing that keeps it off a session is the in-hold re-read below,
+    /// serialized against that same flock. Neither seam can pose the narrower
+    /// window on the other side of the flock acquisition — that one wants a
+    /// thread holding the flock — so placement is pinned by `debug_assert!`s
+    /// instead: `refuse_if_unconfigured`'s for the gate, the re-read's own
+    /// for the field copy.
     ///
     /// `stamp_window_closing` and `hold_released` are the two halves of the
     /// shortened hold's pin, and they are separate because one question can only be
@@ -2323,7 +2332,7 @@ impl ProfileRuntime {
     /// artifacts are pinned inside the closure — restoring the long hold makes it
     /// see the lock HELD wherever it sits.
     fn acquire_synced(
-        profile: &Profile,
+        name: &ProfileName,
         isolation: Isolation,
         stale_env_keys: &[String],
         follows_chain: bool,
@@ -2331,7 +2340,6 @@ impl ProfileRuntime {
         stamp_window_closing: impl FnOnce(&SessionPaths, &SessionId),
         hold_released: impl FnOnce(),
     ) -> Result<Self> {
-        let name = &profile.name;
         let claude_home = claude_dir()?;
         if !claude_home.exists() {
             anyhow::bail!("~/.claude not found; install Claude Code first");
@@ -2354,10 +2362,31 @@ impl ProfileRuntime {
         let rotation_guard = RotationGuard::acquire_with_timeout(name, rotation_lock_timeout())?;
         pre_lock_done();
 
-        let (session, paths, pid_lock, legacy_lock, mode) = with_state_lock(|_held| {
+        let (session, paths, pid_lock, legacy_lock, mode, fresh) = with_state_lock(|_held| {
             // Inside the hold, and ahead of every write this closure does — see
             // `refuse_if_unconfigured` for which mechanism each half buys.
             refuse_if_unconfigured(name)?;
+            // The record passed the gate; now re-read its FIELDS from disk,
+            // inside the same hold: `acquire_synced` carries only the name, so
+            // this is the one copy a base_url/api_key/env/models edit cannot
+            // slip past — the caller's profile predates the rotation-guard
+            // wait above, and an edit landing in that window must feed this
+            // session's tree from here.
+            //
+            // `load_profile` can WRITE under this hold: it adopts a
+            // `credentials.json.pending` sidecar a crashed rotation left, and
+            // rewrites a semantically-drifted config.toml. Both are safe here —
+            // each re-enters the state flock on the designed reentrant path
+            // (`live_sessions::register` takes the same one below), and neither
+            // fires on an ordinary start, only on a crashed rotation's residue
+            // or a hand-edited config.
+            debug_assert!(
+                crate::lockorder::holds::<crate::lockorder::rank::State>(),
+                "the profile-field re-read must happen under the state flock, \
+                 or a field edit serialized on that flock can land between the \
+                 read and the tree it feeds"
+            );
+            let fresh = crate::profile::load_profile(name)?;
             // The transport is probed FIRST: under `LinkMode::Fake` the tree is
             // shared under the bare stem, so the mode decides every path below.
             // The profile dir is the probe site because it exists independently
@@ -2426,7 +2455,7 @@ impl ProfileRuntime {
             build_runtime_dir_with_active_env(
                 runtime,
                 &claude_home,
-                profile,
+                &fresh,
                 &canonical,
                 mode,
                 isolation,
@@ -2486,7 +2515,7 @@ impl ProfileRuntime {
                 logline!("clauth: registering the live session failed: {e}");
             }
             stamp_window_closing(&paths, &session);
-            Ok::<_, anyhow::Error>((session, paths, file, legacy_lock, mode))
+            Ok::<_, anyhow::Error>((session, paths, file, legacy_lock, mode, fresh))
         })?;
         // Released at the end of the register-and-stamp window rather than at the
         // end of this function, so a queued peer waits out that window and not the
@@ -2541,8 +2570,11 @@ impl ProfileRuntime {
         // Built from `paths` rather than from locals moved out of it, so the
         // runtime dir the swap repoints and the marker it must recognize as its
         // own come from one source.
+        // Built from the re-read under the flock, not the caller's borrow: the
+        // launch member fields (env, models, api_key) must describe what the
+        // session's settings.json actually carries.
         let swap = std::sync::Arc::new(SessionSwap::new(
-            session, isolation, mode, profile, canonical, &paths,
+            session, isolation, mode, &fresh, canonical, &paths,
         ));
         let SessionPaths {
             sessions,

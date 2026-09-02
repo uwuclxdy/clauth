@@ -2951,7 +2951,7 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
         let profile = configured_profile("mixedver");
 
         let err = ProfileRuntime::acquire_synced(
-            &profile,
+            &profile.name,
             Isolation::Shared,
             &[],
             false,
@@ -2994,6 +2994,56 @@ fn acquire_refuses_a_record_removed_without_a_rotation_lock() {
         assert!(
             crate::live_sessions::list().is_empty(),
             "a refused start must register no live row"
+        );
+    });
+}
+
+/// The stale-borrow fix, in its red-today shape: the caller's `&Profile` is
+/// borrowed from a config loaded before `acquire`, and the rotation-guard wait
+/// is exactly where a `base_url`/`api_key`/`env`/`models` edit can land. The
+/// re-read must happen INSIDE the state-flock section — this seam fires before
+/// the flock opens, so anything read before it still sees the pre-edit bytes —
+/// and settings.json is one of the session-tree writes fed from it.
+///
+/// Same actor pose as the mixed-version removal test above, but a real one: an
+/// edit persists through `save_profile` under the state flock alone and never
+/// touches the rotation guard, so a second thread could pose this window — the
+/// seam only makes it deterministic. A re-read hoisted above the seam would
+/// see the pre-edit bytes and red; its placement below the flock section is
+/// pinned by the `debug_assert!` beside it, which this test does not reach.
+#[test]
+fn acquire_builds_session_settings_from_the_profile_re_read_under_the_flock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        // The caller's borrow, taken off the record before the wait.
+        let profile = configured_profile("stale-start");
+
+        let rt = ProfileRuntime::acquire_synced(
+            &profile.name,
+            Isolation::Shared,
+            &[],
+            false,
+            || {
+                // The edit lands on disk only, after the caller's borrow and
+                // after the rotation guard: the borrowed copy stays stale.
+                let mut edited = profile.clone();
+                edited.base_url = Some("https://stale.example/anthropic".into());
+                crate::profile::save_profile(&edited).expect("save edited profile");
+            },
+            |_, _| {},
+            || {},
+        )
+        .expect("acquire");
+
+        let settings: serde_json::Value =
+            serde_json::from_slice(&fs::read(rt.config_dir().join("settings.json")).expect("read"))
+                .expect("parse");
+        assert_eq!(
+            settings["env"]["ANTHROPIC_BASE_URL"],
+            serde_json::json!("https://stale.example/anthropic"),
+            "the session's settings.json must carry the base_url as it stood on \
+             disk when the flock section ran, not the caller's pre-wait copy"
         );
     });
 }
@@ -3826,7 +3876,7 @@ fn the_rotation_hold_ends_at_the_register_and_stamp_window() {
         let released_fired = std::sync::Arc::clone(&fired);
 
         let rt = ProfileRuntime::acquire_synced(
-            &profile,
+            &profile.name,
             Isolation::Shared,
             &[],
             false,
