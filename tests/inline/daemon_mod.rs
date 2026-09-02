@@ -122,25 +122,6 @@ fn active_of(d: &Daemon) -> Option<String> {
 
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
-/// Seed a plugin registration the heal gate must act on: a `clauth@clauth`
-/// user-scope row whose `installPath` is gone. The registry lives under the
-/// sandboxed claude dir, so this touches nothing outside it.
-#[cfg(unix)]
-fn seed_broken_plugin_registration() {
-    let dir = claude_dir().expect("claude dir").join("plugins");
-    std::fs::create_dir_all(&dir).expect("plugins dir");
-    std::fs::write(dir.join("known_marketplaces.json"), "{}").expect("marketplaces");
-    std::fs::write(
-        dir.join("installed_plugins.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 2,
-            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
-        }))
-        .expect("seed json"),
-    )
-    .expect("installed");
-}
-
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes
 /// nothing else — the pure no-op characterization of one loop iteration. Stays
 /// cross-platform: the armed throttle is what keeps the tick's heal inert here,
@@ -179,7 +160,7 @@ fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
 #[cfg(unix)]
 #[test]
 fn tick_heals_a_broken_plugin_registration() {
-    use crate::testutil::{FakeClaude, join_background_tasks};
+    use crate::testutil::{FakeClaude, join_background_tasks, seed_broken_plugin_registration};
 
     let home = HomeSandbox::new();
     let fake = FakeClaude::new(&home);

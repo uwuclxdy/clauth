@@ -741,6 +741,27 @@ impl Drop for FakeClaude<'_> {
     }
 }
 
+/// Seed a plugin registration the heal gate must act on: a `clauth@clauth`
+/// user-scope row whose `installPath` is gone. The registry lives under the
+/// sandboxed claude dir, so this touches nothing outside it.
+#[cfg(unix)]
+pub(crate) fn seed_broken_plugin_registration() {
+    let dir = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("plugins");
+    std::fs::create_dir_all(&dir).expect("plugins dir");
+    std::fs::write(dir.join("known_marketplaces.json"), "{}").expect("marketplaces");
+    std::fs::write(
+        dir.join("installed_plugins.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 2,
+            "plugins": {"clauth@clauth": [{"scope": "user", "installPath": "/gone/runtime/plugins/cache"}]}
+        }))
+        .expect("seed json"),
+    )
+    .expect("installed");
+}
+
 /// RAII tier pin: acquires `TIER_TEST_LOCK` and forces the process-global color
 /// tier for its lifetime, putting the previous pin back on drop (even on panic).
 /// Required for any test asserting on a tier-dependent style, since the tier is

@@ -5102,7 +5102,10 @@ fn hold_bare_session_marker() -> Option<std::fs::File> {
     }
 }
 
-pub(crate) fn serve() -> Result<()> {
+/// `serve`'s pre-handshake work, split out so a test can drive it without standing
+/// up the stdio transport. Returns the bare-session marker because `serve` has to
+/// hold it across `block_on`.
+fn startup() -> Option<std::fs::File> {
     crate::runtime::gc_stale_runtimes();
     jobs::gc(now_ms());
     // Converge a broken plugin registration without ever blocking the stdio
@@ -5118,7 +5121,11 @@ pub(crate) fn serve() -> Result<()> {
     }
     // Held across `block_on`, so the flock drops with the process however it dies
     // — a bare `claude` runs no clauth teardown, SIGKILL least of all.
-    let _bare_marker = hold_bare_session_marker();
+    hold_bare_session_marker()
+}
+
+pub(crate) fn serve() -> Result<()> {
+    let _bare_marker = startup();
     // The delegate-dot knob, read once at startup from the on-demand config.
     // A missing or unreadable profiles.toml answers the default (dot on), so
     // the knob can never fail the server.
@@ -5178,3 +5185,7 @@ mod digest_tests;
 #[cfg(test)]
 #[path = "../../tests/inline/mcp_background_sandbox.rs"]
 mod background_sandbox_tests;
+
+#[cfg(test)]
+#[path = "../../tests/inline/mcp_startup.rs"]
+mod startup_tests;
