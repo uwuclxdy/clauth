@@ -919,12 +919,33 @@ enum RotateOutcome {
 /// keyless one is told about the key. A keyless unrecognised endpoint falls
 /// through to `None` on purpose — it may be a local model needing no key, the
 /// same 2026-08-28 ruling that keeps the delegate's keyless arm scoped.
+///
+/// The own-endpoint arm consults the durable `AuthExpired` verdict before
+/// rendering the split state: when the record matches the profile's CURRENT
+/// credential (fingerprint via [`crate::usage::profile_credential_fingerprint`],
+/// read by [`crate::profile_cache::auth_expired_matches`]), a key the verdict
+/// pronounces dead is no credential and the arm renders the keyless sentence.
+/// Alibaba is excluded: its verdict records a dead console session, which says
+/// nothing about the key the keyless sentence names (what a dead-console
+/// Alibaba profile should read is an open copy question). A profile that
+/// fingerprints no credential (an `[env]`-token profile with no api key) skips
+/// the consult: there is no fingerprint for a record to match.
 pub(crate) fn third_party_dead_chain_copy(
     profile: Option<&crate::profile::Profile>,
     name: &ProfileName,
 ) -> Option<String> {
     let profile = profile?;
     if crate::claude::has_own_inference_endpoint(profile) {
+        // Alibaba's usage fetch authenticates with the console session, never
+        // the api key, so its verdict cannot mean what the keyless sentence
+        // claims: consulting it would tell a profile with a live key it has
+        // none. The consult runs only where the verdict can be about the key.
+        if profile.provider != Some(crate::providers::Provider::Alibaba)
+            && crate::usage::profile_credential_fingerprint(profile)
+                .is_some_and(|fp| crate::profile_cache::auth_expired_matches(name, fp))
+        {
+            return Some(crate::format::third_party_keyless(name));
+        }
         return Some(crate::format::third_party_dead_chain(name));
     }
     if profile.is_third_party() && !crate::claude::has_inference_auth(profile) {

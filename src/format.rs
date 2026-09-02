@@ -377,7 +377,10 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
 /// (`clauth login` is the documented quarantine recovery, AUTH-1 in
 /// `actions.rs`). Rendered by the MCP pre-flight's keyless arm, the
 /// rolling-token bail, the manual-rotate toast and the quarantine's own log
-/// line, so the surfaces cannot spell one state two ways.
+/// line, so the surfaces cannot spell one state two ways. Those last three
+/// render it for a key the profile's `AuthExpired` verdict pronounces dead,
+/// too — Alibaba excepted, whose verdict records a dead console session:
+/// `oauth::third_party_dead_chain_copy` treats such a key as no credential.
 pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String {
     format!("profile has no api key: {name} (run `clauth login {name} --api-key <key>`)")
 }
@@ -389,9 +392,13 @@ pub(crate) fn third_party_keyless(name: &crate::profile::ProfileName) -> String 
 ///
 /// The sentence is owner-ruled verbatim and claims more than the predicate
 /// behind it proves: `has_inference_auth` is satisfied by a well-formed key OR
-/// an `[env]` token, and well-formed is not live — clauth even records a
-/// per-credential `AuthExpired` verdict no refusal site consults. An honest
-/// re-wording is an open copy question the owner has not ruled yet.
+/// an `[env]` token, and well-formed is not live. The key half is guarded
+/// where a verdict can speak to it — `oauth::third_party_dead_chain_copy`
+/// consults the per-credential `AuthExpired` verdict and renders
+/// [`third_party_keyless`] instead when the record matches the profile's
+/// current credential, except on Alibaba, whose verdict records a dead console
+/// session, not a key. The `[env]`-token half and the Alibaba console half
+/// stay unguarded: open copy questions the owner has not ruled yet.
 ///
 /// Three sites route through `oauth::third_party_dead_chain_copy`:
 /// `cmd_rolling_token`'s up-front dead-chain bail, the manual-rotate toast,

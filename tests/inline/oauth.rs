@@ -4878,3 +4878,171 @@ fn mark_auth_broken_does_not_resurrect_a_deleted_profiles_row() {
         "the surviving profile's row is untouched"
     );
 }
+
+/// Fixture for the dead-chain splitter tests: a recognised third-party
+/// profile (provider derived from the base_url) whose own-endpoint arm the
+/// splitter reaches, persisted so a verdict can be seeded against it
+/// (`write_auth_expired` lands only for configured profiles).
+fn dead_chain_copy_fixture(
+    name: &str,
+    base_url: &str,
+    key: Option<&str>,
+    env_token: bool,
+) -> Profile {
+    let mut profile = Profile::new(
+        name.to_string(),
+        Some(base_url.to_string()),
+        key.map(str::to_string),
+    );
+    if env_token {
+        profile
+            .env
+            .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "env-tok".to_string());
+    }
+    crate::profile::save_profile(&profile).expect("save fixture profile");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone()],
+    };
+    config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    profile
+}
+
+/// A `AuthExpired` verdict matching the profile's CURRENT credential retires
+/// the dead-chain sentence: a key the verdict pronounces dead is no
+/// credential, so the splitter renders the keyless sentence instead of "its
+/// api key still works". The pin seeds the verdict through the same
+/// fingerprint spelling the site consults, so the two can never diverge.
+#[test]
+fn dead_chain_copy_renders_keyless_when_the_verdict_matches_the_current_key() {
+    let _home = HomeSandbox::new();
+    let name = "tp-verdict-matches";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        Some("sk-fixture"),
+        false,
+    );
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("the fixture must carry a third-party credential");
+    crate::profile_cache::write_auth_expired(&profile.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "the seeded verdict must land before the choice is pinned"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_keyless(&profile.name))
+    );
+}
+
+/// No verdict: the splitter's dead-chain sentence stays byte-identical.
+#[test]
+fn dead_chain_copy_without_a_verdict_keeps_the_dead_chain_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-no-verdict";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        Some("sk-fixture"),
+        false,
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// A verdict recorded under a different credential is inert: the profile
+/// re-logged in with a new key, so the old verdict must not retire the live
+/// sentence.
+#[test]
+fn dead_chain_copy_ignores_a_verdict_for_another_credential() {
+    let _home = HomeSandbox::new();
+    let name = "tp-stale-verdict";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        Some("sk-current"),
+        false,
+    );
+    let old = Profile::new(
+        "tp-stale-verdict-old".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    let old_fp = crate::usage::profile_credential_fingerprint(&old)
+        .expect("the stale fixture must carry a third-party credential");
+    crate::profile_cache::write_auth_expired(&profile.name, old_fp);
+    assert!(
+        !crate::profile_cache::auth_expired_matches(
+            &profile.name,
+            crate::usage::profile_credential_fingerprint(&profile)
+                .expect("the fixture must carry a third-party credential")
+        ),
+        "a verdict for the previous credential must not match the current one"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// An `[env]`-token profile with no api key has no third-party credential to
+/// fingerprint, so no verdict can match it and the sentence is unchanged.
+/// That the unchanged sentence overclaims for this profile ("its api key
+/// still works") is the open copy question the owner has not ruled; this pin
+/// only bounds the verdict fix's blast radius.
+#[test]
+fn dead_chain_copy_env_token_without_a_key_keeps_the_dead_chain_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-env-token";
+    let profile = dead_chain_copy_fixture(name, "https://api.deepseek.com/anthropic", None, true);
+    assert!(
+        crate::usage::profile_credential_fingerprint(&profile).is_none(),
+        "an env-token-only profile must have no third-party credential to fingerprint"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// The verdict consult is excluded for Alibaba: its usage fetch authenticates
+/// with the console session, never the api key, so a matching verdict records
+/// a dead console while the key may be live — the keyless sentence would
+/// mis-claim the key. A live-key profile whose console died keeps the
+/// dead-chain sentence, byte-identical to pre-fix; what a dead-console
+/// Alibaba profile should read instead is an open copy question.
+#[test]
+fn dead_chain_copy_alibaba_keeps_the_dead_chain_sentence_on_a_console_verdict() {
+    let _home = HomeSandbox::new();
+    let name = "tp-alibaba-console-verdict";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
+        Some("sk-fixture"),
+        false,
+    );
+    assert_eq!(
+        profile.provider,
+        Some(crate::providers::Provider::Alibaba),
+        "the fixture base_url must resolve to the Alibaba provider"
+    );
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "the fixture must reach the own-endpoint arm"
+    );
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("an Alibaba profile always carries a fetchable credential");
+    crate::profile_cache::write_auth_expired(&profile.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "the seeded verdict must land before the choice is pinned"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
