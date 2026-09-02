@@ -274,6 +274,60 @@ fn plugin_check_offers_install_fix_when_missing() {
     );
 }
 
+/// The install row must name the OPERATIVE record, not whichever row sorts first
+/// on disk: a stale project/local row ahead of the live `user`-scope row used to
+/// print the wrong scope and version beside a verdict computed off the user row.
+#[test]
+fn plugin_check_names_the_user_scope_record_when_one_exists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join("plugins")
+        .join("installed_plugins.json");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    let body = serde_json::json!({
+        "plugins": { "clauth@clauth": [
+            { "scope": "local", "version": "0.14.1" },
+            { "scope": "user", "version": "0.15.0" }
+        ] }
+    });
+    std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
+
+    let mut app = bare_app();
+    super::recompute_plugin_checks(&mut app, false);
+    let check = plugin_check(&app);
+    assert_eq!(
+        check.health,
+        super::Health::Ok,
+        "a user-scope row is global: {:?}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|line| line.starts_with("installed: yes (user)")),
+        "the operative user row must name the scope: {:?}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|line| line.starts_with("version: 0.15.0")),
+        "the live user row's version must win: {:?}",
+        check.detail
+    );
+    assert!(
+        !check
+            .detail
+            .iter()
+            .any(|line| line.starts_with("version: 0.14.1")),
+        "the stale local row must not name the install: {:?}",
+        check.detail
+    );
+}
+
 // ── the install fix drives agentgear at user scope ────────────────────────
 
 /// The confirm gate every mutating fix owes (tab spec: "confirm modal first,

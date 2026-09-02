@@ -3827,7 +3827,14 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // plugin install record — installed-only verdict (CC exposes no clean per-scope
     // "enabled" boolean, so v1 reports presence + scope, not enabled/disabled).
     let marketplace = probe::marketplace_known();
-    let plugin_check = if let Some(record) = records.first() {
+    // The operative record is the `user`-scope install when one exists; a stale
+    // project/local row that sorts first must not name the install beside a
+    // verdict computed off the user row (`plugin_global` above).
+    let record_for_check = records
+        .iter()
+        .find(|r| r.scope.as_deref() == Some("user"))
+        .or_else(|| records.first());
+    let plugin_check = if let Some(record) = record_for_check {
         let scope = record.scope.as_deref();
         let mut detail = vec![format!("installed: yes ({})", scope.unwrap_or("?"))];
         if let Some(version) = &record.version {
