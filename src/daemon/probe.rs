@@ -403,8 +403,8 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 /// Send SIGTERM (`hard` false) or SIGKILL (`hard` true) to `pid`, returning
 /// whether the signal command actually ran (`false` = it could not even be
 /// spawned, e.g. `kill` off PATH — which the caller distinguishes from "signalled
-/// but the process survived"). Shelling out keeps `unsafe_code = "forbid"` intact
-/// (`libc::kill` would need `unsafe`, and `signal_hook` only *receives*), matching
+/// but the process survived"). Shelling out spends no `unsafe` here
+/// (`libc::kill` would need it, and `signal_hook` only *receives*), matching
 /// the `/usr/bin/security` shell-out pattern already in the crate. A non-zero exit
 /// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
 /// way. Long-form flags so the call site documents itself.

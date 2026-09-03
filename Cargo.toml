@@ -94,6 +94,10 @@ codegen-units = 1
 strip = true
 
 [lints.rust]
+# `deny` rather than the fleet default `forbid`, because three sites are
+# deliberately allowed and `forbid` admits no override at all: signal delivery in
+# `start.rs`, `stderr_file_mode`'s `fcntl`/`fstat` in `daemon/log_rotate.rs`, and
+# the test sandbox's env mutation, which Rust 2024 made unsafe.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
