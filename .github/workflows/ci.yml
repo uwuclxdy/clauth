@@ -105,13 +105,16 @@ jobs:
             *)       echo "unrecognised runner.os '${{ runner.os }}'" >&2; exit 1 ;;
           esac
           echo "CLAUTH_REQUIRE_SHELL_LINT=1" >> "$GITHUB_ENV"
+      # `--locked` on every leg that resolves dependencies, so a `Cargo.lock` the
+      # committed manifest no longer matches reds here instead of being silently
+      # updated in the runner and thrown away with it.
       - name: clippy (-D warnings)
-        run: cargo clippy --all-targets --all-features --release -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features --release -- -D warnings
       # `--no-fail-fast` so a red run reports every failure instead of a prefix: nextest
       # cancels at the first one, so you fix what you were shown, push, and are handed
       # more — which reads like a regression your own fix caused, at a build per round.
       - name: test
-        run: cargo nextest run --release --all-targets --all-features --no-fail-fast
+        run: cargo nextest run --locked --release --all-targets --all-features --no-fail-fast
       # Every leg above is --release, where debug_assertions is off and
       # `#[cfg(debug_assertions)]` code is not merely unlinted but absent: a test
       # gated on it cannot run at all, so the local gate was catching regressions
@@ -124,8 +127,8 @@ jobs:
         shell: bash
         run: |
           if grep -rqs --include='*.rs' --exclude-dir=target --exclude-dir=.git -e debug_assertions .; then
-            cargo clippy --all-targets --all-features -- -D warnings
-            cargo nextest run --all-targets --all-features --no-fail-fast
+            cargo clippy --locked --all-targets --all-features -- -D warnings
+            cargo nextest run --locked --all-targets --all-features --no-fail-fast
           else
             echo "no debug_assertions in crate; skipping debug legs"
           fi
@@ -136,13 +139,13 @@ jobs:
       - name: doctests
         shell: bash
         run: |
-          if cargo metadata --no-deps --format-version 1 | grep -q '"doctest":true'; then
-            cargo test --release --doc --all-features
+          if cargo metadata --locked --no-deps --format-version 1 | grep -q '"doctest":true'; then
+            cargo test --locked --release --doc --all-features
           else
             echo "no doctest targets; skipping"
           fi
       - name: build release binary
-        run: cargo build --release
+        run: cargo build --locked --release
       - name: upload binary
         uses: actions/upload-artifact@v7
         with:
