@@ -2452,6 +2452,11 @@ impl ProfileRuntime {
             }
             crate::profile::mkdir_700(runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
+            // Closes the gap the wipe comment names: a live REAL session's
+            // compat marker holds `active` nonzero while this bare tree has no
+            // holder, so its pre-upgrade `~/.claude/` links survive an additive
+            // build.
+            prune_isolated_claude_links(name, sessions, runtime, &claude_home, isolation, mode);
             build_runtime_dir_with_active_env(
                 runtime,
                 &claude_home,
@@ -3189,34 +3194,177 @@ fn prune_dangling_links(runtime: &Path) -> Result<()> {
             && meta.file_type().is_symlink()
             && !path.exists()
         {
-            // Windows splits link removal by what the link POINTS AT, not by
-            // what the link is: `remove_file` clears a dangling FILE symlink but
-            // answers os error 5 on a dangling junction or directory symlink and
-            // leaves it standing (measured on Windows 11, elevated and with
-            // `SeCreateSymbolicLinkPrivilege` stripped alike). A survivor is
-            // permanent, not cosmetic — the re-walk below skips any entry whose
-            // `symlink_metadata` succeeds, so that name never re-materializes.
-            //
-            // `remove_dir`, never `remove_dir_all`: it unlinks the link itself
-            // and refuses a non-empty directory, and the guard above already
-            // proved the target is gone, so there is nothing behind this link
-            // for either call to reach. `rmdir` is additionally believed unable
-            // to traverse a LIVE link on either platform, which would make the
-            // call safe without the guard — unverified, so the guard is what
-            // this rests on. Its one soft edge: `Path::exists` swallows every
-            // stat error, so a live link over a dropped mount reads as dangling
-            // and gets unlinked. The re-walk re-links it on the same pass.
-            if let Err(file_err) = std::fs::remove_file(&path)
-                && let Err(dir_err) = std::fs::remove_dir(&path)
-            {
-                logline!(
-                    "clauth: stale link {} could not be removed ({file_err}; as a dir: {dir_err})",
-                    path.display()
-                );
-            }
+            // The guard is load-bearing: `Path::exists` swallows every stat
+            // error, so a live link over a dropped mount reads as dangling and
+            // gets unlinked here — safe only because the re-walk re-links it on
+            // the same pass. A dangling survivor is permanent, since the re-walk
+            // skips any entry whose `symlink_metadata` succeeds.
+            unlink_link(&path, "stale link");
         }
     }
     Ok(())
+}
+
+/// Unlink a link itself without traversing it. On unix `remove_file` is the
+/// whole story: `unlink` never follows the link. The `remove_dir` fallback is
+/// the Windows split, measured twice. Dangling, the merge-base's measurement:
+/// `remove_file` clears a dangling file symlink but answers os error 5 on a
+/// dangling junction or directory symlink. Live, measured on Windows 11 IoT Ent
+/// LTSC 24H2 with rustc 1.96.1, elevated and with
+/// `SeCreateSymbolicLinkPrivilege` stripped alike: `remove_file` errors 5 on a
+/// live directory symlink and on a live junction, then `remove_dir` returns
+/// `Ok`, removes the reparse point, and leaves the target directory and its
+/// files intact. On unix `remove_dir_all` on a live directory symlink also
+/// unlinks the link and leaves the target intact (Linux, rustc 1.98.0), so
+/// unlinking explicitly here is portability rather than data loss.
+/// `remove_dir`, never `remove_dir_all`.
+fn unlink_link(path: &Path, label: &str) {
+    if let Err(file_err) = std::fs::remove_file(path)
+        && let Err(dir_err) = std::fs::remove_dir(path)
+    {
+        logline!(
+            "clauth: {label} {} could not be removed ({file_err}; as a dir: {dir_err})",
+            path.display()
+        );
+    }
+}
+
+/// Whether any live session holds `runtime`. `sessions` is the marker dir the
+/// acquiring session probes; the answer derives from the live marker NAMES, not
+/// from their count. `true` on every unknown — pruning is destructive, so an
+/// undecidable read holds it back.
+fn live_session_holds_runtime(
+    name: &ProfileName,
+    sessions: &Path,
+    runtime: &Path,
+    isolation: Isolation,
+    mode: LinkMode,
+) -> bool {
+    let Some(names) = live_marker_names(sessions) else {
+        return true;
+    };
+    // The bare marker dir (Fake transport) is the ambiguous one: a live marker
+    // there is either a Fake session's own (holds the bare tree) or a Real
+    // session's upgrade-compat marker (holds the per-session tree). Both share
+    // one path, so tell them apart by the Real session's own per-session marker.
+    let bare = mode == LinkMode::Fake;
+    names.iter().any(|marker| {
+        let Some(sid) = marker.to_str() else {
+            return true;
+        };
+        let (real_runtime, real_sessions) = paired_dir_names(isolation, sid, LinkMode::Real);
+        if profile_subpath(name, &real_runtime).is_ok_and(|dir| dir == runtime) {
+            return true;
+        }
+        if bare {
+            // A compat marker maps to the per-session tree only while its own
+            // per-session marker is DEFINITELY held; otherwise the bare-dir
+            // marker is a Fake session's own and holds the bare tree. Reading an
+            // unheld or unreadable own marker as compat would prune a tree the
+            // Fake session still holds, so the probe must be definite.
+            let own = profile_subpath(name, &real_sessions).map(|dir| dir.join(sid));
+            let compat = own.as_deref().is_ok_and(marker_definitely_held);
+            let (fake_runtime, _) = paired_dir_names(isolation, sid, LinkMode::Fake);
+            if !compat && profile_subpath(name, &fake_runtime).is_ok_and(|dir| dir == runtime) {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// True only when `path`'s flock is held by a live holder, this process's own
+/// fds included: a fresh `open` + `try_lock` fails against any fd that already
+/// holds the exclusive flock, same process or not. An open or `try_lock` error
+/// other than that contention is NOT "held" — unlike [`is_session_alive`], which
+/// reads every unknown as alive, a caller deciding whether to prune a shared
+/// tree must read an unknown as "not this holder's own marker".
+fn marker_definitely_held(path: &Path) -> bool {
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
+/// Remove every top-level symlink in `runtime` whose target resolves inside
+/// `claude_home`. The current isolated build links nothing from `~/.claude/`, so
+/// any such link is a pre-upgrade artifact an older binary left; unlinking it
+/// restores exactly the invariant the isolated build enforces. The LINK is
+/// unlinked, never traversed, and a target that cannot be canonicalized is not
+/// a match.
+fn prune_claude_links(runtime: &Path, claude_home: &Path) {
+    let claude_canon = match claude_home.canonicalize() {
+        Ok(canon) => canon,
+        Err(e) => {
+            logline!(
+                "clauth: claude-link prune skipped; cannot canonicalize {}: {e}",
+                claude_home.display()
+            );
+            return;
+        }
+    };
+    let entries = match std::fs::read_dir(runtime) {
+        Ok(entries) => entries,
+        Err(e) => {
+            logline!(
+                "clauth: claude-link prune skipped; cannot read {}: {e}",
+                runtime.display()
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                logline!(
+                    "clauth: claude-link prune could not read an entry in {}: {e}",
+                    runtime.display()
+                );
+                continue;
+            }
+        };
+        let path = entry.path();
+        if !path
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            continue;
+        }
+        let Ok(target) = path.canonicalize() else {
+            continue;
+        };
+        if target.starts_with(&claude_canon) {
+            unlink_link(&path, "claude link");
+        }
+    }
+}
+
+/// Acquire-time prune for an isolated tree: drop the pre-upgrade `~/.claude/`
+/// links an older binary left, but only when no live session holds the tree.
+/// Shared trees link `~/.claude/` by design and are never pruned.
+///
+/// Reachable only on the bare `runtime-isolated` tree. Under `LinkMode::Real`
+/// `runtime` and `sessions` are both keyed by the just-minted sid, so either the
+/// predicate's first branch matches or the wipe already removed the tree.
+/// `LinkMode::Fake` is not Windows-only: `detect_link_mode` drops to it on
+/// privilege denial or an unsupported filesystem, so a `~/.clauth` on exFAT,
+/// FAT32 or SMB lands there on unix too.
+fn prune_isolated_claude_links(
+    name: &ProfileName,
+    sessions: &Path,
+    runtime: &Path,
+    claude_home: &Path,
+    isolation: Isolation,
+    mode: LinkMode,
+) {
+    if isolation != Isolation::Isolated {
+        return;
+    }
+    if live_session_holds_runtime(name, sessions, runtime, isolation, mode) {
+        return;
+    }
+    prune_claude_links(runtime, claude_home);
 }
 
 /// Compute this profile's merged `settings.json` and write it into the runtime

@@ -4845,6 +4845,296 @@ fn prune_removes_a_dangling_directory_link() {
     );
 }
 
+// ── acquire-time isolated ~/.claude prune ────────────────────────────────────
+
+#[test]
+fn prune_isolated_unlinks_a_claude_symlink_when_no_live_session_holds_it() {
+    let sandbox = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("iso");
+    let claude_home = sandbox.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+    fs::write(claude_home.join("projects").join("keep.txt"), b"operator").expect("seed");
+    let runtime = profile_subpath(&name, "runtime-isolated").expect("runtime path");
+    let sessions = profile_subpath(&name, "sessions-isolated").expect("sessions path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let link = runtime.join("projects");
+    pose_dir_link(&link, &claude_home.join("projects"));
+
+    prune_isolated_claude_links(
+        &name,
+        &sessions,
+        &runtime,
+        &claude_home,
+        Isolation::Isolated,
+        LinkMode::Fake,
+    );
+
+    assert!(link.symlink_metadata().is_err(), "claude link unlinked");
+    assert!(
+        claude_home.join("projects").join("keep.txt").exists(),
+        "operator data survives the unlink"
+    );
+}
+
+#[test]
+fn prune_isolated_spares_a_claude_symlink_when_a_live_session_holds_the_tree() {
+    let sandbox = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("iso");
+    let claude_home = sandbox.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+    let runtime = profile_subpath(&name, "runtime-isolated").expect("runtime path");
+    let sessions = profile_subpath(&name, "sessions-isolated").expect("sessions path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let link = runtime.join("projects");
+    pose_dir_link(&link, &claude_home.join("projects"));
+    // A Fake session's own marker in the bare dir holds the bare tree.
+    let held = open_pid_file(&sessions.join("4242-0")).expect("open marker");
+    held.lock().expect("lock marker");
+
+    prune_isolated_claude_links(
+        &name,
+        &sessions,
+        &runtime,
+        &claude_home,
+        Isolation::Isolated,
+        LinkMode::Fake,
+    );
+
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "link left standing for a live holder"
+    );
+    drop(held);
+}
+
+#[test]
+fn prune_isolated_prunes_when_the_only_live_marker_holds_a_different_tree() {
+    let sandbox = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("iso");
+    let claude_home = sandbox.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+    fs::write(claude_home.join("projects").join("keep.txt"), b"operator").expect("seed");
+    let runtime = profile_subpath(&name, "runtime-isolated").expect("runtime path");
+    let sessions = profile_subpath(&name, "sessions-isolated").expect("sessions path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let link = runtime.join("projects");
+    pose_dir_link(&link, &claude_home.join("projects"));
+    // A live REAL session's compat marker sits in the bare dir while its own
+    // per-session marker names the tree it actually holds.
+    let sid = "4242-1";
+    let own_sessions =
+        profile_subpath(&name, &format!("sessions-isolated-{sid}")).expect("own sessions path");
+    fs::create_dir_all(&own_sessions).expect("mkdir own sessions");
+    let own = open_pid_file(&own_sessions.join(sid)).expect("open own marker");
+    own.lock().expect("lock own marker");
+    let compat = open_pid_file(&sessions.join(sid)).expect("open compat marker");
+    compat.lock().expect("lock compat marker");
+
+    prune_isolated_claude_links(
+        &name,
+        &sessions,
+        &runtime,
+        &claude_home,
+        Isolation::Isolated,
+        LinkMode::Fake,
+    );
+
+    assert!(
+        link.symlink_metadata().is_err(),
+        "link pruned: no live session holds this tree"
+    );
+    assert!(
+        claude_home.join("projects").join("keep.txt").exists(),
+        "operator data survives the unlink"
+    );
+    drop(compat);
+    drop(own);
+}
+
+#[test]
+fn prune_isolated_leaves_a_shared_tree_untouched() {
+    let sandbox = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("shared");
+    let claude_home = sandbox.home().join(".claude");
+    fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+    let runtime = profile_subpath(&name, "runtime").expect("runtime path");
+    let sessions = profile_subpath(&name, "sessions").expect("sessions path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let link = runtime.join("projects");
+    pose_dir_link(&link, &claude_home.join("projects"));
+
+    prune_isolated_claude_links(
+        &name,
+        &sessions,
+        &runtime,
+        &claude_home,
+        Isolation::Shared,
+        LinkMode::Fake,
+    );
+
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "shared tree's claude links are by design"
+    );
+}
+
+#[test]
+fn prune_isolated_leaves_a_symlink_outside_claude_home() {
+    let sandbox = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("iso");
+    let claude_home = sandbox.home().join(".claude");
+    fs::create_dir_all(&claude_home).expect("mkdir claude");
+    let outside = sandbox.home().join("elsewhere");
+    fs::create_dir_all(&outside).expect("mkdir outside");
+    let runtime = profile_subpath(&name, "runtime-isolated").expect("runtime path");
+    let sessions = profile_subpath(&name, "sessions-isolated").expect("sessions path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let link = runtime.join("other");
+    pose_dir_link(&link, &outside);
+
+    prune_isolated_claude_links(
+        &name,
+        &sessions,
+        &runtime,
+        &claude_home,
+        Isolation::Isolated,
+        LinkMode::Fake,
+    );
+
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "a non-claude target is untouched"
+    );
+    assert!(outside.exists());
+}
+
+/// A dangling top-level link must stay: its target cannot be canonicalized, and
+/// the prune treats an unresolvable target as NOT a match. unix-gated because
+/// posing a dangling link needs `std::os::unix::fs::symlink` to a missing
+/// target, which has no cross-platform constructor here.
+#[cfg(unix)]
+#[test]
+fn prune_isolated_leaves_a_dangling_link_alone() {
+    let sandbox = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("iso");
+    let claude_home = sandbox.home().join(".claude");
+    fs::create_dir_all(&claude_home).expect("mkdir claude");
+    let runtime = profile_subpath(&name, "runtime-isolated").expect("runtime path");
+    let sessions = profile_subpath(&name, "sessions-isolated").expect("sessions path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let link = runtime.join("projects");
+    std::os::unix::fs::symlink(sandbox.home().join("gone"), &link).expect("symlink");
+
+    prune_isolated_claude_links(
+        &name,
+        &sessions,
+        &runtime,
+        &claude_home,
+        Isolation::Isolated,
+        LinkMode::Fake,
+    );
+
+    assert!(
+        link.symlink_metadata().is_ok(),
+        "an unresolvable target is not a match, so the dangling link stays"
+    );
+}
+
+#[test]
+fn prune_isolated_leaves_real_entries_untouched() {
+    let sandbox = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("iso");
+    let claude_home = sandbox.home().join(".claude");
+    fs::create_dir_all(&claude_home).expect("mkdir claude");
+    let runtime = profile_subpath(&name, "runtime-isolated").expect("runtime path");
+    let sessions = profile_subpath(&name, "sessions-isolated").expect("sessions path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    fs::create_dir_all(&sessions).expect("mkdir sessions");
+    let real_file = runtime.join("settings.json");
+    fs::write(&real_file, b"{}").expect("write real file");
+    let real_dir = runtime.join("projects");
+    fs::create_dir_all(real_dir.join("nested")).expect("mkdir real dir");
+
+    prune_isolated_claude_links(
+        &name,
+        &sessions,
+        &runtime,
+        &claude_home,
+        Isolation::Isolated,
+        LinkMode::Fake,
+    );
+
+    assert!(real_file.is_file(), "a real file is never touched");
+    assert!(
+        real_dir.join("nested").is_dir(),
+        "a real directory is never touched"
+    );
+}
+
+/// Pins the CALL SITE in `acquire_synced`, which the helper tests above cannot
+/// reach: a bare isolated tree with a pre-upgrade link, a live marker that
+/// suppresses the wipe without holding the bare tree, and the acquire itself
+/// must unlink the link.
+#[test]
+fn acquire_prunes_pre_upgrade_claude_links_from_the_isolated_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let claude_home = fake_claude_home(tmp.path());
+        fs::create_dir_all(claude_home.join("projects")).expect("mkdir projects");
+        fs::write(claude_home.join("projects").join("keep.txt"), b"operator").expect("seed");
+        let profile = configured_profile("iso-acquire");
+        let name = crate::profile::ProfileName::from("iso-acquire");
+        let dir = profile_dir(&name).expect("profile dir");
+        let runtime = dir.join("runtime-isolated");
+        let sessions = dir.join("sessions-isolated");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let link = runtime.join("projects");
+        pose_dir_link(&link, &claude_home.join("projects"));
+        // A live REAL session's compat marker sits in the bare dir while its own
+        // per-session marker names a different tree. It keeps `active` nonzero so
+        // the wipe stays suppressed, without holding the bare tree.
+        let sid = "4242-0";
+        let own_sessions = dir.join(format!("sessions-isolated-{sid}"));
+        fs::create_dir_all(&own_sessions).expect("mkdir own sessions");
+        let own = open_pid_file(&own_sessions.join(sid)).expect("open own marker");
+        own.lock().expect("lock own marker");
+        let compat = open_pid_file(&sessions.join(sid)).expect("open compat marker");
+        compat.lock().expect("lock compat marker");
+
+        with_link_mode(LinkMode::Fake, || {
+            let rt = ProfileRuntime::acquire_synced(
+                &profile.name,
+                Isolation::Isolated,
+                &[],
+                false,
+                || {},
+                |_, _| {},
+                || {},
+            )
+            .expect("acquire");
+            assert!(
+                link.symlink_metadata().is_err(),
+                "claude link pruned at acquire"
+            );
+            assert!(
+                claude_home.join("projects").join("keep.txt").exists(),
+                "operator data survives"
+            );
+            drop(rt);
+        });
+
+        drop(compat);
+        drop(own);
+    });
+}
+
 // ── isolation liveness + GC ──────────────────────────────────────────────────
 
 /// THE LIVENESS GATE behind delete and disable. Every session now keys its
