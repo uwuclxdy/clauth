@@ -11,20 +11,13 @@ This page covers where your logins sit and how they move between accounts. The t
 | `~/.clauth/profiles/<name>/session-token.json` | a long-lived `claude setup-token` login, when captured |
 | `~/.clauth/profiles/<name>/config.toml` | the endpoint API key, for endpoint accounts |
 
-Every file clauth writes under `~/.clauth` is `0600` and every directory `0700` on Unix, created that way rather than chmod'd afterwards, and re-tightened on each launch. Windows falls back to the default user-profile ACLs, which clauth does not loosen. Writes are atomic: temp file, fsync, rename. A rotation caught mid-write lands as `credentials.json.pending` and is promoted only once it is durable.
+The full tree, the quarantine slot and the Keychain row are in [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md)'s data-at-rest table. On Unix, clauth creates each file `0600` and each directory `0700` (owner-only from birth, never a later chmod) and re-tightens the whole tree on every launch; Windows keeps the user profile's stock ACLs untouched. Each write is temp-file + fsync + rename, and a rotation caught mid-write parks as `credentials.json.pending`, promoted only once durable.
 
 An endpoint account's API key reaches Claude Code through `apiKeyHelper`, so it never lands in `settings.json`.
 
 ## What a switch touches
 
-| File | Change |
-|------|--------|
-| `~/.claude/.credentials.json` | repointed at the target profile's stored login |
-| `~/.claude/settings.json` | the `env` block, the top-level `model` key, `apiKeyHelper` |
-| `~/.claude.json` | the stale account-identity block is dropped, so Claude Code re-derives identity from the new token |
-| `~/.clauth/profiles/<target>/credentials.json` | gains the live file's MCP-server logins, so a switch stops signing you out of them |
-
-Nothing else moves. Hooks, permissions, status line, projects, plugins and token stats are all left where they are.
+A switch rewrites exactly the files in SECURITY.md's switch list: the global credentials link, the `env`/`model`/`apiKeyHelper` parts of `~/.claude/settings.json`, and the stale identity block in `~/.claude.json`, plus the target profile's stored MCP logins so you are not signed out of them. Nothing else moves. Hooks, permissions, status line, projects, plugins and token stats are all left where they are.
 
 ## MCP-server logins
 
@@ -65,12 +58,6 @@ If Claude Code logged into a different account while clauth was closed, the next
 
 ## Switching things off
 
-| Switch | Effect |
-|--------|--------|
-| `CLAUTH_NO_UPDATE=1` | no background update check, no self-replacement |
-| `CLAUTH_NO_COMPLETIONS=1` | no first-run completions prompt |
-| `auto_start = false` (the default) | clauth sends no inference of its own |
-| an empty `fallback_chain` (the default) | clauth never switches accounts on its own |
-| `allow extra usage` off (the default) | clauth never spends pay-as-you-go money |
+The off-switches are SECURITY.md's table: `CLAUTH_NO_UPDATE=1`, `CLAUTH_NO_COMPLETIONS=1`, an empty `fallback_chain`, `allow extra usage` off, and `auto_start = false` are all default-safe and named there with their effects.
 
 Found something exploitable? Report it privately through the repo's **Security → Report a vulnerability**.
