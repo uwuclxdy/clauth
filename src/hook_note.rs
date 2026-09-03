@@ -335,7 +335,7 @@ fn watch_now() -> Watch {
 }
 
 /// One account reading plus the instant its credential read was taken — the
-/// pair [`note_for`]'s staleness guard compares.
+/// pair [`note_for_inner`]'s staleness guard compares.
 struct Reading {
     account: Option<String>,
     taken_at: SystemTime,
@@ -347,7 +347,7 @@ struct Reading {
 /// the first thing `resolve_active` does.
 ///
 /// The stamp is the observation order two racing fires compare in
-/// [`note_for`], and it is taken here, at the read, rather than at the fire's
+/// [`note_for_inner`], and it is taken here, at the read, rather than at the fire's
 /// start, because "when the resolve started" is only a PROXY for "when it
 /// looked": two fires starting together can read opposite sides of a switch
 /// landing inside their resolve windows, and with a start-of-resolve stamp the
@@ -394,7 +394,8 @@ pub(crate) fn run() -> Result<()> {
             .map(resolve_account)
     };
     let mut notes: Vec<String> = Vec::new();
-    if let Some(note) = note_for(&payload, &watch_now(), &resolve) {
+    let fire = note_for_inner(&payload, &watch_now(), &resolve);
+    if let Some(note) = fire.note {
         notes.push(note);
     }
     if let Some(read) = read_nudge(&payload, config.get().and_then(|loaded| loaded.as_ref()))
@@ -407,6 +408,12 @@ pub(crate) fn run() -> Result<()> {
     // earned the turn.
     if !notes.is_empty() {
         outln!("{}", joined_envelope(&payload.event, &notes));
+    }
+    // Land the exact-owner stamp AFTER the print: a contended state flock then
+    // delays the durable write, never the note the user sees, and at the ceiling
+    // the note has already left before the stamp wait can lose it.
+    if let Some(profile) = fire.exact_owner {
+        crate::sessions::stamp_exact_owner(&payload.session_id, &profile);
     }
     Ok(())
 }
@@ -573,16 +580,62 @@ pub(crate) fn resolved_account(session_id: &str) -> Option<String> {
     load_record(&path)?.resolved
 }
 
-/// Decide what this fire says and store what it learned.
+/// Whether a conversation's MAIN-scope record last fired within
+/// [`MISSING_TRANSCRIPT_GRACE`] — the mtime [`touch_record`] maintains and the
+/// sweep's own predicate reads. The owner-store prune consults this so a
+/// SessionStart that stamped the owner before Claude Code wrote the transcript
+/// survives the prune the way the record sweep keeps that record. The MAIN
+/// scope, never an agent scope: the prune keys the owner store on the bare
+/// conversation id, so the fire that vouches for it is the main record's. An
+/// absent or unreadable record answers `false` — there is no fire to measure,
+/// so nothing to keep.
+///
+/// A FUTURE mtime answers `true`, matching the sweep's `age` predicate (which
+/// reads it as no elapsed age and keeps). A backward clock step — NTP, a VM
+/// resume, a dual boot — future-dates every live conversation's record at once;
+/// reading that as "silent past the grace" would reap them all.
+pub(crate) fn last_fire_within_missing_transcript_grace(session_id: &str) -> bool {
+    if !is_bare_id(session_id) {
+        return false;
+    }
+    let Ok(path) = record_path(session_id, None) else {
+        return false;
+    };
+    let Ok(modified) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age <= MISSING_TRANSCRIPT_GRACE,
+        Err(_) => true,
+    }
+}
+
+/// The two outputs of a fire: the note to emit, and the exact-owner attribution
+/// to land in the durable store. The stamp is split from the note so [`run`] can
+/// print before it lands — a contended state flock then delays the durable write,
+/// never the user-visible note.
+struct FireOutcome {
+    note: Option<String>,
+    exact_owner: Option<String>,
+}
+
+/// Decide what this fire says and store what it learned. Returns the note and
+/// the exact-owner attribution; it does NOT land the owner-store stamp, which is
+/// the caller's job after the note is printed.
 ///
 /// `resolve` is taken by reference so a test can count how often the gate lets it
 /// through and control the reading's stamp; nothing else varies it.
-fn note_for(
+fn note_for_inner(
     payload: &Payload,
     watch: &Watch,
     resolve: &dyn Fn() -> Option<Reading>,
-) -> Option<String> {
-    let path = record_path(&payload.session_id, payload.agent_id.as_deref()).ok()?;
+) -> FireOutcome {
+    let Ok(path) = record_path(&payload.session_id, payload.agent_id.as_deref()) else {
+        return FireOutcome {
+            note: None,
+            exact_owner: None,
+        };
+    };
 
     // Peek UNLOCKED, only to decide whether the slow half is needed. `resolve`
     // goes through `load_config`, which chmod-walks the whole `~/.clauth` tree,
@@ -637,6 +690,10 @@ fn note_for(
     if payload.transcript.is_some() {
         record.transcript = payload.transcript.clone();
     }
+    // The account this scope's record held before the fire. The owner-store
+    // write keys on this: only a first attribution or a real change reaches
+    // the durable store, never a repeat resolution of the same account.
+    let prev_resolved = stored.as_ref().and_then(|r| r.resolved.as_deref());
     let current = match fresh {
         // The cache still answers, and the copy under the lock outranks the peek.
         None => record.resolved.clone(),
@@ -661,6 +718,16 @@ fn note_for(
             account
         }
     };
+    // The owner-store write keys on `payload.session_id` — the MAIN scope —
+    // while the record above keys on `record_path(session_id, agent_id)`, the
+    // scope this fire belongs to. An agent_id-bearing fire is a SUBAGENT's
+    // reading of its own scope: attributing that to the parent conversation
+    // would overwrite the parent's correct owner with the agent's stale reading,
+    // and would spend a store rewrite under the state flock on every subagent's
+    // first fire. Only a MAIN-scope resolution is a conversation attribution.
+    let exact_owner = current
+        .clone()
+        .filter(|_| payload.agent_id.is_none() && current.as_deref() != prev_resolved);
     let used = switched_headroom
         .filter(|h| current.as_deref() == Some(h.account.as_str()))
         .map(|h| h.used);
@@ -680,7 +747,10 @@ fn note_for(
                 "hook-note: cannot persist {}; staying silent",
                 path.display()
             ));
-            return None;
+            return FireOutcome {
+                note: None,
+                exact_owner: None,
+            };
         }
     } else {
         // An unchanged record still means a LIVE fire: the sweep's grace reads
@@ -688,12 +758,32 @@ fn note_for(
         // firing past the grace loses its baseline to the reap.
         touch_record(&path);
     }
-    note
+    // Release the scope lock before the deferred owner-store write: the state
+    // flock it takes is outer to the scope lock in the lock order, so it must
+    // never be acquired while the scope lock is held.
+    drop(_hold);
+    FireOutcome { note, exact_owner }
+}
+
+/// Test-visible wrapper that computes the fire and lands the exact-owner stamp
+/// immediately, the shape the store-stamp tests pin. [`run`] calls
+/// [`note_for_inner`] directly so the stamp lands after the print.
+#[cfg(test)]
+fn note_for(
+    payload: &Payload,
+    watch: &Watch,
+    resolve: &dyn Fn() -> Option<Reading>,
+) -> Option<String> {
+    let out = note_for_inner(payload, watch, resolve);
+    if let Some(profile) = out.exact_owner {
+        crate::sessions::stamp_exact_owner(&payload.session_id, &profile);
+    }
+    out.note
 }
 
 /// Move a record's mtime to now without rewriting its bytes: the sweep's
 /// [`MISSING_TRANSCRIPT_GRACE`] measures this mtime, and it must mean "last
-/// FIRE". `note_for` rewrites only a record that changed, so an unchanged
+/// FIRE". `note_for_inner` rewrites only a record that changed, so an unchanged
 /// record's mtime would otherwise age mid-conversation and the sweep would
 /// reap a live scope's baseline — the defect this exists to close (measured:
 /// 0/40 announced against a reap-eligible record, 40/40 against a fresh one;
@@ -728,17 +818,24 @@ fn touch_record(path: &Path) {
 /// The deadline is also what keeps a NESTED acquisition soft — `flock` blocks a
 /// second fd in the same process, so a future caller that takes this around
 /// something already holding it degrades after the wait instead of hanging.
-/// Today there is no such nesting: `note_for`, `nudge_note` and
+/// Today there is no such nesting: `note_for_inner`, `nudge_note` and
 /// `gc_conversation_records` are the only holders and none reaches another.
-/// `nudge_note` holds across the same shape as `note_for` — a record read,
+/// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)
 /// all run before the acquisition, in `read_nudge`.
+///
+/// It carries a rank in the global lock order — INSIDE the state flock, which
+/// is outer to it — so a future edit that reaches for the state flock while the
+/// scope lock is held trips [`crate::lockorder::RankGuard::enter`]'s assertion
+/// instead of deadlocking.
 struct ScopeLock {
     /// Held open for the guard's lifetime and never read: closing the fd is what
     /// releases the flock, so the binding IS the lock. Named like `StateLock`'s
-    /// own guards for the same reason.
+    /// own guards for the same reason. Drops before `_rank`, so the flock
+    /// releases before the SCOPE rank pops.
     _held: Option<std::fs::File>,
+    _rank: crate::lockorder::RankGuard,
 }
 
 impl ScopeLock {
@@ -759,7 +856,10 @@ impl ScopeLock {
             }
             Some(file)
         })();
-        Self { _held: held }
+        Self {
+            _held: held,
+            _rank: crate::lockorder::RankGuard::enter::<crate::lockorder::rank::Scope>(),
+        }
     }
 }
 

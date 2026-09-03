@@ -152,6 +152,12 @@ pub(crate) mod rank {
         ProfileTtl = 450;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
+        /// `hook_note::ScopeLock` (the per-scope record flock). A true leaf —
+        /// nothing is acquired while it is held — ranked INSIDE `State`, which is
+        /// outer to it: `note_for` drops it before the exact-owner stamp reaches
+        /// for the state flock, and the rank turns a future re-nesting into an
+        /// assertion instead of a deadlock.
+        Scope = 525;
         /// `runtime::SessionSwap`'s cell: the member a live session's credential
         /// link resolves to, plus the liveness markers of every member it has run
         /// on. A true leaf — take-read/take-publish-release, with the file IO the
