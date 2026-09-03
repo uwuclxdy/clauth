@@ -1675,9 +1675,13 @@ pub(crate) fn try_adopt_live_rotation(
         crate::claude::classify_credentials_link(name),
         Ok(crate::claude::LinkState::Diverged)
     ) {
-        // The live slot reads healthy again: whatever refusal state stood is
-        // resolved. Drop the once-per-state record so a FUTURE standing
-        // refusal — the same reason included — is news again.
+        // Anything but a live `Diverged` reading drops the record: a healthy
+        // slot, a missing one, and a classify that could not read at all.
+        // Dropping on the unreadable cases is the safe direction, since
+        // holding the record through one would suppress the NEXT genuine
+        // refusal, where dropping costs at most one duplicate announcement per
+        // blip. A future standing refusal, the same reason included, is then
+        // news again.
         remove_profile_cache(name, ADOPT_REFUSAL_FILE);
         return None;
     }
