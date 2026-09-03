@@ -1767,6 +1767,36 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
     }
 }
 
+/// The live column must be monotone in the list-area inner width (`total`):
+/// once it is present at some width it is present at every wider width, and it
+/// never disappears as the terminal narrows. The tier ladders jump several
+/// cells at a time, so the raw fit predicate alone would blink the column on
+/// and off while resizing.
+///
+/// This inner width is 4 cells narrower than the terminal width the render
+/// smoke test sweeps: the accounts panel takes 2 border cells + 2 horizontal
+/// padding cells. Floors here therefore read 4 lower than that test's.
+#[test]
+fn live_column_width_is_monotone_in_inner_width() {
+    for max_name in 8..=22 {
+        let mut prev = None;
+        for total in 30..=200 {
+            let width = live_column_width(max_name, total);
+            if let Some(prev_w) = prev
+                && width != prev_w
+            {
+                assert_eq!(
+                    (prev_w, width),
+                    (0, LIVE_W),
+                    "live column must only appear (0 -> LIVE_W), never drop or \
+                     flip, at name {max_name}, total {total} ({prev_w} -> {width})",
+                );
+            }
+            prev = Some(width);
+        }
+    }
+}
+
 // ── DeepSeek balance in the 5h column ──────────────────────────────────────
 
 /// The cell sitting under the `5h` header on `row`, padding included. Finds the

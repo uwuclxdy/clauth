@@ -128,6 +128,25 @@ struct OverviewWidths {
 /// constant for that to hold.
 const LIVE_W: usize = 4;
 
+/// Widest the name column ever reaches (the clamp ceiling at wide widths).
+const NAME_MAX: usize = 22;
+/// Widest the kind column ever reaches.
+const KIND_MAX: usize = 16;
+/// Widest the 5h column reaches before the wall-clock stamp bonus.
+const FIVE_HOUR_MAX: usize = 26;
+/// Widest the 7d column reaches before the wall-clock stamp bonus.
+const SEVEN_DAY_MAX: usize = 27;
+/// `total` at which the name clamp lets a name reach [`NAME_MAX`].
+const NAME_WIDE_AT: usize = 86;
+/// `total` at which the kind column reaches [`KIND_MAX`].
+const KIND_WIDE_AT: usize = 92;
+/// `total` at which the 5h column reaches [`FIVE_HOUR_MAX`].
+const FIVE_HOUR_WIDE_AT: usize = 81;
+/// `total` at which the 7d column reaches [`SEVEN_DAY_MAX`].
+const SEVEN_DAY_WIDE_AT: usize = 102;
+/// Minimum gap between overview columns.
+const GAP_MIN: usize = 2;
+
 impl OverviewWidths {
     fn new(width: u16, app: &App) -> Self {
         let total = width as usize;
@@ -138,105 +157,43 @@ impl OverviewWidths {
             .map(|p| p.name.chars().count())
             .max()
             .unwrap_or(8);
-        let mut name = max_name.clamp(8, if total >= 86 { 22 } else { 16 });
-        let mut kind = if total >= 92 {
-            16
-        } else if total >= 66 {
-            12
-        } else {
-            6
-        };
-        // 26 = [bar]+pct+reset, 17 = [bar]+pct only.
-        let mut five_hour = if total >= 81 {
-            26
-        } else if total >= 64 {
-            17
-        } else {
-            12
-        };
-        // One wider than 5h: `humanize_duration` hits 7 chars (`10h 20m`,
-        // `23h 59m`) inside the 7d countdown's 10h–23h band, and the 26-cell
-        // tier was sized for the 6-char ceiling. The bare-suffix fit check in
-        // `reset_suffix` deliberately does not clamp the countdown itself, so
-        // the column has to absorb the extra cell or it leaks into `live`.
-        let mut seven_day = if total >= 102 {
-            27
-        } else if total >= 93 {
-            17
-        } else if total >= 58 {
-            5
-        } else {
-            0
-        };
-        let gap_min = 2;
-        while fixed_overview_width(name, kind, five_hour, seven_day, 0, gap_min) > total {
-            if seven_day >= 17 {
-                seven_day = 5;
-            } else if seven_day > 0 {
-                seven_day = 0;
-            } else if five_hour > 17 {
-                five_hour = 17;
-            } else if five_hour > 12 {
-                five_hour = 12;
-            } else if kind > 6 {
-                kind = 6;
-            } else if name > 8 {
-                name -= 1;
-            } else {
-                break;
-            }
-        }
+        let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
+        let (name, kind, mut five_hour, mut seven_day) = overview_tiers(max_name, total);
+        let live = live_column_width(max_name, total);
 
-        // A wall-clock stamp needs 10 cells beyond the countdown (the worst real
-        // product is `6d 23h · 12:05am`, since `reset_column` drops the day
-        // qualifier once a countdown carries it). Take them ONLY from slack the
-        // layout would otherwise spend on gap padding, after the shrink loop has
-        // settled — so turning the setting on can add a stamp but never cost a
-        // countdown or a bar. Widening the tier itself instead pushed the 7d
-        // column down to 5 at 130 columns, deleting its bar. A column that gets
-        // only part of the 10 still degrades cleanly in `reset_suffix`.
-        if ResetFmt::from_state(&app.config().state).shows_clock() {
+        if shows_clock {
             const CLOCK_COLS: usize = 10;
+            // A wall-clock stamp needs 10 cells beyond the countdown (the worst
+            // real product is `6d 23h · 12:05am`, since `reset_column` drops
+            // the day qualifier once a countdown carries it). Take them ONLY
+            // from slack the layout would otherwise spend on gap padding, after
+            // the live column and the shrink loop have settled — so turning the
+            // setting on can add a stamp but never cost a countdown, a bar or
+            // the live column. Widening the tier itself instead pushed the 7d
+            // column down to 5 at 130 columns, deleting its bar. A column that
+            // gets only part of the 10 still degrades cleanly in
+            // `reset_suffix`.
             let slack = |five: usize, seven: usize| {
                 total.saturating_sub(
-                    fixed_overview_width(name, kind, five, seven, 0, gap_min) + TIMER_SLOT,
+                    fixed_overview_width(name, kind, five, seven, live, GAP_MIN) + TIMER_SLOT,
                 )
             };
-            if five_hour == 26 {
+            if five_hour == FIVE_HOUR_MAX {
                 five_hour += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
-            if seven_day == 27 {
+            if seven_day == SEVEN_DAY_MAX {
                 seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
         }
 
-        // The live-session column plays by the reset column's rule: it takes only
-        // what the layout would otherwise spend on gap padding, after everything
-        // above has settled, so it can never cost a name, a bar, a countdown, or
-        // a reset stamp at any width. Where the slack does not cover it, the
-        // column is dropped whole.
-        //
-        // Gated on WIDTH ALONE, never on whether anything is live: a column that
-        // appeared the moment someone ran `clauth start` would reflow the entire
-        // table under the operator and reflow it back on exit. Same reason the
-        // cell is fixed-width rather than sized to the count it holds.
-        let live = if fixed_overview_width(name, kind, five_hour, seven_day, LIVE_W, gap_min)
-            + TIMER_SLOT
-            <= total
-        {
-            LIVE_W
-        } else {
-            0
-        };
-
-        let base = fixed_overview_width(name, kind, five_hour, seven_day, live, gap_min);
+        let base = fixed_overview_width(name, kind, five_hour, seven_day, live, GAP_MIN);
         let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
         let gap_slots = column_count.saturating_sub(1).max(1);
         // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
         // widening gaps from that undercounted figure overflows the row at
         // narrow widths and clips the tail of the 5h column. Widen from the
         // real leftover instead.
-        let gap = (gap_min + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(gap_min, 8);
+        let gap = (GAP_MIN + total.saturating_sub(base + TIMER_SLOT) / gap_slots).clamp(GAP_MIN, 8);
 
         let deepseek_amount_w = app
             .config()
@@ -259,6 +216,102 @@ impl OverviewWidths {
             gap,
             deepseek_amount_w,
         }
+    }
+}
+
+/// The four semantic column widths after the tier ladders and the shrink loop
+/// have settled at `total`. The wall-clock stamp bonus is applied by the
+/// caller after the live column is decided.
+fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize) {
+    let mut name = max_name.clamp(8, if total >= NAME_WIDE_AT { NAME_MAX } else { 16 });
+    let mut kind = if total >= KIND_WIDE_AT {
+        KIND_MAX
+    } else if total >= 66 {
+        12
+    } else {
+        6
+    };
+    // 26 = [bar]+pct+reset, 17 = [bar]+pct only.
+    let mut five_hour = if total >= FIVE_HOUR_WIDE_AT {
+        FIVE_HOUR_MAX
+    } else if total >= 64 {
+        17
+    } else {
+        12
+    };
+    // One wider than 5h: `humanize_duration` hits 7 chars (`10h 20m`,
+    // `23h 59m`) inside the 7d countdown's 10h–23h band, and the 26-cell
+    // tier was sized for the 6-char ceiling. The bare-suffix fit check in
+    // `reset_suffix` deliberately does not clamp the countdown itself, so
+    // the column has to absorb the extra cell or it leaks into `live`.
+    let mut seven_day = if total >= SEVEN_DAY_WIDE_AT {
+        SEVEN_DAY_MAX
+    } else if total >= 93 {
+        17
+    } else if total >= 58 {
+        5
+    } else {
+        0
+    };
+    while fixed_overview_width(name, kind, five_hour, seven_day, 0, GAP_MIN) > total {
+        if seven_day >= 17 {
+            seven_day = 5;
+        } else if seven_day > 0 {
+            seven_day = 0;
+        } else if five_hour > 17 {
+            five_hour = 17;
+        } else if five_hour > 12 {
+            five_hour = 12;
+        } else if kind > 6 {
+            kind = 6;
+        } else if name > 8 {
+            name -= 1;
+        } else {
+            break;
+        }
+    }
+
+    (name, kind, five_hour, seven_day)
+}
+
+/// The live-session column width at `total`: [`LIVE_W`] only when the column
+/// fits here and at every wider width, `0` otherwise. Gated on width alone,
+/// never on whether anything is live, so the table never reflows when a
+/// session starts or stops.
+///
+/// Decided BEFORE the wall-clock stamp bonus, so it may take cells the stamp
+/// would otherwise use — but never a name, a bar or a countdown, and
+/// `reset_suffix` degrades cleanly on whatever the stamp gets.
+///
+/// The tier ladders jump by more than the one cell a width increment adds
+/// (`kind` 12→16, `seven_day` 5→17→27, `five_hour` 17→26), so the raw fit
+/// predicate can pass at one width, fail at the next and pass again. Once
+/// every ladder has saturated the leftover slack grows 1:1 with width, so the
+/// predicate is monotone from there on and only the bounded stretch up to that
+/// saturation width needs scanning.
+fn live_column_width(max_name: usize, total: usize) -> usize {
+    let fits = |w: usize| {
+        let (name, kind, five_hour, seven_day) = overview_tiers(max_name, w);
+        fixed_overview_width(name, kind, five_hour, seven_day, LIVE_W, GAP_MIN) + TIMER_SLOT <= w
+    };
+    // Two quantities bound the scan: the largest ladder threshold (past it no
+    // tier can still jump) and the width at which every ladder maximum plus the
+    // timer fits (past it the settled tiers stop changing, so slack grows 1:1).
+    // Take the larger so neither half is a coincidence the other one covers.
+    let largest_ladder_at = NAME_WIDE_AT
+        .max(KIND_WIDE_AT)
+        .max(FIVE_HOUR_WIDE_AT)
+        .max(SEVEN_DAY_WIDE_AT);
+    let saturation =
+        fixed_overview_width(NAME_MAX, KIND_MAX, FIVE_HOUR_MAX, SEVEN_DAY_MAX, 0, GAP_MIN)
+            + TIMER_SLOT;
+    let ceiling = saturation.max(largest_ladder_at);
+    if total >= ceiling {
+        if fits(total) { LIVE_W } else { 0 }
+    } else if (total..=ceiling).all(fits) {
+        LIVE_W
+    } else {
+        0
     }
 }
 

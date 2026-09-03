@@ -1566,7 +1566,9 @@ fn live_column_present(app: &App, width: u16) -> bool {
 }
 
 /// Where the `live` column exists, exactly, as a function of name length and
-/// terminal width.
+/// terminal width. The column is monotone in width: once it is present at some
+/// width it is present at every wider width, so each map is one `(floor, 200)`
+/// range and the column never disappears as the terminal widens.
 ///
 /// The fit gate's own comparison had no pin: `<= total` → `< total` shifts every
 /// arrival by one column and the whole suite stayed green, because the only test
@@ -1574,34 +1576,48 @@ fn live_column_present(app: &App, width: u16) -> bool {
 /// it, which is true however the gate is written. This asserts the map instead,
 /// so the boundary is a fact rather than a self-consistency check.
 ///
-/// Presence is NOT monotonic and there is no single cutoff: the column takes what
-/// the name clamp and the kind / 5h / 7d tiers leave, so every tier bump reclaims
-/// its cells and widening the terminal can REMOVE it. That is why the expectation
-/// is a set of ranges and not a threshold.
+/// The column is decided before the wall-clock stamp bonus, so it outranks the
+/// stamp's clock cells rather than the other way round: the map is identical
+/// whether `reset_display` shows a clock or not, and only the stamp's wall-clock
+/// half may lose cells to it.
+///
+/// The floors are TERMINAL widths. The width math itself runs in the list-area
+/// inner width, 4 cells narrower — the accounts panel's rounded border plus a
+/// 1-cell horizontal padding on each side — so the pure-function floors read
+/// 4 lower than these.
 #[test]
-fn the_live_column_exists_exactly_where_the_other_columns_left_room() {
+fn the_live_column_appears_monotonically_in_width() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::Tab;
 
-    // (name length, inclusive terminal-width ranges carrying the column)
-    const PRESENCE: &[(usize, &[(u16, u16)])] = &[
-        (8, &[(48, 200)]),
-        (11, &[(51, 200)]),
-        (16, &[(56, 61), (63, 69), (74, 96), (99, 105), (109, 200)]),
-    ];
+    // (name length, terminal width at which the column first appears)
+    const FLOORS: &[(usize, u16)] = &[(8, 48), (12, 52), (13, 71), (14, 107), (16, 109), (22, 115)];
 
-    for (name_len, ranges) in PRESENCE {
+    for (name_len, floor) in FLOORS {
         let name = "n".repeat(*name_len);
-        let mut app = App::new(AppConfig {
-            state: AppState::default(),
-            profiles: vec![oauth(&name, 40.0, 60.0, false)],
-        });
-        app.tab = Tab::Overview;
+        for clock in [false, true] {
+            let state = AppState {
+                reset_display: if clock {
+                    Some(crate::profile::ResetDisplay::Both)
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            let mut app = App::new(AppConfig {
+                state,
+                profiles: vec![oauth(&name, 40.0, 60.0, false)],
+            });
+            app.tab = Tab::Overview;
 
-        let present: Vec<u16> = (34u16..=200)
-            .filter(|w| live_column_present(&app, *w))
-            .collect();
-        let expected: Vec<u16> = ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect();
-        assert_eq!(present, expected, "the {name_len}-char presence map moved");
+            let present: Vec<u16> = (34u16..=200)
+                .filter(|w| live_column_present(&app, *w))
+                .collect();
+            let expected: Vec<u16> = (*floor..=200).collect();
+            assert_eq!(
+                present, expected,
+                "the {name_len}-char presence map moved (clock {clock})",
+            );
+        }
     }
 }
