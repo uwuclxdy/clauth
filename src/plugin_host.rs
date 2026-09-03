@@ -160,7 +160,10 @@ impl Drop for HealInFlight {
     }
 }
 
-#[cfg(test)]
+/// `unix` because every caller is a `#[cfg(unix)]` test: the heal's fake
+/// `claude` is a shell shim. A bare `cfg(test)` gate is dead code on Windows,
+/// which `-D warnings` reds there and nowhere else.
+#[cfg(all(test, unix))]
 pub(crate) fn reset_heal_throttle_for_test() {
     HEAL_IN_FLIGHT.store(false, Ordering::Release);
     LAST_HEAL_START_MS.store(0, Ordering::Relaxed);
