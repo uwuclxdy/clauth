@@ -8,10 +8,10 @@ use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
     ActivityStore, ClaudeRollingPacing, EpochMs, LastFetchedAt, ProfileActivity,
-    RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, TokenEntry,
+    RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, ThirdPartyFetcher, TokenEntry,
     anchor_post_reset_oauth, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
-    collect_third_party_entries, collect_tokens, filter_suppressed, mark_activity,
-    memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
+    collect_third_party_entries, collect_tokens, fetch_third_party_due, filter_suppressed,
+    mark_activity, memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
@@ -3778,6 +3778,182 @@ fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
     }
 }
 
+fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    super::SchedulerState {
+        config: Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        })),
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(super::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher,
+    }
+}
+
+fn stub_auth_expired(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::AuthExpired)
+}
+
+fn stub_rate_limited(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::RateLimited { retry_after: None })
+}
+
+fn stub_network_error(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::Network)
+}
+
+#[test]
+fn fetch_third_party_due_inserts_generic_auth_expired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-dead"]);
+    let entry = tp_entry("generic-dead");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_auth_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state.suppressed_generic.lock().unwrap().get("generic-dead"),
+        Some(&fp)
+    );
+    assert!(crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_inserts_known_auth_expired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-dead"]);
+    let entry = alibaba_entry("qwen-dead", "console-token");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_auth_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state.suppressed_generic.lock().unwrap().get("qwen-dead"),
+        Some(&fp)
+    );
+    assert!(crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_inserts_generic_failed_without_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-no-data"]);
+    let entry = tp_entry("generic-no-data");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state
+            .suppressed_generic
+            .lock()
+            .unwrap()
+            .get("generic-no-data"),
+        Some(&fp)
+    );
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_does_not_insert_rate_limited() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-limited"]);
+    let entry = tp_entry("generic-limited");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_rate_limited);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_does_not_insert_cached() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-cached"]);
+    let entry = tp_entry("generic-cached");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_does_not_insert_known_failed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-failed"]);
+    let entry = alibaba_entry("qwen-failed", "console-token");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("qwen-failed"),
+        Some(&super::FetchStatus::Failed)
+    );
+}
+
 /// Alibaba's quota surface cannot read the api key at all, so a console-only
 /// profile is still fetchable. Dropped from the work list it would never get a
 /// `fetch_status`, and the Usage tab would spin "loading" forever.
@@ -4495,6 +4671,7 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
@@ -4587,6 +4764,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
@@ -4624,7 +4802,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
 /// below discriminate between the two branches — and keeps a regression cheap:
 ///   * armed + nothing due never calls `fetch_oauth_due`, so a broken lease
 ///     fails these asserts instead of firing a live request at the real endpoint
-///     (`tick` hardcodes the real fetcher; there is no seam to inject through it);
+///     (`fetch_oauth_due` hardcodes the real fetcher; there is no seam to inject through it);
 ///   * the `Queued` mark survives an armed tick (`clear_orphaned_forced` returns
 ///     early on an empty `forced` set, and no worker runs to clear it), while
 ///     `standdown_tick` sweeps EVERY `Queued` mark — so the sweep proves the
@@ -4684,6 +4862,7 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -4786,6 +4965,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     super::tick(&state);
@@ -4901,6 +5081,7 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(stale_prune),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     // First tick: wins the lease, prunes histories, fetches.
@@ -5008,6 +5189,7 @@ fn auto_start_queue_election_is_wired_into_tick() {
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     super::tick(&state);
@@ -5585,6 +5767,7 @@ fn completion_order_state() -> super::SchedulerState {
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     }
 }
 
@@ -8343,6 +8526,7 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     let snapshot = vec![warming("a"), warming("b"), warming("c")];
@@ -8558,6 +8742,7 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     let mut a = token("a");

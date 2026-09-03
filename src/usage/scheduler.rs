@@ -2467,6 +2467,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
         mark_activity(&state.activity, &entry.name, ProfileActivity::Queued);
     }
 
+    let fetcher = state.fetcher;
     let handles: Vec<_> = due
         .into_iter()
         .map(|entry| {
@@ -2495,11 +2496,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
             let h = std::thread::spawn(move || {
                 await_request_slot(&host);
                 mark_activity(&activity, &worker_name, ProfileActivity::Fetching);
-                crate::providers::fetch_third_party_usage(
-                    &entry.target,
-                    &entry.api_key,
-                    hint.as_deref(),
-                )
+                fetcher(&entry.target, &entry.api_key, hint.as_deref())
             });
             (name, is_generic, fingerprint, h)
         })
@@ -2735,8 +2732,17 @@ fn prune_histories_if_due(
     true
 }
 
-/// Background scheduler state. Holds **cloned `Arc`s only** — no live lock guards —
-/// so the struct carries no lock rank. `tick` acquires individual mutexes in rank order.
+/// Injected third-party fetch: production points it at the real endpoint, tests
+/// point it at a canned outcome so the suppression INSERTION side is pinnable.
+type ThirdPartyFetcher = fn(
+    &crate::providers::ThirdPartyTarget,
+    &str,
+    Option<&str>,
+) -> Result<ThirdPartyStats, crate::providers::ThirdPartyError>;
+
+/// Background scheduler state. Every field is cheap to clone and shareable
+/// across worker threads. None holds a live lock guard, so the struct carries
+/// no lock rank. `tick` acquires individual mutexes in rank order.
 pub(crate) struct SchedulerState {
     config: crate::profile::ConfigHandle,
     tokens: TokenList,
@@ -2778,6 +2784,7 @@ pub(crate) struct SchedulerState {
     /// CLA-ROLL pacing for the rolling-sidecar freshness scan.
     claude_rolling:
         crate::lockorder::RankedMutex<ClaudeRollingPacing, crate::lockorder::rank::RollingPacing>,
+    fetcher: ThirdPartyFetcher,
 }
 
 /// One scheduler tick: drain forced refetches, partition both legs, publish
@@ -3241,6 +3248,7 @@ pub(crate) fn spawn_refresher(
         standdown_active: AtomicBool::new(false),
         last_history_prune,
         claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
     // Same test-skip rationale as the status/tokens/pricing workers in
     // `tui/app.rs`: a detached tick thread is never joined, so it could run
