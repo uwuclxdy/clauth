@@ -8,15 +8,102 @@ use super::*;
 use crate::logline::LogLines;
 use crate::testutil::HomeSandbox;
 
-/// Trimmed real ai-pricelog index
+/// Trimmed real ai-pricelog v4 index
 /// (`tests/fixtures/ai-pricelog-index-trimmed.json`): real rows for the
 /// claude / gpt / qwen / glm / deepseek / moonshot / grok first-party
-/// representatives, dashscope's six `removed_at`-stamped resold rows, one
-/// reseller source, and rows marked `"synthetic": true` for shapes no live
-/// row exercises (a future `effective_at`, an overlapping window pair).
+/// representatives, dashscope's six resold rows, deepseek's own
+/// `removed_at`-stamped deepseek-r1 row (the delisting pin, first-party so
+/// the resold guard cannot dash it instead), one reseller source, and rows
+/// marked `"synthetic": true` for shapes no live row exercises: a future
+/// `effective_at`, an overlapping window pair, and a `min_tokens` volume
+/// tier — every live one of those sits on openrouter, which the resold guard
+/// drops (verified against the store, 2026-09-03).
 const FIXTURE: &str = include_str!("../fixtures/ai-pricelog-index-trimmed.json");
 
+/// Trimmed real ai-pricelog v4 provider registry
+/// (`tests/fixtures/ai-pricelog-providers-trimmed.json`): the eight
+/// vendor-carrying providers the other fixtures name plus five vendorless
+/// resellers. Verbatim store bytes.
+const PROVIDERS_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-providers-trimmed.json");
+
+/// Trimmed real ai-pricelog v4 alias chains
+/// (`tests/fixtures/ai-pricelog-aliases-trimmed.json`): the two deepseek api
+/// alias chains (`deepseek-chat`, `deepseek-reasoner`) and one null-bound
+/// chain (`grok-4.5-latest`). Verbatim store bytes.
+const ALIASES_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-aliases-trimmed.json");
+
 // ── helpers ──────────────────────────────────────────────────────────────────
+
+/// The resold guard a literal catalog pair produces, distilled exactly as a
+/// fetch does: the provider registry first, then the model registry against
+/// it.
+fn guard(models: &str, providers: &str) -> FirstParty {
+    let vendors = distill_providers(providers).expect("providers distill");
+    distill_catalog(models, &vendors)
+        .expect("catalog distills")
+        .1
+}
+
+/// The guard the fixtures' own catalog produces.
+fn fixture_guard() -> FirstParty {
+    guard(MODELS_FIXTURE, PROVIDERS_FIXTURE)
+}
+
+/// The canonical map the fixtures' own catalog produces.
+fn fixture_canonical() -> CanonicalMap {
+    let vendors = distill_providers(PROVIDERS_FIXTURE).expect("providers distill");
+    distill_catalog(MODELS_FIXTURE, &vendors)
+        .expect("catalog distills")
+        .0
+}
+
+/// A guard naming every `(source, model_id)` pair an index JSON carries. The
+/// parse-shape tests assert what a row DISTILLS to, so the catalog must not
+/// be what decides whether their row survives; the resold-guard tests build a
+/// real catalog with [`guard`] instead. An unparseable or shapeless JSON
+/// yields an empty guard, which resells everything.
+fn all_first_party(index_json: &str) -> FirstParty {
+    let root: serde_json::Value =
+        serde_json::from_str(index_json).unwrap_or(serde_json::Value::Null);
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    for (source, rows) in root
+        .get("sources")
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        for id in rows
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(id, _)| id.clone())
+        {
+            map.entry(source.clone()).or_default().insert(id);
+        }
+    }
+    FirstParty(map)
+}
+
+/// One history ndjson's every `(source, model_id)` pair as first-party, the
+/// line-shape counterpart of [`all_first_party`].
+fn all_first_party_history(ndjson: &str) -> FirstParty {
+    let mut map: HashMap<String, HashSet<String>> = HashMap::new();
+    for line in ndjson.lines() {
+        let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let (Some(source), Some(id)) = (
+            row.get("source").and_then(serde_json::Value::as_str),
+            row.get("model_id").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        map.entry(source.to_owned())
+            .or_default()
+            .insert(id.to_owned());
+    }
+    FirstParty(map)
+}
 
 /// One unconstrained price entry at the given input/output rates (cache 0).
 fn entry(input: f64, output: f64) -> PriceEntry {
@@ -113,123 +200,373 @@ fn assert_rate(got: Option<f64>, expected: f64) {
 #[test]
 fn distill_converts_mtok_to_per_token() {
     // Real deepseek-v4-pro row: 0.66 USD/Mtok in → 6.6e-7 per token.
-    let json = r#"{"version": 3, "sources": {"deepseek": {
-        "deepseek-v4-pro": {"input_mtok": 0.66, "output_mtok": 1.98, "cache_read_mtok": 0.022}
+    let json = r#"{"version": 4, "sources": {"deepseek": {
+        "deepseek-v4-pro": {"rates": {"input": 0.66, "output": 1.98, "cache_read": 0.022}}
     }}}"#;
-    let models = distill(json).expect("distill ok");
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
     assert_eq!(models.len(), 1);
     let rate = &models[0].prices[0];
     assert!((rate.input - 6.6e-7).abs() < 1e-12, "got {}", rate.input);
     assert!((rate.output - 1.98e-6).abs() < 1e-12, "got {}", rate.output);
     assert!((rate.cache_read - 2.2e-8).abs() < 1e-15);
-    assert_eq!(rate.cache_write, 0.0); // missing field defaults to 0
+    assert_eq!(rate.cache_write, 0.0); // missing axis defaults to 0
 }
 
 #[test]
 fn distill_skips_rows_with_malformed_price_fields() {
     // The index carries no tiered ladders (verified against the live index);
-    // a declared rate key of any non-numeric shape fails the whole row, which
-    // the caller skips — the sibling row survives.
-    let json = r#"{"version": 3, "sources": {"deepseek": {
-        "bad-price-shape": {"input_mtok": "garbage", "output_mtok": 0.42},
-        "deepseek-v3.2": {"input_mtok": 0.28, "output_mtok": 0.42}
+    // a declared rate axis of any non-numeric shape fails the whole row,
+    // which the caller skips — the sibling row survives.
+    let json = r#"{"version": 4, "sources": {"deepseek": {
+        "bad-price-shape": {"rates": {"input": "garbage", "output": 0.42}},
+        "deepseek-v3.2": {"rates": {"input": 0.28, "output": 0.42}}
     }}}"#;
-    let models = distill(json).expect("distill ok");
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["deepseek-v3.2"]);
 }
+
+#[test]
+fn distill_ignores_the_v4_keys_it_models_nothing_for() {
+    // A real v4 row carries a great deal clauth prices nothing off:
+    // `schema` / `source` / `model_id` / `observed_at` / `first_seen`
+    // bookkeeping, `provenance`, `fees`, `limits` (the flat `max_tokens`
+    // family's replacement), `currency`, and six rate axes with no token
+    // bucket to charge to. None is declared, so the row parses and prices its
+    // four axes; DECLARING one of the wrong shape is what fails a row.
+    //
+    // `currency` appears here in the only shape the store writes it — a
+    // NON-USD source quote beside the `provenance.fx_rate` that converted it
+    // (scaleway's real EUR shape). The rates are already USD, so ignoring the
+    // key prices the row correctly; reading it as the rates' unit would not.
+    let json = r#"{"version": 4, "sources": {"deepseek": {"deepseek-v4-pro": {
+        "schema": 4, "source": "deepseek", "model_id": "deepseek-v4-pro",
+        "observed_at": "2026-08-30", "first_seen": "2026-04-24", "currency": "EUR",
+        "rates": {"input": 0.66, "output": 1.98, "cache_read": 0.022,
+                  "cache_write_1h": 9.9, "image": 9.9, "audio": 9.9,
+                  "internal_reasoning": 9.9, "input_audio_cache": 9.9, "image_output": 9.9},
+        "fees": {"web_search": 0.005},
+        "limits": {"context": 1048576, "output": 393216},
+        "provenance": {"url": "https://api-docs.deepseek.com/quick_start/pricing/",
+                       "fx_rate": 1.1643, "fx_rate_date": "2026-08-28"}
+    }}}}"#;
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
+    assert_eq!(models.len(), 1);
+    let rate = &models[0].prices[0];
+    assert!((rate.input - 6.6e-7).abs() < 1e-12);
+    assert!((rate.output - 1.98e-6).abs() < 1e-12);
+    assert!((rate.cache_read - 2.2e-8).abs() < 1e-15);
+    assert_eq!(rate.cache_write, 0.0, "the 1h axis never fills the 5m one");
+}
+
+// ── the resold guard ─────────────────────────────────────────────────────────
+
+/// A literal provider registry: three vendor-carrying makers beside two
+/// vendorless resellers.
+const GUARD_PROVIDERS: &str = r#"{"version": 4, "providers": {
+    "deepseek": {"name": "DeepSeek", "vendor": "deepseek", "kind": "first_party"},
+    "dashscope": {"name": "Alibaba Model Studio", "vendor": "alibaba", "kind": "first_party"},
+    "anthropic": {"name": "Anthropic", "vendor": "anthropic", "kind": "first_party"},
+    "openrouter": {"name": "OpenRouter", "kind": "reseller"},
+    "cerebras": {"name": "Cerebras", "kind": "reseller"}
+}}"#;
 
 #[test]
 fn distill_keeps_first_party_drops_resellers() {
-    let json = r#"{"version": 3, "sources": {
-        "deepseek": {
-            "deepseek-v3.2": {"input_mtok": 0.28, "output_mtok": 0.42}
-        },
-        "openrouter": {
-            "deepseek/deepseek-v3.2": {"input_mtok": 3, "output_mtok": 15}
-        },
-        "novita": {
-            "deepseek/deepseek-v3.2": {"input_mtok": 5, "output_mtok": 25}
-        },
-        "avian": {
-            "deepseek/deepseek-v3.2": {"input_mtok": 1, "output_mtok": 2}
+    // A row is resold when the model's maker differs from the provider's
+    // vendor, and a provider publishing NO vendor resells everything — so
+    // both reseller copies of the id deepseek's own row prices drop, however
+    // they spell it.
+    let catalog = r#"{"version": 4, "models": {"deepseek-v3.2": {
+        "vendor": "deepseek", "curated": true,
+        "sources": {"deepseek": ["deepseek-v3.2"],
+                    "openrouter": ["deepseek/deepseek-v3.2"],
+                    "cerebras": ["deepseek-v3.2"]}
+    }}}"#;
+    let json = r#"{"version": 4, "sources": {
+        "deepseek": {"deepseek-v3.2": {"rates": {"input": 0.28, "output": 0.42}}},
+        "openrouter": {"deepseek/deepseek-v3.2": {"rates": {"input": 3, "output": 15}}},
+        "cerebras": {"deepseek-v3.2": {"rates": {"input": 5, "output": 25}}}
+    }}"#;
+    let models = distill(json, &guard(catalog, GUARD_PROVIDERS)).expect("distill ok");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["deepseek-v3.2"]);
+    assert!(
+        (models[0].prices[0].input - 2.8e-7).abs() < 1e-12,
+        "deepseek's own rate"
+    );
+}
+
+#[test]
+fn distill_splits_a_mixed_provider_row_by_row() {
+    // dashscope MAKES qwen (vendor alibaba) and RESELLS deepseek ids. One
+    // vendor comparison per row splits them; a provider allowlist could only
+    // keep the whole source or drop it.
+    let catalog = r#"{"version": 4, "models": {
+        "qwen3.8-max": {"vendor": "alibaba", "curated": true,
+                        "sources": {"dashscope": ["qwen3.8-max"]}},
+        "deepseek-v4-pro": {"vendor": "deepseek", "curated": true,
+                            "sources": {"deepseek": ["deepseek-v4-pro"],
+                                        "dashscope": ["deepseek-v4-pro"]}}
+    }}"#;
+    let json = r#"{"version": 4, "sources": {"dashscope": {
+        "qwen3.8-max": {"rates": {"input": 2.0, "output": 6.0}},
+        "deepseek-v4-pro": {"rates": {"input": 2.4, "output": 4.8}}
+    }}}"#;
+    let models = distill(json, &guard(catalog, GUARD_PROVIDERS)).expect("distill ok");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["qwen3.8-max"], "its own vendor's row survives alone");
+}
+
+#[test]
+fn distill_drops_a_resold_row_whatever_its_id_spells() {
+    // The id-prefix guess this replaced could only recognize a resold
+    // `claude*` row. The vendor comparison needs no spelling: anthropic's own
+    // claude row survives, dashscope's copy drops, and so does dashscope's
+    // resale of a NON-claude id — the case no prefix guess reaches.
+    let catalog = r#"{"version": 4, "models": {
+        "claude-opus-5": {"vendor": "anthropic", "curated": true,
+                          "sources": {"anthropic": ["claude-opus-5"],
+                                      "dashscope": ["Claude-Opus-5"]}},
+        "deepseek-v4-pro": {"vendor": "deepseek", "curated": true,
+                            "sources": {"dashscope": ["deepseek-v4-pro"]}}
+    }}"#;
+    let json = r#"{"version": 4, "sources": {
+        "anthropic": {"claude-opus-5": {"rates": {"input": 5, "output": 25}}},
+        "dashscope": {
+            "Claude-Opus-5": {"rates": {"input": 3, "output": 15}},
+            "deepseek-v4-pro": {"rates": {"input": 2.4, "output": 4.8}}
         }
     }}"#;
-    let models = distill(json).expect("distill ok");
+    let models = distill(json, &guard(catalog, GUARD_PROVIDERS)).expect("distill ok");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, ["claude-opus-5"]);
+    assert!(
+        (models[0].prices[0].input - 5e-6).abs() < 1e-12,
+        "anthropic's own rate"
+    );
+}
+
+#[test]
+fn a_model_with_no_named_maker_is_nobody_s_first_party_row() {
+    // The clause a bare inequality loses: two absent vendors compare EQUAL,
+    // which would hand every maker-less model to whichever provider serves
+    // it. The live catalog gives 17 of its 724 entries no vendor and all 17
+    // sit on vendorless resellers (measured 2026-09-03), so the row must drop
+    // on the vendorless provider AND on the vendor-carrying one.
+    let catalog = r#"{"version": 4, "models": {"mystery-9b": {
+        "vendor": null, "curated": false,
+        "sources": {"openrouter": ["mystery-9b"], "deepseek": ["mystery-9b"]}
+    }}}"#;
+    let json = r#"{"version": 4, "sources": {
+        "openrouter": {"mystery-9b": {"rates": {"input": 1, "output": 2}}},
+        "deepseek": {"mystery-9b": {"rates": {"input": 3, "output": 4}}}
+    }}"#;
+    assert!(
+        distill(json, &guard(catalog, GUARD_PROVIDERS)).is_err(),
+        "a maker-less model is first-party nowhere, so nothing survives"
+    );
+}
+
+#[test]
+fn a_pair_the_catalog_does_not_name_is_resold() {
+    // The catalog is the only place a maker is named, so a row it says
+    // nothing about has nothing to compare and drops. The live feeds carry no
+    // such pair (0 of 1106 index rows and 0 of 1106 history pairs, measured
+    // 2026-09-03); this is what happens when one appears.
+    let catalog = r#"{"version": 4, "models": {"deepseek-v3.2": {
+        "vendor": "deepseek", "curated": true, "sources": {"deepseek": ["deepseek-v3.2"]}
+    }}}"#;
+    let json = r#"{"version": 4, "sources": {"deepseek": {
+        "deepseek-v3.2": {"rates": {"input": 0.28, "output": 0.42}},
+        "deepseek-v9-unlisted": {"rates": {"input": 9, "output": 9}}
+    }}}"#;
+    let models = distill(json, &guard(catalog, GUARD_PROVIDERS)).expect("distill ok");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["deepseek-v3.2"]);
 }
 
 #[test]
-fn distill_maps_source_names_and_drops_closed_sources() {
-    // The index spells the two renamed providers differently from clauth's
-    // canonical names; the map applies at distill. zhipuai and voyageai are
-    // closed upstream and stay out of the allowlist.
-    let json = r#"{"version": 3, "sources": {
-        "moonshot": {"kimi-k2.6": {"input_mtok": 0.95, "output_mtok": 4.0}},
-        "xai": {"grok-4.6": {"input_mtok": 2.0, "output_mtok": 6.0}},
-        "zhipuai": {"glm-4.7": {"input_mtok": 0.5, "output_mtok": 1.0}},
-        "voyageai": {"voyage-3": {"input_mtok": 0.1, "output_mtok": 0.1}}
+fn catalog_reads_a_sources_value_as_a_list() {
+    // Every `sources` value in the v4 catalog is a LIST of that source's
+    // spellings — all 1106 of them, zero strings (measured 2026-09-03).
+    // Reading one as a string names no pair at all, so the canonical map
+    // distills empty and the feed fails; a bare string is still accepted as a
+    // one-element list.
+    let providers = r#"{"version": 4, "providers": {
+        "groq": {"name": "Groq", "kind": "reseller"},
+        "deepseek": {"name": "DeepSeek", "vendor": "deepseek", "kind": "first_party"}
     }}"#;
-    let models = distill(json).expect("distill ok");
-    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["kimi-k2.6", "grok-4.6"]);
+    let catalog = r#"{"version": 4, "models": {"deepseek-v3.2": {
+        "vendor": "deepseek", "curated": true,
+        "sources": {"deepseek": ["deepseek-v3.2", "deepseek-v3.2-exp"],
+                    "groq": "deepseek-v3.2"}
+    }}}"#;
+    let vendors = distill_providers(providers).expect("providers distill");
+    let (canonical, first_party) = distill_catalog(catalog, &vendors).expect("catalog distills");
+    // Both list entries land, and so does the bare-string one.
+    let deepseek = canonical.get("deepseek").expect("deepseek pairs");
+    assert_eq!(
+        deepseek.get("deepseek-v3.2"),
+        Some(&"deepseek-v3.2".to_owned())
+    );
+    assert_eq!(
+        deepseek.get("deepseek-v3.2-exp"),
+        Some(&"deepseek-v3.2".to_owned())
+    );
+    assert_eq!(
+        canonical
+            .get("groq")
+            .and_then(|ids| ids.get("deepseek-v3.2")),
+        Some(&"deepseek-v3.2".to_owned())
+    );
+    // The guard follows the same read: deepseek makes both spellings, groq
+    // publishes no vendor and resells its one.
+    assert!(!first_party.resells("deepseek", "deepseek-v3.2"));
+    assert!(!first_party.resells("deepseek", "deepseek-v3.2-exp"));
+    assert!(first_party.resells("groq", "deepseek-v3.2"));
+    // A value of neither shape names nothing, and a catalog of only those
+    // fails rather than reselling every row silently.
+    let broken = r#"{"version": 4, "models": {"m": {
+        "vendor": "deepseek", "sources": {"deepseek": 42}
+    }}}"#;
+    assert!(distill_catalog(broken, &vendors).is_err());
 }
 
 #[test]
-fn distill_drops_resold_claude_rows() {
-    // A kept provider reselling another vendor's models: its claude rows drop
-    // and anthropic's own row is the only legitimate one. The live index
-    // carries no such rows today; the guard stays against upstream regress.
-    let json = r#"{"version": 3, "sources": {
-        "anthropic": {
-            "claude-opus-5": {"input_mtok": 5, "output_mtok": 25}
-        },
-        "google": {
-            "claude-opus-5": {"input_mtok": 3, "output_mtok": 15},
-            "gemini-3.7-flash": {"input_mtok": 0.1, "output_mtok": 0.4}
-        }
-    }}"#;
-    let models = distill(json).expect("distill ok");
-    let count = |id: &str| models.iter().filter(|m| m.id == id).count();
-    assert_eq!(count("claude-opus-5"), 1); // anthropic's row survives
-    assert_eq!(count("gemini-3.7-flash"), 1);
+fn provider_registry_keeps_only_named_vendors() {
+    let vendors = distill_providers(PROVIDERS_FIXTURE).expect("providers distill");
+    assert_eq!(
+        vendors.get("dashscope").map(String::as_str),
+        Some("alibaba")
+    );
+    assert_eq!(vendors.get("xai").map(String::as_str), Some("xai"));
+    // A reseller publishes no vendor and is absent, never mapped to a null.
+    for reseller in ["openrouter", "together", "avian", "cloudflare", "groq"] {
+        assert!(!vendors.contains_key(reseller), "{reseller}");
+    }
+    // Tolerance: a missing object and a registry naming no vendor at all both
+    // fail rather than reselling every row while looking healthy.
+    assert!(distill_providers("{}").is_err());
+    assert!(distill_providers("not json").is_err());
+    assert!(distill_providers(r#"{"providers": {}}"#).is_err());
+    assert!(distill_providers(r#"{"providers": {"groq": {"kind": "reseller"}}}"#).is_err());
+    assert!(distill_providers(r#"{"providers": {"groq": {"vendor": 7}}}"#).is_err());
+}
+
+// ── the feed URLs and the all-or-nothing rule ────────────────────────────────
+
+#[test]
+fn the_five_feed_urls_are_the_published_dist_tree() {
+    // A branch or path typo is invisible at compile time and at runtime reads
+    // as a plain fetch failure, which `run_fetch` answers by serving the cache
+    // — so a warm user would keep stale prices forever with no signal. Each
+    // literal is spelled out here so the typo reds instead. The five paths are
+    // what ai-pricelog's own publisher writes: `index.json` and
+    // `history.ndjson` at the tree root, and every catalog file copied under
+    // `catalog/`.
+    assert_eq!(
+        INDEX_URL,
+        "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/index.json"
+    );
+    assert_eq!(
+        HISTORY_URL,
+        "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/history.ndjson"
+    );
+    assert_eq!(
+        CATALOG_MODELS_URL,
+        "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/catalog/models.json"
+    );
+    assert_eq!(
+        CATALOG_PROVIDERS_URL,
+        "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/catalog/providers.json"
+    );
+    assert_eq!(
+        CATALOG_ALIASES_URL,
+        "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/catalog/aliases.json"
+    );
+    // All five are distinct files under one tree: a copy-paste that points two
+    // constants at one path would distill the wrong feed into the wrong half.
+    let urls = [
+        INDEX_URL,
+        HISTORY_URL,
+        CATALOG_MODELS_URL,
+        CATALOG_PROVIDERS_URL,
+        CATALOG_ALIASES_URL,
+    ];
+    let unique: HashSet<&str> = urls.iter().copied().collect();
+    assert_eq!(unique.len(), urls.len());
+}
+
+/// The five feed files, served from the fixtures by URL.
+fn feed_fixture(url: &str) -> anyhow::Result<String> {
+    let body = match url {
+        INDEX_URL => FIXTURE,
+        HISTORY_URL => HISTORY_FIXTURE,
+        CATALOG_MODELS_URL => MODELS_FIXTURE,
+        CATALOG_PROVIDERS_URL => PROVIDERS_FIXTURE,
+        CATALOG_ALIASES_URL => ALIASES_FIXTURE,
+        other => anyhow::bail!("unexpected url {other}"),
+    };
+    Ok(body.to_owned())
 }
 
 #[test]
-fn distill_drops_capitalized_resold_claude_rows() {
-    // The prefix check is case-insensitive; a capitalized resold id must
-    // drop exactly like its lowercase twin.
-    let json = r#"{"version": 3, "sources": {
-        "google": {
-            "Claude-3-5-Sonnet": {"input_mtok": 3, "output_mtok": 15},
-            "gemini-3.7-flash": {"input_mtok": 0.1, "output_mtok": 0.4}
-        }
-    }}"#;
-    let models = distill(json).expect("distill ok");
-    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["gemini-3.7-flash"]);
+fn every_feed_file_failing_fails_the_whole_attempt() {
+    // The all-or-nothing rule: a cached table must never mix a fresh half with
+    // a stale one, so ONE file failing has to fail the composition. The
+    // control comes first — with every file served the attempt succeeds, so a
+    // later failure is the injected one and not a broken harness.
+    let whole = fetch_table_with(feed_fixture).expect("the fixtures compose a feed");
+    assert!(!whole.models.is_empty());
+    assert!(!whole.store.is_empty());
+    assert!(!whole.aliases.is_empty());
+    assert!(!whole.canonical.is_empty());
+
+    // Then one file at a time. A `Failed` here reaches the user as `rates
+    // unavailable` on a cold start; silently distilling the other four would
+    // reach them as a table filtered by half a catalog.
+    for down in [
+        INDEX_URL,
+        HISTORY_URL,
+        CATALOG_MODELS_URL,
+        CATALOG_PROVIDERS_URL,
+        CATALOG_ALIASES_URL,
+    ] {
+        let fetch = |url: &str| -> anyhow::Result<String> {
+            if url == down {
+                anyhow::bail!("404 {url}");
+            }
+            feed_fixture(url)
+        };
+        assert!(
+            fetch_table_with(fetch).is_err(),
+            "{down} failing must fail the attempt"
+        );
+    }
 }
 
+// ── override entries ─────────────────────────────────────────────────────────
+
 #[test]
-fn distill_parses_window_rates_and_effective_at() {
-    // deepseek-v4-pro's real shape: flat base rates, a row-level effective
-    // date, and two weekday window entries with HHMM windows.
-    let json = r#"{"version": 3, "sources": {"deepseek": {
+fn distill_parses_overrides_and_effective_at() {
+    // deepseek-v4-pro's real shape: base rates, a row-level effective date,
+    // and two weekday override entries with HHMM windows.
+    let json = r#"{"version": 4, "sources": {"deepseek": {
         "deepseek-v4-pro": {
-            "input_mtok": 0.66, "output_mtok": 1.98, "cache_read_mtok": 0.022,
+            "rates": {"input": 0.66, "output": 1.98, "cache_read": 0.022},
             "effective_at": "2026-08-23",
-            "window_rates": [
-                {"window": [100, 400],
-                 "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
-                 "input_mtok": 1.32, "output_mtok": 3.96, "cache_read_mtok": 0.044},
-                {"window": [600, 1000],
-                 "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
-                 "input_mtok": 1.32, "output_mtok": 3.96, "cache_read_mtok": 0.044}
+            "overrides": [
+                {"when": {"days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                          "window": [100, 400]},
+                 "rates": {"input": 1.32, "output": 3.96, "cache_read": 0.044}},
+                {"when": {"days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                          "window": [600, 1000]},
+                 "rates": {"input": 1.32, "output": 3.96, "cache_read": 0.044}}
             ]
         }
     }}}"#;
-    let models = distill(json).expect("distill ok");
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
     assert_eq!(models.len(), 1);
     let m = &models[0];
     assert_eq!(m.effective_at.as_deref(), Some("2026-08-23"));
@@ -258,56 +595,75 @@ fn distill_parses_window_rates_and_effective_at() {
 }
 
 #[test]
-fn distill_window_entry_inherits_missing_keys_from_base() {
-    // A window entry carries override rates only; the keys it leaves absent
-    // price at the row's base.
-    let json = r#"{"version": 3, "sources": {"zai": {
+fn distill_override_inherits_missing_axes_from_base() {
+    // An override carries only the axes it changes; the ones it leaves absent
+    // price at the row's base. Every axis has to DISCRIMINATE, so the base
+    // names a distinct non-zero value for all four and the override supplies
+    // only `output` and `cache_read`: dropping the `.or(base.…)` on any of the
+    // other two then yields 0.0 where a real value is asserted. An override
+    // that supplied `input` would make `input`'s inheritance unobservable, and
+    // an axis absent from BOTH sides would assert exactly what a broken
+    // inherit also returns.
+    let json = r#"{"version": 4, "sources": {"zai": {
         "m": {
-            "input_mtok": 0.1, "output_mtok": 0.2, "cache_read_mtok": 0.01,
-            "window_rates": [
-                {"window": [100, 400], "input_mtok": 0.3}
+            "rates": {"input": 0.1, "output": 0.2, "cache_read": 0.01, "cache_write": 1.25},
+            "overrides": [
+                {"when": {"window": [100, 400]}, "rates": {"output": 0.5, "cache_read": 0.03}}
             ]
         }
     }}}"#;
-    let models = distill(json).expect("distill ok");
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
     let entries = &models[0].prices;
     assert_eq!(entries.len(), 2);
-    assert!((entries[1].input - 3e-7).abs() < 1e-12);
+    // Supplied by the override.
+    assert!((entries[1].output - 5e-7).abs() < 1e-12);
+    assert!((entries[1].cache_read - 3e-8).abs() < 1e-15);
+    // Absent from the override, so inherited — and non-zero, so a fall to 0.0
+    // cannot pass.
     assert!(
-        (entries[1].output - 2e-7).abs() < 1e-12,
-        "output inherits base"
+        (entries[1].input - 1e-7).abs() < 1e-12,
+        "input inherits base, got {}",
+        entries[1].input
     );
     assert!(
-        (entries[1].cache_read - 1e-8).abs() < 1e-15,
-        "cache_read inherits base"
+        (entries[1].cache_write - 1.25e-6).abs() < 1e-12,
+        "cache_write inherits base, got {}",
+        entries[1].cache_write
     );
-    assert_eq!(entries[1].cache_write, 0.0, "absent on row and entry");
+    // The base entry itself inherits nothing: an axis absent everywhere is 0.
+    let bare = r#"{"version": 4, "sources": {"zai": {
+        "m": {"rates": {"input": 0.1, "output": 0.2}}
+    }}}"#;
+    let bare = distill(bare, &all_first_party(bare)).expect("distill ok");
+    assert_eq!(bare[0].prices[0].cache_read, 0.0);
+    assert_eq!(bare[0].prices[0].cache_write, 0.0);
 }
 
 #[test]
 fn distill_skips_quota_only_entries() {
     // `quota_multiplier` is a consumption weight, never a rate: an entry with
-    // no rate keys of its own is skipped at distill (the zai glm rows carry
+    // no `rates` of its own is skipped at distill (the zai glm rows carry
     // these), while a quota key ON a rated entry is ignored and the rates
     // still contribute.
-    let json = r#"{"version": 3, "sources": {"zai": {
+    let json = r#"{"version": 4, "sources": {"zai": {
         "glm-5.3-flash": {
-            "input_mtok": 0.075, "output_mtok": 0.25, "cache_read_mtok": 0.015,
-            "window_rates": [
+            "rates": {"input": 0.075, "output": 0.25, "cache_read": 0.015},
+            "overrides": [
                 {"quota_multiplier": 0.4},
-                {"quota_multiplier": 1.2,
-                 "days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
-                 "window": [600, 1000]}
+                {"when": {"days": ["monday", "tuesday", "wednesday", "thursday", "friday"],
+                          "window": [600, 1000]},
+                 "quota_multiplier": 1.2}
             ]
         },
         "quota-plus-rates": {
-            "input_mtok": 0.1, "output_mtok": 0.2,
-            "window_rates": [
-                {"quota_multiplier": 1.5, "window": [100, 400], "input_mtok": 0.5}
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [
+                {"when": {"window": [100, 400]}, "quota_multiplier": 1.5,
+                 "rates": {"input": 0.5}}
             ]
         }
     }}}"#;
-    let models = distill(json).expect("distill ok");
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
     assert_eq!(models.len(), 2);
     assert_eq!(models[0].prices.len(), 1, "both quota entries skipped");
     assert!((models[0].prices[0].input - 7.5e-8).abs() < 1e-15);
@@ -324,20 +680,93 @@ fn distill_skips_quota_only_entries() {
 }
 
 #[test]
-fn distill_skips_malformed_entries_not_the_row() {
-    // A window entry whose window violates the generator's bounds (hours
-    // > 24) skips only itself; the base entry and the good sibling keep the
-    // row priced.
-    let json = r#"{"version": 3, "sources": {"deepseek": {
-        "probe": {
-            "input_mtok": 0.1, "output_mtok": 0.2,
-            "window_rates": [
-                {"window": [9000, 9500], "input_mtok": 0.3},
-                {"window": [100, 400], "input_mtok": 0.4}
+fn distill_skips_volume_tier_overrides() {
+    // v3 parked token-volume tiers in a `volume_rates` key clauth never
+    // declared, so they could not leak; v4 sits them in the same `overrides`
+    // list as the time windows, keyed by `when.min_tokens`. clauth prices per
+    // HOUR and has no volume dimension, so the entry is dropped like a
+    // quota-only one — kept, it would be unconstrained and would price every
+    // request at the tier's rate, 9× the base here.
+    let json = r#"{"version": 4, "sources": {"deepseek": {
+        "tiered": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [
+                {"when": {"min_tokens": 200000}, "rates": {"input": 0.9, "output": 1.8}}
+            ]
+        },
+        "tiered-inside-a-window": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [
+                {"when": {"min_tokens": 200000, "window": [100, 400]},
+                 "rates": {"input": 0.9}}
             ]
         }
     }}}"#;
-    let models = distill(json).expect("good entries survive");
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
+    assert_eq!(models.len(), 2);
+    for m in &models {
+        assert_eq!(m.prices.len(), 1, "{}: the tier contributes no entry", m.id);
+        assert_eq!(m.prices[0].constraint, None);
+    }
+    // And through the resolver: every hour prices the base, none the tier.
+    let t = table(models);
+    for id in ["tiered", "tiered-inside-a-window"] {
+        for hour in [0, 2, 3, 12, 23] {
+            assert_rate(t.rate_at(id, "2026-08-19", hour).map(|r| r.input), 1e-7);
+        }
+    }
+}
+
+#[test]
+fn distill_reads_an_override_window_without_re_deriving_its_timezone() {
+    // ai-pricelog converts every schedule to UTC calendar days at build time,
+    // so `when.timezone` is provenance for a human. Two rows with the same
+    // window and day set must price identically whatever zone they name —
+    // shifting by the zone would move an already-shifted schedule twice
+    // (Asia/Shanghai is UTC+8: hour 2 would fall out of the window and hour
+    // 18 into it).
+    let json = r#"{"version": 4, "sources": {"deepseek": {
+        "zoned": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [{"when": {"days": ["wednesday"], "window": [100, 400],
+                                    "timezone": "Asia/Shanghai"},
+                           "rates": {"input": 0.5}}]
+        },
+        "bare": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [{"when": {"days": ["wednesday"], "window": [100, 400]},
+                           "rates": {"input": 0.5}}]
+        }
+    }}}"#;
+    let models = distill(json, &all_first_party(json)).expect("distill ok");
+    assert_eq!(
+        models[0].prices[1].constraint,
+        models[1].prices[1].constraint
+    );
+    let t = table(models);
+    // 2026-08-19 is a Wednesday.
+    let input = |id: &str, hour: u8| t.rate_at(id, "2026-08-19", hour).map(|r| r.input);
+    for id in ["zoned", "bare"] {
+        assert_rate(input(id, 2), 5e-7); // inside the UTC window
+        assert_rate(input(id, 18), 1e-7); // where a +8 shift would put it
+    }
+}
+
+#[test]
+fn distill_skips_malformed_entries_not_the_row() {
+    // An override whose window violates the generator's bounds (hours > 24)
+    // skips only itself; the base entry and the good sibling keep the row
+    // priced.
+    let json = r#"{"version": 4, "sources": {"deepseek": {
+        "probe": {
+            "rates": {"input": 0.1, "output": 0.2},
+            "overrides": [
+                {"when": {"window": [9000, 9500]}, "rates": {"input": 0.3}},
+                {"when": {"window": [100, 400]}, "rates": {"input": 0.4}}
+            ]
+        }
+    }}}"#;
+    let models = distill(json, &all_first_party(json)).expect("good entries survive");
     assert_eq!(models.len(), 1);
     assert_eq!(models[0].id, "probe");
     assert_eq!(models[0].prices.len(), 2);
@@ -354,32 +783,30 @@ fn distill_skips_malformed_entries_not_the_row() {
 
 #[test]
 fn distill_fails_when_no_models_survive() {
-    // Only resellers → zero models → the fetch fails rather than shipping an
-    // empty table.
-    let json = r#"{"version": 3, "sources": {
-        "openrouter": {"z-ai/glm-4.7": {"input_mtok": 0.5, "output_mtok": 1}}
+    // Only resold rows → zero models → the fetch fails rather than shipping
+    // an empty table.
+    let json = r#"{"version": 4, "sources": {
+        "openrouter": {"z-ai/glm-4.7": {"rates": {"input": 0.5, "output": 1}}}
     }}"#;
-    assert!(distill(json).is_err());
+    assert!(distill(json, &FirstParty::default()).is_err());
     // The genai-prices shape (an array root) is not this feed's shape.
-    assert!(distill(r#"[{"id": "deepseek", "models": []}]"#).is_err());
-    assert!(distill("{}").is_err());
-    assert!(distill("not json").is_err());
+    let arr = r#"[{"id": "deepseek", "models": []}]"#;
+    assert!(distill(arr, &all_first_party(arr)).is_err());
+    assert!(distill("{}", &all_first_party("{}")).is_err());
+    assert!(distill("not json", &all_first_party("not json")).is_err());
 }
 
 #[test]
 fn distill_skips_unparseable_rows_and_sources() {
-    let json = r#"{"version": 3, "sources": {
+    let json = r#"{"version": 4, "sources": {
         "deepseek": {
-            "good": {"input_mtok": 0.28, "output_mtok": 0.42},
-            "bad-price-shape": {"input_mtok": "garbage"},
-            "no-token-price": {"web_search_usd": 10}
+            "good": {"rates": {"input": 0.28, "output": 0.42}},
+            "bad-price-shape": {"rates": {"input": "garbage"}},
+            "no-token-price": {"fees": {"web_search": 10}}
         },
-        "not-an-object-source": 42,
-        "zhipuai": {
-            "no-token-price": {"input_mtok": 1, "output_mtok": 1}
-        }
+        "not-an-object-source": 42
     }}"#;
-    let models = distill(json).expect("one good model survives");
+    let models = distill(json, &all_first_party(json)).expect("one good model survives");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, ["good"]);
 }
@@ -389,14 +816,29 @@ fn unknown_index_version_warns_and_still_parses() {
     let lines = LogLines::new();
     let _guard = lines.capture_here();
     let json = r#"{"version": 99, "sources": {
-        "openai": {"gpt-4.1": {"input_mtok": 2.0, "output_mtok": 8.0}}
+        "openai": {"gpt-4.1": {"rates": {"input": 2.0, "output": 8.0}}}
     }}"#;
-    let models = distill(json).expect("parses best-effort");
+    let models = distill(json, &all_first_party(json)).expect("parses best-effort");
     assert_eq!(models.len(), 1);
     let missing = r#"{"sources": {
-        "openai": {"gpt-4.1": {"input_mtok": 2.0, "output_mtok": 8.0}}
+        "openai": {"gpt-4.1": {"rates": {"input": 2.0, "output": 8.0}}}
     }}"#;
-    assert_eq!(distill(missing).expect("parses best-effort").len(), 1);
+    assert_eq!(
+        distill(missing, &all_first_party(missing))
+            .expect("parses best-effort")
+            .len(),
+        1
+    );
+    // The version this build parses is the one that must NOT warn.
+    let current = r#"{"version": 4, "sources": {
+        "openai": {"gpt-4.1": {"rates": {"input": 2.0, "output": 8.0}}}
+    }}"#;
+    assert_eq!(
+        distill(current, &all_first_party(current))
+            .expect("distill ok")
+            .len(),
+        1
+    );
     let got = lines.snapshot();
     assert_eq!(got.len(), 2, "{got:?}");
     assert!(
@@ -404,34 +846,6 @@ fn unknown_index_version_warns_and_still_parses() {
         "{got:?}"
     );
     assert!(got[1].contains("version missing"), "{got:?}");
-}
-
-#[test]
-fn index_legacy_keys_warn_once_and_price_typed_only() {
-    // The legacy index shape (flat `peak_*` keys + `peak_windows` STRING
-    // pairs) no longer feeds rates on the index path: the row prices its
-    // typed keys at every hour, and the feed warns once however many legacy
-    // rows it carries. The history path keeps feeding the same shape.
-    let lines = LogLines::new();
-    let _guard = lines.capture_here();
-    let json = r#"{"version": 3, "sources": {"deepseek": {
-        "legacy-a": {
-            "input_mtok": 0.1, "output_mtok": 0.2, "cache_read_mtok": 0.01,
-            "peak_windows": [["01:00", "04:00"]],
-            "peak_input_mtok": 0.2, "peak_output_mtok": 0.4
-        },
-        "legacy-b": {
-            "input_mtok": 0.3, "output_mtok": 0.4, "max_tokens": 4096
-        }
-    }}}"#;
-    let models = distill(json).expect("distill ok");
-    let t = table(models);
-    let at = |hour: u8| t.rate_at("legacy-a", "2026-08-29", hour).expect("priced");
-    assert_rate(Some(at(2).input), 1e-7); // peak hour: typed base, no peak entry
-    assert_rate(Some(at(5).input), 1e-7);
-    let got = lines.snapshot();
-    assert_eq!(got.len(), 1, "one warn for two legacy rows: {got:?}");
-    assert!(got[0].contains("legacy"), "{got:?}");
 }
 
 // ── id resolution ────────────────────────────────────────────────────────────
@@ -616,7 +1030,7 @@ fn rate_retries_propagate_date_and_hour() {
     // Effective-gate propagation: the fixture's windowed deepseek-v4-pro row
     // is effective from 2026-08-23; a colon-stripped id respects the gate.
     let ft = PriceTable::capture(
-        distill(FIXTURE).expect("fixture distills"),
+        distill(FIXTURE, &fixture_guard()).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
         CanonicalMap::default(),
@@ -630,6 +1044,56 @@ fn rate_retries_propagate_date_and_hour() {
 }
 
 // ── constraint resolution ────────────────────────────────────────────────────
+
+#[test]
+fn every_weekday_name_matches_the_feeds_spelling() {
+    // A `Constraint::Days` compares this name against the feed's `days` set by
+    // string, so one wrong arm silently unpeaks (or peaks) a whole weekday.
+    // 2026-08-24..30 is one Monday-to-Sunday week, so all seven arms answer.
+    let week = [
+        ("2026-08-24", "monday"),
+        ("2026-08-25", "tuesday"),
+        ("2026-08-26", "wednesday"),
+        ("2026-08-27", "thursday"),
+        ("2026-08-28", "friday"),
+        ("2026-08-29", "saturday"),
+        ("2026-08-30", "sunday"),
+    ];
+    for (date, name) in week {
+        assert_eq!(date_weekday(date), Some(name), "{date}");
+    }
+    // And behaviourally, through the selection the names exist for: an entry
+    // constrained to one weekday is active on that day alone.
+    for (date, name) in week {
+        let m = PricedModel {
+            id: "m".to_owned(),
+            prices: vec![
+                entry(1e-6, 2e-6),
+                PriceEntry {
+                    input: 3e-6,
+                    output: 4e-6,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: Some(Constraint::Days {
+                        days: vec![name.to_owned()],
+                        start: None,
+                        end: None,
+                    }),
+                },
+            ],
+            effective_at: None,
+        };
+        let t = table(vec![m]);
+        for (other, _) in week {
+            let want = if other == date { 3e-6 } else { 1e-6 };
+            assert_rate(t.rate_at("m", other, 12).map(|r| r.input), want);
+        }
+    }
+    // An unparseable date names no weekday, so the constraint is never active
+    // and selection falls through to the base entry.
+    assert_eq!(date_weekday("not-a-date"), None);
+    assert_eq!(date_weekday("2026-13-40"), None);
+}
 
 #[test]
 fn time_window_hour_granularity_boundaries() {
@@ -730,7 +1194,7 @@ fn effective_at_gates_the_whole_row() {
     // peak windows 01:00-04:00 and 06:00-10:00 UTC. A query before the date
     // prices NOTHING — the gate covers the window entries, not only the base.
     let t = PriceTable::capture(
-        distill(FIXTURE).expect("fixture distills"),
+        distill(FIXTURE, &fixture_guard()).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
         CanonicalMap::default(),
@@ -759,7 +1223,7 @@ fn future_effective_row_prices_nothing_until_its_date() {
     // The fixture's synthetic future-effective row (no live row exercises
     // this): flat base rates apply from 2026-12-31 on.
     let t = PriceTable::capture(
-        distill(FIXTURE).expect("fixture distills"),
+        distill(FIXTURE, &fixture_guard()).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
         CanonicalMap::default(),
@@ -786,7 +1250,7 @@ fn later_window_entry_wins_when_both_match() {
     // then a weekday 08:00-20:00 entry. Friday hour 10 matches BOTH — the
     // later entry wins.
     let t = PriceTable::capture(
-        distill(FIXTURE).expect("fixture distills"),
+        distill(FIXTURE, &fixture_guard()).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
         CanonicalMap::default(),
@@ -955,7 +1419,7 @@ fn cache_round_trip_preserves_history() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("ai_pricelog_price_cache.json");
+        .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
     let loaded = load_cached().expect("cache loads");
@@ -977,7 +1441,7 @@ fn load_cache_rejects_empty_history() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("ai_pricelog_price_cache.json");
+        .join("ai_pricelog_v4_price_cache.json");
     std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
     std::fs::write(&path, r#"{"fetched_at_ms": 1, "history": []}"#).expect("write");
     assert!(load_cached().is_none());
@@ -985,46 +1449,86 @@ fn load_cache_rejects_empty_history() {
 
 #[test]
 fn stale_caches_deleted_once() {
-    // Both pre-ai-pricelog cache files go in one cleanup pass after the first
+    // Every superseded cache file goes in one cleanup pass after the first
     // successful new-cache write; the flag is set before the deletes, so a
-    // reappearing file is never re-deleted.
+    // reappearing file is never re-deleted. The v3-feed name joins the two
+    // pre-ai-pricelog ones: its `store` was filtered by the retired provider
+    // allowlist, so a v4 build reading it would serve the rows this change
+    // drops for as long as `first_delay` holds off the first fetch.
     let sandbox = HomeSandbox::new();
-    let new_path = sandbox
-        .home()
-        .join(".clauth")
-        .join("ai_pricelog_price_cache.json");
-    let lite = sandbox.home().join(".clauth").join("price_cache.json");
-    let genai = sandbox
-        .home()
-        .join(".clauth")
-        .join("genai_price_cache.json");
-    std::fs::create_dir_all(lite.parent().expect("parent")).expect("mkdir");
-    std::fs::write(&lite, "{}").expect("write");
-    std::fs::write(&genai, "{}").expect("write");
+    let dir = sandbox.home().join(".clauth");
+    let new_path = dir.join("ai_pricelog_v4_price_cache.json");
+    let stale: Vec<PathBuf> = [
+        "price_cache.json",
+        "genai_price_cache.json",
+        "ai_pricelog_price_cache.json",
+    ]
+    .iter()
+    .map(|name| dir.join(name))
+    .collect();
+    let write_all = || {
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        for path in &stale {
+            std::fs::write(path, "{}").expect("write");
+        }
+    };
+    write_all();
 
     let mut done = false;
     delete_stale_cache_once(&new_path, &mut done);
     assert!(done);
-    assert!(!lite.exists());
-    assert!(!genai.exists());
+    for path in &stale {
+        assert!(!path.exists(), "{}", path.display());
+    }
 
-    std::fs::write(&lite, "{}").expect("write");
-    std::fs::write(&genai, "{}").expect("write");
+    write_all();
     delete_stale_cache_once(&new_path, &mut done);
-    assert!(lite.exists());
-    assert!(genai.exists());
+    for path in &stale {
+        assert!(path.exists(), "{}", path.display());
+    }
+}
+
+#[test]
+fn the_v3_cache_name_is_not_the_one_this_build_reads() {
+    // The upgrade path: a v3-era cache sitting in place must NOT prime this
+    // build. Its bytes parse — the cached types never moved — so nothing but
+    // the filename separates "loads the old guard's rows" from "starts cold",
+    // and `first_delay` would hold the first v4 fetch off by the interval
+    // minus the cache's age.
+    let sandbox = HomeSandbox::new();
+    let dir = sandbox.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let old = dir.join("ai_pricelog_price_cache.json");
+    std::fs::write(
+        &old,
+        r#"{"fetched_at_ms": 7, "history": [{"captured": "2026-01-01", "models": [{"id": "m", "prices": [{"input": 1e-6, "output": 2e-6, "cache_read": 0.0, "cache_write": 0.0, "constraint": null}], "effective_at": null}]}]}"#,
+    )
+    .expect("write");
+    assert!(
+        load_cached().is_none(),
+        "the v3 cache name must not prime a v4 build"
+    );
+    // A cold cache is what `first_delay` ticks immediately, so the upgrade
+    // fetches on the next start rather than up to an interval later.
+    assert_eq!(
+        first_delay(None, 1_000_000, REFRESH_INTERVAL),
+        Duration::ZERO
+    );
+    // Written under the new name, the same bytes do prime it.
+    std::fs::rename(&old, dir.join("ai_pricelog_v4_price_cache.json")).expect("rename");
+    assert_eq!(load_cached().map(|t| t.fetched_at_ms), Some(7));
 }
 
 // ── real-index fixture ───────────────────────────────────────────────────────
 
 #[test]
 fn fixture_distills_resolvers_and_excludes_resellers() {
-    let models = distill(FIXTURE).expect("fixture distills");
+    let models = distill(FIXTURE, &fixture_guard()).expect("fixture distills");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    // The reseller source is dropped entirely.
+    // The vendorless reseller's source is dropped row by row, so nothing of
+    // it survives.
     assert!(!ids.contains(&"aion-labs/aion-2.0"));
-    // The kept first-party representatives survive, the mapped spellings
-    // included.
+    // The first-party representatives survive.
     for id in [
         "claude-opus-5",
         "gpt-4.1",
@@ -1038,8 +1542,8 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
     ] {
         assert!(ids.contains(&id), "{id} missing");
     }
-    // The six dashscope resold rows carry `removed_at` in the fixture (the
-    // post-fix index shape) and delist at distill.
+    // dashscope's six resold rows drop on the vendor comparison, its own qwen
+    // row beside them survives.
     for id in [
         "deepseek-v3.2",
         "deepseek-v4-flash",
@@ -1047,8 +1551,22 @@ fn fixture_distills_resolvers_and_excludes_resellers() {
         "glm-5.2",
         "kimi-k2.7-code",
     ] {
-        assert!(!ids.contains(&id), "removed row {id} must delist");
+        assert!(!ids.contains(&id), "resold row {id} must drop");
     }
+    // deepseek's own deepseek-r1 row carries `removed_at`: it is first-party,
+    // so only the delisting can drop it — and the row above it from the same
+    // source shows the guard kept that source's rows.
+    assert!(
+        !ids.contains(&"deepseek-r1"),
+        "a first-party delisted row must drop too"
+    );
+    assert!(
+        distill(FIXTURE, &all_first_party(FIXTURE))
+            .expect("fixture distills")
+            .iter()
+            .all(|m| m.id != "deepseek-r1"),
+        "and it drops with no resold guard at all — the stamp is what dashes it"
+    );
 
     let t = PriceTable::capture(
         models,
@@ -1301,7 +1819,7 @@ fn the_memo_keys_on_the_date_so_two_snapshots_do_not_bleed() {
 fn zai_quota_entries_are_skipped() {
     // The fixture's real glm-5.3-flash row: quota_multiplier-only window
     // entries distill to nothing, so a weekday peak hour prices the flat base.
-    let models = distill(FIXTURE).expect("fixture distills");
+    let models = distill(FIXTURE, &fixture_guard()).expect("fixture distills");
     let flash = models
         .iter()
         .find(|m| m.id == "glm-5.3-flash")
@@ -1328,12 +1846,14 @@ fn zai_quota_entries_are_skipped() {
 
 #[test]
 fn removed_at_stamped_entries_price_nothing() {
-    // The fixture's dashscope resold rows are real post-fix rows: the index
-    // keeps them with their last prices and a `removed_at` stamp. A delisted
-    // row prices nothing at any date or hour — the ids with no live
-    // first-party twin stay unpriced.
+    // The index's removal convention keeps a row with its last prices and
+    // stamps it `removed_at`; the stamp is what makes a delisting effective
+    // in clauth. deepseek's own deepseek-r1 row is the pin that isolates the
+    // stamp — it is FIRST-PARTY, so the resold guard cannot be what dashes
+    // it. The dashscope ids beside it drop for the other reason and stay
+    // unpriced too, having no live twin.
     let t = PriceTable::capture(
-        distill(FIXTURE).expect("fixture distills"),
+        distill(FIXTURE, &fixture_guard()).expect("fixture distills"),
         Vec::new(),
         Vec::new(),
         CanonicalMap::default(),
@@ -1342,6 +1862,7 @@ fn removed_at_stamped_entries_price_nothing() {
         Vec::new(),
     );
     for id in [
+        "deepseek-r1",
         "deepseek-v3.2",
         "deepseek-v4-flash",
         "glm-5.1",
@@ -1361,28 +1882,29 @@ fn removed_at_stamped_entries_price_nothing() {
 
 // ── store-history dating ──────────────────────────────────────────────────────
 
-/// Trimmed real ai-pricelog history
+/// Trimmed real ai-pricelog v4 history
 /// (`tests/fixtures/ai-pricelog-history-trimmed.ndjson`): five of deepseek's
-/// seven deepseek-v4-pro rows (the 2026-08-30 retro-effective windowed row,
-/// the 2026-08-26 legacy `peak_windows` row, the 08-16 / 05-22 / 04-24 flat
-/// rows), deepseek-v4-flash's 2026-04-24 row (the alias chain's priced
-/// canonical) plus its 2026-08-26 legacy `peak_windows` row (the fixture's
-/// WINNING legacy row — the peak-feed pin; the full store shadows it with a
-/// typed 08-30 row, which the trim drops), grok-4.5's 2026-07-09 row (the
-/// null-bound chain's canonical),
-/// minimax's MiniMax-M2.5-Lightning
-/// price + bare-removal pair, two of together's four deepseek-v4-pro rows (the
-/// 06-09 markup and the 08-28 removal), one of avian's two (the 05-04
+/// deepseek-v4-pro rows (the 2026-08-30 retro-effective windowed row whose
+/// `when`s name a timezone, the 2026-08-26 whole-week windowed row, the
+/// 08-16 / 05-22 / 04-24 flat rows), deepseek-v4-flash's 2026-04-24 row (the
+/// alias chain's priced canonical) plus its 2026-08-26 windowed row (the
+/// fixture's WINNING windowed row — the per-hour pin; the full store shadows
+/// it with an 08-30 row, which the trim drops), grok-4.5's 2026-07-09 row
+/// (the null-bound chain's canonical), minimax's MiniMax-M2.5-Lightning
+/// price and bare-removal pair, two of together's four deepseek-v4-pro rows
+/// (the 06-09 markup and the 08-28 removal), one of avian's two (the 05-04
 /// markup), cloudflare's one row of its forty
 /// (`@cf/deepseek-ai/deepseek-v4-pro-0813`, the dropped source's id behind the
-/// reseller-dash pin), openrouter's `extra`-bearing claude-3-haiku row (the
-/// legacy write-key shape: it parses, and the dropped source keeps it out of
-/// the walk), dashscope's resold deepseek-v3.2 price +
-/// removal pair beside deepseek's own row (the delisted-copy shadow case:
-/// dashscope's key is first-seen earlier), deepseek-r1's and deepseek-v3's
-/// only rows (the 2025-era alias canonicals), and zai's glm-4.5 same-day pair
-/// (a kept-key tie group that differs in rates at its key's newest observed
-/// day). Every line is verbatim store bytes, in store order.
+/// reseller-dash pin), openrouter's `fees`-bearing claude-3-haiku row (it
+/// parses, and the resold guard keeps it out of the walk), dashscope's
+/// resold deepseek-v3.2 price and removal pair beside its OWN qwen3.8-max row
+/// (the mixed-provider split), deepseek-r1's and deepseek-v3's 2025 rows (the
+/// alias canonicals), deepseek-r1's 2026-08-31 removal row — a FIRST-PARTY
+/// removal that CARRIES rates, the shape 15 keys of the real store hold and
+/// the only one that can tell a live terminator from a rate-less row that
+/// dashes on its own — and zai's glm-4.5 same-day pair (a kept-key tie group
+/// that differs in rates at its key's newest observed day). Every line is
+/// verbatim store bytes.
 const HISTORY_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-history-trimmed.ndjson");
 
 /// A table whose only dating source is the history fixture — no snapshot log,
@@ -1391,7 +1913,7 @@ fn store_table() -> PriceTable {
     PriceTable {
         models: Vec::new(),
         history: Vec::new(),
-        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        store: distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills"),
         aliases: Vec::new(),
         canonical: CanonicalMap::default(),
         fetched_at_ms: 0,
@@ -1401,11 +1923,12 @@ fn store_table() -> PriceTable {
 
 #[test]
 fn history_distills_first_party_keys_only() {
-    let keys = distill_history(HISTORY_FIXTURE).expect("history distills");
+    let keys = distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills");
     let ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
-    // First-seen store order (dashscope's resold deepseek-v3.2 key before
-    // deepseek's own); together / avian / cloudflare / openrouter rows never
-    // enter, so a non-kept source's row can neither price an id nor delist it.
+    // First-seen store order. together / avian / cloudflare / openrouter
+    // publish no vendor, and dashscope's deepseek-v3.2 pair is a resale, so
+    // none of their rows enters: they can neither price an id nor delist it.
+    // dashscope's OWN qwen row does enter, one row after the resale it lost.
     assert_eq!(
         ids,
         [
@@ -1414,11 +1937,26 @@ fn history_distills_first_party_keys_only() {
             "deepseek-v4-pro",
             "grok-4.5",
             "glm-4.5",
-            "deepseek-v3.2",
+            "qwen3.8-max",
             "deepseek-r1",
             "deepseek-v3",
             "deepseek-v3.2"
         ]
+    );
+    // Each surviving key names the source that MAKES it.
+    assert!(
+        keys.iter().all(|k| matches!(
+            (k.source.as_str(), k.id.as_str()),
+            ("deepseek", _)
+                | ("minimax", _)
+                | ("xai", _)
+                | ("zai", _)
+                | ("dashscope", "qwen3.8-max")
+        )),
+        "{:?}",
+        keys.iter()
+            .map(|k| (k.source.as_str(), k.id.as_str()))
+            .collect::<Vec<_>>()
     );
     let ds = keys
         .iter()
@@ -1434,10 +1972,50 @@ fn history_distills_first_party_keys_only() {
     assert!(mm.rows[1].removed && mm.rows[1].model.is_none());
 
     // Tolerance: malformed lines skip beside a good one; zero keys fail.
-    let mixed = "{\"source\":\"deepseek\",\"model_id\":\"m\",\"observed_at\":\"2026-01-01\",\"input_mtok\":1,\"output_mtok\":2}\nnot json\n{}\n";
-    assert_eq!(distill_history(mixed).expect("one key").len(), 1);
-    assert!(distill_history("").is_err());
-    assert!(distill_history("not json at all").is_err());
+    let mixed = concat!(
+        r#"{"schema":4,"source":"deepseek","model_id":"m","observed_at":"2026-01-01","#,
+        r#""rates":{"input":1,"output":2}}"#,
+        "\nnot json\n{}\n"
+    );
+    assert_eq!(
+        distill_history(mixed, &all_first_party_history(mixed))
+            .expect("one key")
+            .len(),
+        1
+    );
+    assert!(distill_history("", &FirstParty::default()).is_err());
+    assert!(distill_history("not json at all", &FirstParty::default()).is_err());
+}
+
+#[test]
+fn history_drops_a_mixed_providers_resales_and_keeps_its_own() {
+    // dashscope's fixture rows are a resold deepseek-v3.2 price + removal
+    // pair beside its own qwen3.8-max row. The resale never enters, so
+    // deepseek-v3.2 prices deepseek's own rows at every date the store
+    // covers — dashscope's 0.57 markup and its removal both unreachable —
+    // while dashscope's qwen row prices normally.
+    let keys = distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills");
+    assert!(
+        !keys
+            .iter()
+            .any(|k| k.source == "dashscope" && k.id == "deepseek-v3.2"),
+        "the resale must not enter the walk at all"
+    );
+    let t = store_table();
+    for date in ["2026-08-29", "2026-08-30", "2026-09-05"] {
+        let rate = t.rate_at("deepseek-v3.2", date, 0).expect("priced");
+        assert!(
+            (rate.input - 2.8e-7).abs() < 1e-12,
+            "{date}: {}",
+            rate.input
+        );
+        assert!((rate.output - 4.2e-7).abs() < 1e-12, "{date}");
+        assert!((rate.cache_read - 2.8e-8).abs() < 1e-15, "{date}");
+    }
+    assert_rate(
+        t.rate_at("qwen3.8-max", "2026-08-30", 0).map(|r| r.input),
+        2e-6,
+    );
 }
 
 #[test]
@@ -1460,14 +2038,13 @@ fn store_walk_prices_the_weekday_peak_windows_per_hour() {
 }
 
 #[test]
-fn a_winning_legacy_history_row_keeps_feeding_its_peak_windows() {
-    // The history path keeps the legacy peak shape: deepseek-v4-flash's real
-    // 2026-08-26 row (flat `peak_*` keys + `peak_windows` STRING pairs) is
-    // the fixture's NEWEST v4-flash row, so it wins the walk for 08-26 on
-    // and its peak windows price — the typed 08-30 row that shadows it in
-    // the full store is trimmed out. Deleting the peak push loop in
-    // `RawHistoryRow::into_priced` flattens every hour to the base rate and
-    // reds this pin.
+fn a_winning_history_rows_windows_price_per_hour() {
+    // A history row's `overrides` feed the same per-hour selection an index
+    // row's do: deepseek-v4-flash's real 2026-08-26 row (two windows, no day
+    // set, so every day peaks) is the fixture's NEWEST v4-flash row and wins
+    // the walk for 08-26 on — the 08-30 row that shadows it in the full store
+    // is trimmed out. Dropping the override loop in `row_entries` flattens
+    // every hour to the base rate and reds this pin.
     let t = store_table();
     let input = |date: &str, hour: u8| {
         t.rate_at("deepseek-v4-flash", date, hour)
@@ -1574,6 +2151,42 @@ fn removal_row_terminates_the_key_from_its_date() {
 }
 
 #[test]
+fn a_removal_row_that_carries_rates_still_terminates_the_key() {
+    // The removal row above is BARE, so it dashes whether or not `removed` is
+    // read at all — `into_priced` finds no rates and the walk's winner has no
+    // model either way. deepseek's real 2026-08-31 deepseek-r1 removal is the
+    // other shape: the store keeps the last known rates ON the removal row,
+    // and 15 first-party keys hold it (deepseek's retired r1/v3 line and all
+    // of moonshot's v1 line, measured 2026-09-03). Only `removed` separates
+    // "delisted" from "still 0.55/M" here, and both guards that read it —
+    // `distill_history`'s `model: if removed { None }` and `row_for`'s early
+    // return — are unbound without this row: with them deleted the key prices
+    // its last rate forever instead of dashing.
+    let keys = distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills");
+    let r1 = keys
+        .iter()
+        .find(|k| k.id == "deepseek-r1")
+        .expect("deepseek-r1 key");
+    assert_eq!(r1.rows.len(), 2);
+    let removal = &r1.rows[1];
+    assert!(removal.removed, "the newest row is the removal");
+    assert!(
+        removal.model.is_none(),
+        "a removal carries no distilled prices however many rates its line spells"
+    );
+
+    let t = store_table();
+    let input = |date: &str| t.rate_at("deepseek-r1", date, 0).map(|r| r.input);
+    // The day before still prices the 2025-01-20 row.
+    assert_rate(input("2026-08-30"), 5.5e-7);
+    // The removal date and every day after price nothing — never the
+    // 0.55/M the removal row itself still spells.
+    for date in ["2026-08-31", "2026-09-01", "2027-01-01"] {
+        assert_eq!(input(date), None, "{date}");
+    }
+}
+
+#[test]
 fn reseller_history_rows_neither_price_nor_delist() {
     // together's rows for deepseek-v4-pro (markup 1.74 on 06-09, removal on
     // 08-28) and avian's (1.305 on 05-04) are reseller copies: the id prices
@@ -1604,7 +2217,7 @@ fn store_history_dates_today_not_the_snapshot_log() {
     // holding different rates never overrides it.
     let t = PriceTable::capture(
         vec![eq_model("deepseek-v4-pro", 9e-6, 9e-6)],
-        distill_history(HISTORY_FIXTURE).expect("history distills"),
+        distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills"),
         Vec::new(),
         CanonicalMap::default(),
         "2026-08-31".to_owned(),
@@ -1645,7 +2258,7 @@ fn cache_round_trips_the_store_dating_source() {
             captured: "2026-01-01".to_owned(),
             models: vec![eq_model("m", 1e-6, 2e-6)],
         }],
-        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        store: distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills"),
         aliases: Vec::new(),
         canonical: CanonicalMap::default(),
         fetched_at_ms: 5,
@@ -1654,7 +2267,7 @@ fn cache_round_trips_the_store_dating_source() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("ai_pricelog_price_cache.json");
+        .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
     let loaded = load_cached().expect("cache loads");
@@ -1688,28 +2301,6 @@ fn cache_round_trips_the_store_dating_source() {
     );
     // No store rows, so store-only dating cannot resolve.
     assert!(old.rate_at("deepseek-v4-pro", "2026-08-26", 2).is_none());
-}
-
-#[test]
-fn a_delisted_keys_copy_never_shadows_the_live_first_party_row() {
-    // dashscope (kept: it owns qwen) resells other vendors' ids; the store
-    // delisted the copies on 2026-08-31, and dashscope's deepseek-v3.2 key is
-    // FIRST-SEEN before deepseek's own. The delisting is the evidence the key
-    // was reselling: live keys materialize first, so the delisted copy's
-    // pre-removal days (08-29, 08-30) price deepseek's own row — 0.28 in,
-    // 0.028 cache-read — never dashscope's 0.57 markup — and dashscope's
-    // removal cannot touch deepseek's key.
-    let t = store_table();
-    for date in ["2026-08-29", "2026-08-30", "2026-09-05"] {
-        let rate = t.rate_at("deepseek-v3.2", date, 0).expect("priced");
-        assert!(
-            (rate.input - 2.8e-7).abs() < 1e-12,
-            "{date}: {}",
-            rate.input
-        );
-        assert!((rate.output - 4.2e-7).abs() < 1e-12, "{date}");
-        assert!((rate.cache_read - 2.8e-8).abs() < 1e-15, "{date}");
-    }
 }
 
 #[test]
@@ -1774,11 +2365,17 @@ fn a_same_day_observed_tie_goes_to_the_later_append() {
 /// `qwen3.6-27b` (the catalog does not name dashscope, so the bare id is its
 /// own canonical), groq's slash-spelled qwen copy — the catalog maps it to
 /// that same canonical — delisted beside a live deepseek-v3.2 key and
-/// dashscope's same-spelled deepseek-v3.2 copy (the catalog maps both).
-/// Synthetic rows on the fixture's pattern; the catalog entries are verbatim
-/// store bytes.
+/// dashscope's same-spelled deepseek-v3.2 copy (the catalog maps both). The
+/// keys are built literally rather than distilled: the resold guard drops a
+/// resale before the twin-ness partition can see it, so what these rows model
+/// is a CACHE written before that guard, whose keys the walk still has to
+/// resolve. Synthetic rows on the fixture's pattern; the catalog entries are
+/// verbatim store bytes.
 fn twin_table() -> PriceTable {
-    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("catalog distills");
+    let (aliases, canonical) = (
+        distill_aliases(ALIASES_FIXTURE).expect("aliases distill"),
+        fixture_canonical(),
+    );
     // A snapshot log holding one never-reached model: `load_cache` rejects a
     // cache with no snapshot history, and the store walk overrides the
     // snapshot for every query anyway.
@@ -1846,7 +2443,7 @@ fn twin_table() -> PriceTable {
 
 #[test]
 fn a_delisted_copy_whose_canonical_a_live_key_holds_never_prices() {
-    // Cross-source twin-ness through the catalog's `models` half. The raw
+    // Cross-source twin-ness through the catalog's model registry. The raw
     // (source, id) walk prices each copy's own rows on its pre-removal days
     // (06-01..06-14: 0.6 in for the slash copy, 0.57 for the bare one) — the
     // shape this row kills. With canonical twin-ness neither copy ever
@@ -1880,7 +2477,10 @@ fn two_live_keys_on_one_canonical_keep_first_seen_order() {
     // the ladder where both have candidates, and the later key still prices
     // the dates only it covers — canonical twin-ness never drops or reorders
     // live keys.
-    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("catalog distills");
+    let (aliases, canonical) = (
+        distill_aliases(ALIASES_FIXTURE).expect("aliases distill"),
+        fixture_canonical(),
+    );
     let t = PriceTable {
         models: Vec::new(),
         history: Vec::new(),
@@ -1927,10 +2527,15 @@ fn two_live_keys_on_one_canonical_keep_first_seen_order() {
 fn an_unknown_pair_stays_its_own_key() {
     // (dashscope, "qwen/qwen3.6-27b") is a pair the catalog does not name —
     // its qwen3.6-27b entry lists groq's slash spelling, not dashscope's —
-    // so the identity fallback keeps the copy its own canonical: it still
-    // prices its own raw id on its pre-removal days beside the live bare
-    // key. The two are NOT twins.
-    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("catalog distills");
+    // so [`PriceTable::canonical_of`]'s identity fallback keeps the copy its
+    // own canonical: it still prices its own raw id on its pre-removal days
+    // beside the live bare key. The two are NOT twins. A fetch can no longer
+    // produce such a key (an unnamed pair is resold and drops at distill), so
+    // the fallback's live reach is a cache written before the catalog half.
+    let (aliases, canonical) = (
+        distill_aliases(ALIASES_FIXTURE).expect("aliases distill"),
+        fixture_canonical(),
+    );
     let t = PriceTable {
         models: Vec::new(),
         history: Vec::new(),
@@ -1983,7 +2588,7 @@ fn canonical_map_round_trips_and_old_caches_load_identity() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("ai_pricelog_price_cache.json");
+        .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
     let loaded = load_cached().expect("cache loads");
@@ -2029,7 +2634,7 @@ fn a_pre_source_cache_loads_with_empty_sources_and_stays_identity() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("ai_pricelog_price_cache.json");
+        .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
     let json = std::fs::read_to_string(&path).expect("read cache");
@@ -2054,24 +2659,28 @@ fn a_pre_source_cache_loads_with_empty_sources_and_stays_identity() {
 
 // ── api aliases and variant spellings ────────────────────────────────────────
 
-/// Trimmed real ai-pricelog model catalog
-/// (`tests/fixtures/ai-pricelog-models-trimmed.json`): the two deepseek api
-/// alias chains (`deepseek-chat`, `deepseek-reasoner`), one null-bound chain
-/// (`grok-4.5-latest`), and the `models` entries for their canonicals plus
-/// deepseek-v4-pro and qwen3.6-27b (the canonical-twin pins' cross-source
-/// spelling pair: groq's slash id, the one kept-source slash spelling the
-/// catalog names). Every entry is verbatim store bytes; query-side ids are
-/// test literals, never fixture rows.
+/// Trimmed real ai-pricelog v4 model registry
+/// (`tests/fixtures/ai-pricelog-models-trimmed.json`): every canonical the
+/// index and history fixtures name, each carrying its `vendor` — the maker
+/// half of the resold comparison — plus qwen3.6-27b for the canonical-twin
+/// pins' cross-source spelling pair (groq's slash id beside the bare one).
+/// Every real entry is verbatim store bytes; the three `synth-*` ids the
+/// index fixture invents carry a matching entry so a synthetic row is
+/// first-party for the reason a real one is. Query-side ids are test
+/// literals, never fixture rows.
 const MODELS_FIXTURE: &str = include_str!("../fixtures/ai-pricelog-models-trimmed.json");
 
-/// A store-walk table that also carries the models fixture's alias chains and
+/// A store-walk table that also carries the fixture's alias chains and
 /// canonical map.
 fn aliased_table() -> PriceTable {
-    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("aliases distill");
+    let (aliases, canonical) = (
+        distill_aliases(ALIASES_FIXTURE).expect("aliases distill"),
+        fixture_canonical(),
+    );
     PriceTable {
         models: Vec::new(),
         history: Vec::new(),
-        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        store: distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills"),
         aliases,
         canonical,
         fetched_at_ms: 0,
@@ -2080,8 +2689,8 @@ fn aliased_table() -> PriceTable {
 }
 
 #[test]
-fn models_fixture_distills_three_chains() {
-    let (keys, _) = distill_models(MODELS_FIXTURE).expect("aliases distill");
+fn aliases_fixture_distills_three_chains() {
+    let keys = distill_aliases(ALIASES_FIXTURE).expect("aliases distill");
     let ids: Vec<&str> = keys.iter().map(|k| k.id.as_str()).collect();
     assert_eq!(
         ids,
@@ -2104,35 +2713,67 @@ fn models_fixture_distills_three_chains() {
     assert_eq!(grok.spans[0].canonical, "grok-4.5");
 
     // Tolerance: a record without a canonical skips, an empty chain drops, a
-    // non-array chain drops; zero surviving aliases or canonical pairs fail
-    // the feed.
-    let mixed = r#"{"aliases": {
+    // non-array chain drops; zero surviving aliases fails the feed.
+    let mixed = r#"{"version": 4, "aliases": {
         "a": [{"from": "2026-01-01", "canonical": "m"}],
         "b": [{"from": "2026-01-01"}],
         "c": [],
         "d": 7
-    }, "models": {"m": {"sources": {"deepseek": "m"}}}}"#;
-    let (keys, canonical) = distill_models(mixed).expect("one chain survives");
+    }}"#;
+    let keys = distill_aliases(mixed).expect("one chain survives");
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].id, "a");
     assert_eq!(keys[0].spans[0].canonical, "m");
+    assert!(distill_aliases("{}").is_err());
+    assert!(distill_aliases(r#"{"aliases": {}}"#).is_err());
+    assert!(distill_aliases("not json").is_err());
+    assert!(distill_aliases(r#"{"models": {}}"#).is_err());
+}
+
+#[test]
+fn the_catalog_keys_a_pair_on_the_source_the_feeds_spell() {
+    // The four feed files spell all 29 sources identically (measured
+    // 2026-09-03), so the canonical map's key and a `StoreKey`'s source come
+    // from one vocabulary and no rename sits between them: `xai` on both
+    // sides, never a clauth-side alias for it.
+    let canonical = fixture_canonical();
     assert_eq!(
-        canonical.get("deepseek").and_then(|m| m.get("m")),
-        Some(&"m".to_owned())
-    );
-    // A catalog source name maps to the canonical provider name, like the
-    // history's (the fixture's grok entry spells xai).
-    let (_, canonical) = distill_models(MODELS_FIXTURE).expect("fixture distills");
-    assert_eq!(
-        canonical.get("x-ai").and_then(|m| m.get("grok-4.5")),
+        canonical.get("xai").and_then(|m| m.get("grok-4.5")),
         Some(&"grok-4.5".to_owned())
     );
-    assert!(distill_models("{}").is_err());
-    assert!(distill_models(r#"{"aliases": {}}"#).is_err());
-    assert!(distill_models(r#"{"aliases": {"a": [{"canonical": "m"}]}}"#).is_err());
-    assert!(distill_models(r#"{"aliases": {"a": [{"canonical": "m"}]}, "models": {}}"#).is_err());
-    assert!(distill_models("not json").is_err());
-    assert!(distill_models(r#"{"models": {}}"#).is_err());
+    assert_eq!(
+        canonical.get("moonshot").and_then(|m| m.get("kimi-k2.6")),
+        Some(&"kimi-k2.6".to_owned())
+    );
+    // Same vocabulary on the store side.
+    let keys = distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills");
+    let grok = keys.iter().find(|k| k.id == "grok-4.5").expect("grok key");
+    assert_eq!(grok.source, "xai");
+    assert_eq!(
+        canonical
+            .get(&grok.source)
+            .and_then(|m| m.get(&grok.id))
+            .map(String::as_str),
+        Some("grok-4.5"),
+        "the store key resolves against the map with no rename"
+    );
+    // Tolerance: a missing `models` object and an empty one both fail.
+    let vendors = distill_providers(PROVIDERS_FIXTURE).expect("providers distill");
+    assert!(distill_catalog("{}", &vendors).is_err());
+    assert!(distill_catalog(r#"{"models": {}}"#, &vendors).is_err());
+    assert!(distill_catalog("not json", &vendors).is_err());
+    // An entry with no `sources` object skips instead of failing the feed.
+    let mixed = r#"{"version": 4, "models": {
+        "a": {"vendor": "deepseek", "sources": {"deepseek": ["a"]}},
+        "b": {"vendor": "deepseek"},
+        "c": {"vendor": "deepseek", "sources": 7}
+    }}"#;
+    let (canonical, _) = distill_catalog(mixed, &vendors).expect("one entry survives");
+    assert_eq!(canonical.len(), 1);
+    assert_eq!(
+        canonical.get("deepseek").and_then(|m| m.get("a")),
+        Some(&"a".to_owned())
+    );
 }
 
 #[test]
@@ -2206,7 +2847,10 @@ fn an_alias_only_resolves_once_the_ladder_misses() {
     // id the table prices (no live row carries `deepseek-chat`; this is the
     // guard for the store growing one whose rates differ from the chain's
     // canonical).
-    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("aliases distill");
+    let (aliases, canonical) = (
+        distill_aliases(ALIASES_FIXTURE).expect("aliases distill"),
+        fixture_canonical(),
+    );
     let t = PriceTable {
         models: vec![eq_model("deepseek-chat", 9e-6, 9e-6)],
         history: vec![RateSnapshot {
@@ -2258,18 +2902,20 @@ fn a_verbatim_id_is_never_remapped_by_the_variant_strip() {
 }
 
 #[test]
-fn openrouter_extra_rows_parse_and_stay_dropped() {
-    // The pre-2026-08-28 openrouter shape parks its cache-write prices under
-    // an `extra` object of string values. A kept source carrying the same
-    // shape must PARSE — the line's survival is the parser's tolerance, not
-    // the allowlist's drop — and price its top-level rates.
+fn history_rows_with_unmodeled_keys_parse_and_a_resold_one_stays_dropped() {
+    // openrouter's real row carries a `fees` object and two rate axes clauth
+    // has no bucket for. A FIRST-PARTY row carrying the same keys must PARSE
+    // — the line's survival is the parser's tolerance, not the resold guard's
+    // drop — and price its four modeled axes.
     let kept = concat!(
-        r#"{"source":"deepseek","model_id":"m","observed_at":"2026-01-01","#,
-        r#""input_mtok":1,"output_mtok":2,"extra":{"web_search":"0.01","#,
-        r#""input_cache_write":"0.0000003","input_cache_write_1h":"0.0000005"}}"#,
+        r#"{"schema":4,"source":"deepseek","model_id":"m","observed_at":"2026-01-01","#,
+        r#""rates":{"input":1,"output":2,"cache_write_1h":0.5,"internal_reasoning":9},"#,
+        r#""fees":{"web_search":0.01},"limits":{"context":200000},"#,
+        r#""provenance":{"name":"probe"}}"#,
         "\n"
     );
-    let keys = distill_history(kept).expect("extra keys do not fail the line");
+    let keys = distill_history(kept, &all_first_party_history(kept))
+        .expect("unmodeled keys do not fail the line");
     assert_eq!(keys.len(), 1);
     let t = PriceTable {
         models: Vec::new(),
@@ -2282,10 +2928,18 @@ fn openrouter_extra_rows_parse_and_stay_dropped() {
     };
     assert_rate(t.rate_at("m", "2026-01-01", 0).map(|r| r.input), 1e-6);
 
-    // The fixture's verbatim openrouter row parses the same way and never
-    // enters the walk: the id has no key and prices nothing.
-    let keys = distill_history(HISTORY_FIXTURE).expect("history distills");
+    // The fixture's verbatim openrouter row never enters the walk: the id has
+    // no key and prices nothing. Distilling the same bytes against a guard
+    // that keeps every pair is the control — the row parses, so what dropped
+    // it is the vendor comparison and not a parse failure.
+    let keys = distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills");
     assert!(!keys.iter().any(|k| k.id == "anthropic/claude-3-haiku"));
+    let unguarded = distill_history(HISTORY_FIXTURE, &all_first_party_history(HISTORY_FIXTURE))
+        .expect("history distills");
+    assert!(
+        unguarded.iter().any(|k| k.id == "anthropic/claude-3-haiku"),
+        "the line parses; only the resold guard drops it"
+    );
     let t = store_table();
     assert!(
         t.rate_at("anthropic/claude-3-haiku", "2026-08-26", 0)
@@ -2296,14 +2950,17 @@ fn openrouter_extra_rows_parse_and_stay_dropped() {
 #[test]
 fn cache_round_trips_the_alias_table_and_old_caches_load_without_it() {
     let sandbox = HomeSandbox::new();
-    let (aliases, canonical) = distill_models(MODELS_FIXTURE).expect("aliases distill");
+    let (aliases, canonical) = (
+        distill_aliases(ALIASES_FIXTURE).expect("aliases distill"),
+        fixture_canonical(),
+    );
     let table = PriceTable {
         models: vec![eq_model("m", 1e-6, 2e-6)],
         history: vec![RateSnapshot {
             captured: "2026-01-01".to_owned(),
             models: vec![eq_model("m", 1e-6, 2e-6)],
         }],
-        store: distill_history(HISTORY_FIXTURE).expect("history distills"),
+        store: distill_history(HISTORY_FIXTURE, &fixture_guard()).expect("history distills"),
         aliases,
         canonical,
         fetched_at_ms: 11,
@@ -2312,7 +2969,7 @@ fn cache_round_trips_the_alias_table_and_old_caches_load_without_it() {
     let path = sandbox
         .home()
         .join(".clauth")
-        .join("ai_pricelog_price_cache.json");
+        .join("ai_pricelog_v4_price_cache.json");
     save_cache(&path, &table);
 
     let loaded = load_cached().expect("cache loads");

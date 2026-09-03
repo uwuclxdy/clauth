@@ -1,0 +1,101 @@
+{
+  "version": 4,
+  "aliases": {
+    "deepseek-chat": [
+      {
+        "canonical": "deepseek-v3",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2024-12-26",
+        "from": "2024-12-26",
+        "to": "2025-03-24"
+      },
+      {
+        "canonical": "deepseek-v3-0324",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-03-24",
+        "from": "2025-03-24",
+        "to": "2025-08-21"
+      },
+      {
+        "canonical": "deepseek-v3.1",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-08-21",
+        "from": "2025-08-21",
+        "to": "2025-09-22"
+      },
+      {
+        "canonical": "deepseek-v3.1-terminus",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-22",
+        "from": "2025-09-22",
+        "to": "2025-09-29"
+      },
+      {
+        "canonical": "deepseek-v3.2-exp",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-29",
+        "from": "2025-09-29",
+        "to": "2025-12-01"
+      },
+      {
+        "canonical": "deepseek-v3.2",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-12-01",
+        "from": "2025-12-01",
+        "to": "2026-04-24"
+      },
+      {
+        "canonical": "deepseek-v4-flash",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2026-04-24",
+        "from": "2026-04-24",
+        "to": "2026-07-24"
+      }
+    ],
+    "deepseek-reasoner": [
+      {
+        "canonical": "deepseek-r1",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-01-20",
+        "from": "2025-01-20",
+        "to": "2025-05-28"
+      },
+      {
+        "canonical": "deepseek-r1-0528",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-05-28",
+        "from": "2025-05-28",
+        "to": "2025-08-21"
+      },
+      {
+        "canonical": "deepseek-v3.1",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-08-21",
+        "from": "2025-08-21",
+        "to": "2025-09-22"
+      },
+      {
+        "canonical": "deepseek-v3.1-terminus",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-22",
+        "from": "2025-09-22",
+        "to": "2025-09-29"
+      },
+      {
+        "canonical": "deepseek-v3.2-exp",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-29",
+        "from": "2025-09-29",
+        "to": "2025-12-01"
+      },
+      {
+        "canonical": "deepseek-v3.2",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2025-12-01",
+        "from": "2025-12-01",
+        "to": "2026-04-24"
+      },
+      {
+        "canonical": "deepseek-v4-flash",
+        "citation": "https://api-docs.deepseek.com/updates/#date-2026-04-24",
+        "from": "2026-04-24",
+        "to": "2026-07-24"
+      }
+    ],
+    "grok-4.5-latest": [
+      {
+        "canonical": "grok-4.5",
+        "citation": "https://docs.x.ai/docs/models",
+        "from": null,
+        "to": null
+      }
+    ]
+  }
+}

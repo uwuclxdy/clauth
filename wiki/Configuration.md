@@ -184,7 +184,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 ```
 ~/.clauth/
   profiles.toml            # everything in the table above
-  ai_pricelog_price_cache.json  # ai-pricelog model prices for the cost lens
+  ai_pricelog_v4_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
   session_profiles.json    # which account each Claude Code session ran on

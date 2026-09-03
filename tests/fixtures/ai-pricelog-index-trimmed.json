@@ -1,236 +1,410 @@
 {
-  "version": 3,
+  "version": 4,
   "sources": {
     "anthropic": {
       "claude-opus-5": {
+        "schema": 4,
         "source": "anthropic",
         "model_id": "claude-opus-5",
         "observed_at": "2026-08-29",
-        "input_mtok": 5.0,
-        "output_mtok": 25.0,
-        "cache_read_mtok": 0.5,
-        "cache_write_mtok": 6.25,
-        "cache_write_1h_mtok": 10.0
+        "rates": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25,
+          "cache_write_1h": 10.0
+        },
+        "provenance": {
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing.md"
+        },
+        "first_seen": "2026-08-29"
       }
     },
     "openai": {
       "gpt-4.1": {
+        "schema": 4,
         "source": "openai",
         "model_id": "gpt-4.1",
         "observed_at": "2026-08-29",
-        "input_mtok": 2.0,
-        "output_mtok": 8.0,
-        "cache_read_mtok": 0.5
+        "rates": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5
+        },
+        "provenance": {
+          "url": "https://platform.openai.com/docs/pricing"
+        },
+        "first_seen": "2026-08-29"
       },
       "synth-future-effective": {
         "synthetic": true,
+        "schema": 4,
         "source": "openai",
         "model_id": "synth-future-effective",
         "observed_at": "2026-08-29",
-        "input_mtok": 0.25,
-        "output_mtok": 1.0,
-        "effective_at": "2026-12-31"
+        "effective_at": "2026-12-31",
+        "rates": {
+          "input": 0.25,
+          "output": 1.0
+        }
+      },
+      "synth-volume-tier": {
+        "synthetic": true,
+        "schema": 4,
+        "source": "openai",
+        "model_id": "synth-volume-tier",
+        "observed_at": "2026-08-29",
+        "rates": {
+          "input": 0.1,
+          "output": 0.2
+        },
+        "overrides": [
+          {
+            "when": {
+              "min_tokens": 200000
+            },
+            "rates": {
+              "input": 6.0,
+              "output": 22.5
+            }
+          }
+        ]
       }
     },
     "dashscope": {
       "qwen3.8-max": {
+        "schema": 4,
         "source": "dashscope",
         "model_id": "qwen3.8-max",
         "observed_at": "2026-08-29",
-        "input_mtok": 2.0,
-        "output_mtok": 6.0
+        "rates": {
+          "input": 2.0,
+          "output": 6.0
+        },
+        "provenance": {
+          "url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        },
+        "first_seen": "2026-08-29"
       },
       "deepseek-v3.2": {
+        "schema": 4,
         "source": "dashscope",
         "model_id": "deepseek-v3.2",
         "observed_at": "2026-08-29",
-        "input_mtok": 0.57,
-        "output_mtok": 1.71,
+        "rates": {
+          "input": 0.57,
+          "output": 1.71
+        },
+        "provenance": {
+          "url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        },
+        "first_seen": "2026-08-29",
         "removed_at": "2026-08-31"
       },
       "deepseek-v4-flash": {
+        "schema": 4,
         "source": "dashscope",
         "model_id": "deepseek-v4-flash",
         "observed_at": "2026-08-29",
-        "input_mtok": 0.2,
-        "output_mtok": 0.4,
+        "rates": {
+          "input": 0.2,
+          "output": 0.4
+        },
+        "provenance": {
+          "url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        },
+        "first_seen": "2026-08-29",
         "removed_at": "2026-08-31"
       },
       "deepseek-v4-pro": {
+        "schema": 4,
         "source": "dashscope",
         "model_id": "deepseek-v4-pro",
         "observed_at": "2026-08-29",
-        "input_mtok": 2.4,
-        "output_mtok": 4.8,
+        "rates": {
+          "input": 2.4,
+          "output": 4.8
+        },
+        "provenance": {
+          "url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        },
+        "first_seen": "2026-08-29",
         "removed_at": "2026-08-31"
       },
       "glm-5.1": {
+        "schema": 4,
         "source": "dashscope",
         "model_id": "glm-5.1",
         "observed_at": "2026-08-29",
-        "input_mtok": 1.4,
-        "output_mtok": 4.4,
+        "rates": {
+          "input": 1.4,
+          "output": 4.4
+        },
+        "provenance": {
+          "url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        },
+        "first_seen": "2026-08-29",
         "removed_at": "2026-08-31"
       },
       "glm-5.2": {
+        "schema": 4,
         "source": "dashscope",
         "model_id": "glm-5.2",
         "observed_at": "2026-08-29",
-        "input_mtok": 1.4,
-        "output_mtok": 4.4,
+        "rates": {
+          "input": 1.4,
+          "output": 4.4
+        },
+        "provenance": {
+          "url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        },
+        "first_seen": "2026-08-29",
         "removed_at": "2026-08-31"
       },
       "kimi-k2.7-code": {
+        "schema": 4,
         "source": "dashscope",
         "model_id": "kimi-k2.7-code",
         "observed_at": "2026-08-29",
-        "input_mtok": 0.95,
-        "output_mtok": 4.0,
+        "rates": {
+          "input": 0.95,
+          "output": 4.0
+        },
+        "provenance": {
+          "url": "https://www.alibabacloud.com/help/en/model-studio/model-pricing"
+        },
+        "first_seen": "2026-08-29",
         "removed_at": "2026-08-31"
       }
     },
     "deepseek": {
       "deepseek-v4-pro": {
+        "schema": 4,
         "source": "deepseek",
         "model_id": "deepseek-v4-pro",
         "observed_at": "2026-08-30",
         "effective_at": "2026-08-23",
-        "input_mtok": 0.66,
-        "output_mtok": 1.98,
-        "cache_read_mtok": 0.022,
-        "window_rates": [
+        "rates": {
+          "input": 0.66,
+          "output": 1.98,
+          "cache_read": 0.022
+        },
+        "overrides": [
           {
-            "window": [
-              100,
-              400
-            ],
-            "days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "input_mtok": 1.32,
-            "output_mtok": 3.96,
-            "cache_read_mtok": 0.044
+            "when": {
+              "days": [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday"
+              ],
+              "window": [
+                100,
+                400
+              ],
+              "timezone": "Asia/Shanghai"
+            },
+            "rates": {
+              "input": 1.32,
+              "output": 3.96,
+              "cache_read": 0.044
+            }
           },
           {
-            "window": [
-              600,
-              1000
-            ],
-            "days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "input_mtok": 1.32,
-            "output_mtok": 3.96,
-            "cache_read_mtok": 0.044
+            "when": {
+              "days": [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday"
+              ],
+              "window": [
+                600,
+                1000
+              ],
+              "timezone": "Asia/Shanghai"
+            },
+            "rates": {
+              "input": 1.32,
+              "output": 3.96,
+              "cache_read": 0.044
+            }
           }
         ],
-        "timezone": "Asia/Shanghai"
+        "limits": {
+          "context": 1048576,
+          "output": 393216
+        },
+        "provenance": {
+          "url": "https://api-docs.deepseek.com/quick_start/pricing/"
+        },
+        "first_seen": "2026-04-24"
+      },
+      "deepseek-r1": {
+        "schema": 4,
+        "source": "deepseek",
+        "model_id": "deepseek-r1",
+        "observed_at": "2025-01-20",
+        "rates": {
+          "input": 0.55,
+          "output": 2.19,
+          "cache_read": 0.14
+        },
+        "provenance": {
+          "url": "https://arquivo.pt/wayback/20250311062416id_/https://api-docs.deepseek.com/quick_start/pricing"
+        },
+        "first_seen": "2025-01-20",
+        "removed_at": "2026-08-31"
       }
     },
     "zai": {
       "glm-5.3-flash": {
+        "schema": 4,
         "source": "zai",
         "model_id": "glm-5.3-flash",
         "observed_at": "2026-08-30",
-        "input_mtok": 0.075,
-        "output_mtok": 0.25,
-        "cache_read_mtok": 0.015,
-        "window_rates": [
+        "rates": {
+          "input": 0.075,
+          "output": 0.25,
+          "cache_read": 0.015
+        },
+        "overrides": [
           {
             "quota_multiplier": 0.4
           },
           {
-            "quota_multiplier": 1.2,
-            "days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "window": [
-              600,
-              1000
-            ]
+            "when": {
+              "days": [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday"
+              ],
+              "window": [
+                600,
+                1000
+              ],
+              "timezone": "Asia/Singapore"
+            },
+            "quota_multiplier": 1.2
           }
         ],
-        "timezone": "Asia/Singapore"
+        "provenance": {
+          "url": "https://docs.z.ai/guides/overview/pricing"
+        },
+        "first_seen": "2026-08-26"
       },
       "synth-overlap": {
         "synthetic": true,
+        "schema": 4,
         "source": "zai",
         "model_id": "synth-overlap",
         "observed_at": "2026-08-29",
-        "input_mtok": 0.1,
-        "output_mtok": 0.2,
-        "window_rates": [
+        "rates": {
+          "input": 0.1,
+          "output": 0.2
+        },
+        "overrides": [
           {
-            "window": [
-              0,
-              2400
-            ],
-            "days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "input_mtok": 0.3
+            "when": {
+              "days": [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday"
+              ],
+              "window": [
+                0,
+                2400
+              ]
+            },
+            "rates": {
+              "input": 0.3
+            }
           },
           {
-            "window": [
-              800,
-              2000
-            ],
-            "days": [
-              "monday",
-              "tuesday",
-              "wednesday",
-              "thursday",
-              "friday"
-            ],
-            "input_mtok": 0.5
+            "when": {
+              "days": [
+                "monday",
+                "tuesday",
+                "wednesday",
+                "thursday",
+                "friday"
+              ],
+              "window": [
+                800,
+                2000
+              ]
+            },
+            "rates": {
+              "input": 0.5
+            }
           }
         ]
       }
     },
     "moonshot": {
       "kimi-k2.6": {
+        "schema": 4,
         "source": "moonshot",
         "model_id": "kimi-k2.6",
         "observed_at": "2026-08-29",
-        "input_mtok": 0.95,
-        "output_mtok": 4.0,
-        "cache_read_mtok": 0.16
+        "rates": {
+          "input": 0.95,
+          "output": 4.0,
+          "cache_read": 0.16
+        },
+        "limits": {
+          "context": 262144
+        },
+        "provenance": {
+          "url": "https://platform.kimi.ai/docs/pricing/chat-k26.md"
+        },
+        "first_seen": "2026-04-20"
       }
     },
     "xai": {
       "grok-4.6": {
+        "schema": 4,
         "source": "xai",
         "model_id": "grok-4.6",
         "observed_at": "2026-08-29",
-        "input_mtok": 2.0,
-        "output_mtok": 6.0,
-        "cache_read_mtok": 0.5
+        "rates": {
+          "input": 2.0,
+          "output": 6.0,
+          "cache_read": 0.5
+        },
+        "limits": {
+          "context": 500000
+        },
+        "provenance": {
+          "url": "https://docs.x.ai/docs/models"
+        },
+        "first_seen": "2026-08-11"
       }
     },
     "openrouter": {
       "aion-labs/aion-2.0": {
+        "schema": 4,
         "source": "openrouter",
         "model_id": "aion-labs/aion-2.0",
-        "observed_at": "2026-08-29",
-        "input_mtok": 0.8,
-        "output_mtok": 1.6,
-        "cache_read_mtok": 0.2
+        "observed_at": "2026-08-26",
+        "rates": {
+          "input": 0.8,
+          "output": 1.6,
+          "cache_read": 0.2
+        },
+        "limits": {
+          "context": 131072
+        },
+        "provenance": {
+          "name": "Aion-2.0"
+        },
+        "first_seen": "2026-08-26"
       }
     }
   }

@@ -1,211 +1,439 @@
 {
-  "version": 3,
+  "version": 4,
   "models": {
-    "deepseek-r1": {
+    "claude-opus-5": {
+      "curated": true,
+      "name": "Claude Opus 5",
       "sources": {
-        "deepseek": "deepseek-r1",
-        "openrouter": "deepseek/deepseek-r1"
+        "anthropic": [
+          "claude-opus-5"
+        ],
+        "deepinfra": [
+          "claude-opus-5"
+        ],
+        "digitalocean": [
+          "claude-opus-5"
+        ],
+        "openrouter": [
+          "anthropic/claude-opus-5"
+        ]
       },
-      "name": "R1"
+      "vendor": "anthropic"
     },
-    "deepseek-r1-0528": {
+    "cloudflare/@cf/deepseek-ai/deepseek-v4-pro-0813": {
+      "curated": false,
       "sources": {
-        "deepinfra": "deepseek-r1-0528",
-        "deepseek": "deepseek-r1-0528",
-        "novita": "deepseek/deepseek-r1-0528",
-        "openrouter": "deepseek/deepseek-r1-0528"
+        "cloudflare": [
+          "@cf/deepseek-ai/deepseek-v4-pro-0813"
+        ]
       },
-      "name": "R1"
+      "vendor": "deepseek-ai"
+    },
+    "deepseek-r1": {
+      "curated": true,
+      "name": "R1",
+      "sources": {
+        "deepseek": [
+          "deepseek-r1"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-r1"
+        ]
+      },
+      "vendor": "deepseek"
     },
     "deepseek-v3": {
+      "curated": true,
+      "name": "DeepSeek V3",
       "sources": {
-        "deepinfra": "deepseek-v3",
-        "deepseek": "deepseek-v3"
+        "deepinfra": [
+          "deepseek-v3"
+        ],
+        "deepseek": [
+          "deepseek-v3"
+        ]
       },
-      "name": "DeepSeek V3"
-    },
-    "deepseek-v3-0324": {
-      "sources": {
-        "deepinfra": "deepseek-v3-0324",
-        "deepseek": "deepseek-v3-0324",
-        "novita": "deepseek/deepseek-v3-0324"
-      }
-    },
-    "deepseek-v3.1": {
-      "sources": {
-        "deepinfra": "deepseek-v3.1",
-        "deepseek": "deepseek-v3.1",
-        "novita": "deepseek/deepseek-v3.1",
-        "sambanova": "deepseek-v3.1"
-      }
-    },
-    "deepseek-v3.1-terminus": {
-      "sources": {
-        "deepseek": "deepseek-v3.1-terminus",
-        "novita": "deepseek/deepseek-v3.1-terminus",
-        "openrouter": "deepseek/deepseek-v3.1-terminus"
-      },
-      "name": "DeepSeek V3.1 Terminus"
+      "vendor": "deepseek"
     },
     "deepseek-v3.2": {
+      "curated": true,
+      "name": "DeepSeek V3.2",
       "sources": {
-        "dashscope": "deepseek-v3.2",
-        "deepinfra": "deepseek-v3.2",
-        "deepseek": "deepseek-v3.2",
-        "digitalocean": "deepseek-v3.2",
-        "novita": "deepseek/deepseek-v3.2",
-        "openrouter": "deepseek/deepseek-v3.2",
-        "sambanova": "deepseek-v3.2"
+        "dashscope": [
+          "deepseek-v3.2"
+        ],
+        "deepinfra": [
+          "deepseek-v3.2"
+        ],
+        "deepseek": [
+          "deepseek-v3.2"
+        ],
+        "digitalocean": [
+          "deepseek-v3.2"
+        ],
+        "novita": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "sambanova": [
+          "deepseek-v3.2"
+        ]
       },
-      "name": "DeepSeek V3.2"
-    },
-    "deepseek-v3.2-exp": {
-      "sources": {
-        "deepseek": "deepseek-v3.2-exp",
-        "novita": "deepseek/deepseek-v3.2-exp",
-        "openrouter": "deepseek/deepseek-v3.2-exp"
-      },
-      "name": "DeepSeek V3.2 Exp"
+      "vendor": "deepseek"
     },
     "deepseek-v4-flash": {
+      "curated": true,
+      "name": "DeepSeek V4 Flash",
       "sources": {
-        "avian": "deepseek-v4-flash",
-        "dashscope": "deepseek-v4-flash",
-        "deepinfra": "deepseek-v4-flash",
-        "deepseek": "deepseek-v4-flash",
-        "digitalocean": "deepseek-v4-flash",
-        "novita": "deepseek/deepseek-v4-flash",
-        "openrouter": "deepseek/deepseek-v4-flash"
+        "avian": [
+          "deepseek-v4-flash"
+        ],
+        "dashscope": [
+          "deepseek-v4-flash"
+        ],
+        "deepinfra": [
+          "deepseek-v4-flash"
+        ],
+        "deepseek": [
+          "deepseek-v4-flash"
+        ],
+        "digitalocean": [
+          "deepseek-v4-flash"
+        ],
+        "novita": [
+          "deepseek/deepseek-v4-flash"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-v4-flash"
+        ]
       },
-      "name": "DeepSeek V4 Flash"
+      "vendor": "deepseek"
     },
     "deepseek-v4-pro": {
+      "curated": true,
+      "name": "DeepSeek V4 Pro",
       "sources": {
-        "avian": "deepseek-v4-pro",
-        "dashscope": "deepseek-v4-pro",
-        "deepinfra": "deepseek-v4-pro",
-        "deepseek": "deepseek-v4-pro",
-        "digitalocean": "deepseek-v4-pro",
-        "fireworks": "deepseek-v4-pro",
-        "novita": "deepseek/deepseek-v4-pro",
-        "openrouter": "deepseek/deepseek-v4-pro",
-        "together": "deepseek-v4-pro"
+        "avian": [
+          "deepseek-v4-pro"
+        ],
+        "dashscope": [
+          "deepseek-v4-pro"
+        ],
+        "deepinfra": [
+          "deepseek-v4-pro"
+        ],
+        "deepseek": [
+          "deepseek-v4-pro"
+        ],
+        "digitalocean": [
+          "deepseek-v4-pro"
+        ],
+        "fireworks": [
+          "deepseek-v4-pro"
+        ],
+        "novita": [
+          "deepseek/deepseek-v4-pro"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-v4-pro"
+        ],
+        "together": [
+          "deepseek-v4-pro"
+        ]
       },
-      "name": "DeepSeek V4 Pro"
+      "vendor": "deepseek"
+    },
+    "glm-4.5": {
+      "curated": true,
+      "name": "GLM 4.5",
+      "sources": {
+        "openrouter": [
+          "z-ai/glm-4.5"
+        ],
+        "zai": [
+          "glm-4.5"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "glm-5.1": {
+      "curated": true,
+      "name": "GLM 5.1",
+      "sources": {
+        "avian": [
+          "glm-5.1"
+        ],
+        "dashscope": [
+          "glm-5.1"
+        ],
+        "digitalocean": [
+          "glm-5.1"
+        ],
+        "novita": [
+          "zai-org/glm-5.1"
+        ],
+        "openrouter": [
+          "z-ai/glm-5.1"
+        ],
+        "zai": [
+          "glm-5.1"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "glm-5.2": {
+      "curated": true,
+      "name": "GLM 5.2",
+      "sources": {
+        "avian": [
+          "glm-5.2"
+        ],
+        "dashscope": [
+          "glm-5.2"
+        ],
+        "databricks": [
+          "glm-5.2"
+        ],
+        "digitalocean": [
+          "glm-5.2"
+        ],
+        "fireworks": [
+          "glm-5.2"
+        ],
+        "novita": [
+          "zai-org/glm-5.2"
+        ],
+        "openrouter": [
+          "z-ai/glm-5.2"
+        ],
+        "scaleway": [
+          "glm-5.2"
+        ],
+        "together": [
+          "glm-5.2"
+        ],
+        "zai": [
+          "glm-5.2"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "glm-5.3-flash": {
+      "curated": true,
+      "name": "GLM 5.3 Flash",
+      "sources": {
+        "digitalocean": [
+          "glm-5.3-flash"
+        ],
+        "novita": [
+          "zai-org/glm-5.3-flash"
+        ],
+        "openrouter": [
+          "z-ai/glm-5.3-flash"
+        ],
+        "together": [
+          "glm-5.3-flash"
+        ],
+        "zai": [
+          "glm-5.3-flash"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "gpt-4.1": {
+      "curated": true,
+      "name": "GPT-4.1",
+      "sources": {
+        "digitalocean": [
+          "gpt-4.1"
+        ],
+        "openai": [
+          "gpt-4.1"
+        ],
+        "openrouter": [
+          "openai/gpt-4.1"
+        ]
+      },
+      "vendor": "openai"
     },
     "grok-4.5": {
+      "curated": true,
+      "name": "Grok 4.5",
       "sources": {
-        "openrouter": "x-ai/grok-4.5",
-        "xai": "grok-4.5"
+        "openrouter": [
+          "x-ai/grok-4.5"
+        ],
+        "xai": [
+          "grok-4.5"
+        ]
       },
-      "name": "Grok 4.5"
+      "vendor": "xai"
+    },
+    "grok-4.6": {
+      "curated": true,
+      "name": "Grok 4.6",
+      "sources": {
+        "openrouter": [
+          "x-ai/grok-4.6"
+        ],
+        "xai": [
+          "grok-4.6"
+        ]
+      },
+      "vendor": "xai"
+    },
+    "kimi-k2.6": {
+      "curated": true,
+      "name": "Kimi K2.6",
+      "sources": {
+        "avian": [
+          "kimi-k2.6"
+        ],
+        "deepinfra": [
+          "kimi-k2.6"
+        ],
+        "digitalocean": [
+          "kimi-k2.6"
+        ],
+        "fireworks": [
+          "kimi-k2.6"
+        ],
+        "moonshot": [
+          "kimi-k2.6"
+        ],
+        "novita": [
+          "moonshotai/kimi-k2.6"
+        ],
+        "openrouter": [
+          "moonshotai/kimi-k2.6"
+        ]
+      },
+      "vendor": "moonshot"
+    },
+    "kimi-k2.7-code": {
+      "curated": true,
+      "name": "Kimi K2.7 Code",
+      "sources": {
+        "dashscope": [
+          "kimi-k2.7-code"
+        ],
+        "deepinfra": [
+          "kimi-k2.7-code"
+        ],
+        "fireworks": [
+          "kimi-k2.7-code"
+        ],
+        "moonshot": [
+          "kimi-k2.7-code"
+        ],
+        "novita": [
+          "moonshotai/kimi-k2.7-code"
+        ],
+        "openrouter": [
+          "moonshotai/kimi-k2.7-code"
+        ],
+        "together": [
+          "kimi-k2.7-code"
+        ]
+      },
+      "vendor": "moonshot"
+    },
+    "minimax/MiniMax-M2.5-Lightning": {
+      "curated": false,
+      "sources": {
+        "minimax": [
+          "MiniMax-M2.5-Lightning"
+        ]
+      },
+      "vendor": "minimax"
+    },
+    "openrouter/aion-labs/aion-2.0": {
+      "curated": false,
+      "sources": {
+        "openrouter": [
+          "aion-labs/aion-2.0"
+        ]
+      },
+      "vendor": "aion-labs"
+    },
+    "openrouter/anthropic/claude-3-haiku": {
+      "curated": false,
+      "sources": {
+        "openrouter": [
+          "anthropic/claude-3-haiku"
+        ]
+      },
+      "vendor": "anthropic"
     },
     "qwen3.6-27b": {
+      "curated": true,
+      "name": "Qwen3.6 27B",
       "sources": {
-        "deepinfra": "qwen3.6-27b",
-        "groq": "qwen/qwen3.6-27b",
-        "novita": "qwen/qwen3.6-27b",
-        "openrouter": "qwen/qwen3.6-27b"
+        "deepinfra": [
+          "qwen3.6-27b"
+        ],
+        "groq": [
+          "qwen/qwen3.6-27b"
+        ],
+        "novita": [
+          "qwen/qwen3.6-27b"
+        ],
+        "openrouter": [
+          "qwen/qwen3.6-27b"
+        ]
       },
-      "name": "Qwen3.6 27B"
+      "vendor": "alibaba"
+    },
+    "qwen3.8-max": {
+      "curated": true,
+      "name": "Qwen3.8 Max",
+      "sources": {
+        "dashscope": [
+          "qwen3.8-max"
+        ],
+        "deepinfra": [
+          "qwen3.8-max"
+        ],
+        "digitalocean": [
+          "qwen3.8-max"
+        ],
+        "novita": [
+          "qwen/qwen3.8-max"
+        ],
+        "openrouter": [
+          "qwen/qwen3.8-max"
+        ]
+      },
+      "vendor": "alibaba"
+    },
+    "synth-future-effective": {
+      "curated": false,
+      "sources": {
+        "openai": [
+          "synth-future-effective"
+        ]
+      },
+      "vendor": "openai"
+    },
+    "synth-overlap": {
+      "curated": false,
+      "sources": {
+        "zai": [
+          "synth-overlap"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "synth-volume-tier": {
+      "curated": false,
+      "sources": {
+        "openai": [
+          "synth-volume-tier"
+        ]
+      },
+      "vendor": "openai"
     }
-  },
-  "aliases": {
-    "deepseek-chat": [
-      {
-        "from": "2024-12-26",
-        "to": "2025-03-24",
-        "canonical": "deepseek-v3",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2024-12-26"
-      },
-      {
-        "from": "2025-03-24",
-        "to": "2025-08-21",
-        "canonical": "deepseek-v3-0324",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-03-24"
-      },
-      {
-        "from": "2025-08-21",
-        "to": "2025-09-22",
-        "canonical": "deepseek-v3.1",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-08-21"
-      },
-      {
-        "from": "2025-09-22",
-        "to": "2025-09-29",
-        "canonical": "deepseek-v3.1-terminus",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-22"
-      },
-      {
-        "from": "2025-09-29",
-        "to": "2025-12-01",
-        "canonical": "deepseek-v3.2-exp",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-29"
-      },
-      {
-        "from": "2025-12-01",
-        "to": "2026-04-24",
-        "canonical": "deepseek-v3.2",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-12-01"
-      },
-      {
-        "from": "2026-04-24",
-        "to": "2026-07-24",
-        "canonical": "deepseek-v4-flash",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2026-04-24"
-      }
-    ],
-    "deepseek-reasoner": [
-      {
-        "from": "2025-01-20",
-        "to": "2025-05-28",
-        "canonical": "deepseek-r1",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-01-20"
-      },
-      {
-        "from": "2025-05-28",
-        "to": "2025-08-21",
-        "canonical": "deepseek-r1-0528",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-05-28"
-      },
-      {
-        "from": "2025-08-21",
-        "to": "2025-09-22",
-        "canonical": "deepseek-v3.1",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-08-21"
-      },
-      {
-        "from": "2025-09-22",
-        "to": "2025-09-29",
-        "canonical": "deepseek-v3.1-terminus",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-22"
-      },
-      {
-        "from": "2025-09-29",
-        "to": "2025-12-01",
-        "canonical": "deepseek-v3.2-exp",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-09-29"
-      },
-      {
-        "from": "2025-12-01",
-        "to": "2026-04-24",
-        "canonical": "deepseek-v3.2",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2025-12-01"
-      },
-      {
-        "from": "2026-04-24",
-        "to": "2026-07-24",
-        "canonical": "deepseek-v4-flash",
-        "citation": "https://api-docs.deepseek.com/updates/#date-2026-04-24"
-      }
-    ],
-    "grok-4.5-latest": [
-      {
-        "from": null,
-        "to": null,
-        "canonical": "grok-4.5",
-        "citation": "https://docs.x.ai/docs/models"
-      }
-    ]
   }
 }

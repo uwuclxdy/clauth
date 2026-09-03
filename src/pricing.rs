@@ -5,21 +5,34 @@
 //!
 //! # Source
 //!
-//! The ai-pricelog index (`data/index.json` on the `mommy` branch of
-//! uwuclxdy/ai-pricelog, version 3): a `sources` object mapping provider name
-//! → model id → a flat rate row (`input_mtok`, `output_mtok`,
-//! `cache_read_mtok`, `cache_write_mtok`, USD per million tokens). A row may
-//! carry `effective_at` (prices apply from that date on; earlier dates price
-//! nothing) and `window_rates` entries (an `[HHMM, HHMM]` window, an optional
-//! UTC-weekday `days` set, and override rate keys whose absent fields inherit
-//! the row's base price; later entries override earlier matching ones). A row
-//! carrying `removed_at` is delisted and prices nothing. Only first-party
-//! providers are kept; resellers (OpenRouter, Novita, Together, Avian, …) are
-//! dropped, so a bare id never prices through a reseller's markup. Resold
-//! model rows inside a kept provider (a claude id under a non-anthropic
-//! provider) are dropped the same way.
+//! The ai-pricelog index (`index.json` on the `dist` branch of
+//! uwuclxdy/ai-pricelog, version 4): a `sources` object mapping provider name
+//! → model id → a row whose `rates` object maps a price axis to USD per
+//! million tokens. clauth models four axes (`input`, `output`, `cache_read`,
+//! `cache_write`); every other axis the store carries (`cache_write_1h`,
+//! `image`, `audio`, `internal_reasoning`, …) has no bucket to charge to and
+//! is ignored, as are `limits`, `fees` and `provenance`. A row may carry
+//! `effective_at` (prices apply from that date on; earlier dates price
+//! nothing) and `overrides` entries, each a `when` plus override `rates`, a
+//! `quota_multiplier`, or both. A `when` takes `days` (lowercase weekday
+//! names, already UTC calendar days), `window` (an `[HHMM, HHMM]` pair),
+//! `min_tokens` (a token-volume threshold) and `timezone` — provenance only:
+//! the store converted the schedule to UTC at build time, so re-deriving
+//! `days` from the zone would shift it twice. An override axis left absent
+//! inherits the row's base; later entries override earlier matching ones. A
+//! row carrying `removed_at` is delisted and prices nothing.
 //!
-//! Dated rates come from the store's history ndjson (`data/history.ndjson`),
+//! Whether a row is RESOLD is a per-row comparison against the catalog, not a
+//! provider allowlist: the row is first-party when the model's `vendor` and
+//! the provider's are the same named vendor. A provider publishing no
+//! `vendor` resells everything, a model the catalog gives no vendor is
+//! nobody's first-party row, and a pair the catalog does not name has no
+//! maker to compare — all three are resales. Resold rows drop at distill, so
+//! no lookup path can land on a reseller's markup, and a MIXED provider comes
+//! out right with no special case: dashscope keeps its qwen rows and drops
+//! the deepseek / glm / kimi ids it resells.
+//!
+//! Dated rates come from the store's history ndjson (`history.ndjson`),
 //! fetched alongside the index: one JSON row per line, every row carrying
 //! `observed_at` (the day the scraper saw it), optionally `effective_at` (the
 //! day the price applies FROM — a retro-dated change) and `removed: true`
@@ -28,18 +41,16 @@
 //! `effective_at ?? observed_at` falls on or before the date, back to the
 //! store's oldest row. A removal row winning a day's walk prices nothing for
 //! that day, and a price row appended after a removal re-lives the key from
-//! its own applies day. The same first-party allowlist and resold-row guards
-//! apply to history rows, so a reseller's copy of an id can neither price it
-//! nor delist it; a kept source's DELISTED copy of a foreign id (dashscope's
-//! resales) never shadows the live first-party key that owns the id.
-//! Cross-source twin-ness resolves through the catalog's `models` half
-//! (canonical id → each source's spelling of it): a delisted key whose
+//! its own applies day. The same resold guard applies to history rows, so a
+//! reseller's copy of an id can neither price it nor delist it.
+//! Cross-source twin-ness resolves through the catalog's model registry
+//! (canonical id → each source's spellings of it): a delisted key whose
 //! canonical id a live key holds never prices any date, and a pair the
 //! catalog does not name stays its own key.
 //!
 //! Api-alias ids (`deepseek-chat`, `deepseek-reasoner`) name a served model,
 //! not a page: no index row and no history key carries them, so they resolve
-//! through the store's model catalog (`data/models.json`, `aliases`) — a dated
+//! through the catalog's alias chains (`catalog/aliases.json`) — a dated
 //! chain per alias, one record per canonical model that served it. A query
 //! day prices at the record whose `from <= day < to` window covers it, at
 //! that canonical's own store walk for the day; a day no record covers prices
@@ -75,7 +86,7 @@
 //! Tokens tab's `count_cache` display toggle. Models with no matching rate
 //! (unknown / unpriced providers) contribute nothing and are surfaced as such.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -92,24 +103,35 @@ use crate::profile::{atomic_write_600, clauth_dir};
 use crate::tokens::{ModelTokens, today_date};
 use crate::usage::now_ms;
 
-/// Live price feed (the ai-pricelog index, fetched from GitHub raw `mommy`).
-const FEED_URL: &str =
-    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/index.json";
+/// Live price feed: the ai-pricelog index, the newest priced row per
+/// `(source, model_id)` key, from the published `dist` branch.
+const INDEX_URL: &str = "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/index.json";
 
-/// The store's append-only price history, one JSON row per line. Fetched on
-/// the same cadence as the index; both files must arrive for a fetch to
-/// succeed, so a fresh table never mixes a new index with stale dating.
+/// The store's price history, one JSON row per line, merged across sources.
+/// Fetched on the same cadence as the index; every file below must arrive for
+/// a fetch to succeed, so a fresh table never mixes a new index with stale
+/// dating or a stale resold guard.
 const HISTORY_URL: &str =
-    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/history.ndjson";
+    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/history.ndjson";
 
-/// The store's model catalog (`{version, models, aliases}`), fetched on the
-/// same cadence and the same all-or-nothing rule. Both halves are distilled:
-/// `aliases` chains the api-alias ids — no history key can ever price them,
-/// so the table is the only place the store says what they served — and
-/// `models` maps every `(source, id)` spelling to its canonical id, the
-/// cross-source twin-ness basis of the store walk.
-const MODELS_URL: &str =
-    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/mommy/data/models.json";
+/// Catalog, model registry (`{version, models}`): every canonical model's
+/// `vendor` — the MAKER half of the resold comparison — and its `sources`
+/// map, each source's spellings of it. That map is also the cross-source
+/// twin-ness basis of the store walk.
+const CATALOG_MODELS_URL: &str =
+    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/catalog/models.json";
+
+/// Catalog, provider registry (`{version, providers}`): each source's
+/// `vendor` — the PROVIDER half of the resold comparison, absent on a
+/// reseller — beside its display name and `kind`.
+const CATALOG_PROVIDERS_URL: &str =
+    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/catalog/providers.json";
+
+/// Catalog, api-alias chains (`{version, aliases}`). No index row and no
+/// history key carries an alias id, so this file is the only place the store
+/// says what they served.
+const CATALOG_ALIASES_URL: &str =
+    "https://raw.githubusercontent.com/uwuclxdy/ai-pricelog/dist/catalog/aliases.json";
 
 /// Background refresh cadence. Prices move rarely, so this is deliberately slow;
 /// a manual refresh signal short-circuits the wait.
@@ -119,10 +141,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// HTTP response-receive timeout.
 const RECV_TIMEOUT: Duration = Duration::from_secs(15);
-/// Hard cap on a response body. The real feeds are ~298 KiB (index), ~433 KiB
-/// (history; largest observed single-day batch: 608 rows on 2026-08-29) and
-/// ~52 KiB (models); 8 MiB is generous headroom while still bounding a hostile
-/// / runaway response.
+/// Hard cap on a response body. Measured against the store 2026-09-03: the
+/// index is ~336 KiB, the history ~509 KiB (largest single-day batch: 608
+/// rows on 2026-08-29), and the three catalog files ~164 KiB (models),
+/// ~12 KiB (aliases) and ~3 KiB (providers). 8 MiB is generous headroom while
+/// still bounding a hostile / runaway response.
 const MAX_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Snapshot history cap: the newest 180 fetches survive, older ones drop.
@@ -130,29 +153,7 @@ const HISTORY_CAP: usize = 180;
 
 /// The ai-pricelog index version this table parses. An unknown version warns
 /// through [`logline!`] and parses best-effort.
-const INDEX_VERSION: u64 = 3;
-
-/// First-party providers distilled into the table. Every other provider id in
-/// the index resells another vendor's models (openrouter, novita, together,
-/// avian, baseten, cloudflare, deepinfra, …); keeping them would let a bare id
-/// price through a reseller's markup. zhipuai and voyageai are closed upstream
-/// (their pages no longer publish rates) and stay out.
-const FIRST_PARTY_PROVIDERS: &[&str] = &[
-    "anthropic",
-    "deepseek",
-    "zai",
-    "minimax",
-    "moonshotai",
-    "x-ai",
-    "openai",
-    "google",
-    "mistral",
-    "groq",
-    "cohere",
-    "cerebras",
-    "perplexity",
-    "dashscope",
-];
+const INDEX_VERSION: u64 = 4;
 
 /// Variant-suffix spellings a claude session reports that no price page id
 /// carries (`deepseek-v4-pro-thinking`): one trailing `-<suffix>` group
@@ -244,7 +245,7 @@ pub(crate) struct RateSnapshot {
     pub(crate) models: Vec<PricedModel>,
 }
 
-/// The catalog's canonical map (`models.json` `models`): source → model id →
+/// The catalog's canonical map (`catalog/models.json`): source → model id →
 /// the canonical id every source's spelling of that model shares. Only
 /// catalog-named pairs are held; a lookup miss is the identity fallback (see
 /// [`PriceTable::canonical_of`]).
@@ -341,13 +342,14 @@ pub(crate) struct PriceTable {
     /// source for every day, today included. Empty while no store history has
     /// been fetched or cached (a pre-store cache).
     store: Vec<StoreKey>,
-    /// The store's distilled alias chains (models.json `aliases`). Empty until
+    /// The store's distilled alias chains (`catalog/aliases.json`). Empty until
     /// a fetch or cache brings them (a pre-aliases cache loads empty and
     /// upgrades on the next successful fetch), and then only reached once the
     /// ladder and the variant strip have both missed.
     aliases: Vec<AliasKey>,
-    /// The catalog's canonical `(source, id)` → canonical-id map (models.json
-    /// `models`): the twin-ness basis of [`PriceTable::dated_models`]. Empty
+    /// The catalog's canonical `(source, id)` → canonical-id map
+    /// (`catalog/models.json`): the twin-ness basis of
+    /// [`PriceTable::dated_models`]. Empty
     /// until a fetch or cache brings it (a pre-map cache loads empty and
     /// upgrades on the next successful fetch); an empty map is the identity
     /// behavior — every key canonicalizes to its raw id.
@@ -524,15 +526,19 @@ impl PriceTable {
         let models: Arc<[PricedModel]> = if self.store.is_empty() {
             self.models_for(date)?.into()
         } else {
-            // Twin-ness is canonical (the catalog's `models` half): two kept
-            // sources can carry the same model under different spellings
-            // (groq's `qwen/qwen3.6-27b` beside dashscope's `qwen3.6-27b`).
-            // LIVE keys materialize first, and the ladder's first match lands
-            // on the first-party row instead of a markup. A DELISTED key
-            // whose canonical id a live key holds is a resale of a model the
-            // live key owns — it never prices any date, its own pre-removal
-            // days included. Two live keys on one canonical keep first-seen
-            // order, unchanged.
+            // Twin-ness is canonical (the catalog's model registry), so two
+            // kept sources sharing a model resolve as one however each spells
+            // it. No live pair reaches this today: the resold guard leaves
+            // 256 keys with zero duplicate ids and zero canonical collisions
+            // (measured 2026-09-03), since a model's maker is one provider and
+            // every other carrier of it is a resale dropped at distill. What
+            // the partition still covers is a CACHED store from before that
+            // guard, and the day two vendor-carrying providers publish one
+            // canonical between them. LIVE keys materialize first, so the
+            // ladder's first match lands on a first-party row rather than a
+            // markup; a DELISTED key whose canonical a live key holds never
+            // prices any date, its own pre-removal days included; two live
+            // keys on one canonical keep first-seen order, unchanged.
             let (live, delisted): (Vec<_>, Vec<_>) =
                 self.store.iter().partition(|key| !key.delisted());
             let resold = |key: &StoreKey| {
@@ -559,7 +565,7 @@ impl PriceTable {
         Some(models)
     }
 
-    /// The key's canonical id per the catalog's `models` half: the
+    /// The key's canonical id per the catalog's model registry: the
     /// `(source, id)` pair's mapped canonical id — the id every source's
     /// spelling of the model shares. A pair the catalog does not name is its
     /// own canonical (the identity fallback).
@@ -845,9 +851,10 @@ fn window_contains(start: &str, end: &str, hour: u8) -> bool {
     (sh, sm) <= (hour, 0) && (hour, 0) < (eh, em)
 }
 
-/// Parse the `HH:MM` prefix of a `"HH:MM"` string (the legacy peak-window
-/// shape carried plain pairs; seconds were tolerated by the previous feed and
-/// still parse).
+/// Parse the `HH:MM` prefix of a `"HH:MM"` string. [`fmt_hhmm`] is the only
+/// producer a fetch reaches, and it emits exactly `HH:MM`; the trailing part
+/// is dropped rather than rejected so a [`Constraint`] deserialized from a
+/// cache written against an older feed (`"00:30:00Z"`) still selects.
 fn parse_hhmm(s: &str) -> Option<(u8, u8)> {
     let (hh, mm) = s.split_once(':')?;
     Some((hh.parse().ok()?, mm.get(..2)?.parse().ok()?))
@@ -954,12 +961,13 @@ fn run_fetch(tx: &Sender<PricingEvent>, cache_file: &Path, stale_cleaned: &mut b
     }
 }
 
-/// One-time best-effort removal of the pre-ai-pricelog cache files
+/// One-time best-effort removal of every superseded cache file
 /// (`price_cache.json` from the LiteLLM era, `genai_price_cache.json` from the
-/// genai-prices era), run after the first successful save of the new cache.
-/// The new table never reads the old files, so this is pure cleanup; errors
-/// (including NotFound, the expected steady state) are ignored on purpose. The
-/// flag is set BEFORE the deletes so a reappearing file is never re-deleted.
+/// genai-prices era, `ai_pricelog_price_cache.json` from the v3-feed era), run
+/// after the first successful save of the new cache. The new table never reads
+/// the old files, so this is pure cleanup; errors (including NotFound, the
+/// expected steady state) are ignored on purpose. The flag is set BEFORE the
+/// deletes so a reappearing file is never re-deleted.
 fn delete_stale_cache_once(cache_file: &Path, done: &mut bool) {
     if *done {
         return;
@@ -968,7 +976,11 @@ fn delete_stale_cache_once(cache_file: &Path, done: &mut bool) {
     let Some(dir) = cache_file.parent() else {
         return;
     };
-    for stale in ["price_cache.json", "genai_price_cache.json"] {
+    for stale in [
+        "price_cache.json",
+        "genai_price_cache.json",
+        "ai_pricelog_price_cache.json",
+    ] {
         let _ = std::fs::remove_file(dir.join(stale));
     }
 }
@@ -983,15 +995,31 @@ struct DistilledFeed {
     canonical: CanonicalMap,
 }
 
-/// Fetch and distill the live feed: the index (the current price set, folded
-/// into the snapshot log), the history ndjson (the dating source), and the
-/// model catalog (the alias chains + the canonical map). Any one failing
-/// fails the whole attempt, so the cache fallback serves a coherent table
-/// rather than a mix of halves.
+/// Fetch and distill the live feed over the network.
 fn fetch_table() -> anyhow::Result<DistilledFeed> {
-    let models = distill(&fetch_body(FEED_URL)?)?;
-    let store = distill_history(&fetch_body(HISTORY_URL)?)?;
-    let (aliases, canonical) = distill_models(&fetch_body(MODELS_URL)?)?;
+    fetch_table_with(fetch_body)
+}
+
+/// The feed composition, over any `fetch`: the catalog's three files (the
+/// provider and model registries, then the alias chains), then the index (the
+/// current price set, folded into the snapshot log) and the history ndjson
+/// (the dating source). Any one failing fails the whole attempt, so the cache
+/// fallback serves a coherent table rather than a mix of halves — the seam is
+/// what lets a test hold that rule against each of the five files in turn,
+/// which a hardcoded [`fetch_body`] gave no way to do.
+///
+/// The two registries distill FIRST because they build the [`FirstParty`]
+/// guard, and the index and the history must be filtered by the same one: a
+/// table mixing a filtered index with an unfiltered history would price an id
+/// off a reseller's row on the dates the index does not cover.
+fn fetch_table_with(
+    fetch: impl Fn(&str) -> anyhow::Result<String>,
+) -> anyhow::Result<DistilledFeed> {
+    let provider_vendors = distill_providers(&fetch(CATALOG_PROVIDERS_URL)?)?;
+    let (canonical, first_party) = distill_catalog(&fetch(CATALOG_MODELS_URL)?, &provider_vendors)?;
+    let aliases = distill_aliases(&fetch(CATALOG_ALIASES_URL)?)?;
+    let models = distill(&fetch(INDEX_URL)?, &first_party)?;
+    let store = distill_history(&fetch(HISTORY_URL)?, &first_party)?;
     Ok(DistilledFeed {
         models,
         store,
@@ -1028,32 +1056,144 @@ fn fetch_body(url: &str) -> anyhow::Result<String> {
     String::from_utf8(bytes).map_err(anyhow::Error::from)
 }
 
+// ── The resold guard ─────────────────────────────────────────────────────────
+
+/// Provider name → the vendor it MAKES models for. A provider publishing no
+/// vendor is absent from the map rather than mapped to a null, so "a provider
+/// with no vendor resells everything" is the map's own miss and no comparison
+/// can read two absent vendors as a match.
+type ProviderVendors = HashMap<String, String>;
+
+/// The `(source, model_id)` rows the catalog says a provider serves
+/// FIRST-PARTY: the model's `vendor` and the provider's are the same named
+/// vendor (ai-pricelog plan decision 29). Everything else is a resale — a
+/// provider with no vendor, a model the catalog gives no vendor, and a pair
+/// the catalog does not name at all, which has no maker to compare.
+///
+/// Both sides come from one fetch's two registries together, so the guard can
+/// never compare a model against a provider from a different fetch. A MIXED
+/// provider needs no special case: it keeps the rows it makes and drops the
+/// ones it resells.
+#[derive(Debug, Default)]
+struct FirstParty(HashMap<String, HashSet<String>>);
+
+impl FirstParty {
+    /// Whether `source`'s row for `model_id` is a resale — the guard both
+    /// distills apply per ROW.
+    fn resells(&self, source: &str, model_id: &str) -> bool {
+        !self.0.get(source).is_some_and(|ids| ids.contains(model_id))
+    }
+}
+
+/// The ids one catalog `sources` value names. v4 spells every value as a LIST
+/// of that source's spellings of the model; a bare string is read as a
+/// one-element list so a hand-written catalog still resolves. Exactly one arm
+/// yields — `as_str` misses an array and `as_array` misses a string — and any
+/// other shape yields nothing, skipping the pair.
+fn source_ids(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let single = value.as_str();
+    let list = value.as_array().into_iter().flatten();
+    single
+        .into_iter()
+        .chain(list.filter_map(serde_json::Value::as_str))
+}
+
+/// Distill the catalog's provider registry into [`ProviderVendors`]. An entry
+/// with no `vendor` string is left out — it resells everything. Fails when
+/// the `providers` object is missing or names no vendor at all: a registry
+/// where every provider resells would drop every row downstream, and failing
+/// here names the broken file instead.
+fn distill_providers(json: &str) -> anyhow::Result<ProviderVendors> {
+    let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
+    let providers = root
+        .get("providers")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("providers feed has no providers object"))?;
+    let vendors: ProviderVendors = providers
+        .iter()
+        .filter_map(|(source, entry)| {
+            let vendor = entry.get("vendor")?.as_str()?;
+            Some((source.clone(), vendor.to_owned()))
+        })
+        .collect();
+    if vendors.is_empty() {
+        anyhow::bail!("providers feed names no provider vendor");
+    }
+    Ok(vendors)
+}
+
+/// Distill the catalog's model registry against the provider registry into
+/// the canonical `(source, id)` → canonical-id map (the twin-ness basis of
+/// the store walk) plus the [`FirstParty`] guard. Tolerant like the other
+/// distills: an entry with no `sources` object skips, and a `sources` value
+/// of neither list nor string shape contributes nothing. Fails when the
+/// canonical map distills empty (the store's v4 catalog names 724 models over
+/// 1106 pairs) — an empty map would leave every cross-source twin raw AND
+/// resell every row, while looking like a healthy load.
+fn distill_catalog(
+    json: &str,
+    provider_vendors: &ProviderVendors,
+) -> anyhow::Result<(CanonicalMap, FirstParty)> {
+    let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
+    let models = root
+        .get("models")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("models feed has no models object"))?;
+    let mut canonical = CanonicalMap::new();
+    let mut first_party = FirstParty::default();
+    for (canonical_id, entry) in models {
+        let vendor = entry.get("vendor").and_then(serde_json::Value::as_str);
+        let Some(sources) = entry.get("sources").and_then(serde_json::Value::as_object) else {
+            continue; // malformed entry — skip, don't fail the feed
+        };
+        for (source, ids) in sources {
+            // The resold comparison. `vendor` is `None` for a model the
+            // catalog cannot name a maker for, and the lookup misses for a
+            // provider publishing none: neither can equal a named vendor, so
+            // both fall out as resales without a null ever comparing equal.
+            let first_party_here = provider_vendors
+                .get(source)
+                .is_some_and(|provider_vendor| vendor == Some(provider_vendor.as_str()));
+            for id in source_ids(ids) {
+                canonical
+                    .entry(source.clone())
+                    .or_default()
+                    .insert(id.to_owned(), canonical_id.clone());
+                if first_party_here {
+                    first_party
+                        .0
+                        .entry(source.clone())
+                        .or_default()
+                        .insert(id.to_owned());
+                }
+            }
+        }
+    }
+    if canonical.is_empty() {
+        anyhow::bail!("models feed distilled to zero canonical pairs");
+    }
+    Ok((canonical, first_party))
+}
+
 // ── Distill ──────────────────────────────────────────────────────────────────
 
 /// Parse the ai-pricelog index JSON into distilled [`PricedModel`]s.
-/// Tolerant at every level: malformed sources, rows, and window entries are
+/// Tolerant at every level: malformed sources, rows, and override entries are
 /// skipped; the fetch fails only when ZERO models survive (an empty table
-/// would price nothing and look like a healthy load). Only
-/// [`FIRST_PARTY_PROVIDERS`] are kept — resellers are dropped here, so no
-/// lookup path can land on a reseller's markup; resold model rows inside a
-/// kept provider (a claude id under a non-anthropic provider) are dropped for
-/// the same reason. An unknown `version` warns through [`logline!`] and parses
-/// best-effort. A kept-source row carrying a legacy-shape key (flat
-/// `max_tokens`, `peak_*`, `peak_windows`, `extra`) warns once per fetch and
-/// prices its typed keys alone — the legacy shapes no longer feed the index
-/// path (the history path keeps them).
+/// would price nothing and look like a healthy load). Resold rows are dropped
+/// per [`FirstParty`], so no lookup path can land on a reseller's markup. An
+/// unknown `version` warns through [`logline!`] and parses best-effort.
 ///
 /// A row carrying `removed_at` is delisted and skipped the same way — it
 /// prices nothing at any date. The index's removal convention keeps the row
 /// in place with its last prices and stamps it, so the skip is what makes a
-/// delisting effective in clauth (the dashscope resold deepseek/glm/kimi
-/// copies carry the stamp since 2026-08-31).
+/// delisting effective in clauth.
 ///
 /// Sources iterate in the file's own key order (serde_json's `preserve_order`
-/// feature) — deterministic, and carrying no precedence contract: a delisted
-/// copy under another source is skipped at distill, so a live first-party row
-/// is never shadowed and iteration order cannot pick a price.
-fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
+/// feature) — deterministic, and carrying no precedence contract: a resold or
+/// delisted copy under another source is skipped at distill, so a live
+/// first-party row is never shadowed and iteration order cannot pick a price.
+fn distill(json: &str, first_party: &FirstParty) -> anyhow::Result<Vec<PricedModel>> {
     let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
     let root = root
         .as_object()
@@ -1071,25 +1211,15 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
         .ok_or_else(|| anyhow::anyhow!("price feed has no sources object"))?;
 
     let mut models = Vec::new();
-    let mut warned_legacy = false;
     for (source_name, rows) in sources {
-        let canonical = canonical_source(source_name);
-        if !FIRST_PARTY_PROVIDERS.contains(&canonical) {
-            continue;
-        }
         let Some(rows) = rows.as_object() else {
             continue; // malformed source — skip, don't fail the feed
         };
         for (model_id, row) in rows {
-            // A legacy key on a kept-source row is a shape the typed parser
-            // no longer feeds; warn ONCE per fetch (a regressed feed would
-            // otherwise flood the log with one line per row) and price the
-            // typed keys alone.
-            if !warned_legacy && legacy_keys_present(row) {
-                warned_legacy = true;
-                logline!(
-                    "price feed: ai-pricelog index row {model_id} carries legacy keys (max_tokens / peak_* / peak_windows / extra): legacy keys ignored"
-                );
+            // The resold guard: the catalog decides per ROW whether this
+            // provider makes the model or resells another vendor's.
+            if first_party.resells(source_name, model_id) {
+                continue;
             }
             let Ok(row) = serde_json::from_value::<RawRow>(row.clone()) else {
                 continue; // malformed row — skip, don't fail the source
@@ -1097,17 +1227,6 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
             // A delisted row (`removed_at` stamped) is out of the index's
             // current price set and prices nothing.
             if row.removed_at.is_some() {
-                continue;
-            }
-            // A kept provider can still resell another vendor's models: a
-            // claude id under a non-anthropic provider is a resold listing and
-            // drops, case-insensitively on the id prefix. Anthropic's own rows
-            // are the only legitimate claude rows.
-            if canonical != "anthropic"
-                && model_id
-                    .get(..6)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude"))
-            {
                 continue;
             }
             if let Some(priced) = row.into_priced(model_id.clone()) {
@@ -1121,56 +1240,25 @@ fn distill(json: &str) -> anyhow::Result<Vec<PricedModel>> {
     Ok(models)
 }
 
-/// The index's source spelling → clauth's canonical provider name; the
-/// allowlist tests the canonical name. Only moonshot and xai differ today.
-fn canonical_source(source: &str) -> &str {
-    match source {
-        "moonshot" => "moonshotai",
-        "xai" => "x-ai",
-        other => other,
-    }
-}
-
-/// Whether an index row object carries a legacy-shape key — flat
-/// `max_tokens`, flat `peak_*`, `peak_windows`, or the `extra` modality
-/// object. The typed parser declares none of them, so the row distills from
-/// its typed keys alone; the warn is the only trace the keys were there.
-fn legacy_keys_present(row: &serde_json::Value) -> bool {
-    let Some(obj) = row.as_object() else {
-        return false;
-    };
-    obj.keys()
-        .any(|key| key == "max_tokens" || key == "extra" || key.starts_with("peak_"))
-}
-
 /// Distill the store's history ndjson into per-key dated rows ([`StoreKey`]).
 /// Line-tolerant like the index distill: a malformed line, or a line with no
-/// `observed_at`, skips. The same source rules apply — [`canonical_source`],
-/// the [`FIRST_PARTY_PROVIDERS`] allowlist, the resold-claude guard — so a
+/// `observed_at`, skips. The same [`FirstParty`] guard applies, so a
 /// reseller's rows for an id never enter the walk: they can neither price the
 /// id nor delist it (together's 2026-08-28 removal row for deepseek-v4-pro
-/// cannot terminate deepseek's own key). A `removed: true` row is kept as a
-/// terminator although it carries no distilled prices; a price row that
-/// distills to nothing is kept as an unpriced row — the index delists a key
-/// whose newest row has no per-token rates, and the walk agrees for that day.
-/// Fails when zero keys survive (nothing could ever resolve).
-fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
+/// cannot terminate deepseek's own key). A `removed: true` row — the
+/// history's delisting spelling, where the index stamps `removed_at` — is
+/// kept as a terminator although it carries no distilled prices; a price row
+/// that distills to nothing is kept as an unpriced row, since the index
+/// delists a key whose newest row has no per-token rates and the walk agrees
+/// for that day. Fails when zero keys survive (nothing could ever resolve).
+fn distill_history(ndjson: &str, first_party: &FirstParty) -> anyhow::Result<Vec<StoreKey>> {
     let mut index: HashMap<(String, String), usize> = HashMap::new();
     let mut keys: Vec<StoreKey> = Vec::new();
     for line in ndjson.lines() {
         let Ok(raw) = serde_json::from_str::<RawHistoryRow>(line) else {
             continue; // malformed line — skip, don't fail the feed
         };
-        let canonical = canonical_source(&raw.source).to_owned();
-        if !FIRST_PARTY_PROVIDERS.contains(&canonical.as_str()) {
-            continue;
-        }
-        if canonical != "anthropic"
-            && raw
-                .model_id
-                .get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude"))
-        {
+        if first_party.resells(&raw.source, &raw.model_id) {
             continue;
         }
         let removed = raw.removed == Some(true);
@@ -1179,19 +1267,23 @@ fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
             .effective_at
             .clone()
             .unwrap_or_else(|| raw.observed_at.clone());
-        let key = (canonical.clone(), raw.model_id.clone());
+        let key = (raw.source.clone(), raw.model_id.clone());
         let id = key.1.clone();
         let row = StoreRow {
             observed: raw.observed_at.clone(),
             applies,
             removed,
-            model: if removed { None } else { raw.into_priced() },
+            model: if removed {
+                None
+            } else {
+                raw.row.into_priced(raw.model_id)
+            },
         };
         let slot = match index.get(&key) {
             Some(&slot) => slot,
             None => {
                 keys.push(StoreKey {
-                    source: canonical.clone(),
+                    source: key.0.clone(),
                     id,
                     rows: Vec::new(),
                 });
@@ -1207,22 +1299,17 @@ fn distill_history(ndjson: &str) -> anyhow::Result<Vec<StoreKey>> {
     Ok(keys)
 }
 
-/// Distill the store's model catalog into its alias chains plus the canonical
-/// `(source, id)` map (the `models` half: canonical id → the id each source
-/// spells it as; the source names are canonicalized like the history's).
-/// Tolerant like the other distills: a record without a `canonical` skips, an
-/// alias whose records all skip drops, a non-array chain drops, and a model
-/// entry with no `sources` object (or no string source ids) skips. Fails when
-/// zero aliases survive or the canonical map distills empty (the store's v3
-/// catalog carries 44 aliases and 191 models) — an empty half would dash
-/// every alias id / leave cross-source twins raw while looking like a healthy
-/// load.
-fn distill_models(json: &str) -> anyhow::Result<(Vec<AliasKey>, CanonicalMap)> {
+/// Distill the catalog's api-alias chains. Tolerant like the other distills:
+/// a record without a `canonical` skips, an alias whose records all skip
+/// drops, a non-array chain drops. Fails when zero aliases survive (the
+/// store's v4 catalog carries 44) — an empty table would dash every alias id
+/// while looking like a healthy load.
+fn distill_aliases(json: &str) -> anyhow::Result<Vec<AliasKey>> {
     let root: serde_json::Value = serde_json::from_str(json).map_err(anyhow::Error::from)?;
     let aliases = root
         .get("aliases")
         .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("models feed has no aliases object"))?;
+        .ok_or_else(|| anyhow::anyhow!("aliases feed has no aliases object"))?;
     let mut keys = Vec::new();
     for (id, records) in aliases {
         let Some(records) = records.as_array() else {
@@ -1240,155 +1327,90 @@ fn distill_models(json: &str) -> anyhow::Result<(Vec<AliasKey>, CanonicalMap)> {
         }
     }
     if keys.is_empty() {
-        anyhow::bail!("models feed distilled to zero aliases");
+        anyhow::bail!("aliases feed distilled to zero aliases");
     }
-
-    let models = root
-        .get("models")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("models feed has no models object"))?;
-    let mut canonical = CanonicalMap::new();
-    for (canonical_id, entry) in models {
-        let Some(sources) = entry.get("sources").and_then(serde_json::Value::as_object) else {
-            continue; // malformed entry — skip, don't fail the feed
-        };
-        for (source, source_id) in sources {
-            let Some(source_id) = source_id.as_str() else {
-                continue; // malformed pair — skip
-            };
-            canonical
-                .entry(canonical_source(source).to_owned())
-                .or_default()
-                .insert(source_id.to_owned(), canonical_id.clone());
-        }
-    }
-    if canonical.is_empty() {
-        anyhow::bail!("models feed distilled to zero canonical pairs");
-    }
-    Ok((keys, canonical))
+    Ok(keys)
 }
 
-/// One index row. The four `_mtok` keys are USD per million tokens; missing
-/// keys are `None` (→ 0.0 per token). `cache_write_1h_mtok` is deliberately
-/// NOT declared (the hourly axis has no TTL data), and index-only extras
-/// (`first_seen`, `timezone`, `observed_at`, …) are ignored the same way.
-/// The legacy-shape keys (flat `max_tokens`, `peak_*`, `peak_windows`,
-/// `extra`) are deliberately NOT declared either: the index path no longer
-/// feeds them — [`distill`] warns on them once per fetch — while the history
-/// path declares its own copy on [`RawHistoryRow`] and keeps feeding them. A
-/// declared field of the wrong shape fails the whole row, which the caller
-/// then skips.
-#[derive(Deserialize)]
-struct RawRow {
+/// The rate axes clauth charges tokens to, in USD per million; a missing axis
+/// is `None` (→ 0.0 per token). Every other axis the store's `rates` object
+/// carries (`cache_write_1h`, `image`, `audio`, `internal_reasoning`, …) is
+/// deliberately NOT declared: clauth counts no such tokens, so there is no
+/// bucket to charge them to. `cache_write` is the 5-minute-TTL creation rate;
+/// the 1-hour axis has no TTL data to select it by.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+struct RawRates {
     #[serde(default)]
-    input_mtok: Option<f64>,
+    input: Option<f64>,
     #[serde(default)]
-    output_mtok: Option<f64>,
+    output: Option<f64>,
     #[serde(default)]
-    cache_read_mtok: Option<f64>,
+    cache_read: Option<f64>,
     #[serde(default)]
-    cache_write_mtok: Option<f64>,
-    /// Present = the row is delisted (the index's removal convention keeps
-    /// the row with its last prices and stamps it); the caller skips it, so
-    /// it prices nothing at any date.
-    #[serde(default)]
-    removed_at: Option<String>,
-    #[serde(default)]
-    effective_at: Option<String>,
-    #[serde(default)]
-    window_rates: Option<Vec<serde_json::Value>>,
+    cache_write: Option<f64>,
 }
 
-/// One history-ndjson line: the index row shape plus the line's own
-/// bookkeeping keys. `observed_at` is mandatory — a row with no date cannot
-/// date. The row half reuses [`RawRow`], and the legacy peak shape (flat
-/// `peak_*` keys, `peak_windows` STRING pairs) is declared HERE, not on the
-/// index row: history rows keep feeding it (the store's own 2026-08-26 rows
-/// carry it), while the index path ignores the same keys and warns.
-#[derive(Deserialize)]
-struct RawHistoryRow {
-    source: String,
-    model_id: String,
-    observed_at: String,
-    #[serde(default)]
-    removed: Option<bool>,
-    #[serde(default)]
-    peak_windows: Option<Vec<serde_json::Value>>,
-    #[serde(default)]
-    peak_input_mtok: Option<f64>,
-    #[serde(default)]
-    peak_output_mtok: Option<f64>,
-    #[serde(default)]
-    peak_cache_read_mtok: Option<f64>,
-    #[serde(default)]
-    peak_cache_write_mtok: Option<f64>,
-    #[serde(flatten)]
-    row: RawRow,
-}
-
-/// The four token rates one entry can carry. A window entry holds OVERRIDE
-/// rates only: a key it leaves absent inherits the row's base value at
-/// distill time.
-#[derive(Debug, Default, Clone, Copy)]
-struct RawRateSet {
-    input_mtok: Option<f64>,
-    output_mtok: Option<f64>,
-    cache_read_mtok: Option<f64>,
-    cache_write_mtok: Option<f64>,
-}
-
-impl RawRateSet {
-    /// Per-token entry; `base` fills the keys this set leaves absent. `None`
-    /// values price 0.0.
+impl RawRates {
+    /// Per-token entry; `base` fills the axes this set leaves absent — an
+    /// override carries only what it changes. `None` values price 0.0.
     fn entry(&self, base: &Self, constraint: Option<Constraint>) -> PriceEntry {
         PriceEntry {
-            input: to_per_token(self.input_mtok.or(base.input_mtok).unwrap_or(0.0)),
-            output: to_per_token(self.output_mtok.or(base.output_mtok).unwrap_or(0.0)),
-            cache_read: to_per_token(self.cache_read_mtok.or(base.cache_read_mtok).unwrap_or(0.0)),
-            cache_write: to_per_token(
-                self.cache_write_mtok
-                    .or(base.cache_write_mtok)
-                    .unwrap_or(0.0),
-            ),
+            input: to_per_token(self.input.or(base.input).unwrap_or(0.0)),
+            output: to_per_token(self.output.or(base.output).unwrap_or(0.0)),
+            cache_read: to_per_token(self.cache_read.or(base.cache_read).unwrap_or(0.0)),
+            cache_write: to_per_token(self.cache_write.or(base.cache_write).unwrap_or(0.0)),
             constraint,
         }
     }
 }
 
-/// One `window_rates` entry: an HHMM `[start, end]` window, an optional
-/// UTC-weekday `days` set (absent = every day), and override rate keys. The
-/// `quota_multiplier` key is deliberately NOT declared: it is a consumption
-/// weight, never a rate, and an entry with no rate keys of its own is skipped
-/// by the caller.
+/// When one `overrides` entry applies. `timezone` is deliberately NOT
+/// declared: ai-pricelog converts every schedule to UTC calendar days at
+/// build time, so the zone is provenance for a human and re-deriving `days`
+/// or `window` from it would shift an already-shifted schedule twice.
 #[derive(Deserialize)]
-struct RawWindowEntry {
-    #[serde(default)]
-    window: Option<[u32; 2]>,
+struct RawWhen {
     #[serde(default)]
     days: Option<Vec<String>>,
     #[serde(default)]
-    input_mtok: Option<f64>,
+    window: Option<[u32; 2]>,
+    /// A token-VOLUME threshold: the entry's rates apply to a request above
+    /// it. clauth prices per hour and has no volume dimension, so
+    /// [`RawOverride::to_entry`] drops such an entry rather than letting a
+    /// tier rate price every request.
     #[serde(default)]
-    output_mtok: Option<f64>,
-    #[serde(default)]
-    cache_read_mtok: Option<f64>,
-    #[serde(default)]
-    cache_write_mtok: Option<f64>,
+    min_tokens: Option<u64>,
 }
 
-impl RawWindowEntry {
-    /// `None` for an entry with no rate keys of its own (a quota-only entry)
-    /// or a malformed window — both are dropped, never widened into an
-    /// always-active entry.
-    fn to_entry(&self, base: &RawRateSet) -> Option<PriceEntry> {
-        if !self.any_rate() {
+/// One `overrides` entry: a `when` plus override `rates`, a
+/// `quota_multiplier`, or both. `quota_multiplier` is deliberately NOT
+/// declared — it is a consumption weight, never a rate — so an entry with no
+/// `rates` of its own carries nothing clauth can price.
+#[derive(Deserialize)]
+struct RawOverride {
+    #[serde(default)]
+    when: Option<RawWhen>,
+    #[serde(default)]
+    rates: Option<RawRates>,
+}
+
+impl RawOverride {
+    /// `None` for an entry clauth cannot express as a time-of-day rate: one
+    /// with no `rates` of its own (a quota-only entry), one whose `when`
+    /// names a `min_tokens` volume tier, or one whose window is malformed.
+    /// All three are dropped, never widened into an always-active entry that
+    /// would price every hour and every request size at that entry's rate.
+    fn to_entry(&self, base: &RawRates) -> Option<PriceEntry> {
+        let rates = self.rates.as_ref()?;
+        let when = self.when.as_ref();
+        if when.is_some_and(|when| when.min_tokens.is_some()) {
             return None;
         }
-        let window = match self.window {
+        let window = match when.and_then(|when| when.window) {
             None => None,
             Some([start, end]) => Some((fmt_hhmm(start)?, fmt_hhmm(end)?)),
         };
-        let constraint = match (window, self.days.as_deref()) {
+        let constraint = match (window, when.and_then(|when| when.days.as_deref())) {
             (Some((start, end)), Some(days)) => Some(Constraint::Days {
                 days: days.to_vec(),
                 start: Some(start),
@@ -1402,32 +1424,59 @@ impl RawWindowEntry {
             }),
             (None, None) => None,
         };
-        Some(self.rates().entry(base, constraint))
-    }
-
-    fn any_rate(&self) -> bool {
-        self.input_mtok.is_some()
-            || self.output_mtok.is_some()
-            || self.cache_read_mtok.is_some()
-            || self.cache_write_mtok.is_some()
-    }
-
-    fn rates(&self) -> RawRateSet {
-        RawRateSet {
-            input_mtok: self.input_mtok,
-            output_mtok: self.output_mtok,
-            cache_read_mtok: self.cache_read_mtok,
-            cache_write_mtok: self.cache_write_mtok,
-        }
+        Some(rates.entry(base, constraint))
     }
 }
 
-/// One row's entries: the flat base entry plus the row's window entries, in
+/// One index or history row: the base [`RawRates`], the override entries, and
+/// the two date stamps clauth reads. A v4 row's remaining keys (`schema`,
+/// `source`, `model_id`, `observed_at`, `first_seen`, `provenance`, `fees`,
+/// `limits`, `currency`) are not declared and are ignored — clauth models no
+/// context limit and no per-request fee. `currency` names what the SOURCE
+/// quoted, never what the row holds: ai-pricelog multiplies every rate and
+/// every override rate by the fx factor at build time and records it as
+/// `provenance.fx_rate`, so `rates` is USD whatever `currency` says. It
+/// resolves fail-closed — a quote currency with no rate raises rather than
+/// storing an unconverted number — so there is no non-USD row to guard
+/// against. A DECLARED field of the wrong shape fails the whole row, which
+/// the caller then skips.
+#[derive(Deserialize)]
+struct RawRow {
+    #[serde(default)]
+    rates: Option<RawRates>,
+    /// Held as raw values so a malformed entry skips only itself; a typed
+    /// `Vec<RawOverride>` would fail the whole row over one bad entry.
+    #[serde(default)]
+    overrides: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    effective_at: Option<String>,
+    /// Present = the row is delisted (the index's removal convention keeps
+    /// the row with its last prices and stamps it); the caller skips it, so
+    /// it prices nothing at any date. The history spells a delisting
+    /// `removed: true` instead.
+    #[serde(default)]
+    removed_at: Option<String>,
+}
+
+/// One history-ndjson line: the row shape plus the line's own bookkeeping
+/// keys. `observed_at` is mandatory — a row with no date cannot date.
+#[derive(Deserialize)]
+struct RawHistoryRow {
+    source: String,
+    model_id: String,
+    observed_at: String,
+    #[serde(default)]
+    removed: Option<bool>,
+    #[serde(flatten)]
+    row: RawRow,
+}
+
+/// One row's entries: the flat base entry plus the row's override entries, in
 /// order — later entries override earlier matching ones at selection time.
-fn row_entries(base: RawRateSet, window_rates: Option<Vec<serde_json::Value>>) -> Vec<PriceEntry> {
-    let mut prices = vec![base.entry(&RawRateSet::default(), None)];
-    for raw in window_rates.into_iter().flatten() {
-        let Ok(entry) = serde_json::from_value::<RawWindowEntry>(raw) else {
+fn row_entries(base: RawRates, overrides: Option<Vec<serde_json::Value>>) -> Vec<PriceEntry> {
+    let mut prices = vec![base.entry(&RawRates::default(), None)];
+    for raw in overrides.into_iter().flatten() {
+        let Ok(entry) = serde_json::from_value::<RawOverride>(raw) else {
             continue; // malformed entry — skip, don't fail the row
         };
         if let Some(entry) = entry.to_entry(&base) {
@@ -1456,47 +1505,12 @@ fn finish_priced(
 }
 
 impl RawRow {
-    /// Distill the typed half of a row: the flat base entry plus the window
-    /// entries. Legacy peak keys are not declared on the index row, so they
-    /// never feed here; [`distill`] warns when they show.
+    /// Distill a row into its priced model: the flat base entry plus the
+    /// override entries. One shape serves both feeds — the index and the
+    /// history spell a row identically past their own bookkeeping keys.
     fn into_priced(self, id: String) -> Option<PricedModel> {
-        let base = RawRateSet {
-            input_mtok: self.input_mtok,
-            output_mtok: self.output_mtok,
-            cache_read_mtok: self.cache_read_mtok,
-            cache_write_mtok: self.cache_write_mtok,
-        };
-        let prices = row_entries(base, self.window_rates);
+        let prices = row_entries(self.rates.unwrap_or_default(), self.overrides);
         finish_priced(id, prices, self.effective_at)
-    }
-}
-
-impl RawHistoryRow {
-    /// Distill the line's price half: the typed entries plus the legacy peak
-    /// entries (`peak_windows` ["HH:MM","HH:MM"] STRING pairs plus flat
-    /// `peak_*` keys; absent peak keys inherit the base, like window
-    /// entries). The index path never reaches this.
-    fn into_priced(self) -> Option<PricedModel> {
-        let base = RawRateSet {
-            input_mtok: self.row.input_mtok,
-            output_mtok: self.row.output_mtok,
-            cache_read_mtok: self.row.cache_read_mtok,
-            cache_write_mtok: self.row.cache_write_mtok,
-        };
-        let mut prices = row_entries(base, self.row.window_rates);
-        let peak = RawRateSet {
-            input_mtok: self.peak_input_mtok,
-            output_mtok: self.peak_output_mtok,
-            cache_read_mtok: self.peak_cache_read_mtok,
-            cache_write_mtok: self.peak_cache_write_mtok,
-        };
-        for raw in self.peak_windows.into_iter().flatten() {
-            let Ok([start, end]) = serde_json::from_value::<[String; 2]>(raw) else {
-                continue; // malformed pair — skip
-            };
-            prices.push(peak.entry(&base, Some(Constraint::TimeWindow { start, end })));
-        }
-        finish_priced(self.model_id, prices, self.row.effective_at)
     }
 }
 
@@ -1524,13 +1538,24 @@ struct CacheFile {
     history: Vec<RateSnapshot>,
 }
 
-/// `~/.clauth/ai_pricelog_price_cache.json`. Resolved ONCE at spawn time and
-/// passed into the worker so the detached thread never re-resolves
+/// `~/.clauth/ai_pricelog_v4_price_cache.json`. Resolved ONCE at spawn time
+/// and passed into the worker so the detached thread never re-resolves
 /// `home_dir()` later.
+///
+/// The name carries the feed generation on purpose. A v3-era cache parses into
+/// these types unchanged — they are clauth's own distilled shapes — but its
+/// `store` was filtered by the retired provider allowlist, so reading it would
+/// serve the very rows this build exists to drop (and dash the ones it adds)
+/// until the next fetch. [`first_delay`] does not force that fetch: it returns
+/// the interval MINUS the cache age, so a cache written an hour ago would
+/// delay the first v4 fetch by 23 more. Renaming makes the upgrade a cold
+/// cache, which `first_delay` ticks immediately, and
+/// [`delete_stale_cache_once`] sweeps the old file the way the two
+/// pre-ai-pricelog names were swept.
 fn cache_path() -> Option<PathBuf> {
     clauth_dir()
         .ok()
-        .map(|d| d.join("ai_pricelog_price_cache.json"))
+        .map(|d| d.join("ai_pricelog_v4_price_cache.json"))
 }
 
 /// Synchronous one-shot read of the on-disk price cache, off the background
