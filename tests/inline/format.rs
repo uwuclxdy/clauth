@@ -95,47 +95,44 @@ fn the_retry_hint_follows_the_kind_not_the_call_site() {
 }
 
 /// The pairing rule is structural, not a convention: a `Cause` whose copy
-/// names the operator's next step refuses every retry that appends advice —
-/// `Wait`, `Connection`, `Restart` — at construction. The appended hint would
-/// duplicate the cause's advice (`RotationLockHeld`) or contradict it (a
-/// permissions check followed by `check your connection and retry`). An
-/// `ends_with` guard cannot reach this — the cause text ends in a comma and
-/// the suffix begins with a colon — so the refusal has to sit in the
-/// constructor itself. `Stated` appends nothing and pairs with every arm.
+/// names the operator's next step refuses every retry that appends advice
+/// (`Wait`, `Connection`, `Restart`) at construction. The appended hint either
+/// duplicates the cause's advice, since `RotationLockHeld` already ends with
+/// the exact literal `Wait` appends, or contradicts it, as a permissions check
+/// followed by `check your connection and retry` does. A text guard cannot
+/// reach the class: duplication is the only half a string match can see, and
+/// every other self-prescribing arm contradicts the suffix without containing
+/// it, so the refusal has to read the cause rather than its tail. `Stated`
+/// appends nothing and pairs with every arm.
+///
+/// Both constructors run the full retry set. They delegate to one helper today,
+/// which is an implementation detail rather than a pinned invariant: a split
+/// that leaves `with_status` unguarded would otherwise ship with a green suite.
 #[test]
 fn self_prescribing_arm_refuses_every_suffixed_retry_at_construction() {
-    for retry in [Retry::Wait, Retry::Connection, Retry::Restart] {
-        let retry_name = format!("{retry:?}");
-        let caught = std::panic::catch_unwind(|| {
-            Transient::new(Cause::RotationLockHeld("work".to_string()), retry);
-        });
-        let msg = caught.expect_err(
-            "a self-prescribing arm paired with a suffix-bearing retry must refuse at \
-             construction",
-        );
-        let msg = msg
-            .downcast_ref::<String>()
-            .expect("refusal message as String");
-        assert!(
-            msg.contains("RotationLockHeld") && msg.contains(&retry_name),
-            "the refusal must name the arm and the retry, got: {msg}"
-        );
+    fn refuses_every_suffixed_retry(ctor: &str, build: fn(Cause, Retry)) {
+        for retry in [Retry::Wait, Retry::Connection, Retry::Restart] {
+            let retry_name = format!("{retry:?}");
+            let caught = std::panic::catch_unwind(|| {
+                build(Cause::RotationLockHeld("work".to_string()), retry);
+            });
+            let msg = caught.unwrap_err();
+            let msg = msg
+                .downcast_ref::<String>()
+                .expect("refusal message as String");
+            assert!(
+                msg.contains("RotationLockHeld") && msg.contains(&retry_name),
+                "{ctor} must name the arm and the retry, got: {msg}"
+            );
+        }
     }
 
-    // `with_status` is the same construction with a status in the middle, and
-    // the same pairing rule: the stutter still ships on the status-bearing
-    // form.
-    let caught = std::panic::catch_unwind(|| {
-        Transient::with_status(
-            Cause::SidecarMisfilled("work".to_string()),
-            400,
-            Retry::Wait,
-        );
+    refuses_every_suffixed_retry("new", |cause, retry| {
+        Transient::new(cause, retry);
     });
-    assert!(
-        caught.is_err(),
-        "the status-bearing constructor must refuse the pairing too"
-    );
+    refuses_every_suffixed_retry("with_status", |cause, retry| {
+        Transient::with_status(cause, 400, retry);
+    });
 }
 
 /// The CLI/daemon surfaces name the HTTP status; the toast and MCP forms do not.
