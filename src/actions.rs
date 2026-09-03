@@ -995,18 +995,42 @@ pub(crate) fn identify_live_login_owner(config: &AppConfig) -> Option<ProfileNam
     })
 }
 
-/// Returns a profile whose `refresh_token` matches `live`. Matches on refresh
-/// token only (stable identity); access tokens rotate and would produce false
+/// Returns the profile `live` belongs to, over the two shapes a stored login
+/// takes.
+///
+/// A rotating pair is matched on its `refresh_token`, the only stable identity
+/// it has: its access token rotates, and matching that would produce false
 /// misses and duplicate profiles.
+///
+/// A `claude setup-token` mint carries NO refresh token, so the first tier
+/// cannot see one at all and every mint read as an unknown credential. Its
+/// access token IS its stable identity — a mint never rotates, which is the
+/// whole reason the split installs it — so the second tier matches that against
+/// each profile's stored sidecar. Only a [`SidecarKind::Mint`] qualifies: a
+/// rolling bearer is re-stamped hourly and a mis-fill is a copy of a pair the
+/// first tier already answers.
 pub(crate) fn find_matching_oauth_profile(
     config: &AppConfig,
     live: Option<&ClaudeCredentials>,
 ) -> Option<ProfileName> {
-    let live_refresh = live?.refresh_token().filter(|t| !t.is_empty())?;
+    let live = live?;
+    if let Some(live_refresh) = live.refresh_token().filter(|t| !t.is_empty()) {
+        return config
+            .profiles
+            .iter()
+            .find(|p| p.refresh_token() == Some(live_refresh))
+            .map(|p| p.name.clone());
+    }
+    let live_access = live.access_token().filter(|t| !t.is_empty())?;
     config
         .profiles
         .iter()
-        .find(|p| p.refresh_token() == Some(live_refresh))
+        .find(|p| match crate::claude::sidecar_summary(&p.name) {
+            Some((crate::claude::SidecarKind::Mint, oauth)) => {
+                oauth.access_token.as_str() == live_access
+            }
+            _ => false,
+        })
         .map(|p| p.name.clone())
 }
 

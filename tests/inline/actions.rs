@@ -4213,6 +4213,55 @@ mod identify_live_login_owner {
             "an unparseable file caught mid-write by CC must be left untouched",
         );
     }
+
+    /// A mint with no refresh token: only its stored sidecar can name the owner.
+    fn mint(access: &str) -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        }
+    }
+
+    /// `find_matching_oauth_profile`'s refresh tier is blind to a mint, which
+    /// carries no refresh token, so a live mint read as an unknown credential
+    /// and capturing it duplicated the account it already belongs to. The
+    /// sidecar tier answers it, and only for a genuine mint.
+    #[test]
+    fn a_live_mint_resolves_through_its_stored_sidecar() {
+        let _home = HomeSandbox::new();
+        let cfg = config_with(vec![("pair", creds("at-pair", "rt-pair"))]);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("pair"))
+            .expect("profile dir");
+        std::fs::create_dir_all(&dir).expect("mkdir profile");
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&mint("at-mint")).expect("serialize the mint"),
+        )
+        .expect("write the sidecar");
+
+        assert_eq!(
+            crate::actions::find_matching_oauth_profile(&cfg, Some(&mint("at-mint")))
+                .map(|n| n.as_str().to_string()),
+            Some("pair".to_string()),
+            "the stored sidecar names the account a live mint belongs to",
+        );
+        assert_eq!(
+            crate::actions::find_matching_oauth_profile(&cfg, Some(&mint("at-stranger"))),
+            None,
+            "a mint nobody stored still belongs to nobody",
+        );
+        assert_eq!(
+            crate::actions::find_matching_oauth_profile(&cfg, Some(&creds("at-pair", "rt-pair")))
+                .map(|n| n.as_str().to_string()),
+            Some("pair".to_string()),
+            "the refresh tier is unchanged",
+        );
+    }
 }
 
 // ── a console login never touches the profile's api key ──────────────────────
