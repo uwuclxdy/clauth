@@ -4006,3 +4006,30 @@ fn a_failed_credential_publish_keeps_the_destination_and_strands_nothing() {
         "the staging file is cleaned up on the failure arm"
     );
 }
+
+/// A read-only destination refuses the rename with os error 5, where the
+/// unlink this publish replaced cleared the attribute on its way past. Windows
+/// only: on unix a rename answers to the DIRECTORY's permissions, so the
+/// attribute on the destination changes nothing and there is no failure to
+/// clear. Plain tempdir rather than `HomeSandbox`, because home resolution on
+/// Windows ignores the env vars that sandbox pins.
+#[cfg(windows)]
+#[test]
+fn a_publish_clears_a_read_only_destination() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let target = tmp.path().join("store.json");
+    let link = tmp.path().join(".credentials.json");
+    fs::write(&target, b"{}").expect("write the incoming store");
+    fs::write(&link, b"old").expect("write the live path");
+    let mut perms = fs::metadata(&link).expect("live metadata").permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&link, perms).expect("mark the live path read-only");
+
+    publish_credential_link(&link, &target).expect("the publish clears the attribute and lands");
+
+    assert_eq!(
+        fs::read(&link).expect("read the live path"),
+        b"{}",
+        "the live path resolves to the incoming store"
+    );
+}
