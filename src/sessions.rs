@@ -887,7 +887,7 @@ fn touched_since(path: &Path, since: SystemTime) -> bool {
 /// Record which sessions a `clauth start` run owned into the global store.
 ///
 /// `projects_dir` is where the run's transcripts landed: an isolated runtime's
-/// exclusive `runtime-isolated/projects/` (`isolated = true` — every file maps to
+/// own `runtime-isolated-<sid>/projects/` (`isolated = true` — every file maps to
 /// `profile`), or the shared global `~/.claude/projects/` (`isolated = false` —
 /// only files touched at or after `run_start` are attributed, catching new and
 /// resumed-during-this-run sessions without claiming another profile's untouched

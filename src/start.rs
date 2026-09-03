@@ -43,14 +43,13 @@ struct ChildOutcome {
 /// sidecar leg would otherwise pull `shell-snapshots/` out from under a live
 /// Claude Code mid-session. Self holds its own marker, hence `> 1`.
 ///
-/// Under real symlinks each session owns its tree and marker dir, so the count is
-/// this session alone and the guard never fires. It DOES fire on a fake-symlink
-/// host, where the profile's isolated sessions share one tree: the first out
-/// rescues nothing and the last out rescues everything, since the shared tree
-/// holds every session's transcripts. The consequence is that the rescue becomes
-/// all-or-nothing on the last session's clean exit — SIGKILL the last one and GC
-/// discards the tree with every session's transcripts in it. Not separable while
-/// the tree is shared: the sidecar trees carry no per-session attribution.
+/// Under real symlinks each session owns its tree and marker dir, and under
+/// fake symlinks an isolated session owns them too, so the count is this
+/// session alone and the `> 1` arm never fires in normal operation. Both arms
+/// still earn their place. `None` means the marker dir could not be read;
+/// deleting the guard would delete that refusal with no replacement.
+/// `Some(n > 1)` is defence in depth against a same-sid collision and against a
+/// legacy shared dir.
 pub(crate) fn rescue_teardown(
     iso_root: &Path,
     sessions: &Path,

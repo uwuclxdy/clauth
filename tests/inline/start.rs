@@ -184,11 +184,12 @@ fn live_marker(path: &std::path::Path) -> fs::File {
     file
 }
 
-/// The refcount gate: the isolated runtime tree is SHARED by every session of
-/// that profile+flavor (overlapping `delegate`s hold several), and only the last
-/// one out sees it discarded. An exit while a sibling is still live must move
-/// nothing — rescuing `shell-snapshots/` out from under a running Claude Code
-/// would break its Bash tool mid-session.
+/// The guard's `> 1` arm as defence in depth: a same-sid collision or a legacy
+/// shared dir leaves a sibling's live marker in the sessions dir, and an exit
+/// while a sibling is still live must move nothing. Rescuing `shell-snapshots/`
+/// out from under a running Claude Code would break its Bash tool mid-session.
+/// A normal isolated session owns its dir, so the `None` arm is the other path
+/// to the refusal: it fires when the marker dir could not be read.
 #[test]
 fn rescue_moves_nothing_while_a_sibling_session_is_live() {
     let sb = HomeSandbox::new();

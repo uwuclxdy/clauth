@@ -1,13 +1,14 @@
 //! Per-session `CLAUDE_CONFIG_DIR` trees used by `clauth start`.
 //!
-//! Under real symlinks every `clauth start <profile>` session gets its OWN
-//! runtime tree, keyed by a session id (`<pid>-<seq>`):
+//! Every `clauth start <profile>` session gets its OWN runtime tree, keyed by a
+//! session id (`<pid>-<seq>`):
 //! `~/.clauth/profiles/<profile>/runtime-<sid>/`, or `runtime-isolated-<sid>/`
-//! for an isolated run. Without them the tree is shared per profile+flavor
-//! instead — see the keying rule below. Its `.credentials.json` still
-//! resolves to the profile's canonical creds, so concurrent sessions of one
-//! profile observe a single chain of refresh tokens. A watchdog thread in each
-//! parent process keeps the runtime tree and canonical state in sync.
+//! for an isolated run. The one exception is a SHARED session under
+//! [`LinkMode::Fake`], which shares the bare-stem tree per profile (see the
+//! keying rule below). Its `.credentials.json` still resolves to the profile's
+//! canonical creds, so concurrent sessions of one profile observe a single
+//! chain of refresh tokens. A watchdog thread in each parent process keeps the
+//! runtime tree and canonical state in sync.
 //!
 //! The layout rests on ONE rule, which every enumeration below applies instead
 //! of a hardcoded name list: a runtime dir named `runtime<rest>` pairs with the
@@ -15,11 +16,14 @@
 //! pre-per-session `runtime`/`sessions` pair an earlier release left on disk, so
 //! liveness and GC reach a legacy tree with no migration step.
 //!
-//! Per-session keying is for REAL symlinks only. Under [`LinkMode::Fake`] the
-//! tree is a recursive copy, so both flavors fall back to the bare stem
-//! ([`paired_dir_names`]) and every session of that profile+flavor shares one
-//! tree. The accepted consequence is that Windows without symlink privilege
-//! cannot host independent per-session credentials.
+//! Per-session keying follows the transport and the flavor. Under
+//! [`LinkMode::Real`] every session gets its own `-<sid>` pair. Under
+//! [`LinkMode::Fake`] an ISOLATED session gets one too, because its tree links
+//! nothing from `~/.claude/`. A SHARED session under [`LinkMode::Fake`] still
+//! falls back to the bare stem ([`paired_dir_names`]): its tree is a recursive
+//! copy, so every session of that profile shares one tree. The accepted
+//! consequence is that a fake-symlink host cannot give its SHARED sessions
+//! independent credentials.
 //!
 //! Two transport modes, probed per profile at acquire time BEFORE the tree name
 //! is chosen, since the mode decides that name:
@@ -30,11 +34,12 @@
 //!   The watchdog only repairs the `.credentials.json` link when Claude
 //!   Code's `unlink + write` re-login replaces it with a regular file.
 //!
-//! - **Fake symlinks** (Windows without symlink privilege): the runtime
-//!   tree is built by recursive copy, and `.credentials.json` is a regular
-//!   file. The watchdog walks both sides every tick and reconciles by
-//!   "latest mtime wins" so a re-login on either side propagates to the
-//!   other before another session can pick up a stale refresh token.
+//! - **Fake symlinks** (symlink creation denied, or the filesystem does not
+//!   support it, so `~/.clauth` on exFAT, FAT32 or SMB lands here on unix
+//!   too): the runtime tree is built by recursive copy, and `.credentials.json`
+//!   is a regular file. The watchdog walks both sides every tick and
+//!   reconciles by "latest mtime wins" so a re-login on either side propagates
+//!   to the other before another session can pick up a stale refresh token.
 //!
 //! Liveness lives in the paired sessions directory: the session creates the
 //! marker `<sessions dir>/<sid>` and holds an exclusive `flock(2)` on it for
@@ -45,10 +50,11 @@
 //! only on macOS ([`rotation_blocked_for`]): elsewhere the session reads the
 //! very credential file a rotation writes and simply follows it, while on macOS
 //! its Claude Code reads a Keychain item namespaced per `CLAUDE_CONFIG_DIR` that
-//! clauth cannot write. Teardown drops the marker and discards the tree —
-//! its own under real symlinks, the shared one under [`LinkMode::Fake`] and only
-//! once the last session of the profile has left; [`gc_stale_runtimes`] collects
-//! what a crashed session left behind, of either flavor and in either layout.
+//! clauth cannot write. Teardown drops the marker and discards the tree. That
+//! tree is the session's own except for a SHARED session under
+//! [`LinkMode::Fake`], which is discarded only once the last session of the
+//! profile has left; [`gc_stale_runtimes`] collects what a crashed session left
+//! behind, of either flavor and in either layout.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
@@ -69,11 +75,11 @@ use crate::profile::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkMode {
-    /// OS-level symlinks. Used on Unix unconditionally and on Windows when
-    /// the process can create symlinks (developer mode or admin).
+    /// OS-level symlinks. Used on Unix normally and on Windows when the
+    /// process can create symlinks (developer mode or admin).
     Real,
-    /// Bidirectional mtime-based mirror. Used on Windows when the OS denies
-    /// symlink creation.
+    /// Bidirectional mtime-based mirror. Used when symlink creation fails:
+    /// privilege denial or an unsupported filesystem, on any OS.
     Fake,
 }
 
@@ -138,10 +144,11 @@ pub(crate) fn link_mode_of(config_dir: Option<&Path>) -> LinkProbe {
 }
 
 /// Whether a session inherits the operator's full `~/.claude/` (memory,
-/// plugins, hooks, commands, agents) or runs authenticated-but-clean. Both
-/// flavors are keyed identically (see [`paired_dir_names`]); the flavor decides
-/// only what is materialized into the tree, since every session shares the
-/// profile's canonical credentials and rotation lock either way.
+/// plugins, hooks, commands, agents) or runs authenticated-but-clean. The flavor
+/// decides what is materialized into the tree and, under [`LinkMode::Fake`],
+/// whether the pair is keyed per session (see [`paired_dir_names`]); every
+/// session shares the profile's canonical credentials and rotation lock either
+/// way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Isolation {
     /// Full mirror of `~/.claude/`: the session behaves like the operator's.
@@ -292,22 +299,26 @@ fn paired_runtime_name(sessions_name: &str) -> Option<String> {
 /// transport. Returned as a pair so the module's `runtime<rest>` ↔
 /// `sessions<rest>` rule is structural rather than two call sites agreeing.
 ///
-/// [`LinkMode::Real`] keys each session's pair by its own `<sid>`, so sessions
-/// are independent. [`LinkMode::Fake`] returns the BARE stem, shared by every
-/// session of the profile+flavor: that tree is built by recursive COPY of
-/// `~/.claude/`, so per-session keying charges sessions 2..N a full copy each,
-/// multiple GB apiece on a real install. Disk is the whole reason — the fake-mode
+/// [`LinkMode::Real`] keys every session's pair by its own `<sid>`, so sessions
+/// are independent. [`LinkMode::Fake`] keys an ISOLATED session the same way:
+/// [`build_runtime_dir_with_active_env`] links nothing from `~/.claude/` for it,
+/// so the per-session cost is a settings file, a credentials file, and a
+/// whole-file copy of `~/.claude.json` (whose size is the operator's), not a
+/// tree copy. A SHARED session still lands on the bare stem:
+/// that tree is built by recursive COPY of `~/.claude/`, so per-session keying
+/// would charge sessions 2..N a full copy each, multiple GB apiece on a real
+/// install. Disk is the whole reason for the shared fallback; the fake-mode
 /// watchdog walk is NOT: `acquire` spawns one per `ProfileRuntime` either way, so
 /// N sessions perform N walks per second under both keyings, and sharing only
 /// converges them on one destination tree. The accepted cost is that a
-/// fake-symlink host cannot give its sessions independent credentials.
+/// fake-symlink host cannot give its SHARED sessions independent credentials.
 ///
-/// `session` is a [`SessionId`]'s string — digits and one `-`, which is what
+/// `session` is a [`SessionId`]'s string: digits and one `-`, which is what
 /// keeps a per-session name from spelling the `isolated` flavor stem.
 fn paired_dir_names(isolation: Isolation, session: &str, mode: LinkMode) -> (String, String) {
-    let suffix = match mode {
-        LinkMode::Real => format!("-{session}"),
-        LinkMode::Fake => String::new(),
+    let suffix = match (isolation, mode) {
+        (_, LinkMode::Real) | (Isolation::Isolated, LinkMode::Fake) => format!("-{session}"),
+        (Isolation::Shared, LinkMode::Fake) => String::new(),
     };
     (
         format!("{}{suffix}", isolation.runtime_stem()),
@@ -419,8 +430,10 @@ fn stamp_legacy_marker(path: &Path) -> Option<File> {
 /// silently stale if it spelled the path itself.
 ///
 /// A row carries the profile, the flavor, and the session id but NOT the
-/// transport, and the two layouts put the marker in different dirs. So both are
-/// derived from [`paired_dir_names`] and a caller treats the row as live if
+/// transport. The two layouts put the marker in different dirs for a SHARED
+/// session; an isolated session is keyed per session in both modes, so both
+/// arms collapse to one path. Both are derived from [`paired_dir_names`] and a
+/// caller treats the row as live if
 /// EITHER is held — the fail-safe direction, matching [`session_marker_dirs`]'s
 /// deliberately loose filter: a row reaped under a live session is a live
 /// session nothing can be pointed at again, while probing an absent path costs
@@ -943,11 +956,10 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
 }
 
 /// Every live isolated SESSION, paired with the `runtime-isolated…/projects/`
-/// dir backing it — so under real symlinks a profile running two isolated
-/// sessions appears twice, once per store. A consumer keying by profile name must
-/// expect that. Under [`LinkMode::Fake`] both sessions share one store, so the
-/// profile appears once; a consumer must not read the row count as a session
-/// count either way.
+/// dir backing it. Each session gets its own store under both link modes, so a
+/// profile running two isolated sessions appears twice, once per store. A
+/// consumer keying by profile name must expect that, and must not read the row
+/// count as a session count.
 ///
 /// An isolated runtime's transcripts live
 /// ONLY in this throwaway tree (never symlinked to the global store) and are
@@ -1370,9 +1382,9 @@ pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
 /// the live-Claude-Code probe exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwapUnsupported {
-    /// [`LinkMode::Fake`] shares ONE runtime tree across every session of the
-    /// profile+flavor, so repointing its credential file would move every session
-    /// of that profile at once.
+    /// [`LinkMode::Fake`] shares ONE runtime tree across every SHARED session of
+    /// the profile, so repointing its credential file would move every such
+    /// session at once.
     SharedRuntimeTree,
     /// macOS resolves credentials Keychain-FIRST and deletes the plaintext file
     /// once it has migrated them, so a swapped-in file is inert until the
@@ -2387,8 +2399,10 @@ impl ProfileRuntime {
                  read and the tree it feeds"
             );
             let fresh = crate::profile::load_profile(name)?;
-            // The transport is probed FIRST: under `LinkMode::Fake` the tree is
-            // shared under the bare stem, so the mode decides every path below.
+            // The transport is probed FIRST: it picks link vs copy for the build
+            // and, for a SHARED session, whether the tree is the bare stem under
+            // `LinkMode::Fake` or keyed per session. The mode must be known
+            // before every path below.
             // The profile dir is the probe site because it exists independently
             // of the tree — created here rather than assumed, so nothing rests on
             // `RotationGuard::acquire` having made it.
@@ -2398,10 +2412,11 @@ impl ProfileRuntime {
             // A sid is a NAME, not a claim. `<pid>-<seq>` collides only when a
             // second LIVE process minted the same pair, which needs the shapes
             // `stamp_legacy_marker` names: a `~/.clauth` shared across pid
-            // namespaces, or an NFS home. Under `LinkMode::Fake` that collision
-            // lands on this session's OWN marker, because the bare-stem tree puts
-            // it at the compat path, so there is no separate marker to fall back
-            // to and no `try_lock` concede on the way in. Re-mint rather than
+            // namespaces, or an NFS home. Under a shared bare-stem tree
+            // (`LinkMode::Fake`, SHARED) that collision lands on this session's
+            // OWN marker, because the bare-stem tree puts it at the compat path,
+            // so there is no separate marker to fall back to and no `try_lock`
+            // concede on the way in. Re-mint rather than
             // wait: the claim below runs inside the state flock, so a blocking
             // wait there wedges every other clauth process on this home, and
             // `is_session_alive` reads every unknown as live, so an unreadable
@@ -2437,8 +2452,8 @@ impl ProfileRuntime {
             // since vanished from ~/.claude/ don't carry over. A live sibling
             // holds a marker here, so its tree is never the one wiped.
             //
-            // The converse does NOT hold, and two concurrent starts on one
-            // Windows host can land on different modes. A live REAL
+            // The converse does NOT hold: two concurrent starts can land on
+            // different modes. A live REAL
             // session's compat marker sits in this same shared dir, so it makes
             // `active` nonzero for a Fake acquire and suppresses the wipe of a
             // bare `runtime/` that session does not use. A stale pre-upgrade tree
@@ -2452,11 +2467,6 @@ impl ProfileRuntime {
             }
             crate::profile::mkdir_700(runtime)
                 .with_context(|| format!("failed to create {}", runtime.display()))?;
-            // Closes the gap the wipe comment names: a live REAL session's
-            // compat marker holds `active` nonzero while this bare tree has no
-            // holder, so its pre-upgrade `~/.claude/` links survive an additive
-            // build.
-            prune_isolated_claude_links(name, sessions, runtime, &claude_home, isolation, mode);
             build_runtime_dir_with_active_env(
                 runtime,
                 &claude_home,
@@ -2689,15 +2699,16 @@ impl ProfileRuntime {
         &self.swap
     }
 
-    /// This session's liveness-marker dir. Holds only its own marker under real
-    /// symlinks; under [`LinkMode::Fake`] it is shared with every other session
-    /// of this profile+flavor, so the dir can hold several.
+    /// This session's liveness-marker dir. Holds only its own marker under
+    /// [`LinkMode::Real`] and for an isolated session under [`LinkMode::Fake`];
+    /// a shared session under [`LinkMode::Fake`] still shares it with every
+    /// other session of that profile+flavor, so the dir can hold several.
     ///
-    /// Its live count gates anything that MOVES state out of `config_dir` — the
+    /// Its live count gates anything that MOVES state out of `config_dir`: the
     /// count, not the keying, is what proves no Claude Code is reading the tree
-    /// being emptied. Under the shared tree that gate genuinely fires: a caller
-    /// that moves state out (`start::rescue_teardown`) does nothing until the
-    /// LAST session of the profile leaves.
+    /// being emptied. The only such caller, `start::rescue_teardown`, runs for
+    /// isolated sessions alone, and an isolated session owns this dir under
+    /// both link modes, so the count is this session alone in normal operation.
     pub(crate) fn sessions_dir(&self) -> &Path {
         &self.sessions
     }
@@ -3227,144 +3238,6 @@ fn unlink_link(path: &Path, label: &str) {
             path.display()
         );
     }
-}
-
-/// Whether any live session holds `runtime`. `sessions` is the marker dir the
-/// acquiring session probes; the answer derives from the live marker NAMES, not
-/// from their count. `true` on every unknown — pruning is destructive, so an
-/// undecidable read holds it back.
-fn live_session_holds_runtime(
-    name: &ProfileName,
-    sessions: &Path,
-    runtime: &Path,
-    isolation: Isolation,
-    mode: LinkMode,
-) -> bool {
-    let Some(names) = live_marker_names(sessions) else {
-        return true;
-    };
-    // The bare marker dir (Fake transport) is the ambiguous one: a live marker
-    // there is either a Fake session's own (holds the bare tree) or a Real
-    // session's upgrade-compat marker (holds the per-session tree). Both share
-    // one path, so tell them apart by the Real session's own per-session marker.
-    let bare = mode == LinkMode::Fake;
-    names.iter().any(|marker| {
-        let Some(sid) = marker.to_str() else {
-            return true;
-        };
-        let (real_runtime, real_sessions) = paired_dir_names(isolation, sid, LinkMode::Real);
-        if profile_subpath(name, &real_runtime).is_ok_and(|dir| dir == runtime) {
-            return true;
-        }
-        if bare {
-            // A compat marker maps to the per-session tree only while its own
-            // per-session marker is DEFINITELY held; otherwise the bare-dir
-            // marker is a Fake session's own and holds the bare tree. Reading an
-            // unheld or unreadable own marker as compat would prune a tree the
-            // Fake session still holds, so the probe must be definite.
-            let own = profile_subpath(name, &real_sessions).map(|dir| dir.join(sid));
-            let compat = own.as_deref().is_ok_and(marker_definitely_held);
-            let (fake_runtime, _) = paired_dir_names(isolation, sid, LinkMode::Fake);
-            if !compat && profile_subpath(name, &fake_runtime).is_ok_and(|dir| dir == runtime) {
-                return true;
-            }
-        }
-        false
-    })
-}
-
-/// True only when `path`'s flock is held by a live holder, this process's own
-/// fds included: a fresh `open` + `try_lock` fails against any fd that already
-/// holds the exclusive flock, same process or not. An open or `try_lock` error
-/// other than that contention is NOT "held" — unlike [`is_session_alive`], which
-/// reads every unknown as alive, a caller deciding whether to prune a shared
-/// tree must read an unknown as "not this holder's own marker".
-fn marker_definitely_held(path: &Path) -> bool {
-    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
-        return false;
-    };
-    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
-}
-
-/// Remove every top-level symlink in `runtime` whose target resolves inside
-/// `claude_home`. The current isolated build links nothing from `~/.claude/`, so
-/// any such link is a pre-upgrade artifact an older binary left; unlinking it
-/// restores exactly the invariant the isolated build enforces. The LINK is
-/// unlinked, never traversed, and a target that cannot be canonicalized is not
-/// a match.
-fn prune_claude_links(runtime: &Path, claude_home: &Path) {
-    let claude_canon = match claude_home.canonicalize() {
-        Ok(canon) => canon,
-        Err(e) => {
-            logline!(
-                "clauth: claude-link prune skipped; cannot canonicalize {}: {e}",
-                claude_home.display()
-            );
-            return;
-        }
-    };
-    let entries = match std::fs::read_dir(runtime) {
-        Ok(entries) => entries,
-        Err(e) => {
-            logline!(
-                "clauth: claude-link prune skipped; cannot read {}: {e}",
-                runtime.display()
-            );
-            return;
-        }
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                logline!(
-                    "clauth: claude-link prune could not read an entry in {}: {e}",
-                    runtime.display()
-                );
-                continue;
-            }
-        };
-        let path = entry.path();
-        if !path
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            continue;
-        }
-        let Ok(target) = path.canonicalize() else {
-            continue;
-        };
-        if target.starts_with(&claude_canon) {
-            unlink_link(&path, "claude link");
-        }
-    }
-}
-
-/// Acquire-time prune for an isolated tree: drop the pre-upgrade `~/.claude/`
-/// links an older binary left, but only when no live session holds the tree.
-/// Shared trees link `~/.claude/` by design and are never pruned.
-///
-/// Reachable only on the bare `runtime-isolated` tree. Under `LinkMode::Real`
-/// `runtime` and `sessions` are both keyed by the just-minted sid, so either the
-/// predicate's first branch matches or the wipe already removed the tree.
-/// `LinkMode::Fake` is not Windows-only: `detect_link_mode` drops to it on
-/// privilege denial or an unsupported filesystem, so a `~/.clauth` on exFAT,
-/// FAT32 or SMB lands there on unix too.
-fn prune_isolated_claude_links(
-    name: &ProfileName,
-    sessions: &Path,
-    runtime: &Path,
-    claude_home: &Path,
-    isolation: Isolation,
-    mode: LinkMode,
-) {
-    if isolation != Isolation::Isolated {
-        return;
-    }
-    if live_session_holds_runtime(name, sessions, runtime, isolation, mode) {
-        return;
-    }
-    prune_claude_links(runtime, claude_home);
 }
 
 /// Compute this profile's merged `settings.json` and write it into the runtime
