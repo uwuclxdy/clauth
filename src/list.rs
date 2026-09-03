@@ -163,16 +163,21 @@ fn render_table(config: &AppConfig, entries: &[ProfileEntry]) -> String {
 
     let rows: Vec<Row> = entries.iter().map(|e| Row::from_entry(config, e)).collect();
 
+    // Each header is bound once: `col_width` sizes the column off the same
+    // string the header row prints, so the two can never disagree. The two
+    // window columns say `USED` because the table stands alone in a pipe, where
+    // a bare `5H` over `42%` reads as headroom just as easily as consumption.
+    let (h_name, h_plan, h_5h, h_7d) = ("PROFILE", "PLAN", "5H USED", "7D USED");
     // Endpoint is the last column, so it is never padded and needs no width.
-    let w_name = col_width("PROFILE", rows.iter().map(|r| r.name.as_str()));
-    let w_plan = col_width("PLAN", rows.iter().map(|r| r.plan.as_str()));
-    let w_5h = col_width("5H", rows.iter().map(|r| r.five_h.as_str()));
-    let w_7d = col_width("7D", rows.iter().map(|r| r.seven_d.as_str()));
+    let w_name = col_width(h_name, rows.iter().map(|r| r.name.as_str()));
+    let w_plan = col_width(h_plan, rows.iter().map(|r| r.plan.as_str()));
+    let w_5h = col_width(h_5h, rows.iter().map(|r| r.five_h.as_str()));
+    let w_7d = col_width(h_7d, rows.iter().map(|r| r.seven_d.as_str()));
 
     // Two leading columns: the 1-char active marker and a separating space.
     let mut out = format!(
         "  {:<w_name$}  {:<w_plan$}  {:>w_5h$}  {:>w_7d$}  ENDPOINT\n",
-        "PROFILE", "PLAN", "5H", "7D",
+        h_name, h_plan, h_5h, h_7d,
     );
     for r in &rows {
         out.push_str(&format!(

@@ -52,9 +52,9 @@ fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
     );
 }
 
-const HEADER: &str = "  PROFILE  PLAN       5H     7D  ENDPOINT";
+const HEADER: &str = "  PROFILE  PLAN    5H USED  7D USED  ENDPOINT";
 // 42.4 → 42.4%, 17.6 → 17.6%: format_pct drops only trailing `.0`.
-const WORK_ROW: &str = "* work     Max 5x  42.4%  17.6%  -";
+const WORK_ROW: &str = "* work     Max 5x    42.4%    17.6%  -";
 
 #[test]
 fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
@@ -104,7 +104,7 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
         [
             HEADER,
             WORK_ROW,
-            "  off      Max         -      -  - (disabled)",
+            "  off      Max           -        -  - (disabled)",
         ],
         "the disabled row keeps its columns aligned and carries the (disabled) marker"
     );
@@ -152,7 +152,7 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free        -      -  - (canceled)",
+            "  dead     Free          -        -  - (canceled)",
         ],
         "the canceled row keeps its tier in PLAN and carries the marker"
     );
@@ -207,7 +207,7 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free        -      -  - (disabled, canceled)",
+            "  dead     Free          -        -  - (disabled, canceled)",
         ],
         "neither state may hide the other"
     );
@@ -238,8 +238,8 @@ fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party
     assert_eq!(
         lines,
         [
-            "  PROFILE  PLAN  5H  7D  ENDPOINT",
-            "  z.ai     Z.ai   -   -  https://api.z.ai/api/anthropic",
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai        -        -  https://api.z.ai/api/anthropic",
         ],
         "a third-party account shows its provider as the plan and its base url as the endpoint"
     );
@@ -274,8 +274,8 @@ fn list_table_marks_a_keyless_third_party_profile() {
     assert_eq!(
         lines,
         [
-            "  PROFILE  PLAN  5H  7D  ENDPOINT",
-            "  z.ai     Z.ai   -   -  https://api.z.ai/api/anthropic (keyless)",
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai        -        -  https://api.z.ai/api/anthropic (keyless)",
         ],
         "a keyless third-party row names the state"
     );
@@ -309,8 +309,8 @@ fn list_table_leaves_an_env_keyed_third_party_profile_unmarked() {
     assert_eq!(
         lines,
         [
-            "  PROFILE  PLAN  5H  7D  ENDPOINT",
-            "  z.ai     Z.ai   -   -  https://api.z.ai/api/anthropic",
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai        -        -  https://api.z.ai/api/anthropic",
         ],
         "an env token keys the row, so it carries no marker"
     );
