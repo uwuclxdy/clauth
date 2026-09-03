@@ -981,6 +981,10 @@ pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
 /// `ERROR_SHARING_VIOLATION`. `std::io::ErrorKind` maps it to `Uncategorized`,
 /// so the raw code is the only discriminator, and it is Windows-only: errno 32
 /// is `EPIPE` on Linux.
+///
+/// It names what an OPEN gets. A rename replace over a destination someone else
+/// holds open fails `ERROR_ACCESS_DENIED` (5) instead, measured on a real box,
+/// so this predicate does not carry to a publish.
 #[cfg(windows)]
 fn is_sharing_violation(e: &std::io::Error) -> bool {
     e.raw_os_error() == Some(32)

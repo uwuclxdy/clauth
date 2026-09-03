@@ -584,13 +584,14 @@ pub(crate) fn claim(job_id: &str) -> Claim {
         return Claim::Lost;
     };
     let claimed = from.with_extension("json.claim");
-    // A stale claimed spelling left by a claimant that died mid-claim blocks
-    // the rename on Windows, where rename does not replace an existing
-    // file. Retry once past it. The `from.exists()` gate is the exactly-once
-    // guard: a rename that failed because the source is gone lost the race,
-    // and the claimed spelling then holds the WINNER's bytes, never a stale
-    // file to unlink. On unix the first rename already replaced the target,
-    // so the arm is Windows-only by construction.
+    // The `from.exists()` gate is the exactly-once guard: a rename that failed
+    // because the source is gone lost the race, and the claimed spelling then
+    // holds the WINNER's bytes, never a stale file to unlink.
+    //
+    // The retry past it has no known trigger. It was written for a stale claimed
+    // file left by a claimant that died mid-claim, on the premise that Windows
+    // renames do not replace an existing destination; a real-box measurement has
+    // since shown `std::fs::rename` replacing one there exactly as on unix.
     if std::fs::rename(&from, &claimed).is_err() && from.exists() {
         let _ = std::fs::remove_file(&claimed);
         if std::fs::rename(&from, &claimed).is_err() {
