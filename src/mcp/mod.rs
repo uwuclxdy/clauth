@@ -3970,6 +3970,18 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     let mut child = command
         .spawn()
         .map_err(|e| format!("failed to spawn claude: {e}"))?;
+    // Re-key the row `acquire` registered: `std::process::id()` there reads THIS
+    // process, the mcp server, so every delegate through this server would share
+    // one pid. The herdr pane-tag walk joins rows to processes by pid, and a row
+    // keyed on the mcp names a delegate's account for the pane hosting the
+    // parent session (the pane the delegate's child runs in). The child IS the
+    // session; its row must say so. Best-effort like the register itself — a
+    // failed update leaves a wrong key, never a dead run.
+    if let Err(e) = crate::live_sessions::update_as_session(runtime.session_id(), |fields| {
+        fields.set_pid(child.id())
+    }) {
+        logline!("clauth: re-keying the delegate session onto its child failed: {e}");
+    }
     // A child exists, so the target's window is being spent from here: a caller
     // that walks away now gets this run handed off to a job file rather than
     // stopped, which is the whole difference [`Handoff::hand_off`] reads.

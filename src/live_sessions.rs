@@ -138,6 +138,15 @@ impl SessionFields<'_> {
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {
         self.0.last_swap_at = Some(at);
     }
+
+    /// Re-key the row onto the process that IS the session. A delegate's row is
+    /// registered by the `clauth mcp` that spawns it — `std::process::id()` at
+    /// register time reads the mcp, not the delegate child — and the herdr
+    /// pane-tag walk joins rows to processes by pid, so a row keyed on the mcp
+    /// names a delegate's account for the pane hosting its parent session.
+    pub(crate) fn set_pid(&mut self, pid: u32) {
+        self.0.pid = pid;
+    }
 }
 
 /// Live sessions tallied by the account each one is CURRENTLY running as.

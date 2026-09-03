@@ -2792,6 +2792,12 @@ impl ProfileRuntime {
         &self.swap.runtime
     }
 
+    /// This session's registry id, for a caller that needs to edit its row after
+    /// acquire (a delegate re-keys its row's pid onto the spawned child).
+    pub(crate) fn session_id(&self) -> &str {
+        self.swap.session.as_str()
+    }
+
     /// Ticks this session's watchdog reconciled on rather than on a filesystem
     /// event. Test-only: the unix-only relogin test pins the event leg through
     /// this. Gated with that caller so the windows leg sees no dead code.

@@ -85,6 +85,38 @@ fn each_writers_update_preserves_the_others_fields() {
     assert_eq!(after.chain_cursor, Some(2));
 }
 
+/// A delegate's row is registered by the `clauth mcp` that spawns it (that
+/// process's `std::process::id()` is what register reads) and re-keyed onto the
+/// delegate child right after spawn. `set_pid` is the mutator behind the
+/// re-key, and it must move nothing else — the daemon's decision fields least
+/// of all.
+#[test]
+fn set_pid_rekeys_the_row_and_touches_nothing_else() {
+    let _home = HomeSandbox::new();
+    register(&row("4242-0", "work")).expect("register");
+    update_as_daemon("4242-0", |d| d.set_intended_member("kerry")).expect("daemon update");
+
+    update_as_session("4242-0", |s| s.set_pid(7777)).expect("session update");
+
+    let after = list().pop().expect("one row");
+    assert_eq!(after.pid, 7777, "the row names the re-keyed process");
+    assert_eq!(
+        after.session_id, "4242-0",
+        "the id is not part of the re-key"
+    );
+    assert_eq!(
+        after.start_profile, "work",
+        "the launch member is untouched"
+    );
+    assert_eq!(
+        after.intended_member.as_deref(),
+        Some("kerry"),
+        "the daemon's field survives the re-key"
+    );
+    assert_eq!(after.current_member, None);
+    assert_eq!(after.cwd.as_deref(), Some(Path::new("/w/proj")));
+}
+
 /// THE LOST-UPDATE TEST. The load has to happen INSIDE the state lock, not just
 /// the store: a row read before a swap and written after silently reverts
 /// whatever the other writer put there in between. Thread A parks inside its
