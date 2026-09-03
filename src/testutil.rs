@@ -956,12 +956,39 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
 }
 
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
+///
+/// The open retries while Windows reports a sharing violation: an open landing
+/// inside another thread's `MoveFileEx` replace over the same path fails with
+/// it, which is exactly what a fixture that back-dates a file the code under
+/// test is concurrently republishing does. POSIX renames never block an open,
+/// so `is_sharing_violation` is `false` off Windows and the loop degenerates to
+/// one attempt. Bounded, so a genuinely absent file still panics with its own
+/// error rather than hanging.
 pub(crate) fn set_mtime(path: &Path, when: SystemTime) {
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .expect("open for mtime");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let file = loop {
+        match std::fs::OpenOptions::new().write(true).open(path) {
+            Ok(file) => break file,
+            Err(e) if is_sharing_violation(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => panic!("open {} for mtime: {e}", path.display()),
+        }
+    };
     file.set_modified(when).expect("set_modified");
+}
+
+/// `ERROR_SHARING_VIOLATION`. `std::io::ErrorKind` maps it to `Uncategorized`,
+/// so the raw code is the only discriminator, and it is Windows-only: errno 32
+/// is `EPIPE` on Linux.
+#[cfg(windows)]
+fn is_sharing_violation(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(32)
+}
+
+#[cfg(not(windows))]
+fn is_sharing_violation(_: &std::io::Error) -> bool {
+    false
 }
 
 /// A `Press` key event with no modifiers.
