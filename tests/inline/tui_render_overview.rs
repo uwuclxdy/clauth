@@ -2126,3 +2126,92 @@ fn deepseek_amount_w_spans_all_currencies() {
         "first currencies in both cells start at the same column:\n  {multi_cell:?}\n  {single_cell:?}"
     );
 }
+
+/// The 7d cell text, padding included, under the `7d` header; empty when the
+/// column is dropped. Mirrors `five_hour_cell_text` so the pin proves the cell
+/// sits under its own header, not just that a stamp exists somewhere on the row.
+fn seven_day_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    if widths.seven_day == 0 {
+        return String::new();
+    }
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("7d")
+        .expect("the accounts table carries a `7d` header");
+    line_text(row)
+        .chars()
+        .skip(col)
+        .take(widths.seven_day)
+        .collect()
+}
+
+/// A 12-char account row under `reset_display = both` must never lose its 5h
+/// wall-clock stamp (`· HH:MM`) while the 7d column still paints only the bare
+/// `XX%`. The 7d tier at inner totals 93..101 reserved 17 cells for a bar but
+/// painted 4 (the bar gate is `widths.seven_day >= 18`), so the 5h clock bonus
+/// starved and the stamp dropped between 96 and 97 terminal cols with nothing
+/// gained.
+///
+/// Sweeps TERMINAL widths 40..=170; each render runs in the list-area inner
+/// width 4 cells narrower (the accounts panel's 2 border cells + 1 padding cell
+/// per side, same offset the render smoke test pins). Asserts the 7d stamp map
+/// stays monotone and every 5h-stamp loss is paid for by a newly appeared 7d
+/// bar, then pins the 96/97 boundary in both directions.
+#[test]
+fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = profile("aaaaaaaaaaaa", 40.0, 60.0, 3 * 3600 + 1800);
+    if let Some(ref mut usage) = p.usage {
+        usage.seven_day = Some(UsageWindow {
+            utilization: 60.0,
+            resets_at: Some(reset_in(4 * 86400 + 43200)),
+        });
+    }
+    let mut config = config_with(vec![p], None, vec![]);
+    config.state.reset_display = Some(crate::profile::ResetDisplay::Both);
+    let app = App::new(config);
+
+    let mut five_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_bar = Vec::with_capacity((170 - 40 + 1) as usize);
+
+    for terminal in 40u16..=170 {
+        let widths = OverviewWidths::new(terminal - 4, &app);
+        let row = render_overview_row(&app, 0, &widths, false, false);
+        let five = five_hour_cell_text(&widths, false, &row);
+        let seven = seven_day_cell_text(&widths, &row);
+        five_stamp.push(five.contains('·'));
+        seven_stamp.push(seven.contains('·'));
+        seven_bar.push(seven.contains('['));
+    }
+
+    // The 7d stamp never blinks: once it appears at some width it stays at
+    // every wider width, like the live column.
+    for i in 1..seven_stamp.len() {
+        assert!(
+            !seven_stamp[i - 1] || seven_stamp[i],
+            "7d stamp disappears at terminal width {}",
+            40 + i
+        );
+    }
+
+    // A width that drops the 5h stamp must newly show the 7d bar at that same
+    // width, so the loss is a real trade, never a bare gutter.
+    for i in 1..five_stamp.len() {
+        if five_stamp[i - 1] && !five_stamp[i] {
+            assert!(
+                seven_bar[i] && !seven_bar[i - 1],
+                "5h stamp lost with no new 7d bar at terminal width {}",
+                40 + i
+            );
+        }
+    }
+
+    // The measured boundary, pinned in both directions: 96 and 97 cols both
+    // keep the stamp. Before the fix 97 dropped it while 96 kept it.
+    assert!(five_stamp[96 - 40], "5h stamp present at 96 cols");
+    assert!(
+        five_stamp[97 - 40],
+        "5h stamp present at 97 cols (the defect width)"
+    );
+}

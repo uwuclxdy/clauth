@@ -246,17 +246,13 @@ fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize)
     // the column has to absorb the extra cell or it leaks into `live`.
     let mut seven_day = if total >= SEVEN_DAY_WIDE_AT {
         SEVEN_DAY_MAX
-    } else if total >= 93 {
-        17
     } else if total >= 58 {
         5
     } else {
         0
     };
     while fixed_overview_width(name, kind, five_hour, seven_day, 0, GAP_MIN) > total {
-        if seven_day >= 17 {
-            seven_day = 5;
-        } else if seven_day > 0 {
+        if seven_day > 0 {
             seven_day = 0;
         } else if five_hour > 17 {
             five_hour = 17;
@@ -284,7 +280,7 @@ fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize)
 /// `reset_suffix` degrades cleanly on whatever the stamp gets.
 ///
 /// The tier ladders jump by more than the one cell a width increment adds
-/// (`kind` 12→16, `seven_day` 5→17→27, `five_hour` 17→26), so the raw fit
+/// (`kind` 12→16, `seven_day` 5→27, `five_hour` 17→26), so the raw fit
 /// predicate can pass at one width, fail at the next and pass again. Once
 /// every ladder has saturated the leftover slack grows 1:1 with width, so the
 /// predicate is monotone from there on and only the bounded stretch up to that
