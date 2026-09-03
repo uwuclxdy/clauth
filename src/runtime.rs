@@ -3783,18 +3783,16 @@ fn resolve_credential_winner(
 }
 
 /// Repoint the runtime credential link at canonical so canonical stays the
-/// single source of truth. Swaps via a temp symlink + atomic rename so a sibling
-/// session never sees the path missing; if canonical is gone, removes the file.
+/// single source of truth, through the same staged publish every other
+/// credential link takes, so a sibling session never sees the path missing. If
+/// canonical is gone, removes the file.
 fn relink_to_canonical(link_path: &Path, canonical: &Path) -> Result<()> {
     if canonical.exists() {
-        let tmp = link_path.with_file_name(format!(".credentials.json.tmp.{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        create_symlink(canonical, &tmp)?;
-        std::fs::rename(&tmp, link_path)?;
+        crate::claude::publish_credential_link(link_path, canonical)
     } else {
         std::fs::remove_file(link_path)?;
+        Ok(())
     }
-    Ok(())
 }
 
 /// Bidirectional mtime mirror between `runtime/.credentials.json` and canonical

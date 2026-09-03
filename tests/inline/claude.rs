@@ -3918,3 +3918,91 @@ fn force_snapshot_does_not_resurrect_a_deleted_profile() {
         "a deleted profile's directory must not be resurrected by the capture sink"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Staged credential publishes. Every credential link is replaced by a rename
+// over a staging sibling, so the live path is never absent between two calls
+// and no staging file outlives the swap.
+// ---------------------------------------------------------------------------
+
+/// Names in `dir` that every tree walk skips by name (`watchdog::is_staging`).
+/// One left behind is invisible to the mirror, so nothing ever collects it.
+#[cfg(unix)]
+fn staging_siblings(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .expect("read dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.') && n.contains(".tmp."))
+        .collect();
+    names.sort();
+    names
+}
+
+#[cfg(unix)]
+#[test]
+fn a_credential_publish_repoints_the_live_link_and_strands_no_staging_file() {
+    let _home = HomeSandbox::new();
+    for name in ["from", "onto"] {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(creds(&format!("{name}-access"), Some("refresh")));
+        crate::profile::save_profile(&profile).expect("save profile");
+    }
+    let store = |name: &str| {
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .join("credentials.json")
+    };
+
+    let live = claude_credentials_path().expect("creds path");
+    let claude_home = live.parent().expect("parent").to_path_buf();
+    fs::create_dir_all(&claude_home).expect("mkdir .claude");
+    std::os::unix::fs::symlink(store("from"), &live).expect("seed the outgoing link");
+
+    link_profile_credentials(&crate::profile::ProfileName::from("onto")).expect("publish");
+
+    assert_eq!(
+        fs::read_link(&live).expect("the live path is still a link"),
+        store("onto"),
+        "the publish repointed the live link at the incoming profile's store"
+    );
+    assert_eq!(
+        staging_siblings(&claude_home),
+        Vec::<String>::new(),
+        "the staging sibling was renamed away rather than left in ~/.claude"
+    );
+}
+
+/// A publish that cannot land leaves the destination exactly as it was and
+/// takes its staging file with it. The unlink-then-create this replaced removed
+/// the live path FIRST, so the same failure left it with nothing in it.
+#[cfg(unix)]
+#[test]
+fn a_failed_credential_publish_keeps_the_destination_and_strands_nothing() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("onto".to_string(), None, None);
+    profile.credentials = Some(creds("onto-access", Some("refresh")));
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let live = claude_credentials_path().expect("creds path");
+    let claude_home = live.parent().expect("parent").to_path_buf();
+    // A directory at the live path refuses the rename on every platform, which
+    // fails the swap itself rather than its staging — the half under test.
+    fs::create_dir_all(&live).expect("mkdir a destination no rename can replace");
+
+    let err = force_link_profile_credentials(&crate::profile::ProfileName::from("onto"))
+        .expect_err("the publish must fail");
+    assert!(
+        format!("{err:#}").contains("failed to publish"),
+        "the error names the publish that failed: {err:#}"
+    );
+    assert!(
+        live.is_dir(),
+        "a failed publish leaves the destination untouched"
+    );
+    assert_eq!(
+        staging_siblings(&claude_home),
+        Vec::<String>::new(),
+        "the staging file is cleaned up on the failure arm"
+    );
+}

@@ -1202,6 +1202,63 @@ pub(crate) fn create_symlink(target: &Path, link: &Path) -> Result<()> {
         .context("failed to copy credentials")
 }
 
+/// Point `link` at `target` without ever leaving the path absent: stage the
+/// pointer at a staging sibling, then rename it over whatever is there.
+///
+/// The unlink-then-create this replaced left `~/.claude/.credentials.json`
+/// missing whenever the create failed after the unlink had landed, which is
+/// reachable on Windows: [`create_symlink`] falls back to copying `target`
+/// there, and a copy loses to anyone holding `target` open for writing. Staging
+/// first moves that failure ahead of the swap, where it costs nothing.
+pub(crate) fn publish_credential_link(link: &Path, target: &Path) -> Result<()> {
+    if let Some(parent) = link.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = crate::profile::tmp_sibling(link);
+    let _ = std::fs::remove_file(&tmp);
+    create_symlink(target, &tmp)?;
+    let mut renamed = std::fs::rename(&tmp, link);
+    if renamed.is_err() && clear_readonly(link) {
+        renamed = std::fs::rename(&tmp, link);
+    }
+    match renamed {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e).with_context(|| format!("failed to publish {}", link.display()))
+        }
+    }
+}
+
+/// Drop a read-only attribute from `path`, reporting whether it dropped one.
+///
+/// Windows only. It keeps [`publish_credential_link`] from refusing a switch
+/// that the unlink-then-create before it would have completed: a read-only
+/// destination refuses `rename` there with os error 5, while `remove_file`
+/// clears the attribute on its way past. Nothing clauth writes is read-only, so
+/// the operator or a backup tool is what sets it.
+#[cfg(windows)]
+#[expect(
+    clippy::permissions_set_readonly_false,
+    reason = "the lint is about unix, where clearing readonly grants group and other write; this arm is windows-only, where it clears one file attribute"
+)]
+fn clear_readonly(path: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let mut perms = meta.permissions();
+    if !perms.readonly() {
+        return false;
+    }
+    perms.set_readonly(false);
+    std::fs::set_permissions(path, perms).is_ok()
+}
+
+#[cfg(not(windows))]
+fn clear_readonly(_path: &Path) -> bool {
+    false
+}
+
 /// Credential-store keys a switch carries forward onto the incoming profile.
 /// `mcpOAuth` holds Claude Code's per-MCP-server logins, minted per (server,
 /// endpoint) against the server itself, so they belong to no Claude account and
@@ -1482,14 +1539,12 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
             carry_live_extra_best_effort(&link, &target, name);
-            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
         }
 
         if target.exists() {
-            if let Some(parent) = link.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            create_symlink(&target, &link)?;
+            publish_credential_link(&link, &target)?;
+        } else if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
         }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `Leave` because this is the GUARDED relink: it is also what a rename,
@@ -2041,13 +2096,11 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
             carry_live_extra_best_effort(&link, &target, name);
-            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         if target.exists() {
-            if let Some(parent) = link.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            create_symlink(&target, &link)?;
+            publish_credential_link(&link, &target)?;
+        } else if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `SignOut` because this is the FORCING relink, which every switch path
@@ -2089,9 +2142,12 @@ pub(crate) fn detach_credentials_link() -> Result<()> {
         if !meta.file_type().is_symlink() {
             return Ok(());
         }
+        // No unlink first: `atomic_write_600` publishes through a staging
+        // sibling and a rename, and a rename REPLACES a symlink destination
+        // rather than following it. Unlinking beforehand only opened a window
+        // where a failed write left the path with nothing in it.
         let content =
             std::fs::read(&path).context("failed to read .credentials.json before detach")?;
-        std::fs::remove_file(&path).context("failed to remove .credentials.json symlink")?;
         atomic_write_600(&path, content).context("failed to write detached .credentials.json")?;
         Ok(())
     })
