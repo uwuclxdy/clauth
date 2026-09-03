@@ -4,9 +4,13 @@
 # `clauth.which` action, which is why it takes the pane from the injected
 # context rather than an argument.
 #
-# The pane's foreground process is the `claude` child, its parent is the
-# `clauth start` supervisor, and only the supervisor's pid appears in the
-# live-session registry, so the walk up the parent chain is the join.
+# herdr's process-info names the pane's own session in
+# `foreground_process_group_id` — the `clauth start` supervisor for a
+# clauth-started pane — and the live-session registry carries that pid, so
+# the walk up the parent chain is the join. Delegate sessions share the pane:
+# they run as children of its `clauth mcp` and their rows are keyed on their
+# own processes, so the foreground chain resolves first and the compat sweep
+# never matches through an mcp.
 set -u
 
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
@@ -18,22 +22,45 @@ sessions_dir="$HOME/.clauth/live_sessions"
 pane="${HERDR_PANE_ID:-}"
 
 # Prints the registry row owning $1 or one of its ancestors, empty if none.
+# A `clauth mcp` hop is never matched: rows keyed on it belong to delegate runs
+# the pane hosts, and matching one would name a delegate's account for the
+# pane. The climb passes through it — the pane's own supervisor sits beyond.
 session_row() {
     _pid=$1
     _depth=0
     while [ "${_pid:-0}" -gt 1 ] && [ "$_depth" -lt 8 ]; do
-        # The delimiter alternative keeps the prefix exclusion a bare
-        # "pid":$_pid would lose (123 against 1234) without pinning `pid` to
-        # its current slot in the row.
-        _row=$(grep -lE "\"pid\":$_pid(,|})" "$sessions_dir"/*.json 2>/dev/null | head -n 1)
-        if [ -n "$_row" ]; then
-            printf '%s\n' "$_row"
-            return 0
-        fi
+        # The trailing wildcard keeps the hook's own `clauth mcp-await-job`
+        # out: that cmdline continues with a dash, never a space or nothing.
+        _args=$(ps -o args= -p "$_pid" 2>/dev/null)
+        case "$_args" in
+            'clauth mcp '* | 'clauth mcp') : ;;
+            *)
+                # The delimiter alternative keeps the prefix exclusion a bare
+                # "pid":$_pid would lose (123 against 1234) without pinning
+                # `pid` to its current slot in the row. Newest row wins: a
+                # recycled pid can match a stale row and a live one at once,
+                # and the stale one sorts first alphabetically.
+                _matches=$(grep -lE "\"pid\":$_pid(,|})" "$sessions_dir"/*.json 2>/dev/null)
+                if [ -n "$_matches" ]; then
+                    _row=$(printf '%s\n' "$_matches" | xargs ls -td 2>/dev/null | head -n 1)
+                    printf '%s\n' "$_row"
+                    return 0
+                fi
+                ;;
+        esac
         _pid=$(ps -o ppid= -p "$_pid" 2>/dev/null | tr -d ' ')
         _depth=$((_depth + 1))
     done
     return 1
+}
+
+# The account a row names: the member a --with-fallback session swapped onto,
+# else its launch member.
+row_profile() {
+    _row=$1
+    _p=$(sed -n 's/.*"current_member":"\([^"]*\)".*/\1/p' "$_row")
+    [ -n "$_p" ] || _p=$(sed -n 's/.*"start_profile":"\([^"]*\)".*/\1/p' "$_row")
+    printf '%s\n' "$_p"
 }
 
 # The agent hooks fire for every agent herdr detects, codex and cursor
@@ -55,15 +82,36 @@ esac
 
 profile=""
 if [ -n "$pane" ]; then
-    pids=$("$herdr_bin" pane process-info --pane "$pane" 2>/dev/null | grep -o '"pid":[0-9]*' | cut -d: -f2)
-    for pid in $pids; do
-        row=$(session_row "$pid") || continue
-        # current_member is the chain member a --with-fallback session swapped
-        # onto, and it is null until the first swap.
-        profile=$(sed -n 's/.*"current_member":"\([^"]*\)".*/\1/p' "$row")
-        [ -n "$profile" ] || profile=$(sed -n 's/.*"start_profile":"\([^"]*\)".*/\1/p' "$row")
-        [ -n "$profile" ] && break
-    done
+    info=$("$herdr_bin" pane process-info --pane "$pane" 2>/dev/null)
+    # The pane's own session is named by the foreground process group id herdr
+    # reports — the `clauth start` supervisor for every clauth-started pane
+    # (measured 2026-09-03 on 0.8.2). A delegate session runs in its parent
+    # pane's process group with its row keyed on a process of that pane, so
+    # the foreground chain must resolve FIRST or a delegate's account shadows
+    # the pane's own.
+    fg_pid=$(printf '%s' "$info" | sed -n 's/.*"foreground_process_group_id":\([0-9]*\).*/\1/p')
+    if [ -n "$fg_pid" ]; then
+        row=$(session_row "$fg_pid")
+        [ -n "$row" ] && profile=$(row_profile "$row")
+    fi
+    # The pid sweep is the compat path for a process-info without the
+    # foreground field. When the field is there and found no row, the pane
+    # hosts no clauth session and the global fallback below is the answer —
+    # sweeping would hand a bare `claude` pane the account of a delegate it
+    # happens to host. The sweep skips a pid whose parent is `clauth mcp`: a
+    # delegate child, whose row is keyed on the child itself, and which names
+    # a run the pane hosts, never the pane.
+    if [ -z "$profile" ] && [ -z "$fg_pid" ]; then
+        pids=$(printf '%s' "$info" | grep -o '"pid":[0-9]*' | cut -d: -f2)
+        for pid in $pids; do
+            _pp=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+            _pargs=$(ps -o args= -p "$_pp" 2>/dev/null)
+            case "$_pargs" in 'clauth mcp '* | 'clauth mcp') continue ;; esac
+            row=$(session_row "$pid") || continue
+            profile=$(row_profile "$row")
+            [ -n "$profile" ] && break
+        done
+    fi
 fi
 
 # No clauth-managed session in this pane: a bare `claude` there burns whatever

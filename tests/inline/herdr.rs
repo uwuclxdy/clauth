@@ -1822,3 +1822,214 @@ fn both_knobs_off_publish_both_clears_in_one_call() {
         "no publishes on the off path: {line}"
     );
 }
+
+// ── report-profile.sh pane resolution, driven through the real script ────────
+
+/// Runs the real `herdr-plugin/report-profile.sh` against shimmed `herdr`,
+/// `ps` and `clauth`. The herdr shim answers `pane process-info` ONCE (its
+/// second caller is the detached watcher, which must fail it three times so it
+/// ends itself) and logs every `pane report-metadata` argv; the ps shim
+/// answers ppid/args from the caller's scripted map; the clauth shim answers
+/// `which` with `fit` and the config knobs. Rows land in the sandbox's
+/// `~/.clauth/live_sessions`; `stale_row` names one whose mtime is pushed an
+/// hour back, posing the dead-session leftover a recycled pid would leave.
+/// Returns the logged report lines.
+#[cfg(unix)]
+fn report_profile_resolve_run(
+    info_json: &str,
+    ps_body: &str,
+    rows: &[(&str, &str, u32)],
+    stale_row: Option<&str>,
+) -> Vec<String> {
+    let home = crate::testutil::HomeSandbox::new();
+    let sessions = home.home().join(".clauth/live_sessions");
+    std::fs::create_dir_all(&sessions).expect("sessions dir");
+    for (sid, start, pid) in rows {
+        let path = sessions.join(format!("{sid}.json"));
+        let body = format!(
+            r#"{{"session_id":"{sid}","start_profile":"{start}","pid":{pid},"started_at":0,"isolated":false,"follows_chain":false,"intended_member":null,"chain_cursor":null,"current_member":null,"last_swap_at":null}}"#
+        );
+        std::fs::write(&path, body).expect("row written");
+        if stale_row == Some(sid) {
+            crate::testutil::set_mtime(
+                &path,
+                std::time::SystemTime::now() - std::time::Duration::from_secs(3600),
+            );
+        }
+    }
+    write_shim(
+        home.home(),
+        "herdr",
+        &format!(
+            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info_json}'; exit 0; fi\nexit 0\n"
+        ),
+    );
+    write_shim(home.home(), "ps", ps_body);
+    write_shim(
+        home.home(),
+        "clauth",
+        "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+    );
+    let mut cmd = std::process::Command::new("sh");
+    cmd.arg(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/herdr-plugin/report-profile.sh"
+    ))
+    .env("HERDR_BIN_PATH", home.home().join("herdr"))
+    .env("HERDR_PLUGIN_ID", "clauth")
+    .env("HERDR_PANE_ID", "p1")
+    .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"claude"}"#)
+    .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+    .env("HOME", home.home())
+    .env(
+        "PATH",
+        format!(
+            "{}:{}",
+            home.home().display(),
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    );
+    let out = cmd.output().expect("report-profile.sh runs");
+    assert!(
+        out.status.success(),
+        "the script exits 0: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(home.home().join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The token the resolve published; the four resolution tests below pin the
+/// profile herdr would show on the pane, so the token value IS the verdict.
+#[cfg(unix)]
+fn token_line(lines: &[String]) -> String {
+    assert_eq!(
+        lines.len(),
+        1,
+        "exactly one report-metadata call: {lines:?}"
+    );
+    lines[0].clone()
+}
+
+/// The pane's own session resolves FIRST, off `foreground_process_group_id`.
+/// The sweep order puts the delegate's claude before the supervisor, and the
+/// delegate's row is keyed on the pane's `clauth mcp`, so a sweep-first
+/// resolution names the delegate's account (D3) for a pane running uwuclxdy.
+#[cfg(unix)]
+#[test]
+fn the_foreground_chain_beats_a_delegate_row_in_the_sweep() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"clauth"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; *' 1001') echo 1002;; *' 1002') echo 1000;; esac;;\n  *'-o args='*) case \"$*\" in *' 1002') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(
+        info,
+        ps,
+        &[("1000-0", "uwuclxdy", 1000), ("1002-0", "D3", 1002)],
+        None,
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the pane's own session wins over the delegate row: {}",
+        lines[0]
+    );
+}
+
+/// A bare `claude` pane (foreground present, no registered session) answers
+/// the global account, never the account of a delegate it happens to host:
+/// the sweep must not run when the foreground chain resolved cleanly to no row.
+#[cfg(unix)]
+#[test]
+fn a_bare_pane_hosting_a_delegate_still_answers_the_global_account() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(info, ps, &[("1003-0", "D3", 1003)], None);
+    assert!(
+        token_line(&lines).contains("--token clauth=fit"),
+        "the bare pane answers the global account: {}",
+        lines[0]
+    );
+}
+
+/// The compat sweep (a process-info without the foreground field) skips a
+/// delegate child by its parent and refuses to match a row on an mcp hop, so
+/// it climbs through the mcp to the pane's own supervisor instead of stopping
+/// at the delegate's row.
+#[cfg(unix)]
+#[test]
+fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1002') echo 1003;; *' 1003') echo 1001;; *' 1001') echo 1000;; *' 1000') echo 1;; esac;;\n  *'-o args='*) case \"$*\" in *' 1003') echo 'clauth mcp';; *) echo other;; esac;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(
+        info,
+        ps,
+        &[("1000-0", "uwuclxdy", 1000), ("1003-0", "D3", 1003)],
+        None,
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the sweep climbs past the mcp to the pane's supervisor: {}",
+        lines[0]
+    );
+}
+
+/// Two rows carrying one pid — the D2/DS4 aliasing measured live 2026-09-03,
+/// a finished delegate's stale row beside a newer one — resolve to the
+/// NEWEST, never the alphabetically-first file. The ids sort so the stale one
+/// is alphabetically first: the old `head -n 1` picks it, mtime picks the
+/// live one.
+#[cfg(unix)]
+#[test]
+fn two_rows_on_one_pid_resolve_to_the_newest() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let lines = report_profile_resolve_run(
+        info,
+        ps,
+        &[("1823355-1", "D2", 1000), ("1823355-3", "DS4", 1000)],
+        Some("1823355-1"),
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=DS4"),
+        "the newest row wins over the stale one: {}",
+        lines[0]
+    );
+}
+
+/// The foreground-field parse, pinned against the REAL 0.8.2 process-info
+/// shape (captured 2026-09-03): the sed program is extracted from
+/// `report-profile.sh`'s source, so the pin reds when the script's pattern
+/// drifts from the shape instead of leaving a second spelling that can
+/// disagree with the script.
+#[cfg(unix)]
+#[test]
+fn the_fg_sed_reads_the_real_process_info_shape() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/herdr-plugin/report-profile.sh"
+    ))
+    .expect("report-profile.sh reads");
+    let fg_line = script
+        .lines()
+        .find(|l| l.contains("foreground_process_group_id") && l.contains("sed -n"))
+        .expect("the fg sed line exists");
+    let fg_prog = fg_line
+        .split_once("sed -n '")
+        .expect("single-quoted program")
+        .1
+        .split('\'')
+        .next()
+        .expect("program body");
+
+    // The real 0.8.2 bytes: `process_info` carries the field before the
+    // process array, compact JSON, one line.
+    let real = r#"{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":1822495,"foreground_processes":[{"argv":["clauth","start","uwuclxdy","--effort","max","/handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1."],"cmdline":"clauth start uwuclxdy --effort max /handoff reusable: resume nyatrade queue. read @docs/handoff-state.md first, then the handoff skill's runner protocol from step 1.","pid":1822495,"ppid":2719707,"cwd":"/home/uwuclxdy/repos/py/nyatrade"}]}}}"#;
+    // The capture ends without a trailing newline, and the script consumes the
+    // answer through command substitution, so the pin compares trimmed.
+    assert_eq!(
+        sed_pipe(real, fg_prog).trim(),
+        "1822495",
+        "the fg sed resolves the real shape"
+    );
+}
