@@ -2308,19 +2308,18 @@ impl CancelWatch {
     /// unrepresentable, the subtraction would panic inside the tool handler
     /// on a backing that cannot go below its origin, and such an age can only
     /// mean the finalize preceded this process — so the stamp stays undated
-    /// and the no-verdict rule applies. An UNREADABLE mtime — a peer's
-    /// collect evicted the file between the read and the stamp — falls back
-    /// to the observation itself instead: the `Done` read already earned a
-    /// verdict, and `failed to kill` would be the false claim there. First
-    /// stamp wins, so a later re-read cannot move a death.
+    /// and the no-verdict rule applies. The two healthy-clock fallbacks keep
+    /// the same bound rather than inventing a kill: an UNREADABLE mtime — a
+    /// peer's collect evicted the file between the read and the stamp — and a
+    /// wall-clock step that floors the file's age to zero both leave the
+    /// stamp undated, because neither can place the death at or after the
+    /// ask. First stamp wins, so a later re-read cannot move a death.
     fn saw_done(&mut self, job_id: &str) {
-        let dated = jobs::collectable_mtime_ms(job_id).map(|at| {
-            Instant::now().checked_sub(Duration::from_millis(now_ms().saturating_sub(at)))
+        let died_at = jobs::collectable_mtime_ms(job_id).and_then(|at| {
+            now_ms()
+                .checked_sub(at)
+                .and_then(|age| Instant::now().checked_sub(Duration::from_millis(age)))
         });
-        let died_at = match dated {
-            Some(dated) => dated,
-            None => Some(Instant::now()),
-        };
         self.deaths.entry(job_id.to_string()).or_insert(died_at);
     }
 

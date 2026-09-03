@@ -6427,6 +6427,92 @@ fn the_cancel_report_claims_the_ask_and_only_the_verdicts_it_observed() {
     );
 }
 
+/// A death whose dating cannot place it at or after the ask renders no verdict.
+/// Two healthy-clock fallbacks used to assert a kill nobody observed: an
+/// unreadable mtime (the file evicted between the `Done` read and the stamp) and
+/// a file mtime newer than the wall clock (a backward step), which floors the
+/// reconstructed age to zero.
+#[test]
+fn undatable_death_fallbacks_render_no_verdict() {
+    let _home = HomeSandbox::new();
+
+    // The unreadable-mtime arm: `saw_done` is reached after the record has
+    // already been read `Done`, but the file is gone by the time it stamps.
+    let evicted = "d-785001-0";
+    jobs::write_done(
+        evicted,
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "evicted"}),
+    )
+    .unwrap();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(evicted, std::sync::Arc::clone(&flag));
+    let mut evicted_watch = super::CancelWatch::ask(&[evicted.to_string()]);
+    jobs::remove(evicted);
+    evicted_watch.saw_done(evicted);
+    assert_eq!(
+        evicted_watch.note(),
+        format!("asked `{evicted}` to stop; each hands back whatever it had produced."),
+        "an unreadable mtime renders no kill verdict"
+    );
+
+    // The backward-step arm: the file's mtime sits ahead of the wall clock, so
+    // the age floors to zero and the fallback used to date the death at the
+    // observation instant.
+    let future = "d-785002-0";
+    jobs::write_done(
+        future,
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "future"}),
+    )
+    .unwrap();
+    crate::testutil::set_mtime(
+        &jobs::jobs_dir().unwrap().join(format!("{future}.json")),
+        std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+    );
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(future, std::sync::Arc::clone(&flag));
+    let mut future_watch = super::CancelWatch::ask(&[future.to_string()]);
+    future_watch.saw_done(future);
+    assert_eq!(
+        future_watch.note(),
+        format!("asked `{future}` to stop; each hands back whatever it had produced."),
+        "an mtime ahead of the wall clock renders no kill verdict"
+    );
+
+    // The healthy post-ask arm keeps its verdict through both fallbacks.
+    let healthy = "d-785003-0";
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = super::CancelGuard::register(healthy, std::sync::Arc::clone(&flag));
+    let mut healthy_watch = super::CancelWatch::ask(&[healthy.to_string()]);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    jobs::write_done(
+        healthy,
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "mid-wait"}),
+    )
+    .unwrap();
+    healthy_watch.saw_done(healthy);
+    assert!(
+        healthy_watch
+            .note()
+            .contains(&format!("killed `{healthy}` after 0s")),
+        "a death dated after the ask still reads as killed"
+    );
+}
+
 /// The owner-fixed verdict pair, rendered by the one function behind both
 /// spellings, ids in the module's backticks. The `10` here is an input, never
 /// the grace constant standing in for an observation.
