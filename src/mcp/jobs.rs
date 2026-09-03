@@ -588,10 +588,13 @@ pub(crate) fn claim(job_id: &str) -> Claim {
     // because the source is gone lost the race, and the claimed spelling then
     // holds the WINNER's bytes, never a stale file to unlink.
     //
-    // The retry past it has no known trigger. It was written for a stale claimed
-    // file left by a claimant that died mid-claim, on the premise that Windows
-    // renames do not replace an existing destination; a real-box measurement has
-    // since shown `std::fs::rename` replacing one there exactly as on unix.
+    // The retry past it covers one measured state: a stale claimed file
+    // carrying the read-only attribute refuses the rename on Windows with os
+    // error 5, and `remove_file` clears that attribute on its way past, so the
+    // second rename lands. Against a peer holding the file open the remove
+    // fails 32 and both renames lose, which is the `Lost` this returns anyway.
+    // A Windows rename does replace an existing destination, so an ordinary
+    // closed leftover is handled by the first rename and never reaches here.
     if std::fs::rename(&from, &claimed).is_err() && from.exists() {
         let _ = std::fs::remove_file(&claimed);
         if std::fs::rename(&from, &claimed).is_err() {
