@@ -31,17 +31,13 @@ struct ChildOutcome {
     signal: Option<i32>,
 }
 
-/// Lift an exiting isolated session's state into the global store: the
-/// transcripts under `projects/`, then Claude Code's own session sidecar state
-/// (shell snapshots, file history, tasks/plans, …) from the rest of the runtime
-/// root, so a rescued session keeps more than its resumability. Returns
-/// `(transcripts, sidecar files)` moved. Best-effort throughout: an error is
-/// logged, never fails the run.
-///
-/// Gated on being the only live marker in `sessions`, because the count — not
-/// the keying — is what proves nothing is reading the tree being emptied: the
-/// sidecar leg would otherwise pull `shell-snapshots/` out from under a live
-/// Claude Code mid-session. Self holds its own marker, hence `> 1`.
+/// Lift an exiting isolated session's state into the global store, gated on
+/// being the only live marker in `sessions`: the count — not the keying — is
+/// what proves nothing is reading the tree being emptied, since the sidecar leg
+/// would otherwise pull `shell-snapshots/` out from under a live Claude Code
+/// mid-session. Self holds its own marker, hence `> 1`. The move itself lives
+/// in [`crate::runtime::rescue_isolated_runtime`], shared with the stale-runtime
+/// GC so an unrescued tree is lifted at its deletion site too.
 ///
 /// Under real symlinks each session owns its tree and marker dir, and under
 /// fake symlinks an isolated session owns them too, so the count is this
@@ -62,18 +58,7 @@ pub(crate) fn rescue_teardown(
         logline!("clauth: skipping rescue, another isolated session is still live");
         return (0, 0);
     }
-    let moved = crate::sessions::rescue_isolated_store(
-        &iso_root.join("projects"),
-        &claude_home.join("projects"),
-    );
-    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
-    if moved > 0 || sidecars > 0 {
-        logline!(
-            "clauth: rescued {moved} isolated session transcript(s) \
-             + {sidecars} sidecar file(s) into the global store"
-        );
-    }
-    (moved, sidecars)
+    crate::runtime::rescue_isolated_runtime(iso_root, claude_home)
 }
 
 /// The refusal a `--with-fallback` start gets on a host that structurally cannot

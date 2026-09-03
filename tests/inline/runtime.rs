@@ -8126,3 +8126,224 @@ fn rotation_blocked_for_reads_what_the_live_session_holds() {
         );
     });
 }
+
+/// A live session's liveness marker: an open file holding the same exclusive
+/// flock `ProfileRuntime::acquire` takes, so `prune_stale_sessions` counts it
+/// alive. The returned handle must stay in scope.
+fn live_marker(path: &std::path::Path) -> fs::File {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    file.lock().unwrap();
+    file
+}
+
+/// The tombstone name GC renames an isolated runtime to must fall through both
+/// strict pairing predicates, or a later pass could re-pair it as a runtime and
+/// `remove_dir_all` it unrescued. The `.rescuing` suffix does that because a `.`
+/// is not in [`is_session_id`]'s alphabet.
+#[test]
+fn the_rescue_tombstone_name_is_rejected_by_the_pairing_predicate() {
+    for base in [
+        "runtime",
+        "runtime-isolated",
+        "runtime-4242-7",
+        "runtime-isolated-4242-7",
+    ] {
+        let tombstone = format!("{base}{RESCUE_TOMBSTONE_SUFFIX}");
+        assert!(
+            !is_paired_dir_name(&tombstone, RUNTIME_STEM),
+            "{tombstone} must not read as a runtime dir"
+        );
+    }
+    assert!(is_rescuing_runtime_dir_name("runtime-isolated.rescuing"));
+    assert!(is_rescuing_runtime_dir_name(
+        "runtime-isolated-4242-7.rescuing"
+    ));
+    assert!(!is_rescuing_runtime_dir_name("runtime-4242-7"));
+    assert!(!is_rescuing_runtime_dir_name("runtime-4242-7.rescuing"));
+    assert!(!is_rescuing_runtime_dir_name("sessions-isolated.rescuing"));
+}
+
+/// The defect: a stale isolated tree with no live marker is deleted unrescued,
+/// losing its transcript. GC must lift it into the global store before removing
+/// it, and leave no tombstone behind.
+#[test]
+fn gc_rescues_an_isolated_tree_with_no_live_marker() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let runtime = sb.home().join(".clauth/profiles/iso/runtime-isolated");
+    let sessions = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(runtime.join("shell-snapshots")).unwrap();
+    fs::write(runtime.join("shell-snapshots/snap.sh"), "iso shell").unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("dead"), b"").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl")).unwrap(),
+        "transcript",
+        "the transcript must land in the resumable global store"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("shell-snapshots/snap.sh")).unwrap(),
+        "iso shell",
+        "the sidecar must land in the global store"
+    );
+    assert!(
+        !runtime.exists(),
+        "the isolated tree must be gone after rescue"
+    );
+    assert!(!sessions.exists(), "the marker dir must be gone");
+    assert!(
+        !sb.home()
+            .join(".clauth/profiles/iso/runtime-isolated.rescuing")
+            .exists(),
+        "no tombstone may be left behind"
+    );
+}
+
+/// The per-session shape production meets: `runtime-isolated-<sid>` beside
+/// `sessions-isolated-<sid>`. The rename-and-rescue must reach it, not only the
+/// legacy bare upgrade-window pair.
+#[test]
+fn gc_rescues_a_per_session_isolated_tree_with_no_live_marker() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let runtime = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated-4242-7");
+    let sessions = sb
+        .home()
+        .join(".clauth/profiles/iso/sessions-isolated-4242-7");
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(runtime.join("shell-snapshots")).unwrap();
+    fs::write(runtime.join("shell-snapshots/snap.sh"), "iso shell").unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl")).unwrap(),
+        "transcript",
+        "the per-session transcript must land in the resumable global store"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("shell-snapshots/snap.sh")).unwrap(),
+        "iso shell",
+        "the per-session sidecar must land in the global store"
+    );
+    assert!(
+        !runtime.exists(),
+        "the per-session tree must be gone after rescue"
+    );
+    assert!(
+        !sessions.exists(),
+        "the per-session marker dir must be gone"
+    );
+    assert!(
+        !sb.home()
+            .join(".clauth/profiles/iso/runtime-isolated-4242-7.rescuing")
+            .exists(),
+        "no per-session tombstone may be left behind"
+    );
+}
+
+/// A live marker in the pair's marker dir blocks every leg: nothing is renamed,
+/// nothing is rescued, the tree stays put.
+#[test]
+fn gc_spares_an_isolated_tree_with_a_live_marker() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let runtime = sb.home().join(".clauth/profiles/iso/runtime-isolated");
+    let sessions = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(runtime.join("projects/-w-iso")).unwrap();
+    fs::write(runtime.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(runtime.join("shell-snapshots")).unwrap();
+    fs::write(runtime.join("shell-snapshots/snap.sh"), "iso shell").unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    let _live = live_marker(&sessions.join("1234-0"));
+
+    gc_stale_runtimes();
+
+    assert!(
+        runtime.join("projects/-w-iso/s1.jsonl").is_file(),
+        "a live session's transcript must stay put"
+    );
+    assert!(
+        runtime.join("shell-snapshots/snap.sh").is_file(),
+        "a live session's sidecar must stay put"
+    );
+    assert!(
+        !claude_home.join("projects").exists(),
+        "nothing may be rescued"
+    );
+    assert!(!claude_home.join("shell-snapshots").exists());
+    assert!(
+        !sb.home()
+            .join(".clauth/profiles/iso/runtime-isolated.rescuing")
+            .exists(),
+        "nothing may be renamed to a tombstone"
+    );
+}
+
+/// A shared pair with no live marker keeps today's removal: deleted under the
+/// lock, never rescued.
+#[test]
+fn gc_removes_a_shared_pair_without_rescuing() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let runtime = sb.home().join(".clauth/profiles/sh/runtime");
+    let sessions = sb.home().join(".clauth/profiles/sh/sessions");
+    fs::create_dir_all(runtime.join("projects/-w-sh")).unwrap();
+    fs::write(runtime.join("projects/-w-sh/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(sessions.join("dead"), b"").unwrap();
+
+    gc_stale_runtimes();
+
+    assert!(!runtime.exists(), "the shared tree must be removed");
+    assert!(!sessions.exists(), "the shared marker dir must be removed");
+    assert!(
+        !claude_home.join("projects").exists(),
+        "a shared tree is never rescued"
+    );
+    assert!(!claude_home.join("shell-snapshots").exists());
+}
+
+/// A `.rescuing` directory left by a crash between the rename and the delete is
+/// finished by the sweep: rescue from it, then remove it.
+#[test]
+fn gc_finishes_a_stranded_rescue_tombstone() {
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    let tombstone = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated.rescuing");
+    fs::create_dir_all(tombstone.join("projects/-w-iso")).unwrap();
+    fs::write(tombstone.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
+    fs::create_dir_all(tombstone.join("shell-snapshots")).unwrap();
+    fs::write(tombstone.join("shell-snapshots/snap.sh"), "iso shell").unwrap();
+
+    gc_stale_runtimes();
+
+    assert_eq!(
+        fs::read_to_string(claude_home.join("projects/-w-iso/s1.jsonl")).unwrap(),
+        "transcript",
+        "the transcript must be rescued from the stranded tombstone"
+    );
+    assert_eq!(
+        fs::read_to_string(claude_home.join("shell-snapshots/snap.sh")).unwrap(),
+        "iso shell",
+        "the sidecar must be rescued from the stranded tombstone"
+    );
+    assert!(!tombstone.exists(), "the tombstone must be collected");
+}

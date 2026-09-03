@@ -257,6 +257,20 @@ fn is_sessions_dir_name(name: &str) -> bool {
     is_paired_dir_name(name, SESSIONS_STEM)
 }
 
+/// The suffix a rescue tombstone appends to an isolated runtime dir name. A `.`
+/// cannot appear in a session id ([`is_session_id`] accepts digits and one `-`),
+/// so the suffixed name is rejected by [`is_paired_dir_name`]: no later GC pass
+/// re-pairs it or hands it to `remove_dir_all` as a runtime.
+const RESCUE_TOMBSTONE_SUFFIX: &str = ".rescuing";
+
+/// True for the tombstone name [`gc_one_pair`] renames an isolated runtime to
+/// before the out-of-lock rescue. Stripping the suffix must land on an isolated
+/// runtime dir name; the sweep that matches one finishes the rescue, no lock.
+fn is_rescuing_runtime_dir_name(name: &str) -> bool {
+    name.strip_suffix(RESCUE_TOMBSTONE_SUFFIX)
+        .is_some_and(|base| base.starts_with(ISOLATED_RUNTIME_STEM) && is_runtime_dir_name(base))
+}
+
 /// True for a SHARED runtime dir name — a per-session `runtime-<sid>` or the
 /// legacy bare `runtime` — and false for the isolated flavor or any unrelated
 /// name. Callers that must reach only shared copies (both config reconcilers,
@@ -834,7 +848,9 @@ fn gc_runtime_trees() {
             // Strict predicates, not the loose pairing split: this loop hands
             // `remove_dir_all` whatever it matches, so a future `runtime_state`
             // or `sessions.json` under a profile must fall through untouched.
-            if is_runtime_dir_name(child_name)
+            if is_rescuing_runtime_dir_name(child_name) {
+                rescue_tombstone(&child.path());
+            } else if is_runtime_dir_name(child_name)
                 && let Some(sessions) = paired_sessions_name(child_name)
             {
                 // A stale pre-upgrade `runtime/` pairs with the same `sessions/`
@@ -905,20 +921,113 @@ fn gc_live_session_rows() {
     }
 }
 
+/// Rescue an isolated runtime root into the global store: the transcripts under
+/// `projects/`, then the session sidecars. Returns `(transcripts, sidecars)`
+/// moved. Best-effort throughout — an error is logged, never fails the caller.
+/// Shared by [`crate::start::rescue_teardown`] and the stale-runtime GC, so an
+/// unrescued isolated tree is lifted at its deletion site rather than only on a
+/// clean exit.
+pub(crate) fn rescue_isolated_runtime(iso_root: &Path, claude_home: &Path) -> (usize, usize) {
+    let moved = crate::sessions::rescue_isolated_store(
+        &iso_root.join("projects"),
+        &claude_home.join("projects"),
+    );
+    let sidecars = crate::sessions::rescue_isolated_sidecars(iso_root, claude_home);
+    if moved > 0 || sidecars > 0 {
+        logline!(
+            "clauth: rescued {moved} isolated session transcript(s) \
+             + {sidecars} sidecar file(s) into the global store"
+        );
+    }
+    (moved, sidecars)
+}
+
+/// Finish a rescue from an isolated runtime tombstone: lift it into the global
+/// store, then remove it. Runs outside the state lock — the name is rejected by
+/// [`is_paired_dir_name`], so nothing can adopt it — and is the single tail both
+/// [`gc_one_pair`] and the stranded-tombstone sweep share, so a crash between
+/// the rename and this call cannot strand the tree.
+fn rescue_tombstone(tombstone: &Path) {
+    match claude_dir() {
+        Ok(claude_home) => {
+            rescue_isolated_runtime(tombstone, &claude_home);
+        }
+        Err(e) => {
+            logline!(
+                "clauth: cannot rescue isolated runtime {}: {e}",
+                tombstone.display()
+            );
+            return;
+        }
+    }
+    if let Err(e) = std::fs::remove_dir_all(tombstone) {
+        logline!(
+            "clauth: failed to remove rescued isolated runtime {}: {e}",
+            tombstone.display()
+        );
+    }
+}
+
 /// Collect one paired (`runtime<rest>`, `sessions<rest>`) tree when nothing holds
 /// a marker in it. The two go together; a `runtime` path that does not exist
-/// collects the orphaned marker dir alone.
+/// collects the orphaned marker dir alone. An isolated tree is renamed to a
+/// tombstone under the lock and rescued outside it, so the flock is never held
+/// across a tree-sized copy; a shared tree is removed under the lock as before.
 fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
-    with_state_lock(|_held| {
+    let isolated = runtime
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(ISOLATED_RUNTIME_STEM));
+    let tombstone = runtime
+        .file_name()
+        .map(|name| {
+            let mut tombstone_name = name.to_os_string();
+            tombstone_name.push(RESCUE_TOMBSTONE_SUFFIX);
+            runtime.with_file_name(tombstone_name)
+        })
+        .unwrap_or_else(|| runtime.to_path_buf());
+
+    let renamed = with_state_lock(|_held| {
         // An unknown reads as live: this leg runs from the daemon's timer, in a
         // different process, against every profile, and under `LinkMode::Fake`
         // the tree it would remove is the one a live sibling is running out of.
-        if prune_stale_sessions(sessions).unwrap_or(1) == 0 {
-            let _ = std::fs::remove_dir_all(runtime);
-            let _ = std::fs::remove_dir(sessions);
+        if prune_stale_sessions(sessions).unwrap_or(1) != 0 {
+            return Ok(false);
         }
-        Ok::<_, anyhow::Error>(())
-    })
+        if isolated {
+            // The rename is what stops an `acquire` adopting the tree while the
+            // rescue reads it: the tombstone name matches no pairing predicate.
+            match runtime.symlink_metadata() {
+                Ok(_) => {
+                    if let Err(e) = std::fs::rename(runtime, &tombstone) {
+                        logline!(
+                            "clauth: failed to rename isolated runtime {} for rescue: {e}",
+                            runtime.display()
+                        );
+                        let _ = std::fs::remove_dir(sessions);
+                        return Ok(false);
+                    }
+                    let _ = std::fs::remove_dir(sessions);
+                    return Ok(true);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => logline!(
+                    "clauth: cannot stat isolated runtime {} for rescue: {e}",
+                    runtime.display()
+                ),
+            }
+            let _ = std::fs::remove_dir(sessions);
+            return Ok(false);
+        }
+        let _ = std::fs::remove_dir_all(runtime);
+        let _ = std::fs::remove_dir(sessions);
+        Ok(false)
+    })?;
+
+    if renamed {
+        rescue_tombstone(&tombstone);
+    }
+    Ok(())
 }
 
 /// Every profile's SHARED runtime dirs: each live session's `runtime-<sid>` plus
