@@ -131,12 +131,20 @@ pub(crate) fn clear_static_backup(name: &ProfileName) -> Result<bool> {
     })
 }
 
+/// Where `name`'s preserved mint backup sits. One derivation for both readers,
+/// so they cannot disagree about WHICH file answers the question. They differ
+/// only on an unresolvable home, deliberately: the restore verb propagates that
+/// as a failure, the render paths below cannot fail and take the absence.
+pub(crate) fn static_backup_path(name: &ProfileName) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join("session-token.static.json"))
+}
+
 /// Whether `name` holds a preserved mint backup (`session-token.static.json`).
 /// A single stat: the Setup tab's clear row uses it to DISCLOSE that the
 /// backup goes with a clear, and to stay reachable while the backup is the
 /// only long-lived piece left.
 pub(crate) fn has_static_backup(name: &ProfileName) -> bool {
-    profile_dir(name).is_ok_and(|d| d.join("session-token.static.json").exists())
+    static_backup_path(name).is_ok_and(|p| p.exists())
 }
 
 /// A cheap identity of `name`'s on-disk credential state: (mtime, length) of

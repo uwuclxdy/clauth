@@ -1539,9 +1539,7 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // and the states do not deserve one verdict: a profile already on its mint
     // is a successful no-op, while a rolling bearer left with nothing
     // re-stamping it is a failed restore a script must see as non-zero.
-    let backup_exists = profile::profile_dir(&canonical)?
-        .join("session-token.static.json")
-        .exists();
+    let backup_exists = claude::static_backup_path(&canonical)?.exists();
     // A backup that exists but did not restore is an EXPIRED backup
     // (`restore_static_mint` refuses to install a dead mint, and quarantines
     // away anything that is not a mint at all) — every FAILING verdict below
