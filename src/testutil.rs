@@ -885,6 +885,11 @@ pub(crate) const THIRD_PARTY_CACHE_BYTES: &str = r#"{"is_available":true,"rows":
 /// above is what it renders off a cache written before the rename.
 pub(crate) const DEEPSEEK_CACHE_BYTES: &str = r#"{"is_available":true,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"31.45 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"31.45 CNY","kind":"body"}],"bars":[],"best_effort":false}"#;
 
+/// The same account after DeepSeek reports its balance cannot fund a call: the
+/// wallets still arrive and `ThirdPartyStats::unfunded` appends the refusal, so
+/// every surface can render the figure and the verdict together.
+pub(crate) const DEEPSEEK_UNFUNDED_CACHE_BYTES: &str = r#"{"is_available":false,"rows":[{"label":"CNY balance","value":"","kind":"heading"},{"label":"api balance","value":"0.00 CNY","kind":"body"},{"label":"granted","value":"0.00 CNY","kind":"body"},{"label":"topped up","value":"0.00 CNY","kind":"body"},{"label":"","value":"balance too low","kind":"danger"}],"bars":[],"best_effort":false}"#;
+
 /// The third shape, and the one a bar-count reader gets wrong: a provider that
 /// PUBLISHES usage windows answering with none of them. `alibaba::window_bar`
 /// drops a window whose percentage the response omitted and both are optional,

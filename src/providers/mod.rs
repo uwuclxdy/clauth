@@ -364,14 +364,21 @@ impl ThirdPartyStats {
         }
     }
 
-    fn unavailable(reason: &str) -> Self {
+    /// The provider's own verdict that the account cannot fund a call, carrying
+    /// whatever figures it still reported. The verdict rides as a trailing
+    /// `Danger` row instead of replacing the rows: a reader picking a target
+    /// needs both how short the account is and that it will refuse, and the
+    /// providers that set this flag (DeepSeek's `is_available`, OpenRouter's
+    /// overdrawn wallet) both still send the figures.
+    fn unfunded(mut rows: Vec<StatRow>) -> Self {
+        rows.push(StatRow {
+            label: String::new(),
+            value: LOW_BALANCE.to_string(),
+            kind: StatRowKind::Danger,
+        });
         Self {
             is_available: false,
-            rows: vec![StatRow {
-                label: String::new(),
-                value: reason.to_string(),
-                kind: StatRowKind::Danger,
-            }],
+            rows,
             bars: Vec::new(),
             plan: None,
             endpoint: None,
@@ -389,6 +396,13 @@ pub(crate) struct StatRow {
     pub(crate) kind: StatRowKind,
 }
 
+/// What every surface says when a provider reports the account cannot fund a
+/// call. One spelling, because the roster line, the Usage tab and the MCP
+/// headline all render it and a reader meets more than one of them. It is a
+/// verdict the PROVIDER reached, never clauth failing to read a figure, which
+/// is what the old `balance unavailable` wording claimed.
+pub(crate) const LOW_BALANCE: &str = "balance too low";
+
 /// Visual weight of a row in the Usage tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -397,7 +411,7 @@ pub(crate) enum StatRowKind {
     Heading,
     /// Normal key:value.
     Body,
-    /// Danger-coloured (e.g. "balance unavailable").
+    /// Danger-coloured (e.g. [`LOW_BALANCE`]).
     Danger,
     /// Dim / faint text.
     Faint,

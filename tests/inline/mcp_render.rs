@@ -99,6 +99,59 @@ fn third_party_headline_skips_value_less_heading_row() {
     assert_eq!(third_party_headline(&s), "api balance: $4.20");
 }
 
+/// The reader here is picking a delegate target, so a provider's refusal has to
+/// reach the headline WITH its figure: the number alone reads as spendable and
+/// sent one run into a `402`, while the refusal alone hides how short the
+/// account is. `funded_wallets` drops a zero wallet, so an exhausted account
+/// reaches the headline through the first-value arm rather than the wallet one.
+#[test]
+fn third_party_headline_names_a_refusal_beside_its_figure() {
+    let mut s = third_party_stats(
+        vec![],
+        vec![
+            row("CNY balance", ""),
+            row("api balance", "0.00 CNY"),
+            StatRow {
+                label: String::new(),
+                value: crate::providers::LOW_BALANCE.to_string(),
+                kind: StatRowKind::Danger,
+            },
+        ],
+        None,
+    );
+    s.is_available = false;
+    assert_eq!(
+        third_party_headline(&s),
+        "api balance: 0.00 CNY (balance too low)"
+    );
+}
+
+/// With no figure to qualify, the refusal stands alone rather than doubling.
+/// The figure arm skips `Danger` rows for exactly this reason: letting the
+/// verdict fill that slot rendered it twice.
+#[test]
+fn third_party_headline_renders_a_refusal_alone_when_no_figure_reported() {
+    let mut s = third_party_stats(
+        vec![],
+        vec![StatRow {
+            label: String::new(),
+            value: crate::providers::LOW_BALANCE.to_string(),
+            kind: StatRowKind::Danger,
+        }],
+        None,
+    );
+    s.is_available = false;
+    assert_eq!(third_party_headline(&s), "balance too low");
+}
+
+/// A provider that sets the flag without saying why still names the state.
+#[test]
+fn third_party_headline_falls_back_to_the_bare_word_with_no_verdict_row() {
+    let mut s = third_party_stats(vec![], vec![], None);
+    s.is_available = false;
+    assert_eq!(third_party_headline(&s), "unavailable");
+}
+
 /// The two-wallet ruling (owner 2026-08-28) at the headline: the empty USD
 /// wallet a two-wallet cache lists first must not win the rendered figure
 /// over the funded CNY one. Driven from the captured cache bytes.

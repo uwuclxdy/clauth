@@ -34,11 +34,13 @@ pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
 }
 
 /// Pure response → display-rows mapping, separated from HTTP for testability.
+///
+/// `is_available` is DeepSeek's own verdict that the balance is sufficient for
+/// api calls (its wording, in the reference linked above), never a statement
+/// about whether clauth could read one. The response carries `balance_infos`
+/// either way, so an unfunded account ships its figures beside the refusal
+/// rather than in place of them.
 fn stats(raw: &DeepSeekResponse) -> ThirdPartyStats {
-    if !raw.is_available {
-        return ThirdPartyStats::unavailable("balance unavailable");
-    }
-
     let mut rows: Vec<StatRow> = Vec::new();
     for info in &raw.balance_infos {
         rows.push(StatRow {
@@ -62,7 +64,11 @@ fn stats(raw: &DeepSeekResponse) -> ThirdPartyStats {
             kind: StatRowKind::Body,
         });
     }
-    ThirdPartyStats::from_rows(rows)
+    if raw.is_available {
+        ThirdPartyStats::from_rows(rows)
+    } else {
+        ThirdPartyStats::unfunded(rows)
+    }
 }
 
 // ── Wire types ──────────────────────────────────────────────────────────────────

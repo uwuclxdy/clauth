@@ -333,7 +333,17 @@ fn roster_lines(profiles: &[ProfileSnapshot], auth: &SessionAuth) -> String {
 /// DeepSeek's `USD balance` heading) are skipped so the headline never renders a
 /// dangling `label:` with nothing after it.
 pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
-    let body = if !s.bars.is_empty() {
+    // The verdict row `ThirdPartyStats::unfunded` appends, identified by its
+    // value rather than its `Danger` kind: OpenRouter marks its own overdrawn
+    // `api balance` row `Danger` too, so keying on the kind would skip the
+    // figure and headline a period total instead.
+    let refusal = s
+        .rows
+        .iter()
+        .find(|r| r.value == crate::providers::LOW_BALANCE)
+        .map(|r| r.value.as_str());
+
+    let mut body = if !s.bars.is_empty() {
         s.bars
             .iter()
             .map(|b| format!("{} {}", b.label, format_pct(b.pct)))
@@ -341,17 +351,34 @@ pub(crate) fn third_party_headline(s: &ThirdPartyStats) -> String {
             .join(", ")
     } else if let Some(wallet) = crate::providers::funded_wallets(&s.rows).into_iter().next() {
         format!("{}: {}", wallet.label, wallet.value)
-    } else if let Some(row) = s.rows.iter().find(|r| !r.value.is_empty()) {
+    } else if let Some(row) = s
+        .rows
+        .iter()
+        .find(|r| !r.value.is_empty() && Some(r.value.as_str()) != refusal)
+    {
         if row.label.is_empty() {
             row.value.clone()
         } else {
             format!("{}: {}", row.label, row.value)
         }
-    } else if !s.is_available {
-        "unavailable".to_string()
     } else {
         String::new()
     };
+
+    // The refusal rides BESIDE the figure, never in place of it: the reader
+    // here is picking a delegate target and needs both how short the account is
+    // and that the call will be refused. The figure arm above skips the verdict
+    // row for the same reason, since letting it fill that slot rendered the
+    // refusal twice. A provider that sets the flag without saying why falls
+    // back to the bare word.
+    if !s.is_available {
+        let verdict = refusal.unwrap_or("unavailable");
+        body = if body.is_empty() {
+            verdict.to_string()
+        } else {
+            format!("{body} ({verdict})")
+        };
+    }
 
     match (&s.plan, body.is_empty()) {
         (Some(plan), false) => format!("{plan}: {body}"),

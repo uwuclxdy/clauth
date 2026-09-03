@@ -121,10 +121,15 @@ fn stats_builds_wallet_rows() {
     let key: KeyEnvelope = serde_json::from_str(KEY_BODY).unwrap();
     let stats = stats(&credits.data, Some(&key.data));
     // The live account is overdrawn: the rows render, but the reachability
-    // dot must read red (every paid call 402s).
+    // dot must read red (every paid call 402s) and the refusal rides beside
+    // the figures rather than replacing them.
     assert!(!stats.is_available);
-    // Heading + 3 wallet rows + 3 period rows. No cap, no free tier.
-    assert_eq!(stats.rows.len(), 7);
+    let last = stats.rows.last().expect("refusal row");
+    assert_eq!(last.kind, StatRowKind::Danger);
+    assert_eq!(last.value, crate::providers::LOW_BALANCE);
+    // Heading + 3 wallet rows + 3 period rows, plus that refusal. No cap, no
+    // free tier.
+    assert_eq!(stats.rows.len(), 8);
     assert_eq!(stats.rows[0].kind, StatRowKind::Heading);
     assert_eq!(stats.rows[0].label, "credits");
     // The literal, not the constant: this row's label is a cross-module contract
@@ -134,7 +139,9 @@ fn stats_builds_wallet_rows() {
     // The live overdrawn account: usage exceeds the purchased credits.
     assert_eq!(stats.rows[1].value, "-0.20 USD");
     assert_eq!(stats.rows[1].kind, StatRowKind::Danger);
-    let labels: Vec<&str> = stats.rows[2..].iter().map(|r| r.label.as_str()).collect();
+    // `2..7`, not `2..`: the trailing entry is the refusal asserted above, and
+    // it carries no label.
+    let labels: Vec<&str> = stats.rows[2..7].iter().map(|r| r.label.as_str()).collect();
     assert_eq!(
         labels,
         ["used", "purchased", "today", "this week", "this month"]

@@ -125,17 +125,13 @@ fn stats(credits: &CreditsData, key: Option<&KeyData>) -> ThirdPartyStats {
             });
         }
     }
-    ThirdPartyStats {
+    if remaining >= 0.005 {
+        ThirdPartyStats::from_rows(rows)
+    } else {
         // An overdrawn wallet cannot afford any call, so the daemon's
-        // reachability dot must read red. The rows still render: the TUI and
-        // MCP surfaces only consult `is_available` when no row carries a
-        // value, which never happens here.
-        is_available: remaining >= 0.005,
-        rows,
-        bars: Vec::new(),
-        plan: None,
-        endpoint: None,
-        best_effort: false,
+        // reachability dot must read red. The rows still render, and
+        // `unfunded` appends the shared refusal beside them.
+        ThirdPartyStats::unfunded(rows)
     }
 }
 

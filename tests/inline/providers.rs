@@ -157,7 +157,7 @@ fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
     );
     for junk in [
         "123.4M  (1.2k calls)", // z.ai's token total
-        "balance unavailable",
+        LOW_BALANCE,            // the refusal `unfunded` appends, which reaches this parser
         "31.45",
         "31.45 USD extra",
         "USD 31.45",

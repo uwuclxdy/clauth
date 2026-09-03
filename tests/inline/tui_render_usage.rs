@@ -281,6 +281,36 @@ fn tp_rows_disabled_profile_is_terminal() {
     );
 }
 
+/// The Usage tab is where an operator decides whether an account can still
+/// serve, so a provider's refusal renders BESIDE the figures it qualifies
+/// rather than in place of them. Discarding the wallets left the tab saying
+/// only that something was wrong, with no way to see how short the account was.
+#[test]
+fn tp_rows_render_a_refusal_under_the_figures_it_qualifies() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    profile.third_party_usage = Some(
+        serde_json::from_str(crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES)
+            .expect("the unfunded balance cache parses"),
+    );
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        rendered.iter().any(|l| l.contains("0.00 CNY")),
+        "the wallet figure must survive the refusal, got {rendered:?}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|l| l.contains(crate::providers::LOW_BALANCE)),
+        "the refusal must render, got {rendered:?}"
+    );
+}
+
 /// A recognised-provider profile with NO credential its provider can use is
 /// never scheduled either, so it has the same hole. Reachable from the shipped
 /// TUI: a blank Setup key field stores `None`.
