@@ -85,7 +85,10 @@ There is no `remove field`: an env row's <kbd>⏎</kbd> edits its value, and an 
 
 | Row | Sets |
 |-----|------|
-| `token` | read-only state of a stored long-lived setup token, above the editable rows: its remaining life, or `expired` / `mis-filled` with the fix beneath it ([Configuration](Configuration#account-types)) |
+| `status` | read-only, and present only while the account is disabled |
+| `type` | read-only `api` or `oauth`, off the base-url row and tracking what you type into it |
+| `provider` | read-only, present only for an endpoint clauth recognises: which provider it typed the account as |
+| `token` | read-only state of a stored long-lived setup token, above the editable rows, in one of eight states. Static: `long-lived · ~Nd left`, `expires in ~Nd` inside a month, `long-lived · no recorded expiry`, and `expired`. Rolling: `rolling · re-stamps in ~Nh`, `rolling · re-stamp due` inside the last hour, `rolling · no recorded expiry`, and `rolling token stalled` once nothing re-stamped it in time. `mis-filled` is neither: the sidecar holds a rotating pair the split cannot use. The charged states carry the fix beneath them ([Configuration](Configuration#account-types)) |
 | `name` | the profile name |
 | `auto-start` | whether clauth opens the 5h window with a 1-token ping ([Configuration](Configuration#auto-start-the-5-hour-window)) |
 | `base url` | the API endpoint; blank means an OAuth account |
@@ -131,7 +134,7 @@ Each row is a check on your Claude Code wiring: `clauth` on `PATH` and `claude -
 | `repair credentials` | the active profile's stored login disagrees with the live one |
 | `relink credentials` | the active profile's credential link is missing while its stored credentials are intact |
 | `add the keybinding and sidebar row to herdr's config` | the herdr plugin is installed but its key is unbound or its sidebar row is untemplated |
-| `install the clauth plugin` | the plugin row reads not installed, or installed project-local only; confirming runs the real `claude plugin` installer at user scope |
+| `install the clauth plugin` / `install globally (user scope)` | the first spelling when the plugin row reads not installed, the second when it is installed for this project only. Either confirms into the real `claude plugin` installer at user scope |
 
 The `herdr` row's detail takes focus: <kbd>⏎</kbd> on the row descends, <kbd>↑</kbd>/<kbd>↓</kbd> walk the options rows, <kbd>space</kbd> or <kbd>⏎</kbd> activates one (toggle, cycle, or open the tag-refresh editor), <kbd>+</kbd>/<kbd>-</kbd> step the refresh, <kbd>esc</kbd> closes the editor and then ascends. `delegate row text` opens a confirm that defaults to cancel.
 

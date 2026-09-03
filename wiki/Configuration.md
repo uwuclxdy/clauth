@@ -187,10 +187,18 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
   ai_pricelog_price_cache.json  # ai-pricelog model prices for the cost lens
   status_cache.json        # status.claude.com incident feed
   status.json              # the daemon's published snapshot (see Daemon)
+  session_profiles.json    # which account each Claude Code session ran on
+  token_ledger.json        # the per-day token ledger behind the Tokens tab
   clauth.log, daemon.log   # event lines from the TUI and the daemon
+  clauthd.pid              # the running daemon's process id
   completions/             # generated shell completion scripts
+  .completions_installed   # marker: completions have been installed
+  conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
+  live_bare/<pid>          # one marker per live bare `claude` session
   live_sessions/<sid>.json # one row per live `clauth start` session
+  presets/<name>.json      # endpoint + model presets you saved
+  rotation-locks/<name>.lock  # one OAuth-rotation lock per account
   profiles/
     work/
       config.toml          # everything in the table above
@@ -206,6 +214,8 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
       profile_fetched.json # when the plan tier was last read
       kick_block.json      # messages-limiter block state
       throughput_cache.json# observed delegate tokens/sec per model
+      touch-receipt.json   # what the last credential swap wrote, for the watchdog
+      quarantine/          # credentials parked after a refresh token was rejected
       runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
@@ -216,7 +226,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
   markers/<hash>           # the install record `clauth self-heal` keys on
 ```
 
-Lock files (`.lock`, `clauthd.lock`, `usage-fetch.lock`) sit alongside. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
+Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. That is the whole tree: every path clauth writes is listed above, so a file you find here that is not is a leftover from an older version. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
 Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `credentials.json` or `session-token.json` signs that profile out.
 
