@@ -926,10 +926,11 @@ fn throughput_prose(rows: &[Value]) -> String {
 /// structurally has none.
 ///
 /// The tier guard asks the headroom payload's `kind`, never the display
-/// `provider`: [`crate::profile_json::provider_label`] renders every
-/// unrecognised endpoint as `anthropic`, so a generic api-key account (a local
-/// llama, an aggregator) would be told its Anthropic plan tier is unknown when
-/// it has no Anthropic plan at all.
+/// `provider`: [`crate::profile_json::provider_label`] types the ACCOUNT off
+/// the managed `base_url` field alone, so an account whose endpoint lives only
+/// in an `[env] ANTHROPIC_BASE_URL` entry still reads `anthropic` there and
+/// would be told its Anthropic plan tier is unknown when it has no Anthropic
+/// plan at all. `kind` names which usage shape the account actually has.
 fn profile_line(row: &Value) -> String {
     let name = row.get("name").and_then(Value::as_str).unwrap_or("unknown");
     let active = row.get("active").and_then(Value::as_bool).unwrap_or(false);
@@ -1445,13 +1446,13 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
         if !tokens.is_empty() {
             out.push_str(&format!(", usage: {tokens}"));
             // The child's token counts are its own self-report. The tokenizer
-            // is whichever model actually ran. `live_usage.provider`, the
+            // is whichever model actually ran. `live_usage.served_by`, the
             // call-resolved label, names who served it. A non-anthropic label
             // qualifies the bytes so the count is not read as Anthropic's
             // tokenization.
             if let Some(p) = e
                 .get("live_usage")
-                .and_then(|lu| lu.get("provider"))
+                .and_then(|lu| lu.get("served_by"))
                 .and_then(Value::as_str)
                 && !p.is_empty()
                 && p != "anthropic"

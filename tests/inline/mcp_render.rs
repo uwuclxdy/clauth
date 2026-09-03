@@ -1775,16 +1775,15 @@ fn envelope_prose_names_a_blank_usage_key() {
 }
 
 /// The child's `usage` bytes are its own self-report priced against Anthropic's
-/// card, so a non-anthropic provider label qualifies them with who actually
-/// served. `live_usage.provider` is that call-resolved label, read here as
-/// data.
+/// card, so a non-anthropic label qualifies them with who actually served.
+/// `live_usage.served_by` is that call-resolved label, read here as data.
 #[test]
-fn envelope_prose_qualifies_usage_for_a_non_anthropic_provider() {
+fn envelope_prose_qualifies_usage_for_a_non_anthropic_served_by() {
     let e = serde_json::json!({
         "is_error": false,
         "result": "done",
         "usage": {"input_tokens": 5},
-        "live_usage": {"provider": "DeepSeek"},
+        "live_usage": {"served_by": "DeepSeek"},
     });
     assert_eq!(
         envelope_prose(&e),
@@ -1795,21 +1794,26 @@ fn envelope_prose_qualifies_usage_for_a_non_anthropic_provider() {
 /// A positive `anthropic` earns the bare clause: the bytes are Anthropic-served,
 /// so no qualifier is added.
 #[test]
-fn envelope_prose_leaves_usage_bare_for_an_anthropic_provider() {
+fn envelope_prose_leaves_usage_bare_for_an_anthropic_served_by() {
     let e = serde_json::json!({
         "is_error": false,
         "result": "done",
         "usage": {"input_tokens": 5},
-        "live_usage": {"provider": "anthropic"},
+        "live_usage": {"served_by": "anthropic"},
     });
     assert_eq!(envelope_prose(&e), "finished: done, usage: input 5 tokens");
 }
 
-/// No `live_usage.provider` means no answer about who served; the clause keeps
-/// its old spelling. A missing `live_usage` object and an empty provider string
-/// are the same case, the latter pinned on the `!p.is_empty()` guard.
+/// No `live_usage.served_by` means no answer about who served; the clause keeps
+/// its old spelling. A missing `live_usage` object and an empty label are the
+/// same case, the latter pinned on the `!p.is_empty()` guard.
+///
+/// A `provider` key is the same case too, and that is the point of the split:
+/// `provider` answers how an ACCOUNT is typed everywhere else in this server,
+/// so reading it here would let one account's two different words reach one
+/// clause (owner ruling 2026-09-03).
 #[test]
-fn envelope_prose_renders_the_old_clause_without_a_provider() {
+fn envelope_prose_renders_the_old_clause_without_a_served_by_label() {
     let no_live = serde_json::json!({
         "is_error": false,
         "result": "done",
@@ -1820,14 +1824,14 @@ fn envelope_prose_renders_the_old_clause_without_a_provider() {
         "finished: done, usage: input 5 tokens"
     );
 
-    let no_provider = serde_json::json!({
+    let no_label = serde_json::json!({
         "is_error": false,
         "result": "done",
         "usage": {"input_tokens": 5},
         "live_usage": {"profile": "work"},
     });
     assert_eq!(
-        envelope_prose(&no_provider),
+        envelope_prose(&no_label),
         "finished: done, usage: input 5 tokens"
     );
 
@@ -1835,10 +1839,21 @@ fn envelope_prose_renders_the_old_clause_without_a_provider() {
         "is_error": false,
         "result": "done",
         "usage": {"input_tokens": 5},
-        "live_usage": {"provider": ""},
+        "live_usage": {"served_by": ""},
     });
     assert_eq!(
         envelope_prose(&empty),
+        "finished: done, usage: input 5 tokens"
+    );
+
+    let account_typing_word = serde_json::json!({
+        "is_error": false,
+        "result": "done",
+        "usage": {"input_tokens": 5},
+        "live_usage": {"provider": "DeepSeek"},
+    });
+    assert_eq!(
+        envelope_prose(&account_typing_word),
         "finished: done, usage: input 5 tokens"
     );
 }

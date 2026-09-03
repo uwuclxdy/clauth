@@ -1556,7 +1556,7 @@ fn an_unreadable_profile_config_prices_as_endpoint_unknown() {
     );
 }
 
-/// The fold writes `live_usage.provider` off the CALL's resolved provider, so a
+/// The fold writes `live_usage.served_by` off the CALL's resolved provider, so a
 /// caller `env` override can retarget one run without touching the profile. The
 /// resolver reads the caller's `ANTHROPIC_BASE_URL` first, then the target's
 /// stored endpoint: three stored shapes cover a recognised provider's display
@@ -1598,7 +1598,7 @@ fn the_fold_labels_the_serving_provider_from_the_calls_resolution() {
 
     let label = |value: &serde_json::Value| -> Option<String> {
         value
-            .pointer("/live_usage/provider")
+            .pointer("/live_usage/served_by")
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
@@ -1620,7 +1620,7 @@ fn the_fold_labels_the_serving_provider_from_the_calls_resolution() {
     assert!(
         fold("never-stored", &HashMap::new())
             .get("live_usage")
-            .and_then(|lu| lu.get("provider"))
+            .and_then(|lu| lu.get("served_by"))
             .is_none(),
         "an unreadable profile is `cannot say`: the key stays absent",
     );
@@ -1681,7 +1681,7 @@ fn the_fold_labels_the_serving_provider_from_the_calls_resolution() {
 }
 
 /// The heartbeat writes `RunningSpec.provider` onto the running record, and the
-/// done fold reads that record's field into `live_usage.provider` for the
+/// done fold reads that record's field into `live_usage.served_by` for the
 /// served-by clause. Seeded through the real writers, so dropping any link in
 /// the chain reds here rather than only in the call-time resolver test.
 #[test]
@@ -1714,7 +1714,7 @@ fn a_minted_provider_rides_the_record_to_the_served_by_clause() {
     let (payload, _) = fold_done_envelope(&done, DigestMode::Skip);
     assert_eq!(
         payload
-            .pointer("/live_usage/provider")
+            .pointer("/live_usage/served_by")
             .and_then(serde_json::Value::as_str),
         Some("DeepSeek"),
         "the fold reads the record's provider into live_usage"

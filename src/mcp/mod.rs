@@ -491,7 +491,8 @@ fn serving_provider_label(url: &str) -> String {
 /// The question is "who served this request", so it reads the call's own
 /// resolution and not [`crate::profile_json::provider_label`] (the owner-ruled
 /// label with the same three-word vocabulary, answering how the account is
-/// TYPED off the managed field alone), and not
+/// TYPED off the managed field alone — which is why the reply spends a key of
+/// its own on this one, `live_usage.served_by`), and not
 /// [`crate::profile::stored_provider`] (the managed field's typed provider).
 /// Both type the ACCOUNT, so an account an operator retargets through
 /// `[env] ANTHROPIC_BASE_URL` answers `anthropic` there and the endpoint's
@@ -530,16 +531,24 @@ fn delegate_call_provider(target: &str, caller_env: &HashMap<String, String>) ->
 /// rather than falling back to a name-keyed read of a profile the call may
 /// never have routed through.
 ///
-/// `provider` is the same CALL's serving-provider label, resolved and carried
+/// `served_by` is the same CALL's serving-provider label, resolved and carried
 /// exactly the same way ([`delegate_call_provider`] at call time, the record
 /// on the collect and hook paths). Both ride the call because a caller `env`
 /// override retargets one run without touching the profile, and a name-keyed
 /// read would assert the account's answer for a call that routed elsewhere.
+///
+/// It publishes under its own key rather than `provider`, which every other
+/// reply in this server spends on how an ACCOUNT is typed
+/// ([`crate::profile_json::provider_label`]). The two answer different
+/// questions out of one three-word vocabulary, so one account can hold both
+/// words at once — a profile whose managed `base_url` names Anthropic's own
+/// origin is typed `generic` (`is_oauth` reads that field alone) and served by
+/// `anthropic` (owner ruling 2026-09-03).
 fn fold_delegate_live_usage(
     payload: serde_json::Value,
     profile: &ProfileName,
     endpoint: Option<String>,
-    provider: Option<String>,
+    served_by: Option<String>,
     now: i64,
     digest: DigestMode<'_>,
 ) -> serde_json::Value {
@@ -556,8 +565,8 @@ fn fold_delegate_live_usage(
     if let Some(endpoint) = endpoint {
         live["endpoint"] = serde_json::Value::String(endpoint);
     }
-    if let Some(provider) = provider {
-        live["provider"] = serde_json::Value::String(provider);
+    if let Some(served_by) = served_by {
+        live["served_by"] = serde_json::Value::String(served_by);
     }
     if let Some(note) = throughput_note(profile, now) {
         live["throughput_warning"] = serde_json::Value::String(note);
