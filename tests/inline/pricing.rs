@@ -597,18 +597,19 @@ fn distill_parses_overrides_and_effective_at() {
 #[test]
 fn distill_override_inherits_missing_axes_from_base() {
     // An override carries only the axes it changes; the ones it leaves absent
-    // price at the row's base. Every axis has to DISCRIMINATE, so the base
-    // names a distinct non-zero value for all four and the override supplies
-    // only `output` and `cache_read`: dropping the `.or(base.…)` on any of the
-    // other two then yields 0.0 where a real value is asserted. An override
-    // that supplied `input` would make `input`'s inheritance unobservable, and
-    // an axis absent from BOTH sides would assert exactly what a broken
-    // inherit also returns.
+    // price at the row's base. An axis the override SUPPLIES is unobservable
+    // here — `self.axis.or(base.axis)` and a bare `self.axis` return the same
+    // value — so supplying two axes leaves two of the four untested, and
+    // choosing WHICH two only moves the blind spot. The override therefore
+    // supplies `output` alone, leaving `input`, `cache_read` and `cache_write`
+    // to inherit distinct non-zero values a fall to 0.0 cannot produce.
+    // `output`'s own inheritance is covered by
+    // `later_window_entry_wins_when_both_match`.
     let json = r#"{"version": 4, "sources": {"zai": {
         "m": {
             "rates": {"input": 0.1, "output": 0.2, "cache_read": 0.01, "cache_write": 1.25},
             "overrides": [
-                {"when": {"window": [100, 400]}, "rates": {"output": 0.5, "cache_read": 0.03}}
+                {"when": {"window": [100, 400]}, "rates": {"output": 0.5}}
             ]
         }
     }}}"#;
@@ -617,13 +618,17 @@ fn distill_override_inherits_missing_axes_from_base() {
     assert_eq!(entries.len(), 2);
     // Supplied by the override.
     assert!((entries[1].output - 5e-7).abs() < 1e-12);
-    assert!((entries[1].cache_read - 3e-8).abs() < 1e-15);
     // Absent from the override, so inherited — and non-zero, so a fall to 0.0
     // cannot pass.
     assert!(
         (entries[1].input - 1e-7).abs() < 1e-12,
         "input inherits base, got {}",
         entries[1].input
+    );
+    assert!(
+        (entries[1].cache_read - 1e-8).abs() < 1e-15,
+        "cache_read inherits base, got {}",
+        entries[1].cache_read
     );
     assert!(
         (entries[1].cache_write - 1.25e-6).abs() < 1e-12,
