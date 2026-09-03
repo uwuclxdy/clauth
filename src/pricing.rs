@@ -946,8 +946,12 @@ fn run_fetch(tx: &Sender<PricingEvent>, cache_file: &Path, stale_cleaned: &mut b
                 now_ms(),
                 history,
             );
-            save_cache(cache_file, &table);
-            delete_stale_cache_once(cache_file, stale_cleaned);
+            // the sweep deletes the file the PREVIOUS release wrote, so it
+            // waits on the new one actually landing: a failed write (read-only
+            // home, full disk) would otherwise leave the user with neither
+            if save_cache(cache_file, &table) {
+                delete_stale_cache_once(cache_file, stale_cleaned);
+            }
             let _ = tx.send(PricingEvent::Loaded(Box::new(table)));
         }
         Err(_) => match load_cache(cache_file) {
@@ -1586,7 +1590,7 @@ fn load_cache(path: &Path) -> Option<PriceTable> {
 }
 
 /// Persist the cache best-effort (atomic tmp + rename). Errors are swallowed.
-fn save_cache(path: &Path, table: &PriceTable) {
+fn save_cache(path: &Path, table: &PriceTable) -> bool {
     let cache = CacheFile {
         fetched_at_ms: table.fetched_at_ms,
         store: table.store.clone(),
@@ -1594,8 +1598,9 @@ fn save_cache(path: &Path, table: &PriceTable) {
         canonical: table.canonical.clone(),
         history: table.history.clone(),
     };
-    if let Ok(json) = serde_json::to_string(&cache) {
-        let _ = atomic_write_600(path, json);
+    match serde_json::to_string(&cache) {
+        Ok(json) => atomic_write_600(path, json).is_ok(),
+        Err(_) => false,
     }
 }
 
