@@ -25,6 +25,7 @@ fn spec(job_id: &str, started_at: u64) -> RunningSpec {
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        provider: None,
         isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
@@ -324,6 +325,44 @@ fn a_dead_servers_row_still_carries_the_session_id_its_record_kept() {
     );
 }
 
+/// Whether a handed-back `session_id` is a handle at all is the run's isolation,
+/// and the id alone cannot say: an isolated run's transcript died with its
+/// throwaway tree, so `delegate({resume})` refuses the very id the row prints.
+#[test]
+fn an_isolated_runs_row_is_marked_isolated() {
+    let _home = HomeSandbox::new();
+    let mut isolated = spec("d-iso-0", NOW - 60_000);
+    isolated.isolated = true;
+    write_heartbeat(&isolated, NOW - 1_000, "in a throwaway tree").unwrap();
+    write_heartbeat(
+        &spec("d-shared-0", NOW - 60_000),
+        NOW - 1_000,
+        "in the global store",
+    )
+    .unwrap();
+
+    let json: serde_json::Value = serde_json::from_str(&rows_json(&rows(NOW))).unwrap();
+    let array = json.as_array().expect("a JSON array").clone();
+    let by_id = |id: &str| {
+        array
+            .iter()
+            .find(|r| r["job_id"] == id)
+            .unwrap_or_else(|| panic!("no row for {id} in {json}"))
+            .clone()
+    };
+
+    assert_eq!(
+        by_id("d-iso-0")["isolated"],
+        serde_json::json!(true),
+        "an isolated run's row says its handle is not one"
+    );
+    assert_eq!(
+        by_id("d-shared-0")["isolated"],
+        serde_json::json!(false),
+        "a shared run's row says its handle resolves"
+    );
+}
+
 /// The `--json` field set is FIXED: every key is present on every row, and a
 /// figure the record does not have is `null`.
 ///
@@ -341,12 +380,13 @@ fn the_json_row_carries_every_key_on_every_state() {
     let array = json.as_array().expect("a JSON array");
     assert_eq!(array.len(), 2);
 
-    const KEYS: [&str; 11] = [
+    const KEYS: [&str; 12] = [
         "job_id",
         "profile",
         "state",
         "collectable",
         "session_id",
+        "isolated",
         "age_secs",
         "elapsed_secs",
         "last_output_secs_ago",
@@ -377,6 +417,10 @@ fn the_json_row_carries_every_key_on_every_state() {
         "a streaming run has no wall clock, and null is how that reads here"
     );
     assert_eq!(live["tail"], "building");
+    assert_eq!(
+        live["isolated"], false,
+        "a shared run's session id IS a resume handle, and the flag says so"
+    );
 
     let done = array
         .iter()

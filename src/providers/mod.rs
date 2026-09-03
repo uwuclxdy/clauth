@@ -257,7 +257,7 @@ impl ThirdPartyTarget {
 /// The scheme + host are compared case-insensitively (hosts are
 /// case-insensitive per RFC 3986). `url` is lowercased; `base` is lowercased
 /// defensively so a future caller passing mixed-case still matches.
-fn url_matches_host(url: &str, base: &str) -> bool {
+pub(crate) fn url_matches_host(url: &str, base: &str) -> bool {
     let url = url.to_ascii_lowercase();
     let base = base.to_ascii_lowercase();
     match url.strip_prefix(&base) {

@@ -1774,6 +1774,75 @@ fn envelope_prose_names_a_blank_usage_key() {
     assert_eq!(envelope_prose(&e), "finished: done, usage: `(unnamed)` 5");
 }
 
+/// The child's `usage` bytes are its own self-report priced against Anthropic's
+/// card, so a non-anthropic provider label qualifies them with who actually
+/// served. `live_usage.provider` is that call-resolved label, read here as
+/// data.
+#[test]
+fn envelope_prose_qualifies_usage_for_a_non_anthropic_provider() {
+    let e = serde_json::json!({
+        "is_error": false,
+        "result": "done",
+        "usage": {"input_tokens": 5},
+        "live_usage": {"provider": "DeepSeek"},
+    });
+    assert_eq!(
+        envelope_prose(&e),
+        "finished: done, usage: input 5 tokens (served by DeepSeek)"
+    );
+}
+
+/// A positive `anthropic` earns the bare clause: the bytes are Anthropic-served,
+/// so no qualifier is added.
+#[test]
+fn envelope_prose_leaves_usage_bare_for_an_anthropic_provider() {
+    let e = serde_json::json!({
+        "is_error": false,
+        "result": "done",
+        "usage": {"input_tokens": 5},
+        "live_usage": {"provider": "anthropic"},
+    });
+    assert_eq!(envelope_prose(&e), "finished: done, usage: input 5 tokens");
+}
+
+/// No `live_usage.provider` means no answer about who served; the clause keeps
+/// its old spelling. A missing `live_usage` object and an empty provider string
+/// are the same case, the latter pinned on the `!p.is_empty()` guard.
+#[test]
+fn envelope_prose_renders_the_old_clause_without_a_provider() {
+    let no_live = serde_json::json!({
+        "is_error": false,
+        "result": "done",
+        "usage": {"input_tokens": 5},
+    });
+    assert_eq!(
+        envelope_prose(&no_live),
+        "finished: done, usage: input 5 tokens"
+    );
+
+    let no_provider = serde_json::json!({
+        "is_error": false,
+        "result": "done",
+        "usage": {"input_tokens": 5},
+        "live_usage": {"profile": "work"},
+    });
+    assert_eq!(
+        envelope_prose(&no_provider),
+        "finished: done, usage: input 5 tokens"
+    );
+
+    let empty = serde_json::json!({
+        "is_error": false,
+        "result": "done",
+        "usage": {"input_tokens": 5},
+        "live_usage": {"provider": ""},
+    });
+    assert_eq!(
+        envelope_prose(&empty),
+        "finished: done, usage: input 5 tokens"
+    );
+}
+
 /// The cut walks scalars, not bytes: a multi-byte char at the boundary is
 /// taken whole or not at all. A budget of 0 collapses any non-empty clause to
 /// the marker alone, so no budget value can panic the subtraction, and an

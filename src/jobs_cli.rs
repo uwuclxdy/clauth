@@ -81,6 +81,12 @@ pub(crate) struct JobRow {
     /// [`jobs::JobRecord::session_id`]'s; on this surface the key is always
     /// present, `null` where the record carries none.
     pub(crate) session_id: Option<String>,
+    /// Whether the run launched isolated. It rides beside `session_id` because
+    /// it is what decides whether that handle is one at all: an isolated run's
+    /// transcript lived in a throwaway tree, so a crash left nothing for
+    /// `delegate({resume})` to reach. A script reading the id alone cannot tell
+    /// the two apart.
+    pub(crate) isolated: bool,
     /// The delegate's own last words, already bounded by the writer. Empty on a
     /// finished record: its envelope carries the whole result, so a tail beside
     /// it says nothing new.
@@ -111,6 +117,7 @@ fn row(job: &StoredJob, now: u64) -> JobRow {
         age_secs: job.age_secs(now),
         live: phase.is_live().then(|| jobs::running_liveness(record, now)),
         session_id: record.session_id.clone(),
+        isolated: record.isolated,
         tail: match phase {
             JobPhase::Done => String::new(),
             _ => record.tail.clone(),
@@ -357,6 +364,7 @@ fn row_json(row: &JobRow) -> serde_json::Value {
         "state": row.phase.label(),
         "collectable": row.phase.is_collectable(),
         "session_id": row.session_id,
+        "isolated": row.isolated,
         "age_secs": row.age_secs,
         "elapsed_secs": row.live.map(|l| l.elapsed_secs),
         "last_output_secs_ago": row.live.and_then(|l| l.last_output_secs_ago),

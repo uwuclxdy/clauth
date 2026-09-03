@@ -1280,6 +1280,7 @@ fn running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::RunningSp
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        provider: None,
         isolated: false,
         idle_secs: Some(300),
         // A background job's record is collectable from its reserve; the
@@ -1475,6 +1476,7 @@ fn a_generic_api_key_target_answers_with_the_figures_clauth_holds() {
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("litellm"),
         delegate_call_endpoint("litellm", &HashMap::new()),
+        None,
         0,
         DigestMode::Skip,
     ));
@@ -1514,6 +1516,7 @@ fn an_env_authored_endpoint_qualifies_the_cost_clause() {
             serde_json::json!({"is_error": false, "result": "ok", "total_cost_usd": 2.06}),
             &crate::profile::ProfileName::from(name),
             delegate_call_endpoint(name, &HashMap::new()),
+            None,
             0,
             DigestMode::Skip,
         ))
@@ -1542,6 +1545,7 @@ fn an_unreadable_profile_config_prices_as_endpoint_unknown() {
         serde_json::json!({"is_error": false, "result": "ok", "total_cost_usd": 2.06}),
         &crate::profile::ProfileName::from("never-stored"),
         delegate_call_endpoint("never-stored", &HashMap::new()),
+        None,
         0,
         DigestMode::Skip,
     ));
@@ -1549,6 +1553,208 @@ fn an_unreadable_profile_config_prices_as_endpoint_unknown() {
         prose.contains("(equivalent Anthropic API rate cost: $2.06, endpoint unknown)"),
         "an unclassifiable target neither reads as Anthropic-priced nor claims \
          to know the endpoint: {prose}",
+    );
+}
+
+/// The fold writes `live_usage.provider` off the CALL's resolved provider, so a
+/// caller `env` override can retarget one run without touching the profile. The
+/// resolver reads the caller's `ANTHROPIC_BASE_URL` first, then the target's
+/// stored endpoint: three stored shapes cover a recognised provider's display
+/// name, a generic endpoint, and Anthropic for no endpoint of its own, and an
+/// unreadable profile is `cannot say`, so the key stays absent like the sibling
+/// `endpoint` key.
+#[test]
+fn the_fold_labels_the_serving_provider_from_the_calls_resolution() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "vendor".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save recognised provider profile");
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "litellm".to_string(),
+        Some("http://127.0.0.1:4000".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save generic api-key profile");
+    crate::profile::save_profile(&crate::profile::Profile::new(
+        "work".to_string(),
+        None,
+        None,
+    ))
+    .expect("save oauth profile");
+
+    let fold = |name: &str, caller_env: &HashMap<String, String>| {
+        fold_delegate_live_usage(
+            serde_json::json!({"is_error": false, "result": "ok", "usage": {"input_tokens": 5}}),
+            &crate::profile::ProfileName::from(name),
+            delegate_call_endpoint(name, caller_env),
+            delegate_call_provider(name, caller_env),
+            0,
+            DigestMode::Skip,
+        )
+    };
+
+    let label = |value: &serde_json::Value| -> Option<String> {
+        value
+            .pointer("/live_usage/provider")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    assert_eq!(
+        label(&fold("vendor", &HashMap::new())),
+        Some("DeepSeek".to_string()),
+        "a recognised provider folds its display name"
+    );
+    assert_eq!(
+        label(&fold("litellm", &HashMap::new())),
+        Some("generic".to_string()),
+        "a generic endpoint folds `generic`"
+    );
+    assert_eq!(
+        label(&fold("work", &HashMap::new())),
+        Some("anthropic".to_string()),
+        "no endpoint of its own folds `anthropic`"
+    );
+    assert!(
+        fold("never-stored", &HashMap::new())
+            .get("live_usage")
+            .and_then(|lu| lu.get("provider"))
+            .is_none(),
+        "an unreadable profile is `cannot say`: the key stays absent",
+    );
+
+    let mut localhost = HashMap::new();
+    localhost.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "http://localhost:4000/v1".to_string(),
+    );
+    assert_eq!(
+        delegate_call_provider("work", &localhost).as_deref(),
+        Some("generic"),
+        "an unrecognised caller override serves as generic"
+    );
+    let local = render::envelope_prose(&fold("work", &localhost));
+    assert!(
+        local.contains("usage: input 5 tokens (served by generic)"),
+        "the override's generic label reaches the prose: {local}",
+    );
+
+    let mut deepseek = HashMap::new();
+    deepseek.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://api.deepseek.com/anthropic".to_string(),
+    );
+    assert_eq!(
+        delegate_call_provider("work", &deepseek).as_deref(),
+        Some("DeepSeek"),
+        "a recognised caller override folds its display name"
+    );
+    let deepseek_prose = render::envelope_prose(&fold("work", &deepseek));
+    assert!(
+        deepseek_prose.contains("usage: input 5 tokens (served by DeepSeek)"),
+        "the override's recognised label reaches the prose: {deepseek_prose}",
+    );
+
+    let mut anthropic_url = HashMap::new();
+    anthropic_url.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://api.anthropic.com".to_string(),
+    );
+    assert_eq!(
+        delegate_call_provider("work", &anthropic_url).as_deref(),
+        Some("anthropic"),
+        "Anthropic's own origin folds `anthropic`, never `generic`"
+    );
+    let anthropic_url_prose = render::envelope_prose(&fold("work", &anthropic_url));
+    assert!(
+        !anthropic_url_prose.contains("served by"),
+        "the anthropic origin renders the bare clause: {anthropic_url_prose}",
+    );
+
+    let anthro = render::envelope_prose(&fold("work", &HashMap::new()));
+    assert!(
+        !anthro.contains("served by"),
+        "an anthropic label renders the bare clause: {anthro}",
+    );
+}
+
+/// The heartbeat writes `RunningSpec.provider` onto the running record, and the
+/// done fold reads that record's field into `live_usage.provider` for the
+/// served-by clause. Seeded through the real writers, so dropping any link in
+/// the chain reds here rather than only in the call-time resolver test.
+#[test]
+fn a_minted_provider_rides_the_record_to_the_served_by_clause() {
+    let _home = HomeSandbox::new();
+    let id = jobs::new_job_id(1000);
+    let spec = jobs::RunningSpec {
+        provider: Some("DeepSeek".to_string()),
+        ..running_spec(&id, "work", 1000)
+    };
+    jobs::write_heartbeat_with_session(&spec, 0, "", None).unwrap();
+    let record = jobs::read(&id).unwrap();
+    assert_eq!(
+        record.provider.as_deref(),
+        Some("DeepSeek"),
+        "the heartbeat writes the mint's provider onto the running record"
+    );
+
+    jobs::write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        Some("DeepSeek".to_string()),
+        false,
+        serde_json::json!({"is_error": false, "result": "ok", "usage": {"input_tokens": 5}}),
+    )
+    .unwrap();
+    let done = jobs::read(&id).unwrap();
+    let (payload, _) = fold_done_envelope(&done, DigestMode::Skip);
+    assert_eq!(
+        payload
+            .pointer("/live_usage/provider")
+            .and_then(serde_json::Value::as_str),
+        Some("DeepSeek"),
+        "the fold reads the record's provider into live_usage"
+    );
+    let prose = render::envelope_prose(&payload);
+    assert!(
+        prose.contains("usage: input 5 tokens (served by DeepSeek)"),
+        "and the prose qualifies the bytes: {prose}",
+    );
+}
+
+/// A normal isolated finish still renders its envelope: `fold_done_envelope`
+/// must gate the tombstone arm on `record.crashed`, not on `isolated`, or an
+/// isolated delegate's result reads as a crash because the isolated copy does
+/// not consult the handle.
+#[test]
+fn a_normal_isolated_done_record_renders_its_envelope() {
+    let _home = HomeSandbox::new();
+    let id = jobs::new_job_id(1000);
+    jobs::write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        None,
+        true,
+        serde_json::json!({"is_error": false, "result": "ok", "usage": {"input_tokens": 5}}),
+    )
+    .unwrap();
+    let record = jobs::read(&id).unwrap();
+
+    let (payload, _) = fold_done_envelope(&record, DigestMode::Skip);
+    let prose = render::envelope_prose(&payload);
+    assert!(
+        prose.contains("finished: ok"),
+        "a normal isolated finish renders its envelope: {prose}",
+    );
+    assert!(
+        !prose.contains("died without finishing"),
+        "and never the tombstone copy: {prose}",
     );
 }
 
@@ -1599,6 +1805,7 @@ fn a_delegate_env_override_qualifies_the_blocking_reply_cost_clause() {
         envelope(),
         &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &caller_env),
+        None,
         0,
         DigestMode::Skip,
     ));
@@ -1610,6 +1817,7 @@ fn a_delegate_env_override_qualifies_the_blocking_reply_cost_clause() {
         envelope(),
         &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
+        None,
         0,
         DigestMode::Skip,
     ));
@@ -1691,6 +1899,7 @@ fn an_endpointless_done_record_collects_as_endpoint_unknown() {
         "d-old-0",
         "work",
         1,
+        None,
         None,
         false,
         parse_delegate_envelope(
@@ -1960,6 +2169,7 @@ fn return_on_all_waits_for_the_slowest_lane_and_any_does_not() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "first"}),
     )
@@ -2197,7 +2407,7 @@ fn monitor_refuses_a_cross_mode_return_on() {
 fn monitor_done_returns_envelope_and_evicts() {
     let _home = HomeSandbox::new();
     let env = serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" });
-    jobs::write_done("d-done-0", "work", 1, None, false, env).unwrap();
+    jobs::write_done("d-done-0", "work", 1, None, None, false, env).unwrap();
 
     let result = call_monitor("d-done-0", Some(0));
     assert_ne!(result.is_error, Some(true));
@@ -2224,6 +2434,7 @@ fn monitor_done_scalar_envelope_is_wrapped_not_panicked() {
         "d-scalar-0",
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!("unauthorized"),
@@ -2262,7 +2473,16 @@ fn monitor_done_scalar_envelope_is_wrapped_not_panicked() {
 #[test]
 fn monitor_done_keeps_the_job_until_the_result_renders() {
     let _home = HomeSandbox::new();
-    jobs::write_done("d-keep-0", "work", 1, None, false, serde_json::json!(42)).unwrap();
+    jobs::write_done(
+        "d-keep-0",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!(42),
+    )
+    .unwrap();
 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         call_monitor("d-keep-0", Some(0))
@@ -2304,6 +2524,7 @@ fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!("unauthorized"),
     )
@@ -2338,6 +2559,7 @@ fn monitor_batch_returns_one_result_per_id_in_order() {
         "d-b1-0",
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
@@ -2407,6 +2629,7 @@ fn monitor_batch_names_an_unknown_cause_once_at_the_tail() {
         "d-cause-0",
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
@@ -2499,6 +2722,7 @@ fn monitor_batch_prose_is_one_block_with_one_line_per_job() {
         "d-b1-0",
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "line one\nline two"}),
@@ -2607,6 +2831,7 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
         "work",
         minted,
         None,
+        None,
         false,
         serde_json::json!({
             "profile": "work",
@@ -2621,6 +2846,7 @@ fn a_collect_never_sweeps_the_envelope_it_came_for() {
         "d-bystander-0",
         "work",
         minted,
+        None,
         None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "someone else's answer"}),
@@ -2681,6 +2907,7 @@ fn return_on_any_returns_before_the_slowest_lane() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "first"}),
     )
@@ -2723,6 +2950,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": true, "result": "boom"}),
     )
@@ -2731,6 +2959,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
         "d-ok-0",
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "fine"}),
@@ -2768,6 +2997,7 @@ fn monitor_batch_failed_job_is_a_protocol_error() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "fine"}),
     )
@@ -2790,6 +3020,7 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
         "d-decoy-0",
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "decoy"}),
@@ -2916,6 +3147,7 @@ fn monitor_single_spelling_keeps_the_pre_merge_done_bytes_and_names_its_unknown_
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
     )
@@ -2947,6 +3179,7 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
             scalar.clone(),
             &crate::profile::ProfileName::from("work"),
             delegate_call_endpoint("work", &HashMap::new()),
+            None,
             0,
             DigestMode::Report(&digest),
         );
@@ -2964,6 +3197,7 @@ fn fold_delegate_live_usage_wraps_non_objects_and_folds_objects() {
         serde_json::json!({"profile": "work", "is_error": false, "result": "all done"}),
         &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
+        None,
         0,
         DigestMode::Report(&digest),
     );
@@ -3010,6 +3244,7 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
+        None,
         0,
         DigestMode::Skip,
     ));
@@ -3029,6 +3264,7 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
         delegate_call_endpoint("work", &HashMap::new()),
+        None,
         0,
         DigestMode::Skip,
     ));
@@ -3295,6 +3531,7 @@ fn await_job_outcomes_delivers_each_and_drops_absent() {
         "solo",
         1,
         None,
+        None,
         false,
         serde_json::json!({ "profile": "solo", "is_error": false, "result": "a" }),
     )
@@ -3303,6 +3540,7 @@ fn await_job_outcomes_delivers_each_and_drops_absent() {
         "d-multi-1",
         "vendor",
         1,
+        None,
         None,
         false,
         serde_json::json!({ "profile": "vendor", "is_error": false, "result": "b" }),
@@ -3358,6 +3596,7 @@ fn the_await_job_hook_delivers_the_collect_replys_cost_qualification() {
         None,
         true,
         Some("api.deepseek.com".to_string()),
+        None,
         Isolation::Shared,
     )
     .expect("reserve");
@@ -3370,6 +3609,7 @@ fn the_await_job_hook_delivers_the_collect_replys_cost_qualification() {
         "work",
         reserved.spec.started_at,
         reserved.spec.endpoint.clone(),
+        reserved.spec.provider.clone(),
         reserved.spec.isolated,
         envelope,
     )
@@ -3407,7 +3647,7 @@ fn monitor_long_poll_sees_completion() {
         std::thread::sleep(std::time::Duration::from_millis(150));
         let env =
             serde_json::json!({ "profile": "work", "is_error": false, "result": "late finish" });
-        jobs::write_done("d-poll-0", "work", 1, None, false, env).unwrap();
+        jobs::write_done("d-poll-0", "work", 1, None, None, false, env).unwrap();
     });
     let result = call_monitor("d-poll-0", Some(5));
     writer.join().unwrap();
@@ -4400,6 +4640,7 @@ fn an_abandoned_blocking_fanout_hands_every_member_off() {
                     started_at: *started_at,
                     timeout_secs: None,
                     endpoint: None,
+                    provider: None,
                     idle_secs: None,
                     streaming: true,
                     isolation: Isolation::Shared,
@@ -5026,6 +5267,151 @@ fn an_isolated_corpse_offers_no_resume_handle() {
     assert!(
         !text.contains("resumable from its session id"),
         "the resumable promise is the shared arm's alone: {text}"
+    );
+}
+
+/// Seed a crashed TOMBSTONE: the `Done` record the sweep leaves for a blocking
+/// run whose server died, `crashed: true`, no envelope, the handle and isolation
+/// flag kept. Written raw, the same bytes the sweep writes.
+fn seed_tombstone(job_id: &str, session_id: Option<&str>, isolated: bool) {
+    let started_at = now_ms() - jobs::RUNNING_TTL_MS - 60_000;
+    let dir = jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut record = serde_json::json!({
+        "job_id": job_id,
+        "profile": "work",
+        "state": "done",
+        "started_at": started_at,
+        "done_at": now_ms(),
+        "crashed": true,
+        "isolated": isolated,
+    });
+    if let Some(session_id) = session_id {
+        record["session_id"] = serde_json::json!(session_id);
+    }
+    std::fs::write(
+        dir.join(format!("{job_id}.json")),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+}
+
+/// The sweep's TOMBSTONE (a `Done` record with `crashed: true`, no envelope, the
+/// handle kept) renders the owner's copy raw: no `delegate to`, no
+/// `finished`/`failed`, no target footer. The shared arm names the handle the
+/// sweep kept.
+#[test]
+fn a_crashed_tombstone_renders_the_owners_shared_copy() {
+    let _home = HomeSandbox::new();
+    let id = jobs::new_job_id(now_ms());
+    seed_tombstone(&id, Some("sess-tomb-1"), false);
+
+    let result = call_monitor(&id, Some(0));
+    assert_eq!(result.is_error, Some(true), "a crashed run is a tool error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: sess-tomb-1"
+        ),
+        "the owner's shared tombstone copy ships, raw: {text}"
+    );
+}
+
+/// The isolation split of the tombstone: an isolated run's transcript left with
+/// its throwaway tree, so the copy says the run cannot be resumed and never
+/// names the handle.
+#[test]
+fn a_crashed_tombstone_renders_the_owners_isolated_copy() {
+    let _home = HomeSandbox::new();
+    let id = jobs::new_job_id(now_ms());
+    seed_tombstone(&id, Some("sess-tomb-2"), true);
+
+    let result = call_monitor(&id, Some(0));
+    assert_eq!(result.is_error, Some(true), "a crashed run is a tool error");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job {id} died without finishing and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        ),
+        "the owner's isolated tombstone copy ships, raw: {text}"
+    );
+    assert!(
+        !text.contains("resumable from its session id"),
+        "the resumable promise is the shared arm's alone: {text}"
+    );
+}
+
+/// A crashed tombstone with no session id cannot name a handle it does not
+/// have: the tombstone copy stays silent and the envelope fallback answers.
+#[test]
+fn a_handleless_tombstone_promises_no_resume_handle() {
+    let _home = HomeSandbox::new();
+    let id = jobs::new_job_id(now_ms());
+    seed_tombstone(&id, None, false);
+
+    let result = call_monitor(&id, Some(0));
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains("job finished without an envelope"),
+        "a handleless tombstone keeps the envelope fallback: {text}"
+    );
+    assert!(
+        !text.contains("died without finishing"),
+        "and the tombstone copy, which names a handle, stays silent: {text}"
+    );
+    assert!(
+        !text.contains("resumable from its session id"),
+        "no handle is promised: {text}"
+    );
+}
+
+/// The batch's done row normally opens with `job \`id\` finished:`; the
+/// tombstone copy already names the job, so the batch renders it raw like the
+/// one-id arm, and the batch still fails.
+#[test]
+fn a_batch_polling_a_crashed_tombstone_renders_the_owners_copy_raw() {
+    let _home = HomeSandbox::new();
+    let id = jobs::new_job_id(now_ms());
+    seed_tombstone(&id, Some("sess-tomb-3"), false);
+
+    let result = call_monitor_batch(vec![&id], Some(0));
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "a crashed run makes the batch fail"
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job {id} died without finishing and left no result. \
+             it's still resumable from its session id: sess-tomb-3"
+        ),
+        "the batch renders the tombstone copy raw: {text}"
     );
 }
 
@@ -5762,6 +6148,7 @@ fn cancelling_a_live_job_flips_its_flag_and_the_reply_says_so() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": true, "result": "half an answer"}),
     )
@@ -5825,6 +6212,7 @@ fn cancelling_a_job_this_server_does_not_hold_names_it_and_hedges_why() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "landed first"}),
     )
@@ -5878,7 +6266,7 @@ fn a_cancelled_run_finalizes_as_a_done_error_rather_than_stranding() {
 
     // The finalize `launch_background_delegate` runs on every outcome.
     let id = "d-780000-0";
-    jobs::write_done(id, "work", 1, None, false, envelope).unwrap();
+    jobs::write_done(id, "work", 1, None, None, false, envelope).unwrap();
     let record = jobs::read(id).expect("the job file is finalized");
     assert_eq!(
         record.state,
@@ -6005,6 +6393,7 @@ fn the_cancel_report_claims_the_ask_and_only_the_verdicts_it_observed() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "done long ago"}),
     )
@@ -6025,6 +6414,7 @@ fn the_cancel_report_claims_the_ask_and_only_the_verdicts_it_observed() {
         id,
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "done mid-wait"}),
@@ -6106,6 +6496,7 @@ fn a_death_observed_mid_wait_reports_its_own_elapsed() {
                 "work",
                 1,
                 None,
+                None,
                 false,
                 serde_json::json!({"profile": "work", "is_error": false, "result": "mid-wait"}),
             )
@@ -6165,6 +6556,7 @@ fn a_batch_cancel_renders_one_verdict_per_asked_job_and_the_hedge_last() {
                 &dying,
                 "work",
                 1,
+                None,
                 None,
                 false,
                 serde_json::json!({"profile": "work", "is_error": false, "result": "half an answer"}),
@@ -6273,6 +6665,7 @@ fn a_death_far_older_than_the_call_renders_no_verdict() {
         "work",
         1,
         None,
+        None,
         false,
         serde_json::json!({"profile": "work", "is_error": false, "result": "ancient"}),
     )
@@ -6298,8 +6691,8 @@ fn a_death_far_older_than_the_call_renders_no_verdict() {
 #[test]
 fn a_reserved_job_is_cancellable_before_its_task_starts() {
     let _home = HomeSandbox::new();
-    let reserved =
-        reserve_background_job("work", None, None, true, None, Isolation::Shared).expect("reserve");
+    let reserved = reserve_background_job("work", None, None, true, None, None, Isolation::Shared)
+        .expect("reserve");
     let job_id = reserved.spec.job_id.clone();
     assert!(
         super::cancel_job(&job_id),
@@ -6321,8 +6714,16 @@ fn a_reserved_job_is_cancellable_before_its_task_starts() {
 #[test]
 fn a_reserved_job_records_a_deadline_pair_a_reader_can_tell_apart() {
     let _home = HomeSandbox::new();
-    let streaming = reserve_background_job("work", Some(1800), None, true, None, Isolation::Shared)
-        .expect("reserve");
+    let streaming = reserve_background_job(
+        "work",
+        Some(1800),
+        None,
+        true,
+        None,
+        None,
+        Isolation::Shared,
+    )
+    .expect("reserve");
     let record = jobs::read(&streaming.spec.job_id).expect("running record");
     assert_eq!(
         record.timeout_secs, 0,
@@ -6334,8 +6735,16 @@ fn a_reserved_job_records_a_deadline_pair_a_reader_can_tell_apart() {
         "the idle guard is what it does have, so the zero above is not a missing field",
     );
 
-    let pinned = reserve_background_job("work", Some(1800), None, false, None, Isolation::Shared)
-        .expect("reserve");
+    let pinned = reserve_background_job(
+        "work",
+        Some(1800),
+        None,
+        false,
+        None,
+        None,
+        Isolation::Shared,
+    )
+    .expect("reserve");
     let record = jobs::read(&pinned.spec.job_id).expect("running record");
     assert_eq!(
         record.timeout_secs, 1800,
@@ -6614,6 +7023,7 @@ fn mint_spec(profile: &str) -> super::MintSpec {
         started_at: now_ms().saturating_sub(60_000),
         timeout_secs: None,
         endpoint: None,
+        provider: None,
         idle_secs: None,
         streaming: true,
         isolation: Isolation::Shared,
@@ -7028,8 +7438,8 @@ fn a_spawn_write_that_lost_the_race_to_the_crossing_is_cleared_too() {
 #[test]
 fn a_reserved_run_is_already_across_the_seam_and_a_hand_off_cannot_move_it() {
     let _home = HomeSandbox::new();
-    let reserved =
-        reserve_background_job("work", None, None, true, None, Isolation::Shared).expect("reserve");
+    let reserved = reserve_background_job("work", None, None, true, None, None, Isolation::Shared)
+        .expect("reserve");
     let job_id = reserved.spec.job_id.clone();
     let handoff = super::Handoff::reserved(reserved);
 

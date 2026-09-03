@@ -1444,6 +1444,20 @@ pub(crate) fn envelope_prose(e: &Value) -> String {
         let tokens = usage_prose(u);
         if !tokens.is_empty() {
             out.push_str(&format!(", usage: {tokens}"));
+            // The child's token counts are its own self-report. The tokenizer
+            // is whichever model actually ran. `live_usage.provider`, the
+            // call-resolved label, names who served it. A non-anthropic label
+            // qualifies the bytes so the count is not read as Anthropic's
+            // tokenization.
+            if let Some(p) = e
+                .get("live_usage")
+                .and_then(|lu| lu.get("provider"))
+                .and_then(Value::as_str)
+                && !p.is_empty()
+                && p != "anthropic"
+            {
+                out.push_str(&format!(" (served by {p})"));
+            }
         }
     }
     if let Some(p) = e.get("partial_result").and_then(Value::as_str) {
@@ -1607,6 +1621,15 @@ pub(crate) fn delegate_fanout_results_prose(p: &Value) -> String {
 /// Prose for `monitor`'s one-id mode: the running status, the done envelope, or
 /// an invalid/unknown job_id refusal.
 pub(crate) fn monitor_job_prose(p: &Value) -> String {
+    // A crashed tombstone's owner copy is the whole line: no `delegate to`,
+    // `finished`/`failed`, or target footer may qualify it.
+    if p.get("crashed").and_then(Value::as_bool).unwrap_or(false) {
+        return p
+            .get("result")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+    }
     if p.get("job_id").and_then(Value::as_str).is_some()
         && p.get("status").and_then(Value::as_str).is_some()
     {
@@ -1736,6 +1759,16 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
     let mut out = results
         .iter()
         .map(|r| {
+            // The same owner copy, rendered raw: the batch row prefix and
+            // `finished`/`failed` qualify a result, and this line IS the whole
+            // result.
+            if r.get("crashed").and_then(Value::as_bool).unwrap_or(false) {
+                return r
+                    .get("result")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+            }
             let job_id = r.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
             match r.get("status").and_then(Value::as_str) {
                 Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),

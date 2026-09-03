@@ -27,6 +27,7 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         recorded_at: started_at,
         timeout_secs: 0,
         endpoint: None,
+        provider: None,
         isolated: false,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
@@ -76,6 +77,7 @@ fn the_isolation_flag_rides_the_mint_through_heartbeats_and_the_finish() {
         "work",
         1000,
         None,
+        None,
         true,
         serde_json::json!({"result": "ok"}),
     )
@@ -105,7 +107,7 @@ fn write_read_roundtrip_running_then_done() {
     assert!(r.envelope.is_none());
 
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
-    write_done(&id, "work", 1000, None, false, env.clone()).unwrap();
+    write_done(&id, "work", 1000, None, None, false, env.clone()).unwrap();
     let r = read(&id).expect("done record");
     assert_eq!(r.state, JobState::Done);
     assert_eq!(r.envelope, Some(env));
@@ -272,8 +274,10 @@ fn promote_moves_the_spelling_and_keeps_the_id() {
     );
 }
 
-/// A blocking run's record rides the same GC as any other: the extension is
-/// still `.json`, so the corpse rule reaches it with no arm of its own.
+/// A blocking run's record rides the same sweep as any other: the extension is
+/// still `.json`, so the silence rule reaches it with no arm of its own. The
+/// outcome differs — a silent one is converted to a tombstone, not reaped —
+/// which the conversion test below pins.
 #[test]
 fn a_liveness_record_is_swept_on_the_same_rules_as_any_other_running_one() {
     let _home = HomeSandbox::new();
@@ -297,7 +301,137 @@ fn a_liveness_record_is_swept_on_the_same_rules_as_any_other_running_one() {
     );
     assert!(
         !dir.join("d-live-silent.live.json").exists(),
-        "and one whose server died is reaped like any other corpse",
+        "a silent one's liveness spelling is gone",
+    );
+    assert!(
+        read("d-live-silent").is_some_and(|r| r.crashed),
+        "and the collectable spelling holds the converted tombstone",
+    );
+}
+
+/// The sweep's conversion, driven through the real producer: a silent blocking
+/// run's liveness record, written by `write_heartbeat_with_session` the way the
+/// streaming reader writes it, becomes a `Done` tombstone that keeps the handle
+/// and the isolation flag and invents no envelope. Seeding post-conversion bytes
+/// would leave the conversion itself untested.
+#[test]
+fn the_sweep_converts_a_silent_liveness_record_into_a_tombstone() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+    let id = new_job_id(ancient);
+    let spec = RunningSpec {
+        kind: RecordKind::Liveness,
+        isolated: true,
+        ..spec(&id, "work", ancient)
+    };
+    write_heartbeat_with_session(&spec, 0, "", Some("sess-tomb-1")).unwrap();
+
+    gc_running_corpses(now);
+
+    let converted = read(&id).expect("the collectable spelling holds the tombstone");
+    assert_eq!(
+        converted.state,
+        JobState::Done,
+        "the tombstone is a done record"
+    );
+    assert!(converted.crashed, "it marks the crash");
+    assert_eq!(
+        converted.session_id.as_deref(),
+        Some("sess-tomb-1"),
+        "the resume handle survives"
+    );
+    assert!(converted.isolated, "the isolation flag survives");
+    assert!(
+        converted.envelope.is_none(),
+        "no envelope is invented for a crash"
+    );
+    assert!(
+        !jobs_dir().unwrap().join(format!("{id}.live.json")).exists(),
+        "the liveness spelling is gone",
+    );
+}
+
+/// The conversion writes to the collectable spelling without reading it, so it
+/// must never overwrite a record that already carries an envelope: a finish
+/// whose liveness leftover is still on disk keeps its result, and only the
+/// stale liveness spelling is dropped.
+#[test]
+fn the_conversion_never_overwrites_a_finished_result() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+    let id = new_job_id(ancient);
+    write_heartbeat_with_session(
+        &RunningSpec {
+            kind: RecordKind::Liveness,
+            ..spec(&id, "work", ancient)
+        },
+        0,
+        "",
+        Some("sess-stale-1"),
+    )
+    .unwrap();
+    write_done(
+        &id,
+        "work",
+        ancient,
+        None,
+        None,
+        false,
+        serde_json::json!({"result": "kept"}),
+    )
+    .unwrap();
+
+    gc_running_corpses(now);
+
+    let kept = read(&id).expect("the finished result survives the sweep");
+    assert_eq!(
+        kept.envelope,
+        Some(serde_json::json!({"result": "kept"})),
+        "the envelope is not overwritten"
+    );
+    assert!(!kept.crashed, "the conversion did not clobber the finish");
+    assert!(
+        !jobs_dir().unwrap().join(format!("{id}.live.json")).exists(),
+        "the stale liveness spelling is dropped",
+    );
+}
+
+/// A tombstone is an orphan, never a done record: `phase()` reads the `crashed`
+/// flag before the generic `Done` arm, or `clauth jobs`, `monitor`'s listing and
+/// the TUI all read a crashed run as a collectable `done`.
+#[test]
+fn a_tombstone_reads_orphaned_not_done() {
+    let _home = HomeSandbox::new();
+    let now = 10_000_000_000u64;
+    let ancient = now - 10 * RUNNING_TTL_MS;
+    let id = new_job_id(ancient);
+    write_heartbeat_with_session(
+        &RunningSpec {
+            kind: RecordKind::Liveness,
+            ..spec(&id, "work", ancient)
+        },
+        0,
+        "",
+        Some("sess-orph-1"),
+    )
+    .unwrap();
+    gc_running_corpses(now);
+
+    let row = list(now)
+        .into_iter()
+        .find(|j| j.record.job_id == id)
+        .expect("the tombstone is listed");
+    assert_eq!(
+        row.phase(),
+        JobPhase::Orphaned,
+        "a crashed tombstone is an orphan"
+    );
+    assert_eq!(row.phase().label(), "orphaned");
+    assert!(
+        !row.phase().is_collectable(),
+        "no result waits in a tombstone"
     );
 }
 
@@ -814,6 +948,7 @@ fn job_files_and_dir_are_owner_only() {
         &id,
         "work",
         1000,
+        None,
         None,
         false,
         serde_json::json!({"result": "secret output"}),

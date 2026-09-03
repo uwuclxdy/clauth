@@ -27,12 +27,14 @@
 //! spelling here, `<job_id>.live.json` ([`RecordKind::Liveness`]) — the same
 //! bytes, heartbeat and all, under a filename no reader can name. It exists so
 //! an operator can see a run whose model-facing result is still travelling back
-//! through the join; nothing collects it, and [`RecordKind`] documents why that
-//! is structural rather than a convention. It ends one of two ways: renamed to
-//! the collectable spelling when the caller walks away, or deleted when the run
-//! finishes with its caller still there.
+//! through the join. [`RecordKind`] documents why no id resolves that
+//! spelling, so nothing collects the liveness file itself. It ends one of
+//! three ways. Renamed to the collectable spelling when the caller walks away.
+//! Deleted when the run finishes with its caller still there. Converted to a
+//! tombstone when the server dies with the caller gone; the tombstone is a
+//! collectable record `monitor` then answers and removes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
@@ -141,6 +143,13 @@ pub(crate) enum JobState {
 /// j.record.job_id == id)` reads correct, returns a blocking run's record under
 /// a caller's string, and reopens exactly what this type closes. An id-keyed
 /// lookup belongs on `read`.
+///
+/// The sweep's conversion is the one place a caller's id resolves content that
+/// started as a `Liveness` record, and it does not reopen this: [`sweep`]
+/// rewrites the silent run onto the COLLECTABLE spelling first, so its
+/// `session_id`, `isolated`, `profile` and `tail` then live in a `Collectable`
+/// record, the spelling `read` resolves by design. The `.live.json` file itself
+/// stays unreachable under any caller-supplied id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecordKind {
     /// `<id>.json` — a result a `monitor` call may collect.
@@ -171,6 +180,16 @@ pub(crate) struct JobRecord {
     /// endpoint could not be resolved at the call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) endpoint: Option<String>,
+    /// Which provider actually served this run, resolved once at the call the
+    /// same way and at the same precedence `endpoint` is: a caller `env`
+    /// override first, then the profile's stored endpoint. The label, not the
+    /// endpoint: `Provider::from_base_url`'s display name on a recognised
+    /// third-party origin, `generic` on any unrecognised origin, `anthropic`
+    /// for Anthropic's own origin and for an account with no endpoint of its
+    /// own. `None` on a record an older server wrote and on one the resolver
+    /// could not answer, where the fold omits the key like `endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
     /// Whether this run launched isolated (`delegate({isolated: true})`): its
     /// transcript lived in a throwaway tree that dies with the run, so a
     /// `session_id` on such a record is NOT a handle `delegate({resume})`
@@ -238,6 +257,13 @@ pub(crate) struct JobRecord {
     /// behaviour.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) done_at: u64,
+    /// Whether this `done` record is the sweep's tombstone for a blocking run
+    /// whose server died without finishing it: `state` is `Done`, `envelope` is
+    /// `None`, and the handle `session_id` kept is the only thing a shared run
+    /// leaves to resume from. `false` on a normal finish and on a record an
+    /// older server wrote, so the default keeps those parseable.
+    #[serde(default)]
+    pub(crate) crashed: bool,
 }
 
 /// What one job's `running` record carries from its mint through every
@@ -262,6 +288,10 @@ pub(crate) struct RunningSpec {
     /// hand-off and the final [`write_done`] record the same answer the mint
     /// resolved once.
     pub(crate) endpoint: Option<String>,
+    /// The call's resolved serving provider, carried the same way and for the
+    /// same reason: a heartbeat rewrites the whole record, and a hand-off must
+    /// keep the label the mint resolved once.
+    pub(crate) provider: Option<String>,
     /// Whether the run launched isolated, carried the same way and for the
     /// same reason: a heartbeat rewrites the whole record, and a hand-off
     /// must keep the answer the mint resolved once.
@@ -331,9 +361,19 @@ fn job_path(job_id: &str, kind: RecordKind) -> Result<PathBuf> {
     Ok(jobs_dir()?.join(name))
 }
 
+/// Which [`RecordKind`] a store path names, off the filename tail. Shared by
+/// [`list`] and [`sweep`] so the two derivations cannot drift.
+fn record_kind(path: &Path) -> RecordKind {
+    match path.file_name().and_then(|n| n.to_str()) {
+        Some(name) if name.ends_with(LIVE_SUFFIX) => RecordKind::Liveness,
+        _ => RecordKind::Collectable,
+    }
+}
+
 /// The filename tail marking a [`RecordKind::Liveness`] record. It still ends
-/// `.json`, so [`gc`] and [`gc_running_corpses`] already retain and reap one on
-/// the same rules as any other running record, with no arm of their own.
+/// `.json`, so [`gc`] and [`gc_running_corpses`] reach one on the same silence
+/// rule as any other running record. A silent one is CONVERTED into a
+/// tombstone instead of reaped (see [`sweep`]).
 const LIVE_SUFFIX: &str = ".live.json";
 
 /// Persist a record atomically (tmp + rename, so a reader sees either the old
@@ -395,12 +435,14 @@ pub(crate) fn write_heartbeat_with_session(
             timeout_secs: spec.timeout_secs,
             idle_secs: spec.idle_secs,
             endpoint: spec.endpoint.clone(),
+            provider: spec.provider.clone(),
             isolated: spec.isolated,
             session_id: session_id.map(str::to_string),
             last_output_at,
             recorded_at: spec.recorded_at,
             tail: tail.to_string(),
             done_at: 0,
+            crashed: false,
         },
         spec.kind,
     )
@@ -440,6 +482,7 @@ pub(crate) fn write_done(
     profile: &str,
     started_at: u64,
     endpoint: Option<String>,
+    provider: Option<String>,
     isolated: bool,
     envelope: serde_json::Value,
 ) -> Result<()> {
@@ -451,6 +494,7 @@ pub(crate) fn write_done(
             started_at,
             envelope: Some(envelope),
             endpoint,
+            provider,
             isolated,
             session_id: None,
             timeout_secs: 0,
@@ -459,6 +503,7 @@ pub(crate) fn write_done(
             recorded_at: 0,
             tail: String::new(),
             done_at: crate::usage::now_ms(),
+            crashed: false,
         },
         // A result is always collectable: the one run that finalizes with a
         // liveness record still open is a blocking one, and its caller already
@@ -531,15 +576,17 @@ pub(crate) fn gc(now: u64) {
     sweep(now, Scope::Everything);
 }
 
-/// The narrower sweep a `monitor` collect runs: `running` files a dead server
-/// orphaned, and nothing else.
+/// The narrower sweep a `monitor` collect runs: reaps the corpses a dead server
+/// orphaned, and touches nothing else.
 ///
 /// A reader must never destroy what it came for. The Done TTL and the `.tmp`
 /// sweep buy nothing before a read and can only delete a result the caller is
 /// asking for, so they stay at startup. What DOES belong here is the corpse:
 /// [`RUNNING_TTL_MS`] already knows a file whose server died mid-job is dead,
 /// and until now `serve()` was the only place that knowledge was ever applied,
-/// so a corpse polled `running` forever.
+/// so a corpse polled `running` forever. One corpse shape is CONVERTED instead
+/// of reaped: a silent blocking run's liveness record becomes the sweep's
+/// tombstone, which keeps the handle for a later resume (see [`sweep`]).
 pub(crate) fn gc_running_corpses(now: u64) {
     sweep(now, Scope::RunningCorpses);
 }
@@ -644,9 +691,13 @@ impl JobPhase {
         }
     }
 
-    /// Whether a `monitor` call naming this record's id could collect a result
+    /// Whether a `monitor` call naming this record's id could collect a RESULT
     /// from it. False for a blocking run by construction (see [`RecordKind`])
-    /// and for an orphan, whose result died with its server.
+    /// and for an orphan, whose result died with its server. A tombstone, an
+    /// orphan whose collectable record still sits on disk, is the exception:
+    /// `monitor` naming its id answers it with the crash copy and then removes
+    /// it. `collectable: false` there names the absence of a result, never the
+    /// absence of an answer.
     pub(crate) fn is_collectable(self) -> bool {
         matches!(self, Self::Running | Self::Done)
     }
@@ -709,6 +760,9 @@ impl StoredJob {
     /// record is in.
     pub(crate) fn phase(&self) -> JobPhase {
         match self.liveness {
+            // A crashed blocking run's record is `Done` on disk but carries no
+            // envelope; it is the sweep's tombstone, not a result to collect.
+            JobLiveness::Done if self.record.crashed => JobPhase::Orphaned,
             JobLiveness::Done => JobPhase::Done,
             JobLiveness::Corpse => JobPhase::Orphaned,
             JobLiveness::Running => match self.kind {
@@ -761,10 +815,7 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let kind = match path.file_name().and_then(|n| n.to_str()) {
-            Some(name) if name.ends_with(LIVE_SUFFIX) => RecordKind::Liveness,
-            _ => RecordKind::Collectable,
-        };
+        let kind = record_kind(&path);
         let record = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<JobRecord>(&b).ok());
@@ -900,11 +951,39 @@ fn sweep(now: u64, scope: Scope) {
             }
             continue;
         };
+        let kind = record_kind(&path);
         let expired = match record.state {
             JobState::Done => full && now.saturating_sub(retention_anchor(&record)) > DONE_TTL_MS,
             JobState::Running => running_is_silent(&record, now),
         };
-        if expired {
+        if !expired {
+            continue;
+        }
+        // A silent blocking run's liveness record is CONVERTED rather than
+        // deleted: the caller holding the join is gone, and the run's handle is
+        // the only thing it left to resume from. The collectable spelling keeps
+        // being deleted, since its server dying means its result died with it.
+        if record.state == JobState::Running && kind == RecordKind::Liveness {
+            // The conversion writes to the COLLECTABLE spelling, a file this
+            // sweep has not read. Never overwrite a record that carries an
+            // envelope: a finish whose liveness leftover is the stale file here
+            // must keep its result.
+            if read(&record.job_id).is_some_and(|existing| existing.envelope.is_some()) {
+                let _ = std::fs::remove_file(&path);
+                continue;
+            }
+            let mut crashed = record;
+            crashed.state = JobState::Done;
+            crashed.done_at = now;
+            crashed.envelope = None;
+            crashed.crashed = true;
+            // Drop the source only once the tombstone landed: a failed write
+            // (ENOSPC, read-only dir) leaves the liveness record as the
+            // surviving carrier of the handle.
+            if write_atomic(&crashed, RecordKind::Collectable).is_ok() {
+                let _ = std::fs::remove_file(&path);
+            }
+        } else {
             let _ = std::fs::remove_file(&path);
         }
     }

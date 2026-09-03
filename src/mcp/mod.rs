@@ -469,6 +469,52 @@ fn delegate_call_endpoint(target: &str, caller_env: &HashMap<String, String>) ->
     target_endpoint(&ProfileName::from(target))
 }
 
+/// The serving-provider label for one endpoint url. Anthropic's own origin
+/// reads `anthropic`. A recognised third-party origin reads that provider's
+/// display name. Anything else reads `generic`.
+fn serving_provider_label(url: &str) -> String {
+    if crate::providers::url_matches_host(url, crate::usage::ANTHROPIC_ORIGIN) {
+        return "anthropic".to_string();
+    }
+    crate::providers::Provider::from_base_url(url)
+        .map(|p| p.display_name().to_string())
+        .unwrap_or_else(|| "generic".to_string())
+}
+
+/// Which provider served one delegate CALL. The caller's own `env` entry wins,
+/// then the target profile's stored endpoint. That is the same precedence
+/// [`delegate_call_endpoint`] applies, because both answers describe the same
+/// request. The label is read off the FULL url, not the host the sibling
+/// stores: `Provider`'s origin matching needs the scheme, and the bare host
+/// `target_endpoint` returns carries none.
+///
+/// The question is "who served this request", so it reads the call's own
+/// resolution and not [`crate::profile_json::provider_label`] (the owner-ruled
+/// label with the same three-word vocabulary, answering how the account is
+/// TYPED off the managed field alone), and not
+/// [`crate::profile::stored_provider`] (the managed field's typed provider).
+/// Both type the ACCOUNT, so an account an operator retargets through
+/// `[env] ANTHROPIC_BASE_URL` answers `anthropic` there and the endpoint's
+/// provider here.
+///
+/// `None` is "cannot say": the profile half resolved `Unknown`. The caller
+/// wanting one answer for the whole call resolves it here at call time, so it
+/// can ride the record the same way `endpoint` does.
+fn delegate_call_provider(target: &str, caller_env: &HashMap<String, String>) -> Option<String> {
+    if let Some(url) = caller_env
+        .get("ANTHROPIC_BASE_URL")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+    {
+        return Some(serving_provider_label(url));
+    }
+    match crate::profile::stored_endpoint(&ProfileName::from(target)) {
+        crate::profile::StoredEndpoint::Anthropic => Some("anthropic".to_string()),
+        crate::profile::StoredEndpoint::Custom(url) => Some(serving_provider_label(&url)),
+        crate::profile::StoredEndpoint::Unknown => None,
+    }
+}
+
 /// Fold the target profile's live usage into a delegate envelope (the sync
 /// `delegate` and `monitor` done-handoff paths share this). The
 /// envelope is whatever `claude` printed, so it may be ANY json shape:
@@ -483,10 +529,17 @@ fn delegate_call_endpoint(target: &str, caller_env: &HashMap<String, String>) ->
 /// job record. `None` is "cannot say"; the endpoint key then stays absent
 /// rather than falling back to a name-keyed read of a profile the call may
 /// never have routed through.
+///
+/// `provider` is the same CALL's serving-provider label, resolved and carried
+/// exactly the same way ([`delegate_call_provider`] at call time, the record
+/// on the collect and hook paths). Both ride the call because a caller `env`
+/// override retargets one run without touching the profile, and a name-keyed
+/// read would assert the account's answer for a call that routed elsewhere.
 fn fold_delegate_live_usage(
     payload: serde_json::Value,
     profile: &ProfileName,
     endpoint: Option<String>,
+    provider: Option<String>,
     now: i64,
     digest: DigestMode<'_>,
 ) -> serde_json::Value {
@@ -502,6 +555,9 @@ fn fold_delegate_live_usage(
     let mut live = live_usage_json(Some(profile), Some(&windows));
     if let Some(endpoint) = endpoint {
         live["endpoint"] = serde_json::Value::String(endpoint);
+    }
+    if let Some(provider) = provider {
+        live["provider"] = serde_json::Value::String(provider);
     }
     if let Some(note) = throughput_note(profile, now) {
         live["throughput_warning"] = serde_json::Value::String(note);
@@ -1108,12 +1164,14 @@ Delegating spends the target account, so pick the account with `profiles` first.
                     // actually routes. A later profile edit changes none of
                     // the three.
                     let endpoint = delegate_call_endpoint(&name, &opts.env);
+                    let provider = delegate_call_provider(&name, &opts.env);
                     let reserved = reserve_background_job(
                         &name,
                         timeout_secs,
                         idle_secs,
                         streaming,
                         endpoint.clone(),
+                        provider.clone(),
                         isolation,
                     )
                     .map_err(|e| ErrorData::internal_error(e, None))?;
@@ -1143,6 +1201,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         }),
                         &ProfileName::from(name.clone()),
                         endpoint,
+                        provider,
                         now_epoch_secs(),
                         DigestMode::Report(&self.digest),
                     );
@@ -1178,6 +1237,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                             idle_secs,
                             streaming,
                             delegate_call_endpoint(name, &opts.env),
+                            delegate_call_provider(name, &opts.env),
                             isolation,
                         ) {
                             Ok(job) => reserved.push(job),
@@ -1201,6 +1261,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         // the record it names rather than re-resolving and
                         // hoping nothing moved.
                         let endpoint = job.spec.endpoint.clone();
+                        let provider = job.spec.provider.clone();
                         launch_background_delegate(
                             name.clone(),
                             opts.clone(),
@@ -1221,6 +1282,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                             }),
                             &ProfileName::from(name.clone()),
                             endpoint,
+                            provider,
                             now,
                             DigestMode::Skip,
                         ));
@@ -1275,6 +1337,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         idle_secs,
                         streaming,
                         endpoint: delegate_call_endpoint(name, &opts.env),
+                        provider: delegate_call_provider(name, &opts.env),
                         isolation,
                     });
                     handles.push(spawn_delegate(
@@ -1351,6 +1414,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
                                     }),
                                     &ProfileName::from(profile.clone()),
                                     delegate_call_endpoint(&profile, &opts.env),
+                                    delegate_call_provider(&profile, &opts.env),
                                     now,
                                     DigestMode::Skip,
                                 )
@@ -1385,6 +1449,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
         // minted by a hand-off carry the same answer. A caller `env` override
         // retargets this one run without touching the profile.
         let endpoint = delegate_call_endpoint(&target, &opts.env);
+        let provider = delegate_call_provider(&target, &opts.env);
         let started_at = now_ms();
         // A blocking run owns no job file yet. It gets one the moment its caller
         // walks away from a child that is already spending.
@@ -1395,6 +1460,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
             idle_secs,
             streaming,
             endpoint: endpoint.clone(),
+            provider: provider.clone(),
             isolation,
         });
         // Commits to spawn: from here the delegate is in flight. `begin` marks
@@ -1457,6 +1523,7 @@ Delegating spends the target account, so pick the account with `profiles` first.
             envelope,
             &ProfileName::from(target.clone()),
             endpoint,
+            provider,
             now_epoch_secs(),
             delegate_digest_mode(&self.digest, abandoned),
         );
@@ -2057,6 +2124,7 @@ fn fold_fanout_rows(
                 envelope,
                 &ProfileName::from(name.clone()),
                 delegate_call_endpoint(name, caller_env),
+                delegate_call_provider(name, caller_env),
                 now,
                 DigestMode::Skip,
             )
@@ -2641,6 +2709,18 @@ fn fold_done_envelope(
     record: &jobs::JobRecord,
     digest: DigestMode<'_>,
 ) -> (serde_json::Value, bool) {
+    // A crashed tombstone renders the owner's copy raw, never the envelope
+    // fallback: the run's lifetime ended, just with no result to collect.
+    if record.crashed
+        && let Some(reason) = crashed_job_reason(&record.job_id, record)
+    {
+        return (
+            serde_json::json!({ "crashed": true, "result": reason }),
+            true,
+        );
+    }
+    // A shared tombstone with no session id has no handle to promise, so
+    // the envelope fallback below still answers it.
     let payload = fold_delegate_live_usage(
         record.envelope.clone().unwrap_or_else(|| {
             serde_json::json!({
@@ -2655,6 +2735,7 @@ fn fold_done_envelope(
         // name-keyed read would assert the managed field's answer for a call
         // that may have been retargeted by its own `env` argument.
         record.endpoint.clone(),
+        record.provider.clone(),
         now_epoch_secs(),
         digest,
     );
@@ -2781,6 +2862,28 @@ fn orphan_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> {
     } else {
         format!(
             "unknown job_id: {job_id}. it died without finishing and its record was removed. \
+             it's still resumable from its session id: {session_id}"
+        )
+    })
+}
+
+/// The owner-ruled copy (verbatim, never reworded) for a crashed run whose
+/// tombstone is STILL ON DISK ([`jobs::JobRecord::crashed`]): the sweep
+/// converted the silent blocking run's liveness record into a `Done` record
+/// with no envelope, keeping the handle and isolation flag. The shared arm
+/// names the handle; the isolated arm cannot, because its transcript left with
+/// the throwaway tree. A shared tombstone with no `session_id` returns `None` —
+/// it has no handle to promise — and the caller keeps the envelope fallback.
+fn crashed_job_reason(job_id: &str, record: &jobs::JobRecord) -> Option<String> {
+    Some(if record.isolated {
+        format!(
+            "job {job_id} died without finishing and left no result; \
+             its transcript lived in an isolated store and left with it, so the run cannot be resumed."
+        )
+    } else {
+        let session_id = record.session_id.as_deref()?;
+        format!(
+            "job {job_id} died without finishing and left no result. \
              it's still resumable from its session id: {session_id}"
         )
     })
@@ -4376,6 +4479,9 @@ struct MintSpec {
     /// The call's resolved endpoint, so a record minted at the hand-off carries
     /// the same answer the blocking reply folded with.
     endpoint: Option<String>,
+    /// The call's resolved serving provider, carried for the same reason: the
+    /// hand-off mint and the blocking reply must name the same provider.
+    provider: Option<String>,
     /// Whether the run launches isolated, so a record minted at the hand-off
     /// carries the same answer the run itself launched under.
     isolation: Isolation,
@@ -4400,6 +4506,7 @@ fn reserve_background_job(
     idle_secs: Option<u64>,
     streaming: bool,
     endpoint: Option<String>,
+    provider: Option<String>,
     isolation: Isolation,
 ) -> std::result::Result<ReservedJob, String> {
     reserve_job(
@@ -4410,6 +4517,7 @@ fn reserve_background_job(
             idle_secs,
             streaming,
             endpoint,
+            provider,
             isolation,
         },
         std::sync::Arc::new(AtomicBool::new(false)),
@@ -4442,6 +4550,7 @@ fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
         // such deadline to count down to rather than an unknown one.
         idle_secs: mint.streaming.then_some(idle.as_secs()),
         endpoint: mint.endpoint.clone(),
+        provider: mint.provider.clone(),
         isolated: mint.isolation == Isolation::Isolated,
         kind,
     }
@@ -4717,6 +4826,7 @@ impl Handoff {
                 &spec.profile,
                 spec.started_at,
                 spec.endpoint.clone(),
+                spec.provider.clone(),
                 spec.isolated,
                 envelope.clone(),
             );

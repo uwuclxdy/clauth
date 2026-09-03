@@ -723,14 +723,15 @@ fn monitor_done_envelope_reports_the_digest() {
         "is_error": false,
         "result": "all done",
     });
-    jobs::write_done("d-digest-0", "work", 1, None, false, envelope.clone()).expect("write job");
+    jobs::write_done("d-digest-0", "work", 1, None, None, false, envelope.clone())
+        .expect("write job");
     let first = call_monitor_ids(&server, &["d-digest-0"], 0);
     assert!(
         !first.contains("since your last call"),
         "first digest call seeds, even through a collected job: {first}",
     );
 
-    jobs::write_done("d-digest-1", "work", 1, None, false, envelope).expect("write job");
+    jobs::write_done("d-digest-1", "work", 1, None, None, false, envelope).expect("write job");
     set_mtime(&credentials_path(), t1());
     let second = call_monitor_ids(&server, &["d-digest-1"], 0);
     assert!(
@@ -745,6 +746,7 @@ fn seed_done_job(id: &str) {
         id,
         "work",
         1,
+        None,
         None,
         false,
         serde_json::json!({ "profile": "work", "is_error": false, "result": "all done" }),
@@ -910,6 +912,7 @@ fn an_abandoned_blocking_delegate_reply_never_consumes_the_digest() {
             serde_json::json!({"profile": "work", "result": "done"}),
             &crate::profile::ProfileName::from("work"),
             delegate_call_endpoint("work", &std::collections::HashMap::new()),
+            None,
             0,
             super::delegate_digest_mode(&tracker, abandoned),
         )
