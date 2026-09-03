@@ -2576,13 +2576,10 @@ async fn monitor_one(
             Ok(CallToolResult::success(single_block(prose)))
         }
         WaitOutcome::Done(record) => {
+            // Eviction is the claim's job, already done: an owned record's
+            // file is consumed, a refused one renamed back — either way this
+            // render is the one delivery of it.
             let (blocks, is_error) = render_done_envelope(record, digest);
-            // Fallback path delivered it — evict only now that the envelope
-            // is safely rendered, so the file doesn't linger past its
-            // purpose (GC also reaps it on a TTL) while a panic inside
-            // `render_done_envelope` still leaves the job file as the
-            // recoverable copy.
-            jobs::remove(&job_id);
             if is_error {
                 Ok(CallToolResult::error(blocks))
             } else {
@@ -2595,9 +2592,9 @@ async fn monitor_one(
 /// The several-ids half of `monitor`'s job mode: one result per requested id
 /// in the order given. An absent id is its own `unknown` result, never a
 /// batch-level failure; the reply tail carries ONE unknown-count clause for
-/// the whole batch, however many rows read `unknown`. A done id is evicted
-/// only after the whole batch rendered, so a mid-fold panic leaves every done
-/// file as its recoverable copy. The protocol-level error flag mirrors the
+/// the whole batch, however many rows read `unknown`. A done id's file is
+/// evicted by the claim its wait wins, before any render; the rows render
+/// from the claimed records. The protocol-level error flag mirrors the
 /// per-result flags: any failed done envelope makes the whole batch an error.
 async fn monitor_batch(
     job_ids: Vec<String>,
@@ -2626,7 +2623,6 @@ async fn monitor_batch(
     let outcomes = wait_for_batch(&job_ids, wait, return_on, progress, watch).await;
 
     let mut results = Vec::with_capacity(outcomes.len());
-    let mut delivered = Vec::new();
     let mut any_error = false;
     let mut unknown_job_id_count = 0u64;
     // The owner-ruled orphan copy, one line per reaped corpse with a handle,
@@ -2649,6 +2645,10 @@ async fn monitor_batch(
             }
             WaitOutcome::Running(record) => running_payload(&id, &record, now_ms()),
             WaitOutcome::Done(record) => {
+                // An owned record's file is already evicted by the claim the
+                // wait won; a refused one (mismatched self-report) was
+                // renamed back and renders without eviction — the stored-id
+                // rule this arm used to carry as a literal.
                 // No per-result digest: one rides the whole reply below.
                 let (mut payload, is_error) = fold_done_envelope(&record, DigestMode::Skip);
                 any_error |= is_error;
@@ -2661,14 +2661,6 @@ async fn monitor_batch(
                         "status".to_string(),
                         serde_json::Value::String("done".to_string()),
                     );
-                }
-                // Evict only when the file self-reports the id it was fetched
-                // under, and evict by that caller-supplied id, never the
-                // stored one: `jobs::remove` joins the id into a path without
-                // a safety check, so a mismatched self-report (a hand-written
-                // file) must never pick the eviction path.
-                if record.job_id == id {
-                    delivered.push(id);
                 }
                 payload
             }
@@ -2696,9 +2688,6 @@ async fn monitor_batch(
         prose.push_str(reason);
     }
     let blocks = single_block(prose);
-    for id in delivered {
-        jobs::remove(&id);
-    }
     // The batch-level error flag mirrors the per-result flags: any failed
     // delegate makes the whole batch an error, so a client branching on
     // `isError` reads a failed job the same way in both spellings.
@@ -2710,9 +2699,9 @@ async fn monitor_batch(
 }
 
 /// Fold a finished job's envelope the way every delivery path does, returning
-/// the payload and its error flag. Pure of the job store: the caller evicts the
-/// file only after its render, so a panic inside leaves the job file as the
-/// recoverable copy of the delegate's result.
+/// the payload and its error flag. Pure of the job store: the caller already
+/// claimed the record this folds — the claim is what evicts, and it must
+/// precede the render, since the render is the delivery the claim serializes.
 fn fold_done_envelope(
     record: &jobs::JobRecord,
     digest: DigestMode<'_>,
@@ -2770,7 +2759,9 @@ enum WaitOutcome {
     /// Present but not yet finished (the wait deadline elapsed first). Carries the
     /// record so the caller can report `elapsed_secs`.
     Running(jobs::JobRecord),
-    /// No such job file (never created or already evicted).
+    /// No such job file: never created, already evicted, or claimed by the
+    /// other waiter (the hook or the sibling collect) — the hedged unknown
+    /// copy answers all three.
     Unknown,
 }
 
@@ -2945,8 +2936,8 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
     let unminted = "clauth may never have minted it at all (a real id reads \
                     `d-<base36-ms>-<counter>`)";
     if now.saturating_sub(minted_at) > jobs::DONE_TTL_MS {
-        // Collection leads even here. Every collect evicts through
-        // `jobs::remove`; the day-after-finish sweep runs at startup alone
+        // Collection leads even here. Every delivery evicts through its
+        // `jobs::claim`; the day-after-finish sweep runs at startup alone
         // (`jobs::gc`), so on a session that has been up a while the sweep is
         // the rarer of the two rather than the likelier.
         return format!(
@@ -2980,7 +2971,14 @@ async fn wait_for_done(
                 if let Some(w) = watch.as_deref_mut() {
                     w.saw_done(job_id);
                 }
-                return WaitOutcome::Done(r);
+                // The claim serializes this collect against the auto-delivery
+                // hook: whichever claimant's rename lands first owns the
+                // delivery, and the loser answers `Unknown`, whose
+                // owner-picked copy names the already-collected cause.
+                return match jobs::claim(job_id) {
+                    jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => WaitOutcome::Done(r),
+                    jobs::Claim::Lost => WaitOutcome::Unknown,
+                };
             }
             Some(r) if cancelled || start.elapsed() >= deadline => {
                 return WaitOutcome::Running(r);
@@ -3037,7 +3035,13 @@ async fn wait_for_batch(
                     if let Some(w) = watch.as_deref_mut() {
                         w.saw_done(id);
                     }
-                    *slot = Some(WaitOutcome::Done(r));
+                    // Same claim as the one-id wait: the loser answers
+                    // `Unknown` rather than re-delivering an envelope the
+                    // hook just printed.
+                    *slot = Some(match jobs::claim(id) {
+                        jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => WaitOutcome::Done(r),
+                        jobs::Claim::Lost => WaitOutcome::Unknown,
+                    });
                 }
                 Some(r) if cancelled || start.elapsed() >= deadline => {
                     *slot = Some(WaitOutcome::Running(r));
@@ -3070,7 +3074,10 @@ async fn wait_for_batch(
                     if let Some(w) = watch.as_deref_mut() {
                         w.saw_done(id);
                     }
-                    WaitOutcome::Done(r)
+                    match jobs::claim(id) {
+                        jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => WaitOutcome::Done(r),
+                        jobs::Claim::Lost => WaitOutcome::Unknown,
+                    }
                 }
                 Some(r) => WaitOutcome::Running(r),
                 None => WaitOutcome::Unknown,
@@ -3138,8 +3145,10 @@ pub(crate) fn await_job() -> ! {
 /// passes. Returns the delivered envelopes, folded the way every collect
 /// folds them ([`fold_done_envelope`]: live-usage footer, cost endpoint, and
 /// the no-envelope fallback), plus the ids still `running` at the deadline.
-/// An absent id is dropped silently (its file was GC'd or already
-/// collected). Blocking; the hook calls it directly on its own thread.
+/// A delivery claims its record ([`jobs::claim`]), so a `monitor` collect
+/// racing this wait owns the delivery and the hook drops that id; an absent
+/// id is dropped the same way (its file was GC'd or already collected).
+/// Blocking; the hook calls it directly on its own thread.
 fn await_job_outcomes(
     job_ids: &[String],
     deadline: Duration,
@@ -3150,9 +3159,21 @@ fn await_job_outcomes(
     loop {
         pending.retain(|id| match jobs::read(id) {
             Some(r) if r.state == jobs::JobState::Done => {
-                let (envelope, _is_error) = fold_done_envelope(&r, DigestMode::Skip);
-                delivered.push(envelope);
-                false
+                // The claim owns the delivery: a `monitor` wait that reads
+                // `Done` in the same instant finds the file gone and answers
+                // its hedged unknown copy, so exactly one full envelope
+                // reaches the conversation.
+                match jobs::claim(id) {
+                    jobs::Claim::Owned(r) | jobs::Claim::Refused(r) => {
+                        let (envelope, _is_error) = fold_done_envelope(&r, DigestMode::Skip);
+                        delivered.push(envelope);
+                        false
+                    }
+                    // Claimed between the read and the claim: a `monitor`
+                    // collect owns the delivery. Nothing to print, nothing
+                    // to wake — the collect's own reply reaches the model.
+                    jobs::Claim::Lost => false,
+                }
             }
             Some(_) => true, // still running: the loop exit decides on the deadline
             None => false,

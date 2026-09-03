@@ -123,6 +123,145 @@ fn write_read_roundtrip_running_then_done() {
     assert!(read(&id).is_none(), "removed job is gone");
 }
 
+#[test]
+fn a_done_record_is_claimable_once_and_the_claim_evicts_it() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    let env = serde_json::json!({ "is_error": false, "result": "ok" });
+    write_done(&id, "work", 1000, None, None, false, env.clone()).unwrap();
+
+    let Claim::Owned(claimed) = claim(&id) else {
+        panic!("the first claimant owns the record");
+    };
+    assert_eq!(claimed.state, JobState::Done);
+    assert_eq!(claimed.envelope, Some(env));
+    assert!(
+        read(&id).is_none(),
+        "the claim consumed the file: nothing is left to collect twice"
+    );
+    assert!(
+        !job_path(&id, RecordKind::Collectable)
+            .unwrap()
+            .with_extension("json.claim")
+            .exists(),
+        "the claimed spelling is consumed too, not parked beside the record"
+    );
+    assert!(
+        matches!(claim(&id), Claim::Lost),
+        "a second claimant loses: the delivery is exactly once"
+    );
+}
+
+/// The eviction rule `monitor`'s batch arm used to carry as a literal:
+/// eviction follows the STORED id, so a caller-supplied id must never collect
+/// a file another id's record owns. `claim` refuses the record and puts it
+/// back, so the old guard survives the move into the shared primitive.
+#[test]
+fn claim_refuses_a_record_whose_self_report_disagrees_and_leaves_it_readable() {
+    let _home = HomeSandbox::new();
+    let path = job_path("d-claimed-0", RecordKind::Collectable).unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        serde_json::json!({
+            "job_id": "d-other-0",
+            "profile": "work",
+            "state": "done",
+            "started_at": 1,
+            "done_at": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    assert!(
+        matches!(claim("d-claimed-0"), Claim::Refused(_)),
+        "a mismatched self-report is never claimed"
+    );
+    let restored = read("d-claimed-0").expect("the record is renamed back, not eaten");
+    assert_eq!(
+        restored.job_id, "d-other-0",
+        "the stored id decides ownership, and the file still says so"
+    );
+    assert!(
+        read("d-other-0").is_none(),
+        "nothing was moved under the stored id's own path"
+    );
+}
+
+/// The claimed spelling is a transient: invisible to every reader (its
+/// extension is not `json`), and only the startup sweep's foreign-file arm
+/// reaps a leftover from a claimant that died mid-claim.
+#[test]
+fn a_leftover_claimed_file_is_invisible_to_list_and_reaped_only_by_the_full_sweep() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        None,
+        false,
+        serde_json::json!({"result": "ok"}),
+    )
+    .unwrap();
+    let path = job_path(&id, RecordKind::Collectable)
+        .unwrap()
+        .with_extension("json.claim");
+    std::fs::rename(job_path(&id, RecordKind::Collectable).unwrap(), &path).unwrap();
+
+    assert!(
+        list(crate::usage::now_ms())
+            .iter()
+            .all(|j| j.record.job_id != id),
+        "a claimed file is no record to a reader"
+    );
+    gc_running_corpses(crate::usage::now_ms());
+    assert!(
+        path.exists(),
+        "the narrow collect sweep never touches a claimed file"
+    );
+    gc(crate::usage::now_ms());
+    assert!(
+        !path.exists(),
+        "the startup sweep's foreign-file arm reaps the leftover"
+    );
+}
+
+/// A stale claimed spelling from a claimant that died mid-claim must not
+/// block a later claim. The retry past it is Windows-only by construction
+/// (a unix rename replaces the target, so the first attempt already
+/// succeeds), which makes this pin inert on the linux leg and live on the
+/// Windows one; it documents the contract either way.
+#[test]
+fn a_stale_claimed_spelling_does_not_block_the_claim() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    write_done(
+        &id,
+        "work",
+        1000,
+        None,
+        None,
+        false,
+        serde_json::json!({"result": "ok"}),
+    )
+    .unwrap();
+    let claimed = job_path(&id, RecordKind::Collectable)
+        .unwrap()
+        .with_extension("json.claim");
+    std::fs::write(&claimed, "stale").unwrap();
+
+    let Claim::Owned(record) = claim(&id) else {
+        panic!("a stale claimed spelling must not block the claim");
+    };
+    assert_eq!(
+        record.job_id, id,
+        "the record behind the stale spelling is claimed"
+    );
+}
+
 /// A running job file is written by the server that spawned it and read by a
 /// possibly newer one PLUS the separate `mcp-await-job` hook process, so every
 /// field added after the first release has to default. Pinned against the real

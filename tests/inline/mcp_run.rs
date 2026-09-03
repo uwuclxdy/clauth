@@ -2193,6 +2193,18 @@ fn return_on_all_waits_for_the_slowest_lane_and_any_does_not() {
     );
     assert!(matches!(&any[1].1, WaitOutcome::Running(_)));
 
+    // The `any` phase claimed the done lane, so the `all` phase needs a fresh
+    // record: a wait that resolves a lane now owns (and consumes) its file.
+    jobs::write_done(
+        "d-mode-done-0",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "first"}),
+    )
+    .unwrap();
     let start = std::time::Instant::now();
     let all = rt.block_on(async {
         wait_for_batch(&ids, 3, ReturnOn::All, &mut ProgressSink::none(), None).await
@@ -2467,11 +2479,16 @@ fn monitor_done_scalar_envelope_is_wrapped_not_panicked() {
     );
 }
 
-/// The eviction must run only after the envelope rendered: a panic between the
-/// two (the pre-fix scalar fold) destroyed the job file, the only surviving
-/// copy of the delegate's result.
+/// The claim owns the file the moment the wait resolves a `Done` record, so
+/// a render panic cannot leave a second collectable copy: the old
+/// evict-after-render ordering died with the double delivery, since the
+/// render IS the delivery the claim serializes. The Ok arm pins the
+/// eviction; the Err arm is a safety net no live panic seam can reach
+/// (the fold wraps every non-object), and the ordering's live pin is the
+/// claim itself — removing it reds the collect and hook tests. The pre-fix
+/// scalar fold panic is the reason both arms assert against the store.
 #[test]
-fn monitor_done_keeps_the_job_until_the_result_renders() {
+fn monitor_done_claims_the_job_before_the_result_renders() {
     let _home = HomeSandbox::new();
     jobs::write_done(
         "d-keep-0",
@@ -2506,16 +2523,17 @@ fn monitor_done_keeps_the_job_until_the_result_renders() {
         }
         Err(_) => {
             assert!(
-                jobs::read("d-keep-0").is_some(),
-                "a failed render must leave the job file as the recoverable copy"
+                jobs::read("d-keep-0").is_none(),
+                "a failed render leaves nothing collectable: the claim already owned the delivery"
             );
         }
     }
 }
 
-/// The done-arm renderer is pure of the job store: it renders without evicting,
-/// and the handler evicts only after it returned. An eviction moved inside the
-/// renderer would destroy the only copy before the envelope was safely out.
+/// The done-arm renderer is pure of the job store: it renders without
+/// evicting. The claim is what evicts, and it runs before the render, in
+/// the wait — a renderer that evicted would destroy a refused record's
+/// restored file.
 #[test]
 fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
     let _home = HomeSandbox::new();
@@ -2539,7 +2557,7 @@ fn render_done_envelope_leaves_the_job_until_the_caller_evicts() {
     );
     assert!(
         jobs::read("d-render-0").is_some(),
-        "rendering never evicts; the handler does, after it returned"
+        "rendering never evicts; the claim does, before the render"
     );
     let text = blocks
         .first()
@@ -3076,6 +3094,39 @@ fn monitor_batch_never_evicts_a_mismatched_stored_job_id() {
     );
 }
 
+/// The one-id collect used to evict a mismatched hand-written record
+/// unconditionally while the batch arm's self-report guard spared it. The
+/// claim made both arms one rule: a refused record renders and its file
+/// stays, eviction keeps following the stored id.
+#[test]
+fn monitor_one_renders_a_mismatched_stored_id_without_evicting() {
+    let _home = HomeSandbox::new();
+    let dir = jobs::jobs_dir().expect("jobs dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("d-mis-1.json"),
+        serde_json::json!({
+            "job_id": "d-other-1",
+            "profile": "work",
+            "state": "done",
+            "started_at": 1,
+            "envelope": {"profile": "work", "is_error": false, "result": "stolen"},
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let text = monitor_text("d-mis-1");
+    assert!(
+        text.contains("finished: stolen"),
+        "the record renders under the caller's id: {text}"
+    );
+    assert!(
+        jobs::read("d-mis-1").is_some(),
+        "the refused record was renamed back, never evicted"
+    );
+}
+
 #[test]
 fn monitor_batch_refuses_over_cap_and_empty_list() {
     let _home = HomeSandbox::new();
@@ -3584,9 +3635,10 @@ fn await_job_outcomes_reports_still_running_at_deadline() {
 }
 
 /// The hook's delivery is the same folded envelope every collect renders, so
-/// its cost clause reads the record's endpoint. Both spellings are driven on
-/// the one record and print the same qualification; the envelope rides the
-/// real producer, so the clause is the one a real child's output earns.
+/// its cost clause reads the record's endpoint. The envelope rides the real
+/// producer, so the clause is the one a real child's output earns. The
+/// delivery CLAIMS the record: a later collect answers the hedged unknown
+/// copy instead of re-delivering the same full envelope (the A4 double).
 #[test]
 fn the_await_job_hook_delivers_the_collect_replys_cost_qualification() {
     let _home = HomeSandbox::new();
@@ -3628,11 +3680,81 @@ fn the_await_job_hook_delivers_the_collect_replys_cost_qualification() {
         hook_prose.contains("(equivalent Anthropic API rate cost: $2.06)"),
         "the hook's prose carries the same qualification: {hook_prose}"
     );
+    assert!(
+        jobs::read(&job_id).is_none(),
+        "the delivery claimed the record: nothing is left to collect twice"
+    );
 
     let collect_text = monitor_text(&job_id);
     assert!(
-        collect_text.contains("(equivalent Anthropic API rate cost: $2.06)"),
-        "and the collect reply agrees: {collect_text}"
+        collect_text.contains("unknown job_id")
+            && collect_text.contains("delivered by clauth's auto-delivery hook"),
+        "the collect answers the hedged unknown, never the envelope again: {collect_text}"
+    );
+}
+
+/// The `monitor` wait wins the race: it claims the record, so the hook that
+/// was waiting on the same id has nothing left to deliver and must not print
+/// a second copy.
+#[test]
+fn a_monitor_collect_leaves_the_hook_nothing_to_deliver() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-race-0",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "once"}),
+    )
+    .unwrap();
+
+    let collect_text = monitor_text("d-race-0");
+    assert!(
+        collect_text.contains("finished: once"),
+        "the collect returns the envelope: {collect_text}"
+    );
+    let (delivered, pending) = await_job_outcomes(
+        std::slice::from_ref(&"d-race-0".to_string()),
+        Duration::from_secs(2),
+    );
+    assert!(
+        delivered.is_empty() && pending.is_empty(),
+        "the hook delivers nothing a collect already returned"
+    );
+}
+
+/// The hook wins the race: a `monitor` wait still polling the id at the
+/// finish finds the record claimed from under it and answers the hedged
+/// unknown copy, whose owner-picked clause names the auto-delivery.
+#[test]
+fn a_wait_that_loses_the_claim_answers_the_hedged_unknown() {
+    let _home = HomeSandbox::new();
+    jobs::write_done(
+        "d-race-1",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "once"}),
+    )
+    .unwrap();
+    // A claim made before the wait's first read stands in for the race the
+    // claim serializes: it pins the same observable (a claimed record
+    // answers the hedged unknown, never a second envelope). The in-race
+    // `Claim::Lost` arm itself has no in-process pin.
+    assert!(
+        matches!(jobs::claim("d-race-1"), jobs::Claim::Owned(_)),
+        "the hook owns the record"
+    );
+
+    let collect_text = monitor_text("d-race-1");
+    assert!(
+        collect_text.contains("unknown job_id")
+            && collect_text.contains("delivered by clauth's auto-delivery hook"),
+        "the wait answers the hedged unknown, never a second envelope: {collect_text}"
     );
 }
 

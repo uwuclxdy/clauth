@@ -536,12 +536,80 @@ pub(crate) fn collectable_mtime_ms(job_id: &str) -> Option<u64> {
         .ok()
 }
 
-/// Delete a job file (best-effort). Called after a fallback `monitor` collect
-/// hands the envelope back.
+/// Delete a job file (best-effort). No delivery path calls this any more:
+/// a collect evicts through [`claim`]. The remaining caller gives a reserved
+/// running job's record back on abandon.
 pub(crate) fn remove(job_id: &str) {
     if let Ok(path) = job_path(job_id, RecordKind::Collectable) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// Who owns the delivery after a [`claim`] attempt.
+pub(crate) enum Claim {
+    /// The rename won: this record is the one delivery of the job, and its
+    /// file is consumed.
+    Owned(JobRecord),
+    /// The stored `job_id` disagrees with the path: the record was renamed
+    /// back, so the caller may render it but nothing was evicted.
+    Refused(JobRecord),
+    /// The source was already gone: another claimant owns the delivery, and
+    /// the caller answers the hedged unknown copy whose "already collected"
+    /// clause names exactly this.
+    Lost,
+}
+
+/// Claim the done record under `job_id` for exactly one delivery, whichever
+/// process delivers it. The rename is the whole serialization: the `monitor`
+/// wait and the auto-delivery hook both poll a finished record, and a
+/// read-then-remove pair would let both read `Done`, both deliver, and both
+/// evict — the double delivery this exists to end.
+///
+/// Contract: claim only a record a read just reported `Done`. A running
+/// record is rewritten by its heartbeat, and renaming one would evict a live
+/// job's file from under its waiter.
+///
+/// A record whose stored `job_id` disagrees with the path is renamed back
+/// and refused, never claimed: eviction follows the stored id, so an id the
+/// caller supplied must not collect a file another id's record owns. The
+/// rename-back cannot clobber anything — ids mint exactly once, and a `Done`
+/// file is never rewritten. The claimed spelling is invisible to [`list`]
+/// (its extension is not `json`) and a leftover from a crash is removed by
+/// the startup sweep's foreign-file arm; that crash also loses the record's
+/// only copy, since nothing reads the claimed spelling — the accepted cost
+/// of serializing before the render.
+pub(crate) fn claim(job_id: &str) -> Claim {
+    let from = job_path(job_id, RecordKind::Collectable).ok();
+    let Some(from) = from else {
+        return Claim::Lost;
+    };
+    let claimed = from.with_extension("json.claim");
+    // A stale claimed spelling left by a claimant that died mid-claim blocks
+    // the rename on Windows, where rename does not replace an existing
+    // file. Retry once past it. The `from.exists()` gate is the exactly-once
+    // guard: a rename that failed because the source is gone lost the race,
+    // and the claimed spelling then holds the WINNER's bytes, never a stale
+    // file to unlink. On unix the first rename already replaced the target,
+    // so the arm is Windows-only by construction.
+    if std::fs::rename(&from, &claimed).is_err() && from.exists() {
+        let _ = std::fs::remove_file(&claimed);
+        if std::fs::rename(&from, &claimed).is_err() {
+            return Claim::Lost;
+        }
+    }
+    let record = std::fs::read(&claimed)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<JobRecord>(&bytes).ok());
+    let Some(record) = record else {
+        let _ = std::fs::remove_file(&claimed);
+        return Claim::Lost;
+    };
+    if record.job_id != job_id {
+        let _ = std::fs::rename(&claimed, &from);
+        return Claim::Refused(record);
+    }
+    let _ = std::fs::remove_file(&claimed);
+    Claim::Owned(record)
 }
 
 /// Whether a blocking run's liveness record stands under this id.
