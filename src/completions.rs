@@ -20,10 +20,10 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "__CLATHA_LOGIN_FLAGS__" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "start" ] && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--isolated --with-fallback" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--isolated --with-fallback --auto --explain" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "daemon" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--standby --no-standby --replace --status" -- "${cur}") )
-    elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ]; then
+    elif [ "$prev" = "--isolated" ] || [ "$prev" = "--with-fallback" ] || [ "$prev" = "--profile" ] || [ "$prev" = "--explain" ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
@@ -98,8 +98,10 @@ _clauth() {
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
         [[ "${words[2]}" == start ]] && _values 'flag' '--isolated[clean isolated runtime; drops operator config]' \
-            '--with-fallback[follow the fallback chain; needs a running daemon]'
-    elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback) ]]; then
+            '--with-fallback[follow the fallback chain; needs a running daemon]' \
+            '--auto[pick the account by the models this session may run]' \
+            '--explain[print the account that would be launched, without launching]'
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
         _describe 'profile' profiles
@@ -189,6 +191,8 @@ complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--th
 complete -c clauth -f -n "__fish_seen_subcommand_from start login delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick the account by the models this session may run"
+complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --explain -d "Print the account that would be launched, without launching"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"

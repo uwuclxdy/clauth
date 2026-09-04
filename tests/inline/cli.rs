@@ -89,7 +89,7 @@ fn start_forwards_claude_args_verbatim_including_leading_hyphens() {
     let Command::Start(a) = command(&["start", "acme", "-p", "hi", "--model", "opus"]) else {
         panic!("start must parse");
     };
-    assert_eq!(a.profile, "acme");
+    assert_eq!(a.profile.as_deref(), Some("acme"));
     assert_eq!(a.claude_args, ["-p", "hi", "--model", "opus"]);
     assert_eq!(a.isolation(), Isolation::Shared);
 }
@@ -139,12 +139,92 @@ fn start_consumes_a_leading_double_dash_separator_and_forwards_the_rest() {
     let Command::Start(a) = command(&["start", "acme", "--", "--model", "haiku"]) else {
         panic!("start must parse");
     };
-    assert_eq!(a.profile, "acme");
+    assert_eq!(a.profile.as_deref(), Some("acme"));
     assert_eq!(
         a.claude_args,
         ["--model", "haiku"],
         "the separator is clap's, the args behind it are claude's"
     );
+}
+
+// ── --auto ──────────────────────────────────────────────────────────
+
+/// `--auto` defers the account to selection and takes the profile's place, so
+/// there is no name to read back.
+#[test]
+fn start_auto_defers_the_account_and_keeps_the_positional_free() {
+    let Command::Start(a) = command(&["start", "--auto"]) else {
+        panic!("start --auto must parse with no profile");
+    };
+    assert!(a.auto);
+    assert_eq!(a.target(), crate::cli::StartTarget::Auto);
+    assert!(a.passthrough().is_empty());
+}
+
+/// The trap `passthrough` exists for: clap still binds the first trailing value
+/// to the (now unused) profile slot, so without the fold `claude` would receive
+/// `hi` and lose the `-p` in front of it.
+#[test]
+fn start_auto_folds_the_positional_back_into_claude_args() {
+    let Command::Start(a) = command(&["start", "--auto", "--", "-p", "hi", "--model", "opus"])
+    else {
+        panic!("start must parse");
+    };
+    assert_eq!(
+        a.passthrough(),
+        ["-p", "hi", "--model", "opus"],
+        "--auto leaves no profile, so nothing may be eaten as one"
+    );
+}
+
+/// A non-hyphen first argument needs no separator, and is folded the same way.
+#[test]
+fn start_auto_folds_a_bare_first_argument_too() {
+    let Command::Start(a) = command(&["start", "--auto", "do the thing"]) else {
+        panic!("start must parse");
+    };
+    assert_eq!(a.target(), crate::cli::StartTarget::Auto);
+    assert_eq!(a.passthrough(), ["do the thing"]);
+}
+
+/// Why the `--` is documented rather than worked around: with no name in the
+/// profile slot, clap has nothing to tell a passthrough `-p` from a misspelled
+/// clauth flag, so it refuses instead of guessing. Pinned so the day someone
+/// makes the positional take hyphen values, this says what it costs.
+#[test]
+fn start_auto_refuses_a_bare_hyphen_argument_without_a_separator() {
+    parse(&["start", "--auto", "-p", "hi"])
+        .expect_err("a leading-hyphen claude arg after --auto needs the `--` separator");
+}
+
+/// Without `--auto` the positional is the profile and nothing is folded.
+#[test]
+fn start_without_auto_keeps_the_named_target() {
+    let Command::Start(a) = command(&["start", "acme", "-p", "hi"]) else {
+        panic!("start must parse");
+    };
+    assert_eq!(
+        a.target(),
+        crate::cli::StartTarget::Named("acme".to_owned())
+    );
+    assert_eq!(a.passthrough(), ["-p", "hi"]);
+}
+
+/// A bare `start` still has to name an account.
+#[test]
+fn start_without_auto_requires_a_profile() {
+    parse(&["start"]).expect_err("a start with neither a profile nor --auto must be refused");
+}
+
+/// `--auto` and `--with-fallback` compose: pick the best entry point, then let
+/// the chain rescue it if that account runs out.
+#[test]
+fn start_auto_composes_with_with_fallback() {
+    let Command::Start(a) = command(&["start", "--auto", "--with-fallback"]) else {
+        panic!("start must parse");
+    };
+    assert!(a.auto && a.with_fallback);
+    assert_eq!(a.target(), crate::cli::StartTarget::Auto);
 }
 
 // ── start's own flags ───────────────────────────────────────────────────────
@@ -154,7 +234,7 @@ fn start_isolated_flag_precedes_the_name() {
     let Command::Start(a) = command(&["start", "--isolated", "acme", "-p", "hi"]) else {
         panic!("start must parse");
     };
-    assert_eq!(a.profile, "acme");
+    assert_eq!(a.profile.as_deref(), Some("acme"));
     assert_eq!(a.isolation(), Isolation::Isolated);
     assert_eq!(a.claude_args, ["-p", "hi"]);
 }
@@ -169,7 +249,7 @@ fn start_with_fallback_flag_parses_and_defaults_off() {
         panic!("must parse");
     };
     assert!(on.with_fallback, "the flag must reach StartArgs");
-    assert_eq!(on.profile, "acme");
+    assert_eq!(on.profile.as_deref(), Some("acme"));
 
     let Command::Start(off) = command(&["start", "acme"]) else {
         panic!("must parse");
@@ -250,7 +330,9 @@ fn start_args_accessors_map_flags_to_the_runtime_types() {
     let shared = StartArgs {
         isolated: false,
         with_fallback: false,
-        profile: "acme".into(),
+        auto: false,
+        explain: false,
+        profile: Some("acme".into()),
         claude_args: Vec::new(),
     };
     assert_eq!(shared.isolation(), Isolation::Shared);
@@ -258,7 +340,9 @@ fn start_args_accessors_map_flags_to_the_runtime_types() {
     let isolated = StartArgs {
         isolated: true,
         with_fallback: false,
-        profile: "acme".into(),
+        auto: false,
+        explain: false,
+        profile: Some("acme".into()),
         claude_args: Vec::new(),
     };
     assert_eq!(isolated.isolation(), Isolation::Isolated);
@@ -1048,8 +1132,14 @@ mod disabled_target_refusal {
         let home = HomeSandbox::new();
         seed_disabled_profile("off");
 
-        let err = cmd_start("off", &[], crate::runtime::Isolation::Shared, false)
-            .expect_err("a disabled target must be refused");
+        let err = cmd_start(
+            &crate::cli::StartTarget::Named("off".to_owned()),
+            &[],
+            crate::runtime::Isolation::Shared,
+            false,
+            false,
+        )
+        .expect_err("a disabled target must be refused");
         assert_eq!(
             err.to_string(),
             "'off': account is disabled, run `clauth enable off`"

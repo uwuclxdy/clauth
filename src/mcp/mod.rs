@@ -1107,6 +1107,26 @@ Delegating spends the target account, so pick the account with `profiles` first.
                         )));
                     }
                 },
+                None if config.state.delegate_auto_select => {
+                    // A delegate is the one subagent that CAN hold its own
+                    // account — it is a separate `claude` process, where a
+                    // `Task` subagent shares the parent's process-wide
+                    // credential memo. So this is the only place a subagent's
+                    // account can be chosen at all, and the model it asked for
+                    // is the demand: no inference, the caller said it.
+                    let demand = crate::selection::demand_from(model.as_deref());
+                    let outcome =
+                        crate::selection::select(&config, &demand, config.state.selection_limits());
+                    match outcome.chosen {
+                        Some(c) => Target::One(c.name.as_str().to_owned()),
+                        None => {
+                            return Ok(delegate_refusal(
+                                "`profiles` is empty and no chain member can serve this \
+                                 model; name a profile to spend",
+                            ));
+                        }
+                    }
+                }
                 None => {
                     return Ok(delegate_refusal(
                         "`profiles` is empty: name at least one profile",

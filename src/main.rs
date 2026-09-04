@@ -35,6 +35,7 @@ mod profile_cache;
 mod profile_json;
 mod providers;
 mod runtime;
+mod selection;
 mod sessions;
 mod sessions_cli;
 mod settings_sync;
@@ -163,7 +164,13 @@ fn dispatch(cli: Cli) -> Result<()> {
     };
 
     match command {
-        Command::Start(a) => cmd_start(&a.profile, &a.claude_args, a.isolation(), a.with_fallback),
+        Command::Start(a) => cmd_start(
+            &a.target(),
+            &a.passthrough(),
+            a.isolation(),
+            a.with_fallback,
+            a.explain,
+        ),
         Command::Login(a) => cmd_login(a),
         Command::Delete {
             profile,
@@ -296,13 +303,63 @@ fn cmd_completions(target: &str, shell: Option<&str>) -> Result<()> {
     completions::print_script(target)
 }
 
-fn cmd_start(name: &str, rest: &[String], isolation: Isolation, follows_chain: bool) -> Result<()> {
+fn cmd_start(
+    target: &cli::StartTarget,
+    rest: &[String],
+    isolation: Isolation,
+    follows_chain: bool,
+    explain_only: bool,
+) -> Result<()> {
     platform::init();
     runtime::gc_stale_runtimes();
     let config = load_config()?;
-    let canonical = resolve_or_bail(&config, name)?;
+    let canonical = match target {
+        cli::StartTarget::Named(name) => resolve_or_bail(&config, name)?,
+        cli::StartTarget::Auto => auto_select(&config, rest)?,
+    };
     refuse_if_disabled(&config, &canonical)?;
+    // After the refusals, so `--explain` answers what a real start would do
+    // rather than naming a target the launch would then reject.
+    if explain_only {
+        outln!("dry run: would start on `{}`", canonical.as_str());
+        return Ok(());
+    }
     start::run(&config, &canonical, rest, isolation, None, follows_chain)
+}
+
+/// `clauth start --auto`: pick the chain member with the most runway that can
+/// serve every model this session may run, and say so on the way in.
+///
+/// The candidate set is the fallback chain, so an empty one refuses with the
+/// fix named rather than reaching for an account the operator never put in
+/// rotation — the same contract `--with-fallback` refuses under.
+fn auto_select(config: &profile::AppConfig, claude_args: &[String]) -> Result<ProfileName> {
+    anyhow::ensure!(
+        !config.state.fallback_chain.is_empty(),
+        "--auto picks from the fallback chain and it is empty; add members on the Fallback tab, \
+         or name a profile instead"
+    );
+    let demand = selection::demand_from(selection::launch_models(claude_args));
+    let outcome = selection::select(config, &demand, config.state.selection_limits());
+    let chosen = outcome.chosen.ok_or_else(|| {
+        let why = outcome
+            .rejected
+            .iter()
+            .map(|(name, r)| match r {
+                selection::Rejected::ScopedSpent { label } => {
+                    format!("{}: {label} spent", name.as_str())
+                }
+                selection::Rejected::WeeklySpent => format!("{}: weekly spent", name.as_str()),
+                selection::Rejected::Canceled => {
+                    format!("{}: subscription canceled", name.as_str())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::anyhow!("--auto found no chain member that can serve this session ({why})")
+    })?;
+    crate::outln!("{}", selection::explain(&chosen, &demand));
+    Ok(chosen.name)
 }
 
 /// Where `clauth login <name>` lands. An EXISTING profile (matched

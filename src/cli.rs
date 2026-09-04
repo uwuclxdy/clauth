@@ -351,8 +351,29 @@ pub(crate) struct StartArgs {
     /// refused by name at launch.
     #[arg(long, conflicts_with = "isolated")]
     pub(crate) with_fallback: bool,
+    /// Pick the account automatically instead of naming one.
+    ///
+    /// Weighs every fallback-chain member against the models this session may
+    /// run — the `--model` you pass, the model in your settings, and the
+    /// subagent model — and starts on the one with the most runway that can
+    /// actually serve all of them.
+    ///
+    /// It takes the place of the profile name, so separate `claude`'s own args
+    /// with `--` whenever the first of them starts with a hyphen:
+    /// `clauth start --auto -- -p "hi"`. Without a name in that slot there is
+    /// nothing to tell a passthrough `-p` from a misspelled clauth flag, and
+    /// guessing would silently eat one of them.
+    #[arg(long)]
+    pub(crate) auto: bool,
+    /// Print the account that would be launched, and why, without launching it.
+    ///
+    /// The selector reads live usage and burn history, so this is how an
+    /// operator sees the decision before spending a window on it.
+    #[arg(long)]
+    pub(crate) explain: bool,
     /// Profile to launch under.
-    pub(crate) profile: String,
+    #[arg(required_unless_present = "auto")]
+    pub(crate) profile: Option<String>,
     /// Args handed to `claude` verbatim.
     #[arg(
         trailing_var_arg = true,
@@ -360,6 +381,14 @@ pub(crate) struct StartArgs {
         value_name = "CLAUDE_ARGS"
     )]
     pub(crate) claude_args: Vec<String>,
+}
+
+/// Which account a `clauth start` runs under: the name the operator typed, or
+/// the one [`crate::selection`] picks for the models the session may run.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StartTarget {
+    Named(String),
+    Auto,
 }
 
 impl StartArgs {
@@ -370,6 +399,33 @@ impl StartArgs {
             Isolation::Isolated
         } else {
             Isolation::Shared
+        }
+    }
+
+    /// The account to start on. `--auto` defers it to selection; without it the
+    /// positional is required, so the `unwrap_or_default` is unreachable rather
+    /// than a fallback.
+    pub(crate) fn target(&self) -> StartTarget {
+        if self.auto {
+            StartTarget::Auto
+        } else {
+            StartTarget::Named(self.profile.clone().unwrap_or_default())
+        }
+    }
+
+    /// Args for `claude`.
+    ///
+    /// `--auto` leaves no profile to fill, but clap fills positionals in
+    /// declaration order and binds the first trailing value to that slot
+    /// anyway — so `clauth start --auto -- -p "hi"` parks `-p` in `profile` and
+    /// leaves `claude` a bare `hi`. Folding it back is what makes the `--`
+    /// spelling come out whole on the other side.
+    pub(crate) fn passthrough(&self) -> Vec<String> {
+        match (&self.profile, self.auto) {
+            (Some(first), true) => std::iter::once(first.clone())
+                .chain(self.claude_args.iter().cloned())
+                .collect(),
+            _ => self.claude_args.clone(),
         }
     }
 }
