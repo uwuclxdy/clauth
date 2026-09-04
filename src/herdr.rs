@@ -67,6 +67,11 @@ pub(crate) fn install(
     match plugin_source() {
         Source::Link(path) => {
             outln!("clauth: linking {} into herdr", path.display());
+            // Stamp before linking: herdr derives the linked plugin's version
+            // from this manifest, so it must match the running binary's version.
+            let manifest = path.join("herdr-plugin.toml");
+            stamp_manifest_version(&manifest)
+                .with_context(|| format!("failed to stamp {}", manifest.display()))?;
             let path = path.to_string_lossy().into_owned();
             // `plugin link` answers with the whole parsed manifest as one JSON
             // line and asks nothing, so it is swallowed unless it fails.
@@ -589,7 +594,9 @@ pub(crate) fn plugin_heal_line() -> anyhow::Result<Option<String>> {
 
 /// The deadline seam under [`plugin_heal_line`]: the shipped call uses
 /// [`HEAL_INSTALL_TIMEOUT`], a test drives the same path with a short one so
-/// the heal's use of the bound is pinned, not just the helper's.
+/// the heal's use of the bound is pinned, not just the helper's. After a
+/// reinstall it re-probes herdr and stamps the installed manifest when the
+/// fresh entry still trails this binary's version.
 pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<String>> {
     let Some(bin) = resolved_bin() else {
         return Ok(None);
@@ -615,9 +622,107 @@ pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<
         &["plugin", "install", GITHUB_SOURCE, "--yes"],
         timeout,
     )?;
-    Ok(Some(format!(
-        "reinstalled the herdr plugin from {GITHUB_SOURCE} (was {old})"
-    )))
+
+    // A fresh probe drives the stamp: the reinstall may fetch a manifest whose
+    // version still trails this binary, and only then does the heal stamp the
+    // installed manifest. A probe error here is not a heal failure — the
+    // reinstall landed, and the next window's probe retries the read.
+    let mut stamped = false;
+    if let (Some(fresh), None) = registry_probe(&bin)
+        && plugin_update_needed(&fresh)
+        && let Some(root) = fresh.plugin_root.as_deref()
+    {
+        let manifest = Path::new(root).join("herdr-plugin.toml");
+        stamped = stamp_manifest_version(&manifest)
+            .with_context(|| format!("failed to stamp {}", manifest.display()))?;
+    }
+
+    let mut line = format!("reinstalled the herdr plugin from {GITHUB_SOURCE} (was {old})");
+    if stamped {
+        line.push_str(&format!(
+            "; stamped the manifest version to {}",
+            crate::update::CURRENT_VERSION
+        ));
+    }
+    Ok(Some(line))
+}
+
+/// Stamps the top-level `version = "..."` line of a herdr plugin manifest to
+/// [`crate::update::CURRENT_VERSION`], preserving every other byte. A manifest
+/// already at the crate version returns `Ok(false)` with no write, so a
+/// matching file stays byte-identical.
+///
+/// The write is atomic: the staged sibling carries the original file's
+/// permissions before the rename, so a reader sees the old or the new bytes and
+/// the manifest keeps its mode.
+fn stamp_manifest_version(path: &Path) -> Result<bool> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
+    let doc: toml::Value = toml::from_str(&text)
+        .with_context(|| format!("{} does not parse as toml", path.display()))?;
+    let current = doc
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .with_context(|| format!("{} carries no version", path.display()))?;
+    if current == crate::update::CURRENT_VERSION {
+        return Ok(false);
+    }
+    let stamped = rewrite_version_line(&text, current).with_context(|| {
+        format!(
+            "{} has no top-level `version = \"{current}\"` line",
+            path.display()
+        )
+    })?;
+    publish_preserving_perms(path, stamped.as_bytes())
+        .with_context(|| format!("failed to stamp {}", path.display()))?;
+    Ok(true)
+}
+
+/// Replaces the top-level `version = "old"` line in place, leaving every
+/// comment and other key untouched, so a reserialization cannot reformat the
+/// manifest. `Err` when no top-level line matched: a write that changed nothing
+/// must not read as a successful stamp.
+fn rewrite_version_line(text: &str, old: &str) -> Result<String> {
+    let needle = format!("version = \"{old}\"");
+    let mut replaced = false;
+    let out: Vec<String> = text
+        .lines()
+        .map(|line| {
+            if !replaced && !line.starts_with(' ') && line.trim() == needle.as_str() {
+                replaced = true;
+                format!("version = \"{}\"", crate::update::CURRENT_VERSION)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    if !replaced {
+        bail!("no top-level `{needle}` line");
+    }
+    let mut out = out.join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Atomic publish that keeps the destination's permissions: the staged sibling
+/// takes the original's mode before the rename, and the rename stays within one
+/// directory. Shared by the install stamp and the heal stamp.
+fn publish_preserving_perms(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let perms = std::fs::metadata(path).map(|m| m.permissions()).ok();
+    let tmp = crate::profile::tmp_sibling(path);
+    std::fs::write(&tmp, bytes)?;
+    if let Some(perms) = perms {
+        std::fs::set_permissions(&tmp, perms)?;
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 /// Stamp the floor at now, so [`heal_detached`] refuses every attempt for the

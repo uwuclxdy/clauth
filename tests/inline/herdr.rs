@@ -437,6 +437,19 @@ fn heal_shim(dir: &Path) -> PathBuf {
     )
 }
 
+/// A herdr shim for the stamp path: `plugin list --json` answers
+/// `HEAL_ANSWER_BEFORE` until an install runs, then `HEAL_ANSWER_AFTER` (the
+/// flip is an `installed` state file the install leg creates). Every other
+/// invocation logs its argv into `heal.log` beside itself, like [`heal_shim`].
+#[cfg(unix)]
+fn stateful_heal_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then if [ -f \"$(dirname \"$0\")/installed\" ]; then echo \"$HEAL_ANSWER_AFTER\"; else echo \"$HEAL_ANSWER_BEFORE\"; fi; exit 0; fi; if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"install\" ]; then : > \"$(dirname \"$0\")/installed\"; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exit 0",
+    )
+}
+
 #[cfg(unix)]
 #[test]
 fn plugin_heal_reinstalls_a_stale_github_install() {
@@ -473,6 +486,152 @@ fn plugin_heal_reinstalls_a_stale_github_install() {
         log.trim(),
         "plugin install uwuclxdy/clauth/herdr-plugin --yes",
         "the update is a reinstall with the preview skipped"
+    );
+}
+
+/// The stamp half of the heal: a reinstall that still trails the binary gets
+/// its installed manifest's version line rewritten, and the success line says
+/// so. The shim flips its registry answer on the install's state file, so the
+/// pre-install and post-install probes read different entries.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_stamps_a_still_trailing_installed_manifest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let planted = home.home().join("installed-plugin");
+    std::fs::create_dir_all(&planted).expect("planted dir");
+    let manifest = planted.join("herdr-plugin.toml");
+    let fixture =
+        "id = \"clauth\"\nname = \"clauth\"\nversion = \"0.0.0\"\nmin_herdr_version = \"0.8.0\"\n";
+    std::fs::write(&manifest, fixture).expect("fixture written");
+
+    let before = plugin_list_json(
+        r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+    );
+    let after = plugin_list_json(&format!(
+        r#"{{"enabled":true,"version":"0.0.0","plugin_id":"clauth","plugin_root":"{}","source":{{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}}}"#,
+        planted.display()
+    ));
+    let shim = stateful_heal_shim(home.home());
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HEAL_ANSWER_BEFORE", Some(std::ffi::OsStr::new(&before))),
+            ("HEAL_ANSWER_AFTER", Some(std::ffi::OsStr::new(&after))),
+        ],
+    );
+
+    let line = plugin_heal_line()
+        .expect("heal runs")
+        .expect("update lands");
+    assert!(
+        line.contains("stamped the manifest version to"),
+        "the line names the stamp: {line}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&manifest).expect("manifest reads"),
+        format!(
+            "id = \"clauth\"\nname = \"clauth\"\nversion = \"{}\"\nmin_herdr_version = \"0.8.0\"\n",
+            crate::update::CURRENT_VERSION
+        ),
+        "the version line carries the crate version, everything else byte-for-byte"
+    );
+}
+
+/// The stamp's control: when the fresh post-install entry already carries the
+/// crate version, the heal leaves the planted manifest byte-identical and the
+/// line carries no stamp clause.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_leaves_a_current_manifest_byte_identical_after_reinstall() {
+    let home = crate::testutil::HomeSandbox::new();
+    let planted = home.home().join("installed-plugin");
+    std::fs::create_dir_all(&planted).expect("planted dir");
+    let manifest = planted.join("herdr-plugin.toml");
+    let fixture = "id = \"clauth\"\nversion = \"0.0.0\"\n";
+    std::fs::write(&manifest, fixture).expect("fixture written");
+
+    let before = plugin_list_json(
+        r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+    );
+    let after = plugin_list_json(&format!(
+        r#"{{"enabled":true,"version":"{}","plugin_id":"clauth","plugin_root":"{}","source":{{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}}}"#,
+        env!("CARGO_PKG_VERSION"),
+        planted.display()
+    ));
+    let shim = stateful_heal_shim(home.home());
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HEAL_ANSWER_BEFORE", Some(std::ffi::OsStr::new(&before))),
+            ("HEAL_ANSWER_AFTER", Some(std::ffi::OsStr::new(&after))),
+        ],
+    );
+
+    let line = plugin_heal_line()
+        .expect("heal runs")
+        .expect("update lands");
+    assert!(
+        !line.contains("stamped the manifest version to"),
+        "a current entry is not stamped: {line}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&manifest).expect("manifest reads"),
+        fixture,
+        "no stamp: the manifest stays byte-identical"
+    );
+}
+
+/// `install` over a checkout stamps the linked manifest before `plugin link`,
+/// so a linked checkout reports the running binary's version to herdr.
+#[cfg(unix)]
+#[test]
+fn install_links_a_checkout_and_stamps_its_manifest() {
+    let home = crate::testutil::HomeSandbox::new();
+    let checkout = home.home().join("checkout");
+    let plugin_dir = checkout.join("herdr-plugin");
+    std::fs::create_dir_all(&plugin_dir).expect("checkout dir");
+    let manifest = plugin_dir.join("herdr-plugin.toml");
+    std::fs::write(&manifest, "id = \"clauth\"\nversion = \"0.0.0\"\n").expect("fixture written");
+
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "echo \"$@\" >> \"$(dirname \"$0\")/link.log\"; exit 0",
+    );
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "HERDR_BIN_PATH",
+            Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+        )],
+    );
+
+    {
+        let _cwd = CwdPin::new(&checkout);
+        install(None, true, true, false).expect("install links the checkout");
+    }
+
+    let text = std::fs::read_to_string(&manifest).expect("manifest reads");
+    assert!(
+        text.contains(&format!("version = \"{}\"", crate::update::CURRENT_VERSION)),
+        "the checkout's manifest carries the crate version: {text}"
+    );
+    let log = std::fs::read_to_string(home.home().join("link.log")).unwrap_or_default();
+    assert!(
+        log.trim().starts_with("plugin link "),
+        "the link ran after the stamp: {log}"
+    );
+    assert!(
+        log.trim().ends_with("/checkout/herdr-plugin"),
+        "the link names the checkout's plugin dir: {log}"
     );
 }
 
@@ -1290,6 +1449,31 @@ fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("shim chmod");
     path
+}
+
+/// RAII current-directory pin: sets the process cwd for the block and restores
+/// it on drop, even on panic. Only `install`'s checkout branch reads cwd, and
+/// no other test in this module observes it, so the pin is scoped to the one
+/// test that needs it. nextest also runs each test in its own process.
+#[cfg(unix)]
+struct CwdPin {
+    prev: PathBuf,
+}
+
+#[cfg(unix)]
+impl CwdPin {
+    fn new(dir: &Path) -> Self {
+        let prev = std::env::current_dir().expect("current dir");
+        std::env::set_current_dir(dir).expect("set cwd");
+        Self { prev }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CwdPin {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.prev);
+    }
 }
 
 /// The probe bound: a herdr that never answers costs the caller the timeout,
