@@ -29,6 +29,9 @@ const PLUGIN_ID: &str = "clauth";
 const OPEN_ACTION: &str = "clauth.open";
 /// `owner/repo/subdir`, the only source shape `herdr plugin install` accepts.
 const GITHUB_SOURCE: &str = "uwuclxdy/clauth/herdr-plugin";
+/// The fetch URL behind `GITHUB_SOURCE`: the release probe's `git ls-remote
+/// --tags` reads the repo's release tags without a checkout.
+const GITHUB_REMOTE: &str = "https://github.com/uwuclxdy/clauth.git";
 /// Offered when `--key` is absent. `prefix+` is herdr's own leader.
 pub(crate) const DEFAULT_KEY: &str = "prefix+a";
 /// The pane-metadata name `report-profile.sh` publishes the account under.
@@ -67,8 +70,25 @@ pub(crate) fn install(
         refuse_over_local_link(entry.as_ref())?;
     }
 
-    outln!("clauth: installing {GITHUB_SOURCE} into herdr");
+    // The install lands at the newest release tag, so an install is
+    // reproducible and matches the commit the heal compares against. The
+    // probe failure never fails the install: a manual `clauth herdr install`
+    // is the user's own act, and the heal re-pins a stale install later.
+    let release = match latest_release_target() {
+        Ok(release) => release,
+        Err(error) => {
+            install_err(&unpinned_release_note(&error));
+            None
+        }
+    };
+    install_out(&installing_line(
+        release.as_ref().map(|(tag, _)| tag.as_str()),
+    ));
     let mut args = vec!["plugin", "install", GITHUB_SOURCE];
+    if let Some((tag, _)) = &release {
+        args.push("--ref");
+        args.push(tag);
+    }
     // herdr's preview is the user's chance to read what a plugin will
     // run as them. Only skip it when this command was already answered.
     if yes {
@@ -135,6 +155,117 @@ pub(crate) fn install(
     outln!("clauth: wrote {}", path.display());
     outln!("clauth: press {key} in herdr to open the dashboard");
     Ok(())
+}
+
+/// The installing line: names the source, and the tag the install is pinned
+/// to when the release probe picked one. Split out so a test pins both
+/// wordings without driving `install`'s subprocesses.
+fn installing_line(tag: Option<&str>) -> String {
+    match tag {
+        Some(tag) => format!("clauth: installing {GITHUB_SOURCE} at {tag} into herdr"),
+        None => format!("clauth: installing {GITHUB_SOURCE} into herdr"),
+    }
+}
+
+/// The one-line note `install` prints when the release probe fails: a failed
+/// probe degrades the install to unpinned, never aborts it. Split out so a
+/// test pins the wording.
+fn unpinned_release_note(error: &anyhow::Error) -> String {
+    format!(
+        "clauth: could not resolve the latest release ({error:#}); installing {GITHUB_SOURCE} unpinned"
+    )
+}
+
+/// `install`'s emitter for the ruled lines: [`outln!`] in every build, and in
+/// test builds the line is also offered to the thread's capture, so a test
+/// pins that `install` PRINTED the line rather than only that a helper
+/// formats it.
+fn install_out(line: &str) {
+    #[cfg(all(test, unix))]
+    record_install_line(line);
+    outln!("{line}");
+}
+
+/// The stderr half of [`install_out`], through [`errln!`].
+fn install_err(line: &str) {
+    #[cfg(all(test, unix))]
+    record_install_line(line);
+    errln!("{line}");
+}
+
+// Per-thread rather than a process-global for the same reason `logline`'s
+// capture is: under `cargo.sh`'s `cargo test` fallback every inline test file
+// compiles into one binary whose tests are THREADS, so a global buffer would
+// hand one test its neighbour's lines. Unix-only, like the install tests that
+// drive the seam: the windows cross-lint compiles the test target without
+// them, where the seam would read as dead code.
+#[cfg(all(test, unix))]
+thread_local! {
+    static INSTALL_CAPTURE: std::cell::RefCell<Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+fn record_install_line(line: &str) {
+    let _ = INSTALL_CAPTURE.try_with(|c| {
+        c.borrow().as_ref().map(|lines| {
+            lines
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(line.to_string())
+        })
+    });
+}
+
+/// A capture buffer for the lines `install` prints: install it on the thread
+/// that will drive [`install`], read the lines back. Mirrors `logline`'s
+/// capture seam.
+#[cfg(all(test, unix))]
+#[derive(Clone, Default)]
+struct InstallLines(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+#[cfg(all(test, unix))]
+impl InstallLines {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Take every line [`install_out`]/[`install_err`] carry on the CALLING
+    /// thread until the returned guard drops. Panics when one is already
+    /// installed: the inner guard's drop would silently retire the outer
+    /// capture.
+    #[must_use]
+    fn capture_here(&self) -> InstallCapture {
+        INSTALL_CAPTURE.with(|c| {
+            let mut c = c.borrow_mut();
+            assert!(
+                c.is_none(),
+                "an install-line capture is already installed on this thread"
+            );
+            *c = Some(self.0.clone());
+        });
+        InstallCapture(std::marker::PhantomData)
+    }
+
+    /// The lines taken so far, oldest first.
+    fn snapshot(&self) -> Vec<String> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+/// RAII half of [`InstallLines::capture_here`]: clears the thread's capture
+/// slot on drop, panic included. `!Send` by construction, same claim as
+/// `logline`'s guard.
+#[cfg(all(test, unix))]
+struct InstallCapture(std::marker::PhantomData<*const ()>);
+
+#[cfg(all(test, unix))]
+impl Drop for InstallCapture {
+    fn drop(&mut self) {
+        // `try_with`, so a drop running during thread teardown restores
+        // nothing instead of panicking the thread it exists to report on.
+        let _ = INSTALL_CAPTURE.try_with(|c| c.borrow_mut().take());
+    }
 }
 
 /// The one install refusal: herdr refuses a github install over a registered
@@ -239,6 +370,15 @@ pub(crate) struct RegistryEntry {
     pub(crate) min_herdr_version: Option<String>,
     pub(crate) plugin_root: Option<String>,
     pub(crate) source_kind: Option<String>,
+    /// The commit a github install was fetched at; the auto-update heal's
+    /// staleness signal. Absent for local links and for entries registered by
+    /// an older herdr, where the heal degrades to a no-op.
+    pub(crate) resolved_commit: Option<String>,
+    /// The github owner/repo a github install came from. The heal reinstalls
+    /// only the canonical repo: a fork's install was vetted by its user and is
+    /// never replaced behind them.
+    pub(crate) source_owner: Option<String>,
+    pub(crate) source_repo: Option<String>,
     pub(crate) warnings: Vec<String>,
 }
 
@@ -413,6 +553,21 @@ fn registry_entry_from_value(root: &Value) -> Option<RegistryEntry> {
             .and_then(|source| source.get("kind"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        resolved_commit: entry
+            .get("source")
+            .and_then(|source| source.get("resolved_commit"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        source_owner: entry
+            .get("source")
+            .and_then(|source| source.get("owner"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        source_repo: entry
+            .get("source")
+            .and_then(|source| source.get("repo"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         warnings: entry
             .get("warnings")
             .and_then(Value::as_array)
@@ -425,6 +580,253 @@ fn registry_entry_from_value(root: &Value) -> Option<RegistryEntry> {
             })
             .unwrap_or_default(),
     })
+}
+
+/// The herdr heal's own attempt limiter; a second [`crate::plugin_host::HealThrottle`]
+/// instance, so a herdr heal never defers the claude one or the other way round.
+static HEAL_THROTTLE: crate::plugin_host::HealThrottle = crate::plugin_host::HealThrottle::new();
+
+/// The throttled detached heal for the herdr plugin. herdr has no `plugin
+/// update`, so an install over an existing github source IS the update: herdr
+/// replaces the managed checkout and re-registers. Staleness is the installed
+/// checkout's `resolved_commit` against the newest release tag's commit — an
+/// install lands at that tag, so a matching commit means current — never the
+/// manifest version number, which is display metadata and would make the
+/// installed entry lie. Callers: the daemon tick and `clauth mcp` startup,
+/// mirroring the claude plugin's detached heal. Success and failure both log
+/// through `logline!`, never stdout.
+pub(crate) fn heal_detached() {
+    // The plugin is linux and macos only (its entrypoints are POSIX shell), so
+    // there is nothing to heal on Windows.
+    if cfg!(windows) {
+        return;
+    }
+    // This heal is a network update (herdr's install fetches from GitHub), so
+    // the same opt-out that gates clauth's own binary update gates it, before
+    // the throttle claim so a disabled box never even claims an attempt.
+    if !crate::update::updates_enabled() {
+        return;
+    }
+    let Some(claim) = HEAL_THROTTLE.claim(crate::usage::now_ms()) else {
+        return;
+    };
+    // Fail closed in test builds: the worker probes and reinstalls through the
+    // resolved binary, and herdr panes inject `HERDR_BIN_PATH` with the
+    // operator's real herdr, so a test run inside a pane sees the assert
+    // satisfied with no shim staged. Only the test fake sets `HERDR_SHIM_STATE`,
+    // so it is the sentinel; a test that drives a caller of this heal arms the
+    // throttle instead when the heal is not what the test is about.
+    #[cfg(test)]
+    assert!(
+        std::env::var_os("HERDR_SHIM_STATE").is_some(),
+        "heal_detached would probe the operator's real `herdr` and reinstall \
+         their real plugin — stage a herdr shim beside a `HERDR_SHIM_STATE` pin, or call \
+         `arm_heal_throttle_for_test` if the heal is not what the test is about"
+    );
+    #[cfg(test)]
+    let done = crate::testutil::register_background_task();
+    std::thread::spawn(move || {
+        let _claim = claim;
+        match plugin_heal_line() {
+            Ok(Some(line)) => crate::logline::logline!("{line}"),
+            Ok(None) => {}
+            Err(e) => crate::logline::logline!("clauth: herdr plugin heal failed: {e:#}"),
+        }
+        // Last action, after every env-touching step: the claim's drop clears
+        // one atomic and nothing else, so it is safe past the send.
+        #[cfg(test)]
+        let _ = done.send(());
+    });
+}
+
+/// How long one detached reinstall may take: a stalled fetch must release the
+/// heal's in-flight claim rather than wedge it for the process lifetime.
+const HEAL_INSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// The bound on the release probe: one network round trip, but cold DNS and
+/// TLS setup can outlast the local-subprocess bound [`PROBE_TIMEOUT`] was
+/// sized for.
+const REMOTE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The gate + update behind [`heal_detached`], split out so a test can pin the
+/// contract without a thread: `None` when there is nothing to do, `Some` when
+/// the update landed, `Err` when the probe or the install failed.
+pub(crate) fn plugin_heal_line() -> anyhow::Result<Option<String>> {
+    plugin_heal_line_with(HEAL_INSTALL_TIMEOUT)
+}
+
+/// The deadline seam under [`plugin_heal_line`]: the shipped call uses
+/// [`HEAL_INSTALL_TIMEOUT`], a test drives the same path with a short one so
+/// the heal's use of the bound is pinned, not just the helper's.
+pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<String>> {
+    let Some(bin) = resolved_bin() else {
+        return Ok(None);
+    };
+    let bin = bin.to_string_lossy().into_owned();
+    let (entry, error) = registry_probe(&bin);
+    if let Some(error) = error {
+        bail!("{error}");
+    }
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    // Stale means the installed checkout's commit differs from the latest
+    // release tag's commit. Only github installs carry a commit; a linked
+    // checkout is the developer's live tree, a disabled entry stays disabled,
+    // and an entry without a commit (an older herdr's registration) degrades
+    // to a no-op.
+    if !entry.enabled || entry.source_kind.as_deref() != Some("github") {
+        return Ok(None);
+    }
+    // Never hijack a fork: the user vetted whatever source they installed
+    // from, and the heal only ever reinstalls the canonical repo.
+    if entry.source_owner.as_deref() != Some("uwuclxdy")
+        || entry.source_repo.as_deref() != Some("clauth")
+    {
+        return Ok(None);
+    }
+    let Some(installed) = entry.resolved_commit.clone() else {
+        return Ok(None);
+    };
+    // No conforming release tag on the remote: nothing names a target, so
+    // the heal stays a no-op rather than install an unpinned HEAD.
+    let Some((tag, target)) = latest_release_target()? else {
+        return Ok(None);
+    };
+    if installed == target {
+        return Ok(None);
+    }
+
+    // `--ref` pins the reinstall to the release tag the probe picked — the
+    // heal never installs a HEAD it did not compare against. `--yes` skips
+    // the interactive preview: the source was already vetted at install time,
+    // and a detached caller has no tty to answer it on anyway. The install is
+    // bounded: herdr's fetch has no timeout of its own, and a stall must not
+    // wedge the in-flight claim for the process lifetime. The spawn is the
+    // caller's so a failed spawn is named as such rather than as a timeout.
+    let mut cmd = Command::new(&bin);
+    cmd.args(["plugin", "install", GITHUB_SOURCE, "--ref", &tag, "--yes"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().with_context(|| {
+        format!(
+            "could not run `{bin} plugin install {GITHUB_SOURCE} --ref {tag} --yes`; is herdr installed and on PATH?"
+        )
+    })?;
+    let Some(out) = run_bounded(child, timeout) else {
+        bail!(
+            "`{bin} plugin install {GITHUB_SOURCE} --ref {tag} --yes` timed out after {}s",
+            timeout.as_secs()
+        );
+    };
+    if !out.status.success() {
+        let mut why = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !err.trim().is_empty() {
+            why.push('\n');
+            why.push_str(err.trim());
+        }
+        bail!("`{bin} plugin install {GITHUB_SOURCE} --ref {tag} --yes` failed:\n{why}");
+    }
+
+    // The success line names the release the reinstall landed at and the
+    // commits it crossed. A fresh probe is the truth about what landed (the
+    // fetch can race a push); when the probe fails, the picked tag's commit
+    // is the best known target.
+    let landed = registry_probe(&bin)
+        .0
+        .and_then(|fresh| fresh.resolved_commit)
+        .unwrap_or(target);
+    Ok(Some(format!(
+        "reinstalled the herdr plugin from {GITHUB_SOURCE} at {tag} ({short} -> {short_now})",
+        short = short_commit(&installed),
+        short_now = short_commit(&landed),
+    )))
+}
+
+/// The newest release tag on `GITHUB_REMOTE` and the commit it resolves to,
+/// read with `git ls-remote --tags`: one network round trip and no checkout,
+/// which is all the staleness check and the pinned install need. Bounded like
+/// a probe, so a stalled remote costs one failed attempt rather than a wedged
+/// claim. `Ok(None)` when the remote carries no conforming
+/// `v<digits>.<digits>.<digits>` tag.
+fn latest_release_target() -> Result<Option<(String, String)>> {
+    let mut cmd = Command::new("git");
+    cmd.args(["ls-remote", "--tags", GITHUB_REMOTE])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd
+        .spawn()
+        .with_context(|| "could not run `git ls-remote`; is git installed?")?;
+    let out = run_bounded(child, REMOTE_PROBE_TIMEOUT)
+        .with_context(|| format!("`git ls-remote --tags {GITHUB_REMOTE}` timed out"))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        bail!(
+            "`git ls-remote --tags {GITHUB_REMOTE}` failed: {}",
+            why.trim()
+        );
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    Ok(pick_release(&text))
+}
+
+/// The pure half of the release probe, split out so tests feed it the real
+/// `ls-remote --tags` bytes with no subprocess. An annotated tag prints two
+/// lines — the tag object and its peeled `^{}` commit — and the peeled commit
+/// is what an install at the tag resolves to, so it is the compare target.
+fn pick_release(text: &str) -> Option<(String, String)> {
+    // Plain refs first, then peeled refs, so a tag's peeled commit outranks
+    // its tag-object sha wherever both lines exist: among equal versions the
+    // max-by-key pick returns the last entry, which is then the peeled one.
+    let mut candidates: Vec<((u64, u64, u64), String, String)> = Vec::new();
+    for peeled in [false, true] {
+        candidates.extend(text.lines().filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let sha = words.next()?;
+            let reference = words.next()?;
+            if reference.ends_with("^{}") != peeled {
+                return None;
+            }
+            let tag = reference.strip_suffix("^{}").unwrap_or(reference);
+            let tag = tag.strip_prefix("refs/tags/")?;
+            if sha.len() < 7 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let version = parse_release_version(tag)?;
+            Some((version, tag.to_string(), sha.to_string()))
+        }));
+    }
+    candidates
+        .into_iter()
+        .max_by_key(|(version, _, _)| *version)
+        .map(|(_, tag, sha)| (tag, sha))
+}
+
+/// `v1.2.3` -> `(1, 2, 3)`; a conforming tag is exactly
+/// `v<digits>.<digits>.<digits>`, and anything else is not a release tag.
+fn parse_release_version(tag: &str) -> Option<(u64, u64, u64)> {
+    let rest = tag.strip_prefix('v')?;
+    // "Exactly digits" lets only the separators through: `+1` would otherwise
+    // parse as a leading sign, which is not a conforming tag name.
+    if !rest.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let mut parts = rest.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// `abcdef0123...` -> `abcdef0`, the log-line form.
+fn short_commit(commit: &str) -> &str {
+    commit.get(..7).unwrap_or(commit)
 }
 
 /// The one kill-on-deadline reap loop: [`bounded_output`] spawns and hands
@@ -463,6 +865,20 @@ fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Outp
         stdout,
         stderr,
     })
+}
+
+/// Stamp the floor at now, so [`heal_detached`] refuses every attempt for the
+/// next window. For a test that drives a caller of the heal (the daemon tick,
+/// `clauth mcp` startup) and is about something else.
+#[cfg(test)]
+pub(crate) fn arm_heal_throttle_for_test() {
+    HEAL_THROTTLE.arm_for_test();
+}
+
+/// Clear both flags so a test can drive a heal fresh.
+#[cfg(all(test, unix))]
+pub(crate) fn reset_heal_throttle_for_test() {
+    HEAL_THROTTLE.reset_for_test();
 }
 
 fn resolve_key(key: Option<&str>, yes: bool) -> Result<String> {

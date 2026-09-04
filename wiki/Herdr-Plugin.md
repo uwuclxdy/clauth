@@ -26,7 +26,7 @@ To install by hand instead, run `herdr plugin install uwuclxdy/clauth/herdr-plug
 
 ## Updates
 
-clauth does not update the plugin on its own. herdr has no `plugin update`, and re-running `clauth herdr install` is the refresh path: an install over an existing GitHub install replaces the checkout and re-registers it. The manifest's version tracks the clauth release that ships it (the release script bumps it with the crate version), which is what `herdr plugin list` displays. The popup runs the `clauth` on your `PATH`, which updates itself, so a stale plugin wrapper still opens a current dashboard.
+clauth keeps the plugin current on its own. `clauth herdr install` lands the plugin at the latest release tag, and herdr has no `plugin update`, so the daemon and every `clauth mcp` startup compare the installed checkout's commit (the one herdr's registry recorded at install) against the latest release tag's commit with `git ls-remote --tags`, and reinstall at that tag when they differ, at most once per 30 minutes per process. The installed plugin is always release code, and its manifest version names the release it came from: the release script bumps the manifest with the crate version, so `herdr plugin list` shows the clauth release that shipped the plugin. The check never resurrects an uninstall, never re-enables a plugin you disabled in herdr, never touches a checkout linked from a local path, and never replaces an install made from a fork. `CLAUTH_NO_UPDATE=1` opts out, same as clauth's own self-update. Re-running `clauth herdr install` is the manual refresh path.
 
 ## Uninstall
 

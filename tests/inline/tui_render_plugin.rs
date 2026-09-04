@@ -23,6 +23,9 @@ fn entry(enabled: bool, min: Option<&str>, warnings: Vec<&str>) -> RegistryEntry
         min_herdr_version: min.map(str::to_string),
         plugin_root: None,
         source_kind: Some("github".into()),
+        resolved_commit: None,
+        source_owner: None,
+        source_repo: None,
         warnings: warnings.into_iter().map(str::to_string).collect(),
     }
 }

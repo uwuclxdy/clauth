@@ -14,6 +14,9 @@ fn startup_heals_a_broken_plugin_registration() {
     let home = HomeSandbox::new();
     let fake = FakeClaude::new(&home);
     crate::plugin_host::reset_heal_throttle_for_test();
+    // This test pins the claude heal; the herdr twin shares the startup call
+    // site, so its throttle is armed to keep this test spawn-free.
+    crate::herdr::arm_heal_throttle_for_test();
     crate::testutil::seed_broken_plugin_registration();
 
     let _marker = super::startup();
