@@ -1,6 +1,6 @@
 id = "clauth"
 name = "clauth"
-version = "0.15.0"
+version = "0.15.1"
 min_herdr_version = "0.8.0"
 description = "Claude Code account switcher and usage dashboard, in a herdr popup"
 platforms = ["linux", "macos"]
