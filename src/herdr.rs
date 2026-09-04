@@ -536,15 +536,16 @@ pub(crate) fn heal_detached() {
         return;
     };
     // Fail closed in test builds: the worker probes and reinstalls through the
-    // resolved binary, and `herdr_bin` falls back to a `PATH` lookup that finds
-    // the operator's real herdr. Only the injected path is hermetic, so it is
-    // the sentinel; a test that drives a caller of this heal arms the throttle
-    // instead when the heal is not what the test is about.
+    // resolved binary, and herdr panes inject `HERDR_BIN_PATH` with the
+    // operator's real herdr, so a test run inside a pane sees the assert
+    // satisfied with no shim staged. Only the test fake sets `HERDR_SHIM_STATE`,
+    // so it is the sentinel; a test that drives a caller of this heal arms the
+    // throttle instead when the heal is not what the test is about.
     #[cfg(test)]
     assert!(
-        std::env::var_os("HERDR_BIN_PATH").is_some(),
+        std::env::var_os("HERDR_SHIM_STATE").is_some(),
         "heal_detached would probe the operator's real `herdr` and reinstall \
-         their real plugin — set HERDR_BIN_PATH to a shim, or call \
+         their real plugin — stage a herdr shim beside a `HERDR_SHIM_STATE` pin, or call \
          `arm_heal_throttle_for_test` if the heal is not what the test is about"
     );
     #[cfg(test)]

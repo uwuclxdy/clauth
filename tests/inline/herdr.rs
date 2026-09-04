@@ -794,6 +794,7 @@ fn heal_detached_reinstalls_once_and_throttles() {
                 Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
             ),
             ("HEAL_ANSWER", Some(std::ffi::OsStr::new(&stale))),
+            ("HERDR_SHIM_STATE", Some(std::ffi::OsStr::new("1"))),
         ],
     );
     reset_heal_throttle_for_test();
@@ -837,6 +838,7 @@ fn heal_detached_respects_the_update_optout() {
             ),
             ("HEAL_ANSWER", Some(std::ffi::OsStr::new(&stale))),
             ("CLAUTH_NO_UPDATE", Some(std::ffi::OsStr::new("1"))),
+            ("HERDR_SHIM_STATE", Some(std::ffi::OsStr::new("1"))),
         ],
     );
     reset_heal_throttle_for_test();
@@ -847,6 +849,30 @@ fn heal_detached_respects_the_update_optout() {
         !home.home().join("heal.log").exists(),
         "the opt-out gates the network update"
     );
+}
+
+/// The fail-closed sentinel: `heal_detached` refuses to run when only
+/// `HERDR_BIN_PATH` is pinned, because a herdr pane injects that with the
+/// operator's real binary. The shim-state var is the sentinel a test fake sets.
+#[cfg(unix)]
+#[test]
+#[should_panic(expected = "stage a herdr shim beside a `HERDR_SHIM_STATE` pin")]
+fn heal_detached_fails_closed_without_the_shim_sentinel() {
+    let home = crate::testutil::HomeSandbox::new();
+    reset_heal_throttle_for_test();
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(home.home().join("no-such-herdr").as_os_str()),
+            ),
+            ("HERDR_SHIM_STATE", None),
+            ("CLAUTH_NO_UPDATE", None),
+        ],
+    );
+
+    heal_detached();
 }
 
 #[test]
