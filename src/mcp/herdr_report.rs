@@ -83,7 +83,7 @@
 //! independent Claude Code sessions in one pane reach that; a delegate's own
 //! `claude` cannot, since the depth guard refuses it a second `delegate`.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -166,7 +166,7 @@ impl PaneReporter {
         if pane_id.trim().is_empty() {
             return None;
         }
-        let bin = resolve_bin()?;
+        let bin = crate::herdr::resolved_bin()?;
         let shared = Arc::new(Shared {
             bin,
             pane_id,
@@ -336,21 +336,6 @@ fn report(shared: &Shared, state: &str, seq: u64) {
             }
         }
     }
-}
-
-/// The herdr binary to report through, resolved once at server construction:
-/// `HERDR_BIN_PATH` when set (a path must exist), else `herdr` found on
-/// `PATH`.
-fn resolve_bin() -> Option<PathBuf> {
-    let raw = crate::herdr::herdr_bin();
-    let candidate = Path::new(&raw);
-    // Path-like (absolute or carrying a separator): must exist as a file.
-    if candidate.components().count() > 1 {
-        return candidate.is_file().then(|| candidate.to_path_buf());
-    }
-    // Bare name: first executable hit on PATH (exec bit on Unix, the usual
-    // extensions on Windows).
-    crate::plugin_probe::on_path(&raw)
 }
 
 /// RAII in-flight tracker half: the drop reports `idle` once nothing else is in

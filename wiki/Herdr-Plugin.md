@@ -24,6 +24,12 @@ Run it a second time and it adds nothing. `--key` picks the keybinding, and a re
 
 To install by hand instead, run `herdr plugin install uwuclxdy/clauth/herdr-plugin` and paste the two blocks from the [plugin README](https://github.com/uwuclxdy/clauth/tree/mommy/herdr-plugin#readme).
 
+## Updates
+
+clauth keeps the plugin current on its own. herdr has no `plugin update`; an install over an existing GitHub source is the update, so the daemon and every `clauth mcp` startup check the installed version against the running clauth and reinstall when it trails, at most once per 30 minutes per process. A stale install converges after a session or two with nothing to do.
+
+The check never resurrects an uninstall, never re-enables a plugin you disabled in herdr, and never touches a checkout linked from a clauth source tree. `CLAUTH_NO_UPDATE=1` opts out, same as clauth's own self-update. The plugin is Linux and macOS only, so Windows has nothing to update.
+
 ## Uninstall
 
 ```sh

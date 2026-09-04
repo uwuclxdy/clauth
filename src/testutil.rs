@@ -515,37 +515,68 @@ impl Drop for EndpointSandbox<'_> {
 /// pin still standing and let the next test run against it. As a borrow that
 /// inversion is E0505 at compile time instead of a race nothing checks.
 pub(crate) struct ConfigDirSandbox<'a> {
-    prev: Option<std::ffi::OsString>,
-    _home: std::marker::PhantomData<&'a HomeSandbox>,
+    _pin: EnvPin<'a>,
 }
 
 impl<'a> ConfigDirSandbox<'a> {
+    pub(crate) fn new(home: &'a HomeSandbox, dir: &Path) -> Self {
+        Self {
+            _pin: EnvPin::new(home, &[("CLAUDE_CONFIG_DIR", Some(dir.as_os_str()))]),
+        }
+    }
+}
+
+/// One or more process env pins, restored to their previous values on drop
+/// (even on panic), in reverse order. Same contract as every pin here: the env
+/// is process-global, serialized by `HOME_TEST_LOCK`, so the pin BORROWS the
+/// [`HomeSandbox`] that holds it; dropping the home first is E0505 at compile
+/// time instead of a race nothing checks.
+pub(crate) struct EnvPin<'a> {
+    prevs: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    _home: std::marker::PhantomData<&'a HomeSandbox>,
+}
+
+impl<'a> EnvPin<'a> {
     #[expect(
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
-    pub(crate) fn new(_home: &'a HomeSandbox, dir: &Path) -> Self {
-        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
-        // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
-        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", dir) };
+    pub(crate) fn new(
+        _home: &'a HomeSandbox,
+        pins: &[(&'static str, Option<&std::ffi::OsStr>)],
+    ) -> Self {
+        let mut prevs = Vec::with_capacity(pins.len());
+        for &(key, value) in pins {
+            let prev = std::env::var_os(key);
+            // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            prevs.push((key, prev));
+        }
         Self {
-            prev,
+            prevs,
             _home: std::marker::PhantomData,
         }
     }
 }
 
-impl Drop for ConfigDirSandbox<'_> {
+impl Drop for EnvPin<'_> {
     #[expect(
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
     fn drop(&mut self) {
-        // SAFETY: same as `new` — restore the prior value under the same lock.
-        unsafe {
-            match &self.prev {
-                Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-                None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        // SAFETY: same as `new` — restore the prior values under the same lock.
+        for (key, prev) in self.prevs.iter().rev() {
+            unsafe {
+                match prev {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
             }
         }
     }

@@ -358,6 +358,338 @@ fn registry_entry_from_reads_every_real_shape() {
     );
 }
 
+/// One version one above the crate's, built from `CARGO_PKG_VERSION` so a
+/// version bump never reds these tests.
+fn bumped_version() -> String {
+    let mut parts: Vec<u32> = env!("CARGO_PKG_VERSION")
+        .split('.')
+        .map(|p| p.parse().expect("numeric version part"))
+        .collect();
+    *parts.last_mut().expect("non-empty version") += 1;
+    parts
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+#[test]
+fn plugin_update_needed_accepts_only_stale_github_entries() {
+    let entry = |json: &str| registry_entry_from(&plugin_list_json(json)).expect("entry");
+    let stale =
+        r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github"}}"#;
+    let current = format!(
+        r#"{{"enabled":true,"version":"{}","plugin_id":"clauth","source":{{"kind":"github"}}}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let newer = format!(
+        r#"{{"enabled":true,"version":"{}","plugin_id":"clauth","source":{{"kind":"github"}}}}"#,
+        bumped_version()
+    );
+
+    assert!(
+        plugin_update_needed(&entry(stale)),
+        "a stale github entry updates"
+    );
+    assert!(
+        !plugin_update_needed(&entry(&current)),
+        "a current version is a no-op"
+    );
+    assert!(
+        !plugin_update_needed(&entry(&newer)),
+        "a newer install is never downgraded"
+    );
+    assert!(
+        !plugin_update_needed(&entry(
+            r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"local"}}"#
+        )),
+        "a linked checkout is the developer's live tree"
+    );
+    assert!(
+        !plugin_update_needed(&entry(
+            r#"{"enabled":false,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github"}}"#
+        )),
+        "never re-enable a deliberate disable"
+    );
+    assert!(
+        !plugin_update_needed(&entry(
+            r#"{"enabled":true,"version":"not-a-version","plugin_id":"clauth","source":{"kind":"github"}}"#
+        )),
+        "an unreadable version degrades to a no-op"
+    );
+    assert!(
+        !plugin_update_needed(&entry(
+            r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github"}}"#
+        )),
+        "a missing version degrades to a no-op"
+    );
+}
+
+/// A herdr shim whose `plugin list --json` answer is the `HEAL_ANSWER` env var,
+/// and which logs every other invocation's argv into `heal.log` beside itself.
+/// The heal's install lands in that log; a no-op leaves the file absent.
+#[cfg(unix)]
+fn heal_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$HEAL_ANSWER\"; exit 0; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exit 0",
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_heal_reinstalls_a_stale_github_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stale = plugin_list_json(
+        r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+    );
+    let shim = heal_shim(home.home());
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HEAL_ANSWER", Some(std::ffi::OsStr::new(&stale))),
+        ],
+    );
+
+    let line = plugin_heal_line()
+        .expect("heal runs")
+        .expect("update lands");
+    assert!(
+        line.contains("reinstalled the herdr plugin from uwuclxdy/clauth/herdr-plugin"),
+        "the line names the reinstall: {line}"
+    );
+    assert!(
+        line.contains("was 0.0.0"),
+        "the line names the installed version: {line}"
+    );
+
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --yes",
+        "the update is a reinstall with the preview skipped"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_heal_skips_every_non_stale_shape() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = heal_shim(home.home());
+    let _bin = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "HERDR_BIN_PATH",
+            Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+        )],
+    );
+
+    let current = format!(
+        r#"{{"enabled":true,"version":"{}","plugin_id":"clauth","source":{{"kind":"github"}}}}"#,
+        env!("CARGO_PKG_VERSION")
+    );
+    let newer = format!(
+        r#"{{"enabled":true,"version":"{}","plugin_id":"clauth","source":{{"kind":"github"}}}}"#,
+        bumped_version()
+    );
+    let cases = [
+        (
+            "no clauth entry",
+            plugin_list_json(r#"{"plugin_id":"other"}"#),
+        ),
+        (
+            "a linked checkout",
+            plugin_list_json(
+                r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"local"}}"#,
+            ),
+        ),
+        (
+            "a disabled entry",
+            plugin_list_json(
+                r#"{"enabled":false,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github"}}"#,
+            ),
+        ),
+        ("a current version", plugin_list_json(&current)),
+        ("a newer version", plugin_list_json(&newer)),
+    ];
+    for (why, answer) in cases {
+        let _answer = crate::testutil::EnvPin::new(
+            &home,
+            &[("HEAL_ANSWER", Some(std::ffi::OsStr::new(&answer)))],
+        );
+        assert!(
+            plugin_heal_line().expect("heal runs").is_none(),
+            "case `{why}` must be a no-op"
+        );
+    }
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "none of the no-op cases installed anything"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_heal_fails_loud_on_a_broken_probe() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = write_shim(home.home(), "herdr", "echo 'herdr is sick' >&2; exit 1");
+    let _bin = crate::testutil::EnvPin::new(
+        &home,
+        &[(
+            "HERDR_BIN_PATH",
+            Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+        )],
+    );
+
+    let err = plugin_heal_line().expect_err("a broken probe must fail, not skip");
+    assert!(
+        format!("{err:#}").contains("plugin list"),
+        "the error names the failing probe: {err:#}"
+    );
+}
+
+/// The install bound: a herdr that never answers costs the caller the timeout,
+/// never a wedge — the heal's in-flight claim must not sit on a stalled fetch.
+#[cfg(unix)]
+#[test]
+fn a_stalled_install_bounds_the_heal() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = write_shim(home.home(), "herdr", "exec sleep 10");
+    let start = std::time::Instant::now();
+    let err = run_quiet_bounded(
+        shim.to_str().expect("utf8 path"),
+        &["plugin", "install", "uwuclxdy/clauth/herdr-plugin", "--yes"],
+        std::time::Duration::from_secs(1),
+    )
+    .expect_err("a stalled install must fail, not hang");
+    assert!(
+        format!("{err:#}").contains("timed out after 1s"),
+        "the error names the bound: {err:#}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "the caller is bounded, not the shim's full sleep"
+    );
+}
+
+/// The heal-level twin of the helper pin above: `plugin_heal_line` must route
+/// its install through the bound, not just `run_quiet_bounded` exist. A bound
+/// dropped from the heal makes this red after the shim's full sleep, since the
+/// unbounded run exits 0 where the bounded one reports the timeout.
+#[cfg(unix)]
+#[test]
+fn plugin_heal_bounds_a_stalled_install() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stale = plugin_list_json(
+        r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+    );
+    let shim = write_shim(
+        home.home(),
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then echo \"$HEAL_ANSWER\"; exit 0; fi; exec sleep 10",
+    );
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HEAL_ANSWER", Some(std::ffi::OsStr::new(&stale))),
+        ],
+    );
+
+    let start = std::time::Instant::now();
+    let err = plugin_heal_line_with(std::time::Duration::from_secs(1))
+        .expect_err("a stalled install must fail the heal, not hang");
+    assert!(
+        format!("{err:#}").contains("timed out after 1s"),
+        "the error names the bound: {err:#}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "the heal is bounded, not the shim's full sleep"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn heal_detached_reinstalls_once_and_throttles() {
+    use crate::testutil::join_background_tasks;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let stale = plugin_list_json(
+        r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+    );
+    let shim = heal_shim(home.home());
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HEAL_ANSWER", Some(std::ffi::OsStr::new(&stale))),
+        ],
+    );
+    reset_heal_throttle_for_test();
+
+    heal_detached();
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --yes",
+        "the first attempt installs"
+    );
+
+    // The floor is armed by the first attempt: a second spawns nothing.
+    heal_detached();
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --yes",
+        "the floor refuses a second attempt"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn heal_detached_respects_the_update_optout() {
+    use crate::testutil::join_background_tasks;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let stale = plugin_list_json(
+        r#"{"enabled":true,"version":"0.0.0","plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth"}}"#,
+    );
+    let shim = heal_shim(home.home());
+    let _env = crate::testutil::EnvPin::new(
+        &home,
+        &[
+            (
+                "HERDR_BIN_PATH",
+                Some(std::ffi::OsStr::new(shim.to_str().expect("utf8 path"))),
+            ),
+            ("HEAL_ANSWER", Some(std::ffi::OsStr::new(&stale))),
+            ("CLAUTH_NO_UPDATE", Some(std::ffi::OsStr::new("1"))),
+        ],
+    );
+    reset_heal_throttle_for_test();
+
+    heal_detached();
+    join_background_tasks();
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "the opt-out gates the network update"
+    );
+}
+
 #[test]
 fn version_from_parses_the_real_line() {
     assert_eq!(version_from("herdr 0.8.0"), Some("0.8.0".to_string()));

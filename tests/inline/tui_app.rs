@@ -9612,43 +9612,20 @@ fn write_shim(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathB
     path
 }
 
-/// RAII pin for `HERDR_BIN_PATH`, restored on drop (even on panic). Borrows
-/// the [`crate::testutil::HomeSandbox`]: the env is a process-global
-/// serialized by `HOME_TEST_LOCK`, which the sandbox holds.
+/// RAII pin for `HERDR_BIN_PATH`, restored on drop (even on panic). The pin
+/// itself is `crate::testutil::EnvPin`, which borrows the
+/// [`crate::testutil::HomeSandbox`]: the env is a process-global serialized by
+/// `HOME_TEST_LOCK`, which the sandbox holds.
 #[cfg(unix)]
 struct HerdrBinPin<'a> {
-    prev: Option<std::ffi::OsString>,
-    _home: std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+    _pin: crate::testutil::EnvPin<'a>,
 }
 
 #[cfg(unix)]
 impl<'a> HerdrBinPin<'a> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
-    )]
-    fn new(_home: &'a crate::testutil::HomeSandbox, bin: &std::path::Path) -> Self {
-        let prev = std::env::var_os("HERDR_BIN_PATH");
-        unsafe { std::env::set_var("HERDR_BIN_PATH", bin) };
+    fn new(home: &'a crate::testutil::HomeSandbox, bin: &std::path::Path) -> Self {
         Self {
-            prev,
-            _home: std::marker::PhantomData,
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for HerdrBinPin<'_> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, restored on drop"
-    )]
-    fn drop(&mut self) {
-        unsafe {
-            match &self.prev {
-                Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-                None => std::env::remove_var("HERDR_BIN_PATH"),
-            }
+            _pin: crate::testutil::EnvPin::new(home, &[("HERDR_BIN_PATH", Some(bin.as_os_str()))]),
         }
     }
 }
@@ -9659,70 +9636,42 @@ impl Drop for HerdrBinPin<'_> {
 /// reds the pin. With `herdr_env: false` only `HERDR_ENV` is removed: the
 /// other vars stay pinned to prove the gate, not a missing path, is what
 /// suppresses the spawn. Restored on drop (even on panic). Same contract as
-/// [`HerdrBinPin`]: process-global env, serialized by `HOME_TEST_LOCK`, which
+/// `HerdrBinPin`: process-global env, serialized by `HOME_TEST_LOCK`, which
 /// the borrowed sandbox holds.
 struct HerdrRuntimePin<'a> {
-    prevs: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    _home: std::marker::PhantomData<&'a crate::testutil::HomeSandbox>,
+    _pin: crate::testutil::EnvPin<'a>,
 }
 
 impl<'a> HerdrRuntimePin<'a> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
-    )]
     fn new(
-        _home: &'a crate::testutil::HomeSandbox,
+        home: &'a crate::testutil::HomeSandbox,
         bin: &std::path::Path,
         plugin_root: &std::path::Path,
         herdr_env: bool,
     ) -> Self {
-        let mut prevs = Vec::new();
-        for (key, value) in [
-            ("HERDR_ENV", herdr_env.then_some("1".to_string())),
-            (
-                "HERDR_BIN_PATH",
-                Some(bin.as_os_str().to_string_lossy().into_owned()),
-            ),
-            (
-                "HERDR_PLUGIN_ROOT",
-                Some(plugin_root.as_os_str().to_string_lossy().into_owned()),
-            ),
-            ("HERDR_PLUGIN_EVENT_JSON", Some("stale-event".to_string())),
-            (
-                "HERDR_PLUGIN_CONTEXT_JSON",
-                Some("stale-context".to_string()),
-            ),
-        ] {
-            let prev = std::env::var_os(key);
-            unsafe {
-                match &value {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-            prevs.push((key, prev));
-        }
+        let bin = bin.as_os_str().to_string_lossy().into_owned();
+        let plugin_root = plugin_root.as_os_str().to_string_lossy().into_owned();
+        let herdr_env = herdr_env.then_some("1".to_string());
         Self {
-            prevs,
-            _home: std::marker::PhantomData,
-        }
-    }
-}
-
-impl Drop for HerdrRuntimePin<'_> {
-    #[expect(
-        unsafe_code,
-        reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, restored on drop"
-    )]
-    fn drop(&mut self) {
-        for (key, prev) in self.prevs.iter().rev() {
-            unsafe {
-                match prev {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
+            _pin: crate::testutil::EnvPin::new(
+                home,
+                &[
+                    ("HERDR_ENV", herdr_env.as_deref().map(std::ffi::OsStr::new)),
+                    ("HERDR_BIN_PATH", Some(std::ffi::OsStr::new(&bin))),
+                    (
+                        "HERDR_PLUGIN_ROOT",
+                        Some(std::ffi::OsStr::new(&plugin_root)),
+                    ),
+                    (
+                        "HERDR_PLUGIN_EVENT_JSON",
+                        Some(std::ffi::OsStr::new("stale-event")),
+                    ),
+                    (
+                        "HERDR_PLUGIN_CONTEXT_JSON",
+                        Some(std::ffi::OsStr::new("stale-context")),
+                    ),
+                ],
+            ),
         }
     }
 }

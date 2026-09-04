@@ -51,7 +51,9 @@ struct Asset {
     browser_download_url: String,
 }
 
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version this binary is; the herdr auto-update heal compares the
+/// installed plugin manifest against it.
+pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns `true` when the update system is active (env var unset or not `"1"`).
 pub(crate) fn updates_enabled() -> bool {
@@ -316,7 +318,7 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     ))
 }
 
-fn is_newer(tag: &str, current: &str) -> bool {
+pub(crate) fn is_newer(tag: &str, current: &str) -> bool {
     match (parse_version(tag), parse_version(current)) {
         (Some(latest), Some(cur)) => latest > cur,
         _ => false,

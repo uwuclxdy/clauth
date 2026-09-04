@@ -463,11 +463,11 @@ fn heal_detached_throttles_to_one_heal_per_window() {
     // First attempt: the spawn path is entered, so the floor timestamp advances.
     super::heal_detached();
     assert!(
-        super::LAST_HEAL_START_MS.load(Ordering::Relaxed) > 0,
+        super::HEAL_THROTTLE.last_start_ms.load(Ordering::Relaxed) > 0,
         "the first heal must enter the spawn path"
     );
     join_background_tasks();
-    let first_start = super::LAST_HEAL_START_MS.load(Ordering::Relaxed);
+    let first_start = super::HEAL_THROTTLE.last_start_ms.load(Ordering::Relaxed);
     let after_first = fake.log();
     assert!(
         !after_first.is_empty(),
@@ -481,7 +481,7 @@ fn heal_detached_throttles_to_one_heal_per_window() {
     // timestamp does not advance.
     super::heal_detached();
     assert_eq!(
-        super::LAST_HEAL_START_MS.load(Ordering::Relaxed),
+        super::HEAL_THROTTLE.last_start_ms.load(Ordering::Relaxed),
         first_start,
         "the 30-minute floor must refuse a fresh attempt"
     );
@@ -496,11 +496,15 @@ fn heal_detached_throttles_to_one_heal_per_window() {
     // An in-flight heal also refuses. The floor is CLEARED first, so the flag is
     // the only guard left standing: with the floor still armed, disabling the
     // swap changes nothing and this block pins nothing.
-    super::LAST_HEAL_START_MS.store(0, Ordering::Relaxed);
-    super::HEAL_IN_FLIGHT.store(true, Ordering::Release);
+    super::HEAL_THROTTLE
+        .last_start_ms
+        .store(0, Ordering::Relaxed);
+    super::HEAL_THROTTLE
+        .in_flight
+        .store(true, Ordering::Release);
     super::heal_detached();
     assert_eq!(
-        super::LAST_HEAL_START_MS.load(Ordering::Relaxed),
+        super::HEAL_THROTTLE.last_start_ms.load(Ordering::Relaxed),
         0,
         "an in-flight heal must refuse before it stamps the floor"
     );
@@ -511,7 +515,9 @@ fn heal_detached_throttles_to_one_heal_per_window() {
         "an in-flight heal must spawn nothing, got:\n{}",
         fake.log()
     );
-    super::HEAL_IN_FLIGHT.store(false, Ordering::Release);
+    super::HEAL_THROTTLE
+        .in_flight
+        .store(false, Ordering::Release);
 }
 
 /// The committed root marketplace manifest must stay agentgear-conformant, or a

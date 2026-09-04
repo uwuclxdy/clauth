@@ -72,6 +72,10 @@ agentgear = "0.1.3"
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/
 # plugin.json` and CARGO_PKG_VERSION disagree (CC caches on that version).
 agentgear = "0.1.3"
+# `build.rs` rewrites `herdr-plugin/herdr-plugin.toml`'s version line from
+# `CARGO_PKG_VERSION`; the herdr auto-update heal keys its staleness check on
+# that tie.
+toml = "1.1.4"
 
 [dev-dependencies]
 # `test-util` alone, for `Builder::start_paused`. The blocking `delegate`'s

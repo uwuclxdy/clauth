@@ -19,52 +19,25 @@ use crate::testutil::HomeSandbox;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// RAII pin for the two herdr env vars (`HERDR_PANE_ID`, `HERDR_BIN_PATH`),
-/// restored on drop (even on panic). Borrows the [`HomeSandbox`] the way
+/// The herdr-report spelling of the shared pin: `HERDR_PANE_ID` and
+/// `HERDR_BIN_PATH`, restored on drop (even on panic). The pin itself is
+/// `testutil::EnvPin`, which borrows the [`HomeSandbox`] for the same reason
 /// `testutil::ConfigDirSandbox` does: the env is a process-global serialized by
 /// `HOME_TEST_LOCK`, which the sandbox holds, so the pin must never outlive it.
 struct EnvPin<'a> {
-    prev_pane: Option<std::ffi::OsString>,
-    prev_bin: Option<std::ffi::OsString>,
-    _home: std::marker::PhantomData<&'a HomeSandbox>,
+    _pin: crate::testutil::EnvPin<'a>,
 }
 
 impl<'a> EnvPin<'a> {
-    fn new(_home: &'a HomeSandbox, pane: Option<&str>, bin: Option<&Path>) -> Self {
-        let prev_pane = std::env::var_os("HERDR_PANE_ID");
-        let prev_bin = std::env::var_os("HERDR_BIN_PATH");
-        // SAFETY: test-only; serialized by HOME_TEST_LOCK (held by the borrowed
-        // sandbox); restored on drop.
-        unsafe {
-            match pane {
-                Some(v) => std::env::set_var("HERDR_PANE_ID", v),
-                None => std::env::remove_var("HERDR_PANE_ID"),
-            }
-            match bin {
-                Some(p) => std::env::set_var("HERDR_BIN_PATH", p),
-                None => std::env::remove_var("HERDR_BIN_PATH"),
-            }
-        }
+    fn new(home: &'a HomeSandbox, pane: Option<&str>, bin: Option<&Path>) -> Self {
         Self {
-            prev_pane,
-            prev_bin,
-            _home: std::marker::PhantomData,
-        }
-    }
-}
-
-impl Drop for EnvPin<'_> {
-    fn drop(&mut self) {
-        // SAFETY: same as `new` — restore the prior value under the same lock.
-        unsafe {
-            match &self.prev_pane {
-                Some(v) => std::env::set_var("HERDR_PANE_ID", v),
-                None => std::env::remove_var("HERDR_PANE_ID"),
-            }
-            match &self.prev_bin {
-                Some(v) => std::env::set_var("HERDR_BIN_PATH", v),
-                None => std::env::remove_var("HERDR_BIN_PATH"),
-            }
+            _pin: crate::testutil::EnvPin::new(
+                home,
+                &[
+                    ("HERDR_PANE_ID", pane.map(std::ffi::OsStr::new)),
+                    ("HERDR_BIN_PATH", bin.map(Path::as_os_str)),
+                ],
+            ),
         }
     }
 }

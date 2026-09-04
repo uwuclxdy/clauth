@@ -180,16 +180,35 @@ fn run_quiet(bin: &str, args: &[&str]) -> Result<()> {
             args.join(" ")
         )
     })?;
-    if !out.status.success() {
-        let mut why = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let err = String::from_utf8_lossy(&out.stderr);
-        if !err.trim().is_empty() {
-            why.push('\n');
-            why.push_str(err.trim());
-        }
-        bail!("`{bin} {}` failed:\n{why}", args.join(" "));
+    quiet_outcome(bin, args, &out)
+}
+
+/// Same, bounded: a stalled fetch (git has no default timeout) must not wedge
+/// the detached heal's in-flight claim forever. The next attempt retries.
+fn run_quiet_bounded(bin: &str, args: &[&str], timeout: Duration) -> Result<()> {
+    let Some(out) = bounded_output_for(bin, args, &[], timeout) else {
+        bail!(
+            "`{bin} {}` timed out after {}s",
+            args.join(" "),
+            timeout.as_secs()
+        );
+    };
+    quiet_outcome(bin, args, &out)
+}
+
+/// The shared failure read for the quiet runners: a nonzero exit becomes one
+/// error carrying whatever the child printed, stdout first.
+fn quiet_outcome(bin: &str, args: &[&str], out: &Output) -> Result<()> {
+    if out.status.success() {
+        return Ok(());
     }
-    Ok(())
+    let mut why = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr);
+    if !err.trim().is_empty() {
+        why.push('\n');
+        why.push_str(err.trim());
+    }
+    bail!("`{bin} {}` failed:\n{why}", args.join(" "));
 }
 
 /// herdr resolves its own config root per OS and exposes no command that prints
@@ -272,14 +291,8 @@ pub(crate) struct HerdrProbe {
 
 /// Probes the installed herdr. `None` when herdr does not resolve, so the caller renders no row at all.
 pub(crate) fn probe() -> Option<HerdrProbe> {
-    let bin = herdr_bin();
-    let bin = if bin == "herdr" {
-        crate::plugin_probe::on_path("herdr")?
-            .to_string_lossy()
-            .into_owned()
-    } else {
-        bin
-    };
+    let bin = resolved_bin()?;
+    let bin = bin.to_string_lossy();
 
     let version = version_command(&bin);
     let (entry, error) = registry_probe(&bin);
@@ -291,6 +304,23 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
         config_path,
         error,
     })
+}
+
+/// The herdr binary to drive: `HERDR_BIN_PATH` when it names an existing file,
+/// else a `PATH`-resolved herdr. `None` when herdr is not installed. Shared by
+/// the Plugin tab probe, the pane reporter, and the auto-update heal, so all
+/// three resolve one name.
+pub(crate) fn resolved_bin() -> Option<PathBuf> {
+    let raw = herdr_bin();
+    let candidate = Path::new(&raw);
+    // Path-like (absolute or carrying a separator): must exist as a file, the
+    // way the pane reporter reads a stale injected path.
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then(|| candidate.to_path_buf());
+    }
+    // Bare name: first executable hit on PATH (exec bit on Unix, the usual
+    // extensions on Windows).
+    crate::plugin_probe::on_path(&raw)
 }
 
 /// Bounds one herdr subprocess on the probe path (construction in herdr mode,
@@ -307,6 +337,17 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) -> Option<Output> {
+    bounded_output_for(bin, args, envs, PROBE_TIMEOUT)
+}
+
+/// The same bounded spawn with an explicit deadline; the detached heal's
+/// install is the one caller that needs a longer bound than [`PROBE_TIMEOUT`].
+pub(crate) fn bounded_output_for(
+    bin: &str,
+    args: &[&str],
+    envs: &[(&str, &OsStr)],
+    timeout: Duration,
+) -> Option<Output> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -316,7 +357,7 @@ pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) 
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().ok()?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -463,6 +504,134 @@ fn registry_entry_from_value(root: &Value) -> Option<RegistryEntry> {
             })
             .unwrap_or_default(),
     })
+}
+
+/// The herdr heal's own attempt limiter; a second [`HealThrottle`] instance,
+/// so a herdr heal never defers the claude one or the other way round.
+static HEAL_THROTTLE: crate::plugin_host::HealThrottle = crate::plugin_host::HealThrottle::new();
+
+/// The throttled detached heal for the herdr plugin. herdr has no `plugin
+/// update`, so an install over an existing github source IS the update: herdr
+/// replaces the managed checkout and re-registers. Callers: the daemon tick and
+/// `clauth mcp` startup, mirroring the claude plugin's detached heal. Success
+/// and failure both log through `logline!`, never stdout.
+pub(crate) fn heal_detached() {
+    // The plugin is linux and macos only (its entrypoints are POSIX shell), so
+    // there is nothing to heal on Windows.
+    if cfg!(windows) {
+        return;
+    }
+    // This heal is a network update (herdr's install fetches from GitHub), so
+    // the same opt-out that gates clauth's own binary update gates it, before
+    // the throttle claim so a disabled box never even claims an attempt.
+    if !crate::update::updates_enabled() {
+        return;
+    }
+    let Some(claim) = HEAL_THROTTLE.claim(crate::usage::now_ms()) else {
+        return;
+    };
+    // Fail closed in test builds: the worker probes and reinstalls through the
+    // resolved binary, and `herdr_bin` falls back to a `PATH` lookup that finds
+    // the operator's real herdr. Only the injected path is hermetic, so it is
+    // the sentinel; a test that drives a caller of this heal arms the throttle
+    // instead when the heal is not what the test is about.
+    #[cfg(test)]
+    assert!(
+        std::env::var_os("HERDR_BIN_PATH").is_some(),
+        "heal_detached would probe the operator's real `herdr` and reinstall \
+         their real plugin — set HERDR_BIN_PATH to a shim, or call \
+         `arm_heal_throttle_for_test` if the heal is not what the test is about"
+    );
+    #[cfg(test)]
+    let done = crate::testutil::register_background_task();
+    std::thread::spawn(move || {
+        let _claim = claim;
+        match plugin_heal_line() {
+            Ok(Some(line)) => crate::logline::logline!("{line}"),
+            Ok(None) => {}
+            Err(e) => crate::logline::logline!("clauth: herdr plugin heal failed: {e:#}"),
+        }
+        // Last action, after every env-touching step: the claim's drop clears
+        // one atomic and nothing else, so it is safe past the send.
+        #[cfg(test)]
+        let _ = done.send(());
+    });
+}
+
+/// Whether the installed entry needs the update heal: a github-sourced, enabled
+/// entry whose manifest version sits below this binary's. Never true for an
+/// absent entry (never resurrect an uninstall), a disabled one (never
+/// re-enable), a linked checkout (the developer's own live tree), or a version
+/// that cannot be compared (a lenient read degrades to no-op).
+pub(crate) fn plugin_update_needed(entry: &RegistryEntry) -> bool {
+    if !entry.enabled {
+        return false;
+    }
+    if entry.source_kind.as_deref() != Some("github") {
+        return false;
+    }
+    entry
+        .version
+        .as_deref()
+        .is_some_and(|installed| crate::update::is_newer(crate::update::CURRENT_VERSION, installed))
+}
+
+/// How long one detached reinstall may take: a stalled fetch must release the
+/// heal's in-flight claim rather than wedge it for the process lifetime.
+const HEAL_INSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// The gate + update behind [`heal_detached`], split out so a test can pin the
+/// contract without a thread: `None` when there is nothing to do, `Some` when
+/// the update landed, `Err` when the probe or the install failed.
+pub(crate) fn plugin_heal_line() -> anyhow::Result<Option<String>> {
+    plugin_heal_line_with(HEAL_INSTALL_TIMEOUT)
+}
+
+/// The deadline seam under [`plugin_heal_line`]: the shipped call uses
+/// [`HEAL_INSTALL_TIMEOUT`], a test drives the same path with a short one so
+/// the heal's use of the bound is pinned, not just the helper's.
+pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<String>> {
+    let Some(bin) = resolved_bin() else {
+        return Ok(None);
+    };
+    let bin = bin.to_string_lossy();
+    let (entry, error) = registry_probe(&bin);
+    if let Some(error) = error {
+        bail!("{error}");
+    }
+    let Some(entry) = entry else {
+        return Ok(None);
+    };
+    if !plugin_update_needed(&entry) {
+        return Ok(None);
+    }
+    let old = entry.version.unwrap_or_default();
+    // `--yes` skips the interactive preview: the source was already vetted at
+    // install time, and a detached caller has no tty to answer it on anyway.
+    // The install is bounded: herdr's fetch has no timeout of its own, and a
+    // stall must not wedge the in-flight claim for the process lifetime.
+    run_quiet_bounded(
+        &bin,
+        &["plugin", "install", GITHUB_SOURCE, "--yes"],
+        timeout,
+    )?;
+    Ok(Some(format!(
+        "reinstalled the herdr plugin from {GITHUB_SOURCE} (was {old})"
+    )))
+}
+
+/// Stamp the floor at now, so [`heal_detached`] refuses every attempt for the
+/// next window. For a test that drives a caller of the heal (the daemon tick,
+/// `clauth mcp` startup) and is about something else.
+#[cfg(test)]
+pub(crate) fn arm_heal_throttle_for_test() {
+    HEAL_THROTTLE.arm_for_test();
+}
+
+/// Clear both flags so a test can drive a heal fresh.
+#[cfg(all(test, unix))]
+pub(crate) fn reset_heal_throttle_for_test() {
+    HEAL_THROTTLE.reset_for_test();
 }
 
 fn resolve_key(key: Option<&str>, yes: bool) -> Result<String> {

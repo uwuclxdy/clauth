@@ -77,15 +77,78 @@ pub(crate) fn preflight() {
     }
 }
 
-/// A heal may run at most once per process every 30 minutes, success or failure:
-/// both detached callers (`clauth mcp` boot, daemon tick) can fire once per
-/// second on a box whose `claude` is missing, and an untried retry every tick
-/// would spawn + fail forever. The in-flight flag bounds overlap; the floor
-/// bounds frequency from the attempt STARTING (not finishing), so a slow heal
-/// still cannot stack a second one behind it.
+/// How long the floor between attempts holds. See [`HealThrottle`].
 const HEAL_THROTTLE_MS: u64 = 30 * 60 * 1000;
-static HEAL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-static LAST_HEAL_START_MS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) static HEAL_THROTTLE: HealThrottle = HealThrottle::new();
+
+/// One heal's attempt limiter: at most one attempt per process every
+/// [`HEAL_THROTTLE_MS`], success or failure, and never two in flight. Both
+/// detached callers (`clauth mcp` boot, daemon tick) can fire once per second
+/// on a box whose `claude` is missing, and an untried retry every tick would
+/// spawn + fail forever. The in-flight flag bounds overlap; the floor bounds
+/// frequency from the attempt STARTING (not finishing), so a slow heal still
+/// cannot stack a second one behind it. The claude heal and the herdr heal
+/// each hold their own instance, so one healing never defers the other.
+/// Fields are `pub(crate)` for the inline test's direct pinning; every writer
+/// outside a test goes through [`HealThrottle::claim`].
+pub(crate) struct HealThrottle {
+    pub(crate) in_flight: AtomicBool,
+    pub(crate) last_start_ms: AtomicU64,
+}
+
+/// A claimed in-flight flag. The caller builds it on the claiming thread and
+/// moves it into the worker, so an early return, a panic, or the worker
+/// finishing all clear the flag rather than wedging the throttle shut for the
+/// rest of the process.
+pub(crate) struct HealClaim<'a>(&'a AtomicBool);
+
+impl Drop for HealClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl HealThrottle {
+    pub(crate) const fn new() -> Self {
+        Self {
+            in_flight: AtomicBool::new(false),
+            last_start_ms: AtomicU64::new(0),
+        }
+    }
+
+    /// Claim an attempt at `now_ms`: `None` when one is in flight or the last
+    /// attempt started within the floor window. The floor stamps here, on the
+    /// claiming thread, so the window between claim and spawn is covered too.
+    pub(crate) fn claim(&self, now_ms: u64) -> Option<HealClaim<'_>> {
+        if self.in_flight.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let claim = HealClaim(&self.in_flight);
+        if now_ms.saturating_sub(self.last_start_ms.load(Ordering::Relaxed)) < HEAL_THROTTLE_MS {
+            return None;
+        }
+        self.last_start_ms.store(now_ms, Ordering::Relaxed);
+        Some(claim)
+    }
+
+    /// Clear both flags so a test can drive a heal fresh.
+    #[cfg(all(test, unix))]
+    pub(crate) fn reset_for_test(&self) {
+        self.in_flight.store(false, Ordering::Release);
+        self.last_start_ms.store(0, Ordering::Relaxed);
+    }
+
+    /// Stamp the floor at now, so every attempt is refused for the next
+    /// window. For a test that drives a caller of the heal (the daemon tick)
+    /// and is about something else.
+    #[cfg(test)]
+    pub(crate) fn arm_for_test(&self) {
+        self.in_flight.store(false, Ordering::Release);
+        self.last_start_ms
+            .store(crate::usage::now_ms(), Ordering::Relaxed);
+    }
+}
 
 /// The shared detached heal: `clauth mcp` runs it before its stdio handshake and
 /// the daemon once per tick. The gate runs INLINE (two registry reads, no
@@ -100,18 +163,9 @@ pub(crate) fn heal_detached() {
     if !preflight_gate() {
         return;
     }
-    let now = crate::usage::now_ms();
-    if HEAL_IN_FLIGHT.swap(true, Ordering::AcqRel) {
+    let Some(claim) = HEAL_THROTTLE.claim(crate::usage::now_ms()) else {
         return;
-    }
-    // Built the moment the flag is claimed, on the CALLING thread, then moved
-    // into the worker: every early return and every panic between here and the
-    // spawn clears the flag through this drop rather than wedging the throttle
-    // shut for the rest of the process.
-    let inflight = HealInFlight;
-    if now.saturating_sub(LAST_HEAL_START_MS.load(Ordering::Relaxed)) < HEAL_THROTTLE_MS {
-        return;
-    }
+    };
     // Fail closed in test builds. The worker shells out to `claude` and lets
     // agentgear write its marker tree, and BOTH resolve off the process
     // environment: `PATH`, `HOME`, `XDG_DATA_HOME`, `XDG_RUNTIME_DIR`. Only
@@ -125,7 +179,6 @@ pub(crate) fn heal_detached() {
          real agentgear tree — stage a `FakeClaude` beside the `HomeSandbox`, or \
          call `arm_heal_throttle_for_test` if the heal is not what the test is about"
     );
-    LAST_HEAL_START_MS.store(now, Ordering::Relaxed);
     // Registered on THIS thread, before the spawn, the way the MCP background
     // delegate does it: `join_background_tasks` drains whatever is registered at
     // the moment it runs, so registering inside the worker lets a sandbox
@@ -135,7 +188,7 @@ pub(crate) fn heal_detached() {
     #[cfg(test)]
     let done = crate::testutil::register_background_task();
     std::thread::spawn(move || {
-        let _inflight = inflight;
+        let _claim = claim;
         match self_heal_line() {
             Ok(Some(line)) => crate::logline::logline!("{line}"),
             Ok(None) => {}
@@ -148,25 +201,12 @@ pub(crate) fn heal_detached() {
     });
 }
 
-/// Clears the in-flight flag however the claim ends — an early return, a panic,
-/// or the heal thread finishing — so nothing wedges the throttle shut. Built by
-/// the caller at the swap and moved into the worker, so the window between the
-/// two is covered too.
-struct HealInFlight;
-
-impl Drop for HealInFlight {
-    fn drop(&mut self) {
-        HEAL_IN_FLIGHT.store(false, Ordering::Release);
-    }
-}
-
 /// `unix` because every caller is a `#[cfg(unix)]` test: the heal's fake
 /// `claude` is a shell shim. A bare `cfg(test)` gate is dead code on Windows,
 /// which `-D warnings` reds there and nowhere else.
 #[cfg(all(test, unix))]
 pub(crate) fn reset_heal_throttle_for_test() {
-    HEAL_IN_FLIGHT.store(false, Ordering::Release);
-    LAST_HEAL_START_MS.store(0, Ordering::Relaxed);
+    HEAL_THROTTLE.reset_for_test();
 }
 
 /// Stamp the floor at now, so [`heal_detached`] refuses every attempt for the
@@ -178,8 +218,7 @@ pub(crate) fn reset_heal_throttle_for_test() {
 /// own lock.
 #[cfg(test)]
 pub(crate) fn arm_heal_throttle_for_test() {
-    HEAL_IN_FLIGHT.store(false, Ordering::Release);
-    LAST_HEAL_START_MS.store(crate::usage::now_ms(), Ordering::Relaxed);
+    HEAL_THROTTLE.arm_for_test();
 }
 
 /// Whether the pre-flight should run the heal: `true` for every registry shape a
