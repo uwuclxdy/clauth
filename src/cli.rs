@@ -430,8 +430,8 @@ pub(crate) enum HerdrCommand {
     ///
     /// herdr's installer prints every command the plugin would run as you and
     /// asks before registering it; this passes that prompt straight through
-    /// rather than answering it. Run from a clauth checkout it links the local
-    /// `herdr-plugin/` directory instead of fetching the published one.
+    /// rather than answering it. A plugin already linked from a local checkout
+    /// refuses the install: it names the tree and the two ways out.
     Install {
         /// Key that opens the dashboard, in herdr's own binding syntax
         /// (`prefix+a`, `ctrl+alt+c`). Prompted for when omitted.
@@ -448,7 +448,7 @@ pub(crate) enum HerdrCommand {
 
     /// Uninstall the plugin from herdr and drop the config clauth added
     ///
-    /// Runs herdr's uninstall, then takes the keybinding and sidebar row `install` wrote back out of herdr's `config.toml`, leaving anything else in the file alone.
+    /// Takes the keybinding and sidebar row `install` wrote back out of herdr's `config.toml`, leaving anything else in the file alone, then runs herdr's uninstall.
     Uninstall {
         /// Uninstall the plugin and leave herdr's config.toml untouched.
         #[arg(long)]

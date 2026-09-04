@@ -51,8 +51,7 @@ struct Asset {
     browser_download_url: String,
 }
 
-/// The version this binary is; the herdr auto-update heal compares the
-/// installed plugin manifest against it.
+/// The version this binary is, read off the manifest at build time.
 pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns `true` when the update system is active (env var unset or not `"1"`).

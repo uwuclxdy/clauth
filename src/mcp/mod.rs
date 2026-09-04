@@ -5643,9 +5643,6 @@ fn startup() -> Option<std::fs::File> {
     // grandchild left to finish its registry write unsignalled.
     if std::env::var_os(MCP_PROBE_ENV).is_none() {
         crate::plugin_host::heal_detached();
-        // The herdr twin: same detached throttle, same probe-env exclusion (a
-        // probe-spawned server must not reinstall the operator's plugin).
-        crate::herdr::heal_detached();
     }
     // Held across `block_on`, so the flock drops with the process however it dies
     // — a bare `claude` runs no clauth teardown, SIGKILL least of all.

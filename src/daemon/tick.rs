@@ -36,9 +36,6 @@ impl super::Daemon {
         // registry reads inline and a needed heal runs detached (throttled inside
         // `heal_detached`), so this never blocks the run loop.
         crate::plugin_host::heal_detached();
-        // Same shape for the herdr plugin: update a stale install in the
-        // background, throttled inside its own `heal_detached`.
-        crate::herdr::heal_detached();
     }
 
     /// Rebuild the scheduler's token snapshots from the current config (after a

@@ -130,7 +130,6 @@ fn active_of(d: &Daemon) -> Option<String> {
 fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
     let _home = HomeSandbox::new();
     crate::plugin_host::arm_heal_throttle_for_test();
-    crate::herdr::arm_heal_throttle_for_test();
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha")],
         Some("alpha"),
@@ -166,10 +165,6 @@ fn tick_heals_a_broken_plugin_registration() {
     let home = HomeSandbox::new();
     let fake = FakeClaude::new(&home);
     crate::plugin_host::reset_heal_throttle_for_test();
-    // The tick drives the herdr heal too; its throttle is armed so this test
-    // stays spawn-free beside the claude heal it pins (the herdr heal's
-    // fail-closed test assert needs the injected path, which no sandbox pins).
-    crate::herdr::arm_heal_throttle_for_test();
     seed_broken_plugin_registration();
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha")],

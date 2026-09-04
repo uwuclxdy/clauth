@@ -12,7 +12,7 @@ clauth herdr install
 
 One command for the whole setup. It runs herdr's own installer, passing herdr's preview of every command the plugin would run as you straight through, then adds the two things a herdr plugin cannot declare for itself: the key that opens the dashboard, and the sidebar row that renders the pane tag. Both land in your herdr `config.toml`, appended after a diff and a `[y/N]`, and herdr validates the result before anything is written.
 
-Run it a second time and it adds nothing. `--key` picks the keybinding, and a re-run with a new key re-binds an existing clauth binding to it; the Plugin tab's heal keeps the installed key instead. Run it from a clauth checkout and it links the local `herdr-plugin/` directory instead of fetching the published one, so an edit is live on the next open.
+Run it a second time and it adds nothing. `--key` picks the keybinding, and a re-run with a new key re-binds an existing clauth binding to it; the Plugin tab's heal keeps the installed key instead. If the plugin is already linked from a local checkout (a development setup), install refuses rather than replace your live tree, and names the checkout plus the two ways out: `herdr plugin link` relinks it, `clauth herdr uninstall` first switches you to the GitHub install.
 
 | Flag | Effect |
 |------|--------|
@@ -26,9 +26,7 @@ To install by hand instead, run `herdr plugin install uwuclxdy/clauth/herdr-plug
 
 ## Updates
 
-clauth keeps the plugin current on its own. herdr has no `plugin update`; an install over an existing GitHub source is the update, so the daemon and every `clauth mcp` startup check the installed version against the running clauth and reinstall when it trails, at most once per 30 minutes per process. A stale install converges after a session or two with nothing to do.
-
-The check never resurrects an uninstall, never re-enables a plugin you disabled in herdr, and never touches a checkout linked from a clauth source tree. `CLAUTH_NO_UPDATE=1` opts out, same as clauth's own self-update. The plugin is Linux and macOS only, so Windows has nothing to update.
+clauth does not update the plugin on its own. herdr has no `plugin update`, and re-running `clauth herdr install` is the refresh path: an install over an existing GitHub install replaces the checkout and re-registers it. The manifest's version tracks the clauth release that ships it (the release script bumps it with the crate version), which is what `herdr plugin list` displays. The popup runs the `clauth` on your `PATH`, which updates itself, so a stale plugin wrapper still opens a current dashboard.
 
 ## Uninstall
 
@@ -110,8 +108,6 @@ The options render whether the TUI runs inside herdr or standalone. herdr mode d
 The dashboard's [Plugin tab](Interface-And-Keys#plugin-tab) carries a `herdr` row, shown only if herdr is installed. It reports the herdr version, whether the plugin is linked or installed and whether it is enabled, the key you bound and its spelling, and whether the sidebar row is templated. A registry entry whose checkout has been moved or deleted reads as danger, since herdr keeps the entry and the plugin cannot run.
 
 <kbd>f</kbd> on that row appends whichever of the keybinding and the sidebar row is missing, behind a confirm that defaults to cancel. It is the same write `clauth herdr install` performs, so it is the repair for a config edited by hand since. If your config spells one of those tables in a way clauth cannot extend by appending, it says so and leaves that half to you rather than guessing.
-
-There is deliberately no "newer version available" check. herdr 0.8.0 ships no `plugin update`, and re-running `clauth herdr install` already is the refresh path.
 
 ## What this plugin cannot do, by design of herdr's plugin v1
 

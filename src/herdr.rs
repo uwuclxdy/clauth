@@ -40,13 +40,6 @@ const DELEGATE_TOKEN: &str = "$clauth_delegate";
 /// Marks this crate's additions inside a file clauth does not own.
 const MARKER: &str = "# clauth herdr plugin";
 
-/// Where the plugin comes from. A checkout gets linked in place so an edit is
-/// live on the next open; anyone else fetches the published subdir.
-enum Source {
-    Link(PathBuf),
-    Github,
-}
-
 pub(crate) fn install(
     key: Option<&str>,
     no_config: bool,
@@ -64,30 +57,24 @@ pub(crate) fn install(
 
     let bin = herdr_bin();
 
-    match plugin_source() {
-        Source::Link(path) => {
-            outln!("clauth: linking {} into herdr", path.display());
-            // Stamp before linking: herdr derives the linked plugin's version
-            // from this manifest, so it must match the running binary's version.
-            let manifest = path.join("herdr-plugin.toml");
-            stamp_manifest_version(&manifest)
-                .with_context(|| format!("failed to stamp {}", manifest.display()))?;
-            let path = path.to_string_lossy().into_owned();
-            // `plugin link` answers with the whole parsed manifest as one JSON
-            // line and asks nothing, so it is swallowed unless it fails.
-            run_quiet(&bin, &["plugin", "link", &path])?;
-        }
-        Source::Github => {
-            outln!("clauth: installing {GITHUB_SOURCE} into herdr");
-            let mut args = vec!["plugin", "install", GITHUB_SOURCE];
-            // herdr's preview is the user's chance to read what a plugin will
-            // run as them. Only skip it when this command was already answered.
-            if yes {
-                args.push("--yes");
-            }
-            run(&bin, &args)?;
-        }
+    // A registered local link is the developer's own live tree: herdr refuses
+    // a github install over it, and replacing that tree with a fetched copy is
+    // the wrong default anyway. Refuse here, before the fetch, naming the tree
+    // and the two ways out. A probe error proceeds: herdr reports its own
+    // trouble loudly enough.
+    let (entry, error) = registry_probe(&bin);
+    if error.is_none() {
+        refuse_over_local_link(entry.as_ref())?;
     }
+
+    outln!("clauth: installing {GITHUB_SOURCE} into herdr");
+    let mut args = vec!["plugin", "install", GITHUB_SOURCE];
+    // herdr's preview is the user's chance to read what a plugin will
+    // run as them. Only skip it when this command was already answered.
+    if yes {
+        args.push("--yes");
+    }
+    run(&bin, &args)?;
 
     // Ahead of the --no-config branch: that path prints a block to paste, and
     // a key that breaks the file breaks it just as thoroughly by hand.
@@ -131,16 +118,42 @@ pub(crate) fn install(
     outln!("");
 
     if !confirm("write these to herdr's config?", yes)? {
-        outln!("clauth: nothing written");
+        outln!("clauth: herdr's config was left alone");
         print_manual(&key, delegate_row_text);
         return Ok(());
     }
 
-    write_validated(&path, &existing, &text, &bin)?;
+    if let Err(error) = write_validated(&path, &existing, &text, &bin, "what clauth would add") {
+        // The plugin install already landed before the config write: name the
+        // half-done state rather than let the refusal read as a full no-op.
+        errln!(
+            "clauth: the plugin install landed; the config was left alone. fix what herdr reports, then rerun `clauth herdr install`"
+        );
+        return Err(error);
+    }
 
     outln!("clauth: wrote {}", path.display());
     outln!("clauth: press {key} in herdr to open the dashboard");
     Ok(())
+}
+
+/// The one install refusal: herdr refuses a github install over a registered
+/// local link, and silently replacing the developer's live tree with a fetched
+/// copy is the wrong default. Split out so a test pins the verdict and the
+/// remedies without driving `install`'s subprocesses.
+fn refuse_over_local_link(entry: Option<&RegistryEntry>) -> Result<()> {
+    let Some(entry) = entry else {
+        return Ok(());
+    };
+    if entry.source_kind.as_deref() != Some("local") {
+        return Ok(());
+    }
+    let root = entry.plugin_root.clone().unwrap_or_default();
+    bail!(
+        "herdr has the clauth plugin linked from a local checkout: {root}\n\
+         `clauth herdr install` installs the published plugin and never replaces a live tree;\n\
+         relink it with `herdr plugin link {root}`, or `clauth herdr uninstall` first to switch to the GitHub install"
+    );
 }
 
 /// The running herdr when clauth was launched from one of its panes, else
@@ -148,18 +161,6 @@ pub(crate) fn install(
 /// owns the session being configured, which a bare name can miss.
 pub(crate) fn herdr_bin() -> String {
     std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".to_string())
-}
-
-/// A checkout is recognized by the manifest rather than by a repo name, so a
-/// fork or a rename still links.
-fn plugin_source() -> Source {
-    let dir = std::env::current_dir()
-        .unwrap_or_default()
-        .join("herdr-plugin");
-    if dir.join("herdr-plugin.toml").is_file() {
-        return Source::Link(dir);
-    }
-    Source::Github
 }
 
 fn run(bin: &str, args: &[&str]) -> Result<()> {
@@ -173,47 +174,6 @@ fn run(bin: &str, args: &[&str]) -> Result<()> {
         bail!("`{bin} {}` failed", args.join(" "));
     }
     Ok(())
-}
-
-/// Same, for a command that neither prompts nor prints anything a user wants.
-/// Its output still reaches them when it fails, which is the only time it says
-/// something they can act on.
-fn run_quiet(bin: &str, args: &[&str]) -> Result<()> {
-    let out = Command::new(bin).args(args).output().with_context(|| {
-        format!(
-            "could not run `{bin} {}`; is herdr installed and on PATH?",
-            args.join(" ")
-        )
-    })?;
-    quiet_outcome(bin, args, &out)
-}
-
-/// Same, bounded: a stalled fetch (git has no default timeout) must not wedge
-/// the detached heal's in-flight claim forever. The next attempt retries.
-fn run_quiet_bounded(bin: &str, args: &[&str], timeout: Duration) -> Result<()> {
-    let Some(out) = bounded_output_for(bin, args, &[], timeout) else {
-        bail!(
-            "`{bin} {}` timed out after {}s",
-            args.join(" "),
-            timeout.as_secs()
-        );
-    };
-    quiet_outcome(bin, args, &out)
-}
-
-/// The shared failure read for the quiet runners: a nonzero exit becomes one
-/// error carrying whatever the child printed, stdout first.
-fn quiet_outcome(bin: &str, args: &[&str], out: &Output) -> Result<()> {
-    if out.status.success() {
-        return Ok(());
-    }
-    let mut why = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let err = String::from_utf8_lossy(&out.stderr);
-    if !err.trim().is_empty() {
-        why.push('\n');
-        why.push_str(err.trim());
-    }
-    bail!("`{bin} {}` failed:\n{why}", args.join(" "));
 }
 
 /// herdr resolves its own config root per OS and exposes no command that prints
@@ -313,8 +273,7 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
 
 /// The herdr binary to drive: `HERDR_BIN_PATH` when it names an existing file,
 /// else a `PATH`-resolved herdr. `None` when herdr is not installed. Shared by
-/// the Plugin tab probe, the pane reporter, and the auto-update heal, so all
-/// three resolve one name.
+/// the Plugin tab probe and the pane reporter, so both resolve one name.
 pub(crate) fn resolved_bin() -> Option<PathBuf> {
     let raw = herdr_bin();
     let candidate = Path::new(&raw);
@@ -336,23 +295,11 @@ pub(crate) fn resolved_bin() -> Option<PathBuf> {
 /// (`herdr_report.rs`); `probe()` runs its three calls sequentially, so the
 /// worst case is three times this bound. A child that floods its own pipe
 /// before the deadline is killed with it, same as one that never exits.
-/// `run_quiet` deliberately stays unbounded: its caller is `plugin link`, a
-/// local registry write; the network-fetching `plugin install` runs through
-/// `run` with inherited stdio, where the user watches any stall.
+/// `run` deliberately stays unbounded: the network-fetching `plugin install`
+/// runs with inherited stdio, where the user watches any stall.
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) -> Option<Output> {
-    bounded_output_for(bin, args, envs, PROBE_TIMEOUT)
-}
-
-/// The same bounded spawn with an explicit deadline; the detached heal's
-/// install is the one caller that needs a longer bound than [`PROBE_TIMEOUT`].
-pub(crate) fn bounded_output_for(
-    bin: &str,
-    args: &[&str],
-    envs: &[(&str, &OsStr)],
-    timeout: Duration,
-) -> Option<Output> {
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::null())
@@ -361,39 +308,8 @@ pub(crate) fn bounded_output_for(
     for (k, v) in envs {
         cmd.env(k, v);
     }
-    let mut child = cmd.spawn().ok()?;
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            // A failed waitpid leaves a zombie otherwise; reap like the
-            // reporter does.
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_end(&mut stdout);
-    }
-    if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_end(&mut stderr);
-    }
-    Some(Output {
-        status,
-        stdout,
-        stderr,
-    })
+    let child = cmd.spawn().ok()?;
+    run_bounded(child, PROBE_TIMEOUT)
 }
 
 fn version_command(bin: &str) -> Option<String> {
@@ -511,233 +427,42 @@ fn registry_entry_from_value(root: &Value) -> Option<RegistryEntry> {
     })
 }
 
-/// The herdr heal's own attempt limiter; a second [`HealThrottle`] instance,
-/// so a herdr heal never defers the claude one or the other way round.
-static HEAL_THROTTLE: crate::plugin_host::HealThrottle = crate::plugin_host::HealThrottle::new();
-
-/// The throttled detached heal for the herdr plugin. herdr has no `plugin
-/// update`, so an install over an existing github source IS the update: herdr
-/// replaces the managed checkout and re-registers. Callers: the daemon tick and
-/// `clauth mcp` startup, mirroring the claude plugin's detached heal. Success
-/// and failure both log through `logline!`, never stdout.
-pub(crate) fn heal_detached() {
-    // The plugin is linux and macos only (its entrypoints are POSIX shell), so
-    // there is nothing to heal on Windows.
-    if cfg!(windows) {
-        return;
-    }
-    // This heal is a network update (herdr's install fetches from GitHub), so
-    // the same opt-out that gates clauth's own binary update gates it, before
-    // the throttle claim so a disabled box never even claims an attempt.
-    if !crate::update::updates_enabled() {
-        return;
-    }
-    let Some(claim) = HEAL_THROTTLE.claim(crate::usage::now_ms()) else {
-        return;
-    };
-    // Fail closed in test builds: the worker probes and reinstalls through the
-    // resolved binary, and herdr panes inject `HERDR_BIN_PATH` with the
-    // operator's real herdr, so a test run inside a pane sees the assert
-    // satisfied with no shim staged. Only the test fake sets `HERDR_SHIM_STATE`,
-    // so it is the sentinel; a test that drives a caller of this heal arms the
-    // throttle instead when the heal is not what the test is about.
-    #[cfg(test)]
-    assert!(
-        std::env::var_os("HERDR_SHIM_STATE").is_some(),
-        "heal_detached would probe the operator's real `herdr` and reinstall \
-         their real plugin — stage a herdr shim beside a `HERDR_SHIM_STATE` pin, or call \
-         `arm_heal_throttle_for_test` if the heal is not what the test is about"
-    );
-    #[cfg(test)]
-    let done = crate::testutil::register_background_task();
-    std::thread::spawn(move || {
-        let _claim = claim;
-        match plugin_heal_line() {
-            Ok(Some(line)) => crate::logline::logline!("{line}"),
-            Ok(None) => {}
-            Err(e) => crate::logline::logline!("clauth: herdr plugin heal failed: {e:#}"),
-        }
-        // Last action, after every env-touching step: the claim's drop clears
-        // one atomic and nothing else, so it is safe past the send.
-        #[cfg(test)]
-        let _ = done.send(());
-    });
-}
-
-/// Whether the installed entry needs the update heal: a github-sourced, enabled
-/// entry whose manifest version sits below this binary's. Never true for an
-/// absent entry (never resurrect an uninstall), a disabled one (never
-/// re-enable), a linked checkout (the developer's own live tree), or a version
-/// that cannot be compared (a lenient read degrades to no-op).
-pub(crate) fn plugin_update_needed(entry: &RegistryEntry) -> bool {
-    if !entry.enabled {
-        return false;
-    }
-    if entry.source_kind.as_deref() != Some("github") {
-        return false;
-    }
-    entry
-        .version
-        .as_deref()
-        .is_some_and(|installed| crate::update::is_newer(crate::update::CURRENT_VERSION, installed))
-}
-
-/// How long one detached reinstall may take: a stalled fetch must release the
-/// heal's in-flight claim rather than wedge it for the process lifetime.
-const HEAL_INSTALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-
-/// The gate + update behind [`heal_detached`], split out so a test can pin the
-/// contract without a thread: `None` when there is nothing to do, `Some` when
-/// the update landed, `Err` when the probe or the install failed.
-pub(crate) fn plugin_heal_line() -> anyhow::Result<Option<String>> {
-    plugin_heal_line_with(HEAL_INSTALL_TIMEOUT)
-}
-
-/// The deadline seam under [`plugin_heal_line`]: the shipped call uses
-/// [`HEAL_INSTALL_TIMEOUT`], a test drives the same path with a short one so
-/// the heal's use of the bound is pinned, not just the helper's. After a
-/// reinstall it re-probes herdr and stamps the installed manifest when the
-/// fresh entry still trails this binary's version.
-pub(crate) fn plugin_heal_line_with(timeout: Duration) -> anyhow::Result<Option<String>> {
-    let Some(bin) = resolved_bin() else {
-        return Ok(None);
-    };
-    let bin = bin.to_string_lossy();
-    let (entry, error) = registry_probe(&bin);
-    if let Some(error) = error {
-        bail!("{error}");
-    }
-    let Some(entry) = entry else {
-        return Ok(None);
-    };
-    if !plugin_update_needed(&entry) {
-        return Ok(None);
-    }
-    let old = entry.version.unwrap_or_default();
-    // `--yes` skips the interactive preview: the source was already vetted at
-    // install time, and a detached caller has no tty to answer it on anyway.
-    // The install is bounded: herdr's fetch has no timeout of its own, and a
-    // stall must not wedge the in-flight claim for the process lifetime.
-    run_quiet_bounded(
-        &bin,
-        &["plugin", "install", GITHUB_SOURCE, "--yes"],
-        timeout,
-    )?;
-
-    // A fresh probe drives the stamp: the reinstall may fetch a manifest whose
-    // version still trails this binary, and only then does the heal stamp the
-    // installed manifest. A probe error here is not a heal failure — the
-    // reinstall landed, and the next window's probe retries the read.
-    let mut stamped = false;
-    if let (Some(fresh), None) = registry_probe(&bin)
-        && plugin_update_needed(&fresh)
-        && let Some(root) = fresh.plugin_root.as_deref()
-    {
-        let manifest = Path::new(root).join("herdr-plugin.toml");
-        stamped = stamp_manifest_version(&manifest)
-            .with_context(|| format!("failed to stamp {}", manifest.display()))?;
-    }
-
-    let mut line = format!("reinstalled the herdr plugin from {GITHUB_SOURCE} (was {old})");
-    if stamped {
-        line.push_str(&format!(
-            "; stamped the manifest version to {}",
-            crate::update::CURRENT_VERSION
-        ));
-    }
-    Ok(Some(line))
-}
-
-/// Stamps the top-level `version = "..."` line of a herdr plugin manifest to
-/// [`crate::update::CURRENT_VERSION`], preserving every other byte. A manifest
-/// already at the crate version returns `Ok(false)` with no write, so a
-/// matching file stays byte-identical.
-///
-/// The write is atomic: the staged sibling carries the original file's
-/// permissions before the rename, so a reader sees the old or the new bytes and
-/// the manifest keeps its mode.
-fn stamp_manifest_version(path: &Path) -> Result<bool> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-    let doc: toml::Value = toml::from_str(&text)
-        .with_context(|| format!("{} does not parse as toml", path.display()))?;
-    let current = doc
-        .get("version")
-        .and_then(toml::Value::as_str)
-        .with_context(|| format!("{} carries no version", path.display()))?;
-    if current == crate::update::CURRENT_VERSION {
-        return Ok(false);
-    }
-    let stamped = rewrite_version_line(&text, current).with_context(|| {
-        format!(
-            "{} has no top-level `version = \"{current}\"` line",
-            path.display()
-        )
-    })?;
-    publish_preserving_perms(path, stamped.as_bytes())
-        .with_context(|| format!("failed to stamp {}", path.display()))?;
-    Ok(true)
-}
-
-/// Replaces the top-level `version = "old"` line in place, leaving every
-/// comment and other key untouched, so a reserialization cannot reformat the
-/// manifest. `Err` when no top-level line matched: a write that changed nothing
-/// must not read as a successful stamp.
-fn rewrite_version_line(text: &str, old: &str) -> Result<String> {
-    let needle = format!("version = \"{old}\"");
-    let mut replaced = false;
-    let out: Vec<String> = text
-        .lines()
-        .map(|line| {
-            if !replaced && !line.starts_with(' ') && line.trim() == needle.as_str() {
-                replaced = true;
-                format!("version = \"{}\"", crate::update::CURRENT_VERSION)
-            } else {
-                line.to_string()
+/// The one kill-on-deadline reap loop: [`bounded_output`] spawns and hands
+/// its child here, and the heal's install and remote probe spawn their own so
+/// a failed spawn is named at the call site rather than read as a timeout.
+fn run_bounded(mut child: std::process::Child, timeout: Duration) -> Option<Output> {
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
             }
-        })
-        .collect();
-    if !replaced {
-        bail!("no top-level `{needle}` line");
-    }
-    let mut out = out.join("\n");
-    if text.ends_with('\n') {
-        out.push('\n');
-    }
-    Ok(out)
-}
-
-/// Atomic publish that keeps the destination's permissions: the staged sibling
-/// takes the original's mode before the rename, and the rename stays within one
-/// directory. Shared by the install stamp and the heal stamp.
-fn publish_preserving_perms(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let perms = std::fs::metadata(path).map(|m| m.permissions()).ok();
-    let tmp = crate::profile::tmp_sibling(path);
-    std::fs::write(&tmp, bytes)?;
-    if let Some(perms) = perms {
-        std::fs::set_permissions(&tmp, perms)?;
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            // A failed waitpid leaves a zombie otherwise; reap like the
+            // reporter does.
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
+    };
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_end(&mut stdout);
     }
-}
-
-/// Stamp the floor at now, so [`heal_detached`] refuses every attempt for the
-/// next window. For a test that drives a caller of the heal (the daemon tick,
-/// `clauth mcp` startup) and is about something else.
-#[cfg(test)]
-pub(crate) fn arm_heal_throttle_for_test() {
-    HEAL_THROTTLE.arm_for_test();
-}
-
-/// Clear both flags so a test can drive a heal fresh.
-#[cfg(all(test, unix))]
-pub(crate) fn reset_heal_throttle_for_test() {
-    HEAL_THROTTLE.reset_for_test();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
+    Some(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn resolve_key(key: Option<&str>, yes: bool) -> Result<String> {
@@ -781,7 +506,7 @@ fn confirm(question: &str, yes: bool) -> Result<bool> {
         return Ok(true);
     }
     if !is_tty() {
-        errln!("clauth: not a terminal, so nothing was changed; rerun with --yes");
+        errln!("clauth: not a terminal; rerun with --yes");
         return Ok(false);
     }
     out!("clauth: {question} [y/N] ");
@@ -1010,7 +735,7 @@ pub(crate) fn heal(
         .unwrap_or_else(|| key.to_string());
     let (text, plan, _) = resync_text(&existing, &plan_key, delegate_row_text)?;
     if text != existing {
-        write_validated(config_path, &existing, &text, bin)?;
+        write_validated(config_path, &existing, &text, bin, "what clauth would add")?;
     }
     Ok(plan.notes)
 }
@@ -1257,20 +982,44 @@ pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
         "remove the clauth plugin from herdr?"
     };
     if !confirm(question, yes)? {
-        outln!("clauth: nothing changed");
+        outln!("clauth: cancelled; nothing was removed");
         return Ok(());
     }
 
-    match uninstall_plugin(&bin)? {
-        PluginUninstall::Done => outln!("clauth: uninstalled the herdr plugin"),
-        PluginUninstall::NotInstalled => {
-            outln!("clauth: herdr had no clauth plugin to uninstall (plugin not installed)")
-        }
+    // The config write lands before the unlink: a failed write leaves the
+    // plugin registered and the binding intact, a consistent install. The old
+    // order stranded a config binding an action herdr no longer has whenever
+    // the write failed. The reverse order's residual, a cleaned config while
+    // the unlink fails, is the note below, naming the manual command.
+    let mut config_cleaned = false;
+    if let Some((path, previous, text, _)) = config_edit {
+        write_validated(
+            &path,
+            &previous,
+            &text,
+            &bin,
+            "the config without clauth's blocks",
+        )?;
+        outln!("clauth: removed clauth's additions from {}", path.display());
+        config_cleaned = true;
     }
 
-    if let Some((path, previous, text, _)) = config_edit {
-        write_validated(&path, &previous, &text, &bin)?;
-        outln!("clauth: removed clauth's additions from {}", path.display());
+    match uninstall_plugin(&bin) {
+        Ok(PluginUninstall::Done) => outln!("clauth: uninstalled the herdr plugin"),
+        Ok(PluginUninstall::NotInstalled) => {
+            outln!("clauth: herdr had no clauth plugin to uninstall (plugin not installed)")
+        }
+        Err(error) => {
+            // The note rides the error's context chain, so a non-tty caller
+            // and a log both get it: the manual command that finishes what the
+            // unlink left half-done.
+            let error = if config_cleaned {
+                error.context(unlink_failure_note(&bin))
+            } else {
+                error
+            };
+            return Err(error);
+        }
     }
 
     Ok(())
@@ -1279,6 +1028,12 @@ pub(crate) fn uninstall(no_config: bool, yes: bool) -> Result<()> {
 enum PluginUninstall {
     Done,
     NotInstalled,
+}
+
+/// The residual `uninstall` names when the config was already cleaned but the
+/// unlink failed: the manual command that finishes the removal.
+fn unlink_failure_note(bin: &str) -> String {
+    format!("the config was already cleaned; finish with `{bin} plugin uninstall {PLUGIN_ID}`")
 }
 
 /// `herdr plugin uninstall clauth`. herdr exits 1 with a `plugin not installed` line when there is nothing to remove; the caller treats that as a no-op. The phrase must start a line, so a real failure that merely mentions it still fails.
@@ -1330,7 +1085,9 @@ fn mentions_token(value: &toml::Value) -> bool {
 /// config check` diagnoses the whole file, so refusing on its exit code alone
 /// locks anyone with one stale key out of this command over something that
 /// predates it. Only a diagnostic this edit ADDS is clauth's to refuse over.
-fn write_validated(path: &Path, previous: &str, text: &str, bin: &str) -> Result<()> {
+/// `edit` names the change for the refusal message; both callers refuse with
+/// nothing written.
+fn write_validated(path: &Path, previous: &str, text: &str, bin: &str, edit: &str) -> Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
     let probe = tempfile::Builder::new()
@@ -1342,7 +1099,7 @@ fn write_validated(path: &Path, previous: &str, text: &str, bin: &str) -> Result
     let added = added_diagnostics(&before, &after);
     if !added.is_empty() {
         bail!(
-            "herdr rejected what clauth would add, so nothing changed:\n{}",
+            "herdr rejected {edit}, so nothing was written:\n{}",
             added.join("\n")
         );
     }
