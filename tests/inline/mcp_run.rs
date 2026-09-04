@@ -2307,13 +2307,16 @@ fn a_cancelled_request_ends_every_wait_loop_early() {
     assert!(matches!(watched, WatchOutcome::Unchanged { .. }));
 }
 
-/// `write_heartbeat`'s lock-free safety rests on the stdout reader thread being
-/// JOINED before any envelope is built, so the last heartbeat strictly precedes
-/// `write_done`. An early `return` between the spawn and the join orphans the
-/// thread: the child keeps writing (`Child::drop` does not kill), the orphan
-/// keeps heartbeating, and it overwrites the finalized record with
-/// `state: running, envelope: None` — a job that polls running for 70 minutes
-/// and an `mcp-await-job` blocked on a terminal state that never arrives.
+/// The shared-capture structure's single-exit guarantee: `run_delegate` must
+/// reach the capture take on every path, because an early `return` between the
+/// reader spawn and the take drops the shared slots while the readers are
+/// still writing into them — the whole result is lost, and the run finalizes
+/// an envelope built from nothing.
+///
+/// The old join-based invariant is gone with the join itself: beats can no
+/// longer overwrite a finalized record because `Handoff::finalize` sets
+/// `Finished` first and then drains the in-flight beat counter before any
+/// write, so the guard now protects result completeness alone.
 ///
 /// The precondition is a `waitpid` failure, which has no practical repro, so the
 /// guarantee is structural: there is exactly one exit between those two points.
@@ -2326,20 +2329,20 @@ fn a_cancelled_request_ends_every_wait_loop_early() {
 /// the right answer to one is to restructure it rather than to loosen this,
 /// since a reader cannot tell the two apart at a glance either.
 #[test]
-fn run_delegate_never_returns_between_spawning_the_reader_and_joining_it() {
+fn run_delegate_never_returns_between_spawning_the_reader_and_taking_the_capture() {
     let src = include_str!("../../src/mcp/mod.rs");
     let body = src
         .split_once("fn run_delegate(")
         .expect("run_delegate is defined")
         .1;
     let spawn = body
-        .find("let stdout_reader = child.stdout.take()")
+        .find("let _stdout_reader = child.stdout.take()")
         .expect("the reader thread is spawned");
-    let join = body
-        .find("let capture = stdout_reader")
-        .expect("the reader thread is joined");
-    assert!(spawn < join, "the join follows the spawn");
-    let window: String = body[spawn..join]
+    let take = body
+        .find("let capture = capture_slot")
+        .expect("the capture is taken");
+    assert!(spawn < take, "the take follows the spawn");
+    let window: String = body[spawn..take]
         .lines()
         .filter(|l| !l.trim_start().starts_with("//"))
         .collect::<Vec<_>>()
@@ -2347,8 +2350,9 @@ fn run_delegate_never_returns_between_spawning_the_reader_and_joining_it() {
     for shape in ["return ", "return;", "?"] {
         assert!(
             !window.contains(shape),
-            "an early exit ({shape:?}) between the reader spawn and its join orphans \
-             the thread, and the orphan then overwrites the finalized job file: {window}",
+            "an early exit ({shape:?}) between the reader spawn and the capture \
+             take drops the shared slots while the readers still write into \
+             them, losing the run's whole result: {window}",
         );
     }
 }
@@ -4312,15 +4316,17 @@ fn salvaged_text_keeps_its_tail_on_a_char_boundary() {
 }
 
 /// The reader is the liveness source: every line it consumes stamps the progress
-/// clock the wait loop reads.
+/// clock the wait loop reads, and lands in the shared capture slot.
 #[test]
 fn the_stdout_reader_stamps_progress_and_keeps_the_result() {
     let progress = super::AtomicU64::new(u64::MAX);
-    let capture = super::read_stdout(
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(super::StreamCapture::default()));
+    super::read_stdout(
         std::io::Cursor::new(STREAM.as_bytes()),
         true,
         std::time::Instant::now(),
         &progress,
+        &capture,
         None,
     );
     assert_ne!(
@@ -4328,6 +4334,7 @@ fn the_stdout_reader_stamps_progress_and_keeps_the_result() {
         u64::MAX,
         "each event resets the idle clock"
     );
+    let capture = capture.lock().unwrap_or_else(|e| e.into_inner());
     assert!(capture.envelope_src().contains("final report"));
     assert_eq!(capture.partial_text(), "alpha");
 }
@@ -4381,15 +4388,17 @@ fn the_stdout_reader_throttles_the_heartbeat_sink() {
     };
 
     let progress = super::AtomicU64::new(0);
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(super::StreamCapture::default()));
     let mut beats: Vec<String> = Vec::new();
-    let mut sink = |capture: &super::StreamCapture| {
-        beats.push(super::tail_line(capture));
+    let mut sink = |tail: String, _session: Option<String>| {
+        beats.push(tail);
     };
     super::read_stdout(
         reader,
         true,
         std::time::Instant::now(),
         &progress,
+        &capture,
         Some(&mut sink),
     );
 
@@ -4432,32 +4441,31 @@ fn a_streamed_session_id_round_trips_through_the_running_record() {
         "\n",
     );
     let progress = super::AtomicU64::new(0);
-    let mut sink = |capture: &super::StreamCapture| {
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(super::StreamCapture::default()));
+    let mut sink = |tail: String, session: Option<String>| {
         // The production beat: what `run_delegate`'s reader thread writes on
         // every throttle slice.
-        let _ = jobs::write_heartbeat_with_session(
-            &spec,
-            now_ms(),
-            &super::tail_line(capture),
-            capture.session_id.as_deref(),
-        );
+        let _ = jobs::write_heartbeat_with_session(&spec, now_ms(), &tail, session.as_deref());
     };
-    let capture = super::read_stdout(
+    super::read_stdout(
         std::io::Cursor::new(stream.as_bytes()),
         true,
         std::time::Instant::now(),
         &progress,
+        &capture,
         Some(&mut sink),
     );
 
     let id = capture
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
         .session_id
-        .as_deref()
+        .clone()
         .expect("the stream named a session");
     let record = jobs::read("d-stream-0").expect("record");
     assert_eq!(
         record.session_id.as_deref(),
-        Some(id),
+        Some(id.as_str()),
         "the running record carries the exact value the capture held — the one \
          `delegate({{resume}})` accepts, byte for byte",
     );
@@ -4468,7 +4476,7 @@ fn a_streamed_session_id_round_trips_through_the_running_record() {
 /// crashed run's record carries no resume handle however well the store
 /// round-trips a value handed it directly. The closure lives inside
 /// `run_delegate`, which cannot run without a real `claude` child, so the pin is
-/// a source scan — the same mechanism the reader-join guarantee uses.
+/// a source scan — the same mechanism the capture-take guarantee uses.
 #[test]
 fn the_production_heartbeat_passes_the_captured_session_id() {
     let src = include_str!("../../src/mcp/mod.rs");
@@ -4477,19 +4485,20 @@ fn the_production_heartbeat_passes_the_captured_session_id() {
         .expect("run_delegate is defined")
         .1;
     let beat = body
-        .split_once("let mut beat = |capture: &StreamCapture| {")
+        .split_once("let mut beat = |tail: String, session: Option<String>| {")
         .expect("the heartbeat closure exists")
         .1
         .split_once("read_stdout(h, streaming, start, &progress")
         .expect("the beat closure ends at the reader spawn")
         .0;
     assert!(
-        beat.contains("write_heartbeat_with_session"),
-        "the production beat writes through the session-carrying writer: {beat}",
+        beat.contains("handoff.heartbeat"),
+        "the production beat is `Handoff::heartbeat`, the one writer the \
+         counter-based finalize serializes against: {beat}",
     );
     assert!(
-        beat.contains("capture.session_id.as_deref()"),
-        "and passes the value the capture holds: {beat}",
+        beat.contains("session.as_deref()"),
+        "and passes the value the capture held: {beat}",
     );
 }
 
@@ -4500,14 +4509,22 @@ fn the_production_heartbeat_passes_the_captured_session_id() {
 #[test]
 fn a_sinkless_reader_never_beats() {
     let progress = super::AtomicU64::new(0);
-    let capture = super::read_stdout(
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(super::StreamCapture::default()));
+    super::read_stdout(
         std::io::Cursor::new(STREAM.as_bytes()),
         true,
         std::time::Instant::now(),
         &progress,
+        &capture,
         None,
     );
-    assert_eq!(capture.partial_text(), "alpha");
+    assert_eq!(
+        capture
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .partial_text(),
+        "alpha"
+    );
 }
 
 /// A current-thread runtime with a PAUSED clock: both the ticker's sleep and the
@@ -5607,13 +5624,16 @@ fn token_is_job_id_accepts_fresh_and_legacy_and_rejects_bad_shapes() {
 fn a_pinned_output_format_is_captured_as_one_document() {
     let raw = "{\n  \"type\": \"result\",\n  \"result\": \"pinned\"\n}\n";
     let progress = super::AtomicU64::new(0);
-    let capture = super::read_stdout(
+    let capture = std::sync::Arc::new(std::sync::Mutex::new(super::StreamCapture::default()));
+    super::read_stdout(
         std::io::Cursor::new(raw.as_bytes()),
         false,
         std::time::Instant::now(),
         &progress,
+        &capture,
         None,
     );
+    let capture = capture.lock().unwrap_or_else(|e| e.into_inner());
     let envelope = super::parse_delegate_envelope(capture.envelope_src().trim())
         .expect("whole document parses");
     assert_eq!(envelope["result"], "pinned");
@@ -6706,6 +6726,385 @@ fn a_job_alive_when_the_wait_ends_verdicts_failed_to_kill() {
     );
 }
 
+// ---- cancel against a blocking run's liveness record ----
+
+/// The one-id cancel path end to end: a blocking run's id is HELD from its
+/// spawn, so the ask reaches it, and the wait holds while its liveness record
+/// stands — then reports the run stopped the moment the record vanishes, with
+/// a verdict of its own rather than "failed to kill". The finalizer thread is
+/// the run's own teardown, staged instead of faked.
+#[test]
+fn a_cancelling_monitor_waits_out_a_blocking_run_and_reports_it_stopped() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    let finisher = {
+        let handoff = handoff.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            handoff.finalize(&serde_json::json!({"profile": "work", "result": "done"}));
+        })
+    };
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.to_string()]),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    finisher.join().expect("finisher thread");
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "a run the cancel stopped is reported, not refused"
+    );
+    assert_eq!(result.content.len(), 1, "one block, note included");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    let (note, body) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert!(
+        note.contains(&format!("asked `{id}` to stop")),
+        "the ask named the blocking run's own id: {note}"
+    );
+    assert!(
+        note.contains(&format!("stopped `{id}` after")),
+        "the verdict says what the record did, never 'failed to kill': {note}"
+    );
+    assert!(
+        !note.contains("failed to kill") && !note.contains("still stopping"),
+        "a run whose record vanished is stopped, full stop: {note}"
+    );
+    assert_eq!(
+        body,
+        format!("job `{id}` stopped: its blocking run has ended and left nothing here to collect"),
+        "the reply row is the stopped spelling, not the owner-ruled blocking copy: {text}"
+    );
+}
+
+/// The wait's other end: the liveness record still standing when the wait gave
+/// up resolves `Blocking`, the tick names the id and nothing else, and the
+/// note's verdict is the still-stopping spelling. Driven on `wait_for_done`
+/// directly because the reply path floors cancel waits at the grace constant —
+/// ten seconds of wall time this shape cannot spend — and the one-id reply arm
+/// is pinned by the render test below.
+#[test]
+fn a_cancelling_wait_holds_while_the_blocking_record_stands_and_verdicts_still_stopping() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let mut sink = ProgressSink::recording();
+    let mut watch = super::CancelWatch::ask(std::slice::from_ref(&id));
+    let start = std::time::Instant::now();
+    let outcome = rt.block_on(wait_for_done(&id, 1, &mut sink, Some(&mut watch)));
+    let elapsed = start.elapsed();
+    assert!(
+        matches!(outcome, WaitOutcome::Blocking),
+        "a standing liveness record resolves Blocking at the wait's end: {outcome:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "the wait HELD on the liveness record instead of answering at once: {elapsed:?}"
+    );
+    let ticks = sink.recorded();
+    assert!(
+        !ticks.is_empty(),
+        "the wait ticked while it held: {ticks:?}"
+    );
+    assert!(
+        ticks
+            .iter()
+            .all(|line| line == &format!("waiting for blocking `delegate` `{id}` to stop")),
+        "each tick is the plain id-only line — no record content: {ticks:?}"
+    );
+    let note = watch.note();
+    assert!(
+        note.contains(&format!("`{id}` still stopping after")),
+        "the verdict is the still-stopping spelling, not a false 'failed to kill': {note}"
+    );
+}
+
+/// The batch keeps the same pair of resolutions per slot, and `Unknown` keeps
+/// meaning a missing file: a blocking id resolves Blocking or BlockingStopped,
+/// never Unknown, and a genuinely absent id stays Unknown. Driven on
+/// `wait_for_batch` directly for the same reason as the one-id wait above.
+#[test]
+fn a_cancelling_batch_keeps_blocking_outcomes_apart_from_unknown() {
+    let _home = HomeSandbox::new();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("runtime");
+    let mut sink = ProgressSink::none();
+
+    // The still-standing arm.
+    let standing = super::Handoff::blocking(mint_spec("work"));
+    standing.mark_spawned();
+    let standing_id = standing.spec().expect("liveness record").job_id;
+    let ids = vec![standing_id.clone(), "d-missing-0".to_string()];
+    let mut watch = super::CancelWatch::ask(&ids);
+    let outcomes = rt.block_on(wait_for_batch(
+        &ids,
+        1,
+        ReturnOn::All,
+        &mut sink,
+        Some(&mut watch),
+    ));
+    assert!(
+        matches!(outcomes[0].1, WaitOutcome::Blocking),
+        "a standing liveness record resolves Blocking, in the slot it was asked: {:?}",
+        outcomes[0]
+    );
+    assert!(
+        matches!(outcomes[1].1, WaitOutcome::Unknown),
+        "a missing file stays Unknown: {:?}",
+        outcomes[1]
+    );
+    let note = watch.note();
+    assert!(
+        note.contains(&format!("`{standing_id}` still stopping after")),
+        "the still-standing verdict names the blocking id: {note}"
+    );
+    assert!(
+        note.contains("no running delegate here for `d-missing-0`"),
+        "and the unheld hedge still answers the absent one: {note}"
+    );
+
+    // The stopped arm: the record vanishes mid-wait.
+    let stopping = super::Handoff::blocking(mint_spec("work"));
+    stopping.mark_spawned();
+    let stopping_id = stopping.spec().expect("liveness record").job_id;
+    let finisher = {
+        let stopping = stopping.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            stopping.finalize(&serde_json::json!({"profile": "work", "result": "done"}));
+        })
+    };
+    let ids = vec![stopping_id.clone()];
+    let mut watch = super::CancelWatch::ask(&ids);
+    let outcomes = rt.block_on(wait_for_batch(
+        &ids,
+        5,
+        ReturnOn::All,
+        &mut sink,
+        Some(&mut watch),
+    ));
+    finisher.join().expect("finisher thread");
+    assert!(
+        matches!(outcomes[0].1, WaitOutcome::BlockingStopped),
+        "a record that vanishes mid-wait resolves BlockingStopped: {:?}",
+        outcomes[0]
+    );
+    let note = watch.note();
+    assert!(
+        note.contains(&format!("stopped `{stopping_id}` after")),
+        "the stopped verdict names the blocking id: {note}"
+    );
+}
+
+/// The batch reply rows for the two new outcomes, and their exclusion from the
+/// unknown count: `unknown_job_id_count` stays a count of MISSING files, so
+/// the blocking and stopped rows never feed it.
+#[test]
+fn the_blocking_batch_rows_render_and_stay_out_of_the_unknown_count() {
+    let payload = serde_json::json!({
+        "results": [
+            { "job_id": "d-1-0", "status": "blocking" },
+            { "job_id": "d-2-0", "status": "stopped" },
+            { "job_id": "d-3-0", "status": "unknown" },
+        ],
+        "unknown_job_id_count": 1,
+    });
+    let prose = super::render::monitor_batch_prose(&payload);
+    assert_eq!(
+        prose,
+        "job `d-1-0` blocking: its run is still stopping; check again\n\
+         job `d-2-0` stopped: its blocking run has ended and left nothing here to collect\n\
+         job `d-3-0` unknown\n\
+         1 unknown job id(s): use monitor without `job_ids` to list the existing jobs.",
+        "one row per outcome, the blocking pair rendered by their own arms, \
+         and the tail clause counts the missing file alone: {prose}"
+    );
+    // The one-id reply arms render the same pair through the shared job prose.
+    assert_eq!(
+        super::render::monitor_job_prose(
+            &serde_json::json!({"job_id": "d-1-0", "status": "blocking"})
+        ),
+        "job `d-1-0` blocking: its run is still stopping; check again",
+    );
+    assert_eq!(
+        super::render::monitor_job_prose(
+            &serde_json::json!({"job_id": "d-2-0", "status": "stopped"})
+        ),
+        "job `d-2-0` stopped: its blocking run has ended and left nothing here to collect",
+    );
+}
+
+/// The full batch path with the count exclusion live: a batch cancel over one
+/// blocking id (which stops mid-wait) and one missing id ends the moment both
+/// resolve — the stopped row and the unknown row, the tail clause counting the
+/// missing one alone.
+#[test]
+fn a_batch_cancel_counts_the_missing_id_but_not_the_stopped_blocking_one() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    let finisher = {
+        let handoff = handoff.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            handoff.finalize(&serde_json::json!({"profile": "work", "result": "done"}));
+        })
+    };
+
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.clone(), "d-missing-0".to_string()]),
+        wait_secs: Some(0),
+        return_on: None,
+        cancel: Some(true),
+    });
+    finisher.join().expect("finisher thread");
+    assert_eq!(result.content.len(), 1, "one block, note included");
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains(&format!("job `{id}` stopped:")),
+        "the stopped row renders: {text}"
+    );
+    assert!(
+        text.contains("job `d-missing-0` unknown"),
+        "the missing id keeps its unknown row: {text}"
+    );
+    assert!(
+        text.ends_with(
+            "1 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+        ),
+        "the count covers the missing file alone: {text}"
+    );
+}
+
+/// Non-cancel mode is unchanged by the blocking split: a batch poll on a
+/// blocking id answers instantly with its unknown row, never a wait and never
+/// the new vocabulary. Two ids, so the call takes the batch shape — a
+/// one-element list routes through the one-id reply, whose owner-ruled copy
+/// is pinned elsewhere.
+#[test]
+fn a_non_cancelling_batch_poll_on_a_blocking_id_answers_unknown_instantly() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+
+    let start = std::time::Instant::now();
+    let result = call_monitor_batch(vec![&id, "d-missing-0"], Some(5));
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "a non-cancelling poll does not start waiting on a blocking id: {:?}",
+        start.elapsed()
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert_eq!(
+        text,
+        format!(
+            "job `{id}` unknown\njob `d-missing-0` unknown\n\
+             2 unknown job id(s): use monitor without `job_ids` to list the existing jobs."
+        ),
+        "the rows and the count are the pre-rework shapes: {text}"
+    );
+}
+
+/// The still-standing batch row, end to end: an explicit `return_on: "any"`
+/// with a pre-seeded done lane ends the wait on that lane, and the final pass
+/// resolves the blocking id whose liveness record still stands as the
+/// `blocking` row — outside the unknown count. The one-id spelling of the
+/// same outcome cannot be driven this cheaply (its wait is floored at the
+/// grace constant), and its reply arm is pinned by the render test.
+#[test]
+fn a_batch_cancel_reports_the_still_standing_blocking_row_end_to_end() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    jobs::write_done(
+        "d-done-lane-0",
+        "work",
+        1,
+        None,
+        None,
+        false,
+        serde_json::json!({"profile": "work", "is_error": false, "result": "landed first"}),
+    )
+    .unwrap();
+
+    let start = std::time::Instant::now();
+    let result = call_monitor_args(MonitorArgs {
+        job_ids: Some(vec![id.clone(), "d-done-lane-0".to_string()]),
+        wait_secs: Some(0),
+        return_on: Some("any".to_string()),
+        cancel: Some(true),
+    });
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "the done lane ends the wait well inside the grace floor: {:?}",
+        start.elapsed()
+    );
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("reply text");
+    assert!(
+        text.contains(&format!(
+            "job `{id}` blocking: its run is still stopping; check again"
+        )),
+        "the standing liveness record resolves the blocking row through the \
+         full reply path: {text}"
+    );
+    assert!(
+        text.contains("job `d-done-lane-0` finished: landed first"),
+        "the done lane collected normally: {text}"
+    );
+    assert!(
+        !text.contains("unknown job id(s)"),
+        "neither the blocking row nor the done lane feeds the unknown count: {text}"
+    );
+    let (note, _) = text
+        .split_once('\n')
+        .expect("the cancel note leads the reply");
+    assert!(
+        note.contains(&format!("`{id}` still stopping after")),
+        "the note verdicts the standing record with the still-stopping spelling: {note}"
+    );
+    assert!(
+        note.contains("no running delegate here for `d-done-lane-0`"),
+        "and the unheld hedge still answers the done lane: {note}"
+    );
+}
+
 /// The waited figure is observed per job, not floored: a job that dies
 /// partway through the wait reports the seconds this call actually waited for
 /// it. Driven on `wait_for_done` directly because the reply's grace floor buys
@@ -7349,6 +7748,130 @@ fn an_abandoned_run_with_a_live_child_hands_off_to_a_job_file() {
     );
 }
 
+/// A blocking run's id is stoppable from the moment its liveness record exists,
+/// and the registry entry travels with the record across the crossing: taken,
+/// never re-registered, and released only when the finalize lands.
+///
+/// The `cancel_job` true after the hand-off is what pins the take against the
+/// register-a-second shape: two guards sharing one flag `Arc` each remove the
+/// other's entry on drop, so a hand-off that registered instead of taking would
+/// lose the entry the moment the crossed `AttachedRun` dropped — and this read
+/// would answer false for a run that is still live.
+#[test]
+fn a_blocking_run_is_cancellable_from_its_spawn_and_the_entry_travels_with_the_crossing() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+
+    assert!(
+        super::cancel_job(&id),
+        "the spawn registers: the id the record shows is held from the same instant"
+    );
+    assert!(
+        handoff.is_cancelled(),
+        "and the entry sets the flag the run's supervision loop reads"
+    );
+
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a run with a live child is handed off");
+    };
+    assert_eq!(job_id, id, "one id across the crossing");
+    assert!(
+        super::cancel_job(&id),
+        "the entry is TAKEN with the record, so the handed-off run stays stoppable"
+    );
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "done"}));
+    assert!(
+        !super::cancel_job(&id),
+        "the entry goes with the finalize, so a later job reusing the id cannot \
+         be stopped by a stale cancel"
+    );
+}
+
+/// The attached half of the same lifecycle: a blocking run whose caller is
+/// still waiting drops the liveness record and the registry entry together at
+/// the finalize, in that order, so the id stops reading held the moment the
+/// record stops reading live.
+#[test]
+fn a_blocking_run_finished_with_its_caller_waiting_releases_the_entry_with_the_record() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    assert!(super::cancel_job(&id), "the spawn registered the id");
+
+    handoff.finalize(&serde_json::json!({"profile": "work", "result": "the caller got this"}));
+    assert!(
+        !super::cancel_job(&id),
+        "the entry retires with the liveness record it guarded"
+    );
+    assert!(
+        job_files().is_empty(),
+        "and the record itself is gone too: {:?}",
+        job_files(),
+    );
+}
+
+/// The observable half of the one-hold install: the entry is in the registry
+/// before the record's first write lands, so no reader can see a liveness
+/// record whose id `cancel_job` does not already hold. Pinned structurally
+/// rather than timed — the window between two statements in one function is
+/// not a thing a clock can race — and the same-hold half is what the
+/// `debug_assert!` in `hand_off`'s unreachable fallback checks in debug.
+#[test]
+fn mark_spawned_registers_the_entry_before_it_writes_the_record() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn mark_spawned(")
+        .expect("mark_spawned is defined")
+        .1;
+    let register = body
+        .find("CancelGuard::register(")
+        .expect("mark_spawned registers the guard");
+    let write = body
+        .find("jobs::write_running(&spec)")
+        .expect("mark_spawned writes the liveness record");
+    assert!(
+        register < write,
+        "the registry entry lands before the record's first write, so the \
+         record is never observable unheld"
+    );
+}
+
+/// The entry lives from spawn to finalize on the FAILED hand-off too: a
+/// promote that loses both its rename and its write fallback keeps the run
+/// attached with its liveness record standing, and the record's id must stay
+/// held — the R1 contract is "from `mark_spawned` until `finalize`", and
+/// without the reinstall a cancel-mode `monitor` would hold the grace on a
+/// record whose id nothing holds, answering "still stopping" beside the
+/// unheld hedge.
+#[test]
+fn a_failed_hand_off_keeps_the_entry_with_the_live_run() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+    assert!(super::cancel_job(&id), "the spawn registered the id");
+
+    // Break the store: the jobs path becomes a FILE, so both `promote`'s
+    // rename and its `write_running` fallback fail.
+    let jobs = jobs::jobs_dir().expect("jobs dir");
+    std::fs::remove_dir_all(&jobs).unwrap();
+    std::fs::write(&jobs, b"not a dir").unwrap();
+
+    assert!(
+        matches!(handoff.hand_off(), super::Abandoned::Kept),
+        "a promote that loses both its writes reports nothing to collect"
+    );
+    assert!(
+        super::cancel_job(&id),
+        "the failed crossing returns the entry to the still-live run, so the \
+         id stays stoppable until its finalize"
+    );
+}
+
 /// The boundary the conversion turns on, from the handler's side. Before a child
 /// exists nothing has been billed, so there is no result to preserve and a job
 /// file would only promise one that is never coming: the run is STOPPED instead,
@@ -7616,8 +8139,9 @@ fn a_heartbeat_that_raced_the_crossing_cannot_outlive_it() {
         job_files(),
         vec![format!("{job_id}.json")],
         "one run leaves one record: the raced beat's file is an orphan the \
-         finalize is positioned to clear, since `run_delegate` has already \
-         joined the reader thread by then",
+         finalize is positioned to clear, since `Finished` is set before its \
+         writes and the in-flight drain has landed every beat that resolved \
+         earlier",
     );
     let listed = jobs::list(now_ms());
     assert_eq!(
@@ -7625,6 +8149,119 @@ fn a_heartbeat_that_raced_the_crossing_cannot_outlive_it() {
         1,
         "so the pane cannot draw the same run as live and finished at once: {listed:?}",
     );
+}
+
+/// The observable contract the counter-based finalize stands on: a beat that
+/// resolves its destination after `Finished` writes nothing, and one that
+/// resolved before it has landed by the time the finalize's own writes run —
+/// so the collectable stays `Done` with its envelope and no liveness file is
+/// ever recreated, however late a reader thread calls in. The in-flight drain
+/// itself (the yield-spin) is not driven here — no hook exists to hold a beat
+/// mid-write — and is documented at `Handoff::finalize`; this pins what the
+/// drain must deliver.
+#[test]
+fn a_heartbeat_after_finalize_writes_nothing() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a run with a live child is handed off");
+    };
+    let envelope = serde_json::json!({"profile": "work", "result": "done"});
+    handoff.finalize(&envelope);
+
+    // The reader thread can stay parked past the finalize (a grandchild
+    // holding the child's stdout pipe); this is its beat landing late.
+    handoff.heartbeat(now_ms(), "late beat", Some("s-late"));
+    assert_eq!(
+        job_files(),
+        vec![format!("{job_id}.json")],
+        "no liveness file is recreated by a beat that resolved its \
+         destination after the finalize: {:?}",
+        job_files(),
+    );
+    let record = jobs::read(&job_id).expect("the done record");
+    assert_eq!(
+        record.state,
+        jobs::JobState::Done,
+        "and the collectable stays Done — a beat cannot resurrect `running`"
+    );
+    assert_eq!(
+        record.envelope.as_ref(),
+        Some(&envelope),
+        "with the finalize's own envelope untouched"
+    );
+}
+
+/// The structural half of the drain the behaviour test above cannot hold up:
+/// the counter drain itself cannot be driven deterministically (no hook holds
+/// a beat mid-write), so the ORDER is pinned over the source — `finalize`
+/// drains the in-flight counter after setting `Finished` and BEFORE any of
+/// its file IO, since a finalize whose first write ran ahead of the drain is
+/// exactly the beat-races-the-write bug the counter exists to close. The
+/// counter's correctness (increment under the same hold as the resolve,
+/// decrement after the write) is the safety sentence the reviewer opens on,
+/// never this scan.
+#[test]
+fn finalize_drains_in_flight_beats_before_any_of_its_io() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn finalize(")
+        .expect("finalize is defined")
+        .1
+        .split("fn launch_background_delegate")
+        .next()
+        .expect("finalize ends where the next item begins");
+    let drain = body
+        .find("while self.in_flight.load")
+        .expect("finalize drains the in-flight counter");
+    let first_io = ["jobs::remove_liveness", "jobs::write_done"]
+        .into_iter()
+        .filter_map(|needle| body.find(needle))
+        .min()
+        .expect("finalize writes files");
+    assert!(
+        drain < first_io,
+        "the drain sits between `Finished` and the first file write: a beat \
+         that resolved before `Finished` lands before the remove/write_done, \
+         and one resolving after writes nothing"
+    );
+}
+
+/// The beat writer the restructure moved the production sink onto: it resolves
+/// the record under the state lock, writes through the session-carrying
+/// writer, and lands in whichever spelling the run currently owns — liveness
+/// while attached, collectable after the crossing.
+#[test]
+fn the_heartbeat_method_writes_the_running_record_with_the_session_id() {
+    let _home = HomeSandbox::new();
+    let handoff = super::Handoff::blocking(mint_spec("work"));
+    handoff.mark_spawned();
+    let id = handoff.spec().expect("liveness record").job_id;
+
+    handoff.heartbeat(now_ms(), "thinking", Some("s1"));
+    let listed = jobs::list(now_ms());
+    assert_eq!(
+        listed.len(),
+        1,
+        "the attached beat lands in the liveness record: {listed:?}"
+    );
+    assert_eq!(listed[0].record.tail, "thinking");
+    assert_eq!(listed[0].record.session_id.as_deref(), Some("s1"));
+
+    let super::Abandoned::HandedOff(job_id) = handoff.hand_off() else {
+        panic!("a run with a live child is handed off");
+    };
+    assert_eq!(job_id, id, "one id across the crossing");
+    handoff.heartbeat(now_ms(), "still thinking", Some("s1"));
+    let record = jobs::read(&job_id).expect("collectable record");
+    assert_eq!(
+        record.session_id.as_deref(),
+        Some("s1"),
+        "the collectable beat carries the session id, which is what a crashed \
+         run's resume handle survives on"
+    );
+    assert_eq!(record.tail, "still thinking");
 }
 
 /// The same class through the other window: `mark_spawned` installs the spec
@@ -7852,7 +8489,7 @@ fn run_delegate_records_the_spawn_only_after_the_child_exists() {
         .find("let mut child = command")
         .expect("the child is spawned");
     let reader = body
-        .find("let stdout_reader = child.stdout.take()")
+        .find("let _stdout_reader = child.stdout.take()")
         .expect("the reader thread is spawned");
     let marked = body
         .find(".mark_spawned()")

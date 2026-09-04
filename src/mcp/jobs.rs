@@ -397,14 +397,15 @@ pub(crate) fn write_running(spec: &RunningSpec) -> Result<()> {
 /// Rewrite a running job's record with its freshest liveness: the epoch ms of
 /// its last stdout line, and the bounded tail of what it has said.
 ///
-/// Lock-free against [`write_done`] because the two cannot interleave: the
-/// stdout reader thread is this function's only caller, and `run_delegate` joins
-/// that thread on every exit path before it builds any envelope, while
-/// `Handoff::finalize` — the sole `write_done` caller for a job — runs only
-/// after `run_delegate` returns.
-/// `run_delegate_never_returns_between_spawning_the_reader_and_joining_it`
-/// is what holds the single-exit half of that up, since a `return` in between
-/// would orphan a thread that then overwrites the finalized record.
+/// Lock-free against [`write_done`] by `Handoff`'s in-flight beat counter:
+/// every caller counts itself in flight under the state lock, in the same hold
+/// that resolved its destination, and `Handoff::finalize` sets `Finished`
+/// under that lock and then waits for the count to drain before any of its own
+/// writes. A beat that resolved its destination after `Finished` writes
+/// nothing; one that resolved before it lands before the finalize's first file
+/// write — so the two cannot interleave, however the reader thread outlives
+/// `run_delegate` (a grandchild holding the child's stdout pipe can park it in
+/// `read` past the finalize).
 ///
 /// A run handed off mid-flight does not widen that: the record it starts
 /// heartbeating into is minted before its first beat resolves one, and the same

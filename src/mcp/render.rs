@@ -1661,7 +1661,14 @@ pub(crate) fn monitor_job_prose(p: &Value) -> String {
     if p.get("job_id").and_then(Value::as_str).is_some()
         && p.get("status").and_then(Value::as_str).is_some()
     {
-        return running_status_prose(p);
+        return match p.get("status").and_then(Value::as_str) {
+            Some("blocking") => blocking_status_prose(p),
+            Some("stopped") => stopped_status_prose(p),
+            // `running` and any status a future arm adds before its prose arm
+            // exists: the running spelling is the safe fallback, and the
+            // explicit arms above are the split this rework added.
+            _ => running_status_prose(p),
+        };
     }
     if let Some(lu) = p.get("live_usage") {
         let target = lu
@@ -1762,6 +1769,43 @@ pub(super) fn kill_verdict(job_id: &str, killed: bool, waited_secs: u64) -> Stri
     }
 }
 
+/// One asked job's verdict for a cancelling `monitor` whose wait watched that
+/// job's blocking-run liveness record rather than a collectable one, with the
+/// seconds the call actually waited, like [`kill_verdict`]. `stopped`: the
+/// record vanished before the wait gave up, so the run has wound down; the
+/// other spelling: the record still stood when the wait ended, so the run is
+/// still stopping.
+pub(super) fn blocking_verdict(job_id: &str, stopped: bool, waited_secs: u64) -> String {
+    if stopped {
+        format!("stopped `{job_id}` after {waited_secs}s")
+    } else {
+        format!("`{job_id}` still stopping after {waited_secs}s")
+    }
+}
+
+/// The line a cancelling wait ticks while a blocking run's liveness record is
+/// all it can see: the id alone. An id-keyed read of liveness CONTENT stays
+/// forbidden by `RecordKind`'s contract, so the tick names the id and reads
+/// nothing of the record.
+pub(super) fn blocking_wait_prose(job_id: &str) -> String {
+    format!("waiting for blocking `delegate` `{job_id}` to stop")
+}
+
+/// The reply row for a blocking run whose liveness record still stood when the
+/// cancelling wait gave up: the run is stopping and nothing is collectable.
+pub(super) fn blocking_status_prose(p: &Value) -> String {
+    let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
+    format!("job `{job_id}` blocking: its run is still stopping; check again")
+}
+
+/// The reply row for a blocking run whose liveness record vanished mid-wait
+/// with no collectable record ever appearing: the run has ended, and its
+/// result went back through the call that started it.
+pub(super) fn stopped_status_prose(p: &Value) -> String {
+    let job_id = p.get("job_id").and_then(Value::as_str).unwrap_or("unknown");
+    format!("job `{job_id}` stopped: its blocking run has ended and left nothing here to collect")
+}
+
 /// Prose for a `monitor` several-ids reply: one BLOCK per requested id, naming
 /// its id and state, then the batch's own digest clause when it carries one,
 /// then ONE unknown-count clause on the tail when the payload carries a
@@ -1801,6 +1845,8 @@ pub(crate) fn monitor_batch_prose(p: &Value) -> String {
             match r.get("status").and_then(Value::as_str) {
                 Some("done") => format!("job `{job_id}` {}", envelope_prose(r)),
                 Some("running") => running_status_prose(r),
+                Some("blocking") => blocking_status_prose(r),
+                Some("stopped") => stopped_status_prose(r),
                 _ => format!("job `{job_id}` unknown"),
             }
         })

@@ -2183,7 +2183,10 @@ const CANCEL_GRACE_SECS: u64 = 10;
 /// A LEAF with no `lockorder` rank, matching the job store's own posture: NEVER
 /// acquire another lock while holding this one. Every caller takes it, does one
 /// map operation, and drops it, so there is no ordering for the rank table to
-/// police.
+/// police. The one nest in the crate is [`Handoff::mark_spawned`], which takes
+/// the run's state lock FIRST and registers under it — the registry itself is
+/// always acquired last and never held across anything, so the leaf contract
+/// survives the nest.
 static CANCEL_REGISTRY: std::sync::LazyLock<
     std::sync::Mutex<HashMap<String, std::sync::Arc<AtomicBool>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
@@ -2202,10 +2205,14 @@ impl CancelGuard {
     /// Register the flag the RUN reads, rather than minting one here.
     ///
     /// The caller holds it first because a run that is already in flight is
-    /// already reading its own — a blocking delegate handed off by
-    /// [`Handoff::hand_off`] is the case — and a fresh `Arc` here would leave
-    /// its id cancellable in name only: `cancel_job` would set a flag nothing
-    /// reads.
+    /// already reading its own — [`Handoff::mark_spawned`] registering the flag
+    /// its supervision loop reads is the blocking case — and a fresh `Arc` here
+    /// would leave its id cancellable in name only: `cancel_job` would set a
+    /// flag nothing reads. A second entry for one id is the other hazard this
+    /// shape must avoid: two guards sharing one flag `Arc` would each remove
+    /// the other's entry on drop, leaving the run uncancellable — so the guard
+    /// is minted exactly once per run and MOVED at the crossing, never
+    /// re-registered.
     fn register(job_id: &str, flag: std::sync::Arc<AtomicBool>) -> Self {
         CANCEL_REGISTRY
             .lock()
@@ -2281,6 +2288,11 @@ struct CancelWatch {
     /// the death is real but its dating cannot place it at or after the ask,
     /// so it renders no verdict. An id absent from the map never died here.
     deaths: HashMap<String, Option<Instant>>,
+    /// One entry per asked id whose wait watched its blocking-run liveness
+    /// record: `true` when the record vanished before the wait gave up (the
+    /// finalize landed, so nothing is left to stop), `false` when it still
+    /// stood at the end (the run is still winding down).
+    blocking: HashMap<String, bool>,
 }
 
 impl CancelWatch {
@@ -2302,6 +2314,7 @@ impl CancelWatch {
             asked,
             unheld,
             deaths: HashMap::new(),
+            blocking: HashMap::new(),
         }
     }
 
@@ -2325,6 +2338,13 @@ impl CancelWatch {
                 .and_then(|age| Instant::now().checked_sub(Duration::from_millis(age)))
         });
         self.deaths.entry(job_id.to_string()).or_insert(died_at);
+    }
+
+    /// The wait loops' other half: this id's blocking-run liveness record is
+    /// what the wait watched, and whether it had vanished by the time the wait
+    /// gave up. First observation wins, like [`Self::saw_done`].
+    fn saw_blocking(&mut self, job_id: &str, stopped: bool) {
+        self.blocking.entry(job_id.to_string()).or_insert(stopped);
     }
 
     /// The line a cancelling `monitor` opens with: the ask, then one verdict
@@ -2358,11 +2378,22 @@ impl CancelWatch {
                     // A death dated before the ask, or one the dating cannot
                     // place: the struct doc's no-verdict rule.
                     Some(_) => None,
-                    None => Some(render::kill_verdict(
-                        id,
-                        false,
-                        gave_up_at.duration_since(self.asked_at).as_secs(),
-                    )),
+                    None => Some(match self.blocking.get(id) {
+                        // A blocking run's record was what the wait watched,
+                        // so its verdict says what that record did — the
+                        // cancel DID reach this run, and "failed to kill"
+                        // would claim the opposite.
+                        Some(stopped) => render::blocking_verdict(
+                            id,
+                            *stopped,
+                            gave_up_at.duration_since(self.asked_at).as_secs(),
+                        ),
+                        None => render::kill_verdict(
+                            id,
+                            false,
+                            gave_up_at.duration_since(self.asked_at).as_secs(),
+                        ),
+                    }),
                 })
                 .collect::<Vec<_>>();
             if !verdicts.is_empty() {
@@ -2590,6 +2621,20 @@ async fn monitor_one(
                 Ok(CallToolResult::success(blocks))
             }
         }
+        // Both reachable only in cancel mode: the run is stopping, and whether
+        // its liveness record still stood when the wait gave up is the whole
+        // of what can be reported. A success, not an error — the cancel
+        // reached its run, and the note above the reply carries the verdict.
+        outcome @ (WaitOutcome::Blocking | WaitOutcome::BlockingStopped) => {
+            let status = if matches!(outcome, WaitOutcome::Blocking) {
+                "blocking"
+            } else {
+                "stopped"
+            };
+            let payload = serde_json::json!({ "job_id": job_id, "status": status });
+            let prose = render::monitor_job_prose(&payload);
+            Ok(CallToolResult::success(single_block(prose)))
+        }
     }
 }
 
@@ -2646,6 +2691,14 @@ async fn monitor_batch(
                     orphan_reasons.push(reason);
                 }
                 serde_json::json!({ "job_id": id, "status": "unknown" })
+            }
+            // Cancel mode only: the row says what the wait saw of the
+            // blocking run's record. Outside the unknown count — `Unknown` is
+            // a verdict about a MISSING file, and these rows know exactly
+            // which file was there.
+            WaitOutcome::Blocking => serde_json::json!({ "job_id": id, "status": "blocking" }),
+            WaitOutcome::BlockingStopped => {
+                serde_json::json!({ "job_id": id, "status": "stopped" })
             }
             WaitOutcome::Running(record) => running_payload(&id, &record, now_ms()),
             WaitOutcome::Done(record) => {
@@ -2758,6 +2811,7 @@ fn render_done_envelope(
 }
 
 /// Result of polling a background job file.
+#[derive(Debug)]
 enum WaitOutcome {
     Done(jobs::JobRecord),
     /// Present but not yet finished (the wait deadline elapsed first). Carries the
@@ -2767,6 +2821,15 @@ enum WaitOutcome {
     /// other waiter (the hook or the sibling collect) — the hedged unknown
     /// copy answers all three.
     Unknown,
+    /// A cancelling wait gave up with the id's blocking-run liveness record
+    /// still standing: the run is stopping, and nothing collectable exists to
+    /// report.
+    Blocking,
+    /// A cancelling wait watched the blocking run's liveness record vanish —
+    /// its finalize landed — and never saw a collectable record appear: the
+    /// run ended with its caller attached, so its result went back through the
+    /// join and nothing here is collectable.
+    BlockingStopped,
 }
 
 /// The running-check payload both `monitor` arms render, so the one-id and
@@ -2960,6 +3023,18 @@ fn unknown_job_reason(job_id: &str, now: u64) -> String {
 /// client abandons the call, ticking progress each slice off the freshest
 /// running record. `Unknown` when the file is absent (distinct from `Running`
 /// for a present-but-incomplete job).
+///
+/// A cancelling wait (the `watch` is `Some`) treats a blocking run's liveness
+/// record as in progress rather than absent: the id names a run this server
+/// holds and is stopping, so the wait holds while the record stands — ticking
+/// a plain line that names the id and reads no record content — and resolves
+/// [`WaitOutcome::Blocking`] when it gives up with the record still standing,
+/// [`WaitOutcome::BlockingStopped`] when the record vanished with no
+/// collectable one ever seen. A hand-off mid-wait makes the collectable
+/// appear, and the wait then takes the ordinary paths; the sweep's tombstone
+/// conversion does the same, resolving as the `Done(crashed)` it wrote. A
+/// non-cancelling wait is unchanged: a liveness record reads as an absent
+/// file, and the owner-ruled copy answers it.
 async fn wait_for_done(
     job_id: &str,
     deadline_secs: u64,
@@ -2968,6 +3043,8 @@ async fn wait_for_done(
 ) -> WaitOutcome {
     let start = Instant::now();
     let deadline = Duration::from_secs(deadline_secs);
+    let watch_liveness = watch.is_some();
+    let mut saw_liveness = false;
     let mut cancelled = false;
     loop {
         match jobs::read(job_id) {
@@ -2992,7 +3069,25 @@ async fn wait_for_done(
                     .tick(|| render::running_status_prose(&running_payload(job_id, &r, now_ms())))
                     .await;
             }
-            None => return WaitOutcome::Unknown,
+            None => {
+                if watch_liveness && jobs::liveness_exists(job_id) {
+                    saw_liveness = true;
+                    if cancelled || start.elapsed() >= deadline {
+                        if let Some(w) = watch.as_deref_mut() {
+                            w.saw_blocking(job_id, false);
+                        }
+                        return WaitOutcome::Blocking;
+                    }
+                    progress.tick(|| render::blocking_wait_prose(job_id)).await;
+                } else if watch_liveness && saw_liveness {
+                    if let Some(w) = watch.as_deref_mut() {
+                        w.saw_blocking(job_id, true);
+                    }
+                    return WaitOutcome::BlockingStopped;
+                } else {
+                    return WaitOutcome::Unknown;
+                }
+            }
         }
         cancelled = progress.sleep_or_cancelled(JOB_POLL_INTERVAL).await;
     }
@@ -3003,11 +3098,17 @@ async fn wait_for_done(
 /// never appears for a caller-supplied id), and a running file holds. One
 /// outcome per id, in the order given.
 ///
+/// A cancelling wait (the `watch` is `Some`) treats an absent collectable
+/// whose blocking-run liveness record stands as in progress, exactly like
+/// [`wait_for_done`] does for one id, and resolves it `Blocking` at the wait's
+/// end or `BlockingStopped` once the record vanishes.
+///
 /// `ReturnOn::Any` ends the wait on the first job to finish, so the reply is not
 /// paced by the slowest lane. That break leaves slots unresolved, and the
 /// deadline can cross mid-pass under either mode, so a final pass resolves every
 /// remaining slot by its own state. The invariant it protects: `Unknown` belongs
-/// to a MISSING file only — a running id must never fall out as one.
+/// to a MISSING file only — a running id, and a blocking one whose record this
+/// wait saw, must never fall out as one.
 async fn wait_for_batch(
     job_ids: &[String],
     deadline_secs: u64,
@@ -3017,6 +3118,7 @@ async fn wait_for_batch(
 ) -> Vec<(String, WaitOutcome)> {
     let start = Instant::now();
     let deadline = Duration::from_secs(deadline_secs);
+    let watch_liveness = watch.is_some();
     // `None` = unresolved. An unsafe id can never name a job file
     // (`new_job_id` mints only safe ids), so it resolves to `Unknown` upfront
     // and never reaches the path join.
@@ -3024,12 +3126,18 @@ async fn wait_for_batch(
         .iter()
         .map(|id| (!jobs::is_safe_job_id(id)).then_some(WaitOutcome::Unknown))
         .collect();
+    // Per-slot, the same fact `wait_for_done` keeps for its one id: whether
+    // THIS wait has seen the id's blocking-run liveness record stand, which is
+    // what turns an absent collectable into `BlockingStopped` rather than
+    // `Unknown` once the record vanishes.
+    let mut saw_liveness = vec![false; job_ids.len()];
     let mut any_done = false;
     let mut cancelled = false;
     loop {
         let mut unresolved = false;
         let mut newest: Option<jobs::JobRecord> = None;
-        for (id, slot) in job_ids.iter().zip(&mut outcomes) {
+        let mut blocking_tick: Option<&str> = None;
+        for ((id, slot), saw) in job_ids.iter().zip(&mut outcomes).zip(&mut saw_liveness) {
             if slot.is_some() {
                 continue;
             }
@@ -3054,7 +3162,27 @@ async fn wait_for_batch(
                     unresolved = true;
                     newest = Some(r);
                 }
-                None => *slot = Some(WaitOutcome::Unknown),
+                None => {
+                    if watch_liveness && jobs::liveness_exists(id) {
+                        *saw = true;
+                        if cancelled || start.elapsed() >= deadline {
+                            if let Some(w) = watch.as_deref_mut() {
+                                w.saw_blocking(id, false);
+                            }
+                            *slot = Some(WaitOutcome::Blocking);
+                        } else {
+                            unresolved = true;
+                            blocking_tick = Some(id);
+                        }
+                    } else if watch_liveness && *saw {
+                        if let Some(w) = watch.as_deref_mut() {
+                            w.saw_blocking(id, true);
+                        }
+                        *slot = Some(WaitOutcome::BlockingStopped);
+                    } else {
+                        *slot = Some(WaitOutcome::Unknown);
+                    }
+                }
             }
         }
         if !unresolved || (return_on == ReturnOn::Any && any_done) {
@@ -3066,13 +3194,16 @@ async fn wait_for_batch(
                     render::running_status_prose(&running_payload(&record.job_id, record, now_ms()))
                 })
                 .await;
+        } else if let Some(id) = blocking_tick {
+            progress.tick(|| render::blocking_wait_prose(id)).await;
         }
         cancelled = progress.sleep_or_cancelled(JOB_POLL_INTERVAL).await;
     }
     job_ids
         .iter()
         .zip(outcomes)
-        .map(|(id, slot)| {
+        .zip(saw_liveness)
+        .map(|((id, slot), saw)| {
             let outcome = slot.unwrap_or_else(|| match jobs::read(id) {
                 Some(r) if r.state == jobs::JobState::Done => {
                     if let Some(w) = watch.as_deref_mut() {
@@ -3084,7 +3215,21 @@ async fn wait_for_batch(
                     }
                 }
                 Some(r) => WaitOutcome::Running(r),
-                None => WaitOutcome::Unknown,
+                None => {
+                    if watch_liveness && jobs::liveness_exists(id) {
+                        if let Some(w) = watch.as_deref_mut() {
+                            w.saw_blocking(id, false);
+                        }
+                        WaitOutcome::Blocking
+                    } else if watch_liveness && saw {
+                        if let Some(w) = watch.as_deref_mut() {
+                            w.saw_blocking(id, true);
+                        }
+                        WaitOutcome::BlockingStopped
+                    } else {
+                        WaitOutcome::Unknown
+                    }
+                }
             });
             (id.clone(), outcome)
         })
@@ -3328,8 +3473,8 @@ struct BackgroundOpts {
 }
 
 /// Why the supervision loop stopped waiting on the child, when it was not the
-/// child exiting. Both arms leave the loop rather than returning, so the stdout
-/// reader thread is joined on every path out of `run_delegate`.
+/// child exiting. Both arms leave the loop rather than returning, so the
+/// capture take below the loop runs on every path out of `run_delegate`.
 enum WaitEnd {
     /// A deadline fired; the child was killed and hands back what it wrote.
     Expired(Expiry),
@@ -3569,29 +3714,28 @@ fn tail_line(capture: &StreamCapture) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// A run's "write this now" callback. It is handed the capture and nothing else:
-/// the run-relative clock `read_stdout` keeps is anchored at the child's spawn
-/// while the job file's `started_at` is anchored at the run's own start, and
-/// passing one where the other is meant is the skew this signature removes.
+/// A run's "write this now" callback, handed an OWNED snapshot (tail + session
+/// id) rather than the capture itself. The snapshot is extracted under the
+/// capture lock and the lock released before the call, so no sink can nest the
+/// capture lock inside whatever lock it takes — the production sink takes
+/// `Handoff`'s state lock, and a capture-lock -> state-lock nest is the
+/// deadlock shape this ownership split exists to refuse.
 ///
 /// The sink resolves its target record per call rather than closing over one,
 /// because a blocking run acquires a record mid-read when its caller abandons
-/// the call (`Handoff::spec`). A beat that finds none writes nothing.
-type HeartbeatSink<'a> = &'a mut dyn FnMut(&StreamCapture);
+/// the call (`Handoff::heartbeat`). A beat that finds none writes nothing.
+type HeartbeatSink<'a> = &'a mut dyn FnMut(String, Option<String>);
 
 /// Read the child's stdout to EOF, stamping `progress` with the elapsed
 /// milliseconds at every line so the wait loop can tell a working delegate from
-/// a stalled one. Non-streaming mode drains the pipe whole (there is nothing to
-/// stamp until the child exits, and so nothing to heartbeat either).
+/// a stalled one, and pushing every line into the shared `capture` under its
+/// lock. Non-streaming mode drains the pipe whole (there is nothing to stamp
+/// until the child exits, and so nothing to heartbeat either) and stores the
+/// drain in the same slot.
 ///
 /// `heartbeat` is the run's "write this now" callback, called at most once per
 /// [`HEARTBEAT_INTERVAL`]. The throttle lives HERE rather than in the sink so it
-/// is testable in one place and every sink stays pure. The sink is a closure on
-/// this thread rather than a read from the supervision loop because the tail
-/// text lives inside `StreamCapture`, which this thread owns exclusively:
-/// handing it over would mean a `Mutex<String>` written once per token delta on
-/// the hottest path in the run, which is a lock the MCP layer is not allowed to
-/// add and buys nothing.
+/// is testable in one place and every sink stays pure.
 ///
 /// EVERY server-produced run passes a sink, blocking ones included — a blocking
 /// run can acquire a job record mid-read, and one that never does simply has
@@ -3605,14 +3749,16 @@ fn read_stdout<R: std::io::Read>(
     streaming: bool,
     start: Instant,
     progress: &AtomicU64,
+    capture: &std::sync::Arc<std::sync::Mutex<StreamCapture>>,
     mut heartbeat: Option<HeartbeatSink<'_>>,
-) -> StreamCapture {
+) {
     let mut reader = reader;
     if !streaming {
-        return StreamCapture::from_raw(&drain_pipe(&mut reader));
+        let bytes = drain_pipe(&mut reader);
+        *capture.lock().unwrap_or_else(|e| e.into_inner()) = StreamCapture::from_raw(&bytes);
+        return;
     }
     let mut buffered = std::io::BufReader::new(reader);
-    let mut capture = StreamCapture::default();
     let mut raw = Vec::new();
     let mut last_beat: Option<Instant> = None;
     loop {
@@ -3625,16 +3771,27 @@ fn read_stdout<R: std::io::Read>(
         }
         let stamp = elapsed_ms(start);
         progress.store(stamp, Ordering::Relaxed);
-        capture.push_line(String::from_utf8_lossy(&raw).trim());
-        if let Some(sink) = heartbeat.as_mut() {
+        let mut beat_now = false;
+        if heartbeat.is_some() {
             let now = Instant::now();
             if last_beat.is_none_or(|t| now.duration_since(t) >= HEARTBEAT_INTERVAL) {
                 last_beat = Some(now);
-                sink(&capture);
+                beat_now = true;
             }
         }
+        let (tail, session) = {
+            let mut capture = capture.lock().unwrap_or_else(|e| e.into_inner());
+            capture.push_line(String::from_utf8_lossy(&raw).trim());
+            if beat_now {
+                (tail_line(&capture), capture.session_id.clone())
+            } else {
+                (String::new(), None)
+            }
+        };
+        if beat_now && let Some(sink) = heartbeat.as_mut() {
+            sink(tail, session);
+        }
     }
-    capture
 }
 
 /// Milliseconds since `start`, saturating (the `u128` only exceeds a `u64` after
@@ -3993,15 +4150,19 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         handoff.mark_spawned();
     }
 
-    // Drain both pipes on their own threads from the moment of spawn. A bare
-    // try_wait loop never reads, so a >~64KiB result blocks the child on a full
-    // pipe and it never exits — a false timeout that drops a valid result. Killing
-    // the child closes the write ends, the readers hit EOF, and the joins return.
+    // Drain both pipes on their own threads from the moment of spawn, into
+    // shared slots taken below once the child exits. A bare try_wait loop never
+    // reads, so a >~64KiB result blocks the child on a full pipe and it never
+    // exits — a false timeout that drops a valid result. Killing the child
+    // closes the write ends; the readers hit EOF and exit on their own.
     let start = Instant::now();
     let progress = std::sync::Arc::new(AtomicU64::new(0));
+    let capture_slot = std::sync::Arc::new(std::sync::Mutex::new(StreamCapture::default()));
+    let stderr_slot = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let beat_handoff = handoff.clone();
-    let stdout_reader = child.stdout.take().map(|h| {
+    let _stdout_reader = child.stdout.take().map(|h| {
         let progress = std::sync::Arc::clone(&progress);
+        let capture = std::sync::Arc::clone(&capture_slot);
         std::thread::spawn(move || match beat_handoff {
             // A run that owns a job file rewrites it as it reads, so a `monitor`
             // check sees liveness that would otherwise die with this task.
@@ -4015,40 +4176,32 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
             // `--output-format` run, which never beats at all — is its
             // `recorded_at` mint stamp, not this closure.
             Some(handoff) => {
-                let mut beat = |capture: &StreamCapture| {
-                    if let Some(spec) = handoff.spec() {
-                        // The session id arrives HERE, mid-run, and rides the
-                        // capture from its first event on: the record this
-                        // thread rewrites is the only place a crashed run's
-                        // resume handle survives, so every beat carries it.
-                        let _ = jobs::write_heartbeat_with_session(
-                            &spec,
-                            now_ms(),
-                            &tail_line(capture),
-                            capture.session_id.as_deref(),
-                        );
-                    }
+                let mut beat = |tail: String, session: Option<String>| {
+                    handoff.heartbeat(now_ms(), &tail, session.as_deref());
                 };
-                read_stdout(h, streaming, start, &progress, Some(&mut beat))
+                read_stdout(h, streaming, start, &progress, &capture, Some(&mut beat))
             }
-            None => read_stdout(h, streaming, start, &progress, None),
+            None => read_stdout(h, streaming, start, &progress, &capture, None),
         })
     });
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|mut h| std::thread::spawn(move || drain_pipe(&mut h)));
+    let _stderr_reader = child.stderr.take().map(|mut h| {
+        let stderr_slot = std::sync::Arc::clone(&stderr_slot);
+        std::thread::spawn(move || {
+            let bytes = drain_pipe(&mut h);
+            *stderr_slot.lock().unwrap_or_else(|e| e.into_inner()) = bytes;
+        })
+    });
 
     let (wall, idle) = resolve_deadlines(opts.timeout_secs, opts.idle_secs, streaming);
 
-    // Nothing between the spawn above and the join below may return: the reader
-    // thread would outlive this call, the child would keep writing into it
-    // (`Child::drop` does not kill), and its heartbeats would overwrite the
-    // `write_done` the caller makes next — leaving a finished job polling
-    // `running` until GC and an `mcp-await-job` blocked on a terminal state that
-    // never arrives. So a supervision failure kills and falls through to the
-    // same join every other path takes, carrying its reason.
-    // `run_delegate_never_returns_between_spawning_the_reader_and_joining_it`
+    // Nothing between the spawn above and the capture take below may return:
+    // the child is already outliving this function's future (`Child::drop`
+    // does not kill), the reader threads are detached on purpose (see the
+    // parked-thread note at the take), and a return before the take would
+    // drop the shared slots while the readers are still writing into them —
+    // losing everything the run produced. So a supervision failure kills and
+    // falls through to the same take every other path takes, carrying its
+    // reason. `run_delegate_never_returns_between_spawning_the_reader_and_taking_the_capture`
     // is the guard; this comment only says why it is there.
     let outcome = loop {
         match child.try_wait() {
@@ -4081,13 +4234,24 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         }
     };
 
-    // Joined before the timeout branch returns: the kill above closed the write
-    // ends, so the readers are at EOF and the capture holds everything the run
-    // produced before it died.
-    let capture = stdout_reader
-        .and_then(|h| h.join().ok())
+    // Taken once the child has exited, never joined: a grandchild that
+    // inherited claude's stdout pipe keeps a reader parked in `read` long
+    // after the child is gone, and a join here would wedge the run — and its
+    // liveness record — on the grandchild. What the take costs is any bytes
+    // the readers had not consumed yet; the readers are usually at the pipe's
+    // tail when the child exits, and a grandchild's post-exit writes are not
+    // the delegate's result anyway. The parked threads are bounded so: each
+    // writes nothing after `finalize` (its beats resolve `Finished` and write
+    // nothing, and its capture pushes land in slots nobody reads), holds no
+    // lock while writing, and drops its `Arc`s when it exits.
+    let capture = capture_slot
+        .lock()
+        .map(|mut c| std::mem::take(&mut *c))
         .unwrap_or_default();
-    let stderr_bytes = join_reader(stderr_reader);
+    let stderr_bytes = stderr_slot
+        .lock()
+        .map(|mut b| std::mem::take(&mut *b))
+        .unwrap_or_default();
 
     // Mirrors `start::run`'s own teardown legs, in the same window: the child
     // has exited and the guard is still alive, so the tree is there to read.
@@ -4628,15 +4792,26 @@ fn reserve_job(
 /// abandoning a blocking call left a child spending a window whose result was
 /// dropped with the handler's future, bounded only by the idle guard.
 struct Handoff {
-    /// The flag `run_delegate` reads each tick — held here from the start, and
-    /// REGISTERED (under the id minted at the crossing) only there. A blocking
-    /// run has no id to name until then, so nothing can reach it, and it ends up
-    /// with exactly one registry entry either way.
+    /// The flag `run_delegate` reads each tick — held here from the start. A
+    /// background run's registry entry is minted at the reserve, under the
+    /// collectable id created there; a blocking run's is minted by
+    /// [`Self::mark_spawned`] under its liveness id, and moves with the record
+    /// at the crossing ([`Self::hand_off`] takes it). Exactly one entry lives
+    /// from spawn to finalize either way, so `cancel_job` always reaches the
+    /// flag this run reads.
     cancel: std::sync::Arc<AtomicBool>,
     /// A LEAF, matching [`CANCEL_REGISTRY`]'s posture: never acquire another
     /// lock while holding it, which is why [`Handoff::hand_off`] mints outside
-    /// it and why [`Handoff::finalize`] writes outside it.
+    /// it and why [`Handoff::finalize`] writes outside it. The one nest is
+    /// [`Self::mark_spawned`], which registers under this lock — see
+    /// [`CANCEL_REGISTRY`]'s doc for why that keeps the leaf contract.
     state: std::sync::Mutex<HandoffState>,
+    /// Heartbeats that resolved a destination but have not finished writing
+    /// it. Incremented under `state` in the same hold that resolves the
+    /// destination, decremented after the write; [`Self::finalize`] waits for
+    /// it to drain before any of its own file IO, so no beat write can land
+    /// after the finalize's.
+    in_flight: std::sync::atomic::AtomicUsize,
 }
 
 /// Which side of a [`Handoff`] a run is on.
@@ -4664,6 +4839,13 @@ struct AttachedRun {
     /// spawn either sees no record and cancels — killing a child ~50 ms in, the
     /// same loss the pre-spawn arm already reports — or sees one and crosses.
     live: Option<jobs::RunningSpec>,
+    /// The registry entry for `live`'s id, installed under the SAME lock hold
+    /// that installs the record, so the two facts cannot disagree: a record a
+    /// `monitor` call can see is a record whose id `cancel_job` holds. `None`
+    /// until the spawn; taken by [`Handoff::hand_off`] at the crossing (the
+    /// reservation then owns it); dropped by [`Handoff::finalize`] after the
+    /// liveness record is gone.
+    cancel_guard: Option<CancelGuard>,
 }
 
 /// What became of a run whose caller went away.
@@ -4679,11 +4861,18 @@ enum Abandoned {
 
 impl Handoff {
     /// A blocking run's seam: nothing minted, nothing registered, a caller
-    /// holding the join.
+    /// holding the join. Both are installed at the spawn, under one lock hold,
+    /// by [`Self::mark_spawned`] — before a child exists there is nothing
+    /// observable to stop yet, so a pre-spawn id stays unheld.
     fn blocking(mint: MintSpec) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             cancel: std::sync::Arc::new(AtomicBool::new(false)),
-            state: std::sync::Mutex::new(HandoffState::Attached(AttachedRun { mint, live: None })),
+            state: std::sync::Mutex::new(HandoffState::Attached(AttachedRun {
+                mint,
+                live: None,
+                cancel_guard: None,
+            })),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -4693,6 +4882,7 @@ impl Handoff {
         std::sync::Arc::new(Self {
             cancel: std::sync::Arc::clone(&job.cancel.flag),
             state: std::sync::Mutex::new(HandoffState::Converted(job)),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -4709,6 +4899,13 @@ impl Handoff {
     /// `ProfileRuntime::acquire`, has spent nothing and must leave no file
     /// behind to say otherwise.
     ///
+    /// The cancel entry is installed under the SAME lock hold as the record,
+    /// so the id becomes stoppable in the same instant the record makes it
+    /// observable: a `monitor({cancel: true})` naming the id that record shows
+    /// can never find it unheld. That hold is the one place `CANCEL_REGISTRY`
+    /// nests inside `state` — the registry is acquired last and holds nothing —
+    /// and it must stay the only one.
+    ///
     /// A background run reaches here already `Converted`, its record minted at
     /// the reserve, and mints nothing.
     fn mark_spawned(&self) {
@@ -4717,6 +4914,10 @@ impl Handoff {
             match &mut *state {
                 HandoffState::Attached(run) if run.live.is_none() => {
                     let spec = mint_spec(&run.mint, jobs::RecordKind::Liveness);
+                    run.cancel_guard = Some(CancelGuard::register(
+                        &spec.job_id,
+                        std::sync::Arc::clone(&self.cancel),
+                    ));
                     run.live = Some(spec.clone());
                     Some(spec)
                 }
@@ -4738,9 +4939,13 @@ impl Handoff {
         self.cancel.load(Ordering::Relaxed)
     }
 
-    /// The record this run heartbeats into, `None` while it has none. An
-    /// attached run answers with its liveness record from the spawn on, which is
-    /// what puts a blocking delegate's heartbeat on disk at all.
+    /// The record this run heartbeats into, `None` while it has none — the
+    /// same resolution [`Self::heartbeat`] runs per beat, kept as the
+    /// test-visible accessor (the tests are its only callers, so it never
+    /// compiles into the binary). An attached run answers with its liveness
+    /// record from the spawn on, which is what puts a blocking delegate's
+    /// heartbeat on disk at all.
+    #[cfg(test)]
     fn spec(&self) -> Option<jobs::RunningSpec> {
         match &*self.lock() {
             HandoffState::Converted(job) => Some(job.spec.clone()),
@@ -4751,11 +4956,19 @@ impl Handoff {
 
     /// The caller went away. Hand the run off to a job file if it has already
     /// started spending, and stop it if it has not.
+    ///
+    /// The registry entry is TAKEN out of the attached state here, never
+    /// re-registered: a second register for the id would mint two guards
+    /// sharing one flag `Arc`, and each guard's drop removes the other's
+    /// entry — the handed-off run would silently become uncancellable.
     fn hand_off(&self) -> Abandoned {
-        let live = match &*self.lock() {
-            HandoffState::Attached(run) => run.live.clone(),
-            // Already across (a background run), or over.
-            HandoffState::Converted(_) | HandoffState::Finished => return Abandoned::Kept,
+        let (live, guard) = {
+            let mut state = self.lock();
+            match &mut *state {
+                HandoffState::Attached(run) => (run.live.clone(), run.cancel_guard.take()),
+                // Already across (a background run), or over.
+                HandoffState::Converted(_) | HandoffState::Finished => return Abandoned::Kept,
+            }
         };
         // The same boundary `run_delegate` reads right after
         // `ProfileRuntime::acquire` returns, from the other side: with no child
@@ -4770,15 +4983,35 @@ impl Handoff {
             kind: jobs::RecordKind::Collectable,
             ..live
         };
-        // Registered OUTSIDE the state lock, because `CancelGuard::register`
-        // takes CANCEL_REGISTRY's: both stay TRUE leaves only while neither is
-        // ever held across the other. What that costs is the window `install`
-        // exists to close.
-        let cancel = CancelGuard::register(&spec.job_id, std::sync::Arc::clone(&self.cancel));
+        // `mark_spawned` installs the guard under the same lock hold that
+        // installs the record, so a record that exists always carries its
+        // guard and the fallback is unreachable. It registers rather than
+        // panicking because the run must not cross uncancellable; it is safe
+        // to build here because the unreachable case has no other guard — the
+        // hazard a register opens is exactly two guards for one id, which this
+        // branch by construction does not create.
+        let cancel = guard.unwrap_or_else(|| {
+            debug_assert!(
+                false,
+                "mark_spawned installs the guard with the live record"
+            );
+            CancelGuard::register(&spec.job_id, std::sync::Arc::clone(&self.cancel))
+        });
         match jobs::promote(&spec) {
             Ok(()) => self.install(ReservedJob { spec, cancel }),
             Err(reason) => {
                 logline!("clauth: delegate hand-off failed, its result is lost: {reason}");
+                // The run stays attached and its liveness record stands, so it
+                // gets its entry back: without it a cancel-mode `monitor` would
+                // hold the grace on a record whose id nothing holds, answering
+                // "still stopping" beside the unheld hedge — two clauses that
+                // contradict each other about a run the cancel never reached.
+                // A finalize racing this finds no `Attached` state left, and
+                // the guard drops with the arm, outside the state lock.
+                let mut state = self.lock();
+                if let HandoffState::Attached(run) = &mut *state {
+                    run.cancel_guard = Some(cancel);
+                }
                 Abandoned::Kept
             }
         }
@@ -4817,33 +5050,83 @@ impl Handoff {
         }
     }
 
+    /// Write one heartbeat for the record this run owns, or nothing when it has
+    /// none (before the spawn, or the run is over).
+    ///
+    /// The destination is resolved under the state lock and the beat is counted
+    /// in-flight under the SAME hold; the write itself runs with no lock held
+    /// (the store resolves `$HOME`, which in test builds takes `HOME_OVERRIDE` —
+    /// a write under a held state lock would deadlock against a sandbox-holding
+    /// test thread; this is why the counter design, not lock-across-write).
+    /// [`Self::finalize`] sets `Finished` under that lock and then waits for the
+    /// count to drain before any of its own IO, so a beat that resolved its
+    /// destination after `Finished` writes nothing, and one that resolved
+    /// before it lands before the finalize's first file write. The one reader
+    /// thread beats synchronously, so at most one beat is ever in flight —
+    /// which is what bounds the finalize's wait.
+    fn heartbeat(&self, last_output_at: u64, tail: &str, session_id: Option<&str>) {
+        let spec = {
+            let state = self.lock();
+            let spec = match &*state {
+                HandoffState::Converted(job) => Some(job.spec.clone()),
+                HandoffState::Attached(run) => run.live.clone(),
+                HandoffState::Finished => None,
+            };
+            if spec.is_some() {
+                // Counted under the same hold that resolved it, so `finalize`'s
+                // `Finished` write and this count cannot pass each other: either
+                // the beat counted first and `finalize` waits for its write, or
+                // `finalize` won and this beat writes nothing.
+                self.in_flight.fetch_add(1, Ordering::Relaxed);
+            }
+            spec
+        };
+        let Some(spec) = spec else {
+            return;
+        };
+        let _ = jobs::write_heartbeat_with_session(&spec, last_output_at, tail, session_id);
+        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
     /// The run is over: write its envelope into the job file, if it owns one.
     ///
-    /// Nothing can heartbeat past this point on either shape — `run_delegate`
-    /// joins the stdout reader before it returns — so the last heartbeat
-    /// strictly precedes this write.
+    /// `Finished` is set under the state lock before anything else, so every
+    /// beat resolving its destination from here writes nothing; the in-flight
+    /// count is then drained before any of the IO below, so no beat write can
+    /// land after it — recreating the liveness file or overwriting the
+    /// `write_done` a beat would otherwise race.
     fn finalize(&self, envelope: &serde_json::Value) {
         // The old state is bound OUT of the guard's scope before anything drops
         // it, rather than being dropped as a `mem::replace` temporary while the
-        // guard is still alive. That is free today, since no remaining variant
-        // owns a `CancelGuard` — but the day one does, dropping it under this
-        // lock would nest `CANCEL_REGISTRY` inside `state` with no rank to catch
-        // it, which is precisely the two-lock order both leaves exist to avoid.
+        // guard is still alive: the `Attached` arm owns a `CancelGuard` now,
+        // and dropping it under this lock would nest `CANCEL_REGISTRY` inside
+        // `state` with no rank to catch it, which is precisely the two-lock
+        // order both leaves exist to avoid.
         let previous = {
             let mut state = self.lock();
             std::mem::replace(&mut *state, HandoffState::Finished)
         };
+        // Wait out the beats that resolved a destination before `Finished`
+        // landed. Bounded by one small local-file write — the one reader
+        // thread means at most one beat is in flight — and a beat resolving
+        // after `Finished` never counted.
+        while self.in_flight.load(Ordering::Relaxed) != 0 {
+            std::thread::yield_now();
+        }
         let owned = match previous {
             HandoffState::Converted(job) => Some(job),
             // A caller is still holding the join and takes the envelope from
             // there, so this run's liveness record has no result left to offer.
             // Leaving it would advertise a job nothing will ever collect, and
             // writing a `done` record into it would deliver one result twice.
-            // Outside the lock, like every other write here.
-            HandoffState::Attached(run) => {
+            // The record goes first — it is what makes the id visible as a
+            // blocking run at all — then the registry entry, both outside the
+            // lock like every other write here.
+            HandoffState::Attached(mut run) => {
                 if let Some(spec) = run.live {
                     jobs::remove_liveness(&spec.job_id);
                 }
+                drop(run.cancel_guard.take());
                 None
             }
             HandoffState::Finished => {
@@ -4856,15 +5139,18 @@ impl Handoff {
             // Any liveness record still standing under this id is provably an
             // orphan, and clearing it here is what makes the crossing safe at
             // all. The rename in `promote` is atomic, but the WRITER racing it
-            // is not bounded by it: the stdout reader resolves `spec()` and only
-            // then does its IO, so a beat that resolved the liveness spelling
-            // lands after the rename and recreates the file. `mark_spawned` has
-            // the same shape, installing the spec under the lock and writing
-            // outside it. Neither window can be closed by ordering the rename.
-            // What closes both is WHEN this runs: `run_delegate` joins the
-            // reader thread before it returns and this is called after it does,
-            // so no beat exists to lose a second race to. A no-op for a run that
-            // started out background and never had the spelling.
+            // is not bounded by it: the reader resolves its destination and
+            // only then does its IO, so a beat that resolved the liveness
+            // spelling lands after the rename and recreates the file.
+            // `mark_spawned` has the same shape, installing the spec under the
+            // lock and writing outside it. Neither window can be closed by
+            // ordering the rename. What closes both is WHEN this runs:
+            // `Finished` is already set, so no NEW beat can resolve the
+            // liveness spelling, and the drain above has landed every beat
+            // that resolved one before it — the remove below then finds and
+            // deletes the file they wrote, and the `write_done` after it has
+            // no writer left to race. A no-op for a run that started out
+            // background and never had the spelling.
             jobs::remove_liveness(&spec.job_id);
             let _ = jobs::write_done(
                 &spec.job_id,
@@ -4988,10 +5274,11 @@ fn spawn_delegate(
                 "result": "delegate task panicked",
             }),
         };
-        // `run_delegate` has returned, so it has already joined the reader
-        // thread: the last heartbeat strictly precedes this finalize. A run
-        // still attached to a waiting caller writes nothing and hands the
-        // envelope back below instead.
+        // `run_delegate` has returned, so the child has exited; any reader
+        // beat still in flight is landed by `finalize`'s counter drain, and a
+        // beat resolving later writes nothing. A run still attached to a
+        // waiting caller writes nothing and hands the envelope back below
+        // instead.
         handoff.finalize(&envelope);
         // Dropped explicitly so the completion signal below is genuinely this
         // task's last action. A guard bound in the closure drops in reverse
@@ -5204,12 +5491,6 @@ fn drain_pipe<R: std::io::Read>(reader: &mut R) -> Vec<u8> {
     let mut buf = Vec::new();
     let _ = reader.read_to_end(&mut buf);
     buf
-}
-
-/// Join a reader thread, returning its drained bytes (empty on a join panic or
-/// an absent pipe).
-fn join_reader(handle: Option<std::thread::JoinHandle<Vec<u8>>>) -> Vec<u8> {
-    handle.and_then(|h| h.join().ok()).unwrap_or_default()
 }
 
 /// Truncate a string to `max` bytes (on a char boundary) for an error payload,
