@@ -132,18 +132,28 @@ impl HealThrottle {
         Some(claim)
     }
 
-    /// Clear both flags so a test can drive a heal fresh.
+    /// Clear both flags so a test can drive a heal fresh. The statics serialize
+    /// on `HOME_TEST_LOCK`; call under a `HomeSandbox`.
     #[cfg(all(test, unix))]
     pub(crate) fn reset_for_test(&self) {
+        assert!(
+            crate::lockorder::holds::<crate::lockorder::rank::HomeTest>(),
+            "heal throttle statics serialize on `HOME_TEST_LOCK`; call under a `HomeSandbox`"
+        );
         self.in_flight.store(false, Ordering::Release);
         self.last_start_ms.store(0, Ordering::Relaxed);
     }
 
     /// Stamp the floor at now, so every attempt is refused for the next
     /// window. For a test that drives a caller of the heal (the daemon tick)
-    /// and is about something else.
+    /// and is about something else. The statics serialize on `HOME_TEST_LOCK`;
+    /// call under a `HomeSandbox`.
     #[cfg(test)]
     pub(crate) fn arm_for_test(&self) {
+        assert!(
+            crate::lockorder::holds::<crate::lockorder::rank::HomeTest>(),
+            "heal throttle statics serialize on `HOME_TEST_LOCK`; call under a `HomeSandbox`"
+        );
         self.in_flight.store(false, Ordering::Release);
         self.last_start_ms
             .store(crate::usage::now_ms(), Ordering::Relaxed);

@@ -390,8 +390,8 @@ fn heal_detached_skips_when_the_gate_says_healthy() {
     // Without this the throttle any earlier test in the process stamped refuses
     // the heal on its own, and the assertion below goes green over a gate that
     // spawns on every call. Tests share one process under `cargo test`.
-    super::reset_heal_throttle_for_test();
     let home = HomeSandbox::new();
+    super::reset_heal_throttle_for_test();
     let config = home.home().join(".claude-config");
     std::fs::create_dir_all(&config).expect("config dir");
     let _config = ConfigDirSandbox::new(&home, &config);
@@ -435,8 +435,8 @@ fn heal_detached_throttles_to_one_heal_per_window() {
 
     use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox, join_background_tasks};
 
-    super::reset_heal_throttle_for_test();
     let home = HomeSandbox::new();
+    super::reset_heal_throttle_for_test();
     let config = home.home().join(".claude-config");
     std::fs::create_dir_all(&config).expect("config dir");
     let _config = ConfigDirSandbox::new(&home, &config);
@@ -518,6 +518,15 @@ fn heal_detached_throttles_to_one_heal_per_window() {
     super::HEAL_THROTTLE
         .in_flight
         .store(false, Ordering::Release);
+}
+
+/// The reset mutates process-global statics that serialize on
+/// `HOME_TEST_LOCK`, so it must refuse to run with no sandbox held.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+#[should_panic(expected = "call under a `HomeSandbox`")]
+fn reset_heal_throttle_without_a_sandbox_panics() {
+    super::reset_heal_throttle_for_test();
 }
 
 /// The committed root marketplace manifest must stay agentgear-conformant, or a
