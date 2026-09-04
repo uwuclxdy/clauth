@@ -823,3 +823,23 @@ fn the_parity_scan_still_catches_a_bare_apostrophe_beside_the_escape_idiom() {
         "the idiom alone is balanced zsh and must not red"
     );
 }
+
+/// Every shell must offer `--manual` under the `login` subcommand, gated to
+/// login like the other login flags, and the `login` subcommand's own help
+/// names the manual flow so a user can find it from the completion alone.
+#[test]
+fn every_shell_completes_login_manual_flag() {
+    let cases = [
+        (&BASH, "--setup-token --manual"),
+        (&ZSH, "'--manual[log in without a browser"),
+        (&FISH, "__fish_seen_subcommand_from login\" -a --manual"),
+    ];
+    for (script, gated) in cases {
+        assert!(
+            script.contains(gated),
+            "the --manual completion must be gated to `login`, missing {gated:?}",
+        );
+    }
+    assert!(ZSH.contains("'login[log in via browser, manual code, or an API key]'"));
+    assert!(FISH.contains("-a login -d \"Log in via browser, manual code, or an API key\""));
+}

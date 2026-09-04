@@ -73,7 +73,7 @@ _clauth() {
         _describe 'profile' profiles
         _values 'subcommand' \
             'start[launch claude with that profile]' \
-            'login[log in via browser OAuth or an API key]' \
+            'login[log in via browser, manual code, or an API key]' \
             'delete[remove a profile and its credentials]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
@@ -157,7 +157,7 @@ end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
-complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser OAuth or an API key"
+complete -c clauth -f -n __fish_is_first_token -a login -d "Log in via browser, manual code, or an API key"
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
@@ -230,6 +230,10 @@ const ZSH_LOGIN_DESCS: &[(&str, &str)] = &[
         "--setup-token",
         "capture a claude setup-token mint as a long-lived login",
     ),
+    (
+        "--manual",
+        "log in without a browser on this host (paste a code)",
+    ),
     ("--yes", "replace an existing long-lived token unprompted"),
     ("-y", "replace an existing long-lived token unprompted"),
     ("--model", "set the default model before signing in"),
@@ -241,6 +245,10 @@ const FISH_LOGIN_DESCS: &[(&str, &str)] = &[
     (
         "--setup-token",
         "Capture a claude setup-token mint as a long-lived login",
+    ),
+    (
+        "--manual",
+        "Log in without a browser on this host (paste a code)",
     ),
     ("--yes", "Replace an existing long-lived token unprompted"),
     ("-y", "Replace an existing long-lived token unprompted"),

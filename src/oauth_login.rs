@@ -1,16 +1,24 @@
-//! Interactive browser OAuth login for a fresh Claude Code account, shared by
-//! the `clauth login` CLI and the TUI Setup tab (login / re-login rows). Both
+//! Interactive OAuth login for a fresh Claude Code account, shared by the
+//! `clauth login` CLI and the TUI Setup tab (login / re-login rows). Both
 //! observe the flow through [`LoginProgress`] callbacks.
 //!
-//! Reproduces the Claude Code `/login` PKCE + RFC 8252 loopback flow so a new
-//! profile can be populated from a real login instead of a snapshot. Ground truth
-//! is the installed Claude Code binary (v2.1.199): the Pro/Max **subscription**
-//! login authorizes at `claude.com/cai/oauth/authorize` (`CLAUDE_AI_AUTHORIZE_URL`
+//! Two flows mint the same credential. [`login_with`] reproduces the Claude Code
+//! `/login` PKCE + RFC 8252 loopback flow: it opens the browser on this machine
+//! and catches the redirect on `http://localhost:<port>/callback`. The manual
+//! flow ([`begin_manual_login`] then [`PendingManualLogin::complete`]) is Claude
+//! Code's "Browser didn't open?" path: the same authorize request with
+//! [`MANUAL_REDIRECT_URI`] as the redirect, a page that shows the user a
+//! `code#state` string, and a paste back into the terminal. No listener, no
+//! browser on this host, so it is the login for an ssh session.
+//!
+//! Ground truth is the installed Claude Code binary (v2.1.199 for the loopback
+//! flow, v2.1.260 for the manual one): the Pro/Max **subscription** login
+//! authorizes at `claude.com/cai/oauth/authorize` (`CLAUDE_AI_AUTHORIZE_URL`
 //! — the `platform.claude.com` host is the Console/API-billing surface and does
-//! NOT mint claude.ai credentials), sends `code=true` plus the 6-scope set below,
-//! and uses a loopback redirect to `http://localhost:<port>/callback`. The code is
-//! then exchanged at `platform.claude.com/v1/oauth/token` via [`crate::oauth`].
-//! The authorize-host risk knob is documented on [`AUTHORIZE_URL`].
+//! NOT mint claude.ai credentials), sends `code=true` plus the 6-scope set below.
+//! The code is then exchanged at `platform.claude.com/v1/oauth/token` via
+//! [`crate::oauth`] with whichever redirect delivered it. The authorize-host
+//! risk knob is documented on [`AUTHORIZE_URL`].
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -28,6 +36,33 @@ use crate::usage::now_ms;
 /// host is Console/API-billing and does NOT mint claude.ai credentials — if a live
 /// login 4xx's or shows an API-key consent screen, that host is the fallback knob.
 const AUTHORIZE_URL: &str = "https://claude.com/cai/oauth/authorize";
+
+/// Claude Code's manual redirect (`MANUAL_REDIRECT_URL` in v2.1.260). Instead of a
+/// loopback port, the authorize page lands on this platform.claude.com page,
+/// which shows the user a `code#state` string to paste back. Verified in
+/// v2.1.260: every `/login` builds both URLs from one PKCE pair and one `state`,
+/// prints this one under "Browser didn't open? Visit:", and sends it as the
+/// exchange's `redirect_uri` whenever the paste, not the listener, delivered the
+/// code. If a live manual login 4xx's at authorize time, this constant is the
+/// knob: Anthropic moved the platform host once already (console.anthropic.com).
+pub(crate) const MANUAL_REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback";
+
+/// Longest pasted `code#state` accepted, in bytes. A real one is a few hundred;
+/// the cap bounds what a piped stdin or a TUI paste can make the process hold.
+pub(crate) const MANUAL_CODE_MAX: usize = 4096;
+
+/// Which login flow runs. Both mint the same credential; the CLI picks by
+/// `--manual`, the TUI by which Setup row was chosen. The progress modal and
+/// the footer read it so a manual exchange is never told to "complete it in
+/// your browser".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginMethod {
+    /// A browser round-trip on this host, catching the loopback redirect. In
+    /// the TUI this also covers the Alibaba console login.
+    Browser,
+    /// A link to open anywhere, then the pasted code; no browser on this host.
+    Manual,
+}
 
 /// The 6-scope union Claude Code requests for an interactive login (verbatim from
 /// v2.1.199's `ALL_OAUTH_SCOPES`). `org:create_api_key` is Console-only but rides
@@ -585,14 +620,27 @@ pub(crate) fn login_with(
 
     let deadline = Instant::now() + Duration::from_secs(LOGIN_TIMEOUT_SECS);
     let code = wait_for_code(&listener, &state, deadline).map_err(LoginError::Local)?;
+    finish_login(&code, &verifier, &redirect_uri, &state, &progress)
+}
+
+/// The tail both flows share once an authorization code is in hand: exchange
+/// it at the token endpoint, then verify the mint with one `/profile` probe.
+/// `redirect_uri` MUST be the one the authorize request carried (the loopback
+/// URL or [`MANUAL_REDIRECT_URI`]); the token endpoint rejects a mismatch.
+fn finish_login(
+    code: &str,
+    verifier: &str,
+    redirect_uri: &str,
+    state: &str,
+    progress: &impl Fn(LoginProgress<'_>),
+) -> std::result::Result<LoginOutcome, LoginError> {
     progress(LoginProgress::ExchangingCode);
-    let token =
-        crate::oauth::exchange_code(&code, &verifier, &redirect_uri, &state).map_err(|e| {
-            // The BODY stops here; the status rides the typed value so stderr can
-            // name it and the toast cannot.
-            logline!("clauth: login code exchange failed: {}", e.log_detail());
-            LoginError::Exchange(e)
-        })?;
+    let token = crate::oauth::exchange_code(code, verifier, redirect_uri, state).map_err(|e| {
+        // The BODY stops here; the status rides the typed value so stderr can
+        // name it and the toast cannot.
+        logline!("clauth: login code exchange failed: {}", e.log_detail());
+        LoginError::Exchange(e)
+    })?;
     let mut creds = credentials_from_token(token);
 
     progress(LoginProgress::Verifying);
@@ -614,6 +662,144 @@ pub(crate) fn login_with(
         credentials: creds,
         account_uuid,
     })
+}
+
+// ── manual (no browser) flow ─────────────────────────────────────────────────
+
+/// A manual login in flight: the authorize URL to show the user, plus the PKCE
+/// verifier and `state` the exchange needs. Nothing is held open (no socket, no
+/// timeout), so it can sit in a TUI modal for as long as the user takes; the
+/// authorize code's own server-side expiry is the ceiling.
+///
+/// `Clone` because the TUI clones its top modal per keystroke. `Debug` is
+/// hand-written to print nothing: the verifier is the PKCE secret and the URL
+/// carries `state`.
+#[derive(Clone)]
+pub(crate) struct PendingManualLogin {
+    url: String,
+    verifier: String,
+    state: String,
+}
+
+impl std::fmt::Debug for PendingManualLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingManualLogin { .. }")
+    }
+}
+
+/// An authorization code that passed [`PendingManualLogin::parse`] against the
+/// pending login's own `state`. Redacted `Debug`: until exchanged it is worth
+/// exactly what the token pair will be.
+#[derive(Clone)]
+pub(crate) struct ManualCode(String);
+
+impl std::fmt::Debug for ManualCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ManualCode(..)")
+    }
+}
+
+/// Why a pasted string was refused. Canned text only, so no rendering of one
+/// can carry the pasted bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualCodeError {
+    Empty,
+    TooLong,
+    /// No `#`, or an empty half on either side of it.
+    Shape,
+    /// The `state` half is not this login's: the paste came from a different
+    /// run (or somebody else's URL). Same refusal the loopback callback makes.
+    StateMismatch,
+}
+
+impl ManualCodeError {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::Empty => "no code entered",
+            Self::TooLong => {
+                "that is far longer than a login code; paste only the code the page shows"
+            }
+            Self::Shape => "invalid code; paste the whole string the page shows (it contains a #)",
+            Self::StateMismatch => {
+                "state mismatch: this code came from a different login; use the link shown here"
+            }
+        }
+    }
+}
+
+/// Split a pasted `code#state` and check it belongs to the login that expects
+/// `expected_state`. Mirrors Claude Code's `Paste code here` parser (split on
+/// `#`, both halves required) plus the state check the loopback path already
+/// makes. Pure and never logs, so it is pinned without a network.
+pub(crate) fn parse_manual_code(
+    raw: &str,
+    expected_state: &str,
+) -> Result<String, ManualCodeError> {
+    // Trim before the cap: the surrounding whitespace is not the code, so a
+    // code of exactly the cap plus its newline is not "too long".
+    let raw = raw.trim();
+    if raw.len() > MANUAL_CODE_MAX {
+        return Err(ManualCodeError::TooLong);
+    }
+    if raw.is_empty() {
+        return Err(ManualCodeError::Empty);
+    }
+    let Some((code, state)) = raw.split_once('#') else {
+        return Err(ManualCodeError::Shape);
+    };
+    if code.is_empty() || state.is_empty() {
+        return Err(ManualCodeError::Shape);
+    }
+    if state != expected_state {
+        return Err(ManualCodeError::StateMismatch);
+    }
+    Ok(code.to_string())
+}
+
+/// Start a manual login: mint the PKCE pair and `state`, build the authorize
+/// URL against [`MANUAL_REDIRECT_URI`]. No network, no socket; the only failure
+/// is the CSPRNG. Callers show [`PendingManualLogin::url`] themselves — there is
+/// no [`LoginProgress::AuthorizeUrl`] event on this path.
+pub(crate) fn begin_manual_login() -> std::result::Result<PendingManualLogin, LoginError> {
+    let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
+    let state = random_b64url(32).map_err(LoginError::Local)?;
+    let url = authorize_url(MANUAL_REDIRECT_URI, &challenge, &state);
+    Ok(PendingManualLogin {
+        url,
+        verifier,
+        state,
+    })
+}
+
+impl PendingManualLogin {
+    /// The authorize URL for the user to open on any device.
+    pub(crate) fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Check a pasted string WITHOUT consuming the pending login, so a bad paste
+    /// can be corrected against the same URL instead of forcing a fresh one.
+    pub(crate) fn parse(&self, pasted: &str) -> std::result::Result<ManualCode, LoginError> {
+        parse_manual_code(pasted, &self.state)
+            .map(ManualCode)
+            .map_err(|e| LoginError::Local(anyhow::anyhow!("{}", e.message())))
+    }
+
+    /// Exchange a parsed code and verify the mint. `ExchangingCode` and
+    /// `Verifying` fire through `progress`, exactly as the loopback flow's do.
+    pub(crate) fn complete(
+        self,
+        code: ManualCode,
+        progress: impl Fn(LoginProgress<'_>),
+    ) -> std::result::Result<LoginOutcome, LoginError> {
+        finish_login(
+            &code.0,
+            &self.verifier,
+            MANUAL_REDIRECT_URI,
+            &self.state,
+            &progress,
+        )
+    }
 }
 
 /// A one-glance summary of a captured login for the `clauth login` CLI. Never

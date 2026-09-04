@@ -432,3 +432,173 @@ fn login_summary_defers_when_the_token_claims_no_plan() {
     );
     assert!(!summary.contains("verified"), "got: {summary}");
 }
+
+// ── manual (no browser) flow ─────────────────────────────────────────────────
+
+#[test]
+fn authorize_url_takes_the_manual_redirect_and_keeps_code_true() {
+    let url = authorize_url(super::MANUAL_REDIRECT_URI, "CHAL", "STATE");
+    assert!(url.starts_with("https://claude.com/cai/oauth/authorize?"));
+    assert!(url.contains("code=true"));
+    assert!(
+        url.contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback")
+    );
+    assert!(url.contains("state=STATE"));
+}
+
+#[test]
+fn parse_manual_code_splits_on_the_hash_and_trims() {
+    use super::parse_manual_code;
+    assert_eq!(parse_manual_code("abc#st", "st"), Ok("abc".to_string()));
+    assert_eq!(parse_manual_code("  abc#st\n", "st"), Ok("abc".to_string()));
+    // Only the FIRST `#` splits; a code never carries one, a state never does
+    // either, so anything after a second one is the state half and mismatches.
+    assert_eq!(
+        parse_manual_code("abc#st#x", "st"),
+        Err(super::ManualCodeError::StateMismatch)
+    );
+}
+
+#[test]
+fn parse_manual_code_refuses_every_malformed_shape() {
+    use super::{MANUAL_CODE_MAX, ManualCodeError, parse_manual_code};
+    assert_eq!(parse_manual_code("", "st"), Err(ManualCodeError::Empty));
+    assert_eq!(
+        parse_manual_code("   \n", "st"),
+        Err(ManualCodeError::Empty)
+    );
+    assert_eq!(
+        parse_manual_code("abcst", "st"),
+        Err(ManualCodeError::Shape)
+    );
+    assert_eq!(parse_manual_code("#st", "st"), Err(ManualCodeError::Shape));
+    assert_eq!(parse_manual_code("abc#", "st"), Err(ManualCodeError::Shape));
+    assert_eq!(
+        parse_manual_code("abc#other", "st"),
+        Err(ManualCodeError::StateMismatch)
+    );
+    // The cap applies to the trimmed paste: exactly the cap is accepted even
+    // with a newline behind it, one byte over is refused.
+    let exact = format!("{}#st", "a".repeat(MANUAL_CODE_MAX - 3));
+    assert_eq!(exact.len(), MANUAL_CODE_MAX);
+    assert_eq!(
+        parse_manual_code(&format!("{exact}\n"), "st").as_deref(),
+        Ok("a".repeat(MANUAL_CODE_MAX - 3).as_str())
+    );
+    let long = format!("{}#st", "a".repeat(MANUAL_CODE_MAX - 2));
+    assert_eq!(long.len(), MANUAL_CODE_MAX + 1);
+    assert_eq!(
+        parse_manual_code(&long, "st"),
+        Err(ManualCodeError::TooLong)
+    );
+}
+
+#[test]
+fn manual_code_errors_and_debug_carry_no_pasted_bytes() {
+    use super::{ManualCodeError, begin_manual_login};
+    let canary = "CANARY-CODE-7f3a";
+    for e in [
+        ManualCodeError::Empty,
+        ManualCodeError::TooLong,
+        ManualCodeError::Shape,
+        ManualCodeError::StateMismatch,
+    ] {
+        assert!(!e.message().contains(canary));
+    }
+    let pending = begin_manual_login().unwrap_or_else(|e| panic!("{}", e.user_message()));
+    // `parse`'s error goes through `LoginError`, whose renderings are the only
+    // way a toast or stderr line is built; neither may echo the paste.
+    let err = pending
+        .parse(&format!("{canary}#wrong-state"))
+        .expect_err("state mismatch");
+    assert!(!err.user_message().contains(canary));
+    assert!(!err.cli_message().contains(canary));
+    assert!(err.user_message().contains("state mismatch"));
+    // The pending login's Debug shows neither the verifier nor the URL (which
+    // carries `state`).
+    let dbg = format!("{pending:?}");
+    assert_eq!(dbg, "PendingManualLogin { .. }");
+    assert!(!dbg.contains(pending.url()));
+    let code = pending
+        .parse(&format!("{canary}#{}", pending_state(&pending)))
+        .unwrap_or_else(|e| panic!("{}", e.user_message()));
+    assert_eq!(format!("{code:?}"), "ManualCode(..)");
+}
+
+/// The `state` a pending login expects, read back off its own URL: the test
+/// has no other honest way to mint a matching paste.
+fn pending_state(pending: &super::PendingManualLogin) -> String {
+    let (_, query) = pending.url().split_once('?').expect("query");
+    query_param(query, "state").expect("state param")
+}
+
+/// The manual exchange, end to end against a loopback stand-in for both hosts:
+/// the token request carries the MANUAL redirect, the original `state`, the
+/// verifier behind the URL's challenge, and the parsed code (never the `#state`
+/// suffix); the outcome carries the stubbed tier and account uuid.
+#[test]
+fn manual_login_exchanges_against_the_manual_redirect() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_recording(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-manual","refresh_token":"rt-manual","expires_in":28800,"scope":"user:profile user:inference"}"#
+                    .to_string(),
+            )
+        } else {
+            (
+                200,
+                r#"{"account":{"uuid":"uuid-manual","has_claude_max":true},"organization":{"organization_type":"claude_max"}}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let pending = super::begin_manual_login().unwrap_or_else(|e| panic!("{}", e.user_message()));
+    let state = pending_state(&pending);
+    let (_, query) = pending.url().split_once('?').expect("query");
+    let challenge = query_param(query, "code_challenge").expect("challenge");
+    let code = pending
+        .parse(&format!("the-code#{state}"))
+        .unwrap_or_else(|e| panic!("{}", e.user_message()));
+
+    let stages = std::sync::Mutex::new(Vec::new());
+    let outcome = pending
+        .complete(code, |p| {
+            stages.lock().expect("stages").push(format!("{p:?}"))
+        })
+        .unwrap_or_else(|e| panic!("{}", e.cli_message()));
+
+    let seen = server.join().expect("listener");
+    let (_, body) = seen
+        .iter()
+        .find(|(p, _)| p.starts_with("/v1/oauth/token"))
+        .expect("token request");
+    let body: serde_json::Value = serde_json::from_str(body).expect("json body");
+    assert_eq!(body["grant_type"], "authorization_code");
+    assert_eq!(body["code"], "the-code");
+    assert_eq!(body["redirect_uri"], super::MANUAL_REDIRECT_URI);
+    assert_eq!(body["state"], state);
+    assert_eq!(body["client_id"], crate::oauth::CLIENT_ID);
+    let verifier = body["code_verifier"].as_str().expect("verifier");
+    assert_eq!(challenge_from_verifier(verifier), challenge);
+    assert!(
+        seen.iter()
+            .any(|(p, _)| p.starts_with("/api/oauth/profile"))
+    );
+
+    let oauth = outcome.credentials.claude_ai_oauth.expect("oauth block");
+    assert_eq!(oauth.access_token, "at-manual");
+    assert_eq!(oauth.refresh_token.as_deref(), Some("rt-manual"));
+    assert!(
+        oauth.subscription_type.is_some(),
+        "tier stamped from the probe"
+    );
+    assert_eq!(outcome.account_uuid.as_deref(), Some("uuid-manual"));
+    assert_eq!(
+        *stages.lock().expect("stages"),
+        vec!["ExchangingCode".to_string(), "Verifying".to_string()]
+    );
+}

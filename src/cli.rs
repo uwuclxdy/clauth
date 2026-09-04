@@ -57,9 +57,11 @@ pub(crate) enum Command {
     /// Add a new account, or re-authenticate an existing one in place
     ///
     /// Neither switches to it. Bare (no --base-url/--api-key) runs the browser
-    /// OAuth flow and writes the minted tokens into the profile; passing either
-    /// endpoint flag captures an API-key account instead, prompting for
-    /// whatever a flag omitted (the key is read echo-off).
+    /// OAuth flow and writes the minted tokens into the profile; --manual runs
+    /// the same login without a browser on this host (prints a link to open
+    /// anywhere, then takes the code that page shows, for ssh sessions);
+    /// passing either endpoint flag captures an API-key account instead,
+    /// prompting for whatever a flag omitted (the key is read echo-off).
     ///
     /// An existing name re-authenticates in place: the fresh credential set
     /// replaces the old one while the profile's chain slot, env, and model
@@ -395,6 +397,11 @@ pub(crate) struct LoginArgs {
     /// on the next switch and touches nothing else about the profile.
     #[arg(long, conflicts_with_all = ["base_url", "api_key"])]
     pub(crate) setup_token: bool,
+    /// Log in without a browser on this host: prints a link to open on any
+    /// device, then takes the code that page shows. Same credential as the
+    /// bare login; for ssh sessions and headless machines.
+    #[arg(long, conflicts_with_all = ["base_url", "api_key", "setup_token"])]
+    pub(crate) manual: bool,
     /// Replace an existing long-lived token unprompted.
     #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
@@ -411,6 +418,7 @@ pub(crate) const LOGIN_FLAGS: &[&str] = &[
     "--base-url",
     "--api-key",
     "--setup-token",
+    "--manual",
     "--yes",
     "-y",
     "--model",
