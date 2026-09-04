@@ -1028,7 +1028,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
 }
 
 /// "Preserve key on reauth" (owner ruling, 2026-08-30): a browser reauth's
-/// snapshot carries the minted tokens and nothing else (`run_oauth_browser`),
+/// snapshot carries the minted tokens and nothing else (`run_oauth`),
 /// so the uniform replace stripped a third-party profile's endpoint and key —
 /// a login about the OAuth chain deleting the working api-key credential. A
 /// field the snapshot omits keeps the stored one on a provider-set profile.

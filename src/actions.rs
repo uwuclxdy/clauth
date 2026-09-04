@@ -1189,8 +1189,8 @@ pub(crate) fn overwrite_captured_profile(
         let profile = config
             .find_mut(name)
             .with_context(|| format!("profile '{name}' vanished before overwrite"))?;
-        // A browser reauth's snapshot carries the minted tokens and nothing
-        // else (`run_oauth_browser`), so a uniform replace strips the profile's
+        // An OAuth reauth's snapshot carries the minted tokens and nothing
+        // else (`run_oauth`), so a uniform replace strips the profile's
         // endpoint and key — the login was about the chain, and its side effect
         // deleted the credential its inference actually runs on. A field the
         // snapshot omits keeps the stored one; an api-mode login carries both

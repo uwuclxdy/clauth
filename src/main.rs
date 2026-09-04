@@ -500,27 +500,93 @@ fn collect_api_reauth_snapshot(
     Ok(api_reauth_snapshot(base_url, api_key, stored))
 }
 
-/// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
-/// tokens, login summary, identity-anchor seed) and wrap it in a capture
-/// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
-/// in lockstep.
-fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
-    if reauth {
-        outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
-    } else {
-        outln!("clauth: opening a browser to log in to a new account for '{target}'…");
+/// One line of pasted `code#state` from a non-TTY stdin, for a driver that
+/// read the link off stdout and feeds the code back to the SAME process (the
+/// code is bound to this process's PKCE verifier). Reads through a `take` so
+/// at most `MANUAL_CODE_MAX + 3` bytes are ever buffered (the cap, a CRLF,
+/// and one byte to tell "exactly the cap" from "over it"): a longer line with
+/// no newline is refused before it is held, not after. The cap is judged on
+/// the line minus its terminator, so a code of exactly the cap still passes.
+/// A line ended by EOF is as good as one ended by `\n` (the driver may close
+/// stdin after writing). The TTY path uses `rpassword` instead and cannot be
+/// driven from a test.
+fn read_manual_code_from(reader: impl std::io::BufRead) -> Result<String> {
+    use std::io::BufRead as _;
+    let cap = oauth_login::MANUAL_CODE_MAX;
+    let mut line = String::new();
+    reader.take(cap as u64 + 3).read_line(&mut line)?;
+    if line.trim_end_matches(['\r', '\n']).len() > cap {
+        anyhow::bail!("{}", oauth_login::ManualCodeError::TooLong.message());
     }
-    let outcome = oauth_login::login_with(|progress| {
-        // The CLI surfaces only the paste-fallback URL; the later milestones
-        // are TUI-modal fodder and would just be noise between the prints here.
-        if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
-            outln!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
-        }
-    })
+    if line.trim().is_empty() {
+        anyhow::bail!("no code on stdin; the manual login needs the code the page shows");
+    }
+    Ok(line)
+}
+
+/// Run an OAuth login (preamble, the link, minted tokens, login summary,
+/// identity-anchor seed) and wrap it in a capture snapshot. Shared by
+/// `cmd_login`'s new and reauth OAuth arms so the two stay in lockstep.
+fn run_oauth(
+    reauth: bool,
+    target: &str,
+    method: oauth_login::LoginMethod,
+) -> Result<actions::CaptureSnapshot> {
     // CLI stderr: name the HTTP status too. This lands on the `errln!`
     // backstop below, a terminal with no companion log open, and a fresh login
     // failing on a 400 is the case that ruling exists for.
-    .map_err(|e| anyhow::anyhow!("{}", e.cli_message()))?;
+    let cli_err = |e: oauth_login::LoginError| anyhow::anyhow!("{}", e.cli_message());
+    let outcome = match method {
+        oauth_login::LoginMethod::Browser => {
+            if reauth {
+                outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
+            } else {
+                outln!("clauth: opening a browser to log in to a new account for '{target}'…");
+            }
+            oauth_login::login_with(|progress| {
+                // The CLI surfaces only the paste-fallback URL; the later
+                // milestones are TUI-modal fodder and would just be noise
+                // between the prints here.
+                if let oauth_login::LoginProgress::AuthorizeUrl(url) = progress {
+                    outln!("\nIf the browser didn't open, visit this URL to authorize:\n{url}\n");
+                }
+            })
+            .map_err(cli_err)?
+        }
+        oauth_login::LoginMethod::Manual => {
+            use std::io::IsTerminal as _;
+            if reauth {
+                outln!("clauth: re-authenticating existing profile '{target}' without a browser.");
+            } else {
+                outln!("clauth: logging in to a new account for '{target}' without a browser.");
+            }
+            let pending = oauth_login::begin_manual_login().map_err(cli_err)?;
+            outln!(
+                "\nOpen this link on any device, sign in, then paste the code it shows:\n{}\n",
+                pending.url()
+            );
+            // The code is a bearer-grade secret until exchanged: echo-off on a
+            // TTY, one bounded line when piped. `parse` does not consume the
+            // pending login, so a person at a TTY gets to re-paste against the
+            // same link; a piped driver gets one shot, since nobody is there
+            // to answer a second prompt.
+            let code = if std::io::stdin().is_terminal() {
+                loop {
+                    let raw = rpassword::prompt_password("Paste code here: ")
+                        .map_err(|e| anyhow::anyhow!("failed to read the code: {e}"))?;
+                    match pending.parse(&raw) {
+                        Ok(code) => break code,
+                        Err(e) => errln!("clauth: {}. Try again.", e.cli_message()),
+                    }
+                }
+            } else {
+                let raw = read_manual_code_from(std::io::stdin().lock())?;
+                pending.parse(&raw).map_err(cli_err)?
+            };
+            outln!("clauth: exchanging the code…");
+            pending.complete(code, |_| {}).map_err(cli_err)?
+        }
+    };
     outln!(
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
@@ -538,11 +604,14 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
     })
 }
 
-/// `clauth login <name> [--base-url <url>] [--api-key <key>] [--model <id>]` —
+/// `clauth login <name> [--manual] [--base-url <url>] [--api-key <key>] [--model <id>]` —
 /// add a new account or re-authenticate an existing one in place (#7). The auth
 /// method is flag-selected: bare (no `--base-url`/`--api-key`) runs the browser
 /// OAuth flow (`oauth_login`) and writes the minted tokens straight into the
-/// profile's `.credentials.json`, identically on every platform; passing either
+/// profile's `.credentials.json`, identically on every platform; `--manual`
+/// runs the same OAuth login through Claude Code's manual redirect (a link to
+/// open anywhere, a code pasted back, no browser or listener on this host) and
+/// is refused on an Alibaba account, whose login is a console session; passing either
 /// endpoint flag switches to API-key mode and captures a base_url + api_key pair
 /// instead, prompting (echo-off for the key) for whatever a flag omitted. On a
 /// reauth, a non-TTY stdin cannot answer the endpoint prompt, so `--api-key`
@@ -602,12 +671,26 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // and NOTHING else. Not the api key: the callback returns a workspace key
     // for a different product, and `actions::store_console_login` exists to
     // keep it off the profile.
-    if !is_api
-        && reauth
-        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba)
-    {
+    let is_alibaba = reauth
+        && config.find(&target).and_then(|p| p.provider) == Some(providers::Provider::Alibaba);
+    // `--manual` is an Anthropic subscription login; an Alibaba account's login
+    // is its console session, so the flag has nothing to run there. Refuse
+    // rather than fall through to the console flow the flag never promised.
+    if args.manual && is_alibaba {
+        anyhow::bail!(
+            "--manual is an Anthropic subscription login; '{target}' is an Alibaba Model Studio \
+             account, whose login is its console session. Run `clauth login {target}` without \
+             the flag."
+        );
+    }
+    if !is_api && is_alibaba {
         return cmd_login_console(&mut config, &target, args.model.as_deref());
     }
+    let method = if args.manual {
+        oauth_login::LoginMethod::Manual
+    } else {
+        oauth_login::LoginMethod::Browser
+    };
 
     // Confirm a reauth BEFORE collecting anything (browser or key prompt): a
     // declined overwrite must not open a browser or read a secret.
@@ -632,7 +715,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
                 std::io::stdin().is_terminal(),
             )?
         } else {
-            run_oauth_browser(true, &target)?
+            run_oauth(true, &target, method)?
         };
         actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
         // On a reauth `--model` is an explicit override; without it the
@@ -670,7 +753,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
-        let snapshot = run_oauth_browser(false, &target)?;
+        let snapshot = run_oauth(false, &target, method)?;
         actions::capture_into_profile(&mut config, target.to_string(), snapshot)?;
         // Apply the requested default model so the captured profile's sessions
         // route there from the first launch.

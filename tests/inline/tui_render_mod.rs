@@ -184,6 +184,7 @@ fn login_modal_drops_the_url_and_offers_a_retry() {
         generation: 1,
         url: Some("https://claude.com/cai/oauth/authorize?client_id=redacted".to_string()),
         stage: LoginStage::WaitingBrowser,
+        method: crate::tui::app::LoginMethod::Browser,
     });
     app.modals.push(Modal::Login);
 
@@ -488,16 +489,20 @@ fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
 
     let out = dump(&app, 120, 30);
     assert!(
-        out.contains("re-login"),
-        "a stored OAuth pair reads as logged in:\n{out}",
+        out.contains("web re-login"),
+        "a stored OAuth pair reads as logged in, on the browser-mint row:\n{out}",
     );
     assert!(
         out.contains("log out"),
         "a stored OAuth pair keeps the log-out row:\n{out}",
     );
     assert!(
-        out.contains("browser OAuth login"),
+        out.contains("opens a browser on this machine"),
         "the login row's hint describes the OAuth mint:\n{out}",
+    );
+    assert!(
+        out.contains("manual re-login (no browser)"),
+        "and the manual twin sits under it:\n{out}",
     );
 }
 
@@ -1620,4 +1625,169 @@ fn the_live_column_appears_monotonically_in_width() {
             );
         }
     }
+}
+
+// ── manual login (no browser) ────────────────────────────────────────────────
+
+fn manual_form(
+    input: &str,
+    phase: crate::tui::app::ManualPhase,
+) -> crate::tui::app::ManualLoginForm {
+    crate::tui::app::ManualLoginForm {
+        name: "fresh".to_string(),
+        is_new: true,
+        pending: crate::oauth_login::begin_manual_login()
+            .unwrap_or_else(|e| panic!("{}", e.user_message())),
+        phase,
+        input: crate::tui::app::InputState::new(input),
+    }
+}
+
+/// A manual session reaches the progress modal with the code already in
+/// hand, so nothing about a browser may be said: not the retry line, and not
+/// the "opening your browser…" arm a session with no URL would otherwise hit.
+#[test]
+fn login_modal_says_nothing_about_a_browser_for_a_manual_session() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{LoginMethod, LoginSession, LoginStage, Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.login = Some(LoginSession {
+        name: "fresh".to_string(),
+        is_new: true,
+        generation: 1,
+        url: None,
+        stage: LoginStage::ExchangingCode,
+        method: LoginMethod::Manual,
+    });
+    app.modals.push(Modal::Login);
+
+    let out = dump(&app, 80, 24);
+    assert!(
+        out.contains("exchanging the code"),
+        "the stage line shows:\n{out}"
+    );
+    assert!(
+        !out.to_lowercase().contains("browser"),
+        "no browser copy anywhere in the frame, footer included:\n{out}"
+    );
+    assert!(
+        out.contains("manual login in progress"),
+        "the footer names the manual flow:\n{out}"
+    );
+}
+
+/// The pasted code is a bearer-grade secret until exchanged: the code phase
+/// renders a bullet run and a count, never the bytes.
+#[test]
+fn manual_login_code_phase_never_shows_the_paste() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{ManualPhase, Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    let form = manual_form("CANARYCODE#CANARYSTATE", ManualPhase::Code);
+    let url = form.pending.url().to_string();
+    app.modals.push(Modal::ManualLogin(form));
+
+    let out = dump(&app, 80, 24);
+    assert!(out.contains("MANUAL LOGIN"), "{out}");
+    assert!(
+        !out.contains("CANARY"),
+        "the paste never reaches the frame:\n{out}"
+    );
+    assert!(
+        out.contains("(22 chars)"),
+        "the count stands in for it:\n{out}"
+    );
+    assert!(
+        !out.contains(&url[..40]),
+        "the link belongs to the other phase:\n{out}"
+    );
+}
+
+/// The link phase fits its own rows so a short, narrow terminal loses URL
+/// characters, never the key line: at 40×12 the whole instruction survives.
+#[test]
+fn manual_login_link_phase_keeps_its_key_line_on_a_tiny_terminal() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{ManualPhase, Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    app.modals
+        .push(Modal::ManualLogin(manual_form("", ManualPhase::Link)));
+
+    let wide = dump(&app, 120, 40);
+    assert!(wide.contains("c copy link"), "{wide}");
+    assert!(wide.contains("esc cancel"), "{wide}");
+    assert!(
+        wide.contains("claude.com/cai/oauth/authorize"),
+        "the link shows in full:\n{wide}"
+    );
+
+    let tiny = dump(&app, 40, 12);
+    let flat: String = tiny
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(flat.contains("copy link"), "the copy key survives:\n{tiny}");
+    assert!(
+        flat.contains("esc"),
+        "so does the tail of the key line:\n{tiny}"
+    );
+    assert!(flat.contains("cancel"), "{tiny}");
+    // 40×12 leaves no row for the URL at all, so none of it shows and there
+    // is nothing to mark as cut.
+    assert!(
+        !tiny.contains("authorize"),
+        "no URL row fits at this size:\n{tiny}"
+    );
+    assert!(!tiny.contains('…'), "nothing cut, nothing marked:\n{tiny}");
+}
+
+/// Between "fits in full" and "no room at all": at 40×20 the URL gets two
+/// rows but needs many more, so its head shows, its tail is gone, and the cut
+/// is marked with an ellipsis.
+#[test]
+fn manual_login_link_phase_marks_a_url_it_had_to_cut() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{ManualPhase, Modal, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Setup;
+    let form = manual_form("", ManualPhase::Link);
+    let url = form.pending.url().to_string();
+    let (_, state) = url.split_once("state=").expect("the URL carries a state");
+    let state = state.split('&').next().unwrap_or(state);
+    app.modals.push(Modal::ManualLogin(form));
+
+    let mid = dump(&app, 40, 20);
+    // The URL is chunked across rows, each wrapped in modal and pane chrome;
+    // dropping whitespace and box-drawing characters glues the chunks back so
+    // the head can be matched as one string (the URL contains neither).
+    let flat: String = mid
+        .chars()
+        .filter(|c| !c.is_whitespace() && !('\u{2500}'..='\u{259F}').contains(c))
+        .collect();
+    assert!(mid.contains('…'), "the cut is marked:\n{mid}");
+    assert!(
+        flat.contains("https://claude.com/cai/oauth/authorize"),
+        "the head of the URL shows:\n{mid}"
+    );
+    assert!(
+        !flat.contains(state),
+        "the tail of the URL is what was cut:\n{mid}"
+    );
+    assert!(mid.contains("copy link"), "the key line survives:\n{mid}");
 }

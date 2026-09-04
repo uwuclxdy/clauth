@@ -821,6 +821,7 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
             ConfigRow::ModelOverrideAdd,
             ConfigRow::EnvAdd,
             ConfigRow::Login,
+            ConfigRow::ManualLogin,
             ConfigRow::DeleteCreds,
             ConfigRow::Disabled,
             ConfigRow::Delete,
@@ -984,6 +985,19 @@ fn hybrid(name: &str, api_key: Option<&str>) -> crate::profile::Profile {
     );
     p.credentials = Some(login_creds("ref"));
     p
+}
+
+/// The console arm of the login-row resolver, as the `Option` the old
+/// `console_login_target` helper returned: `login_flow_for` folded it in when
+/// `config_rows` needed the decision on an already-borrowed profile.
+fn console_login_target(
+    app: &App,
+    name: &crate::profile::ProfileName,
+) -> Option<(crate::profile::ConsoleSite, &'static str)> {
+    match super::login_row_flow(app, Some(name)) {
+        super::LoginRowFlow::Console { site, region } => Some((site, region)),
+        _ => None,
+    }
 }
 
 fn app_with(profiles: Vec<crate::profile::Profile>) -> App {
@@ -2922,6 +2936,7 @@ fn login_session(name: &str, is_new: bool, generation: u64) -> super::LoginSessi
         generation,
         url: None,
         stage: super::LoginStage::WaitingBrowser,
+        method: super::LoginMethod::Browser,
     }
 }
 
@@ -3041,13 +3056,66 @@ fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
     assert!(
         matches!(
             app.modals.last(),
-            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true))
+            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true, _))
         ),
         "⏎ on a stashed new-form login must confirm before dropping the capture",
     );
     assert!(
         app.login.is_none(),
         "no login worker starts until the confirm is accepted",
+    );
+}
+
+/// The manual row shares the stash gate: ⏎ on a stashed new-form capture
+/// confirms first, and accepting opens the manual modal, not the browser one.
+#[test]
+fn manual_relogin_on_a_stashed_new_form_confirms_then_opens_the_manual_modal() {
+    use super::{
+        ConfigFocus, ConfigRow, ConfirmAction, LoginMethod, Modal, build_draft_new, handle_key,
+        run_config_row,
+    };
+    use crate::profile::{AppConfig, AppState};
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0; // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    draft.captured_login = Some(Box::new(login_outcome("stashed", Some("uuid-stashed"))));
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::ManualLogin);
+
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(Modal::Confirm(s))
+                if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true, LoginMethod::Manual))
+        ),
+        "the confirm must carry the manual method, got {:?}",
+        app.modals.last()
+    );
+    assert!(
+        app.login.is_none(),
+        "nothing starts until the confirm is accepted"
+    );
+
+    handle_key(&mut app, key(KeyCode::Char('y')));
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::ManualLogin(_))),
+        "accepting opens the manual modal, not the browser login, got {:?}",
+        app.modals.last()
+    );
+    assert!(
+        app.login.is_none(),
+        "the manual link phase has no worker in flight"
     );
 }
 
@@ -8651,17 +8719,17 @@ fn the_login_row_targets_a_console_only_for_a_model_studio_account() {
     // Exact values: the site decides which console front is opened, and a token
     // minted on one front is meaningless on the other.
     assert_eq!(
-        super::console_login_target(&app, &crate::profile::ProfileName::from("qwen-intl")),
+        console_login_target(&app, &crate::profile::ProfileName::from("qwen-intl")),
         Some((ConsoleSite::International, "ap-southeast-1"))
     );
     assert_eq!(
-        super::console_login_target(&app, &crate::profile::ProfileName::from("qwen-cn")),
+        console_login_target(&app, &crate::profile::ProfileName::from("qwen-cn")),
         Some((ConsoleSite::Domestic, "cn-beijing"))
     );
 
     for other in ["oauth", "deepseek", "proxy", "missing"] {
         assert_eq!(
-            super::console_login_target(&app, &crate::profile::ProfileName::from(other)),
+            console_login_target(&app, &crate::profile::ProfileName::from(other)),
             None,
             "'{other}' keeps its own login flow"
         );
@@ -8794,7 +8862,7 @@ fn a_console_session_from_the_other_front_is_discarded_rather_than_stored() {
     let mut app = app_with(vec![acct]);
 
     assert_eq!(
-        super::console_login_target(&app, &crate::profile::ProfileName::from("swapped"))
+        console_login_target(&app, &crate::profile::ProfileName::from("swapped"))
             .map(|(site, _)| site),
         Some(crate::profile::ConsoleSite::Domestic),
         "the fixture is the mainland front, so the intl session below mismatches"
@@ -9873,4 +9941,379 @@ fn a_plain_app_lands_on_overview_with_the_first_row_selected() {
         app.plugin.checks.is_empty(),
         "no construction recompute outside herdr mode"
     );
+}
+
+// ── manual login (no browser) ────────────────────────────────────────────────
+
+/// The manual row appears exactly where the login row would run the OAuth
+/// mint: right under it on an OAuth account and on the `+ new` form, and
+/// nowhere on an api-key or Model Studio account, whose login rows run other
+/// flows that have no browser-free twin.
+#[test]
+fn config_rows_manual_login_follows_the_oauth_mint() {
+    use super::{ConfigRow, build_draft_new, config_rows};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![
+        Profile::new("oauth".to_string(), None, None),
+        Profile::new(
+            "deepseek".to_string(),
+            Some("https://api.deepseek.com".to_string()),
+            Some("sk-test".to_string()),
+        ),
+        Profile::new(
+            "qwen".to_string(),
+            Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string()),
+            Some("sk-sp-test".to_string()),
+        ),
+    ]);
+    app.config_draft = None;
+
+    app.profile_cursor = 0;
+    let rows = config_rows(&app);
+    let li = rows
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("login row");
+    assert_eq!(
+        rows.get(li + 1),
+        Some(&ConfigRow::ManualLogin),
+        "an OAuth account gets the manual twin right under its login row: {rows:?}"
+    );
+    for (i, name) in [(1, "deepseek"), (2, "qwen")] {
+        app.profile_cursor = i;
+        let rows = config_rows(&app);
+        assert!(rows.contains(&ConfigRow::Login), "{name}: {rows:?}");
+        assert!(
+            !rows.contains(&ConfigRow::ManualLogin),
+            "{name}'s login row runs another flow, so no manual twin: {rows:?}"
+        );
+    }
+
+    // `+ new`: both rows while no base url is typed, neither once one is.
+    app.profile_cursor = 3;
+    app.config_draft = Some(build_draft_new());
+    let rows = config_rows(&app);
+    let li = rows
+        .iter()
+        .position(|r| *r == ConfigRow::Login)
+        .expect("login row on the new form");
+    assert_eq!(rows.get(li + 1), Some(&ConfigRow::ManualLogin), "{rows:?}");
+    app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://x");
+    let rows = config_rows(&app);
+    assert!(
+        !rows.contains(&ConfigRow::Login) && !rows.contains(&ConfigRow::ManualLogin),
+        "a typed base url makes it an api account, which mints nothing: {rows:?}"
+    );
+}
+
+/// The manual modal on the stack, as the row left it.
+fn manual_form(app: &App) -> super::ManualLoginForm {
+    match app.modals.last() {
+        Some(super::Modal::ManualLogin(f)) => f.clone(),
+        other => panic!("expected the manual login modal on top, got {other:?}"),
+    }
+}
+
+/// The `state` a pending manual login expects, read off its own URL — the only
+/// honest way a test can mint a matching paste.
+fn manual_state(form: &super::ManualLoginForm) -> String {
+    let (_, query) = form.pending.url().split_once('?').expect("query");
+    crate::oauth_login::query_param(query, "state").expect("state param")
+}
+
+/// Two phases so the copy key can never eat a pasted character: in `Link`
+/// only `c`, ⏎ and esc mean anything (a stray paste changes nothing); in
+/// `Code` every printable character is data, `c` and `q` included, since a
+/// paste arrives as one key event per character.
+/// The code phase stops taking characters at `MANUAL_CODE_MAX`: the cap
+/// `parse` enforces is applied at the door, so a runaway paste is never held.
+#[test]
+fn manual_login_code_phase_stops_at_the_cap() {
+    use super::{ConfigRow, ManualPhase, Modal, enter_config_detail, handle_key, run_config_row};
+    use crate::oauth_login::MANUAL_CODE_MAX;
+    use crate::profile::Profile;
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+
+    run_config_row(&mut app, ConfigRow::ManualLogin);
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(manual_form(&app).phase, ManualPhase::Code);
+
+    for _ in 0..MANUAL_CODE_MAX + 5 {
+        handle_key(&mut app, key(KeyCode::Char('a')));
+    }
+    assert_eq!(
+        manual_form(&app).input.value.len(),
+        MANUAL_CODE_MAX,
+        "characters past the cap are dropped at the door"
+    );
+    assert!(
+        matches!(app.modals.last(), Some(Modal::ManualLogin(_))),
+        "the modal stays open"
+    );
+}
+
+#[test]
+fn manual_login_modal_takes_every_character_as_code_once_in_the_code_phase() {
+    use super::{ConfigRow, ManualPhase, Modal, enter_config_detail, handle_key, run_config_row};
+    use crate::profile::Profile;
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+
+    run_config_row(&mut app, ConfigRow::ManualLogin);
+    let form = manual_form(&app);
+    assert_eq!(form.phase, ManualPhase::Link);
+    assert!(
+        form.pending
+            .url()
+            .contains("redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback"),
+        "the link carries the manual redirect"
+    );
+    assert!(
+        app.login.is_none(),
+        "nothing is in flight while the link shows"
+    );
+
+    // A paste that lands in the link phase by mistake types nothing.
+    for c in "q#x".chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    let form = manual_form(&app);
+    assert_eq!(form.phase, ManualPhase::Link);
+    assert!(form.input.value.is_empty());
+
+    handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(manual_form(&app).phase, ManualPhase::Code);
+    for c in "cqc#cq".chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    assert_eq!(
+        manual_form(&app).input.value,
+        "cqc#cq",
+        "every printable character is data in the code phase"
+    );
+    assert!(app.login.is_none(), "still nothing in flight until ⏎");
+
+    handle_key(&mut app, key(KeyCode::Esc));
+    let form = manual_form(&app);
+    assert_eq!(form.phase, ManualPhase::Link, "esc steps back to the link");
+    assert!(form.input.value.is_empty(), "and clears the buffer");
+    handle_key(&mut app, key(KeyCode::Esc));
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, Modal::ManualLogin(_))),
+        "esc on the link cancels"
+    );
+    assert!(app.login.is_none());
+}
+
+/// A paste that fails the shape or state check is cleared, not kept: the
+/// field is masked so it cannot be edited by eye, and a corrected paste
+/// appended to leftover bytes would pass the shape check and burn the pending
+/// exchange. The modal stays in the code phase against the same link.
+#[test]
+fn manual_login_bad_paste_clears_the_field_and_keeps_the_modal() {
+    use super::{ConfigRow, ManualPhase, Modal, enter_config_detail, handle_key, run_config_row};
+    use crate::profile::Profile;
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    run_config_row(&mut app, ConfigRow::ManualLogin);
+    let url_before = manual_form(&app).pending.url().to_string();
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    for bad in ["garbage", "abc#not-this-state"] {
+        for c in bad.chars() {
+            handle_key(&mut app, key(KeyCode::Char(c)));
+        }
+        handle_key(&mut app, key(KeyCode::Enter));
+        let form = manual_form(&app);
+        assert_eq!(
+            form.phase,
+            ManualPhase::Code,
+            "{bad}: stays on the code field"
+        );
+        assert!(
+            form.input.value.is_empty(),
+            "{bad}: the bad paste is cleared"
+        );
+        assert_eq!(
+            form.pending.url(),
+            url_before,
+            "{bad}: the same link is still good"
+        );
+        assert!(app.login.is_none(), "{bad}: nothing was started");
+        assert!(
+            !app.modals.iter().any(|m| matches!(m, Modal::Login)),
+            "{bad}: no progress modal"
+        );
+    }
+}
+
+/// A login already running owns the progress modal: ⏎ on the manual row then
+/// re-expands it and mints no second pending login.
+#[test]
+fn manual_login_row_defers_to_a_login_in_flight() {
+    use super::{ConfigRow, Modal, enter_config_detail, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.login_generation = 1;
+    app.login = Some(login_session("acct", false, 1));
+
+    run_config_row(&mut app, ConfigRow::ManualLogin);
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, Modal::ManualLogin(_))),
+        "no second login while one runs"
+    );
+    assert!(
+        app.modals.iter().any(|m| matches!(m, Modal::Login)),
+        "the running login's modal is re-shown instead"
+    );
+    assert_eq!(app.login_generation, 1, "the generation is untouched");
+}
+
+/// The whole manual flow through the real keys and a real worker, against a
+/// loopback stand-in for both hosts: the pasted code reaches the exchange with
+/// the manual redirect, and the mint lands where the browser flow's would (the
+/// `+ new` draft's stash), through the unchanged drain/apply path.
+///
+/// The worker is joined EXPLICITLY while the endpoint sandbox is alive: the
+/// sandbox borrows the home sandbox, so it drops first and clears the overrides
+/// before `HomeSandbox::drop` would join the worker, and an unjoined worker
+/// would then race onto the real endpoints.
+#[test]
+fn manual_login_good_paste_exchanges_and_stashes_the_mint() {
+    use super::{
+        ConfigRow, LoginMethod, LoginStage, Modal, build_draft_new, drain_login_events, handle_key,
+        run_config_row,
+    };
+    use crate::testutil::key;
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_recording(3, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (
+                200,
+                r#"{"access_token":"at-manual","refresh_token":"rt-manual","expires_in":28800,"scope":"user:profile user:inference"}"#
+                    .to_string(),
+            )
+        } else {
+            (
+                200,
+                r#"{"account":{"uuid":"uuid-manual","has_claude_max":true},"organization":{"organization_type":"claude_max"}}"#
+                    .to_string(),
+            )
+        }
+    });
+    let endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let mut app = app_with(vec![]);
+    app.tab = super::Tab::Setup;
+    app.profile_cursor = 0; // == profile_count() → the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    app.config_draft = Some(draft);
+
+    run_config_row(&mut app, ConfigRow::ManualLogin);
+    handle_key(&mut app, key(KeyCode::Enter));
+    let state = manual_state(&manual_form(&app));
+    for c in format!("the-code#{state}").chars() {
+        handle_key(&mut app, key(KeyCode::Char(c)));
+    }
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert!(
+        app.login.as_ref().is_some_and(|s| {
+            s.name == "fresh"
+                && s.is_new
+                && s.method == LoginMethod::Manual
+                && s.stage == LoginStage::ExchangingCode
+        }),
+        "⏎ on a good paste seats a manual session at the exchange stage"
+    );
+    assert!(app.modals.iter().any(|m| matches!(m, Modal::Login)));
+    assert!(
+        !app.modals
+            .iter()
+            .any(|m| matches!(m, Modal::ManualLogin(_)))
+    );
+
+    crate::tui::join_test_workers();
+    drain_login_events(&mut app);
+
+    assert!(app.login.is_none(), "the session ends with the result");
+    assert!(!app.modals.iter().any(|m| matches!(m, Modal::Login)));
+    let stashed = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.captured_login.as_ref())
+        .expect("the mint lands in the draft, as the browser flow's does");
+    let oauth = stashed
+        .credentials
+        .claude_ai_oauth
+        .as_ref()
+        .expect("oauth block");
+    assert_eq!(oauth.access_token, "at-manual");
+    assert_eq!(stashed.account_uuid.as_deref(), Some("uuid-manual"));
+
+    let seen = server.join().expect("listener");
+    let (_, body) = seen
+        .iter()
+        .find(|(p, _)| p.starts_with("/v1/oauth/token"))
+        .expect("token request");
+    let body: serde_json::Value = serde_json::from_str(body).expect("json body");
+    assert_eq!(body["code"], "the-code");
+    assert_eq!(
+        body["redirect_uri"],
+        crate::oauth_login::MANUAL_REDIRECT_URI
+    );
+    assert_eq!(body["state"], state);
+    drop(endpoints);
+}
+
+/// `Modal` derives `Debug` and the top modal is cloned per keystroke, so the
+/// form's own `Debug` must be what stands between the pasted code and a log
+/// line: it names the account and the phase, never the paste, the PKCE
+/// verifier, or the URL (which carries `state`).
+#[test]
+fn manual_login_form_debug_redacts_the_paste_and_the_pending_secrets() {
+    use super::{ManualLoginForm, ManualPhase, Modal};
+    let pending =
+        crate::oauth_login::begin_manual_login().unwrap_or_else(|e| panic!("{}", e.user_message()));
+    let url = pending.url().to_string();
+    let form = ManualLoginForm {
+        name: "acct".to_string(),
+        is_new: false,
+        pending,
+        phase: ManualPhase::Code,
+        input: InputState::new("CANARY-code#CANARY-state"),
+    };
+    let dbg = format!("{form:?}");
+    assert!(dbg.contains("acct") && dbg.contains("Code"), "{dbg}");
+    assert!(!dbg.contains("CANARY"), "{dbg}");
+    assert!(!dbg.contains(&url), "{dbg}");
+    assert!(!dbg.contains("code_challenge"), "{dbg}");
+    let modal = format!("{:?}", Modal::ManualLogin(form));
+    assert!(!modal.contains("CANARY"), "{modal}");
 }

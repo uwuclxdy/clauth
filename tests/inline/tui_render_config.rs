@@ -112,11 +112,12 @@ fn action_rows_bold_on_select_and_keep_their_color() {
     let mut snap = Snap::blank("+ new account");
     let input = InputState::new("");
     // (row, the style the label holds in both states)
-    let cases: [(ConfigRow, Style); 4] = [
+    let cases: [(ConfigRow, Style); 5] = [
         (ConfigRow::EnvAdd, theme::accent()),
         (ConfigRow::ModelOverrideAdd, theme::accent()),
         (ConfigRow::Create, theme::accent()),
         (ConfigRow::Login, theme::accent()),
+        (ConfigRow::ManualLogin, theme::accent()),
     ];
     for (row, want) in cases {
         let blurred = detail_row(row, false, false, None, &snap, &input);
@@ -1014,4 +1015,42 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
         joined.contains("clauth rolling-token acct re-arms"),
         "the fix line reads the title, which a draft never blanks: {joined}"
     );
+}
+
+/// Only the OAuth mint carries the `web` qualifier, because only it has a
+/// manual twin on the row below. The api-key re-entry and the console capture
+/// keep the labels they had, since neither has a browser-free variant.
+#[test]
+fn login_labels_qualify_only_the_oauth_mint() {
+    let input = InputState::new("");
+    let text = |snap: &Snap, row: ConfigRow| {
+        line_text(&detail_row(row, false, false, None, snap, &input))
+            .trim()
+            .to_string()
+    };
+    let mut snap = Snap::blank("a");
+    assert_eq!(text(&snap, ConfigRow::Login), "+ web login");
+    assert_eq!(
+        text(&snap, ConfigRow::ManualLogin),
+        "+ manual login (no browser)"
+    );
+    snap.logged_in = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "web re-login");
+    assert_eq!(
+        text(&snap, ConfigRow::ManualLogin),
+        "manual re-login (no browser)"
+    );
+
+    // An api-key account: the row re-enters the key, so no `web`.
+    snap.login_is_oauth = false;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
+    snap.logged_in = false;
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+
+    // A Model Studio account is api-typed too, and its row opens the console.
+    snap.login_is_oauth = true;
+    snap.console_login = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "+ login");
+    snap.logged_in = true;
+    assert_eq!(text(&snap, ConfigRow::Login), "re-login");
 }

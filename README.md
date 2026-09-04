@@ -98,7 +98,7 @@ clauth start --isolated personal -p < prompt.txt
 | `clauth` | open the TUI |
 | `clauth <profile>` | switch and exit |
 | `clauth start <profile>` | run `claude` under that account, in its own config dir |
-| `clauth login <profile>` | add or re-authenticate an account, browser or API key |
+| `clauth login <profile>` | add or re-authenticate an account: browser, manual (no browser, for ssh), or API key |
 | `clauth list` / `clauth which` | account table with cached usage / who owns this session |
 | `clauth sessions`, `resume`, `info` | browse past Claude Code sessions and resume one anywhere |
 | `clauth daemon` | headless refresh + auto-switch loop |

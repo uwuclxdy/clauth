@@ -473,12 +473,14 @@ pub(crate) fn stored_scopes(
     config.lock().ok()?.find(name)?.scopes_joined()
 }
 
-/// Exchange an authorization code (from the interactive loopback login in
-/// `oauth_login`) for an OAuth token pair. Uses the same client + HTTP agent as
-/// [`refresh_result`], against [`TOKEN_ENDPOINT`] (the `platform.claude.com`
-/// host the current Claude Code binary uses), carrying the same axios-mimicking
-/// headers. `redirect_uri` MUST byte-match the one sent to the authorize
-/// endpoint, and `state` echoes the value round-tripped through the browser.
+/// Exchange an authorization code (from the interactive login in `oauth_login`,
+/// whether the loopback callback or a pasted manual code delivered it) for an
+/// OAuth token pair. Uses the same client + HTTP agent as [`refresh_result`],
+/// against [`TOKEN_ENDPOINT`] (the `platform.claude.com` host the current
+/// Claude Code binary uses), carrying the same axios-mimicking headers.
+/// `redirect_uri` MUST byte-match the one sent to the authorize endpoint (the
+/// loopback URL, or `oauth_login::MANUAL_REDIRECT_URI`), and `state` echoes
+/// the value round-tripped through the browser.
 ///
 /// Errs as [`TokenFailure`] rather than `anyhow::Error` so the rejection body —
 /// which reached a login toast and `clauth login`'s stderr verbatim — has

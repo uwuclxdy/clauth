@@ -51,8 +51,8 @@ Every request clauth makes, and what rides along with it:
 |----------|------|---------|
 | `api.github.com/repos/uwuclxdy/clauth/releases/latest` + release assets | background update check on launch (binary installs only) | no credentials, just a `User-Agent` |
 | `platform.claude.com/v1/oauth/token` | token refresh ahead of expiry, on a rejected request, and on `t` force-rotate | your stored refresh token |
-| `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser | no credentials; a PKCE challenge + random `state` |
-| `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange | the one-time auth code + PKCE verifier (mints a fresh token pair) |
+| `claude.com/cai/oauth/authorize` | `clauth login` interactive sign-in, opened in your browser, or shown as a link for you to open anywhere (`--manual`) | no credentials; a PKCE challenge + random `state` |
+| `platform.claude.com/v1/oauth/token` | `clauth login` authorization-code exchange; a manual login sends the manual redirect URI and the same `state` | the one-time auth code + PKCE verifier (mints a fresh token pair) |
 | `api.anthropic.com/api/oauth/usage` | usage poll on the refresh interval | access token (Bearer) |
 | `api.anthropic.com/api/oauth/profile` | plan-tier detection, and reading which account a token belongs to (so a live re-login can be told apart) | access token |
 | `api.anthropic.com/v1/messages` | auto-start kick (opt-in, off by default) | access token; a 1-token Haiku request |
@@ -65,7 +65,7 @@ Every request clauth makes, and what rides along with it:
 | `bailian.console.aliyun.com` or `modelstudio.console.alibabacloud.com` | `clauth login` on a Model Studio profile, opened in your browser to capture that console session | no credentials; the callback comes back to a loopback listener |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |
 
-Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize (or, with `--manual`, showing you the same link to open anywhere) and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
 
 ## What acts on your behalf
 
@@ -86,6 +86,7 @@ User-invoked, only when you run the command:
 
 - **Interactive login (`clauth login <profile>`).** Opens your browser to Claude's OAuth authorize page and binds a loopback listener on `127.0.0.1:<random port>` to catch the redirect, then exchanges the returned code for a fresh token pair written into the new profile.
   - It reproduces Claude Code's own PKCE flow, touches no other account, and never opens a usage window. On macOS this is why `clauth login` works at all: Claude Code's own `/login` under a custom config dir writes only a per-config-dir Keychain item, never the profile's credentials file.
+- **Manual login (`clauth login <profile> --manual`, or the Setup tab's `manual login (no browser)` row).** The same authorize request, with Claude Code's manual redirect instead of a loopback one: no listener, no browser opened on this host. You open the link wherever you like, and the page shows a one-time `code#state` string that you paste back. clauth checks the `state` half against the one it generated before exchanging the code. The pasted string is a bearer-grade secret until exchanged: read echo-off on the command line, masked in the TUI, held in memory only, never logged and never written to disk. In the TUI, <kbd>c</kbd> writes the link (which carries no credential) to your terminal's clipboard through the OSC 52 escape and nothing else.
 - **`clauth start` / `clauth resume`.** Spawns `claude` against the profile you named, so everything that session sends bills to that account. clauth forwards your args and sends nothing of its own.
 
 - **Rolling session token (`clauth rolling-token <profile>`).** Points the profile's `session-token.json` at that profile's own OAuth usage chain: the daemon re-stamps the file with the chain's current access token, minus the refresh token, so sessions still hold nothing rotatable.
