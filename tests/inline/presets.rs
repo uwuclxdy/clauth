@@ -14,10 +14,11 @@ fn models(default: &str) -> ModelSettings {
 }
 
 /// The shipped names in menu order, so a table change lands in one place.
-const BUILTIN_NAMES: [&str; 7] = [
+const BUILTIN_NAMES: [&str; 8] = [
     "DeepSeek",
     "Z.ai",
     "OpenRouter",
+    "MiniMax",
     "Qwen-TokenPlan-Intl",
     "Qwen-TokenPlan-CN",
     "Qwen-CodingPlan-Intl",
@@ -67,6 +68,14 @@ fn the_builtins_ship_with_their_endpoint_and_base_model() {
         Some("openrouter/auto")
     );
     assert_eq!(openrouter.models.opus, None);
+
+    let minimax = &listed[3];
+    assert_eq!(
+        minimax.base_url.as_deref(),
+        Some("https://api.minimax.io/anthropic")
+    );
+    assert_eq!(minimax.models.default.as_deref(), Some("MiniMax-M3"));
+    assert_eq!(minimax.models.opus, None);
 }
 
 /// Alibaba's endpoints answer `400 "Model not exist."` for any Claude model id,

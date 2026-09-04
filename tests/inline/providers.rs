@@ -346,3 +346,79 @@ fn console_url_answers_none_for_a_base_url_the_provider_does_not_own() {
     );
     assert_eq!(Provider::DeepSeek.console_url(""), None);
 }
+
+// ── ThirdPartyStats::to_usage_info ────────────────────────────────────────────
+
+fn stats_with_bars(bars: Vec<UsageBar>) -> ThirdPartyStats {
+    ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars,
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+fn bar(label: &str, pct: f64) -> UsageBar {
+    UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: Some("2026-09-04T15:00:00+00:00".to_string()),
+        used: None,
+        total: None,
+    }
+}
+
+#[test]
+fn to_usage_info_maps_the_two_windows_the_chain_judges() {
+    let usage = stats_with_bars(vec![bar("5h", 62.0), bar("7d", 31.0)])
+        .to_usage_info()
+        .expect("both windows present");
+    assert_eq!(usage.five_hour.as_ref().map(|w| w.utilization), Some(62.0));
+    assert_eq!(usage.seven_day.as_ref().map(|w| w.utilization), Some(31.0));
+    assert_eq!(
+        usage.five_hour.and_then(|w| w.resets_at).as_deref(),
+        Some("2026-09-04T15:00:00+00:00"),
+        "the reset instant is what makes the window judgeable as live"
+    );
+}
+
+#[test]
+fn to_usage_info_drops_windows_that_are_not_5h_or_7d() {
+    // z.ai's 30d ceiling is account-wide, not per-model, so folding it into
+    // `weekly_scoped` would block the member as though one model were capped.
+    let usage = stats_with_bars(vec![bar("5h", 10.0), bar("30d", 99.0)])
+        .to_usage_info()
+        .expect("the 5h window still maps");
+    assert!(usage.seven_day.is_none());
+    assert!(usage.weekly_scoped.is_empty());
+}
+
+#[test]
+fn to_usage_info_declines_a_stats_with_no_recognised_window() {
+    assert!(stats_with_bars(Vec::new()).to_usage_info().is_none());
+    assert!(
+        stats_with_bars(vec![bar("30d", 5.0)])
+            .to_usage_info()
+            .is_none(),
+        "a balance-only or monthly-only provider contributes no chain window"
+    );
+}
+
+#[test]
+fn to_usage_info_refuses_best_effort_stats() {
+    // The generic scanner's guess at an unknown endpoint is a figure nobody
+    // verified; believing it would park an account out of the rotation.
+    let mut stats = stats_with_bars(vec![bar("5h", 99.0)]);
+    stats.best_effort = true;
+    assert!(stats.to_usage_info().is_none());
+}
+
+#[test]
+fn to_usage_info_clamps_a_bar_into_the_utilization_range() {
+    let usage = stats_with_bars(vec![bar("5h", 140.0)])
+        .to_usage_info()
+        .expect("still a window");
+    assert_eq!(usage.five_hour.map(|w| w.utilization), Some(100.0));
+}

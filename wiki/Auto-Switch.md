@@ -29,6 +29,8 @@ An account is exhausted when either window is past its line.
 
 The weekly lines are deliberately below 100. Topping out a week bricks an account for days rather than hours, so clauth moves off while there is still room to land the hop. The 100% hard cap blocks an account regardless of every toggle below.
 
+API-key accounts are judged on the same lines, using whatever 5h / 7d windows their provider publishes — Z.ai, MiniMax and Alibaba Model Studio today. Before, only OAuth accounts could ever be exhausted, so a `fallback_threshold` on an api-key member never fired. A window a provider does not publish simply has no line to cross, and a best-effort scan of an unrecognised endpoint never counts: its numbers are guessed from the response shape, and parking an account on a guess is worse than not switching. Windows on any other schedule (z.ai's 30d ceiling) render as bars but are not judged — the chain only knows the 5h and 7d lines.
+
 Per-model weekly windows (a "7d fable" window, say) gate the same way: an account whose scoped week is past the line stays out of rotation, since a session of the capped model landed there would strand, and the walk cannot know which model your next session runs.
 
 Two per-account toggles relax this:

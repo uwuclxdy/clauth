@@ -239,20 +239,28 @@ pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
         .collect()
 }
 
-/// The profile's OAuth usage windows, read fresh from the disk cache; empty
-/// when there is no cache. The rows of the published `status.json` `windows`
-/// array — hence this flat spelling rather than [`ProfileWindows`]'s
-/// discriminated one, which the MCP surface renders.
+/// The profile's usage windows, read fresh from the disk cache; empty when
+/// there is no cache. The rows of the published `status.json` `windows` array —
+/// hence this flat spelling rather than [`ProfileWindows`]'s discriminated one,
+/// which the MCP surface renders.
 ///
-/// Empty TOO for an account whose figures live in the third-party cache, the
-/// shared cache selector's name-only form
-/// ([`crate::profile::stored_usage_cache_is_third_party`]): whatever
-/// `usage_cache.json` still holds for one is a leftover from an earlier OAuth
-/// life, and publishing it rendered a stale 100% Anthropic window beside
-/// `"third_party":{"available":true}` for an account with no Anthropic window.
+/// Each account is read from ITS OWN cache, on the shared cache selector's
+/// name-only form ([`crate::profile::stored_usage_cache_is_third_party`]) — an
+/// api-key account's windows come from `third_party_cache.json` via
+/// [`ThirdPartyStats::to_usage_info`], never from `usage_cache.json`. Reading
+/// the OAuth file for one published a stale 100% Anthropic window beside
+/// `"third_party":{"available":true}`, a leftover from an earlier OAuth life
+/// describing a window that account no longer has; keeping the two files apart
+/// is what makes publishing the third-party figures safe rather than a second
+/// way to render that same leftover.
 pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
     if crate::profile::stored_usage_cache_is_third_party(name) {
-        return Vec::new();
+        return load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
+            .as_ref()
+            .and_then(ThirdPartyStats::to_usage_info)
+            .as_ref()
+            .map(oauth_windows)
+            .unwrap_or_default();
     }
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
         .as_ref()

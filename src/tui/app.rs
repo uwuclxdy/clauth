@@ -2175,6 +2175,7 @@ impl App {
             );
             bootstrap_third_party(
                 &h.third_party_usage_store,
+                &h.usage_store,
                 &h.third_party_status,
                 &h.last_fetched,
                 &third_party,
@@ -2369,6 +2370,18 @@ impl App {
                     && s.contains_key(p.name.as_str())
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
+                }
+                // A third-party member's bars are its usage snapshot. The OAuth
+                // store above just wrote `None` over this account (it holds no
+                // entry for one), so the seed `load_profile` set is gone by
+                // here and the derivation has to run on every apply, not once
+                // at load. Guarded on `is_none` so a hybrid account that really
+                // does carry an OAuth reading keeps it — that one is the
+                // authoritative window, the provider cache is the other leg.
+                if p.usage.is_none()
+                    && let Some(stats) = p.third_party_usage.as_ref()
+                {
+                    p.usage = stats.to_usage_info();
                 }
             }
 
