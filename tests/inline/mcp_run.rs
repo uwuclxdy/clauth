@@ -4037,6 +4037,29 @@ fn the_two_deadline_parameters_each_disclose_the_other() {
     }
 }
 
+/// Structural twin of the deadline-disclosure pin: the `resume` description
+/// must name the split (`cwd` travels, `env` does not), so a future change that
+/// carries the spawn's env forward must also edit the description, and dropping
+/// the disclosure reds. A wording rewrite stays free.
+#[test]
+fn the_resume_description_discloses_the_env_split() {
+    let tools = ClauthServer::new().tool_router.list_all();
+    let delegate = tools
+        .iter()
+        .find(|t| t.name == "delegate")
+        .expect("delegate tool is registered");
+    let props = delegate.input_schema["properties"]
+        .as_object()
+        .expect("the schema carries its parameters");
+    let text = props["resume"]["description"]
+        .as_str()
+        .expect("every parameter carries a description");
+    assert!(
+        text.contains("env") && text.contains("does not travel"),
+        "`resume` must disclose that `env` does not travel: {text}",
+    );
+}
+
 #[test]
 fn a_streaming_delegate_ignores_every_timeout_secs_it_is_given() {
     for secs in [1, 60, 900, 3600, 99_999] {

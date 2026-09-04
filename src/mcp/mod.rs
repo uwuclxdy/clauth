@@ -658,6 +658,10 @@ pub(crate) struct DelegateArgs {
     /// in the session's original working directory. `cwd` is optional.
     /// `delegate` refuses to resume if it differs from the original directory.
     ///
+    /// The original call's `env` does not travel: a resume runs with this
+    /// call's `env` only. Pass the same `env` again when the resumed run needs
+    /// it.
+    ///
     /// Without `profiles`, the delegate runs on the account this session last
     /// ran on (from the conversation record); name `profiles` to spend a
     /// different one.
