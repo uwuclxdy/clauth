@@ -445,13 +445,16 @@ fn draw_login(
     } else {
         ("   esc ", "cancel")
     };
+    let what = match session.method {
+        crate::tui::app::LoginMethod::Browser => "complete it in your browser",
+        // Stage-neutral: the exchange and the verify probe both pass through
+        // here, and the modal's stage line is where the live stage belongs.
+        crate::tui::app::LoginMethod::Manual => "manual login in progress",
+    };
     let spans = vec![
         Span::styled(format!("{} ", spinner_frame(tick)), theme::accent()),
         Span::styled(
-            format!(
-                "logging in '{}' (complete it in your browser)",
-                session.name
-            ),
+            format!("logging in '{}' ({what})", session.name),
             theme::dim(),
         ),
         Span::styled(key, theme::accent().bold()),

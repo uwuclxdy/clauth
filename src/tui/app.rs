@@ -236,6 +236,11 @@ pub(crate) enum ConfigRow {
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
     /// `+ new` form, create the account from the login). Async — runs on a worker.
     Login,
+    /// The same OAuth mint without a browser on this host: a link to open on
+    /// any device, then the `code#state` that page shows, pasted back. Rendered
+    /// only where `Login` would run the browser mint; the api-key re-entry and
+    /// the console capture have no manual twin. Async once a code is submitted.
+    ManualLogin,
     /// Drop this account's stored OAuth credentials, keeping the profile shell.
     DeleteCreds,
     /// CLA-SPLIT escape hatch: delete this account's `session-token.json`, so
@@ -435,6 +440,7 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
+            | ConfigRow::ManualLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
@@ -461,6 +467,7 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
+            | ConfigRow::ManualLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
@@ -517,7 +524,10 @@ pub(crate) enum ConfirmAction {
     /// Setup `+ new` draft: a login already stashed a mint (the `✓ logged in`
     /// row), so re-running would silently replace it. Confirm first, then
     /// re-dispatch `start_login`. `bool` = `is_new`, carried to the restart.
-    RestartLogin(String, bool),
+    /// Replace a captured stash by re-running the login of the ROW that was
+    /// pressed (`bool` = `is_new`); the stash itself does not remember which
+    /// flow minted it, and does not need to.
+    RestartLogin(String, bool, LoginMethod),
     /// Delete row on a profile with a live `clauth start` session: the unforced
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
@@ -931,9 +941,48 @@ pub(crate) enum Modal {
     ActionMenu(ActionMenuState),
     /// Custom env key collides with an existing source; overwrite/keep/cancel.
     EnvCollision(EnvCollisionForm),
-    /// In-flight browser login progress; renders live from [`App::login`].
-    /// esc/q collapse it to the footer indicator — the login keeps running.
+    /// Manual (no browser) login: the link to open elsewhere, then the pasted
+    /// code. Holds the pending PKCE state itself; a [`LoginSession`] starts
+    /// only once a code is submitted, so esc here is a plain close.
+    ManualLogin(ManualLoginForm),
+    /// In-flight login progress (a browser round-trip, or a manual exchange);
+    /// renders live from [`App::login`]. esc/q collapse it to the footer
+    /// indicator — the login keeps running.
     Login,
+}
+
+/// The manual (no browser) login modal, in two phases so the copy key and the
+/// pasted code can never collide: `Link` shows the URL and answers `c`, ⏎, and
+/// esc only; `Code` is a text field where every printable character is data.
+#[derive(Clone)]
+pub(crate) struct ManualLoginForm {
+    pub(crate) name: String,
+    /// Same meaning as [`LoginSession::is_new`].
+    pub(crate) is_new: bool,
+    pub(crate) pending: crate::oauth_login::PendingManualLogin,
+    pub(crate) phase: ManualPhase,
+    /// The pasted `code#state`; masked in render, never logged.
+    pub(crate) input: InputState,
+}
+
+/// Hand-written so the pasted code cannot ride a `{:?}` anywhere (`Modal`
+/// derives `Debug`, and the derived `InputState` one prints its value).
+impl std::fmt::Debug for ManualLoginForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManualLoginForm")
+            .field("name", &self.name)
+            .field("is_new", &self.is_new)
+            .field("phase", &self.phase)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManualPhase {
+    /// Showing the link: `c` copies it, ⏎ moves on to the code, esc cancels.
+    Link,
+    /// Taking the code: ⏎ submits, esc goes back to the link.
+    Code,
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -1472,8 +1521,9 @@ pub(crate) enum MainItemKind {
 
 // ── Login session ─────────────────────────────────────────────────────────────
 
-/// An in-flight browser OAuth login. The worker blocks up to 180s in
-/// `oauth_login::login_with`; the UI stays live and applies the result in
+/// An in-flight OAuth login. A browser one blocks its worker up to 180s in
+/// `oauth_login::login_with`; a manual one starts at the exchange, once the
+/// code is pasted. Either way the UI stays live and applies the result in
 /// `on_tick`. `generation` discards a stale result from a login the user
 /// superseded (esc-cancel or a fresh login start).
 pub(crate) struct LoginSession {
@@ -1486,7 +1536,13 @@ pub(crate) struct LoginSession {
     pub(crate) url: Option<String>,
     /// Live milestone for the modal's stage line.
     pub(crate) stage: LoginStage,
+    /// Which flow this is, for the copy the modal and footer show.
+    pub(crate) method: LoginMethod,
 }
+
+// Re-exported so the render code and the tests keep addressing it as this
+// module's type: the CLI runs the same two flows off the same enum.
+pub(crate) use crate::oauth_login::LoginMethod;
 
 /// Where an in-flight login currently sits, mapped from
 /// [`crate::oauth_login::LoginProgress`] worker events.
@@ -1506,11 +1562,11 @@ pub(crate) enum LoginEvent {
     Stage(LoginStage),
 }
 
-/// What a finished login worker produced. Both flows are a browser round-trip
-/// announced through the same [`LoginEvent`] channel and drawn by the same
-/// modal, and they diverge only at apply time: an Anthropic login replaces the
-/// profile's credentials, an Alibaba console login replaces its usage session
-/// and touches nothing else.
+/// What a finished login worker produced. Every flow (browser, manual paste,
+/// Alibaba console) reports through the same [`LoginEvent`] channel and is
+/// drawn by the same modal, and they diverge only at apply time: an Anthropic
+/// login replaces the profile's credentials, an Alibaba console login replaces
+/// its usage session and touches nothing else.
 ///
 /// The drain routes on this payload rather than on anything recorded in
 /// [`LoginSession`], so a session and its result cannot disagree about which
@@ -1629,7 +1685,7 @@ pub(crate) struct App {
     /// Join handle for the update check thread; joined on TUI exit for clean shutdown.
     pub(crate) update_handle: Option<JoinHandle<()>>,
 
-    /// In-flight browser OAuth login (Setup tab); `None` when idle.
+    /// In-flight login worker of any method (Setup tab); `None` when idle.
     pub(crate) login: Option<LoginSession>,
     /// Monotonic login id; bumped on each start so a superseded worker's result
     /// is discarded when it lands.
@@ -5815,6 +5871,7 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
+        Modal::ManualLogin(_) => handle_manual_login_key(app, key),
         Modal::Login => match key.code {
             // Re-fire the browser open. The URL exists once the worker announced
             // it; before that there is nothing to open, so `r` is a no-op.
@@ -6225,6 +6282,9 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::Model);
         if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::Login);
+            // Stays beside a captured stash: `Login` renders the `✓ logged in`
+            // state, and ⏎ on either row goes through the same replace-confirm.
+            rows.push(ConfigRow::ManualLogin);
         }
         rows.push(ConfigRow::Create);
         return rows;
@@ -6295,6 +6355,12 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     // row acts on what's on disk, so a hybrid's token can't be hidden behind
     // either a base url or an uncommitted draft.
     rows.push(ConfigRow::Login);
+    // The manual twin exists only where `Login` runs the browser mint. Decided
+    // on the profile ALREADY borrowed here: `cfg` holds the config mutex, which
+    // is not reentrant, so `login_row_flow` (which locks) cannot be asked.
+    if login_flow_for(profile) == LoginRowFlow::OauthMint {
+        rows.push(ConfigRow::ManualLogin);
+    }
     let has_creds = if profile.is_some_and(|p| p.login_is_oauth()) {
         profile.and_then(|p| p.credentials.as_ref()).is_some()
     } else {
@@ -6523,45 +6589,20 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 }
                 LoginRowFlow::OauthMint => {}
             }
-            let target = match editing {
-                Some(name) => Some((name, false)),
-                None => {
-                    let typed = app
-                        .config_draft
-                        .as_ref()
-                        .map(|d| d.name.trimmed().to_string())
-                        .unwrap_or_default();
-                    let validation = {
-                        let cfg = app.config();
-                        validate_profile_name(&typed, &cfg.names(), None)
-                    };
-                    match validation {
-                        Ok(()) => Some((typed, true)),
-                        Err(e) => {
-                            app.toast(ToastKind::Danger, format!("{e}"));
-                            None
-                        }
-                    }
-                }
-            };
-            if let Some((name, is_new)) = target {
-                // A stashed mint (the `✓ logged in` done-state) makes ⏎ a
-                // stash-replacing re-login; gate it so it can't drop the capture
-                // silently. Only the `+ new` draft ever holds a stash.
-                let has_stash = app
-                    .config_draft
-                    .as_ref()
-                    .is_some_and(|d| d.captured_login.is_some());
-                if has_stash {
-                    app.modals.push(Modal::Confirm(ConfirmState {
-                        message: "replace the captured login?".to_string(),
-                        detail: Some("the login you already captured will be dropped".to_string()),
-                        choice: false,
-                        on_confirm: ConfirmAction::RestartLogin(name, is_new),
-                    }));
-                } else {
-                    start_login(app, name, is_new);
-                }
+            if let Some((name, is_new)) = oauth_login_target(app, editing) {
+                begin_oauth_login(app, name, is_new, LoginMethod::Browser);
+            }
+        }
+        ConfigRow::ManualLogin => {
+            // Rendered only where `Login` resolves to the OAuth mint (see
+            // `config_rows`), so there is no flow to dispatch: this row IS the
+            // mint, minus the browser.
+            let editing = app
+                .config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.clone());
+            if let Some((name, is_new)) = oauth_login_target(app, editing) {
+                begin_oauth_login(app, name, is_new, LoginMethod::Manual);
             }
         }
         ConfigRow::DeleteCreds => {
@@ -6846,16 +6887,7 @@ fn start_api_relogin(app: &mut App) {
 /// (divergence-gated in `apply_login`). A second ⏎ while one is in flight
 /// re-expands the progress modal instead of starting another login.
 fn start_login(app: &mut App, name: String, is_new: bool) {
-    if let Some(session) = app.login.as_ref() {
-        // A ⏎ aimed at a different account can't start a second login — say
-        // so instead of silently re-showing the in-flight session's modal.
-        if session.name != name || session.is_new != is_new {
-            app.toast(
-                ToastKind::Warning,
-                format!("a login for '{}' is already in progress", session.name),
-            );
-        }
-        open_login_modal(app);
+    if login_in_flight(app, &name, is_new) {
         return;
     }
     app.login_generation += 1;
@@ -6866,18 +6898,13 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
         generation,
         url: None,
         stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
     });
     let event_tx = app.login_event_tx.clone();
     let result_tx = app.login_result_tx.clone();
     spawn_worker(move || {
         let res = crate::oauth_login::login_with(|progress| {
-            use crate::oauth_login::LoginProgress;
-            let event = match progress {
-                LoginProgress::AuthorizeUrl(url) => LoginEvent::Url(url.to_string()),
-                LoginProgress::ExchangingCode => LoginEvent::Stage(LoginStage::ExchangingCode),
-                LoginProgress::Verifying => LoginEvent::Stage(LoginStage::Verifying),
-            };
-            let _ = event_tx.send((generation, event));
+            let _ = event_tx.send((generation, login_event(progress)));
         });
         // A toast, not stderr: the canned line without the HTTP status. The
         // status is in `~/.clauth/clauth.log` via the exchange's `logline!`.
@@ -6912,36 +6939,268 @@ pub(crate) enum LoginRowFlow {
 }
 
 /// Resolve the `log in` row's flow for the draft's account (`None` on the
-/// `+ new` form, which can only mint).
+/// `+ new` form, which can only mint). Locks the config; callers already
+/// holding the guard use [`login_flow_for`] directly.
 fn login_row_flow(app: &App, editing: Option<&str>) -> LoginRowFlow {
     let Some(name) = editing else {
         return LoginRowFlow::OauthMint;
     };
-    let name = ProfileName::from(name);
-    if let Some((site, region)) = console_login_target(app, &name) {
+    let cfg = app.config();
+    login_flow_for(cfg.find(&ProfileName::from(name)))
+}
+
+/// The flow decision itself, on an already-borrowed profile (`None` = no
+/// account, which can only mint). The console verdict is
+/// [`Profile::console_login_target`], shared with the row's hint and label so
+/// the copy cannot describe a different flow than the one ⏎ runs.
+pub(crate) fn login_flow_for(profile: Option<&Profile>) -> LoginRowFlow {
+    let Some(p) = profile else {
+        return LoginRowFlow::OauthMint;
+    };
+    if let Some((site, region)) = p.console_login_target() {
         return LoginRowFlow::Console { site, region };
     }
-    let cfg = app.config();
-    match cfg.find(&name) {
-        Some(p) if !p.login_is_oauth() => LoginRowFlow::ApiKey,
-        _ => LoginRowFlow::OauthMint,
+    if p.login_is_oauth() {
+        LoginRowFlow::OauthMint
+    } else {
+        LoginRowFlow::ApiKey
     }
 }
 
-/// Which console the `log in` row would capture a session from for `name`, or
-/// `None` when that row runs one of its other two flows (an api-key re-entry or
-/// an Anthropic browser mint).
-///
-/// Split out of the row so the decision is readable without starting a browser
-/// round-trip: driving the row itself binds a loopback listener and opens a
-/// browser, which is not something a test may do.
-///
-/// The verdict itself is [`Profile::console_login_target`], shared with the row's
-/// hint and label so the copy cannot describe a different flow than the one ⏎
-/// runs.
-fn console_login_target(app: &App, name: &ProfileName) -> Option<(ConsoleSite, &'static str)> {
-    let cfg = app.config();
-    cfg.find(name)?.console_login_target()
+/// The account an OAuth-mint row acts on: an existing draft re-logs in place;
+/// the `+ new` form validates its typed name now and creates on mint. `None`
+/// (with a toast) when the typed name is unusable.
+fn oauth_login_target(app: &mut App, editing: Option<String>) -> Option<(String, bool)> {
+    match editing {
+        Some(name) => Some((name, false)),
+        None => {
+            let typed = app
+                .config_draft
+                .as_ref()
+                .map(|d| d.name.trimmed().to_string())
+                .unwrap_or_default();
+            let validation = {
+                let cfg = app.config();
+                validate_profile_name(&typed, &cfg.names(), None)
+            };
+            match validation {
+                Ok(()) => Some((typed, true)),
+                Err(e) => {
+                    app.toast(ToastKind::Danger, format!("{e}"));
+                    None
+                }
+            }
+        }
+    }
+}
+
+/// Shared head of the two OAuth-mint rows: nothing starts while a login is in
+/// flight, a captured stash is confirmed before it is dropped, and only then
+/// does `method`'s flow begin.
+fn begin_oauth_login(app: &mut App, name: String, is_new: bool, method: LoginMethod) {
+    if login_in_flight(app, &name, is_new) {
+        return;
+    }
+    // A stashed mint (the `✓ logged in` done-state) makes ⏎ a stash-replacing
+    // re-login; gate it so it can't drop the capture silently. Only the `+ new`
+    // draft ever holds a stash.
+    let has_stash = app
+        .config_draft
+        .as_ref()
+        .is_some_and(|d| d.captured_login.is_some());
+    if has_stash {
+        app.modals.push(Modal::Confirm(ConfirmState {
+            message: "replace the captured login?".to_string(),
+            detail: Some("the login you already captured will be dropped".to_string()),
+            choice: false,
+            on_confirm: ConfirmAction::RestartLogin(name, is_new, method),
+        }));
+    } else {
+        restart_login(app, name, is_new, method);
+    }
+}
+
+/// Run `method`'s flow for the given target, past every guard.
+fn restart_login(app: &mut App, name: String, is_new: bool, method: LoginMethod) {
+    match method {
+        LoginMethod::Browser => start_login(app, name, is_new),
+        LoginMethod::Manual => open_manual_login(app, name, is_new),
+    }
+}
+
+/// A login already running owns the progress modal: a ⏎ aimed at the same
+/// target re-expands it, one aimed elsewhere says so. Either way nothing new
+/// starts — a second worker would race the first for `app.login`.
+fn login_in_flight(app: &mut App, name: &str, is_new: bool) -> bool {
+    let Some(session) = app.login.as_ref() else {
+        return false;
+    };
+    if session.name != name || session.is_new != is_new {
+        app.toast(
+            ToastKind::Warning,
+            format!("a login for '{}' is already in progress", session.name),
+        );
+    }
+    open_login_modal(app);
+    true
+}
+
+/// The worker→UI event for one `oauth_login` milestone, shared by both flows.
+fn login_event(progress: crate::oauth_login::LoginProgress<'_>) -> LoginEvent {
+    use crate::oauth_login::LoginProgress;
+    match progress {
+        LoginProgress::AuthorizeUrl(url) => LoginEvent::Url(url.to_string()),
+        LoginProgress::ExchangingCode => LoginEvent::Stage(LoginStage::ExchangingCode),
+        LoginProgress::Verifying => LoginEvent::Stage(LoginStage::Verifying),
+    }
+}
+
+/// Start the manual (no browser) login: mint the PKCE state and open the link
+/// modal. No [`LoginSession`] yet — nothing is in flight until a code is
+/// submitted, so esc on the modal is a plain close and the top-level esc
+/// (which cancels an in-flight login) is not in play.
+fn open_manual_login(app: &mut App, name: String, is_new: bool) {
+    match crate::oauth_login::begin_manual_login() {
+        Ok(pending) => app.modals.push(Modal::ManualLogin(ManualLoginForm {
+            name,
+            is_new,
+            pending,
+            phase: ManualPhase::Link,
+            input: InputState::new(""),
+        })),
+        Err(e) => app.toast(
+            ToastKind::Danger,
+            format!("login failed\n{}", e.user_message()),
+        ),
+    }
+}
+
+/// Keys on the manual login modal. Phase decides the vocabulary: in `Link`
+/// only `c`, ⏎, and esc mean anything, so a paste that lands here by mistake
+/// changes nothing; in `Code` every printable character is data (`c` and `q`
+/// included — a paste arrives as one key event per character), esc goes back
+/// to the link, and ⏎ submits.
+fn handle_manual_login_key(app: &mut App, key: KeyEvent) {
+    enum Act {
+        None,
+        Copy(String),
+        Cancel,
+        Submit,
+    }
+    let Some(Modal::ManualLogin(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let act = match form.phase {
+        ManualPhase::Link => match key.code {
+            KeyCode::Char('c' | 'C') => Act::Copy(form.pending.url().to_string()),
+            KeyCode::Enter => {
+                form.phase = ManualPhase::Code;
+                Act::None
+            }
+            KeyCode::Esc => Act::Cancel,
+            _ => Act::None,
+        },
+        ManualPhase::Code => match key.code {
+            KeyCode::Esc => {
+                form.input = InputState::new("");
+                form.phase = ManualPhase::Link;
+                Act::None
+            }
+            KeyCode::Enter => Act::Submit,
+            // The cap `parse` enforces, applied at the door so a runaway paste
+            // is not held first and refused after.
+            KeyCode::Char(_) if form.input.value.len() >= crate::oauth_login::MANUAL_CODE_MAX => {
+                Act::None
+            }
+            _ => {
+                apply_input_edit(&mut form.input, key);
+                Act::None
+            }
+        },
+    };
+    match act {
+        Act::None => {}
+        // OSC 52 lands on the LOCAL terminal's clipboard even over ssh. `Ok`
+        // proves only that the bytes left; the terminal's answer is not
+        // observable, so the toast says "sent", not "copied".
+        Act::Copy(url) => match crate::platform::copy_to_clipboard_osc52(&url) {
+            Ok(()) => app.toast(ToastKind::Info, "link sent to your clipboard"),
+            Err(e) => app.toast(
+                ToastKind::Danger,
+                format!("couldn't send the link to your clipboard\n{e}"),
+            ),
+        },
+        Act::Cancel => {
+            app.modals.pop();
+            app.toast(ToastKind::Info, "login canceled");
+        }
+        Act::Submit => submit_manual_code(app),
+    }
+}
+
+/// ⏎ in the `Code` phase: parse against the pending login's own `state`
+/// WITHOUT consuming it, so a bad paste is corrected against the same link;
+/// a good one seats the session and hands the exchange to a worker, joining
+/// the browser flow's drain/apply path from there.
+fn submit_manual_code(app: &mut App) {
+    let parsed = {
+        let Some(Modal::ManualLogin(form)) = app.modals.last_mut() else {
+            return;
+        };
+        let raw = form.input.trimmed().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        form.pending.parse(&raw).map_err(|e| {
+            // The buffer is masked, so it cannot be edited by eye; and a
+            // corrected paste appended to leftover bytes would pass the shape
+            // check and burn the exchange. Clear, then say so.
+            form.input = InputState::new("");
+            e.user_message()
+        })
+    };
+    let code = match parsed {
+        Ok(code) => code,
+        Err(msg) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("{msg}\ncleared, paste the whole code again"),
+            );
+            return;
+        }
+    };
+    let Some(Modal::ManualLogin(form)) = app.modals.pop() else {
+        return;
+    };
+    let ManualLoginForm {
+        name,
+        is_new,
+        pending,
+        ..
+    } = form;
+    app.login_generation += 1;
+    let generation = app.login_generation;
+    app.login = Some(LoginSession {
+        name,
+        is_new,
+        generation,
+        url: None,
+        stage: LoginStage::ExchangingCode,
+        method: LoginMethod::Manual,
+    });
+    let event_tx = app.login_event_tx.clone();
+    let result_tx = app.login_result_tx.clone();
+    spawn_worker(move || {
+        let res = pending.complete(code, |progress| {
+            let _ = event_tx.send((generation, login_event(progress)));
+        });
+        let _ = result_tx.send((
+            generation,
+            res.map(|o| LoginResult::Oauth(Box::new(o)))
+                .map_err(|e| e.user_message()),
+        ));
+    });
+    open_login_modal(app);
 }
 
 /// Kick the Alibaba console login on a worker — the same browser round-trip and
@@ -6975,6 +7234,7 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
         generation,
         url: None,
         stage: LoginStage::WaitingBrowser,
+        method: LoginMethod::Browser,
     });
     let event_tx = app.login_event_tx.clone();
     let result_tx = app.login_result_tx.clone();
@@ -7167,6 +7427,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
+        | ConfigRow::ManualLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -7274,6 +7535,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         | ConfigRow::EnvEntry(_)
         | ConfigRow::EnvAdd
         | ConfigRow::Login
+        | ConfigRow::ManualLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -8610,7 +8872,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("log out failed\n{e}")),
             }
         }
-        ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
+        ConfirmAction::RestartLogin(name, is_new, method) => {
+            restart_login(app, name, is_new, method)
+        }
         ConfirmAction::DeleteLiveSession(name) => {
             finish_delete(app, &ProfileName::from(name), true)
         }
@@ -9191,9 +9455,9 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
                 if keeps_endpoint {
-                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, model settings, and its endpoint and api key stay."
+                    "a fresh login finished for this account. the old tokens are dropped; chain slot, env, model settings, and its endpoint and api key stay."
                 } else {
-                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
+                    "a fresh login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
                 }
                 .to_string(),
             ),
