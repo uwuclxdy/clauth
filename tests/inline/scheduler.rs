@@ -3992,7 +3992,8 @@ fn bootstrap_third_party_seeds_any_cache() {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, bootstrap_third_party, now_ms,
+        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, UsageStore,
+        bootstrap_third_party, now_ms,
     };
     use crate::profile::profile_subpath;
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
@@ -4003,6 +4004,9 @@ fn bootstrap_third_party_seeds_any_cache() {
     let store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    // The OAuth-shaped map the auto-switch walk reads: a seeded third-party
+    // account has to reach it too, or its window is invisible to the chain.
+    let usage_store_for_mirror: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     let stats = |pct: f64| ThirdPartyStats {
         is_available: true,
@@ -4043,6 +4047,7 @@ fn bootstrap_third_party_seeds_any_cache() {
     let entries = vec![tp_entry("cached"), tp_entry("stale"), tp_entry("missing")];
     bootstrap_third_party(
         &store,
+        &usage_store_for_mirror,
         &status,
         &last_fetched,
         &entries,
@@ -4060,6 +4065,23 @@ fn bootstrap_third_party_seeds_any_cache() {
     assert!(
         !store.lock().unwrap().contains_key("missing"),
         "a profile with no cache is left for the scheduler"
+    );
+    assert_eq!(
+        usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .get("cached")
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(12.0),
+        "the seeded window is mirrored into the map auto-switch reads"
+    );
+    assert!(
+        !usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .contains_key("missing"),
+        "a profile with no cache contributes no mirrored window either"
     );
     assert_eq!(
         status.lock().unwrap().get("cached").copied(),

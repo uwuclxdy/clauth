@@ -38,7 +38,7 @@
 
 **A `delegate` run did nothing and the tree is unchanged.** A delegate spawns with the permission gate armed and nobody to answer it. Pass the permission flag through `args` for a delegate that writes files, and read the `permission_denials` array in the envelope. [Claude Code plugin](Claude-Code-Plugin#delegate).
 
-**My custom endpoint shows no usage bars.** Only DeepSeek, Z.ai, OpenRouter and Alibaba Model Studio have typed panels. Everything else gets a best-effort scan of the usual usage paths, which can come back empty. Press <kbd>r</kbd> to retry an endpoint clauth gave up on. An Alibaba account is the one case where an api key is not enough: run `clauth login <account>` to capture the console session its quota is read with ([Configuration](Configuration#the-alibaba-console-session)).
+**My custom endpoint shows no usage bars.** Only DeepSeek, Z.ai, OpenRouter, MiniMax and Alibaba Model Studio have typed panels. Everything else gets a best-effort scan of the usual usage paths, which can come back empty. Press <kbd>r</kbd> to retry an endpoint clauth gave up on. An Alibaba account is the one case where an api key is not enough: run `clauth login <account>` to capture the console session its quota is read with ([Configuration](Configuration#the-alibaba-console-session)).
 
 **The Tokens tab shows `$X+` instead of a figure.** Some model in that period has no published price, or the period reaches into days that carry no cache split. The number is a floor. [Tokens and cost](Tokens-And-Cost#period-lens).
 

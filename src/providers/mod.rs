@@ -35,6 +35,7 @@
 pub(crate) mod alibaba;
 mod deepseek;
 mod generic;
+mod minimax;
 mod openrouter;
 mod zai;
 
@@ -127,6 +128,7 @@ pub(crate) enum Provider {
     Zai,
     Alibaba,
     OpenRouter,
+    MiniMax,
 }
 
 impl Provider {
@@ -140,6 +142,8 @@ impl Provider {
             Some(Self::Alibaba)
         } else if openrouter::matches_base_url(url) {
             Some(Self::OpenRouter)
+        } else if minimax::matches_base_url(url) {
+            Some(Self::MiniMax)
         } else {
             None
         }
@@ -151,6 +155,7 @@ impl Provider {
             Self::Zai => zai::DISPLAY_NAME,
             Self::Alibaba => alibaba::DISPLAY_NAME,
             Self::OpenRouter => openrouter::DISPLAY_NAME,
+            Self::MiniMax => minimax::DISPLAY_NAME,
         }
     }
 
@@ -161,7 +166,7 @@ impl Provider {
     /// has none: a windows-publishing provider HAS the limits even when one
     /// cached response carried no bars.
     pub(crate) fn publishes_windows(self) -> bool {
-        matches!(self, Self::Zai | Self::Alibaba)
+        matches!(self, Self::Zai | Self::Alibaba | Self::MiniMax)
     }
 
     /// The vendor page where this endpoint's api key is minted, for a surface
@@ -181,6 +186,7 @@ impl Provider {
             Self::OpenRouter => {
                 openrouter::matches_base_url(base_url).then_some(openrouter::CONSOLE_URL)
             }
+            Self::MiniMax => minimax::matches_base_url(base_url).then_some(minimax::CONSOLE_URL),
         }
     }
 
@@ -198,6 +204,7 @@ impl Provider {
             // The api key is not a quota credential here — the console session is.
             Self::Alibaba => alibaba::fetch(console),
             Self::OpenRouter => openrouter::fetch(api_key),
+            Self::MiniMax => minimax::fetch(api_key),
         }
     }
 }
@@ -234,6 +241,7 @@ impl ThirdPartyTarget {
                 // One of four console gateways, chosen by region + site.
                 Provider::Alibaba => alibaba::gateway_origin(console.as_ref()).to_string(),
                 Provider::OpenRouter => openrouter::ORIGIN.to_string(),
+                Provider::MiniMax => minimax::ORIGIN.to_string(),
             },
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
         }
@@ -384,6 +392,51 @@ impl ThirdPartyStats {
             endpoint: None,
             best_effort: false,
         }
+    }
+}
+
+impl ThirdPartyStats {
+    /// These stats as the [`UsageInfo`] the scheduling layer reads, or `None`
+    /// when this provider published no window clauth recognises.
+    ///
+    /// A provider bar and an OAuth window are the same measurement — a rolling
+    /// percentage with a reset instant — so mapping the two labels the chain
+    /// actually judges (`5h`, `7d`) lets a third-party member take part in
+    /// auto-switch, `clauth list`'s used columns, and the published
+    /// `status.json` `windows` array with no per-provider branching downstream.
+    ///
+    /// Two deliberate exclusions:
+    ///
+    /// - Any other label (z.ai's `30d`) is dropped rather than folded into
+    ///   [`UsageInfo::weekly_scoped`]. That vec means per-MODEL weekly windows
+    ///   and carries the `check_scoped` gate's semantics; a monthly account-wide
+    ///   ceiling landing there would block the member as though one model were
+    ///   capped, which is neither what it measures nor what the gate documents.
+    /// - `best_effort` stats — the generic scanner's guess at an unknown
+    ///   endpoint's shape — never become windows. A misread field there is a
+    ///   figure nobody verified, and the cost of believing it is an account
+    ///   parked out of the rotation on a number the vendor never published.
+    ///   They keep rendering as bars, which is a claim about the display only.
+    pub(crate) fn to_usage_info(&self) -> Option<crate::usage::UsageInfo> {
+        if self.best_effort {
+            return None;
+        }
+        let window = |label: &str| {
+            self.bars
+                .iter()
+                .find(|b| b.label == label)
+                .map(|b| crate::usage::UsageWindow {
+                    utilization: b.pct.clamp(0.0, 100.0),
+                    resets_at: b.resets_at.clone(),
+                })
+        };
+        let five_hour = window(crate::usage::LABEL_5H);
+        let seven_day = window(crate::usage::LABEL_7D);
+        (five_hour.is_some() || seven_day.is_some()).then(|| crate::usage::UsageInfo {
+            five_hour,
+            seven_day,
+            ..Default::default()
+        })
     }
 }
 

@@ -471,6 +471,7 @@ impl Daemon {
         );
         bootstrap_third_party(
             &self.third_party_usage_store,
+            &self.usage_store,
             &self.third_party_status,
             &self.last_fetched,
             &third_party,

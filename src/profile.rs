@@ -2250,6 +2250,14 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     } else {
         None
     };
+    // A third-party account's windows ARE its usage snapshot, so seed `usage`
+    // from them at the same boundary. Every OAuth account keeps `None` here and
+    // is filled by the usage store as before — this load has no OAuth cache to
+    // read, and `third_party_usage` is `Some` only where that store never had an
+    // entry to begin with, so the two can't overwrite each other.
+    let usage = third_party_usage
+        .as_ref()
+        .and_then(crate::providers::ThirdPartyStats::to_usage_info);
 
     let profile = Profile {
         name: name.clone(),
@@ -2285,7 +2293,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         disabled: config.disabled,
         console: console_credential(&config.console),
         credentials: slot(credentials),
-        usage: None,
+        usage,
         fetch_status: None,
         provider,
         third_party_usage,

@@ -260,6 +260,7 @@ impl ThirdPartyEntry {
                         crate::providers::Provider::Zai => b"zai".as_slice(),
                         crate::providers::Provider::Alibaba => b"alibaba".as_slice(),
                         crate::providers::Provider::OpenRouter => b"openrouter".as_slice(),
+                        crate::providers::Provider::MiniMax => b"minimax".as_slice(),
                     },
                 );
                 match console {
@@ -2129,6 +2130,37 @@ fn try_seed_cache(
     true
 }
 
+/// Publish a third-party account's derived windows into the OAuth usage store.
+///
+/// [`crate::fallback::next_auto_switch_target`] reads that ONE map, so a
+/// provider window that never lands in it is invisible to the chain however
+/// well it renders — which is why a `fallback_threshold` on an api-key member
+/// used to do nothing at all. Every reader of that map wants the same thing
+/// from a window (a live percentage against a threshold), and the derivation
+/// declines anything it cannot vouch for, so nothing here branches on provider.
+///
+/// `None` REMOVES rather than leaves the previous entry. A provider that
+/// stopped publishing windows — a plan change, a response shape clauth no
+/// longer recognises, a best-effort scan that used to guess one — has no
+/// current reading, and a frozen entry would keep answering the walk with a
+/// figure nothing refreshes: exactly the stale-cache trap the OAuth leg's
+/// liveness checks exist to avoid.
+fn publish_third_party_windows(
+    store: &UsageStore,
+    name: &ProfileName,
+    derived: Option<crate::usage::UsageInfo>,
+) {
+    let Ok(mut s) = store.lock() else { return };
+    match derived {
+        Some(info) => {
+            s.insert(name.to_string(), info);
+        }
+        None => {
+            s.remove(name.as_str());
+        }
+    }
+}
+
 /// Startup third-party seed — the api-key/provider analogue of [`bootstrap_fetch`].
 /// Each profile with a `third_party_cache.json` is seeded straight from disk
 /// (`last_fetched` stamped at the cache mtime so the cadence resumes across the
@@ -2137,6 +2169,7 @@ fn try_seed_cache(
 /// A profile with no cache is left unstamped, so the scheduler fetches it fresh.
 pub(crate) fn bootstrap_third_party(
     store: &ThirdPartyUsageStore,
+    usage: &UsageStore,
     status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
     entries: &[ThirdPartyEntry],
@@ -2153,9 +2186,12 @@ pub(crate) fn bootstrap_third_party(
         ) else {
             continue;
         };
+        // Derived before the move, so the mirror below costs no clone.
+        let derived = stats.to_usage_info();
         if let Ok(mut s) = store.lock() {
             s.insert(entry.name.to_string(), stats);
         }
+        publish_third_party_windows(usage, &entry.name, derived);
         // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
         if let Ok(mut lf) = last_fetched.lock() {
             lf.insert(entry.name.to_string(), EpochMs::from_millis(mtime));
@@ -2510,9 +2546,12 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 // that read it have no other way to learn the session came back.
                 crate::profile_cache::clear_auth_expired(&name);
                 write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+                // Derived before the move, so the mirror below costs no clone.
+                let derived = stats.to_usage_info();
                 if let Ok(mut store) = state.third_party_usage_store.lock() {
                     store.insert(name.to_string(), stats);
                 }
+                publish_third_party_windows(&state.store, &name, derived);
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), FetchStatus::Fresh);
                 }
@@ -2547,10 +2586,21 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     _ if cached.is_some() => (FetchStatus::Cached, None),
                     _ => (FetchStatus::Failed, None),
                 };
+                let derived = cached
+                    .as_ref()
+                    .and_then(crate::providers::ThirdPartyStats::to_usage_info);
                 if let Some(c) = cached
                     && let Ok(mut store) = state.third_party_usage_store.lock()
                 {
                     store.entry(name.to_string()).or_insert(c);
+                }
+                // Cold-fill, NOT `publish_third_party_windows`: this leg never
+                // overwrites a live reading with disk state, the same rule the
+                // third-party store's own `or_insert` above follows.
+                if let Some(info) = derived
+                    && let Ok(mut s) = state.store.lock()
+                {
+                    s.entry(name.to_string()).or_insert(info);
                 }
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), status);
@@ -3161,7 +3211,14 @@ fn hydrate_from_daemon_caches(
             interval_ms,
         );
     }
-    bootstrap_third_party(tp_store, tp_status, last_fetched, third_party, interval_ms);
+    bootstrap_third_party(
+        tp_store,
+        store,
+        tp_status,
+        last_fetched,
+        third_party,
+        interval_ms,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
