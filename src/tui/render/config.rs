@@ -583,57 +583,39 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
         ConfigRow::BaseUrl if snap.base_url.trim().is_empty() => {
-            "leave empty for a claude.ai account, or set an api endpoint"
+            "leave empty for a Claude account, or set an API endpoint"
         }
-        ConfigRow::BaseUrl => "the api endpoint this account calls instead of claude.ai",
-        ConfigRow::ApiKey => "api key sent to the endpoint above",
-        // The value grammar (`space cycle · ↵ custom`) already lives in the footer.
-        ConfigRow::Model => "default model for this account",
-        ConfigRow::OpusModel => "what the opus alias resolves to (full model id)",
-        ConfigRow::SonnetModel => "what the sonnet alias resolves to (full model id)",
-        ConfigRow::HaikuModel => "what the haiku alias resolves to (full model id)",
-        ConfigRow::FableModel => "what the fable alias resolves to (full model id)",
-        ConfigRow::SubagentModel => "model forced for every subagent in this account",
-        // No row or key drops the key itself — an emptied value saves as an
-        // empty string — so the hint has to say where the entry actually goes.
-        ConfigRow::EnvEntry(_) => "set while this account is active · an empty value keeps the key",
-        ConfigRow::EnvAdd => "add an env var for this account",
+        ConfigRow::BaseUrl => "the API endpoint this account calls instead of claude.ai",
+        ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
+        ConfigRow::SubagentModel => "default subagent model in this account",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
         // state. `live session` is the app-wide noun for a running `clauth
         // start`; the CLI's wording is its own.
-        ConfigRow::Disabled if snap.is_active => {
-            "the active account can't be disabled · switch away first"
-        }
+        ConfigRow::Disabled if snap.is_active => "cannot disable the global active account",
         ConfigRow::Disabled if snap.has_live_session => {
-            "has a live session, close it before disabling"
+            "cannot disable an account with a live session"
         }
         ConfigRow::Disabled if snap.disabled => {
             "excluded from auto-switch, usage polling, and status until re-enabled"
         }
         ConfigRow::Disabled => {
-            "removes this account from auto-switch, usage polling, and status until re-enabled"
+            "excludes this account from auto-switch, usage polling, and status until re-enabled"
         }
         ConfigRow::AutoStart if snap.auto_start => {
-            "starts a throwaway session when idle so the 5h window counts"
+            "sends a 1-token request to Haiku at every 5h usage reset"
         }
-        ConfigRow::AutoStart => "never starts a session on its own",
-        ConfigRow::ModelOverrideAdd => "pin what an alias resolves to, or force the subagent model",
+        ConfigRow::AutoStart => "5h usage window stays closed after reset",
+        ConfigRow::ModelOverrideAdd => "set custom model names on this account",
         ConfigRow::Login if snap.console_login => {
-            "opens the alibaba console to capture this account's usage session"
+            "log into alibaba console to see this account's usage"
         }
-        ConfigRow::Login if api_login => "re-enter the base url + api key for this account",
+        ConfigRow::Login if api_login => "re-enter the base URL + API key for this account",
         ConfigRow::Login => "browser OAuth login; mints fresh tokens for this account",
-        ConfigRow::CaptureLogin => {
-            "saves the login Claude Code is using now; create account commits it"
-        }
-        ConfigRow::DeleteCreds if api_login => {
-            "clears the stored api key; keeps the account and its settings"
-        }
-        ConfigRow::DeleteCreds => {
-            "clears the stored OAuth login; keeps the account and its settings"
-        }
+        ConfigRow::CaptureLogin => "save the current global credentials into a new account",
+        ConfigRow::DeleteCreds if api_login => "clears the stored API key",
+        ConfigRow::DeleteCreds => "clears the stored OAuth login",
         // Gate reason first (same order as `Disabled` above — a gate only ever
         // bites the clearable state), then what the clear does from here. The
         // active account's wording names the relink, since that is the half a
@@ -650,7 +632,9 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         // (armed, nothing stamped, no preserved mint) disarms without
         // stripping a credential, so it skips past — a gate line over a row
         // that acts would be the one lie a hint can tell.
-        ConfigRow::ClearSessionToken if snap.clear_gated() => "no other login stored, log in first",
+        ConfigRow::ClearSessionToken if snap.clear_gated() => {
+            "cannot clear with no other login stored"
+        }
         // The flag-only state with NO login gets its own lines rather than the
         // 4-way base below: those arms were written under the old invariant
         // that "no OAuth login" implies an api key behind it, and promising an
@@ -667,9 +651,9 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::ClearSessionToken => {
             let base = match (snap.is_active, snap.clear_falls_back_to_oauth) {
                 (true, true) => "relinks this account's own login now · running sessions follow",
-                (true, false) => "signs Claude Code out now · this account runs on its api key",
+                (true, false) => "signs Claude Code out now · this account runs on its API key",
                 (false, true) => "the next switch installs this account's own login again",
-                (false, false) => "the next switch runs this account on its api key",
+                (false, false) => "the next switch runs this account on its API key",
             };
             let mut hint = base.to_string();
             if snap.rolling_armed || snap.rolling_token {
@@ -683,7 +667,15 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::Delete => {
             "deletes the account and everything stored for it, usage history included"
         }
-        ConfigRow::Name | ConfigRow::Create => return None,
+        ConfigRow::Model
+        | ConfigRow::OpusModel
+        | ConfigRow::SonnetModel
+        | ConfigRow::HaikuModel
+        | ConfigRow::FableModel
+        | ConfigRow::EnvEntry(_)
+        | ConfigRow::EnvAdd
+        | ConfigRow::Name
+        | ConfigRow::Create => return None,
     };
     Some(hint.to_string())
 }

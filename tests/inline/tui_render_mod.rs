@@ -454,7 +454,7 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
         "api account with a key shows a log-out row:\n{out}",
     );
     assert!(
-        out.contains("re-enter the base url"),
+        out.contains("re-enter the base URL"),
         "the login row's hint describes the API re-entry:\n{out}",
     );
 }
@@ -515,7 +515,7 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
         "the form carries the capture row under `+ login`:\n{out}"
     );
     assert!(
-        out.contains("saves the login Claude Code is using now"),
+        out.contains("save the current global credentials into a new account"),
         "the capture row's hint explains what ⏎ stashes:\n{out}"
     );
 
