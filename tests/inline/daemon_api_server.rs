@@ -18,102 +18,13 @@ use super::*;
 
 use std::io::{Read, Write};
 use std::path::Path;
-use std::process::Command;
 
 use crate::daemon::api::routes::ApiContext;
 use crate::daemon::api::token::AuthToken;
 use crate::profile::{AppConfig, AppState};
-use crate::testutil::HomeSandbox;
+use crate::testutil::{HomeSandbox, SERVER_NAME, generate_chain};
 
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-/// The name the generated certificate is issued for, and the name the client
-/// asks for. Not this host's real FQDN: the point is the handshake, not the
-/// lookup that finds the file.
-const SERVER_NAME: &str = "localhost";
-
-fn openssl(args: &[&str]) -> bool {
-    Command::new("openssl")
-        .args(args)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// A CA, and a `localhost` certificate signed by it, laid out the way lego
-/// writes them. Returns `None` when `openssl` cannot produce them.
-///
-/// The leaf gets its name from a subjectAltName in an extension FILE. Both
-/// details matter: rustls verifies the SAN and ignores the CN entirely, and an
-/// `-extfile` on disk keeps generation independent of what the test harness has
-/// attached to stdin.
-fn generate_chain(dir: &Path) -> Option<(tls::LegoPaths, std::path::PathBuf)> {
-    let ca_key = dir.join("ca.key");
-    let ca_crt = dir.join("ca.crt");
-    let csr = dir.join("server.csr");
-    let ext = dir.join("leaf.ext");
-    let paths = tls::lego_paths_in(dir, SERVER_NAME);
-
-    std::fs::write(
-        &ext,
-        format!("subjectAltName=DNS:{SERVER_NAME}\nbasicConstraints=critical,CA:FALSE\n"),
-    )
-    .ok()?;
-
-    let ok = openssl(&[
-        "req",
-        "-x509",
-        "-newkey",
-        "ec",
-        "-pkeyopt",
-        "ec_paramgen_curve:P-256",
-        "-nodes",
-        "-keyout",
-        ca_key.to_str()?,
-        "-out",
-        ca_crt.to_str()?,
-        "-days",
-        "3650",
-        "-subj",
-        "/CN=clauth-test-ca",
-        "-addext",
-        "basicConstraints=critical,CA:TRUE",
-    ]) && openssl(&[
-        "req",
-        "-newkey",
-        "ec",
-        "-pkeyopt",
-        "ec_paramgen_curve:P-256",
-        "-nodes",
-        "-keyout",
-        paths.key.to_str()?,
-        "-out",
-        csr.to_str()?,
-        "-subj",
-        &format!("/CN={SERVER_NAME}"),
-    ]) && openssl(&[
-        "x509",
-        "-req",
-        "-in",
-        csr.to_str()?,
-        "-CA",
-        ca_crt.to_str()?,
-        "-CAkey",
-        ca_key.to_str()?,
-        "-out",
-        paths.cert.to_str()?,
-        "-days",
-        "3650",
-        "-extfile",
-        ext.to_str()?,
-    ]);
-    if !ok {
-        return None;
-    }
-    // lego's `<fqdn>.issuer.crt`: the chain the leaf does not carry itself.
-    std::fs::copy(&ca_crt, &paths.issuer).ok()?;
-    Some((paths, ca_crt))
-}
 
 /// A client that trusts only the CA just generated, so a handshake succeeding
 /// means the server really presented a chain back to it.
@@ -141,7 +52,7 @@ fn ctx() -> std::sync::Arc<ApiContext> {
         profiles: Vec::new(),
     }));
     let status_path = crate::profile::clauth_dir().unwrap().join("status.json");
-    ApiContext::new(config, status_path, AuthToken::from_plaintext(TOKEN))
+    ApiContext::new(config, status_path, AuthToken::from_plaintext(TOKEN), None)
 }
 
 /// A TLS client connection that can be driven request by request.
@@ -260,7 +171,7 @@ fn a_real_tls_request_is_served_end_to_end() {
             port,
             &client_tls,
             &format!(
-                "GET /v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                "GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
             ),
         )
@@ -277,7 +188,9 @@ fn a_real_tls_request_is_served_end_to_end() {
         let anonymous = round_trip(
             port,
             &client_tls,
-            &format!("GET /v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\nConnection: close\r\n\r\n"),
+            &format!(
+                "GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\nConnection: close\r\n\r\n"
+            ),
         )
         .expect("anonymous round trip");
         assert!(
@@ -293,7 +206,7 @@ fn a_real_tls_request_is_served_end_to_end() {
             port,
             &client_tls,
             &format!(
-                "GET /v1/nope HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                "GET /api/v1/nope HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
             ),
         )
@@ -465,7 +378,7 @@ fn a_read_timeout_inside_a_tls_record_resumes() {
         );
 
         let get = format!(
-            "GET /v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+            "GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
              Authorization: Bearer {TOKEN}\r\n\r\n"
         );
         let mut session = Session::connect(proxy_port, &f.client_tls).expect("connect via proxy");
@@ -508,7 +421,7 @@ fn a_connection_is_reused_across_requests() {
         for i in 0..3 {
             session
                 .send(&format!(
-                    "GET /v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                    "GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                      Authorization: Bearer {TOKEN}\r\n\r\n"
                 ))
                 .unwrap_or_else(|e| panic!("send {i}: {e}"));
@@ -528,7 +441,7 @@ fn a_connection_is_reused_across_requests() {
         // Asking to close ends it, and the server says so on the way out.
         session
             .send(&format!(
-                "GET /v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
             ))
             .expect("send close");
@@ -558,11 +471,11 @@ fn pipelined_requests_are_answered_in_order() {
         // server reads the second out of the buffer left by the first.
         session
             .send(&format!(
-                "GET /v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\n\r\n\
-                 GET /v1/nope HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 GET /api/v1/nope HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\n\r\n\
-                 GET /v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                 GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\nConnection: close\r\n\r\n"
             ))
             .expect("send pipeline");
@@ -623,7 +536,7 @@ fn a_connection_survives_an_idle_gap_longer_than_the_io_timeout() {
 
         let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
         let get = format!(
-            "GET /v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+            "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
              Authorization: Bearer {TOKEN}\r\n\r\n"
         );
 
@@ -667,7 +580,7 @@ fn the_advertised_budget_is_the_one_enforced() {
 
         let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
         let get = format!(
-            "GET /v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+            "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
              Authorization: Bearer {TOKEN}\r\n\r\n"
         );
         session.send(&get).expect("send");
@@ -716,7 +629,7 @@ fn an_unauthenticated_request_does_not_keep_the_connection() {
         let mut session = Session::connect(f.port, &f.client_tls).expect("connect");
         session
             .send(&format!(
-                "GET /v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\r\n"
+                "GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\r\n"
             ))
             .expect("send");
         let (head, _) = session.recv().expect("recv");
@@ -791,7 +704,7 @@ fn a_framing_error_answers_and_closes_even_on_a_persistent_connection() {
         // which this server refuses.
         session
             .send(&format!(
-                "GET /v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                "GET /api/v1/health HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\n\r\n"
             ))
             .expect("send good");
@@ -800,7 +713,7 @@ fn a_framing_error_answers_and_closes_even_on_a_persistent_connection() {
 
         session
             .send(&format!(
-                "POST /v1/switch HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
+                "POST /api/v1/switch HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\
                  Authorization: Bearer {TOKEN}\r\n\
                  Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
             ))
@@ -840,7 +753,7 @@ fn a_plaintext_client_gets_nothing_back() {
         sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("timeout");
         let _ = sock.write_all(
-            format!("GET /v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\r\n").as_bytes(),
+            format!("GET /api/v1/status HTTP/1.1\r\nHost: {SERVER_NAME}\r\n\r\n").as_bytes(),
         );
 
         let mut got = Vec::new();
@@ -865,12 +778,37 @@ fn the_connection_cap_admits_up_to_the_limit_and_releases_on_drop() {
         0
     );
 
-    let slots: Vec<_> = (0..MAX_CONNECTIONS)
+    SATURATION_LOGGED.store(false, std::sync::atomic::Ordering::Release);
+
+    let mut slots: Vec<_> = (0..MAX_CONNECTIONS)
         .map(|i| claim_slot().unwrap_or_else(|| panic!("slot {i} should be admitted")))
         .collect();
     assert!(
         claim_slot().is_none(),
         "the {MAX_CONNECTIONS}th+1 connection must be refused, not queued"
+    );
+
+    // The "at capacity" line is once per episode, and this is what makes that
+    // true: at the cap a flood ends one connection and takes its slot again
+    // immediately, so re-arming on any release would put a line in the log per
+    // refusal — the spam the flag exists to prevent, reached the long way round.
+    //
+    // Asserted here rather than in a test of its own because `LIVE_CONNECTIONS`
+    // is process-global and these run as threads in one process: a second test
+    // driving the same counter would race this one.
+    assert!(
+        SATURATION_LOGGED.load(std::sync::atomic::Ordering::Acquire),
+        "the first refusal must arm the notice"
+    );
+    slots.pop();
+    assert!(
+        SATURATION_LOGGED.load(std::sync::atomic::Ordering::Acquire),
+        "one connection finishing at the cap is not a new saturation episode"
+    );
+    slots.truncate(SATURATION_REARM_BELOW - 1);
+    assert!(
+        !SATURATION_LOGGED.load(std::sync::atomic::Ordering::Acquire),
+        "coming back below {SATURATION_REARM_BELOW} live connections re-arms it"
     );
 
     drop(slots);
@@ -885,4 +823,50 @@ fn the_connection_cap_admits_up_to_the_limit_and_releases_on_drop() {
         "capacity must be reusable once connections finish"
     );
     drop(reopened);
+}
+
+/// The listener's failures have to be reachable BEFORE the singleton claim.
+///
+/// `--replace` terminates the running daemon as part of claiming, so a
+/// certificate that fails to load after that point takes the incumbent down and
+/// then aborts, leaving the host with no daemon at all — no refresh, no
+/// auto-switch, not merely no listener. `wiki/Daemon.md` recommends
+/// `clauth daemon --replace --listen` as the post-`lego renew` hook, so the
+/// documented automation is the trigger.
+///
+/// What this pins is that a bad certificate is discovered in `prepare`, which
+/// needs no daemon lock, no config and no scheduler — so `daemon::serve` can
+/// call it above the claim, and does.
+///
+/// The cert directory is pointed at an empty tempdir through `tls.json` rather
+/// than relying on this host having no lego tree: the box this was written on
+/// serves a real certificate out of `/etc/lego`, which `HomeSandbox` does not
+/// redirect, so the obvious version of this test passed vacuously.
+#[test]
+fn a_missing_certificate_fails_in_prepare_not_after_the_claim() {
+    let _home = HomeSandbox::new();
+    let empty = tempfile::tempdir().expect("tempdir");
+    let tls_json = crate::profile::clauth_dir().expect("dir").join("tls.json");
+    #[allow(clippy::expect_used)]
+    std::fs::create_dir_all(tls_json.parent().expect("has parent")).expect("mkdir");
+    std::fs::write(
+        &tls_json,
+        serde_json::json!({ "schema": 1, "cert_dir": empty.path() }).to_string(),
+    )
+    .expect("write tls.json");
+
+    // Matched rather than `expect_err`: that needs `Debug` on the success type,
+    // and `Prepared` holds a bound socket and a rustls config — not a thing to
+    // give a derived formatter to for a test's convenience.
+    let Err(err) = super::prepare(
+        "127.0.0.1:0".parse().expect("addr"),
+        &crate::daemon::api::tls::CertSource::Lego,
+    ) else {
+        panic!("an empty certificate directory must fail in prepare");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&empty.path().display().to_string()) || msg.contains(".crt"),
+        "the failure names the path the operator has to fix: {msg}"
+    );
 }

@@ -10,6 +10,7 @@
 //! not declare to `claude` untouched, leading hyphens included.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -268,6 +269,33 @@ pub(crate) enum Command {
             conflicts_with_all = ["print_token", "rotate_token"],
         )]
         listen: Option<SocketAddr>,
+        /// Serve this certificate instead of the host's lego certificate
+        ///
+        /// For hosts where the lego derivation cannot work rather than merely
+        /// points somewhere else: on a tailnet node `hostname -f` answers a name
+        /// no certificate covers, and `tailscale cert` writes a `<name>.crt` and
+        /// `<name>.key` with no issuer file and none of lego's naming.
+        ///
+        /// Both files are read as PEM. Given these, nothing else is consulted —
+        /// not `hostname -f`, not the directory in ~/.clauth/tls.json, and no
+        /// issuer file beside the certificate. Requires --key and --listen.
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "key",
+            requires = "listen",
+            conflicts_with_all = ["print_token", "rotate_token"],
+        )]
+        cert: Option<PathBuf>,
+        /// The private key for --cert (PKCS#8, PKCS#1 or SEC1)
+        #[arg(
+            long,
+            value_name = "PATH",
+            requires = "cert",
+            requires = "listen",
+            conflicts_with_all = ["print_token", "rotate_token"],
+        )]
+        key: Option<PathBuf>,
         /// Print the REST API's auth token, creating it on first use, and exit.
         #[arg(long, conflicts_with = "rotate_token")]
         print_token: bool,

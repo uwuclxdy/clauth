@@ -24,7 +24,7 @@ Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-onl
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
 | `~/.clauth/profiles/<name>/runtime-<sid>/settings.json` | one live session's Claude Code settings. An endpoint profile's key is **not** in it: the file carries an `apiKeyHelper` line naming `clauth __api-key <profile>`, which Claude Code runs per request to mint the key | `0600` |
-| `~/.clauth/auth_token.json` | bearer token for the daemon's REST API, only if you have ever run `clauth daemon --listen`, `--print-token`, or `--rotate-token` | `0600` |
+| `~/.clauth/auth_token.json` | bearer token for the daemon's REST API, and the `tier` saying what it may do (`control` — everything the API exposes — is the only value today). Only if you have ever run `clauth daemon --listen`, `--print-token`, or `--rotate-token` | `0600` |
 | `~/.clauth/tls.json` | which directory holds the REST API's lego certificate; written with the platform default the first time `clauth daemon --listen` starts. Not a secret — a path, no key material | `0600` |
 | `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
 | `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
@@ -79,7 +79,8 @@ clauth binds a socket in exactly two places, both narrow:
 | the address you pass to `clauth daemon --listen` | for as long as that daemon runs | wherever you bind it |
 
 `--listen` is off unless you ask for it, and it is the only way anything outside this
-machine can reach clauth. It is TLS-only (from this host's lego certificate, read at
+machine can reach clauth. It is TLS-only (from this host's lego certificate, or the
+`--cert`/`--key` pair named on the command line, read at
 startup) and every route requires a bearer token, compared in constant time, stored at
 `~/.clauth/auth_token.json` and printed by `clauth daemon --print-token`. It exposes two
 operations, reading the status feed and switching the active account, and the feed it
@@ -87,8 +88,11 @@ serves carries what `status.json` carries: names, tiers, percentages, timestamps
 token or key. Connections persist and may be pipelined; `Content-Length` is the only
 framing accepted, chunked is refused, and any framing error closes the connection rather
 than resynchronizing, so the ambiguity request smuggling depends on does not arise. An
-unauthenticated request closes the connection too, so reaching the port is not by itself
-enough to occupy a connection slot.
+unauthenticated request closes the connection too, so no unauthenticated client can hold a
+connection slot — though reaching the port does occupy one while connected, since the slot
+is claimed at `accept()`, before the handshake and before any token is seen. What bounds
+that is the clock: a peer that connects and says nothing gets the 10s first-request
+timeout, not the full connection lifetime.
 Limits: 8 KiB of headers, 64 KiB of body, 32 concurrent connections, 100 requests and
 120 seconds per connection, a 10s deadline per read or write.
 `CLAUTH_NO_API=1` disables it. See `wiki/Daemon.md`.
@@ -128,7 +132,7 @@ Agent-invoked, only when the Claude Code plugin is installed:
 
 Network-invoked, only while `clauth daemon --listen` is running:
 
-- **`POST /v1/switch`.** The same relink as the `switch` MCP tool, performed for a
+- **`POST /api/v1/switch`.** The same relink as the `switch` MCP tool, performed for a
   caller that presented the bearer token. It sends no inference itself, and it refuses
   the cases that need a human (a login clauth has not saved, credentials a refresh has
   rejected, a disabled account) rather than resolving them unattended.
@@ -166,7 +170,7 @@ Every command below goes through an argument vector, never a shell, so there is 
 | `/usr/bin/security` | macOS only: writing and clearing the Keychain item above |
 | `xdg-open` (Linux), `open` (macOS), `rundll32` (Windows) | opening a URL: the browser login page, or a status incident from the Status tab. The URL is passed as one argument |
 | `kill` / `taskkill`, plus `ps` on macOS and `tasklist` on Windows | `clauth daemon --replace` only: the pid is checked against a running clauth daemon before it is signalled (Linux reads `/proc/<pid>/cmdline` instead of shelling out) |
-| `hostname -f` (macOS, Linux), `powershell.exe` evaluating `[System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName` (Windows) | `clauth daemon --listen` only: once at startup, to learn which lego certificate to load. No part of it comes from you — the argument vector is a compile-time constant — and the answer is rejected unless it looks like a hostname before it is used as a filename in the certificate directory named by `~/.clauth/tls.json`, which is yours to edit and owner-only like the rest of the tree |
+| `hostname -f` (macOS, Linux), `powershell.exe` evaluating `[System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName` (Windows) | `clauth daemon --listen` without `--cert`/`--key` only: once at startup, to learn which lego certificate to load. Naming the certificate outright runs neither command. No part of it comes from you — the argument vector is a compile-time constant — and the answer is rejected unless it looks like a hostname before it is used as a filename in the certificate directory named by `~/.clauth/tls.json`, which is yours to edit and owner-only like the rest of the tree |
 
 clauth runs no other external commands.
 

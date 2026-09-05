@@ -8,9 +8,9 @@
 //! Paths are derived from the host's own FQDN, matching lego's layout:
 //!
 //! ```text
-//! /etc/lego/certificates/boson.cygnusx-1.org.crt
-//! /etc/lego/certificates/boson.cygnusx-1.org.issuer.crt
-//! /etc/lego/certificates/boson.cygnusx-1.org.key
+//! /etc/lego/certificates/boson.example.org.crt
+//! /etc/lego/certificates/boson.example.org.issuer.crt
+//! /etc/lego/certificates/boson.example.org.key
 //! ```
 //!
 //! Only two things here are platform-specific — which directory holds that
@@ -23,6 +23,13 @@
 //! start ([`cert_dir`]). That is what lets a Windows box whose lego lives
 //! somewhere other than `%AppData%` — or a Linux one behind a packaging
 //! convention of its own — serve TLS without a rebuild.
+//!
+//! The derivation itself can be wrong, though, and no directory setting fixes
+//! that: on a tailnet node `hostname -f` answers a name no certificate covers,
+//! and `tailscale cert` writes a `<name>.crt`/`<name>.key` pair with no issuer
+//! file beside it and none of lego's naming. So the whole derivation is
+//! skippable — `--cert`/`--key` name the two files outright ([`CertSource`]),
+//! and nothing about the FQDN, the directory, or the issuer file is consulted.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -183,18 +190,51 @@ const FQDN_COMMAND: (&str, &[&str]) = (
     ],
 );
 
-/// The three files for `fqdn`, in lego's naming.
-pub(crate) struct LegoPaths {
+/// The files one TLS identity is loaded from.
+///
+/// `issuer` is an `Option` and not a path that might not exist, because the two
+/// cases are different: lego writes an issuer file and a missing one means the
+/// leaf carried the chain, whereas `tailscale cert` has no such file at all and
+/// never will. `None` says "do not look", which is what keeps an explicit
+/// `--cert` from inventing a `<cert>.issuer.crt` the operator never named.
+pub(crate) struct CertPaths {
     pub(crate) cert: PathBuf,
-    pub(crate) issuer: PathBuf,
+    pub(crate) issuer: Option<PathBuf>,
     pub(crate) key: PathBuf,
 }
 
-pub(crate) fn lego_paths_in(dir: &Path, fqdn: &str) -> LegoPaths {
-    LegoPaths {
+/// The three files for `fqdn`, in lego's naming.
+pub(crate) fn lego_paths_in(dir: &Path, fqdn: &str) -> CertPaths {
+    CertPaths {
         cert: dir.join(format!("{fqdn}.crt")),
-        issuer: dir.join(format!("{fqdn}.issuer.crt")),
+        issuer: Some(dir.join(format!("{fqdn}.issuer.crt"))),
         key: dir.join(format!("{fqdn}.key")),
+    }
+}
+
+/// Where the listener's TLS identity comes from.
+///
+/// [`Lego`](CertSource::Lego) is the default and needs no flags: this host's
+/// FQDN and the configured directory name the files between them.
+/// [`Explicit`](CertSource::Explicit) is `--cert`/`--key`, for the hosts where
+/// that derivation cannot work at all — see the module docs.
+pub(crate) enum CertSource {
+    Lego,
+    Explicit(CertPaths),
+}
+
+impl CertSource {
+    /// `--cert`/`--key` if both are present, lego otherwise. The CLI requires
+    /// them together, so a half-set pair cannot reach here.
+    pub(crate) fn from_flags(cert: Option<PathBuf>, key: Option<PathBuf>) -> Self {
+        match (cert, key) {
+            (Some(cert), Some(key)) => Self::Explicit(CertPaths {
+                cert,
+                issuer: None,
+                key,
+            }),
+            _ => Self::Lego,
+        }
     }
 }
 
@@ -258,7 +298,10 @@ fn validate_fqdn(name: &str) -> Result<()> {
 /// malformed, so the de-dup is what makes reading both safe rather than
 /// optional. A missing issuer file is fine (the leaf carried the chain); an
 /// unreadable one is not silently ignored.
-pub(crate) fn load_chain(cert: &Path, issuer: &Path) -> Result<Vec<CertificateDer<'static>>> {
+pub(crate) fn load_chain(
+    cert: &Path,
+    issuer: Option<&Path>,
+) -> Result<Vec<CertificateDer<'static>>> {
     let mut chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(cert)
         .with_context(|| format!("failed to read the TLS certificate {}", cert.display()))?
         .collect::<std::result::Result<_, _>>()
@@ -267,7 +310,7 @@ pub(crate) fn load_chain(cert: &Path, issuer: &Path) -> Result<Vec<CertificateDe
         bail!("{} contains no certificate", cert.display());
     }
 
-    if issuer.exists() {
+    if let Some(issuer) = issuer.filter(|p| p.exists()) {
         let extra: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(issuer)
             .with_context(|| format!("failed to read the issuer chain {}", issuer.display()))?
             .collect::<std::result::Result<_, _>>()
@@ -289,8 +332,8 @@ pub(crate) fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Build the server's TLS configuration from an explicit set of paths.
-pub(crate) fn server_config_from(paths: &LegoPaths) -> Result<Arc<ServerConfig>> {
-    let chain = load_chain(&paths.cert, &paths.issuer)?;
+pub(crate) fn server_config_from(paths: &CertPaths) -> Result<Arc<ServerConfig>> {
+    let chain = load_chain(&paths.cert, paths.issuer.as_deref())?;
     let key = load_key(&paths.key)?;
 
     // Pin the provider rather than taking the process-wide default: ureq also
@@ -307,12 +350,21 @@ pub(crate) fn server_config_from(paths: &LegoPaths) -> Result<Arc<ServerConfig>>
     Ok(Arc::new(config))
 }
 
-/// The production entry point: resolve this host's FQDN and the configured
-/// certificate directory, then load the lego certificate they name.
-pub(crate) fn server_config() -> Result<Arc<ServerConfig>> {
-    let fqdn = fqdn()?;
-    let paths = lego_paths_in(&cert_dir()?, &fqdn);
-    server_config_from(&paths)
+/// The production entry point.
+///
+/// For [`CertSource::Lego`] this resolves the host's FQDN and the configured
+/// certificate directory and loads what they name between them. For
+/// [`CertSource::Explicit`] none of that runs: no `hostname -f`, no `tls.json`,
+/// no issuer file — the two named files are read and that is all.
+pub(crate) fn server_config(source: &CertSource) -> Result<Arc<ServerConfig>> {
+    match source {
+        CertSource::Lego => {
+            let fqdn = fqdn()?;
+            let paths = lego_paths_in(&cert_dir()?, &fqdn);
+            server_config_from(&paths)
+        }
+        CertSource::Explicit(paths) => server_config_from(paths),
+    }
 }
 
 #[cfg(test)]

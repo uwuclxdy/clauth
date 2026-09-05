@@ -114,6 +114,13 @@ jobs:
       # cancels at the first one, so you fix what you were shown, push, and are handed
       # more — which reads like a regression your own fix caused, at a build per round.
       - name: test
+        env:
+          # The TLS tests build their certificates with `openssl`, and skip
+          # themselves when it is absent — a skip that reads exactly like a pass
+          # in the summary line, over the listener's ONLY coverage. The Linux and
+          # macOS images carry openssl, so require it there; Windows images do
+          # not reliably, and a hard requirement would red on that alone.
+          CLAUTH_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
         run: cargo nextest run --locked --release --all-targets --all-features --no-fail-fast
       # Every leg above is --release, where debug_assertions is off and
       # `#[cfg(debug_assertions)]` code is not merely unlinted but absent: a test
@@ -125,6 +132,8 @@ jobs:
       # `cfg!`-guarded assert that release still type- and lint-checks.
       - name: debug clippy + test
         shell: bash
+        env:
+          CLAUTH_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
         run: |
           if grep -rqs --include='*.rs' --exclude-dir=target --exclude-dir=.git -e debug_assertions .; then
             cargo clippy --locked --all-targets --all-features -- -D warnings

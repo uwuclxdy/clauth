@@ -451,6 +451,59 @@ fn login_rejects_flag_shaped_profile_names_and_a_second_positional() {
     }
 }
 
+/// `--cert`/`--key` come as a pair, and only alongside `--listen`.
+///
+/// Both halves matter. A lone `--cert` would otherwise be accepted and then
+/// silently fall back to the lego certificate at startup, which is the failure
+/// the flag exists to avoid — the operator would be told the host has no
+/// certificate for a name they never asked it to use. And without `--listen`
+/// there is no listener for either file to serve, so accepting them would be a
+/// no-op that reads like configuration.
+#[test]
+fn cert_and_key_are_required_together_and_only_with_listen() {
+    for args in [
+        ["daemon", "--listen", "--cert", "/tmp/a.crt"].as_slice(),
+        ["daemon", "--listen", "--key", "/tmp/a.key"].as_slice(),
+        ["daemon", "--cert", "/tmp/a.crt", "--key", "/tmp/a.key"].as_slice(),
+        [
+            "daemon",
+            "--print-token",
+            "--cert",
+            "/tmp/a.crt",
+            "--key",
+            "/tmp/a.key",
+        ]
+        .as_slice(),
+    ] {
+        assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+
+    let Command::Daemon {
+        listen, cert, key, ..
+    } = command(&[
+        "daemon",
+        "--listen",
+        "--cert",
+        "/tmp/a.crt",
+        "--key",
+        "/tmp/a.key",
+    ])
+    else {
+        panic!("must parse");
+    };
+    assert!(
+        listen.is_some(),
+        "bare --listen still takes the default bind"
+    );
+    assert_eq!(
+        (cert.as_deref(), key.as_deref()),
+        (
+            Some(std::path::Path::new("/tmp/a.crt")),
+            Some(std::path::Path::new("/tmp/a.key"))
+        )
+    );
+}
+
 // ── delete / disable / enable ───────────────────────────────────────────────
 
 #[test]
@@ -593,6 +646,8 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         replace,
         status,
         listen,
+        cert,
+        key,
         print_token,
         rotate_token,
     } = command(&["daemon"])
@@ -609,6 +664,11 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         (None, false, false),
         "the REST API is off unless an address is asked for"
     );
+    assert_eq!(
+        (cert, key),
+        (None, None),
+        "TLS comes from this host's lego certificate unless both files are named"
+    );
 
     for (args, flag) in [
         (["daemon", "--standby"].as_slice(), "standby"),
@@ -624,6 +684,8 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             replace,
             status,
             listen,
+            cert: _,
+            key: _,
             print_token,
             rotate_token,
         } = command(args)
@@ -1106,6 +1168,8 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
             replace: false,
             status: true,
             listen: None,
+            cert: None,
+            key: None,
             print_token: false,
             rotate_token: false,
         }),

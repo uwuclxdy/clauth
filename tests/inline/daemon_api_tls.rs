@@ -16,6 +16,8 @@
 
 use super::*;
 
+use std::path::PathBuf;
+
 use crate::profile::clauth_dir;
 use crate::testutil::HomeSandbox;
 
@@ -33,18 +35,21 @@ const ISSUER: &str = "BQYHCA==";
 
 #[test]
 fn lego_paths_use_legos_naming() {
-    let paths = lego_paths_in(Path::new("/etc/lego/certificates"), "boson.cygnusx-1.org");
+    let paths = lego_paths_in(Path::new("/etc/lego/certificates"), "boson.example.org");
     assert_eq!(
         paths.cert,
-        Path::new("/etc/lego/certificates/boson.cygnusx-1.org.crt")
+        Path::new("/etc/lego/certificates/boson.example.org.crt")
     );
     assert_eq!(
-        paths.issuer,
-        Path::new("/etc/lego/certificates/boson.cygnusx-1.org.issuer.crt")
+        paths.issuer.as_deref(),
+        Some(Path::new(
+            "/etc/lego/certificates/boson.example.org.issuer.crt"
+        )),
+        "lego writes an issuer file, so the lego source always names one"
     );
     assert_eq!(
         paths.key,
-        Path::new("/etc/lego/certificates/boson.cygnusx-1.org.key")
+        Path::new("/etc/lego/certificates/boson.example.org.key")
     );
 }
 
@@ -53,9 +58,13 @@ fn a_leaf_only_cert_gains_the_issuer() {
     let dir = tempfile::tempdir().expect("tempdir");
     let paths = lego_paths_in(dir.path(), "host.example");
     std::fs::write(&paths.cert, cert_pem(LEAF)).expect("write leaf");
-    std::fs::write(&paths.issuer, cert_pem(ISSUER)).expect("write issuer");
+    std::fs::write(
+        paths.issuer.as_deref().expect("lego names an issuer"),
+        cert_pem(ISSUER),
+    )
+    .expect("write issuer");
 
-    let chain = load_chain(&paths.cert, &paths.issuer).expect("chain");
+    let chain = load_chain(&paths.cert, paths.issuer.as_deref()).expect("chain");
     assert_eq!(chain.len(), 2, "leaf then issuer");
     assert_eq!(chain[0].as_ref(), &[1, 2, 3, 4], "the leaf stays first");
 }
@@ -72,9 +81,13 @@ fn an_issuer_already_in_the_leaf_file_is_not_duplicated() {
         format!("{}{}", cert_pem(LEAF), cert_pem(ISSUER)),
     )
     .expect("write chain");
-    std::fs::write(&paths.issuer, cert_pem(ISSUER)).expect("write issuer");
+    std::fs::write(
+        paths.issuer.as_deref().expect("lego names an issuer"),
+        cert_pem(ISSUER),
+    )
+    .expect("write issuer");
 
-    let chain = load_chain(&paths.cert, &paths.issuer).expect("chain");
+    let chain = load_chain(&paths.cert, paths.issuer.as_deref()).expect("chain");
     assert_eq!(chain.len(), 2, "the repeated issuer is dropped");
 }
 
@@ -84,8 +97,69 @@ fn a_missing_issuer_file_is_fine() {
     let paths = lego_paths_in(dir.path(), "host.example");
     std::fs::write(&paths.cert, cert_pem(LEAF)).expect("write leaf");
 
-    let chain = load_chain(&paths.cert, &paths.issuer).expect("chain");
+    let chain = load_chain(&paths.cert, paths.issuer.as_deref()).expect("chain");
     assert_eq!(chain.len(), 1);
+}
+
+// ── --cert / --key ──────────────────────────────────────────────────────────
+
+/// Both flags present is the only thing that leaves lego behind.
+///
+/// The CLI already refuses a half pair, so this is the second line: a bug that
+/// dropped one of them would otherwise fall back to lego silently, and the
+/// operator would be told this host has no certificate for a name they never
+/// asked it to serve.
+#[test]
+fn cert_source_is_explicit_only_when_both_files_are_named() {
+    let cert = PathBuf::from("/srv/tailscale/node.crt");
+    let key = PathBuf::from("/srv/tailscale/node.key");
+
+    let CertSource::Explicit(paths) = CertSource::from_flags(Some(cert.clone()), Some(key.clone()))
+    else {
+        panic!("both files named must give an explicit source");
+    };
+    assert_eq!((paths.cert, paths.key), (cert.clone(), key.clone()));
+    assert_eq!(
+        paths.issuer, None,
+        "`tailscale cert` writes no issuer file, and none is invented beside the leaf"
+    );
+
+    for (c, k) in [
+        (Some(cert.clone()), None),
+        (None, Some(key.clone())),
+        (None, None),
+    ] {
+        assert!(
+            matches!(CertSource::from_flags(c, k), CertSource::Lego),
+            "anything short of both files stays on this host's lego certificate"
+        );
+    }
+}
+
+/// An explicit certificate does not pick up a sibling issuer file.
+///
+/// `None` has to mean "do not look" rather than "the file is missing": a
+/// `--cert` pointed into a directory that happens to hold a lego-shaped
+/// `<name>.issuer.crt` must serve exactly the chain in the file the operator
+/// named, and nothing that merely sits next to it.
+#[test]
+fn an_explicit_cert_ignores_an_issuer_file_beside_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cert = dir.path().join("node.crt");
+    let key = dir.path().join("node.key");
+    std::fs::write(&cert, cert_pem(LEAF)).expect("write leaf");
+    // A file the lego path would have merged in, left here on purpose.
+    std::fs::write(dir.path().join("node.issuer.crt"), cert_pem(ISSUER)).expect("write issuer");
+
+    let CertSource::Explicit(paths) = CertSource::from_flags(Some(cert), Some(key)) else {
+        panic!("explicit");
+    };
+    let chain = load_chain(&paths.cert, paths.issuer.as_deref()).expect("chain");
+    assert_eq!(
+        chain.len(),
+        1,
+        "only the named file is read, sibling or no sibling"
+    );
 }
 
 #[test]
@@ -93,7 +167,7 @@ fn a_missing_certificate_names_the_path_it_wanted() {
     let dir = tempfile::tempdir().expect("tempdir");
     let paths = lego_paths_in(dir.path(), "host.example");
 
-    let err = load_chain(&paths.cert, &paths.issuer)
+    let err = load_chain(&paths.cert, paths.issuer.as_deref())
         .expect_err("a missing certificate must not be silently empty");
     assert!(
         format!("{err:#}").contains("host.example.crt"),
@@ -108,7 +182,7 @@ fn an_empty_certificate_file_is_an_error_not_an_empty_chain() {
     std::fs::write(&paths.cert, "").expect("write empty");
 
     assert!(
-        load_chain(&paths.cert, &paths.issuer).is_err(),
+        load_chain(&paths.cert, paths.issuer.as_deref()).is_err(),
         "an empty chain would fail later, at handshake time, with no context"
     );
 }
@@ -162,8 +236,8 @@ fn a_hostname_that_could_escape_the_certificate_directory_is_refused() {
 #[test]
 fn a_real_fqdn_is_accepted() {
     for good in [
-        "boson.cygnusx-1.org",
-        "higgs.cygnusx-1.org",
+        "boson.example.org",
+        "higgs.example.org",
         "host",
         "a-b.c-d.example",
     ] {
@@ -227,6 +301,23 @@ fn tls_config_is_written_with_the_platform_default_on_first_use() {
     assert!(
         body.contains("cert_dir") && body.contains("schema"),
         "the file an operator opens has to show both fields: {body}"
+    );
+}
+
+/// `tls.json` inherits the tree's 0600, like every other file clauth writes.
+///
+/// It holds no key material — it names a directory — but the pin is on the tree
+/// and not on the secrecy of any one file: a mode that drifts loose here is a
+/// mode nobody notices drifting loose in the file beside it.
+#[cfg(unix)]
+#[test]
+fn tls_config_is_owner_only() {
+    let _home = HomeSandbox::new();
+    cert_dir().expect("first read creates the file");
+    let left = crate::testutil::owner_only_violations(&clauth_dir().expect("clauth dir"));
+    assert!(
+        left.is_empty(),
+        "tls.json must inherit the 0600 tree invariant; still loose: {left:#?}"
     );
 }
 

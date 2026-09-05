@@ -51,7 +51,8 @@ another. Off unless the flag is passed. TLS comes from this host's
 [lego](https://github.com/go-acme/lego) certificate, on all three platforms
 clauth supports — macOS, Linux, and Windows. Only two things differ by platform:
 where that certificate lives, and how the host's own FQDN is discovered. Both
-are spelled out below.
+are spelled out below, and `--cert`/`--key` skip the derivation entirely for
+hosts where it cannot work.
 
 - **The address is optional.** A bare `clauth daemon --listen` binds
   `0.0.0.0:8443`, the spelling this page uses everywhere else; pass an explicit
@@ -130,6 +131,18 @@ are spelled out below.
   same name to resolve to the daemon's reachable address (split-horizon DNS or a
   `hosts` entry), since the name in the certificate, not the address you dialed,
   is what gets checked.
+- **`--cert` and `--key` skip the derivation entirely.** For the hosts where it
+  cannot work rather than merely points somewhere else: on a tailnet node
+  `hostname -f` answers a name no certificate covers, and
+  `tailscale cert <node>.<tailnet>.ts.net` writes a `.crt` and a `.key` with no
+  issuer file beside them and none of lego's naming. Passing both by path reads
+  exactly those two files — no `hostname -f`, no `tls.json`, and no sibling
+  `.issuer.crt` even if one happens to sit there, so the chain served is the one
+  in the file you named. The pair is required together and only alongside
+  `--listen`; a lone `--cert` is a usage error rather than a silent fall back to
+  lego. Everything else is unchanged: clients still dial the name the
+  certificate covers, and the certificate is still read once at startup, so the
+  restart hook below applies to a `tailscale cert` renewal too.
 - **Renewal is yours to automate.** Let's Encrypt certificates are valid for 90
   days, and clauth does not renew them — it only reads what lego left on disk,
   once, at startup. So a `--listen` daemon needs two automated steps, not one: a
@@ -149,21 +162,41 @@ are spelled out below.
   survives restarts and only has to be copied to the client once.
   `clauth daemon --print-token` prints it (creating it if absent) and exits;
   `clauth daemon --rotate-token` replaces it, after which every client holding
-  the old one gets 401s. Both work whether or not a daemon is running. The
-  comparison is constant-time over digests, so neither a token's length nor its
-  first wrong byte is observable in the timing.
+  the old one gets 401s. Both work whether or not a daemon is running. A rotation
+  takes effect against a **running** daemon: the file is re-read per request, so
+  the old token stops working without a restart. The comparison is constant-time
+  over digests, so neither a token's length nor its first wrong byte is
+  observable in the timing.
+- **The file records a tier**, `"tier": "control"`, which is the only value there
+  is: this token does everything the API exposes. It is written now so that a
+  narrower token later — read-only for a wall display, for instance — is a new
+  value in a field every deployed file already carries rather than a schema bump
+  with a migration behind it. A file from before the field reads as `control`,
+  which is what it was, so an upgrade rotates nothing. A tier this build does
+  *not* know refuses to start and leaves the file alone: serving it would promote
+  a token a newer clauth deliberately restricted, and replacing it would revoke,
+  from a downgrade, a credential you had distributed on purpose. A file that is
+  unusable for any other reason — bad JSON, a truncated token — is replaced, and
+  now says so in the log rather than silently 401ing every client.
 - **Every route needs it**, health included. An unauthenticated caller gets a
   401 and learns only that something is listening, which is all a liveness probe
-  needs. A 401 also closes the connection rather than keeping it alive, so
-  reaching the port is not by itself enough to occupy one of the 32 slots.
+  needs. A 401 also closes the connection rather than keeping it alive, so an
+  unauthenticated client cannot *hold* one of the 32 slots — but it does occupy
+  one while it is connected. The slot is taken at `accept()`, before the TLS
+  handshake and before any token is seen, because refusing at that point is the
+  cheapest refusal available and the alternative is spawning threads for
+  unauthenticated peers without bound. What bounds the occupancy is the clock,
+  not the token: a client that connects and says nothing gets only the 10s
+  first-request timeout, not the 120s lifetime, and one that says something
+  unauthenticated is answered and closed at once.
 
 | Route | What it does |
 |---|---|
-| `GET /v1/health` | `{"ok":true,"version":"<ver>","schema":1}`. `schema` is the status feed's, so a reader can refuse a daemon newer than it knows. |
-| `GET /v1/status` | The `status.json` body below, byte for byte off disk. `?all=1` rebuilds it to include disabled accounts, which the published file always hides. |
-| `POST /v1/switch` | Body `{"profile":"<name>"}` (resolved case-insensitively). Returns `{"ok":true,"previous":…,"active":…}`. |
+| `GET /api/v1/health` | `{"ok":true,"version":"<ver>","schema":1}`. `schema` is the status feed's, so a reader can refuse a daemon newer than it knows. |
+| `GET /api/v1/status` | The `status.json` body below, byte for byte off disk. Conditional: the `ETag` digests everything in the body except `generated_at`, so a feed rewritten by a tick that changed nothing answers `304` with no body. `?wait=<secs>` on a request already carrying the current tag holds it open until the accounts actually move (capped at 60s, inside the connection's own 120s lifetime), which is how a client follows a switch without polling. `?all=1` rebuilds the body to include disabled accounts, which the published file always hides, and never waits. |
+| `POST /api/v1/switch` | Body `{"profile":"<name>"}` (resolved case-insensitively). Returns `{"ok":true,"previous":…,"active":…}`. Republishes `status.json` before answering, so every reader parked on `GET /api/v1/status?wait=` is woken by the same switch rather than by the next tick. |
 
-`POST /v1/switch` failures: `404` unknown profile · `409` refused, because the
+`POST /api/v1/switch` failures: `404` unknown profile · `409` refused, because the
 target is disabled, its credentials were rejected by a refresh, or the live
 login is one clauth has not saved (the body's `reason` names the fix, and
 nothing was changed) · `409` `switch_in_progress` when another switch is still
@@ -201,12 +234,46 @@ since a client that connects and says nothing has not earned the idle allowance.
 `CLAUTH_NO_API=1` disables the listener whatever the flags say, for killing it
 without editing the unit that passes `--listen`.
 
+**Neither bound is a response-time budget, and a switch is the case where that
+matters.** The 10s applies to one read or one write, not to the handler between
+them: `POST /api/v1/switch` waits up to 25 seconds for the cross-process state
+flock (`clauth`'s own bound, sized around a macOS Keychain switch) and may run a
+token refresh after that, so a switch can legitimately take tens of seconds
+before a single byte of the response is written. Nothing times out — the whole
+of it sits inside the connection's 120s lifetime — but a client that sets a 10s
+socket deadline because this page mentions 10s will give up on a switch that was
+about to succeed. Size a client timeout against the 120s, and treat a `409`
+(state lock held) as the retryable answer rather than an abandoned request.
+
 Readers should follow the same evolution rule as the feed (below): ignore
 unknown fields, and refuse only on a `schema` greater than what they know.
 
 ## `~/.clauth/status.json`
 
-Written each scheduler tick and immediately after a switch lands. Atomic (`tmp` + rename into place), `0600`. **Never carries a token, secret, or key**: names, tiers, percentages, timestamps only.
+Written each daemon tick, and by whichever process lands a switch when no
+daemon is running to do it — so the published `active_profile` is never an
+account the operator has already switched away from, whether the switch came
+from the TUI, `clauth <name>`, or the MCP tool. A running daemon owns the file:
+a switch made elsewhere leaves the write to that daemon's next tick (≤1s), which
+republishes it with the scheduler's live `fetch_status` / `next_refresh_at` /
+`pending_switch` that a single-shot build cannot see. A switch the daemon itself
+performs through `POST /api/v1/switch` is the exception: it republishes before
+answering, so a client waiting on the feed is woken by the switch rather than by
+the tick after it. Atomic (`tmp` + rename into place), `0600`. **Never carries a
+token, secret, or key**: names, tiers, percentages, timestamps only.
+
+A reader that wants a switch the moment it happens has two ways in. Over the
+network, `GET /api/v1/status?wait=<secs>` with the current `ETag` blocks until the
+feed's content actually changes — no polling interval to lose time to. On the
+same machine, watch this file *and* `~/.clauth/profiles.toml`, which every switch
+surface rewrites and nothing else touches that often.
+
+Compare more than the modification time when you do. A daemon rewrites this file
+every second through `tmp` + rename, two writes can land inside one filesystem
+clock granule, and a feed republished for a different active account is often
+exactly as long as the one it replaced — so `(mtime, len)` can miss a real
+switch. The renamed inode always differs, which is what makes the change
+detectable whatever the clock did.
 
 ```json
 {

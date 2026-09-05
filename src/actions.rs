@@ -128,7 +128,11 @@ pub(crate) fn switch_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
             force_link_profile_credentials(name)?;
         }
         finish_switch(config, name, held)
-    })
+    })?;
+    // The active account moved: republish the feed for its external readers.
+    // Outside the lock — see `daemon::publish_status`.
+    crate::daemon::publish_status(config);
+    Ok(())
 }
 
 /// Discard the live login: force-relink to `target`'s stored creds WITHOUT
@@ -143,7 +147,11 @@ pub(crate) fn switch_profile_discard(config: &mut AppConfig, target: &ProfileNam
         }
         force_link_profile_credentials(target)?;
         finish_switch(config, target, held)
-    })
+    })?;
+    // The active account moved: republish the feed for its external readers.
+    // Outside the lock — see `daemon::publish_status`.
+    crate::daemon::publish_status(config);
+    Ok(())
 }
 
 /// Force-snapshot the outgoing creds then force the symlink. CLI prompt path only.
@@ -156,7 +164,11 @@ pub(crate) fn switch_profile_reconciled(config: &mut AppConfig, name: &ProfileNa
         force_snapshot_active_credentials(config)?;
         force_link_profile_credentials(name)?;
         finish_switch(config, name, held)
-    })
+    })?;
+    // The active account moved: republish the feed for its external readers.
+    // Outside the lock — see `daemon::publish_status`.
+    crate::daemon::publish_status(config);
+    Ok(())
 }
 
 /// CLI switch: relink (reconciling diverged live file via `[Y/n]` prompt), then
@@ -362,7 +374,11 @@ pub(crate) fn switch_off(config: &mut AppConfig) -> Result<()> {
         let mut state = load_app_state()?;
         state.set_active(None, held);
         save_app_state(&state)
-    })
+    })?;
+    // The active account moved: republish the feed for its external readers.
+    // Outside the lock — see `daemon::publish_status`.
+    crate::daemon::publish_status(config);
+    Ok(())
 }
 
 /// The env keys an activation has to strip out of `settings.json` before it

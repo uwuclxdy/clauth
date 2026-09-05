@@ -38,6 +38,9 @@ pub(crate) struct Request {
     pub(crate) query: String,
     /// The `Authorization: Bearer <token>` value, if one was presented.
     pub(crate) bearer: Option<String>,
+    /// The `If-None-Match` value, verbatim including its quotes. Only
+    /// `/api/v1/mirror` reads it; every other route answers unconditionally.
+    pub(crate) if_none_match: Option<String>,
     pub(crate) body: Vec<u8>,
     /// Whether the client is willing to reuse this connection: HTTP/1.1 unless
     /// it said `Connection: close`, HTTP/1.0 only if it asked for keep-alive.
@@ -54,6 +57,16 @@ impl Request {
             let (k, v) = pair.split_once('=').unwrap_or((pair, "1"));
             k == key && (v == "1" || v.eq_ignore_ascii_case("true"))
         })
+    }
+
+    /// The value of `key`, when it was given one. Same deliberately unparsed
+    /// scan as [`flag`](Self::flag): the query string has two keys in total.
+    pub(crate) fn param(&self, key: &str) -> Option<&str> {
+        self.query
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v)
     }
 }
 
@@ -243,6 +256,7 @@ impl<S: Read> RequestReader<S> {
         };
 
         let mut bearer = None;
+        let mut if_none_match = None;
         let mut content_length: Option<usize> = None;
         let mut close_requested = false;
         let mut keep_alive_requested = false;
@@ -255,10 +269,7 @@ impl<S: Read> RequestReader<S> {
                 return Err(RequestError::Unsupported);
             }
             if header.name.eq_ignore_ascii_case("content-length") {
-                let value = std::str::from_utf8(header.value)
-                    .ok()
-                    .and_then(|v| v.trim().parse::<usize>().ok())
-                    .ok_or(RequestError::Malformed)?;
+                let value = parse_content_length(header.value).ok_or(RequestError::Malformed)?;
                 // A repeated header agreeing with itself is legal; two different
                 // lengths are a smuggling attempt, not a request.
                 if content_length.is_some_and(|seen| seen != value) {
@@ -271,6 +282,16 @@ impl<S: Read> RequestReader<S> {
                     .ok()
                     .and_then(strip_bearer)
                     .map(str::to_string);
+            }
+            if header.name.eq_ignore_ascii_case("if-none-match") {
+                // Kept verbatim, quotes included: it is compared against a tag
+                // this server produced, so any normalizing would have to be
+                // done identically on both sides to be worth doing. A `*` or a
+                // list simply fails to match, which serves the full body -- the
+                // correct answer, just not the cheapest one.
+                if_none_match = std::str::from_utf8(header.value)
+                    .ok()
+                    .map(|v| v.trim().to_string());
             }
             if header.name.eq_ignore_ascii_case("connection")
                 && let Ok(value) = std::str::from_utf8(header.value)
@@ -305,11 +326,42 @@ impl<S: Read> RequestReader<S> {
             path,
             query,
             bearer,
+            if_none_match,
             body,
             // HTTP/1.1 persists by default; HTTP/1.0 does not unless asked.
             keep_alive: !close_requested && (http_11 || keep_alive_requested),
         }))
     }
+}
+
+/// `Content-Length`, which the grammar defines as `1*DIGIT` and nothing else
+/// (RFC 9110 §8.6), with only the OWS the field syntax allows around it.
+///
+/// Deliberately stricter than `str::parse`, which accepts a leading `+`, and
+/// than `str::trim`, which strips every Unicode whitespace character — NBSP
+/// included. Either would have this server agree a body length that another
+/// parser in the path reads differently, and a disagreement about where a
+/// message ends is the whole of request smuggling. Only ASCII SP and HTAB are
+/// stripped here, because those are the two characters OWS actually is.
+fn parse_content_length(value: &[u8]) -> Option<usize> {
+    let digits = trim_ows(value);
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // Still fallible: a length too large for `usize` is not a length.
+    std::str::from_utf8(digits).ok()?.parse().ok()
+}
+
+/// Strip leading and trailing OWS — ASCII space and horizontal tab, per RFC
+/// 9110 — and nothing else.
+fn trim_ows(mut value: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = value {
+        value = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = value {
+        value = rest;
+    }
+    value
 }
 
 /// The token out of an `Authorization` value, or `None` for any other scheme.
@@ -329,6 +381,8 @@ pub(crate) struct Response {
     /// Emit `WWW-Authenticate: Bearer`. Set on 401 so a client knows the scheme
     /// rather than guessing.
     pub(crate) challenge: bool,
+    /// Emit `ETag`, so the next request can be conditional.
+    pub(crate) etag: Option<String>,
 }
 
 impl Response {
@@ -338,6 +392,26 @@ impl Response {
             status,
             body,
             challenge: false,
+            etag: None,
+        }
+    }
+
+    /// The same, tagged, so a client can ask again conditionally.
+    pub(crate) fn raw_json_tagged(status: u16, body: Vec<u8>, etag: String) -> Self {
+        Self {
+            etag: Some(etag),
+            ..Self::raw_json(status, body)
+        }
+    }
+
+    /// `304 Not Modified`: no body, and the tag repeated so a client that
+    /// dropped its copy can re-arm from the response.
+    pub(crate) fn not_modified(etag: String) -> Self {
+        Self {
+            status: 304,
+            body: Vec::new(),
+            challenge: false,
+            etag: Some(etag),
         }
     }
 
@@ -431,6 +505,9 @@ pub(crate) fn write_response<W: Write>(
     if resp.challenge {
         head.push_str("WWW-Authenticate: Bearer\r\n");
     }
+    if let Some(etag) = &resp.etag {
+        head.push_str(&format!("ETag: {etag}\r\n"));
+    }
     head.push_str("\r\n");
     w.write_all(head.as_bytes())?;
     w.write_all(&resp.body)?;
@@ -451,6 +528,7 @@ pub(crate) fn sanitize_for_log(s: &str) -> String {
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        304 => "Not Modified",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",

@@ -23,7 +23,7 @@
 
 mod http;
 pub(crate) mod routes;
-mod tls;
+pub(crate) mod tls;
 pub(crate) mod token;
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -89,14 +89,28 @@ impl Limits {
 static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 static SATURATION_LOGGED: AtomicBool = AtomicBool::new(false);
 
+/// How far the connection count must fall before another "at capacity" line is
+/// allowed.
+///
+/// Hysteresis, and the whole reason the flag works at all. Re-arming on ANY
+/// release re-armed it constantly: at the cap a flood ends one connection and
+/// takes its slot immediately, so every refusal found the flag clear and logged
+/// — which is the per-rejection spam the flag exists to prevent, just reached by
+/// a longer route. Half the cap is a level the server only reaches by genuinely
+/// coming back down, which is what makes the next line a new episode.
+const SATURATION_REARM_BELOW: usize = MAX_CONNECTIONS / 2;
+
 /// Decrements [`LIVE_CONNECTIONS`] however the handler thread ends, panic
 /// included — a leaked slot here would permanently shrink the cap.
 struct ConnectionSlot;
 
 impl Drop for ConnectionSlot {
     fn drop(&mut self) {
-        LIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
-        SATURATION_LOGGED.store(false, Ordering::Release);
+        // `fetch_sub` returns the value BEFORE the subtraction.
+        let remaining = LIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel) - 1;
+        if remaining < SATURATION_REARM_BELOW {
+            SATURATION_LOGGED.store(false, Ordering::Release);
+        }
     }
 }
 
@@ -107,25 +121,31 @@ impl Drop for ConnectionSlot {
 /// the only thing standing between a connection flood and unbounded thread
 /// creation, which makes it the piece most worth pinning.
 ///
-/// Claiming and releasing are one `AcqRel` each on a shared counter, so under a
-/// flood the count can momentarily read low here and be at the cap by the time
-/// the thread starts. That slack is bounded by the number of accepting threads
-/// (one), so the real ceiling is `MAX_CONNECTIONS`, never a multiple of it.
+/// The check and the increment are ONE atomic operation, so the cap cannot be
+/// overshot however many threads call this. The earlier load-then-`fetch_add`
+/// left a window between them and leaned on there being exactly one accepting
+/// thread to keep that window harmless — an invariant that lives in the caller,
+/// not here, and that a second acceptor would break silently.
 fn claim_slot() -> Option<ConnectionSlot> {
-    if LIVE_CONNECTIONS.load(Ordering::Acquire) >= MAX_CONNECTIONS {
-        // Say so once per saturation episode rather than once per rejected
-        // connection: otherwise the flood being refused just moves into
-        // `daemon.log`.
-        if !SATURATION_LOGGED.swap(true, Ordering::AcqRel) {
-            logline!(
-                "clauth api: at {MAX_CONNECTIONS} concurrent connections; refusing more \
-                 until one finishes"
-            );
-        }
-        return None;
+    let claimed = LIVE_CONNECTIONS
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+            (live < MAX_CONNECTIONS).then_some(live + 1)
+        })
+        .is_ok();
+    if claimed {
+        return Some(ConnectionSlot);
     }
-    LIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel);
-    Some(ConnectionSlot)
+    // Say so once per saturation episode rather than once per rejected
+    // connection: otherwise the flood being refused just moves into
+    // `daemon.log`. See [`SATURATION_REARM_BELOW`] for when the next episode
+    // may start.
+    if !SATURATION_LOGGED.swap(true, Ordering::AcqRel) {
+        logline!(
+            "clauth api: at {MAX_CONNECTIONS} concurrent connections; refusing more \
+             until one finishes"
+        );
+    }
+    None
 }
 
 /// Start the listener. Returns once it is bound and its accept thread is
@@ -135,14 +155,55 @@ fn claim_slot() -> Option<ConnectionSlot> {
 /// it): the operator asked for a listener, and a daemon that silently ran
 /// without one — no certificate, port already taken — would look healthy while
 /// the remote client stayed dark.
-pub(crate) fn spawn(listen: SocketAddr, config: ConfigHandle, status_path: PathBuf) -> Result<()> {
-    // The plaintext token lives only for this scope; the context keeps its
+/// Everything that can FAIL about the listener, done before anything is at
+/// stake: the certificate is read and the socket is bound.
+///
+/// Split from [`serve_prepared`] so `daemon::serve` can run it BEFORE claiming
+/// the singleton. Under `--replace` the claim terminates the running daemon, so
+/// a certificate that had just been renewed badly used to take the incumbent
+/// down and then abort — leaving the host with no daemon at all, and with it no
+/// refresh and no auto-switch, not merely no listener. `wiki/Daemon.md`
+/// recommends `clauth daemon --replace --listen` as the post-`lego renew` hook,
+/// which makes the documented automation the trigger. Prepared first, a bad
+/// renewal is a no-op: the incumbent keeps running.
+pub(crate) struct Prepared {
+    listen: SocketAddr,
+    listener: TcpListener,
+    tls_config: Arc<rustls::ServerConfig>,
+    auth: AuthToken,
+}
+
+pub(crate) fn prepare(listen: SocketAddr, certs: &tls::CertSource) -> Result<Prepared> {
+    // The plaintext token lives only for this scope; `AuthToken` keeps its
     // digest.
     let auth = AuthToken::from_plaintext(&token::load_or_create()?);
-    let tls_config = tls::server_config()?;
+    let tls_config = tls::server_config(certs)?;
     let listener = TcpListener::bind(listen)
         .with_context(|| format!("failed to bind the REST API to {listen}"))?;
-    let ctx = ApiContext::new(config, status_path, auth);
+    Ok(Prepared {
+        listen,
+        listener,
+        tls_config,
+        auth,
+    })
+}
+
+/// Start serving on an already-[`prepare`]d listener. Only the accept thread's
+/// creation can fail here, and that failure is not one a certificate or a busy
+/// port can cause.
+pub(crate) fn serve_prepared(
+    prepared: Prepared,
+    config: ConfigHandle,
+    status_path: PathBuf,
+    live: super::LiveStores,
+) -> Result<()> {
+    let Prepared {
+        listen,
+        listener,
+        tls_config,
+        auth,
+    } = prepared;
+    let ctx = ApiContext::new(config, status_path, auth, Some(live));
 
     let spawned = std::thread::Builder::new()
         .name("clauth-api-accept".into())
@@ -198,7 +259,7 @@ fn accept_loop(
 ///
 /// Requests are served strictly one at a time. That is what keeps a pipelining
 /// client's responses in the order it asked for them, and it means a `POST
-/// /v1/switch` on a reused connection is serialized against the next request
+/// /api/v1/switch` on a reused connection is serialized against the next request
 /// exactly as it would be on its own.
 fn serve_connection(
     stream: TcpStream,

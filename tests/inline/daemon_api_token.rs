@@ -114,6 +114,75 @@ fn future_schema_token_is_reused_when_well_formed() {
     assert_eq!(load_or_create().expect("load"), future);
 }
 
+// ── tier ────────────────────────────────────────────────────────────────────
+
+/// A freshly minted file says what the token may do.
+///
+/// Written now so that a later read-only or mirror-only token is a new value in
+/// a field every deployed file already carries, rather than a schema bump with a
+/// migration behind it.
+#[test]
+fn a_fresh_token_file_records_the_control_tier() {
+    let _home = HomeSandbox::new();
+    load_or_create().expect("load");
+
+    let body = std::fs::read_to_string(token_path().expect("path")).expect("read");
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(parsed["tier"], serde_json::json!("control"));
+}
+
+/// A file written before the field existed is reused, not rotated.
+///
+/// This is the whole upgrade path: every `auth_token.json` in the field today
+/// lacks `tier`, and rotating them on upgrade would 401 every client the
+/// operator had already set up.
+#[test]
+fn a_file_without_a_tier_reads_as_control() {
+    let _home = HomeSandbox::new();
+    let existing = "b".repeat(64);
+    let path = token_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        format!(r#"{{"schema":1,"token":"{existing}","created_at":"x"}}"#),
+    )
+    .expect("seed");
+
+    assert_eq!(
+        load_or_create().expect("load"),
+        existing,
+        "an upgrade must not rotate the token every client already holds"
+    );
+}
+
+/// A tier this build does not know refuses, and leaves the file alone.
+///
+/// Both halves matter and they pull in opposite directions. Serving it would
+/// promote a token a newer clauth deliberately restricted; replacing it would
+/// revoke, from a downgrade, a credential the operator distributed on purpose.
+/// So the only safe move is to do neither and say so.
+#[test]
+fn an_unknown_tier_refuses_rather_than_serving_or_replacing() {
+    let _home = HomeSandbox::new();
+    let restricted = "c".repeat(64);
+    let path = token_path().expect("path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    let seeded =
+        format!(r#"{{"schema":2,"token":"{restricted}","created_at":"x","tier":"readonly"}}"#);
+    std::fs::write(&path, &seeded).expect("seed");
+
+    let err = load_or_create().expect_err("an unknown tier must not be served");
+    assert!(
+        format!("{err:#}").contains("readonly"),
+        "the operator has to be told which tier stopped it: {err:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("read"),
+        seeded,
+        "the file must survive untouched — replacing it would revoke a token on a downgrade"
+    );
+}
+
 #[test]
 fn verify_accepts_the_exact_token_only() {
     let token = generate().expect("generate");

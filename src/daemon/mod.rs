@@ -43,8 +43,8 @@ use crate::lockorder::RankedMutex;
 use crate::logline::logline;
 use crate::out::outln;
 use crate::profile::{
-    AppConfig, ConfigHandle, ReloadFingerprint, atomic_write_600, clauth_dir, load_config,
-    mkdir_700, reload_fingerprint,
+    AppConfig, ConfigHandle, ProfileName, ReloadFingerprint, atomic_write_600, clauth_dir,
+    load_config, mkdir_700, reload_fingerprint,
 };
 use crate::usage::{
     ActivityStore, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile, PendingSwitch,
@@ -172,8 +172,13 @@ fn api_enabled() -> bool {
 /// loop executing auto-switches + rewriting `status.json` until killed.
 ///
 /// `listen` is the REST API's bind address (`--listen`), or `None` for the
-/// default file-only daemon.
-pub(crate) fn serve(mode: StartMode, listen: Option<SocketAddr>) -> Result<()> {
+/// default file-only daemon. `certs` is where that listener's TLS identity
+/// comes from, and is ignored without a `listen`.
+pub(crate) fn serve(
+    mode: StartMode,
+    listen: Option<SocketAddr>,
+    certs: &api::tls::CertSource,
+) -> Result<()> {
     // First thing, before any output (including the standing-by line below):
     // daemon stderr IS daemon.log, and undated lines cost real forensics time
     // (2026-07-09 — see `logline`).
@@ -185,6 +190,20 @@ pub(crate) fn serve(mode: StartMode, listen: Option<SocketAddr>) -> Result<()> {
     // singleton claim because the lock files live in the dir; it no-ops for
     // every instance after the first.
     mkdir_700(&dir).context("failed to create ~/.clauth")?;
+
+    // The listener's two failure modes — an unreadable certificate and a port
+    // already taken — are settled BEFORE the claim below, because the claim is
+    // what terminates the incumbent under `--replace`. Failing after it would
+    // leave the host with no daemon at all: no refresh, no auto-switch, not
+    // merely no listener. See `api::prepare`.
+    let prepared = match listen {
+        Some(addr) if api_enabled() => Some(api::prepare(addr, certs)?),
+        Some(addr) => {
+            logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
+            None
+        }
+        None => None,
+    };
 
     // Single-instance guard, claimed BEFORE any shared-tree work below: a
     // redundant instance must not GC the live daemon's runtime forest or walk
@@ -221,15 +240,16 @@ pub(crate) fn serve(mode: StartMode, listen: Option<SocketAddr>) -> Result<()> {
 
     // After `boot` (the stores are seeded and the scheduler is up, so a request
     // arriving immediately gets real numbers) and before `run` (which never
-    // returns). A bind or certificate failure propagates: the operator asked
-    // for a listener, and a daemon that quietly ran without one would look
-    // healthy while the remote client stayed dark.
-    if let Some(addr) = listen {
-        if api_enabled() {
-            api::spawn(addr, Arc::clone(&daemon.config), daemon.status_path.clone())?;
-        } else {
-            logline!("clauth daemon: {NO_API_ENV}=1 is set; not serving the REST API on {addr}");
-        }
+    // returns). Nothing here can fail on a certificate or a busy port — both
+    // were settled by `api::prepare` above the claim — so a listener that got
+    // this far starts.
+    if let Some(prepared) = prepared {
+        api::serve_prepared(
+            prepared,
+            Arc::clone(&daemon.config),
+            daemon.status_path.clone(),
+            daemon.live_stores(),
+        )?;
     }
 
     logline!(
@@ -357,6 +377,77 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
     Ok(())
 }
 
+/// Republish `~/.clauth/status.json` from a process that is not the daemon, so a
+/// switch landing in the TUI, in `clauth <name>`, or through the MCP tool reaches
+/// the feed's readers at once.
+///
+/// Without this the feed is only ever written by a running daemon, which learns
+/// of such a switch from the `profiles.toml` mtime on its next tick — and never
+/// learns of it at all when no daemon is running, leaving the published file
+/// naming an account the operator switched away from however long ago. That is
+/// the one field an external reader (`clauth-tray`, a status bar) most needs to
+/// be right, so a switch publishes it itself.
+///
+/// A live daemon OWNS the file: it republishes every tick with the scheduler's
+/// in-memory signals (`fetch_status`, `next_refresh_at`, `pending_switch`) that
+/// a single-shot build cannot see, and its own auto-switches already end in a
+/// `write_status`. So this defers whenever the singleton lock is positively
+/// held — that daemon's next tick, at most a second out, publishes the richer
+/// body over the same active account. Only an uncertain probe (a filesystem
+/// without working locks) publishes anyway: writing a slightly thinner body is
+/// cheaper than leaving a stale one.
+///
+/// Best-effort by design. The switch has already landed and been persisted by
+/// the time this runs; the caller must not fail because a status file could not
+/// be written.
+///
+/// Call it OUTSIDE the switch's `with_state_lock`, the way every caller in
+/// `actions` does: [`build_status`] stats and reads each profile's caches and
+/// sweeps the session flocks, and that disk work has no business extending the
+/// critical section every other clauth process is queued behind.
+pub(crate) fn publish_status(config: &AppConfig) {
+    if singleton_held().unwrap_or(false) {
+        return;
+    }
+    write_status_feed(config, None);
+}
+
+/// Rewrite `status.json` from `config`, unconditionally.
+///
+/// [`publish_status`]'s core, split out for the one caller that must NOT defer
+/// to a running daemon: the daemon's own `POST /v1/switch`. There the daemon IS
+/// the process that just switched, so there is no other owner to wait for, and
+/// a client blocked on `GET /v1/status?wait=` is holding a connection open
+/// precisely to be told the moment this file names the new account. Leaving it
+/// to the next scheduler tick adds up to a second of nothing happening to every
+/// switch made through the API.
+///
+/// `live` carries the scheduler's in-memory signals when the caller has them —
+/// the daemon's own API switch does, and passing `None` there republished a feed
+/// whose `fetch_status`, `next_refresh_at`, `stale` and `pending_switch` fell
+/// back to the mtime derivation until the next tick overwrote them.
+///
+/// Best-effort and lock-placement rules are [`publish_status`]'s.
+pub(crate) fn write_status_feed(config: &AppConfig, live: Option<&LiveSignals>) {
+    let Ok(dir) = clauth_dir() else { return };
+    if let Err(e) = mkdir_700(&dir) {
+        logline!(
+            "clauth: failed to prepare {} for status.json: {e}",
+            dir.display()
+        );
+        return;
+    }
+    let body = build_status(config, config.state.refresh_interval_ms, live, false);
+    match serde_json::to_vec_pretty(&body) {
+        Ok(json) => {
+            if let Err(e) = atomic_write_600(&dir.join(STATUS_FILE), &json) {
+                logline!("clauth: failed to publish status.json after a switch: {e}");
+            }
+        }
+        Err(e) => logline!("clauth: failed to serialize status.json after a switch: {e}"),
+    }
+}
+
 /// True when the live credentials diverge from the active profile's stored chain
 /// and it isn't a first-login adoption — the daemon cannot prompt, so it skips
 /// the switch and leaves the resolution to the operator (TUI Divergence modal).
@@ -376,6 +467,133 @@ fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
 /// Owns the shared `Arc` stores (cloned into the scheduler) plus main-loop-only
 /// state. Only the main thread touches `self`; the scheduler holds `Arc` clones
 /// of the individual stores.
+/// The live scheduler stores a published feed's [`LiveSignals`] are built from.
+///
+/// Bundled so that anything publishing the feed takes the SAME snapshot the
+/// daemon's own tick does. Without it the REST API had to pass `None` and fall
+/// back to the mtime derivation, so `GET /api/v1/status?all=1` — which rebuilds
+/// rather than serving the file — disagreed with the plain route on
+/// `fetch_status`, `next_refresh_at`, `stale` and `pending_switch`, on the same
+/// daemon, in the same second.
+///
+/// Seven `Arc` clones, so handing one to the listener costs nothing and shares
+/// the scheduler's state rather than copying it.
+#[derive(Clone)]
+pub(crate) struct LiveStores {
+    pub(crate) usage_status: StatusStore,
+    pub(crate) third_party_status: ThirdPartyStatusStore,
+    pub(crate) next_refresh_per_profile: NextRefreshPerProfile,
+    pub(crate) poll_streaks: PollStreaks,
+    pub(crate) pending_switch: PendingSwitch,
+    pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
+    pub(crate) kick_blocks: KickBlocks,
+}
+
+#[cfg(test)]
+impl Default for LiveStores {
+    /// Empty stores, for a test that wants to seed one of them and prove a
+    /// route reads it rather than deriving the same field from a file mtime.
+    fn default() -> Self {
+        Self {
+            usage_status: Arc::new(RankedMutex::new(HashMap::new())),
+            third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+            next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+            poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+            pending_switch: Arc::new(RankedMutex::new(Default::default())),
+            auto_start_queue: Arc::new(RankedMutex::new(Default::default())),
+            kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// One consistent read of [`LiveStores`], owning its data so no lock is held
+/// while the feed is built.
+pub(crate) struct LiveSnapshot {
+    status: HashMap<String, FetchStatus>,
+    third_party_status: HashMap<String, FetchStatus>,
+    next_refresh: HashMap<String, u64>,
+    streaks: HashMap<String, u32>,
+    pending_switch: Option<String>,
+    queue_anchor: Option<i64>,
+    queue_blocked: Vec<ProfileName>,
+}
+
+impl LiveStores {
+    /// Snapshot every store, each lock released at the end of its own statement
+    /// so none is ever held when CONFIG (which outranks all of them) is taken
+    /// next, and none is held while [`build_status`] does its disk work.
+    pub(crate) fn snapshot(&self) -> LiveSnapshot {
+        let status = self
+            .usage_status
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        // The third-party leg writes its outcomes to a store of its own, so
+        // without this snapshot every api-key/provider profile fell through to
+        // the mtime derivation — and an `AuthExpired` session, which writes no
+        // cache, published `fetch_status: null`, indistinguishable from a cold
+        // start.
+        let third_party_status = self
+            .third_party_status
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let next_refresh = self
+            .next_refresh_per_profile
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        // Projected to the 429 axis on purpose: `stale` is contracted as a stuck
+        // THROTTLE (`wiki/Daemon.md`), so a refresh-fail streak must not leak in.
+        let streaks = self
+            .poll_streaks
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.rate_limit)).collect())
+            .unwrap_or_default();
+        // The in-flight switch target (accepted, not yet applied), so a reader
+        // shows in-flight truth instead of a timing heuristic. The set holds at
+        // most one scheduler target in practice (`scan_auto_switch` skips while
+        // one is pending); `min` keeps the snapshot deterministic anyway.
+        let pending_switch = self
+            .pending_switch
+            .lock()
+            .ok()
+            .and_then(|q| q.iter().min().cloned());
+        // `switch_grade_kick_lifts` keys ARE the blocked set: it and the
+        // scheduler's own `kick_rejected_names` share one predicate, which is how
+        // the TUI's queue chips read it too.
+        let queue_anchor = crate::usage::queue_anchor_cached(&self.auto_start_queue);
+        let queue_blocked: Vec<ProfileName> =
+            crate::usage::switch_grade_kick_lifts(&self.kick_blocks)
+                .keys()
+                .map(|k| k.as_str().into())
+                .collect();
+        LiveSnapshot {
+            status,
+            third_party_status,
+            next_refresh,
+            streaks,
+            pending_switch,
+            queue_anchor,
+            queue_blocked,
+        }
+    }
+}
+
+impl LiveSnapshot {
+    pub(crate) fn signals(&self) -> LiveSignals<'_> {
+        LiveSignals {
+            status: &self.status,
+            third_party_status: &self.third_party_status,
+            next_refresh: &self.next_refresh,
+            streaks: &self.streaks,
+            pending_switch: self.pending_switch.as_deref(),
+            queue_anchor: self.queue_anchor,
+            queue_blocked: &self.queue_blocked,
+        }
+    }
+}
+
 struct Daemon {
     config: ConfigHandle,
     usage_tokens: TokenList,
@@ -626,68 +844,27 @@ impl Daemon {
     /// profile's cache files and sweeps the session flocks, and holding CONFIG
     /// across that disk work every tick stalls every other config user (a switch,
     /// a TUI edit) behind it. The clone is a handful of small strings.
+    /// The live stores, bundled for anything that publishes the feed — the tick
+    /// below and the REST API's rebuild alike, so the two cannot disagree.
+    fn live_stores(&self) -> LiveStores {
+        LiveStores {
+            usage_status: Arc::clone(&self.usage_status),
+            third_party_status: Arc::clone(&self.third_party_status),
+            next_refresh_per_profile: Arc::clone(&self.next_refresh_per_profile),
+            poll_streaks: Arc::clone(&self.poll_streaks),
+            pending_switch: Arc::clone(&self.pending_switch),
+            auto_start_queue: Arc::clone(&self.auto_start_queue),
+            kick_blocks: Arc::clone(&self.kick_blocks),
+        }
+    }
+
     fn write_status(&self) {
         let interval = self.refresh_interval.load(Ordering::Relaxed);
-        let status_snap: HashMap<String, FetchStatus> = self
-            .usage_status
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        // The third-party leg writes its outcomes to a store of its own, so
-        // without this snapshot every api-key/provider profile fell through to
-        // the mtime derivation — and an `AuthExpired` session, which writes no
-        // cache, published `fetch_status: null`, indistinguishable from a cold
-        // start.
-        let tp_status_snap: HashMap<String, FetchStatus> = self
-            .third_party_status
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        let next_snap: HashMap<String, u64> = self
-            .next_refresh_per_profile
-            .lock()
-            .map(|m| m.clone())
-            .unwrap_or_default();
-        // Snapshot the 429 streaks so build_status can publish `stale` (a
-        // deep-slot stuck RateLimited). Lower rank than config, like the stores
-        // above — snapshot + release before the config lock. Projected to the 429
-        // axis on purpose: `stale` is contracted as a stuck THROTTLE
-        // (`wiki/Daemon.md`), so a refresh-fail streak must not leak into it.
-        let streaks_snap: HashMap<String, u32> = self
-            .poll_streaks
-            .lock()
-            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.rate_limit)).collect())
-            .unwrap_or_default();
-        // The in-flight switch target (accepted, not yet applied), so the UI
-        // shows in-flight truth instead of a timing heuristic. Snapshot + release
-        // before the config lock, like the freshness stores above. The set holds
-        // at most one scheduler target in practice (`scan_auto_switch` skips
-        // while one is pending); `min` keeps the snapshot deterministic anyway.
-        let pending_snap: Option<String> = self
-            .pending_switch
-            .lock()
-            .ok()
-            .and_then(|q| q.iter().min().cloned());
-        // The auto-start queue's in-memory anchor and the blocks its membership
-        // rule excludes on — both leaf rank, snapshot + release before the config
-        // lock like every store above. `switch_grade_kick_lifts` keys ARE the
-        // blocked set: it and the scheduler's own `kick_rejected_names` share one
-        // predicate, which is how the TUI's queue chips read it too.
-        let queue_anchor = crate::usage::queue_anchor_cached(&self.auto_start_queue);
-        let queue_blocked: Vec<crate::profile::ProfileName> =
-            crate::usage::switch_grade_kick_lifts(&self.kick_blocks)
-                .keys()
-                .map(|k| k.as_str().into())
-                .collect();
-        let live = LiveSignals {
-            status: &status_snap,
-            third_party_status: &tp_status_snap,
-            next_refresh: &next_snap,
-            streaks: &streaks_snap,
-            pending_switch: pending_snap.as_deref(),
-            queue_anchor,
-            queue_blocked: &queue_blocked,
-        };
+        // Every live store, each lock released at the end of its own statement,
+        // so none is held when the `config` lock below is taken. Shared with the
+        // REST API's rebuild so the two publishers cannot diverge.
+        let snapshot = self.live_stores().snapshot();
+        let live = snapshot.signals();
         let cfg_snap = {
             #[allow(
                 clippy::expect_used,

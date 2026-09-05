@@ -197,11 +197,21 @@ fn dispatch(cli: Cli) -> Result<()> {
             replace,
             status,
             listen,
+            cert,
+            key,
             print_token,
             rotate_token,
             // The default's explicit spelling: nothing to branch on.
             no_standby: _,
-        } => cmd_daemon(standby, replace, status, print_token, rotate_token, listen),
+        } => cmd_daemon(
+            standby,
+            replace,
+            status,
+            print_token,
+            rotate_token,
+            listen,
+            daemon::api::tls::CertSource::from_flags(cert, key),
+        ),
         Command::Status {
             json: _,
             all,
@@ -231,6 +241,7 @@ fn cmd_daemon(
     print_token: bool,
     rotate_token: bool,
     listen: Option<std::net::SocketAddr>,
+    certs: daemon::api::tls::CertSource,
 ) -> Result<()> {
     // The token arms come first: both print and exit without touching the
     // singleton lock, so they answer for a daemon that is already running as
@@ -248,11 +259,11 @@ fn cmd_daemon(
     } else if status {
         daemon::status_probe()
     } else if replace {
-        daemon::serve(daemon::StartMode::Replace, listen)
+        daemon::serve(daemon::StartMode::Replace, listen, &certs)
     } else if standby {
-        daemon::serve(daemon::StartMode::Standby, listen)
+        daemon::serve(daemon::StartMode::Standby, listen, &certs)
     } else {
-        daemon::serve(daemon::StartMode::ExitIfRunning, listen)
+        daemon::serve(daemon::StartMode::ExitIfRunning, listen, &certs)
     }
 }
 

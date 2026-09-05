@@ -68,3 +68,56 @@ fn a_tier_pin_is_legal_under_a_home_sandbox() {
     let _home = RankGuard::enter::<rank::HomeTest>();
     let _tier = RankGuard::enter::<rank::TierTest>();
 }
+
+/// A panic under a `try_lock` gate must not wedge it for the process lifetime.
+///
+/// `RankedMutex::lock` has always recovered a poisoned mutex through
+/// `into_inner`; `try_lock` used to collapse `Poisoned` and `WouldBlock` into
+/// one opaque error, and its one caller — `POST /api/v1/switch` — turns that
+/// into `409 switch_in_progress`, documented as "retry shortly". A poisoned
+/// mutex never clears, so a single panic anywhere under the gate answered every
+/// later switch with "busy" forever, with nothing in flight to wait for.
+#[test]
+fn a_poisoned_try_lock_is_recovered_rather_than_reported_as_busy() {
+    let gate: RankedMutex<u32, rank::ApiSwitch> = RankedMutex::new(7);
+
+    // Poison it the only way a mutex gets poisoned: panic while holding it.
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = gate.lock();
+        panic!("a switch panicked under the gate");
+    }));
+    assert!(poisoned.is_err(), "precondition: the closure panicked");
+
+    let guard = gate
+        .try_lock()
+        .expect("a poisoned gate is recovered, not reported busy");
+    assert_eq!(*guard, 7, "and the value it was guarding is still readable");
+}
+
+/// The other half: a gate genuinely held by someone else still reports busy, so
+/// recovering poison did not turn the 409 into a lie in the case it exists for.
+#[test]
+fn a_held_try_lock_still_reports_busy() {
+    // Held from ANOTHER thread, necessarily: the rank stack is per-thread, so
+    // taking rank 380 twice here would trip the order assert rather than
+    // exercising the lock — which is the assert doing its job, not a way to
+    // stage a contended lock.
+    static GATE: RankedMutex<u32, rank::ApiSwitch> = RankedMutex::new(1);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+
+    let holder = std::thread::spawn(move || {
+        let _held = GATE.lock().expect("holder acquires");
+        locked_tx.send(()).expect("announce");
+        let _ = release_rx.recv();
+    });
+    locked_rx.recv().expect("the holder is in");
+
+    assert!(
+        GATE.try_lock().is_err(),
+        "a lock held by a live caller is the case 409 switch_in_progress is for"
+    );
+
+    release_tx.send(()).expect("release");
+    holder.join().expect("holder finishes");
+}
