@@ -2198,6 +2198,324 @@ fn capture_into_profile_anchors_the_account_it_committed() {
     );
 }
 
+// ── first-account create over a foreign live login (issue #72) ────────────────
+
+/// The #72 fixture: `claude` itself logged in on this box, so the live
+/// `.credentials.json` is a plain file holding a login clauth never saved, and
+/// clauth holds zero accounts.
+fn foreign_plain_live_login() -> std::path::PathBuf {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "cc-own-access".to_string(),
+                refresh_token: Some("cc-own-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+    live
+}
+
+fn empty_config() -> AppConfig {
+    AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    }
+}
+
+/// The refusal the issue reports, on `capture_into_profile`'s arm: the message
+/// must name the two actions that actually save the login (never the divergence
+/// modal, unreachable at zero accounts), and nothing may survive the attempt.
+#[test]
+fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    save_app_state(&AppState::default()).expect("persist the empty state");
+    let mut config = empty_config();
+
+    let err = capture_into_profile(
+        &mut config,
+        "work".to_string(),
+        login_snapshot("minted-refresh", None),
+    )
+    .expect_err("the guarded link must refuse over a foreign live file");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clauth capture"),
+        "names the cli way out: {msg}"
+    );
+    assert!(
+        msg.contains("+ new from current login"),
+        "names the tui row: {msg}"
+    );
+    assert!(
+        msg.contains("rolled back"),
+        "says the create was rolled back: {msg}"
+    );
+    assert!(
+        !msg.contains("divergence"),
+        "the zero-account site must not point at the divergence modal: {msg}"
+    );
+    // The CLI error printer shows the whole chain in Debug (`Error: {e:?}`),
+    // so the chain must carry the refusal WITHOUT the guard's divergence
+    // pointer — the exact output surface the issue quoted.
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("refusing to replace"),
+        "the guard's own refusal rides along as the cause, unmasked: {debug}"
+    );
+    assert!(
+        !debug.contains("resolve the divergence"),
+        "the CLI chain must not carry the divergence pointer: {debug}"
+    );
+
+    assert!(
+        !profile_dir(&ProfileName::from("work"))
+            .expect("dir")
+            .exists(),
+        "no orphan profile dir"
+    );
+    assert!(
+        config.profiles.is_empty() && config.state.profiles.is_empty(),
+        "in-memory config matches disk again"
+    );
+    let state_toml = std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("profiles.toml"),
+    )
+    .expect("profiles.toml readable");
+    assert!(
+        !state_toml.contains("work"),
+        "profiles.toml does not list it"
+    );
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the foreign live file is untouched"
+    );
+}
+
+/// The same refusal on `create_profile_from_login`'s arm — the Setup tab's
+/// `+ new` → login → create path the issue reproduces.
+#[test]
+fn first_create_from_login_over_a_foreign_live_login_refuses_and_rolls_back() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    save_app_state(&AppState::default()).expect("persist the empty state");
+    let mut config = empty_config();
+    let minted = ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "minted-access".to_string(),
+            refresh_token: Some("minted-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+
+    let err = create_profile_from_login(&mut config, "work".to_string(), None, minted, None)
+        .expect_err("the guarded link must refuse over a foreign live file");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clauth capture"),
+        "names the cli way out: {msg}"
+    );
+    assert!(
+        !msg.contains("divergence"),
+        "the zero-account site must not point at the divergence modal: {msg}"
+    );
+    let debug = format!("{err:?}");
+    assert!(
+        debug.contains("refusing to replace"),
+        "the guard's own refusal rides along as the cause, unmasked: {debug}"
+    );
+    assert!(
+        !debug.contains("resolve the divergence"),
+        "the CLI chain must not carry the divergence pointer: {debug}"
+    );
+    assert!(
+        !profile_dir(&ProfileName::from("work"))
+            .expect("dir")
+            .exists(),
+        "no orphan profile dir"
+    );
+    assert!(
+        config.profiles.is_empty() && config.state.profiles.is_empty(),
+        "in-memory config matches disk again"
+    );
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the foreign live file is untouched"
+    );
+}
+
+/// The reporter's fixed flow: `clauth capture work` over the foreign plain file
+/// saves the login, becomes the active account, and the live path ends up
+/// clauth's own link.
+#[test]
+fn capture_current_login_saves_a_foreign_live_login_as_the_first_account() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    let mut config = empty_config();
+
+    let became_active = capture_current_login(&mut config, "work").expect("capture");
+
+    assert!(became_active, "the first profile auto-activates");
+    assert_eq!(config.state.active_profile.as_deref(), Some("work"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink()),
+        "the live path is now clauth's link"
+    );
+    assert_eq!(
+        crate::claude::classify_credentials_link(&ProfileName::from("work")).expect("classify"),
+        crate::claude::LinkState::LinkedTo,
+        "the account the login was saved under owns the live slot"
+    );
+}
+
+/// A logged-out box (no live file at all) must refuse rather than persist an
+/// empty profile behind a success line.
+#[test]
+fn capture_current_login_refuses_when_nothing_is_live() {
+    let _home = HomeSandbox::new();
+    let mut config = empty_config();
+
+    let err = capture_current_login(&mut config, "work").expect_err("nothing to capture");
+
+    assert_eq!(err.to_string(), "no live login found to capture");
+    assert!(
+        !profile_dir(&ProfileName::from("work"))
+            .expect("dir")
+            .exists(),
+        "nothing written"
+    );
+    assert!(config.profiles.is_empty(), "no in-memory record either");
+}
+
+#[test]
+fn capture_current_login_refuses_an_existing_name_pointing_at_login() {
+    let _home = HomeSandbox::new();
+    foreign_plain_live_login();
+    let existing = Profile::new("work".to_string(), None, None);
+    save_profile(&existing).expect("save existing");
+    let mut config = empty_config();
+    config.add(existing);
+
+    // Case-different spelling: the refusal must name the canonical existing
+    // profile, not mint a second one.
+    let err = capture_current_login(&mut config, "WORK").expect_err("duplicate refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("clauth login work"),
+        "points at the re-auth verb with the canonical name: {msg}"
+    );
+    assert_eq!(config.profiles.len(), 1, "no second profile added");
+}
+
+/// A capture beside an existing active account neither activates (that is the
+/// first-account arm) nor relinks — the live slot is left exactly as it was.
+/// The live login must be foreign to EVERY profile: one another profile owns
+/// is refused by the ownership gate, not captured.
+#[test]
+fn capture_beside_an_active_account_leaves_the_active_alone() {
+    let _home = HomeSandbox::new();
+    // A live re-login no profile owns yet: the CC-side `/login` the active
+    // account must not consume just because another capture happened.
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "uncaptured-access".to_string(),
+                refresh_token: Some("uncaptured-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+    let mut first = Profile::new("first".to_string(), None, None);
+    first.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "first-access".to_string(),
+            refresh_token: Some("first-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&first).expect("save first");
+    let mut config = empty_config();
+    config.add(first);
+    config.state.active_profile = Some(ProfileName::from("first"));
+
+    let became_active = capture_current_login(&mut config, "work").expect("capture");
+
+    assert!(!became_active, "a later profile needs an explicit switch");
+    assert_eq!(config.state.active_profile.as_deref(), Some("first"));
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is left exactly as it was"
+    );
+}
+
+/// The CLI's twin of the TUI's capture-ownership confirm: a live login another
+/// profile already owns must be refused by name, not duplicated silently.
+#[test]
+fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
+    let _home = HomeSandbox::new();
+    let live = foreign_plain_live_login();
+    let mut owner = Profile::new("first".to_string(), None, None);
+    owner.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "cc-own-access".to_string(),
+            refresh_token: Some("cc-own-refresh".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    save_profile(&owner).expect("save owner");
+    let mut config = empty_config();
+    config.add(owner);
+    config.state.active_profile = Some(ProfileName::from("first"));
+
+    let err = capture_current_login(&mut config, "work").expect_err("owned login refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("'first'") && msg.contains("clauth first"),
+        "names the owning profile and the switch to it: {msg}"
+    );
+    assert_eq!(config.profiles.len(), 1, "no duplicate profile minted");
+    assert!(
+        live.symlink_metadata()
+            .is_ok_and(|m| !m.file_type().is_symlink()),
+        "the live file is untouched"
+    );
+}
+
 #[test]
 fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     let _home = HomeSandbox::new();

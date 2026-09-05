@@ -64,12 +64,13 @@ Binary installs update themselves in the background, checksum and signature veri
 
 ## Quickstart
 
-Capture your current Claude Code session as a profile:
+Capture your current Claude Code login as a profile:
 
 ```bash
-clauth
-# Select "+ new from current profile", enter a name, e.g. "work"
+clauth capture work
 ```
+
+or in the TUI: `clauth`, Setup tab, `+ new from current login`, and name it.
 
 Repeat while logged in to a different account, then switch in the TUI (<kbd>⏎</kbd> + confirm) or directly by name:
 

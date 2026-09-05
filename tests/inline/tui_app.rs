@@ -6378,6 +6378,50 @@ fn capture_refuses_empty_snapshot() {
     );
 }
 
+/// The Setup tab's trailing `+ new from current login` picker row (#72's
+/// restored surface): reaching it through the picker's own keys and pressing ⏎
+/// opens the capture-name prompt, not the divergence flow.
+#[test]
+fn setup_capture_row_opens_the_capture_name_prompt() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // A live login to capture: a plain file, as `claude` itself leaves it.
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "live-access".to_string(),
+                refresh_token: Some("live-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Setup;
+    app.config_focus = super::ConfigFocus::Profiles;
+    // Zero accounts: picker row 0 is `+ new`, row 1 the capture row.
+    super::handle_config_key(&mut app, key(KeyCode::Down));
+    super::handle_config_key(&mut app, key(KeyCode::Enter));
+
+    match app.modals.last() {
+        Some(super::Modal::CaptureName(form)) => {
+            assert!(
+                !form.from_divergence,
+                "the row-initiated capture is not the divergence flow"
+            );
+        }
+        other => panic!("the capture row opens the name prompt, got {other:?}"),
+    }
+}
+
 // ── capture-name collision (issue #7) ──────────────────────────────────────
 
 /// Typing an EXISTING profile's name in the capture-name prompt must open the
@@ -8202,6 +8246,22 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
     );
     assert_eq!(menu.scoped_len, 1);
     assert_eq!(menu.context, None, "the draft has no name yet");
+
+    // The capture row has no draft for a preset to stamp, so `a` offers
+    // nothing scoped — a preset stamped onto a hidden `+ new` draft would be
+    // discarded unseen.
+    app.profile_cursor = app.profile_count() + 1;
+    app.config_draft = None;
+    let menu = build_action_menu(&app);
+    assert_eq!(
+        menu.scoped_len, 0,
+        "the capture row offers no scoped action"
+    );
+    assert!(
+        !menu.items.iter().any(|i| i.label == "apply preset"),
+        "the capture row must not offer apply preset: {:?}",
+        menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+    );
 }
 
 /// Applying a preset on `+ new` stamps the draft's input buffers (base_url +

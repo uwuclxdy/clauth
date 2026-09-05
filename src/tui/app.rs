@@ -26,7 +26,7 @@ use crate::actions::{
     create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
     edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
     overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
-    switch_off, switch_profile, validate_profile_name,
+    snapshot_is_empty, switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -4359,11 +4359,7 @@ fn capture_live_or_toast(app: &mut App) -> Option<CaptureSnapshot> {
             return None;
         }
     };
-    let has_oauth = snapshot
-        .credentials
-        .as_ref()
-        .is_some_and(|c| c.claude_ai_oauth.is_some());
-    if !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none() {
+    if snapshot_is_empty(&snapshot) {
         // The Keychain caveat only makes sense on macOS, where a live login can
         // hide in the Keychain clauth doesn't read; elsewhere it's noise.
         let msg = if cfg!(target_os = "macos") {
@@ -5901,7 +5897,10 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 if focused_provider_console(app).is_some() {
                     scoped.push(OpenProviderConsole);
                 }
-            } else if app.profile_cursor >= app.profile_count() {
+            } else if app.profile_cursor == app.profile_count() {
+                // `+ new` only: its draft is what a preset stamps. The trailing
+                // capture row has no draft, and a preset stamped onto a hidden
+                // one would be discarded unseen.
                 context = app
                     .config_draft
                     .as_ref()
@@ -6156,14 +6155,22 @@ fn set_token_period(app: &mut App, period: TokenPeriod) {
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
 /// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    let sel_len = app.profile_count() + 1; // includes trailing `+ new` row
+    let sel_len = app.profile_count() + 2; // trailing `+ new` + `+ new from current login`
     app.profile_cursor = app.profile_cursor.min(sel_len - 1);
 
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
             KeyCode::Up => step_profile_cursor(app, -1, sel_len),
             KeyCode::Down => step_profile_cursor(app, 1, sel_len),
-            KeyCode::Enter => enter_config_detail(app),
+            KeyCode::Enter => {
+                // The trailing capture row runs the capture itself; every other
+                // selection opens the detail pane.
+                if app.profile_cursor > app.profile_count() {
+                    begin_capture(app, false);
+                } else {
+                    enter_config_detail(app);
+                }
+            }
             _ => {}
         },
         ConfigFocus::Actions => {
@@ -6214,7 +6221,12 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let cfg = app.config();
     let draft = app.config_draft.as_ref();
-    if app.profile_cursor >= cfg.profiles.len() {
+    if app.profile_cursor > cfg.profiles.len() {
+        // The `+ new from current login` picker row: ⏎ on the row runs the
+        // capture, so the detail pane carries no rows of its own.
+        return Vec::new();
+    }
+    if app.profile_cursor == cfg.profiles.len() {
         // `+ new` create form. The api key only means something once a base url
         // makes this an API account, so it stays hidden until one is typed.
         let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];

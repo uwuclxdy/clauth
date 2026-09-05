@@ -283,6 +283,16 @@ fn login_bare_name_is_oauth_mode() {
     assert!(!a.yes);
 }
 
+// ── capture ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn capture_parses_with_a_profile_argument() {
+    let Command::Capture { profile } = command(&["capture", "acme"]) else {
+        panic!("capture must parse");
+    };
+    assert_eq!(profile, "acme");
+}
+
 #[test]
 fn login_accepts_a_short_alias_or_a_full_custom_model_id() {
     assert_eq!(

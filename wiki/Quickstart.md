@@ -2,13 +2,13 @@
 
 ## Capture your first profile
 
-Launch the TUI while logged into Claude Code:
+From a shell where Claude Code is logged in:
 
 ```bash
-clauth
+clauth capture work
 ```
 
-Pick `+ new from current profile` on the Overview tab and name it, e.g. `work`. clauth snapshots the OAuth token and endpoint settings your running session is using. Log into a second account in Claude Code, run `clauth` again, and capture that one too.
+or launch the TUI (`clauth`), open the Setup tab, pick `+ new from current login`, and name it `work`. Either way clauth snapshots the OAuth token and endpoint settings your running session is using. Log into a second account in Claude Code and capture that one too.
 
 To add an account without touching the session you are in, use `clauth login` instead: it opens a browser, runs Claude Code's own OAuth flow, and writes the minted tokens into a fresh profile.
 
@@ -63,6 +63,7 @@ clauth list           # account table with cached usage, no network
 | `clauth <profile>` | | switch to that profile and exit |
 | `clauth start <profile> [claude args…]` | `--isolated`, `--with-fallback` | run `claude` under that profile's own config dir |
 | `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
+| `clauth capture <profile>` | | save the login Claude Code is using now as a new profile; the first one becomes the active account |
 | `clauth rolling-token <profile>` | | serve the profile's sessions a rolling token re-stamped from its usage chain |
 | `clauth static-token <profile>` | `--clear`, `--yes` | bare: restore the preserved mint a rolling token superseded; `--clear` removes the long-lived token entirely |
 | `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds |

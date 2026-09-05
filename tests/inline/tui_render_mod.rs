@@ -459,6 +459,36 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
     );
 }
 
+/// The Setup picker ends in two action rows: `+ new`, and the `+ new from
+/// current login` capture row (#72's restored surface). Selecting the capture
+/// row must show its own explainer pane, not the create form riding along.
+#[test]
+fn setup_capture_row_renders_with_its_own_pane() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut app = App::new(config);
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Profiles;
+    app.profile_cursor = 1; // the `+ new from current login` row
+
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("+ new from current login"),
+        "the capture row renders in the picker:\n{out}"
+    );
+    assert!(
+        out.contains("saves the login"),
+        "the selected capture row explains ⏎:\n{out}"
+    );
+    assert!(
+        !out.contains("base url"),
+        "the create form does not ride along on the capture row:\n{out}"
+    );
+}
+
 /// A hybrid (stored OAuth pair + base url) with no api key: the login/log-out
 /// rows must read off the credential that exists, or the tab reads "logged out"
 /// over a live token.

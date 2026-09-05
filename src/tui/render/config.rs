@@ -24,8 +24,8 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // +1 for the trailing `+ new` picker row.
-    let items = app.config().profiles.len() + 1;
+    // +2 for the trailing `+ new` and `+ new from current login` picker rows.
+    let items = app.config().profiles.len() + 2;
     let (selector, settings) = master_detail(area, items);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
@@ -36,7 +36,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let cfg = app.config();
     let count = cfg.profiles.len();
-    let sel = app.profile_cursor.min(count);
+    let sel = app.profile_cursor.min(count + 1);
     draw_selector_list(frame, area, "accounts", focused, sel, |w| {
         let mut rows: Vec<_> = cfg
             .profiles
@@ -56,6 +56,13 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
             count == sel,
             focused,
             "+ new".to_string(),
+            theme::accent(),
+            w,
+        ));
+        rows.push(picker_row(
+            count + 1 == sel,
+            focused,
+            "+ new from current login".to_string(),
             theme::accent(),
             w,
         ));
@@ -203,7 +210,10 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
         }
     };
     let cfg = app.config();
-    if app.profile_cursor >= cfg.profiles.len() {
+    if app.profile_cursor > cfg.profiles.len() {
+        return Snap::blank("+ new from current login");
+    }
+    if app.profile_cursor == cfg.profiles.len() {
         let mut snap = Snap::blank("+ new account");
         // Mirror commit_new_account's consume rule: a typed base url flips the
         // form to API mode and the mint will be discarded, so no stale ✓.
@@ -298,6 +308,17 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let rows = config_rows(app);
+    if rows.is_empty() {
+        // The `+ new from current login` selection: nothing to edit, ⏎ on the
+        // picker row itself runs the capture.
+        let lines = help_tooltip_lines(
+            "⏎ saves the login ~/.claude/.credentials.json holds as a new account, under a name you type next",
+            inner.width as usize,
+        );
+        let end = lines.len();
+        draw_scrolled_lines(frame, inner, lines, (0, end));
+        return;
+    }
     let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
 
     draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);

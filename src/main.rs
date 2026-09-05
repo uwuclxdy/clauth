@@ -165,6 +165,7 @@ fn dispatch(cli: Cli) -> Result<()> {
     match command {
         Command::Start(a) => cmd_start(&a.profile, &a.claude_args, a.isolation(), a.with_fallback),
         Command::Login(a) => cmd_login(a),
+        Command::Capture { profile } => cmd_capture(&profile),
         Command::Delete {
             profile,
             yes,
@@ -690,6 +691,24 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
              install. This login only feeds usage polling. Drop it with:  clauth static-token \
              {target} --clear"
         );
+    }
+    Ok(())
+}
+
+/// `clauth capture <name>`: save the login Claude Code is using now as a new
+/// profile. The refusal paths (existing name, nothing live to capture) and the
+/// capture itself live in `actions::capture_current_login`, so they are
+/// testable without argv; this wrapper only loads config and reports the
+/// outcome.
+fn cmd_capture(profile: &str) -> Result<()> {
+    platform::init();
+    let mut config = load_config()?;
+    let name = profile.trim();
+    let became_active = actions::capture_current_login(&mut config, name)?;
+    if became_active {
+        outln!("clauth: captured into profile '{name}'. It is the active account.");
+    } else {
+        outln!("clauth: captured into profile '{name}'. Switch to it with:  clauth {name}");
     }
     Ok(())
 }

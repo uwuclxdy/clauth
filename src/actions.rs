@@ -1061,6 +1061,44 @@ pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
     })
 }
 
+/// An all-empty snapshot (no OAuth login, no endpoint, no key) holds nothing a
+/// profile could authenticate with. Both capture surfaces refuse it rather than
+/// persisting a credential-less profile behind a success message.
+pub(crate) fn snapshot_is_empty(snapshot: &CaptureSnapshot) -> bool {
+    let has_oauth = snapshot
+        .credentials
+        .as_ref()
+        .is_some_and(|c| c.claude_ai_oauth.is_some());
+    !has_oauth && snapshot.base_url.is_none() && snapshot.api_key.is_none()
+}
+
+/// `clauth capture <name>`: save the login Claude Code is using now as a new
+/// profile. That is the way out when the live credentials file holds a login no
+/// profile owns (#72) — every other create path refuses over it. Returns
+/// whether the new profile became the active account: the first one
+/// auto-activates, any later one needs an explicit switch.
+pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Result<bool> {
+    let name = name.trim();
+    if let Some(existing) = config.canonical_name(name) {
+        bail!(
+            "a profile named '{existing}' already exists; re-authenticate it with:  clauth login {existing}"
+        );
+    }
+    validate_profile_name(name, &config.names(), None)?;
+    let snapshot = capture_snapshot()?;
+    if snapshot_is_empty(&snapshot) {
+        bail!("no live login found to capture");
+    }
+    // The TUI's capture asks before duplicating a login another profile already
+    // owns; the CLI has no confirm flow, so it refuses with the owner named.
+    if let Some(owner) = find_matching_oauth_profile(config, snapshot.credentials.as_ref()) {
+        bail!("these credentials already belong to '{owner}'; switch to it with:  clauth {owner}");
+    }
+    let becomes_active = config.state.active_profile.is_none();
+    capture_into_profile(config, name.to_string(), snapshot)?;
+    Ok(becomes_active)
+}
+
 pub(crate) fn capture_into_profile(
     config: &mut AppConfig,
     name: String,
@@ -1088,7 +1126,9 @@ pub(crate) fn capture_into_profile(
             // the incoming profile the helper answers with its keys, which
             // strips nothing that was already in the file.
             let stale_env_keys = outgoing_env_keys(config);
-            link_profile_credentials(&name)?;
+            if let Err(link_err) = link_profile_credentials(&name) {
+                return Err(rollback_first_account_create(config, &name, held, link_err));
+            }
             config.state.set_active(Some(name.clone()), held);
             // Same settings write the reauth auto-activate arm makes, for the
             // same reason: this profile IS the active one now, and the live
@@ -1136,7 +1176,9 @@ pub(crate) fn create_profile_from_login(
             // the incoming profile the helper answers with its keys, which
             // strips nothing that was already in the file.
             let stale_env_keys = outgoing_env_keys(config);
-            link_profile_credentials(&name)?;
+            if let Err(link_err) = link_profile_credentials(&name) {
+                return Err(rollback_first_account_create(config, &name, held, link_err));
+            }
             config.state.set_active(Some(name.clone()), held);
             // Same settings write + rationale as `capture_into_profile`'s
             // arm: the departed account's entries are still in the live
@@ -1150,6 +1192,55 @@ pub(crate) fn create_profile_from_login(
     // this is that name, so the anchor lands here rather than at the call site.
     crate::usage::seed_login_anchor(&seed_name, account_uuid.as_ref());
     Ok(())
+}
+
+/// The zero-account create arm's `link_profile_credentials` refusal (#72): the
+/// live credentials file holds a login clauth never saved, and the resolve step
+/// the guard's own message points at is unreachable with no active profile. Roll
+/// the half-created profile back — dir off disk, in-memory records dropped, so
+/// config matches disk again — and name the two actions that CAN save the login.
+/// The guard's refusal rides along as the error's cause rather than being
+/// masked.
+fn rollback_first_account_create(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    held: &StateLockHeld,
+    link_err: anyhow::Error,
+) -> anyhow::Error {
+    let mut rollback_note = String::new();
+    match profile_dir(name) {
+        Ok(dir) => {
+            if let Err(e) = std::fs::remove_dir_all(&dir)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                rollback_note = format!(" (rollback could not remove the profile directory: {e})");
+            }
+        }
+        Err(e) => {
+            rollback_note = format!(" (rollback could not resolve the profile directory: {e})");
+        }
+    }
+    config.remove(name, held);
+    let outer = format!(
+        "profile '{name}' not created, the attempt was rolled back: the live \
+         ~/.claude/.credentials.json holds a login no profile owns. Save it first with \
+         'clauth capture {name}', or with the '+ new from current login' row on the Setup \
+         tab{rollback_note}"
+    );
+    // The CLI error printer (`exit_code`) shows the whole anyhow chain in
+    // Debug, and the guard's message ends in the divergence-TUI pointer this
+    // site must not pass on (no active profile, so no divergence modal to
+    // resolve). Chain the guard's own message with that tail stripped: the
+    // refusal is unmasked, and the two real actions replace the pointer in the
+    // outer message. A link failure that is NOT the guard (a publish error)
+    // keeps its original chain untouched.
+    match link_err
+        .to_string()
+        .strip_suffix(&format!("; {} first", crate::format::RESOLVE_IN_TUI))
+    {
+        Some(trimmed) => anyhow::anyhow!(trimmed.to_string()).context(outer),
+        None => link_err.context(outer),
+    }
 }
 
 /// Capture-name collision (issue #7): replace an EXISTING profile's credential
