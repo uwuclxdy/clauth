@@ -672,12 +672,14 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
         let snapshot = run_oauth_browser(false, &target)?;
-        actions::capture_into_profile(&mut config, target.to_string(), snapshot)?;
-        // Apply the requested default model so the captured profile's sessions
-        // route there from the first launch.
-        if let Some(model) = args.model.as_deref() {
-            actions::set_profile_default_model(&mut config, &target, model)?;
-        }
+        // The requested default model rides the capture's own save, so the
+        // profile's sessions route there from the first launch.
+        actions::capture_into_profile(
+            &mut config,
+            target.to_string(),
+            args.model.clone(),
+            snapshot,
+        )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
     // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch, so a

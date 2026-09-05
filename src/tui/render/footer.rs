@@ -67,22 +67,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ],
         },
         Tab::Setup => match app.config_focus {
-            ConfigFocus::Profiles => {
-                // The trailing capture row runs its action on ⏎ itself; every
-                // other selection opens the detail pane.
-                let enter = if app.profile_cursor > app.profile_count() {
-                    "capture"
-                } else {
-                    "configure"
-                };
-                &[
-                    ("↑↓", "account"),
-                    ("↵", enter),
-                    ("n", "new"),
-                    ("a", "actions"),
-                    ("?", "help"),
-                ]
-            }
+            ConfigFocus::Profiles => &[
+                ("↑↓", "account"),
+                ("↵", "configure"),
+                ("n", "new"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
             ConfigFocus::Actions => {
                 // Row-aware: the `model` row cycles on space; env rows edit a value
                 // or open the add-env key editor.

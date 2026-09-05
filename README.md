@@ -70,7 +70,7 @@ Capture your current Claude Code login as a profile:
 clauth capture work
 ```
 
-or in the TUI: `clauth`, Setup tab, `+ new from current login`, and name it.
+or in the TUI: `clauth`, Setup tab, `+ new`, then the `+ capture current login` row.
 
 Repeat while logged in to a different account, then switch in the TUI (<kbd>⏎</kbd> + confirm) or directly by name:
 

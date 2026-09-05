@@ -8,7 +8,7 @@ From a shell where Claude Code is logged in:
 clauth capture work
 ```
 
-or launch the TUI (`clauth`), open the Setup tab, pick `+ new from current login`, and name it `work`. Either way clauth snapshots the OAuth token and endpoint settings your running session is using. Log into a second account in Claude Code and capture that one too.
+or launch the TUI (`clauth`), open the Setup tab, pick `+ new`, press ⏎ on the `+ capture current login` row, name it `work`, and ⏎ on `create account`. Either way clauth snapshots the OAuth token and endpoint settings your running session is using. Log into a second account in Claude Code and capture that one too.
 
 To add an account without touching the session you are in, use `clauth login` instead: it opens a browser, runs Claude Code's own OAuth flow, and writes the minted tokens into a fresh profile.
 

@@ -1095,13 +1095,17 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
         bail!("these credentials already belong to '{owner}'; switch to it with:  clauth {owner}");
     }
     let becomes_active = config.state.active_profile.is_none();
-    capture_into_profile(config, name.to_string(), snapshot)?;
+    capture_into_profile(config, name.to_string(), None, snapshot)?;
     Ok(becomes_active)
 }
 
+/// `model` rides along the same way [`create_profile_from_login`]'s does: the
+/// Setup `+ new` form's typed default model. Every capture-from-a-name-prompt
+/// caller passes `None`.
 pub(crate) fn capture_into_profile(
     config: &mut AppConfig,
     name: String,
+    model: Option<String>,
     snapshot: CaptureSnapshot,
 ) -> Result<()> {
     let CaptureSnapshot {
@@ -1114,6 +1118,11 @@ pub(crate) fn capture_into_profile(
     let seed_name = name.clone();
     with_state_lock(|held| {
         let mut profile = Profile::new(name.to_string(), base_url, api_key);
+        profile.models.default = model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
         profile.set_credentials(credentials, held);
         save_profile(&profile)?;
         config.add(profile);
@@ -1224,8 +1233,8 @@ fn rollback_first_account_create(
     let outer = format!(
         "profile '{name}' not created, the attempt was rolled back: the live \
          ~/.claude/.credentials.json holds a login no profile owns. Save it first with \
-         'clauth capture {name}', or with the '+ new from current login' row on the Setup \
-         tab{rollback_note}"
+         'clauth capture {name}', or with the '+ capture current login' row on the \
+         '+ new' form{rollback_note}"
     );
     // The CLI error printer (`exit_code`) shows the whole anyhow chain in
     // Debug, and the guard's message ends in the divergence-TUI pointer this

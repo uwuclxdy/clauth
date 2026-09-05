@@ -1558,6 +1558,7 @@ fn a_fresh_capture_after_a_switch_off_strips_the_departed_accounts_env() {
     capture_into_profile(
         &mut config,
         "incoming".to_string(),
+        None,
         login_snapshot("rt-incoming", None),
     )
     .expect("capture the incoming account");
@@ -2187,6 +2188,7 @@ fn capture_into_profile_anchors_the_account_it_committed() {
     capture_into_profile(
         &mut config,
         "fresh".to_string(),
+        None,
         login_snapshot("minted", Some("uuid-fresh")),
     )
     .expect("capture");
@@ -2245,6 +2247,7 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
     let err = capture_into_profile(
         &mut config,
         "work".to_string(),
+        None,
         login_snapshot("minted-refresh", None),
     )
     .expect_err("the guarded link must refuse over a foreign live file");
@@ -2255,7 +2258,7 @@ fn first_capture_over_a_foreign_live_login_refuses_and_rolls_back() {
         "names the cli way out: {msg}"
     );
     assert!(
-        msg.contains("+ new from current login"),
+        msg.contains("+ capture current login"),
         "names the tui row: {msg}"
     );
     assert!(

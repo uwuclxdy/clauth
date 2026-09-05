@@ -10,7 +10,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
 use super::super::app::{
-    App, ConfigDraft, ConfigFocus, ConfigRow, InputState, MODEL_PRESETS, config_rows,
+    App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS, config_rows,
 };
 use super::super::theme;
 use super::panes::{
@@ -24,8 +24,8 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // +2 for the trailing `+ new` and `+ new from current login` picker rows.
-    let items = app.config().profiles.len() + 2;
+    // +1 for the trailing `+ new` picker row.
+    let items = app.config().profiles.len() + 1;
     let (selector, settings) = master_detail(area, items);
 
     let profiles_focused = app.config_focus == ConfigFocus::Profiles;
@@ -36,7 +36,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let cfg = app.config();
     let count = cfg.profiles.len();
-    let sel = app.profile_cursor.min(count + 1);
+    let sel = app.profile_cursor.min(count);
     draw_selector_list(frame, area, "accounts", focused, sel, |w| {
         let mut rows: Vec<_> = cfg
             .profiles
@@ -56,13 +56,6 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
             count == sel,
             focused,
             "+ new".to_string(),
-            theme::accent(),
-            w,
-        ));
-        rows.push(picker_row(
-            count + 1 == sel,
-            focused,
-            "+ new from current login".to_string(),
             theme::accent(),
             w,
         ));
@@ -116,9 +109,12 @@ struct Snap {
     /// both states until 2026-08-12. Mirrors `claude::has_stored_oauth_login`,
     /// which the CLI and the action itself read.
     clear_falls_back_to_oauth: bool,
-    /// `+ new` form only: the draft holds a minted login awaiting `create
-    /// account` — flips the `Login` row to its `✓ logged in` state.
+    /// `+ new` form only: the draft holds a login stash awaiting `create
+    /// account`, flipping its row to the ✓ done state. `captured` is `+
+    /// login`'s mint (oauth mode only, mirroring the consume rule);
+    /// `captured_live` is `+ capture current login`'s snapshot.
     captured: bool,
+    captured_live: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
     /// This account's login IS the Alibaba console login
@@ -191,6 +187,7 @@ impl Snap {
             has_other_login: false,
             clear_falls_back_to_oauth: false,
             captured: false,
+            captured_live: false,
             provider: None,
             console_login: false,
             session_token: None,
@@ -210,17 +207,22 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
         }
     };
     let cfg = app.config();
-    if app.profile_cursor > cfg.profiles.len() {
-        return Snap::blank("+ new from current login");
-    }
-    if app.profile_cursor == cfg.profiles.len() {
+    if app.profile_cursor >= cfg.profiles.len() {
         let mut snap = Snap::blank("+ new account");
-        // Mirror commit_new_account's consume rule: a typed base url flips the
-        // form to API mode and the mint will be discarded, so no stale ✓.
-        snap.captured = app
+        let stash = app
             .config_draft
             .as_ref()
-            .is_some_and(|d| d.captured_login.is_some() && d.base_url.value.trim().is_empty());
+            .and_then(|d| d.captured_login.as_ref());
+        // Mirror commit_new_account's consume rule: a typed base url flips the
+        // form to API mode and the mint will be discarded, so no stale ✓. The
+        // live-login stash survives into api mode, so its ✓ tracks the stash
+        // alone.
+        let oauth_mode = app
+            .config_draft
+            .as_ref()
+            .is_some_and(|d| d.base_url.value.trim().is_empty());
+        snap.captured = oauth_mode && stash.is_some_and(|s| matches!(s, DraftLogin::Mint(_)));
+        snap.captured_live = stash.is_some_and(|s| matches!(s, DraftLogin::LiveLogin(_)));
         return snap;
     }
     match cfg.profiles.get(app.profile_cursor) {
@@ -269,6 +271,7 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 has_other_login: p.credentials.is_some() || p.api_key.is_some(),
                 clear_falls_back_to_oauth: p.credentials.is_some(),
                 captured: false,
+                captured_live: false,
                 provider: p.provider.map(|p| p.display_name()),
                 console_login: p.console_login_target().is_some(),
                 // ONE sidecar read per frame feeds both facts. The status is
@@ -308,17 +311,6 @@ fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let rows = config_rows(app);
-    if rows.is_empty() {
-        // The `+ new from current login` selection: nothing to edit, ⏎ on the
-        // picker row itself runs the capture.
-        let lines = help_tooltip_lines(
-            "⏎ saves the login ~/.claude/.credentials.json holds as a new account, under a name you type next",
-            inner.width as usize,
-        );
-        let end = lines.len();
-        draw_scrolled_lines(frame, inner, lines, (0, end));
-        return;
-    }
     let cursor = app.config_action_cursor.min(rows.len().saturating_sub(1));
 
     draw_settings_rows(frame, inner, app, &rows, cursor, &snap, actions_focused);
@@ -573,6 +565,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
+        | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -632,6 +625,9 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         }
         ConfigRow::Login if api_login => "re-enter the base url + api key for this account",
         ConfigRow::Login => "browser OAuth login; mints fresh tokens for this account",
+        ConfigRow::CaptureLogin => {
+            "saves the login Claude Code is using now; create account commits it"
+        }
         ConfigRow::DeleteCreds if api_login => {
             "clears the stored api key; keeps the account and its settings"
         }
@@ -792,6 +788,27 @@ fn detail_row(
             arrow,
             Span::styled("create account", bold_when(theme::accent(), selected)),
         ]),
+        // Same done-state pattern as `Login`: a stashed snapshot renders the ✓,
+        // ⏎ re-captures but confirms first before replacing a stashed mint.
+        ConfigRow::CaptureLogin => {
+            if snap.captured_live {
+                Line::from(vec![
+                    arrow,
+                    Span::styled(
+                        "✓ captured current login",
+                        bold_when(theme::success(), selected),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    arrow,
+                    Span::styled(
+                        "+ capture current login",
+                        bold_when(theme::accent(), selected),
+                    ),
+                ])
+            }
+        }
         ConfigRow::Login => {
             // A draft-held mint renders the done state; ⏎ re-runs the login but
             // confirms first before replacing the stash.

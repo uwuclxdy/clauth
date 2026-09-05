@@ -236,6 +236,11 @@ pub(crate) enum ConfigRow {
     /// Browser OAuth login: mint fresh tokens into this account (or, on the
     /// `+ new` form, create the account from the login). Async — runs on a worker.
     Login,
+    /// `+ new`-form only: stash the live login Claude Code is using now into
+    /// the draft, like [`ConfigRow::Login`] stashes its mint; `create account`
+    /// commits it. Renders only while the live login is real and unowned
+    /// (`App::unsaved_live_login`).
+    CaptureLogin,
     /// Drop this account's stored OAuth credentials, keeping the profile shell.
     DeleteCreds,
     /// CLA-SPLIT escape hatch: delete this account's `session-token.json`, so
@@ -405,12 +410,14 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
-    /// A `+ new`-form browser login, held in memory until `create account`
-    /// consumes it (capture-then-commit). Carries the probed account uuid
-    /// alongside the mint so the anchor is seeded under the name the create
-    /// actually commits — the draft's name is still editable until then. Dropped
-    /// with the draft; never set on an existing account's draft.
-    pub(crate) captured_login: Option<Box<crate::oauth_login::LoginOutcome>>,
+    /// A `+ new`-form login stash, held in memory until `create account`
+    /// consumes it (capture-then-commit): the browser mint `+ login` produced,
+    /// or the live login `+ capture current login` snapshotted. Carries the
+    /// probed account uuid alongside the credentials so the anchor is seeded
+    /// under the name the create actually commits — the draft's name is still
+    /// editable until then. Dropped with the draft; never set on an existing
+    /// account's draft.
+    pub(crate) captured_login: Option<DraftLogin>,
 }
 
 impl ConfigDraft {
@@ -435,6 +442,7 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
+            | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
@@ -461,6 +469,7 @@ impl ConfigDraft {
             | ConfigRow::EnvEntry(_)
             | ConfigRow::EnvAdd
             | ConfigRow::Login
+            | ConfigRow::CaptureLogin
             | ConfigRow::DeleteCreds
             | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
@@ -468,6 +477,16 @@ impl ConfigDraft {
             | ConfigRow::Create => return None,
         })
     }
+}
+
+/// What a `+ new` draft's stash holds: the browser mint `+ login` finished
+/// with, or the live login `+ capture current login` snapshotted off
+/// `~/.claude/.credentials.json`. One slot — the second stash source replaces
+/// the first, gated on a confirm.
+#[derive(Debug, Clone)]
+pub(crate) enum DraftLogin {
+    Mint(Box<crate::oauth_login::LoginOutcome>),
+    LiveLogin(Box<CaptureSnapshot>),
 }
 
 #[derive(Debug, Clone)]
@@ -518,6 +537,9 @@ pub(crate) enum ConfirmAction {
     /// row), so re-running would silently replace it. Confirm first, then
     /// re-dispatch `start_login`. `bool` = `is_new`, carried to the restart.
     RestartLogin(String, bool),
+    /// Setup `+ new` draft: `+ capture current login` pressed while a browser
+    /// mint is already stashed. Confirm, then stash the snapshot in its place.
+    CaptureOverMintStash(Box<CaptureSnapshot>),
     /// Delete row on a profile with a live `clauth start` session: the unforced
     /// guard in `delete_profile` refuses this, so confirm the deauth risk here
     /// and re-run the delete with `force`.
@@ -1703,6 +1725,14 @@ pub(crate) struct App {
     pub(crate) pricing_refresh: std::sync::mpsc::Sender<()>,
 
     pub(crate) last_reload_fp: ReloadFingerprint,
+    /// The live credentials hold a login no profile owns (a login at all, and
+    /// `find_matching_oauth_profile` misses) — the condition the `+ new`
+    /// form's `+ capture current login` row renders on. Recomputed on
+    /// construct, on entering the Setup tab, on config reload (external
+    /// changes), and at every in-TUI mutation that pins `last_reload_fp`
+    /// forward instead of reloading (switch, capture, create, delete, login,
+    /// logout).
+    pub(crate) unsaved_live_login: bool,
     /// Origin of the ambient-animation phase clock; read through [`App::anim_ms`].
     pub(crate) started_at: Instant,
     /// Pinned animation phase for render tests that must sample a specific point
@@ -1972,7 +2002,7 @@ impl App {
                 .collect::<Vec<_>>(),
         );
 
-        Self {
+        let mut app = Self {
             config: Arc::new(RankedMutex::new(config)),
             usage_store,
             usage_status,
@@ -2046,6 +2076,7 @@ impl App {
             pricing_events,
             pricing_refresh,
             last_reload_fp: reload_fingerprint(),
+            unsaved_live_login: false,
             started_at: Instant::now(),
             #[cfg(test)]
             anim_phase_ms: None,
@@ -2069,7 +2100,9 @@ impl App {
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
-        }
+        };
+        app.refresh_unsaved_live_login();
+        app
     }
 
     /// herdr-mode landing, applied at construction (before the first paint):
@@ -2436,6 +2469,17 @@ impl App {
         }
     }
 
+    /// Refresh `unsaved_live_login` off the live credentials + current config.
+    /// Flips come from the live file moving (a login minted elsewhere), the
+    /// profile set changing, or a switch swapping the live file — every site
+    /// that can produce one calls this (see the field's list).
+    pub(crate) fn refresh_unsaved_live_login(&mut self) {
+        self.unsaved_live_login = capture_snapshot().is_ok_and(|snap| {
+            !snapshot_is_empty(&snap)
+                && find_matching_oauth_profile(&self.config(), snap.credentials.as_ref()).is_none()
+        });
+    }
+
     /// Reload config if state mtime changed. Returns true on reload.
     pub(crate) fn reload_if_state_changed(&mut self) -> bool {
         let current = reload_fingerprint();
@@ -2468,6 +2512,7 @@ impl App {
                     .expect("third_party_tokens mutex poisoned") = third_party;
             }
             self.session_tokens = collect_session_tokens(&names);
+            self.refresh_unsaved_live_login();
             true
         } else {
             false
@@ -3045,6 +3090,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Setup => {
             app.config_focus = ConfigFocus::Profiles;
             app.config_action_cursor = 0;
+            // The `+ new` form's capture row renders off this flag, and a
+            // login may have been minted (or saved) elsewhere since the last
+            // Setup visit.
+            app.refresh_unsaved_live_login();
         }
         Tab::Fallback => {
             app.chain_cursor = chain_cursor_for_profile(app);
@@ -4313,6 +4362,7 @@ fn finalize_switch(app: &mut App, name: &ProfileName) {
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("switched to '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("switch failed\n{e}")),
@@ -4338,6 +4388,7 @@ fn perform_switch_off(app: &mut App) {
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.toast(
                 ToastKind::Warning,
                 "all accounts spent\nswitched off to halt usage".to_string(),
@@ -4395,6 +4446,32 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
         input: InputState::new(""),
         from_divergence,
     }));
+}
+
+/// Land a login stash in the live `+ new` draft (`+ login`'s finished mint, or
+/// `+ capture current login`'s snapshot) and park the cursor on `create
+/// account`, the one step left. Returns `false` when the form was closed in
+/// between, so the caller can warn about the dropped round-trip.
+fn stash_new_form_login(app: &mut App, stash: DraftLogin) -> bool {
+    let stashed = match app
+        .config_draft
+        .as_mut()
+        .filter(|d| d.editing_name.is_none())
+    {
+        Some(draft) => {
+            draft.captured_login = Some(stash);
+            true
+        }
+        None => false,
+    };
+    if stashed
+        && let Some(idx) = config_rows(app)
+            .iter()
+            .position(|r| *r == ConfigRow::Create)
+    {
+        app.config_action_cursor = idx;
+    }
+    stashed
 }
 
 // ── Chain screen ──────────────────────────────────────────────────────────────
@@ -5897,10 +5974,8 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 if focused_provider_console(app).is_some() {
                     scoped.push(OpenProviderConsole);
                 }
-            } else if app.profile_cursor == app.profile_count() {
-                // `+ new` only: its draft is what a preset stamps. The trailing
-                // capture row has no draft, and a preset stamped onto a hidden
-                // one would be discarded unseen.
+            } else if app.profile_cursor >= app.profile_count() {
+                // `+ new` only: its draft is what a preset stamps.
                 context = app
                     .config_draft
                     .as_ref()
@@ -6155,22 +6230,14 @@ fn set_token_period(app: &mut App, period: TokenPeriod) {
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
 /// edits/toggles/arms/creates. Esc (global) returns to list.
 fn handle_config_key(app: &mut App, key: KeyEvent) {
-    let sel_len = app.profile_count() + 2; // trailing `+ new` + `+ new from current login`
+    let sel_len = app.profile_count() + 1; // includes trailing `+ new` row
     app.profile_cursor = app.profile_cursor.min(sel_len - 1);
 
     match app.config_focus {
         ConfigFocus::Profiles => match key.code {
             KeyCode::Up => step_profile_cursor(app, -1, sel_len),
             KeyCode::Down => step_profile_cursor(app, 1, sel_len),
-            KeyCode::Enter => {
-                // The trailing capture row runs the capture itself; every other
-                // selection opens the detail pane.
-                if app.profile_cursor > app.profile_count() {
-                    begin_capture(app, false);
-                } else {
-                    enter_config_detail(app);
-                }
-            }
+            KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
         ConfigFocus::Actions => {
@@ -6221,12 +6288,7 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
 pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     let cfg = app.config();
     let draft = app.config_draft.as_ref();
-    if app.profile_cursor > cfg.profiles.len() {
-        // The `+ new from current login` picker row: ⏎ on the row runs the
-        // capture, so the detail pane carries no rows of its own.
-        return Vec::new();
-    }
-    if app.profile_cursor == cfg.profiles.len() {
+    if app.profile_cursor >= cfg.profiles.len() {
         // `+ new` create form. The api key only means something once a base url
         // makes this an API account, so it stays hidden until one is typed.
         let mut rows = vec![ConfigRow::Name, ConfigRow::BaseUrl];
@@ -6237,6 +6299,13 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         rows.push(ConfigRow::Model);
         if draft.is_none_or(|d| d.base_url.value.trim().is_empty()) {
             rows.push(ConfigRow::Login);
+        }
+        // The live-login capture row sits right below `+ login` and survives
+        // into api mode (`+ login` doesn't): a live setup can be an endpoint
+        // too. Hidden while the live login is saved or absent — nothing to
+        // capture.
+        if app.unsaved_live_login {
+            rows.push(ConfigRow::CaptureLogin);
         }
         rows.push(ConfigRow::Create);
         return rows;
@@ -6362,7 +6431,7 @@ fn start_new_account(app: &mut App) {
     app.config_focus = ConfigFocus::Actions;
 }
 
-fn build_draft_new() -> ConfigDraft {
+pub(crate) fn build_draft_new() -> ConfigDraft {
     ConfigDraft {
         editing_name: None,
         name: InputState::new(""),
@@ -6413,12 +6482,12 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
 
 /// Back out of the Setup detail pane, dropping the draft. A `+ new` draft
 /// holding a minted login loses it with the form — say so instead of
-/// discarding a real browser round-trip silently.
+/// discarding a real browser round-trip silently. A stashed live login needs
+/// no warning: re-pressing the row re-reads the same file.
 fn leave_config_detail(app: &mut App) {
-    let mint_dropped = app
-        .config_draft
-        .as_ref()
-        .is_some_and(|d| d.editing_name.is_none() && d.captured_login.is_some());
+    let mint_dropped = app.config_draft.as_ref().is_some_and(|d| {
+        d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
+    });
     app.config_focus = ConfigFocus::Profiles;
     app.config_draft = None;
     if mint_dropped {
@@ -6557,9 +6626,10 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 }
             };
             if let Some((name, is_new)) = target {
-                // A stashed mint (the `✓ logged in` done-state) makes ⏎ a
-                // stash-replacing re-login; gate it so it can't drop the capture
-                // silently. Only the `+ new` draft ever holds a stash.
+                // A stash (the `✓ logged in` / `✓ captured current login`
+                // done-states) makes ⏎ a stash-replacing re-login; gate it so it
+                // can't drop the capture silently. Only the `+ new` draft ever
+                // holds a stash.
                 let has_stash = app
                     .config_draft
                     .as_ref()
@@ -6574,6 +6644,56 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 } else {
                     start_login(app, name, is_new);
                 }
+            }
+        }
+        ConfigRow::CaptureLogin => {
+            // The row only renders on the `+ new` form, where a draft is always
+            // open; the empty and owned states are what HIDE it, so hitting one
+            // here means the live file moved since the flag was computed.
+            let Some(snapshot) = capture_live_or_toast(app) else {
+                // The file emptied since the flag was computed; drop the row.
+                app.refresh_unsaved_live_login();
+                return;
+            };
+            let owner = {
+                let cfg = app.config();
+                find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
+            };
+            if let Some(owner) = owner {
+                // Refuse, not confirm: a NEW account over a login another
+                // profile owns is the duplicate `overwrite_captured_profile`
+                // exists to prevent, and this row's whole purpose is the
+                // unowned case.
+                app.toast(
+                    ToastKind::Danger,
+                    format!(
+                        "these credentials already belong to '{owner}'\nswitch to it with:  clauth {owner}"
+                    ),
+                );
+                app.refresh_unsaved_live_login();
+                return;
+            }
+            let mint_stashed = app.config_draft.as_ref().is_some_and(|d| {
+                d.editing_name.is_none() && matches!(d.captured_login, Some(DraftLogin::Mint(_)))
+            });
+            if mint_stashed {
+                // The browser round-trip a mint cost can't be redone for free;
+                // gate replacing it, mirroring the re-login gate above.
+                app.modals.push(Modal::Confirm(ConfirmState {
+                    message: "replace the logged-in mint?".to_string(),
+                    detail: Some(
+                        "the browser login you already captured will be dropped".to_string(),
+                    ),
+                    choice: false,
+                    on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
+                }));
+                return;
+            }
+            if stash_new_form_login(app, DraftLogin::LiveLogin(Box::new(snapshot))) {
+                app.toast(
+                    ToastKind::Success,
+                    "current login captured\ncreate account saves it",
+                );
             }
         }
         ConfigRow::DeleteCreds => {
@@ -7179,6 +7299,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         | ConfigRow::ModelOverrideAdd
         | ConfigRow::EnvAdd
         | ConfigRow::Login
+        | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -7286,6 +7407,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         | ConfigRow::EnvEntry(_)
         | ConfigRow::EnvAdd
         | ConfigRow::Login
+        | ConfigRow::CaptureLogin
         | ConfigRow::DeleteCreds
         | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
@@ -7749,12 +7871,17 @@ fn commit_new_account(app: &mut App) {
     let model = d.model.trimmed_some();
     // A draft-held mint only makes sense for an OAuth create; a typed base url
     // flipped the form to API mode (login row hidden), so the mint is dropped.
-    let captured = if base_url.is_none() {
-        d.captured_login.clone()
-    } else {
-        None
+    // The live-login stash commits in BOTH modes — a live setup can be an
+    // endpoint — and the snapshot's own endpoint wins over anything typed.
+    let captured = match d.captured_login.clone() {
+        live @ Some(DraftLogin::LiveLogin(_)) => live,
+        mint @ Some(DraftLogin::Mint(_)) if base_url.is_none() => mint,
+        _ => None,
     };
-    let mint_discarded = base_url.is_some() && d.captured_login.is_some();
+    let mint_discarded =
+        base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::Mint(_)));
+    let endpoint_overridden =
+        base_url.is_some() && matches!(d.captured_login, Some(DraftLogin::LiveLogin(_)));
     let validation = {
         let cfg = app.config();
         validate_profile_name(&name, &cfg.names(), None)
@@ -7767,9 +7894,14 @@ fn commit_new_account(app: &mut App) {
     let result = {
         let mut cfg = app.config();
         match captured {
+            // Both stashes parked the login's uuid until this moment fixed the
+            // name; the commit functions anchor it on the create.
+            Some(DraftLogin::LiveLogin(snapshot)) => {
+                capture_into_profile(&mut cfg, name.clone(), model, *snapshot)
+            }
             // The draft parked the login's uuid until this moment fixed the
             // name; `create_profile_from_login` anchors it on the commit.
-            Some(login) => create_profile_from_login(
+            Some(DraftLogin::Mint(login)) => create_profile_from_login(
                 &mut cfg,
                 name.clone(),
                 model,
@@ -7787,8 +7919,15 @@ fn commit_new_account(app: &mut App) {
                     "base url set\nthe captured oauth login was discarded",
                 );
             }
+            if endpoint_overridden {
+                app.toast(
+                    ToastKind::Info,
+                    "created from the captured current login\nthe typed endpoint fields were not used",
+                );
+            }
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             let new_idx = app
                 .config()
                 .profiles
@@ -7835,6 +7974,7 @@ fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.config_focus = ConfigFocus::Profiles;
             app.config_draft = None;
             app.clamp_profile_cursor();
@@ -8417,6 +8557,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("overwrote '{name}' with the captured login"),
@@ -8463,6 +8604,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("saved the login into '{name}', now active"),
@@ -8554,6 +8696,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match force_link_profile_credentials(&name) {
                 Ok(()) => {
                     app.refresh_tokens();
+                    app.refresh_unsaved_live_login();
                     app.toast(
                         ToastKind::Success,
                         format!("relinked credentials to '{name}'"),
@@ -8617,12 +8760,21 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("log out failed\n{e}")),
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
+        ConfirmAction::CaptureOverMintStash(snapshot) => {
+            if stash_new_form_login(app, DraftLogin::LiveLogin(snapshot)) {
+                app.toast(
+                    ToastKind::Success,
+                    "current login captured\ncreate account saves it",
+                );
+            }
+        }
         ConfirmAction::DeleteLiveSession(name) => {
             finish_delete(app, &ProfileName::from(name), true)
         }
@@ -8893,12 +9045,13 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             }
             let result = {
                 let mut cfg = app.config();
-                capture_into_profile(&mut cfg, name.clone(), *snapshot)
+                capture_into_profile(&mut cfg, name.clone(), None, *snapshot)
             };
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
                     app.last_reload_fp = reload_fingerprint();
+                    app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("captured '{name}'"));
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("capture failed\n{e}")),
@@ -9131,25 +9284,8 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         // the mint lives only in the draft, so without one it is dropped. The
         // anchor waits for `create account`: the draft's name is still editable,
         // so the profile this login belongs to has no final name yet.
-        let stashed = match app
-            .config_draft
-            .as_mut()
-            .filter(|d| d.editing_name.is_none())
-        {
-            Some(draft) => {
-                draft.captured_login = Some(Box::new(outcome));
-                true
-            }
-            None => false,
-        };
+        let stashed = stash_new_form_login(app, DraftLogin::Mint(Box::new(outcome)));
         if stashed {
-            // Land the cursor on `create account`, the one step left.
-            if let Some(idx) = config_rows(app)
-                .iter()
-                .position(|r| *r == ConfigRow::Create)
-            {
-                app.config_action_cursor = idx;
-            }
             app.toast(ToastKind::Success, "logged in\ncreate account saves it");
         } else {
             app.toast(
@@ -9222,6 +9358,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         Ok(()) => {
             app.refresh_tokens();
             app.last_reload_fp = reload_fingerprint();
+            app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
@@ -9602,6 +9739,14 @@ fn poll_credentials_divergence(app: &mut App) {
     if !app.modals.is_empty() {
         return;
     }
+    // The reload fingerprint never stats the live credentials file, so a login
+    // CC itself minted mid-session is invisible to every other refresh site.
+    // This poll already reads at 1Hz; while the Setup tab is open it also
+    // refreshes the `+ capture current login` row's flag — zero accounts is
+    // that row's own onboarding window.
+    if app.tab == Tab::Setup {
+        app.refresh_unsaved_live_login();
+    }
     let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         app.divergence_pending = None;
         return;
@@ -9629,6 +9774,7 @@ fn poll_credentials_divergence(app: &mut App) {
             Ok(()) => {
                 app.refresh_tokens();
                 app.last_reload_fp = reload_fingerprint();
+                app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),

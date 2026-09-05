@@ -3020,7 +3020,9 @@ fn login_result_on_the_new_form_stashes_into_the_draft() {
 
 #[test]
 fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
-    use super::{ConfigFocus, ConfigRow, ConfirmAction, Modal, build_draft_new, run_config_row};
+    use super::{
+        ConfigFocus, ConfigRow, ConfirmAction, DraftLogin, Modal, build_draft_new, run_config_row,
+    };
     use crate::profile::{AppConfig, AppState};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -3032,7 +3034,10 @@ fn relogin_on_a_stashed_new_form_confirms_before_replacing_the_stash() {
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     // A mint already captured → the `✓ logged in` done-state row.
-    draft.captured_login = Some(Box::new(login_outcome("stashed", Some("uuid-stashed"))));
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "stashed",
+        Some("uuid-stashed"),
+    ))));
     app.config_draft = Some(draft);
     app.config_focus = ConfigFocus::Actions;
 
@@ -3091,7 +3096,7 @@ fn login_result_with_the_form_closed_is_dropped_with_a_warning() {
 
 #[test]
 fn commit_new_account_consumes_the_draft_mint() {
-    use super::{build_draft_new, commit_new_account};
+    use super::{DraftLogin, build_draft_new, commit_new_account};
     use crate::profile::{AppConfig, AppState};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -3103,7 +3108,10 @@ fn commit_new_account_consumes_the_draft_mint() {
     let mut draft = build_draft_new();
     draft.name = InputState::new("fresh");
     draft.model = InputState::new("opus");
-    draft.captured_login = Some(Box::new(login_outcome("minted", Some("uuid-minted"))));
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "minted",
+        Some("uuid-minted"),
+    ))));
     app.config_draft = Some(draft);
 
     commit_new_account(&mut app);
@@ -3137,6 +3145,256 @@ fn commit_new_account_consumes_the_draft_mint() {
         Some("uuid-minted"),
         "the anchor lands under the name the create committed — the draft carried \
          the login's uuid this far precisely because the name was still editable"
+    );
+}
+
+// ── `+ capture current login` (the `+ new` form row) ─────────────────────────
+
+/// ⏎ on `+ capture current login` stashes the live login into the draft like
+/// `+ login` stashes its mint; `create account` then commits it under the
+/// typed name, folding the typed model — the #72 flow, on the form.
+#[test]
+fn capture_row_stashes_and_create_account_commits() {
+    use super::{
+        ConfigFocus, ConfigRow, DraftLogin, ToastKind, build_draft_new, commit_new_account,
+        config_rows, run_config_row,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    plain_live_login("live-refresh");
+    let mut app = bare_app();
+    app.refresh_unsaved_live_login();
+    app.profile_cursor = 0; // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("work");
+    draft.model = InputState::new("sonnet");
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    assert!(
+        app.config()
+            .find(&crate::profile::ProfileName::from("work"))
+            .is_none(),
+        "capture-then-commit: no profile until create fires"
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::LiveLogin(_))
+        ),
+        "the live login lands in the draft"
+    );
+    assert_eq!(
+        config_rows(&app).get(app.config_action_cursor),
+        Some(&ConfigRow::Create),
+        "the cursor lands on `create account`"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Success && t.body.contains("current login captured")),
+        "the stash success toast names what happened"
+    );
+
+    commit_new_account(&mut app);
+
+    let cfg = app.config();
+    let profile = cfg
+        .find(&crate::profile::ProfileName::from("work"))
+        .expect("create account commits the captured login");
+    assert_eq!(
+        profile.refresh_token(),
+        Some("live-refresh"),
+        "the profile holds the live login's tokens"
+    );
+    assert_eq!(
+        profile.models.default.as_deref(),
+        Some("sonnet"),
+        "the typed model folds into the same create"
+    );
+    assert!(
+        !app.unsaved_live_login,
+        "the flag drops once the created account owns the login"
+    );
+}
+
+/// Ownership that appeared after the flag was computed: ⏎ refuses naming the
+/// owner — a new account over an owned login is the duplicate the overwrite
+/// path exists to prevent — and refreshes the flag so the row disappears.
+#[test]
+fn capture_row_over_an_owned_live_login_refuses() {
+    use super::{ConfigFocus, ConfigRow, ToastKind, build_draft_new, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+    plain_live_login("rt-owner");
+    let mut app = bare_app();
+    {
+        let mut cfg = app.config();
+        cfg.profiles
+            .push(stored_oauth_profile("owner", far_future()));
+    }
+    app.unsaved_live_login = true; // stale: the state the row was rendered on
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_new());
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "nothing is stashed over an owned login"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("owner")),
+        "the refusal names the owning profile"
+    );
+    assert!(
+        !app.unsaved_live_login,
+        "the refusal refreshes the flag the row renders on"
+    );
+}
+
+/// The live file going empty between the flag and the press: the shared
+/// `capture_live_or_toast` refusal, not a credential-less stash.
+#[test]
+fn capture_row_with_nothing_live_refuses() {
+    use super::{ConfigFocus, ConfigRow, ToastKind, build_draft_new, run_config_row};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.unsaved_live_login = true; // stale
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_new());
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    assert!(
+        app.config_draft
+            .as_ref()
+            .is_some_and(|d| d.captured_login.is_none()),
+        "nothing is stashed from an empty live file"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.kind == ToastKind::Danger && t.body.contains("no live login found")),
+        "the empty-snapshot refusal toast fires"
+    );
+}
+
+/// A browser mint already stashed (`✓ logged in`): capturing over it asks
+/// first, exactly like the re-login gate — the mint cost a real browser
+/// round-trip. Confirming swaps the stash.
+#[test]
+fn capture_row_over_a_stashed_mint_confirms_first() {
+    use super::{
+        ConfigFocus, ConfigRow, ConfirmAction, DraftLogin, Modal, build_draft_new, run_config_row,
+        run_confirm_action,
+    };
+    let _home = crate::testutil::HomeSandbox::new();
+    plain_live_login("live-refresh");
+    let mut app = bare_app();
+    app.refresh_unsaved_live_login();
+    app.profile_cursor = 0;
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    draft.captured_login = Some(DraftLogin::Mint(Box::new(login_outcome(
+        "stashed",
+        Some("uuid-stashed"),
+    ))));
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::CaptureLogin);
+
+    let action = match app.modals.last() {
+        Some(Modal::Confirm(s)) => {
+            assert!(
+                matches!(s.on_confirm, ConfirmAction::CaptureOverMintStash(_)),
+                "the confirm targets the mint replacement"
+            );
+            s.on_confirm.clone()
+        }
+        other => panic!("⏎ over a stashed mint must confirm first, got {other:?}"),
+    };
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::Mint(_))
+        ),
+        "cancel (no confirm) keeps the mint"
+    );
+
+    run_confirm_action(&mut app, action);
+
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::LiveLogin(_))
+        ),
+        "confirming swaps the mint for the captured live login"
+    );
+}
+
+/// The reverse direction of the same single stash slot: `+ login` over a
+/// stashed live login must confirm before replacing it — the gate now guards
+/// ANY stash, not just a mint.
+#[test]
+fn login_row_over_a_stashed_live_login_confirms_first() {
+    use super::{
+        ConfigFocus, ConfigRow, ConfirmAction, DraftLogin, Modal, build_draft_new, run_config_row,
+    };
+    use crate::actions::CaptureSnapshot;
+    use crate::profile::{AppConfig, AppState};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.profile_cursor = 0; // the `+ new` form
+    let mut draft = build_draft_new();
+    draft.name = InputState::new("fresh");
+    draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+        credentials: None,
+        base_url: None,
+        api_key: None,
+        account_uuid: None,
+    })));
+    app.config_draft = Some(draft);
+    app.config_focus = ConfigFocus::Actions;
+
+    run_config_row(&mut app, ConfigRow::Login);
+
+    assert!(
+        matches!(
+            app.modals.last(),
+            Some(Modal::Confirm(s)) if matches!(s.on_confirm, ConfirmAction::RestartLogin(_, true))
+        ),
+        "⏎ on `+ login` over a stashed live login must confirm before dropping it",
+    );
+    assert!(
+        app.login.is_none(),
+        "no login worker starts until the confirm is accepted",
+    );
+    assert!(
+        matches!(
+            app.config_draft
+                .as_ref()
+                .and_then(|d| d.captured_login.as_ref()),
+            Some(DraftLogin::LiveLogin(_))
+        ),
+        "cancel (no confirm) keeps the stashed live login"
     );
 }
 
@@ -6378,13 +6636,10 @@ fn capture_refuses_empty_snapshot() {
     );
 }
 
-/// The Setup tab's trailing `+ new from current login` picker row (#72's
-/// restored surface): reaching it through the picker's own keys and pressing ⏎
-/// opens the capture-name prompt, not the divergence flow.
-#[test]
-fn setup_capture_row_opens_the_capture_name_prompt() {
-    let _home = crate::testutil::HomeSandbox::new();
-    // A live login to capture: a plain file, as `claude` itself leaves it.
+/// A plain live credentials file, as `claude` itself leaves it, holding an
+/// OAuth login (refresh token `rt-<name>` when `name` is given, so a profile
+/// saved with the same token owns it).
+fn plain_live_login(refresh: &str) -> std::path::PathBuf {
     let live = crate::profile::claude_dir()
         .expect("claude dir")
         .join(".credentials.json");
@@ -6393,8 +6648,8 @@ fn setup_capture_row_opens_the_capture_name_prompt() {
         &live,
         serde_json::to_vec(&crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
-                access_token: "live-access".to_string(),
-                refresh_token: Some("live-refresh".to_string()),
+                access_token: format!("access-{refresh}"),
+                refresh_token: Some(refresh.to_string()),
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
@@ -6403,23 +6658,62 @@ fn setup_capture_row_opens_the_capture_name_prompt() {
         .expect("serialize live login"),
     )
     .expect("write live login");
+    live
+}
 
+/// `+ capture current login` renders on the `+ new` form only while the live
+/// login is real and no profile owns it — `unsaved_live_login` drives the row,
+/// and the flag itself reads live credentials + the profile set. API mode
+/// keeps the row (`+ login` doesn't): a live setup can be an endpoint too.
+#[test]
+fn new_form_capture_row_tracks_an_unsaved_live_login() {
+    use super::{ConfigRow, build_draft_new, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.tab = super::Tab::Setup;
-    app.config_focus = super::ConfigFocus::Profiles;
-    // Zero accounts: picker row 0 is `+ new`, row 1 the capture row.
-    super::handle_config_key(&mut app, key(KeyCode::Down));
-    super::handle_config_key(&mut app, key(KeyCode::Enter));
+    app.profile_cursor = 0; // == profile_count() → the `+ new` form
 
-    match app.modals.last() {
-        Some(super::Modal::CaptureName(form)) => {
-            assert!(
-                !form.from_divergence,
-                "the row-initiated capture is not the divergence flow"
-            );
-        }
-        other => panic!("the capture row opens the name prompt, got {other:?}"),
+    // Nothing live: no row (the flag starts false — no login exists).
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "no live login, no capture row"
+    );
+
+    // An unowned live login: the row shows, and survives a typed base url.
+    plain_live_login("live-refresh");
+    app.refresh_unsaved_live_login();
+    assert!(
+        app.unsaved_live_login,
+        "an unowned live login turns the flag on"
+    );
+    assert!(
+        config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "the row renders for an unowned live login"
+    );
+    let mut draft = build_draft_new();
+    draft.base_url = InputState::new("https://api.example.com");
+    app.config_draft = Some(draft);
+    assert!(
+        config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "the row survives api mode (a live setup can be an endpoint)"
+    );
+    app.config_draft = None;
+
+    // A profile owning the login: the flag drops, the row goes.
+    plain_live_login("rt-owner");
+    let owner = stored_oauth_profile("owner", far_future());
+    {
+        let mut cfg = app.config();
+        cfg.profiles.push(owner);
     }
+    app.refresh_unsaved_live_login();
+    assert!(
+        !app.unsaved_live_login,
+        "a login a profile owns turns the flag off"
+    );
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::CaptureLogin),
+        "no row over an owned live login"
+    );
 }
 
 // ── capture-name collision (issue #7) ──────────────────────────────────────
@@ -8246,22 +8540,6 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
     );
     assert_eq!(menu.scoped_len, 1);
     assert_eq!(menu.context, None, "the draft has no name yet");
-
-    // The capture row has no draft for a preset to stamp, so `a` offers
-    // nothing scoped — a preset stamped onto a hidden `+ new` draft would be
-    // discarded unseen.
-    app.profile_cursor = app.profile_count() + 1;
-    app.config_draft = None;
-    let menu = build_action_menu(&app);
-    assert_eq!(
-        menu.scoped_len, 0,
-        "the capture row offers no scoped action"
-    );
-    assert!(
-        !menu.items.iter().any(|i| i.label == "apply preset"),
-        "the capture row must not offer apply preset: {:?}",
-        menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
-    );
 }
 
 /// Applying a preset on `+ new` stamps the draft's input buffers (base_url +
