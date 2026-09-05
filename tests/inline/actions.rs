@@ -150,6 +150,112 @@ fn switch_replaces_active_account_mirror_without_refusing() {
     );
 }
 
+/// Two logged-in profiles with `one` active and the live file mirroring it —
+/// the shape both feed-publishing tests below switch out of.
+fn two_profiles_active_on_one() -> AppConfig {
+    let mk = |name: &str| {
+        let mut p = Profile::new(name.to_string(), None, None);
+        p.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: format!("{name}-access"),
+                refresh_token: Some(format!("{name}-refresh")),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        });
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let outgoing = mk("one");
+    let target = mk("two");
+
+    let live_path = crate::profile::claude_dir()
+        .unwrap()
+        .join(".credentials.json");
+    std::fs::create_dir_all(live_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &live_path,
+        serde_json::to_vec(outgoing.credentials.as_ref().unwrap()).unwrap(),
+    )
+    .unwrap();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![outgoing, target],
+    };
+    config.state.active_profile = Some("one".into());
+    // Persisted, not just in memory: `ensure_installable` gates on
+    // `profile::is_configured`, which reads the roster back off disk so a target
+    // deleted by a concurrent CLI bounces before the relink tears the live slot
+    // down. A fixture holding the roster only in memory reads as "not found".
+    config.state.profiles = vec!["one".into(), "two".into()];
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    config
+}
+
+/// The published feed must name the account the switch just landed on.
+///
+/// `~/.clauth/status.json` is the contract external readers follow
+/// (`wiki/Daemon.md`), and only `clauth daemon` ever wrote it — so a switch made
+/// in the TUI, by `clauth <name>`, or through the MCP tool left the published
+/// `active_profile` naming the account the operator had just switched away
+/// from: until the next tick when a daemon happened to be running to notice the
+/// `profiles.toml` mtime, and forever when one was not.
+#[test]
+fn switch_publishes_the_status_feed_when_no_daemon_owns_it() {
+    let home = HomeSandbox::new();
+    let mut config = two_profiles_active_on_one();
+
+    let feed = home.home().join(".clauth").join("status.json");
+    assert!(!feed.exists(), "nothing has published a feed yet");
+
+    switch_profile(&mut config, &"two".into()).expect("switch");
+
+    let published = std::fs::read(&feed).expect("the switch itself published the feed");
+    let body: serde_json::Value = serde_json::from_slice(&published).unwrap();
+    assert_eq!(body["active_profile"], "two");
+    let flags: Vec<(String, bool)> = body["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["name"].as_str().unwrap().to_string(),
+                p["active"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        flags,
+        vec![("one".to_string(), false), ("two".to_string(), true)],
+        "the per-profile active flags move with the top-level name",
+    );
+}
+
+/// A live daemon OWNS the feed: it republishes every tick with the scheduler's
+/// in-memory `fetch_status` / `next_refresh_at` / `pending_switch`, which a
+/// single-shot build cannot see. A switch must leave the file to that daemon —
+/// whose next tick is at most a second out — rather than overwrite the richer
+/// body with a thinner one.
+#[test]
+fn switch_leaves_the_feed_to_a_running_daemon() {
+    let home = HomeSandbox::new();
+    let mut config = two_profiles_active_on_one();
+    let _daemon = crate::daemon::hold_daemon_lock();
+
+    switch_profile(&mut config, &"two".into()).expect("switch");
+
+    assert!(
+        config.is_active(&"two".into()),
+        "the switch itself still lands"
+    );
+    assert!(
+        !home.home().join(".clauth").join("status.json").exists(),
+        "a daemon owns status.json; its own next tick republishes it",
+    );
+}
+
 /// `switch_profile` to a name with no profile must bail BEFORE any side
 /// effect. Pre-fix the existence check lived in `finish_switch` — LAST in the
 /// sequence — so `force_link_profile_credentials` had already torn down the

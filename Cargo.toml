@@ -68,10 +68,33 @@ clap = { version = "4.6.6", features = ["derive", "wrap_help"] }
 # claude-only host clauth is; the embedded tree is the committed `plugins/` dir.
 agentgear = "0.1.3"
 
+# `clauth daemon --listen` (the TLS REST API). Every crate below is ALREADY in
+# the tree via ureq; these lines only promote them to direct deps, so the
+# listener costs no new download and nothing new for cargo-deny to vet.
+#
+# `default-features = false` is load-bearing: rustls' defaults select the
+# aws-lc-rs provider, which would add a second crypto backend, a C toolchain to
+# every build, and a license that is not on deny.toml's allowlist. `ring` is the
+# provider ureq already builds, so pinning it keeps exactly one in the tree.
+rustls = { version = "0.23.42", default-features = false, features = ["std", "ring", "tls12", "logging"] }
+# PEM decoding for the lego certificate and key. Its `pem` module is
+# unconditional, so this covers what rustls-pemfile would otherwise be needed
+# for; `std` is what adds the read-from-file half of it.
+rustls-pki-types = { version = "1.15.0", features = ["std"] }
+# Request-head parsing for that server. Hand-rolling this is where the bugs are;
+# httparse is in the tree via ureq-proto.
+httparse = "1"
+# Constant-time bearer-token comparison. Nothing in the crate compares secrets
+# today — `update.rs`'s hex compare is explicitly marked as unsafe to reuse here.
+subtle = "2.6"
+# Hex for the token. Three ad-hoc `{b:02x}` loops already exist; don't add a fourth.
+hex = "0.4"
+
 [build-dependencies]
 # The version guard `build.rs` runs: fails the build when `plugins/.claude-plugin/
 # plugin.json` and CARGO_PKG_VERSION disagree (CC caches on that version).
 agentgear = "0.1.3"
+
 
 [dev-dependencies]
 # `test-util` alone, for `Builder::start_paused`. The blocking `delegate`'s
@@ -81,6 +104,7 @@ agentgear = "0.1.3"
 # exact and instant. No new crate — tokio is already a dependency above — and
 # resolver 3 keeps a dev-dependency's features out of the normal build.
 tokio = { version = "1.53.1", features = ["test-util"] }
+
 
 # npm installs `claude` as a `.cmd` shim that Rust's bare `Command::new` can't
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.

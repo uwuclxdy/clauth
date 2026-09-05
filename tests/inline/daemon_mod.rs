@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 //! Characterization of the daemon's per-tick work (`Daemon::tick` and the
 //! drains extracted to `src/daemon/tick.rs`) — the top reliability path.
 //!
@@ -936,7 +937,12 @@ fn a_redundant_instance_exits_without_touching_the_shared_tree() {
     let held = crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open lock");
     held.try_lock().expect("hold the singleton lock");
 
-    super::serve(super::StartMode::ExitIfRunning).expect("a redundant instance exits clean");
+    super::serve(
+        super::StartMode::ExitIfRunning,
+        None,
+        &super::api::tls::CertSource::Lego,
+    )
+    .expect("a redundant instance exits clean");
 
     assert!(
         ghost.exists(),
@@ -1138,4 +1144,58 @@ fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
             .is_none(),
         "the deleted profile's row must not come back through the switch-off state save"
     );
+}
+
+// ── CLAUTH_NO_API ───────────────────────────────────────────────────────────
+
+/// `set_var`/`remove_var` are unsafe in Rust 2024 because they aren't
+/// thread-safe in a multi-threaded process. Serialized here by `HOME_TEST_LOCK`
+/// (the one mutex every env mutator across the suite takes) and undone before
+/// the closure returns, so no other thread observes a torn value.
+fn with_no_api_env<F: FnOnce()>(val: Option<&str>, f: F) {
+    let _guard = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let saved = std::env::var(super::NO_API_ENV).ok();
+    // SAFETY: test-only, serialized by the lock above, restored unconditionally.
+    unsafe {
+        match val {
+            Some(v) => std::env::set_var(super::NO_API_ENV, v),
+            None => std::env::remove_var(super::NO_API_ENV),
+        }
+    }
+    f();
+    // SAFETY: same as above.
+    unsafe {
+        match &saved {
+            Some(v) => std::env::set_var(super::NO_API_ENV, v),
+            None => std::env::remove_var(super::NO_API_ENV),
+        }
+    }
+}
+
+/// `CLAUTH_NO_API=1` and nothing else disables the listener.
+///
+/// The exact-`"1"` rule matters more here than for its siblings: this is the
+/// kill switch an operator reaches for when a listening socket has to go and the
+/// unit passing `--listen` cannot be edited. A build that also honoured `"true"`
+/// or `"0"` would silently drop the listener for someone who set it to `0`
+/// meaning "off, don't disable" — and the symptom is a remote client going dark,
+/// not an error anywhere.
+#[test]
+fn the_rest_api_is_disabled_only_by_exactly_one() {
+    with_no_api_env(None, || {
+        assert!(super::api_enabled(), "unset → the listener is available");
+    });
+    with_no_api_env(Some("1"), || {
+        assert!(!super::api_enabled(), "CLAUTH_NO_API=1 → no listener");
+    });
+    for other in ["0", "true", "yes", "", "11", " 1"] {
+        with_no_api_env(Some(other), || {
+            assert!(
+                super::api_enabled(),
+                "CLAUTH_NO_API={other:?} is not the opt-out spelling"
+            );
+        });
+    }
 }

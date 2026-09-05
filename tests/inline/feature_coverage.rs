@@ -151,6 +151,24 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "live_session_included",
             "force_true_bypasses",
             "rotation_guard_is_independent",
+            // `--listen`: the REST API the Headless bullet claims serves the
+            // feed and the switch to another machine. The bullet said that while
+            // this list named none of it, so the routes, their auth, and the TLS
+            // listener under them all counted as uncovered.
+            "every_route_requires_the_token",
+            "only_the_api_v1_prefix_is_served",
+            "an_unknown_path_is_404_and_a_wrong_method_is_405",
+            "status_serves_the_on_disk_feed_verbatim",
+            "all_equals_one_reads_the_live_stores",
+            "switch_relinks_and_reports_the_previous_account",
+            "a_second_concurrent_switch_is_refused_immediately",
+            "rotating_the_token_revokes_the_old_one",
+            "a_fresh_token_file_records_the_control_tier",
+            "an_unknown_tier_refuses_rather_than",
+            "the_connection_cap_admits_up_to_the_limit",
+            "a_content_length_that_is_not_bare_digits",
+            "cert_source_is_explicit_only_when_both_files_are_named",
+            "a_missing_certificate_fails_in_prepare_not_after_the_claim",
             // rolling session token (#59): the daemon leg — the tick that
             // re-stamps the sidecar and the gate it goes through.
             "claude_rolling_tick_",

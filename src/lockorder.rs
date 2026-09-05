@@ -94,7 +94,24 @@ pub(crate) mod rank {
         /// same threads.
         #[cfg(test)]
         TierTest = 40;
-        /// `RotationGuard` (per-profile rotation flock). Held across HTTP, outermost.
+        /// The REST API's in-process switch gate (`daemon::api`). One
+        /// `POST /api/v1/switch` at a time: a second concurrent request gets an
+        /// immediate 409 instead of parking 25s on the cross-process state flock
+        /// and then timing out.
+        ///
+        /// Outermost real rank, because it is held across the WHOLE of
+        /// `switch_profile_noninteractive` — and that reaches further down than
+        /// it looks. Besides `Config` (400) and `State` (500), it enters
+        /// `ensure_installable` (`actions.rs`), which acquires a
+        /// `RotationGuard` and so takes `Rotation` (100). At its old 380 that
+        /// made every switch of a target holding a clock-expired access token a
+        /// lock-order violation: rank 100 entered while holding 380. No cycle
+        /// existed — nothing takes `ApiSwitch` while holding `Rotation` — but
+        /// the assert is the enforcement, and it was firing on a false premise.
+        ApiSwitch = 60;
+        /// `RotationGuard` (per-profile rotation flock). Held across HTTP, and
+        /// outermost of everything except [`ApiSwitch`], which wraps a whole
+        /// REST switch and therefore wraps this too.
         Rotation = 100;
         /// Process-wide per-host request-spacing clock in `usage::fetch` (keyed by
         /// endpoint origin: the Anthropic OAuth host and each api-key provider host).
@@ -131,6 +148,7 @@ pub(crate) mod rank {
         ThirdPartyStatus = 280;
         UsageStore = 300;
         UsageStatus = 350;
+
         Config = 400;
         /// `/profile` re-fetch TTL clock in `usage::fetch` (in-memory memo +
         /// durable stamp). A true leaf: every acquisition is take-read/insert-
@@ -324,7 +342,45 @@ impl<T, R: Rank> RankedMutex<T, R> {
             })),
         }
     }
+
+    /// Acquire the lock if it is free, else return `Err` at once.
+    ///
+    /// Ranks like [`lock`](Self::lock) rather than skipping the check: a
+    /// try-lock that SUCCEEDS holds the rank for exactly as long, so an
+    /// out-of-order try is the same latent deadlock as an out-of-order lock and
+    /// has to assert the same way. The rank is entered before the attempt and
+    /// dropped again when the attempt fails, so a contended try leaves nothing
+    /// behind.
+    ///
+    /// `daemon::api`'s switch gate is still the only caller, on every platform
+    /// clauth targets.
+    pub(crate) fn try_lock(&self) -> Result<RankedGuard<'_, T>, TryLockError> {
+        let rank = RankGuard::enter::<R>();
+        match self.inner.try_lock() {
+            Ok(guard) => Ok(RankedGuard { guard, _rank: rank }),
+            // Poisoned is NOT busy. `lock` already recovers through
+            // `into_inner`, and collapsing the two here made a single panic
+            // under the gate permanent: every later caller was told "busy, try
+            // again" for the rest of the process, with nothing in flight to
+            // wait for. Recovered the same way `lock` recovers, and reported
+            // separately so a caller can say which it was.
+            Err(std::sync::TryLockError::Poisoned(poison)) => Ok(RankedGuard {
+                guard: poison.into_inner(),
+                _rank: rank,
+            }),
+            Err(std::sync::TryLockError::WouldBlock) => Err(TryLockError),
+        }
+    }
 }
+
+/// [`RankedMutex::try_lock`] found the lock genuinely held by someone else.
+///
+/// Held ONLY — a poisoned mutex is recovered rather than reported here. That
+/// distinction is the point: "busy" invites a retry, and a poisoned lock never
+/// stops being poisoned, so answering it with "busy" is an instruction to retry
+/// forever.
+#[derive(Debug)]
+pub(crate) struct TryLockError;
 
 /// Guard for a [`RankedMutex`]. Derefs to `T`. Releases the inner mutex first,
 /// then the held rank (field declaration order), so the rank outlives the lock

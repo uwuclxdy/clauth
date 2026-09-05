@@ -1086,6 +1086,138 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
         .collect()
 }
 
+// ── TLS fixture ──────────────────────────────────────────────────────────────
+//
+// A throwaway CA and leaf, generated at test time rather than committed, so this
+// repository ships no private key. Shared by the daemon's end-to-end API test
+// and the proxy's outage test: both need a real origin to dial, and a second
+// copy of the openssl invocation would be a second thing to get subtly wrong.
+
+/// The name the generated certificate is issued for, and the name the client
+/// asks for. Not this host's real FQDN: the point is the handshake, not the
+/// lookup that finds the file.
+pub(crate) const SERVER_NAME: &str = "localhost";
+
+pub(crate) fn openssl(args: &[&str]) -> bool {
+    Command::new("openssl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Turns a missing `openssl` from a silent skip into a failure.
+///
+/// [`generate_chain`] is the only coverage the TLS listener has, and a skipped
+/// test is indistinguishable from a passing one in a summary line — so an image
+/// that lost `openssl` would report green over an entirely untested listener,
+/// indefinitely, with nothing to notice. CI sets this on the platforms whose
+/// images carry `openssl`; a developer box without it still runs the rest of the
+/// suite, and now says on stderr which tests it did not run.
+pub(crate) const REQUIRE_TLS_FIXTURE_ENV: &str = "CLAUTH_REQUIRE_TLS_FIXTURE";
+
+/// Announce — or refuse — a run with no `openssl` to build certificates with.
+fn no_tls_fixture() {
+    assert!(
+        std::env::var(REQUIRE_TLS_FIXTURE_ENV).as_deref() != Ok("1"),
+        "`openssl` is not on PATH and {REQUIRE_TLS_FIXTURE_ENV}=1. Every TLS test would \
+         have been skipped, and a skip is indistinguishable from a pass — which is exactly \
+         what this variable exists to catch. Install openssl, or unset the variable to \
+         accept an untested TLS listener on this machine"
+    );
+    crate::logline::logline!(
+        "clauth tests: `openssl` is not on PATH — SKIPPING every test that needs a \
+         certificate, which is all TLS coverage there is. Set {REQUIRE_TLS_FIXTURE_ENV}=1 \
+         to make this a failure instead"
+    );
+}
+
+/// A CA, and a `localhost` certificate signed by it, laid out the way lego
+/// writes them. Returns `None` when `openssl` cannot produce them.
+///
+/// The leaf gets its name from a subjectAltName in an extension FILE. Both
+/// details matter: rustls verifies the SAN and ignores the CN entirely, and an
+/// `-extfile` on disk keeps generation independent of what the test harness has
+/// attached to stdin.
+pub(crate) fn generate_chain(
+    dir: &Path,
+) -> Option<(crate::daemon::api::tls::CertPaths, std::path::PathBuf)> {
+    // Checked up front and separately from the generation below, so "no openssl
+    // here" (a skip) is never confused with "openssl is present and failing" (a
+    // broken fixture, which returns `None` and shows up as an absent test).
+    if !openssl(&["version"]) {
+        no_tls_fixture();
+        return None;
+    }
+
+    let ca_key = dir.join("ca.key");
+    let ca_crt = dir.join("ca.crt");
+    let csr = dir.join("server.csr");
+    let ext = dir.join("leaf.ext");
+    let paths = crate::daemon::api::tls::lego_paths_in(dir, SERVER_NAME);
+
+    std::fs::write(
+        &ext,
+        format!("subjectAltName=DNS:{SERVER_NAME}\nbasicConstraints=critical,CA:FALSE\n"),
+    )
+    .ok()?;
+
+    let ok = openssl(&[
+        "req",
+        "-x509",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+        "-keyout",
+        ca_key.to_str()?,
+        "-out",
+        ca_crt.to_str()?,
+        "-days",
+        "3650",
+        "-subj",
+        "/CN=clauth-test-ca",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+    ]) && openssl(&[
+        "req",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+        "-keyout",
+        paths.key.to_str()?,
+        "-out",
+        csr.to_str()?,
+        "-subj",
+        &format!("/CN={SERVER_NAME}"),
+    ]) && openssl(&[
+        "x509",
+        "-req",
+        "-in",
+        csr.to_str()?,
+        "-CA",
+        ca_crt.to_str()?,
+        "-CAkey",
+        ca_key.to_str()?,
+        "-out",
+        paths.cert.to_str()?,
+        "-days",
+        "3650",
+        "-extfile",
+        ext.to_str()?,
+    ]);
+    if !ok {
+        return None;
+    }
+    // lego's `<fqdn>.issuer.crt`: the chain the leaf does not carry itself.
+    std::fs::copy(&ca_crt, paths.issuer.as_deref()?).ok()?;
+    Some((paths, ca_crt))
+}
+
 // A fake `claude` on a PATH prefix whose final-run invocation holds the child
 // alive for a few seconds, so a test can read a session's runtime
 // `settings.json` MID-run: `ProfileRuntime`'s drop removes the tree once the

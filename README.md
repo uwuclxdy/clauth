@@ -38,7 +38,7 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 - 🤖 **Auto-switch** down a fallback chain the moment an account hits its limit, with weekly-window and spend-ceiling gates so a long run never stalls and never surprises you with a bill. Opted-in accounts queue their auto-start, opening 5h windows `5h / accounts` apart instead of all at once
 - 🧩 **Run in parallel**: several accounts at once in isolated config dirs, or a clean headless session with none of your global memory, plugins, or hooks
 - 🔌 **From inside Claude**: an MCP plugin lets a live session list, switch, or delegate a whole prompt (even headless) to another account, and tells a session when the account behind it changed
-- 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read
+- 🖥️ **Headless**: `clauth daemon` runs the refresh and auto-switch loop with no TUI and publishes `status.json` for a menu-bar app to read, or serves that feed and the account switch to another machine over HTTPS with `--listen`
 - 🛠️ **Quality-of-life**: browse and resume past sessions under any account, per-profile model routing, shell completions, signed self-updates, multi-instance safe
 
 Full reference: **[the wiki](https://github.com/uwuclxdy/clauth/wiki)**.
@@ -102,7 +102,7 @@ clauth start --isolated personal -p < prompt.txt
 | `clauth login <profile>` | add or re-authenticate an account, browser or API key |
 | `clauth list` / `clauth which` | account table with cached usage / who owns this session |
 | `clauth sessions`, `resume`, `info` | browse past Claude Code sessions and resume one anywhere |
-| `clauth daemon` | headless refresh + auto-switch loop |
+| `clauth daemon` | headless refresh + auto-switch loop, optionally serving the REST API (`--listen`) |
 
 Every command and flag: [Quickstart](https://github.com/uwuclxdy/clauth/wiki/Quickstart#commands).
 
@@ -176,7 +176,7 @@ More, including what to check when something misbehaves: [FAQ](https://github.co
 | [Interface and keys](https://github.com/uwuclxdy/clauth/wiki/Interface-And-Keys) | the eight tabs, every keybinding, the action menus |
 | [Configuration](https://github.com/uwuclxdy/clauth/wiki/Configuration) | both TOML files key by key, model routing, storage layout |
 | [Auto-switch](https://github.com/uwuclxdy/clauth/wiki/Auto-Switch) | thresholds, exclusion rules, burn-aware mode, spend ceilings |
-| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon` and the `status.json` read contract |
+| [Daemon](https://github.com/uwuclxdy/clauth/wiki/Daemon) | `clauth daemon`, the REST API, and the `status.json` read contract |
 | [Claude Code plugin](https://github.com/uwuclxdy/clauth/wiki/Claude-Code-Plugin) | the MCP server and `delegate` in full |
 | [herdr plugin](https://github.com/uwuclxdy/clauth/wiki/Herdr-Plugin) | the clauth popup in herdr, the key, the per-pane account tag |
 | [Tokens and cost](https://github.com/uwuclxdy/clauth/wiki/Tokens-And-Cost) | where the dashboard reads from, what the cost figure means |

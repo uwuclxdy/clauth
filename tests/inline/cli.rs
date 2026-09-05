@@ -461,6 +461,59 @@ fn login_rejects_flag_shaped_profile_names_and_a_second_positional() {
     }
 }
 
+/// `--cert`/`--key` come as a pair, and only alongside `--listen`.
+///
+/// Both halves matter. A lone `--cert` would otherwise be accepted and then
+/// silently fall back to the lego certificate at startup, which is the failure
+/// the flag exists to avoid — the operator would be told the host has no
+/// certificate for a name they never asked it to use. And without `--listen`
+/// there is no listener for either file to serve, so accepting them would be a
+/// no-op that reads like configuration.
+#[test]
+fn cert_and_key_are_required_together_and_only_with_listen() {
+    for args in [
+        ["daemon", "--listen", "--cert", "/tmp/a.crt"].as_slice(),
+        ["daemon", "--listen", "--key", "/tmp/a.key"].as_slice(),
+        ["daemon", "--cert", "/tmp/a.crt", "--key", "/tmp/a.key"].as_slice(),
+        [
+            "daemon",
+            "--print-token",
+            "--cert",
+            "/tmp/a.crt",
+            "--key",
+            "/tmp/a.key",
+        ]
+        .as_slice(),
+    ] {
+        assert_eq!(parse_exit_code(args), 2, "{args:?} must be a usage error");
+    }
+
+    let Command::Daemon {
+        listen, cert, key, ..
+    } = command(&[
+        "daemon",
+        "--listen",
+        "--cert",
+        "/tmp/a.crt",
+        "--key",
+        "/tmp/a.key",
+    ])
+    else {
+        panic!("must parse");
+    };
+    assert!(
+        listen.is_some(),
+        "bare --listen still takes the default bind"
+    );
+    assert_eq!(
+        (cert.as_deref(), key.as_deref()),
+        (
+            Some(std::path::Path::new("/tmp/a.crt")),
+            Some(std::path::Path::new("/tmp/a.key"))
+        )
+    );
+}
+
 // ── delete / disable / enable ───────────────────────────────────────────────
 
 #[test]
@@ -602,6 +655,11 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         no_standby,
         replace,
         status,
+        listen,
+        cert,
+        key,
+        print_token,
+        rotate_token,
     } = command(&["daemon"])
     else {
         panic!("must parse");
@@ -611,18 +669,35 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         (false, false, false, false),
         "bare `clauth daemon` picks no mode, which dispatch reads as exit-if-running"
     );
+    assert_eq!(
+        (listen, print_token, rotate_token),
+        (None, false, false),
+        "the REST API is off unless an address is asked for"
+    );
+    assert_eq!(
+        (cert, key),
+        (None, None),
+        "TLS comes from this host's lego certificate unless both files are named"
+    );
 
     for (args, flag) in [
         (["daemon", "--standby"].as_slice(), "standby"),
         (["daemon", "--no-standby"].as_slice(), "no_standby"),
         (["daemon", "--replace"].as_slice(), "replace"),
         (["daemon", "--status"].as_slice(), "status"),
+        (["daemon", "--print-token"].as_slice(), "print_token"),
+        (["daemon", "--rotate-token"].as_slice(), "rotate_token"),
     ] {
         let Command::Daemon {
             standby,
             no_standby,
             replace,
             status,
+            listen,
+            cert: _,
+            key: _,
+            print_token,
+            rotate_token,
         } = command(args)
         else {
             panic!("{args:?} must parse");
@@ -632,6 +707,8 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
             ("no_standby", no_standby),
             ("replace", replace),
             ("status", status),
+            ("print_token", print_token),
+            ("rotate_token", rotate_token),
         ];
         for (name, value) in set {
             assert_eq!(
@@ -641,16 +718,28 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
                 name == flag
             );
         }
+        assert_eq!(listen, None, "{args:?} asks for no listener");
     }
 
-    // Every pair conflicts, so no invocation can ask for two start modes.
+    // Every pair conflicts, so no invocation can ask for two start modes, and
+    // neither one-shot (--status, --print-token, --rotate-token) can be asked
+    // for alongside anything else.
     for pair in [
         ["--standby", "--no-standby"],
         ["--standby", "--replace"],
         ["--standby", "--status"],
+        ["--standby", "--print-token"],
+        ["--standby", "--rotate-token"],
         ["--no-standby", "--replace"],
         ["--no-standby", "--status"],
+        ["--no-standby", "--print-token"],
+        ["--no-standby", "--rotate-token"],
         ["--replace", "--status"],
+        ["--replace", "--print-token"],
+        ["--replace", "--rotate-token"],
+        ["--status", "--print-token"],
+        ["--status", "--rotate-token"],
+        ["--print-token", "--rotate-token"],
     ] {
         assert_eq!(
             parse_exit_code(&["daemon", pair[0], pair[1]]),
@@ -659,6 +748,120 @@ fn daemon_modes_are_mutually_exclusive_and_default_to_exit_if_running() {
         );
     }
     assert_eq!(parse_exit_code(&["daemon", "--nope"]), 2);
+}
+
+/// `--listen` is orthogonal to the start modes (a supervised daemon still
+/// serves the API) but not to the one-shots, which print and exit.
+#[test]
+fn listen_parses_an_address_and_composes_with_the_start_modes() {
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "0.0.0.0:8443"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(std::net::SocketAddr::from(([0, 0, 0, 0], 8443))),
+        "clap parses the address, so a typo fails before the daemon starts"
+    );
+
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen", "127.0.0.1:9000"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(std::net::SocketAddr::from(([127, 0, 0, 1], 9000)))
+    );
+
+    for mode in ["--standby", "--no-standby", "--replace"] {
+        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen", "0.0.0.0:8443"])
+        else {
+            panic!("daemon {mode} --listen must parse");
+        };
+        assert!(listen.is_some(), "{mode} should not conflict with --listen");
+    }
+
+    for one_shot in ["--status", "--print-token", "--rotate-token"] {
+        assert_eq!(
+            parse_exit_code(&["daemon", one_shot, "--listen", "0.0.0.0:8443"]),
+            2,
+            "daemon {one_shot} --listen must be refused as a conflict"
+        );
+    }
+
+    for bad in ["8443", "not-an-address", "0.0.0.0", "0.0.0.0:99999"] {
+        assert_eq!(
+            parse_exit_code(&["daemon", "--listen", bad]),
+            2,
+            "--listen {bad:?} must be refused at parse time"
+        );
+    }
+}
+
+/// A value-less `--listen` binds [`crate::cli::DEFAULT_LISTEN`], and taking no
+/// value must not make the flag start swallowing the argument after it.
+#[test]
+fn bare_listen_defaults_to_every_interface_without_eating_the_next_flag() {
+    let default = crate::cli::DEFAULT_LISTEN
+        .parse::<std::net::SocketAddr>()
+        .expect("DEFAULT_LISTEN must be a parseable address");
+
+    let Command::Daemon { listen, .. } = command(&["daemon", "--listen"]) else {
+        panic!("bare `daemon --listen` must parse");
+    };
+    assert_eq!(
+        listen,
+        Some(default),
+        "a value-less --listen takes the documented default"
+    );
+
+    // The flag is still opt-in: nothing about the default leaks into a `daemon`
+    // that never asked for a listener.
+    let Command::Daemon { listen, .. } = command(&["daemon"]) else {
+        panic!("must parse");
+    };
+    assert_eq!(listen, None, "no --listen still means no listener");
+
+    // `num_args = 0..=1` is the risk here: a following flag must be read as a
+    // flag, not consumed as the address, in either order.
+    for mode in ["--standby", "--no-standby", "--replace"] {
+        let Command::Daemon {
+            listen,
+            standby,
+            no_standby,
+            replace,
+            ..
+        } = command(&["daemon", "--listen", mode])
+        else {
+            panic!("daemon --listen {mode} must parse");
+        };
+        assert_eq!(
+            listen,
+            Some(default),
+            "--listen {mode} must default, not swallow {mode}"
+        );
+        assert!(
+            standby || no_standby || replace,
+            "{mode} must still register as a start mode after a bare --listen"
+        );
+
+        let Command::Daemon { listen, .. } = command(&["daemon", mode, "--listen"]) else {
+            panic!("daemon {mode} --listen must parse");
+        };
+        assert_eq!(
+            listen,
+            Some(default),
+            "{mode} then a bare --listen defaults"
+        );
+    }
+
+    // The one-shots conflict with the shorthand exactly as they do with the
+    // spelled-out address.
+    for one_shot in ["--status", "--print-token", "--rotate-token"] {
+        assert_eq!(
+            parse_exit_code(&["daemon", one_shot, "--listen"]),
+            2,
+            "daemon {one_shot} --listen must be refused as a conflict"
+        );
+    }
 }
 
 #[test]
@@ -974,6 +1177,11 @@ fn an_absent_daemon_reports_exit_one_not_the_usage_code() {
             no_standby: false,
             replace: false,
             status: true,
+            listen: None,
+            cert: None,
+            key: None,
+            print_token: false,
+            rotate_token: false,
         }),
     })
     .expect_err("no daemon is running in the sandbox");

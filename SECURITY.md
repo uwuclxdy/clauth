@@ -24,6 +24,8 @@ Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-onl
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/profiles/<name>/usage_cache.json` | last-known utilization and plan | `0600` |
 | `~/.clauth/profiles/<name>/runtime-<sid>/settings.json` | one live session's Claude Code settings. An endpoint profile's key is **not** in it: the file carries an `apiKeyHelper` line naming `clauth __api-key <profile>`, which Claude Code runs per request to mint the key | `0600` |
+| `~/.clauth/auth_token.json` | bearer token for the daemon's REST API, and the `tier` saying what it may do (`control` — everything the API exposes — is the only value today). Only if you have ever run `clauth daemon --listen`, `--print-token`, or `--rotate-token` | `0600` |
+| `~/.clauth/tls.json` | which directory holds the REST API's lego certificate; written with the platform default the first time `clauth daemon --listen` starts. Not a secret — a path, no key material | `0600` |
 | `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
 | `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
 | usage and price caches, session history, logs, lock files (`~/.clauth/`) | last-known usage, third-party state, burn samples, event log, advisory locks | file `0600`, dir `0700` |
@@ -67,6 +69,34 @@ Every request clauth makes, and what rides along with it:
 
 Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
 
+### Listening sockets
+
+clauth binds a socket in exactly two places, both narrow:
+
+| Listener | When | Reachable from |
+|----------|------|----------------|
+| `127.0.0.1:<random port>` | for the seconds `clauth login` waits for the browser redirect | loopback only; it checks the OAuth `state` and closes |
+| the address you pass to `clauth daemon --listen` | for as long as that daemon runs | wherever you bind it |
+
+`--listen` is off unless you ask for it, and it is the only way anything outside this
+machine can reach clauth. It is TLS-only (from this host's lego certificate, or the
+`--cert`/`--key` pair named on the command line, read at
+startup) and every route requires a bearer token, compared in constant time, stored at
+`~/.clauth/auth_token.json` and printed by `clauth daemon --print-token`. It exposes two
+operations, reading the status feed and switching the active account, and the feed it
+serves carries what `status.json` carries: names, tiers, percentages, timestamps, never a
+token or key. Connections persist and may be pipelined; `Content-Length` is the only
+framing accepted, chunked is refused, and any framing error closes the connection rather
+than resynchronizing, so the ambiguity request smuggling depends on does not arise. An
+unauthenticated request closes the connection too, so no unauthenticated client can hold a
+connection slot — though reaching the port does occupy one while connected, since the slot
+is claimed at `accept()`, before the handshake and before any token is seen. What bounds
+that is the clock: a peer that connects and says nothing gets the 10s first-request
+timeout, not the full connection lifetime.
+Limits: 8 KiB of headers, 64 KiB of body, 32 concurrent connections, 100 requests and
+120 seconds per connection, a 10s deadline per read or write.
+`CLAUTH_NO_API=1` disables it. See `wiki/Daemon.md`.
+
 ## What acts on your behalf
 
 A few code paths can change account state. All are narrow and all are documented.
@@ -99,6 +129,13 @@ Agent-invoked, only when the Claude Code plugin is installed:
 - **`delegate` (MCP tool).** Sends a real, billed `/v1/messages` request on a target profile under its own OAuth token, opening a full 5-hour usage window on that account.
   - It fires only when an agent calls the tool, and is hard-capped at recursion depth 1 (a delegated session cannot call `delegate` again).
 - **`switch_profile` (MCP tool).** Relinks the global `~/.claude` credentials to another profile, the same write `clauth switch` performs. It changes which account the global session refreshes onto; it sends no inference itself.
+
+Network-invoked, only while `clauth daemon --listen` is running:
+
+- **`POST /api/v1/switch`.** The same relink as the `switch` MCP tool, performed for a
+  caller that presented the bearer token. It sends no inference itself, and it refuses
+  the cases that need a human (a login clauth has not saved, credentials a refresh has
+  rejected, a disabled account) rather than resolving them unattended.
 
 Nothing else sends inference or writes to your account.
 
@@ -133,6 +170,7 @@ Every command below goes through an argument vector, never a shell, so there is 
 | `/usr/bin/security` | macOS only: writing and clearing the Keychain item above |
 | `xdg-open` (Linux), `open` (macOS), `rundll32` (Windows) | opening a URL: the browser login page, or a status incident from the Status tab. The URL is passed as one argument |
 | `kill` / `taskkill`, plus `ps` on macOS and `tasklist` on Windows | `clauth daemon --replace` only: the pid is checked against a running clauth daemon before it is signalled (Linux reads `/proc/<pid>/cmdline` instead of shelling out) |
+| `hostname -f` (macOS, Linux), `powershell.exe` evaluating `[System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName` (Windows) | `clauth daemon --listen` without `--cert`/`--key` only: once at startup, to learn which lego certificate to load. Naming the certificate outright runs neither command. No part of it comes from you — the argument vector is a compile-time constant — and the answer is rejected unless it looks like a hostname before it is used as a filename in the certificate directory named by `~/.clauth/tls.json`, which is yours to edit and owner-only like the rest of the tree |
 
 clauth runs no other external commands.
 
@@ -153,6 +191,7 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 |--------|--------|
 | `CLAUTH_NO_UPDATE=1` | disables all background update checks and self-replacement |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completion-install prompt |
+| `CLAUTH_NO_API=1` | stops `clauth daemon --listen` from opening its socket, whatever the flags say |
 | an empty `fallback_chain` (the default) | clauth never switches accounts on its own |
 | `allow extra usage` off (the default) | no auto-switch can reach an account that bills money |
 | `auto_start = false` (the default) | clauth sends no inference of its own |
