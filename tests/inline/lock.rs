@@ -25,7 +25,7 @@ fn cross_thread_with_state_lock_serializes() {
             std::thread::spawn(move || {
                 // All threads rendezvous here to maximize concurrent entry.
                 barrier.wait();
-                with_state_lock(|| {
+                with_state_lock(|_held| {
                     let start = epoch.elapsed().as_nanos() as u64;
                     // Sleep widens the interval so overlaps are detectable.
                     std::thread::sleep(std::time::Duration::from_millis(5));
@@ -65,7 +65,9 @@ fn cross_thread_with_state_lock_serializes() {
 /// Same-thread nested `with_state_lock` calls must not deadlock.
 #[test]
 fn same_thread_reentrancy_does_not_deadlock() {
-    let result = with_state_lock(|| with_state_lock(|| with_state_lock(|| Ok(42u32))));
+    let _home = crate::testutil::HomeSandbox::new();
+    let result =
+        with_state_lock(|_held| with_state_lock(|_held| with_state_lock(|_held| Ok(42u32))));
     assert_eq!(result.unwrap(), 42);
 }
 
@@ -77,6 +79,8 @@ fn same_thread_reentrancy_does_not_deadlock() {
 fn poison_recovery_after_panicking_closure() {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    let _home = crate::testutil::HomeSandbox::new();
+
     let panicked = catch_unwind(AssertUnwindSafe(|| {
         let _guard = StateLock::acquire().expect("acquire before panic");
         panic!("closure blew up while holding the state lock");
@@ -86,13 +90,95 @@ fn poison_recovery_after_panicking_closure() {
     // DEPTH resets to 0 — Drop ran during unwind.
     DEPTH.with(|d| assert_eq!(d.get(), 0, "depth must reset to 0 after unwind"));
 
+    // So does the subprocess budget. A spent budget surviving the unwind would
+    // strangle the very recovery path below, on a thread nothing is waiting on.
+    let huge = Duration::from_secs(3600);
+    assert_eq!(
+        clamp_to_hold_budget(huge),
+        huge,
+        "the panicking hold must release its subprocess budget while unwinding"
+    );
+
     // THREAD_LOCK poisoned + slot None; fresh acquire must recover and re-flock.
-    let result = with_state_lock(|| Ok(7u32));
+    let result = with_state_lock(|_held| Ok(7u32));
     assert_eq!(result.unwrap(), 7, "lock must be reusable after a panic");
 
     // Reentrancy must still work post-recovery.
-    let again = with_state_lock(|| with_state_lock(|| Ok(8u32)));
+    let again = with_state_lock(|_held| with_state_lock(|_held| Ok(8u32)));
     assert_eq!(again.unwrap(), 8, "reentrancy still works post-recovery");
+}
+
+/// The subprocess budget belongs to the HOLD, so it binds inside one and nothing
+/// outside one. A caller with no state lock blocks no peer (`oauth.rs` mirrors a
+/// rotation after its lock closure ends), so clamping it would cost a deadline
+/// with nobody to spend it on.
+#[test]
+fn the_subprocess_budget_binds_only_inside_a_hold() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Larger than any real deadline, so the clamp is the only thing that can
+    // shrink it and the assertions read the budget rather than the base.
+    let huge = Duration::from_secs(3600);
+
+    assert_eq!(
+        clamp_to_hold_budget(huge),
+        huge,
+        "outside a hold there is nothing to bound"
+    );
+
+    with_state_lock(|_held| {
+        let inside = clamp_to_hold_budget(huge);
+        assert!(
+            inside <= SUBPROCESS_BUDGET,
+            "a hold caps its subprocess work at SUBPROCESS_BUDGET, got {inside:?}"
+        );
+        assert!(
+            inside > Duration::ZERO,
+            "a fresh hold must start with budget to spend, got {inside:?}"
+        );
+        Ok(())
+    })
+    .expect("hold");
+
+    assert_eq!(
+        clamp_to_hold_budget(huge),
+        huge,
+        "releasing the outermost hold releases its budget"
+    );
+}
+
+/// The budget is armed by the OUTERMOST acquisition alone. A reentrant hold that
+/// re-armed would hand each nested frame a full budget, which is exactly the
+/// shape this bounds: the two Keychain mirrors of a first-login-adopting switch
+/// reach `security` through nested `with_state_lock` frames, so a per-frame
+/// budget would bound neither of them together.
+#[test]
+fn a_reentrant_hold_keeps_spending_the_outer_budget() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let huge = Duration::from_secs(3600);
+
+    // Asserted as a MARGIN, never as `inner < outer`. Both readings are one
+    // deadline minus a different `now`, so a re-arming mutant lands them within
+    // nanoseconds of each other and a bare `<` passes on whichever way the noise
+    // fell — measured surviving a "re-arm on every acquisition" mutation. The
+    // sleep is what the correct code must visibly spend and the mutant cannot.
+    const SPENT: Duration = Duration::from_millis(50);
+
+    with_state_lock(|_held| {
+        let outer = clamp_to_hold_budget(huge);
+        std::thread::sleep(SPENT);
+        with_state_lock(|_held| {
+            let inner = clamp_to_hold_budget(huge);
+            let spent = outer.saturating_sub(inner);
+            assert!(
+                spent >= SPENT,
+                "a reentrant acquisition must keep spending the outer hold's budget, not \
+                 reset it: {SPENT:?} of sleep moved it only {spent:?} \
+                 (outer {outer:?}, inner {inner:?})"
+            );
+            Ok(())
+        })
+    })
+    .expect("nested hold");
 }
 
 /// The cross-process flock wait is bounded. With `~/.clauth/.lock` already held
@@ -135,6 +221,6 @@ fn held_flock_times_out_then_recovers_on_release() {
 
     // Direction 2: once the holder releases, the next acquisition succeeds.
     drop(holder);
-    let ran = with_state_lock(|| Ok(1234u32)).expect("acquire after the holder releases");
+    let ran = with_state_lock(|_held| Ok(1234u32)).expect("acquire after the holder releases");
     assert_eq!(ran, 1234, "closure runs once the flock is free");
 }

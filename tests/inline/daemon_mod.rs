@@ -63,7 +63,7 @@ fn oauth_creds(access: &str) -> ClaudeCredentials {
 
 /// A blank profile with a live-token credential block attached.
 fn profile_with_creds(name: &str, access: &str) -> Profile {
-    let mut p = blank_profile(name);
+    let mut p = blank_profile(&crate::profile::ProfileName::from(name));
     p.credentials = Some(oauth_creds(access));
     p
 }
@@ -95,7 +95,8 @@ fn daemon_for(config: AppConfig) -> Daemon {
 /// Symlink `~/.claude/.credentials.json` at the profile's stored credentials so
 /// the active link classifies as `LinkedTo` (clean — no unsaved divergence).
 fn link_active_clean(name: &str) {
-    crate::claude::force_link_profile_credentials(name).expect("link active credentials");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from(name))
+        .expect("link active credentials");
 }
 
 /// Write `~/.claude/.credentials.json` as a REGULAR file with an access token
@@ -122,10 +123,14 @@ fn active_of(d: &Daemon) -> Option<String> {
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes
-/// nothing else — the pure no-op characterization of one loop iteration.
+/// nothing else — the pure no-op characterization of one loop iteration. Stays
+/// cross-platform: the armed throttle is what keeps the tick's heal inert here,
+/// since the gate's pointer read cannot be sandboxed on Windows.
 #[test]
 fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
     let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha")],
         Some("alpha"),
@@ -145,6 +150,41 @@ fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
         active_of(&daemon).as_deref(),
         Some("alpha"),
         "no queued switch → active profile is unchanged by a tick"
+    );
+}
+
+/// The tick is a heal call site: one tick over a broken registration reaches
+/// `claude` through the detached heal. Deleting the call from `tick` reds here,
+/// which a healthy-registration variant could never do — that one is green
+/// whether or not the tick calls anything. Unix-only: the fake `claude` is a
+/// shell shim.
+#[cfg(unix)]
+#[test]
+fn tick_heals_a_broken_plugin_registration() {
+    use crate::testutil::{FakeClaude, join_background_tasks, seed_broken_plugin_registration};
+
+    let home = HomeSandbox::new();
+    let fake = FakeClaude::new(&home);
+    crate::plugin_host::reset_heal_throttle_for_test();
+    // The tick drives the herdr heal too; its throttle is armed so this test
+    // stays spawn-free beside the claude heal it pins (the herdr heal's
+    // fail-closed test assert needs the injected path, which no sandbox pins).
+    crate::herdr::arm_heal_throttle_for_test();
+    seed_broken_plugin_registration();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+    join_background_tasks();
+
+    assert!(
+        !fake.log().is_empty(),
+        "one tick over a broken registration must reach the heal"
     );
 }
 
@@ -266,7 +306,7 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
         "the live slot now holds the target's stored login"
     );
     // The empty shell was never captured over the outgoing store.
-    let alpha_store = crate::profile::profile_dir("alpha")
+    let alpha_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
         .expect("alpha dir")
         .join("credentials.json");
     let stored: ClaudeCredentials =
@@ -317,7 +357,8 @@ fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
             subscription_type: None,
         }),
     };
-    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
     std::fs::write(
         alpha_dir.join("session-token.json"),
         serde_json::to_vec(&sidecar).expect("serialize sidecar"),
@@ -379,7 +420,8 @@ fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
             subscription_type: None,
         }),
     };
-    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
     std::fs::write(
         alpha_dir.join("session-token.json"),
         serde_json::to_vec(&sidecar).expect("serialize sidecar"),
@@ -484,7 +526,7 @@ fn drain_pending_switch_drops_a_vanished_target() {
     );
     // Alpha's stored credentials survive on disk (the pre-fix second tick
     // nulled them via the logged-out misread).
-    let stored = crate::profile::profile_dir("alpha")
+    let stored = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
         .unwrap()
         .join("credentials.json");
     assert!(stored.exists(), "alpha's stored credentials survive");
@@ -510,7 +552,11 @@ fn busy_target_requeued_not_dropped() {
 
     // User switch to beta arrives while beta is mid-fetch.
     stage_switch(&daemon, "beta");
-    mark_activity(&daemon.activity, "beta", ProfileActivity::Fetching);
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
     daemon.drain_pending_switch();
 
     assert_eq!(
@@ -525,7 +571,7 @@ fn busy_target_requeued_not_dropped() {
     );
 
     // Fetch completes → the re-queued switch lands on the next tick.
-    clear_activity(&daemon.activity, "beta");
+    clear_activity(&daemon.activity, &crate::profile::ProfileName::from("beta"));
     daemon.drain_pending_switch();
     assert_eq!(
         active_of(&daemon).as_deref(),
@@ -663,7 +709,11 @@ fn switch_failure_backoff_dedups_log_over_many_ticks() {
 
     stage_switch(&daemon, "beta");
     // beta never goes idle → every attempt fails with the same reason.
-    mark_activity(&daemon.activity, "beta", ProfileActivity::Fetching);
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
 
     for _ in 0..30 {
         daemon.drain_pending_switch();
@@ -773,10 +823,10 @@ fn backoff_gate_gives_up_when_the_retry_window_closes() {
 /// uncapped sibling should surface.
 #[test]
 fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
-    let mut disabled = blank_profile("off");
+    let mut disabled = blank_profile(&crate::profile::ProfileName::from("off"));
     disabled.max_auto_spend = Some(5.0);
     disabled.disabled = true;
-    let mut enabled = blank_profile("on");
+    let mut enabled = blank_profile(&crate::profile::ProfileName::from("on"));
     enabled.max_auto_spend = Some(5.0);
 
     let config = AppConfig {
@@ -935,5 +985,157 @@ fn redundant_reason_names_the_pid_for_the_default_and_the_queue_for_standby() {
     assert!(
         standby.contains("standby"),
         "the --standby redundant reason must mention the full queue, got {standby:?}"
+    );
+}
+
+// ── stale-config persist gates (lock-race row 3) ─────────────────────────────
+
+/// A queued switch whose target is deleted out-of-process AFTER the daemon's
+/// in-memory config was loaded must be dropped on the fresh membership read,
+/// not switched to. The pre-fix drain read the vanished guard off the in-memory
+/// list, so the delete (landing between the tick's reload and the drain) was
+/// invisible and `switch_profile` ran against a ghost.
+#[test]
+fn drain_pending_switch_drops_a_target_deleted_after_enqueue() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("beta"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("beta"),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a deleted target must not be switched to"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "a deleted target is dropped, not re-queued"
+    );
+    assert!(
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("beta"))
+            .expect("dir")
+            .exists(),
+        "the deleted target's directory must stay deleted"
+    );
+}
+
+/// A switch's whole-state save must not re-list an unrelated profile deleted by
+/// the CLI after the daemon's config was loaded. The switch still lands on the
+/// (still-existing) target; only the deleted row stays gone.
+#[test]
+fn drain_pending_switch_does_not_resurrect_a_deleted_row() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta");
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("gamma"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("gamma"),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "the switch to beta still lands"
+    );
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded
+            .find(&crate::profile::ProfileName::from("gamma"))
+            .is_none(),
+        "the deleted profile's row must not come back through the switch's state save"
+    );
+}
+
+/// The wrap-off's whole-state save is the same shape as the switch's: it must
+/// not re-list a profile deleted out from under the daemon while it turns
+/// everything off.
+#[test]
+fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("gamma"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("gamma"),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch_off();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "the wrap-off turned everything off"
+    );
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded
+            .find(&crate::profile::ProfileName::from("gamma"))
+            .is_none(),
+        "the deleted profile's row must not come back through the switch-off state save"
     );
 }

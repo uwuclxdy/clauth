@@ -7,21 +7,22 @@ use crate::oauth::RefreshError;
 use crate::profile::DEFAULT_REFRESH_INTERVAL_MS as REFRESH_INTERVAL_MS;
 
 use super::{
-    ActivityStore, EpochMs, LastFetchedAt, ProfileActivity, RESET_ANCHOR_GRACE_MS,
-    SuppressedGenericStore, ThirdPartyEntry, TokenEntry, anchor_post_reset_oauth, clear_activity,
-    clear_orphaned_forced, collect_oauth_seed_names, collect_third_party_entries, collect_tokens,
-    filter_suppressed, mark_activity, memoized_identity, partition_due, should_anchor_fetch,
-    window_lapsed,
+    ActivityStore, ClaudeRollingPacing, EpochMs, LastFetchedAt, ProfileActivity,
+    RESET_ANCHOR_GRACE_MS, SuppressedGenericStore, ThirdPartyEntry, ThirdPartyFetcher, TokenEntry,
+    anchor_post_reset_oauth, clear_activity, clear_orphaned_forced, collect_oauth_seed_names,
+    collect_third_party_entries, collect_tokens, fetch_third_party_due, filter_suppressed,
+    mark_activity, memoized_identity, partition_due, should_anchor_fetch, window_lapsed,
 };
 
 fn token(name: &str) -> TokenEntry {
     TokenEntry {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         access_token: "access".to_string(),
         refresh_token: Some("refresh".to_string()),
         auto_start: false,
         access_expires_at: None,
         auth_broken: false,
+        may_open_window: true,
     }
 }
 
@@ -42,6 +43,13 @@ fn oauth_profile_disabled(name: &str, disabled: bool) -> crate::profile::Profile
     });
     p.disabled = disabled;
     p
+}
+
+/// An enabled OAuth profile that opts into both auto-start and its queue.
+fn auto_start_queue_profile(name: &str) -> crate::profile::Profile {
+    let mut profile = oauth_profile_disabled(name, false);
+    profile.auto_start = true;
+    profile
 }
 
 // A disabled account must not enter the scheduler's per-profile work list at
@@ -117,7 +125,12 @@ fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
         }),
         ..UsageInfo::default()
     };
-    write_profile_cache("off", USAGE_CACHE_FILE, &info);
+    crate::testutil::register_names(&["off"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("off"),
+        USAGE_CACHE_FILE,
+        &info,
+    );
 
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -134,7 +147,7 @@ fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
     // Invariant preserved: seeding the store never widens the poll work-list.
     let poll_names: Vec<String> = collect_tokens(&config)
         .iter()
-        .map(|e| e.name.clone())
+        .map(|e| e.name.to_string())
         .collect();
     assert!(
         !poll_names.contains(&"off".to_string()),
@@ -166,6 +179,43 @@ fn collect_third_party_entries_excludes_disabled_profiles_includes_enabled_sibli
     assert!(
         names.contains(&"on"),
         "an enabled third-party sibling must still be collected"
+    );
+}
+
+/// The same credential test, tightened: an EMPTY or whitespace-only api key is
+/// no credential, so the profile never enters the poll work list. A keyed
+/// sibling still does.
+#[test]
+fn collect_third_party_entries_skips_an_empty_key_profile() {
+    let keyed = crate::profile::Profile::new(
+        "keyed".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let empty = crate::profile::Profile::new(
+        "empty".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some(String::new()),
+    );
+    let space = crate::profile::Profile::new(
+        "space".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("  \t ".to_string()),
+    );
+
+    let collected = collect_third_party_entries(&[keyed, empty, space]);
+    let names: Vec<&str> = collected.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"keyed"),
+        "a keyed third-party account is still collected"
+    );
+    assert!(
+        !names.contains(&"empty"),
+        "an empty-key account must never enter the poll work list: {names:?}"
+    );
+    assert!(
+        !names.contains(&"space"),
+        "a whitespace-key account must never enter the poll work list: {names:?}"
     );
 }
 
@@ -407,7 +457,11 @@ fn partition_due_excludes_refreshing() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snapshot = vec![token("a")];
 
-    mark_activity(&activity, "a", ProfileActivity::Refreshing);
+    mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from("a"),
+        ProfileActivity::Refreshing,
+    );
 
     let (due, next) = partition_due(
         &snapshot,
@@ -433,7 +487,11 @@ fn partition_due_excludes_switching() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snapshot = vec![token("a")];
 
-    mark_activity(&activity, "a", ProfileActivity::Switching);
+    mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from("a"),
+        ProfileActivity::Switching,
+    );
 
     let (due, next) = partition_due(
         &snapshot,
@@ -610,7 +668,12 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
 
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     let update = |status: FetchStatus, refresh_failed: bool| {
-        super::update_streaks(&streaks, "a", status, refresh_failed)
+        super::update_streaks(
+            &streaks,
+            &crate::profile::ProfileName::from("a"),
+            status,
+            refresh_failed,
+        )
     };
 
     // A transient refresh failure bails to `Cached` — it must NOT touch the 429
@@ -630,7 +693,12 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
     let counts = update(FetchStatus::Failed, false);
     assert_eq!((counts.rate_limit, counts.refresh_fail), (1, 2));
     assert_eq!(
-        super::update_streaks(&streaks, "never-seen", FetchStatus::Failed, false),
+        super::update_streaks(
+            &streaks,
+            &crate::profile::ProfileName::from("never-seen"),
+            FetchStatus::Failed,
+            false
+        ),
         super::StreakCounts::default(),
     );
     assert!(
@@ -652,7 +720,11 @@ fn streak_axes_move_independently_and_a_live_body_clears_both() {
 #[test]
 fn merge_forced_skips_switching() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    mark_activity(&activity, "switching", ProfileActivity::Switching);
+    mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from("switching"),
+        ProfileActivity::Switching,
+    );
 
     let snapshot = vec![token("switching"), token("plain")];
     let forced: HashSet<String> = ["switching", "plain"]
@@ -712,7 +784,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
 
     let (status, retry_after) = rotation_bail_context(Some(Some(Duration::from_secs(300))));
     let outcome = FetchOutcome {
-        name: "u".to_string(),
+        name: crate::profile::ProfileName::from("u"),
         info: None,
         status,
         rotated: None,
@@ -721,6 +793,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         plan_override: None,
         retry_after,
     };
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     let before = now_ms();
     apply_outcome(
@@ -731,6 +804,8 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
     let after = now_ms();
 
@@ -783,9 +858,21 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
 #[test]
 fn orphaned_forced_cleared_but_scheduled_and_refreshing_kept() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
-    mark_activity(&activity, "orphan", ProfileActivity::Queued);
-    mark_activity(&activity, "scheduled", ProfileActivity::Queued);
-    mark_activity(&activity, "rotating", ProfileActivity::Refreshing);
+    mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from("orphan"),
+        ProfileActivity::Queued,
+    );
+    mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from("scheduled"),
+        ProfileActivity::Queued,
+    );
+    mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from("rotating"),
+        ProfileActivity::Refreshing,
+    );
 
     let forced: HashSet<String> = ["orphan", "scheduled", "rotating"]
         .iter()
@@ -819,7 +906,11 @@ fn activity_cleared_on_worker_panic() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
     let name = "test-profile";
 
-    mark_activity(&activity, name, ProfileActivity::Fetching);
+    mark_activity(
+        &activity,
+        &crate::profile::ProfileName::from(name),
+        ProfileActivity::Fetching,
+    );
     assert!(
         !activity.lock().unwrap().is_empty(),
         "slot must be set after mark_activity"
@@ -830,7 +921,7 @@ fn activity_cleared_on_worker_panic() {
     // join loop Err arm: clear slot on panic
     match h.join() {
         Ok(_) => panic!("expected panic in worker"),
-        Err(_) => clear_activity(&activity, name),
+        Err(_) => clear_activity(&activity, &crate::profile::ProfileName::from(name)),
     }
 
     assert!(
@@ -852,6 +943,7 @@ fn cached_fallback_does_not_clobber_store() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     let live = UsageInfo {
         five_hour: Some(UsageWindow {
@@ -865,7 +957,7 @@ fn cached_fallback_does_not_clobber_store() {
     let stale_windowless = UsageInfo::default();
     apply_outcome(
         FetchOutcome {
-            name: "a".to_string(),
+            name: crate::profile::ProfileName::from("a"),
             info: Some(stale_windowless.clone()),
             status: FetchStatus::RateLimited,
             rotated: None,
@@ -880,6 +972,8 @@ fn cached_fallback_does_not_clobber_store() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
     assert!(
         store.lock().unwrap().get("a").unwrap().five_hour.is_some(),
@@ -894,7 +988,7 @@ fn cached_fallback_does_not_clobber_store() {
     // Cold start: the same fallback DOES fill an absent entry.
     apply_outcome(
         FetchOutcome {
-            name: "b".to_string(),
+            name: crate::profile::ProfileName::from("b"),
             info: Some(stale_windowless),
             status: FetchStatus::Cached,
             rotated: None,
@@ -909,6 +1003,8 @@ fn cached_fallback_does_not_clobber_store() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
     assert!(
         store.lock().unwrap().contains_key("b"),
@@ -930,6 +1026,7 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     // Prior state: a live 5h window under a (now stale) Pro tier, in both the
     // store and the disk cache the bail loads from.
@@ -945,20 +1042,33 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
         ..Default::default()
     };
     store.lock().unwrap().insert("a".to_string(), prior.clone());
-    super::write_profile_cache("a", super::USAGE_CACHE_FILE, &prior);
+    crate::testutil::register_names(&["a"]);
+    super::write_profile_cache(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+        &prior,
+    );
 
     let canceled = PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
     };
     apply_outcome(
-        FetchOutcome::cached("a", FetchStatus::RateLimited, None, None).with_plan(Some(canceled)),
+        FetchOutcome::cached(
+            &crate::profile::ProfileName::from("a"),
+            FetchStatus::RateLimited,
+            None,
+            None,
+        )
+        .with_plan(Some(canceled)),
         &store,
         &status,
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
 
     let got = store.lock().unwrap().get("a").cloned().unwrap();
@@ -978,7 +1088,11 @@ fn cached_bail_overlays_a_fresh_plan_onto_store_and_disk() {
         "the account stays visibly rate-limited"
     );
 
-    let disk = super::load_profile_cache::<UsageInfo>("a", super::USAGE_CACHE_FILE).unwrap();
+    let disk = super::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("a"),
+        super::USAGE_CACHE_FILE,
+    )
+    .unwrap();
     assert!(
         disk.plan.unwrap().is_canceled(),
         "the flip persists to usage_cache.json for CLI/MCP readers"
@@ -1000,21 +1114,30 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
 
     // No prior store entry and no usage_cache.json: `cached()` yields info=None.
+    crate::testutil::register_names(&["cold"]);
     let canceled = PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
     };
     apply_outcome(
-        FetchOutcome::cached("cold", FetchStatus::RateLimited, None, None)
-            .with_plan(Some(canceled)),
+        FetchOutcome::cached(
+            &crate::profile::ProfileName::from("cold"),
+            FetchStatus::RateLimited,
+            None,
+            None,
+        )
+        .with_plan(Some(canceled)),
         &store,
         &status,
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &weekly_reset_kicks,
     );
 
     let got = store.lock().unwrap().get("cold").cloned();
@@ -1029,7 +1152,10 @@ fn cold_bail_records_a_plan_only_canceled_entry() {
         "a plan-only entry — no windows to show"
     );
 
-    let disk = super::load_profile_cache::<UsageInfo>("cold", super::USAGE_CACHE_FILE);
+    let disk = super::load_profile_cache::<UsageInfo>(
+        &crate::profile::ProfileName::from("cold"),
+        super::USAGE_CACHE_FILE,
+    );
     assert!(
         disk.and_then(|i| i.plan).is_some_and(|p| p.is_canceled()),
         "and persists to usage_cache.json so the flip survives and readers see it"
@@ -1048,7 +1174,7 @@ fn mark_window_open_synthesizes_only_when_not_live() {
     let now = 1_780_000_000i64;
 
     // Absent entry → synthetic window resets now + 5h.
-    mark_window_open(&store, "a", now);
+    mark_window_open(&store, &crate::profile::ProfileName::from("a"), now);
     let resets = store.lock().unwrap()["a"]
         .five_hour
         .as_ref()
@@ -1072,7 +1198,7 @@ fn mark_window_open_synthesizes_only_when_not_live() {
             ..Default::default()
         },
     );
-    mark_window_open(&store, "b", now);
+    mark_window_open(&store, &crate::profile::ProfileName::from("b"), now);
     let kept = store.lock().unwrap()["b"].five_hour.clone().unwrap();
     assert_eq!(kept.resets_at.as_deref(), Some(live_resets));
     assert_eq!(kept.utilization, 42.0);
@@ -1088,7 +1214,7 @@ fn mark_window_open_synthesizes_only_when_not_live() {
             ..Default::default()
         },
     );
-    mark_window_open(&store, "c", now);
+    mark_window_open(&store, &crate::profile::ProfileName::from("c"), now);
     let replaced = store.lock().unwrap()["c"].five_hour.clone().unwrap();
     assert_eq!(
         replaced.resets_at.as_deref().and_then(iso_to_epoch_secs),
@@ -1111,7 +1237,7 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
 
     // Never fetched (absent) → not lapsed: fetch first.
     assert!(
-        !window_lapsed(&store, "a", now),
+        !window_lapsed(&store, &crate::profile::ProfileName::from("a"), now),
         "an absent entry must not kick — fetch first, kick next tick"
     );
 
@@ -1121,7 +1247,7 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
         .unwrap()
         .insert("a".to_string(), UsageInfo::default());
     assert!(
-        window_lapsed(&store, "a", now),
+        window_lapsed(&store, &crate::profile::ProfileName::from("a"), now),
         "a fetched entry with no live window is lapsed"
     );
 
@@ -1137,7 +1263,7 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
         },
     );
     assert!(
-        window_lapsed(&store, "a", now),
+        window_lapsed(&store, &crate::profile::ProfileName::from("a"), now),
         "a past resets_at is lapsed"
     );
 
@@ -1153,7 +1279,7 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
         },
     );
     assert!(
-        !window_lapsed(&store, "a", now),
+        !window_lapsed(&store, &crate::profile::ProfileName::from("a"), now),
         "a future resets_at is a live window — no kick"
     );
 }
@@ -1167,53 +1293,83 @@ fn window_lapsed_only_fires_on_a_fetched_expired_window() {
 fn kick_suppressed_during_rate_limit_streak() {
     use super::should_open_window;
 
-    // args: (streak, window_lapsed, kick_due, has_block)
+    // args: (streak, window_lapsed, kick_due, has_block, queue_due,
+    //        weekly_reset_pending)
     assert!(
-        should_open_window(0, true, true, false),
+        should_open_window(0, true, true, false, true, false),
         "lapsed + no streak → open"
     );
     assert!(
-        !should_open_window(1, true, true, false),
+        !should_open_window(1, true, true, false, true, false),
         "lapsed but 429-streaking → suppress the kick"
     );
     assert!(
-        !should_open_window(5, true, true, false),
+        !should_open_window(5, true, true, false, true, false),
         "deep streak → still suppressed"
     );
     assert!(
-        !should_open_window(0, false, true, false),
+        !should_open_window(0, false, true, false, true, false),
         "a live window with no block never kicks"
     );
     assert!(
-        should_open_window(0, false, true, true),
+        should_open_window(0, false, true, true, true, false),
         "a live window WITH a standing block re-tests it — the window can be a \
          Claude-web open while Claude Code stays 429'd, so only a landed kick \
          proves the block is gone"
     );
     assert!(
-        should_open_window(0, false, false, true),
+        should_open_window(0, false, false, true, true, false),
         "a live-window block re-tests on the POLL cadence, not the deep kick \
          backoff — the window reopened (maybe via web), so recovery may be \
          imminent and we must not wait out the ~15min ladder"
     );
     assert!(
-        !should_open_window(1, false, false, true),
+        !should_open_window(1, false, false, true, true, false),
         "but a /usage 429-streak still suppresses even the live-window re-test"
     );
     assert!(
-        !should_open_window(0, true, false, true),
+        !should_open_window(0, true, false, true, true, false),
         "a LAPSED-window kick-429 block whose retry isn't due still waits its \
          backoff — no reopened-window signal, so don't re-hit a dead endpoint"
+    );
+    assert!(
+        !should_open_window(0, true, true, false, false, false),
+        "the queue gate holds the LAPSED leg: an unelected member with a \
+         lapsed window and a due kick clock still may not open"
+    );
+    assert!(
+        should_open_window(0, false, true, true, false, false),
+        "…and only the lapsed leg: the live-window re-test is a health probe \
+         the queue must never delay"
+    );
+    assert!(
+        should_open_window(0, false, false, false, false, true),
+        "a pending weekly-reset mark kicks a live window on the poll cadence: \
+         no block, no backoff, and the queue never delays a re-test"
+    );
+    assert!(
+        should_open_window(0, false, false, false, true, true),
+        "queue due or not, the pending leg is ungated"
+    );
+    assert!(
+        !should_open_window(1, false, false, false, false, true),
+        "a 429-streak suppresses the pending leg like every other"
+    );
+    assert!(
+        !should_open_window(0, true, false, false, false, true),
+        "pending does NOT bypass the queue for a LAPSED window: there the \
+         kick OPENS a window, and opens belong behind the spacing"
     );
 }
 
 // The `run_fetch` wiring seam: a LIVE 5h window with a standing block must
-// re-test (the fix), a healthy live window stays quiet. Guards the
-// `block.is_some()` → `has_block` plumbing `should_open_window`'s own test can't
-// reach, since `run_fetch` is HTTP-bound.
+// re-test (the fix), a healthy live window stays quiet, and a pending
+// weekly-reset mark fires the same re-test with no block at all. Guards the
+// `block.is_some()` → `has_block` and pending-set plumbing
+// `should_open_window`'s own test can't reach, since `run_fetch` is HTTP-bound.
 #[test]
 fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
-    use super::{KickBlock, KickBlocks, PollStreaks, auto_start_should_kick};
+    use super::{KickBlock, KickBlocks, PollStreaks, WeeklyResetKicks, auto_start_should_kick};
     use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso};
 
     let now = 3_000_000;
@@ -1230,6 +1386,7 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
             },
         )])))
     };
+    let no_pending = || -> WeeklyResetKicks { Arc::new(RankedMutex::new(HashSet::new())) };
 
     let blocked: KickBlocks = Arc::new(RankedMutex::new(HashMap::from([(
         "a".to_string(),
@@ -1241,14 +1398,466 @@ fn auto_start_re_tests_a_live_window_block_but_leaves_a_healthy_one() {
         },
     )])));
     assert!(
-        auto_start_should_kick(&streaks, &live_store(), &blocked, "a", now),
+        auto_start_should_kick(
+            &streaks,
+            &live_store(),
+            &blocked,
+            &no_pending(),
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
         "a live window with a standing block re-tests it — the fix"
     );
 
     let clean: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     assert!(
-        !auto_start_should_kick(&streaks, &live_store(), &clean, "a", now),
+        !auto_start_should_kick(
+            &streaks,
+            &live_store(),
+            &clean,
+            &no_pending(),
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
         "a healthy live window with no block must not kick"
+    );
+
+    // The pending weekly-reset mark fires the same re-test with no block: the
+    // 7d window just rolled over from the hard cap, so the account is fresh
+    // again and one kick proves it (or records the block to continue from).
+    let pending: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::from([
+        crate::profile::ProfileName::from("a"),
+    ])));
+    assert!(
+        auto_start_should_kick(
+            &streaks,
+            &live_store(),
+            &clean,
+            &pending,
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "a pending weekly-reset mark kicks a live window with no block"
+    );
+    assert!(
+        !auto_start_should_kick(
+            &streaks,
+            &live_store(),
+            &clean,
+            &no_pending(),
+            &crate::profile::ProfileName::from("a"),
+            now,
+            true
+        ),
+        "without the mark the same healthy window stays quiet"
+    );
+}
+
+/// The weekly-reset predicate: a fresh body whose aggregate 7d window rolled
+/// over from the hard cap while the 5h window is live. Every arm of the gate
+/// has a pin — below the cap the messages endpoint still serves (a kick
+/// re-tests nothing), and a lapsed 5h window belongs to the queue-gated
+/// lapsed leg, never this one.
+#[test]
+fn weekly_reset_pending_reads_the_rollover_the_hard_cap_and_the_live_window() {
+    use super::weekly_reset_pending;
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let now = 3_000_000;
+    let week = |util: f64, reset_in: i64| UsageWindow {
+        utilization: util,
+        resets_at: Some(epoch_secs_to_iso(now + reset_in)),
+    };
+    let five = |reset_in: i64| UsageWindow {
+        utilization: 1.0,
+        resets_at: Some(epoch_secs_to_iso(now + reset_in)),
+    };
+    let pair = |prev_util: f64, prev_reset_in: i64, new_reset_in: i64, five_reset_in: i64| {
+        let prev = UsageInfo {
+            seven_day: Some(week(prev_util, prev_reset_in)),
+            ..Default::default()
+        };
+        let info = UsageInfo {
+            seven_day: Some(week(0.0, new_reset_in)),
+            five_hour: Some(five(five_reset_in)),
+            ..Default::default()
+        };
+        (prev, info)
+    };
+
+    let (prev, info) = pair(100.0, 3600, 3600 + 7 * 86_400, 3600);
+    assert!(
+        weekly_reset_pending(&prev, &info, now),
+        "a rollover from the hard cap with a live 5h window is owed a re-test"
+    );
+
+    let (prev, info) = pair(99.99, 3600, 3600 + 7 * 86_400, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "below the hard cap the endpoint still serves — no re-test owed"
+    );
+
+    let (prev, info) = pair(100.0, 3600, 3600, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "same reset: no rollover"
+    );
+
+    let (prev, info) = pair(100.0, 3600, 0, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "a reset moving BACKWARD is not a rollover"
+    );
+
+    let (prev, info) = pair(100.0, 3600, 3600 + 7 * 86_400, -60);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "a lapsed 5h window stays on the queue-gated lapsed leg"
+    );
+
+    let prev = UsageInfo::default();
+    let (_, info) = pair(100.0, 3600, 3600 + 7 * 86_400, 3600);
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "no prior weekly window: nothing to roll over from"
+    );
+
+    let (prev, mut info) = pair(100.0, 3600, 3600 + 7 * 86_400, 3600);
+    info.seven_day = None;
+    assert!(
+        !weekly_reset_pending(&prev, &info, now),
+        "no new weekly window: no rollover observed"
+    );
+}
+
+/// The mark lands end to end through `apply_outcome`: only a FRESH body on an
+/// opted-in profile with a hard-cap rollover and a live 5h window sets it;
+/// a cached bail, an opted-out profile, and a soft-line rollover leave the
+/// set empty.
+#[test]
+fn apply_outcome_marks_the_weekly_reset_re_test() {
+    use super::{FetchOutcome, FetchStatus, StatusStore, WeeklyResetKicks, apply_outcome};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let week = |util: f64, reset_in: i64| UsageWindow {
+        utilization: util,
+        resets_at: Some(epoch_secs_to_iso(now + reset_in)),
+    };
+    let live_five = UsageWindow {
+        utilization: 1.0,
+        resets_at: Some(epoch_secs_to_iso(now + 3600)),
+    };
+    let prev = UsageInfo {
+        seven_day: Some(week(100.0, 3600)),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(week(0.0, 3600 + 7 * 86_400)),
+        five_hour: Some(live_five.clone()),
+        ..Default::default()
+    };
+
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "w".to_string(),
+        prev.clone(),
+    )])));
+    let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+
+    let fresh = |info: UsageInfo| FetchOutcome {
+        name: crate::profile::ProfileName::from("w"),
+        info: Some(info),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        refresh_failed: false,
+        plan_override: None,
+        retry_after: None,
+    };
+
+    // The one shape that sets the mark: fresh, opted in, hard-cap rollover,
+    // 5h live.
+    apply_outcome(
+        fresh(rolled.clone()),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        true,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w")),
+        "the rollover marks the profile for one re-test kick"
+    );
+    weekly_reset_kicks.lock().unwrap().clear();
+
+    // Opted out: the mark would sit unconsumed for the process lifetime.
+    apply_outcome(
+        fresh(rolled.clone()),
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        false,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a profile without auto_start gets no mark"
+    );
+
+    // A cached bail recycles the on-disk snapshot: never a rollover observer.
+    // The mark holds even with the store seeded with a spent prev, because
+    // `apply_outcome` reads `prev` only for fresh bodies — the same is_fresh
+    // gate the mark condition carries, so the two cannot disagree.
+    store.lock().unwrap().insert("w".to_string(), prev);
+    let mut cached = rolled.clone();
+    cached.seven_day = Some(week(0.0, 3600 + 7 * 86_400));
+    apply_outcome(
+        FetchOutcome {
+            from_fetch: false,
+            ..fresh(cached)
+        },
+        &store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        true,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a non-fresh outcome never sets the mark"
+    );
+
+    // Below the hard cap: the endpoint still serves, nothing to re-test.
+    let soft_prev = UsageInfo {
+        seven_day: Some(week(98.0, 3600)),
+        ..Default::default()
+    };
+    let soft_store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "w".to_string(),
+        soft_prev,
+    )])));
+    apply_outcome(
+        fresh(rolled),
+        &soft_store,
+        &status,
+        &last_fetched,
+        &streaks,
+        REFRESH_INTERVAL_MS,
+        false,
+        true,
+        &weekly_reset_kicks,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a soft-line rollover sets no mark"
+    );
+}
+
+/// The consume is load-bearing: a fired kick (any leg) clears the weekly-reset
+/// mark, a REFUSED kick leaves it standing for the next tick. Without the
+/// clear the pending leg re-kicks every due tick for the process lifetime —
+/// the per-tick storm the scheduler doc forbids. Mutation: deleting the
+/// `pending.remove` call in `run_fetch` reds this test.
+#[test]
+fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{StreakCounts, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now_before + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    let entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("queued token");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 4.0,
+                resets_at: Some(epoch_secs_to_iso(now_before + 3600)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks = Arc::new(RankedMutex::new(HashMap::new()));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::from([
+        crate::profile::ProfileName::from("a"),
+    ])));
+    let queue = crate::usage::new_auto_start_queue_state();
+
+    // Live window + pending mark + no block: the pending leg fires the kick
+    // and the mark is consumed.
+    let _ = super::run_fetch(
+        &config,
+        entry.clone(),
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert!(
+        weekly_reset_kicks.lock().unwrap().is_empty(),
+        "a fired kick consumes the weekly-reset mark"
+    );
+
+    // Re-arm the mark under a 429-streak: the kick is refused before it can
+    // fire, so the mark must survive for the next tick.
+    weekly_reset_kicks
+        .lock()
+        .unwrap()
+        .insert(crate::profile::ProfileName::from("a"));
+    streaks.lock().unwrap().insert(
+        "a".to_string(),
+        StreakCounts {
+            rate_limit: 1,
+            refresh_fail: 0,
+        },
+    );
+    let _ = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert!(
+        weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("a")),
+        "a refused kick leaves the mark standing for the next tick"
+    );
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "exactly one kick fired across both legs: {seen:?}"
+    );
+}
+
+/// The arming path production uses runs through the drain's config read: a
+/// FRESH rolled-over outcome arms the mark for the profile the CONFIG says is
+/// opted in. Guards the `(is_active, auto_start)` plumbing
+/// `apply_outcome`'s own test can't reach, since nothing else in the tree
+/// drives `drain_oauth_completions` with a live config.
+#[test]
+fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
+    use super::FetchOutcome;
+    use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["w"]);
+
+    let now = crate::usage::now_epoch_secs();
+    let spent = || UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let rolled = UsageInfo {
+        seven_day: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600 + 7 * 86_400)),
+        }),
+        five_hour: Some(UsageWindow {
+            utilization: 1.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    let state = completion_order_state();
+    state.config.lock().unwrap().profiles = vec![auto_start_queue_profile("w")];
+    state.store.lock().unwrap().insert("w".to_string(), spent());
+
+    let run = |entry: super::TokenEntry| FetchOutcome {
+        name: entry.name,
+        info: Some(rolled.clone()),
+        status: FetchStatus::Fresh,
+        rotated: None,
+        from_fetch: true,
+        refresh_failed: false,
+        plan_override: None,
+        retry_after: None,
+    };
+    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
+    assert!(
+        state
+            .weekly_reset_kicks
+            .lock()
+            .unwrap()
+            .contains(&crate::profile::ProfileName::from("w")),
+        "an opted-in profile's rolled-over body arms the mark through the drain"
+    );
+
+    // Opt out and re-run: the drain's config read must hold the mark back.
+    state.weekly_reset_kicks.lock().unwrap().clear();
+    state.config.lock().unwrap().profiles = vec![oauth_profile_disabled("w", false)];
+    state.store.lock().unwrap().insert("w".to_string(), spent());
+    super::fetch_oauth_due_with(&state, vec![token("w")], REFRESH_INTERVAL_MS, run);
+    assert!(
+        state.weekly_reset_kicks.lock().unwrap().is_empty(),
+        "an opted-out profile arms no mark"
     );
 }
 
@@ -1378,7 +1987,10 @@ fn only_a_switch_grade_kick_block_rotates_the_chain() {
         ("dead".to_string(), grade),
         ("blip".to_string(), KickBlock { streak: 1, ..grade }),
     ])));
-    assert_eq!(kick_rejected_names(&blocks, now), vec!["dead".to_string()]);
+    assert_eq!(
+        kick_rejected_names(&blocks, now),
+        vec![crate::profile::ProfileName::from("dead")]
+    );
 }
 
 /// `note_kick_outcome` lifecycle: a 429 upserts the block and writes the
@@ -1391,6 +2003,7 @@ fn kick_block_persists_and_clears_by_outcome() {
     use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, load_profile_cache};
 
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["kitty"]);
     let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     let now = 2_000_000;
     let rl = KickRateLimit {
@@ -1398,36 +2011,80 @@ fn kick_block_persists_and_clears_by_outcome() {
         until_epoch_secs: Some(now + 600),
     };
 
-    note_kick_outcome(&blocks, "kitty", false, Some(rl), now);
-    let live = kick_block(&blocks, "kitty").expect("429 outcome must block");
+    note_kick_outcome(
+        &blocks,
+        &crate::profile::ProfileName::from("kitty"),
+        false,
+        Some(rl),
+        now,
+    );
+    let live = kick_block(&blocks, &crate::profile::ProfileName::from("kitty"))
+        .expect("429 outcome must block");
     assert_eq!(live.streak, 1);
-    let on_disk: super::KickBlock =
-        load_profile_cache("kitty", KICK_BLOCK_CACHE_FILE).expect("block written through");
+    let on_disk: super::KickBlock = load_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        KICK_BLOCK_CACHE_FILE,
+    )
+    .expect("block written through");
     assert_eq!(on_disk, live);
 
     // A failure with no limiter metadata must not disturb the block.
-    note_kick_outcome(&blocks, "kitty", false, None, now + 20);
-    assert_eq!(kick_block(&blocks, "kitty"), Some(live));
+    note_kick_outcome(
+        &blocks,
+        &crate::profile::ProfileName::from("kitty"),
+        false,
+        None,
+        now + 20,
+    );
+    assert_eq!(
+        kick_block(&blocks, &crate::profile::ProfileName::from("kitty")),
+        Some(live)
+    );
 
     // A second 429 grows the streak in place.
-    note_kick_outcome(&blocks, "kitty", false, Some(rl), now + 30);
-    assert_eq!(kick_block(&blocks, "kitty").map(|b| b.streak), Some(2));
+    note_kick_outcome(
+        &blocks,
+        &crate::profile::ProfileName::from("kitty"),
+        false,
+        Some(rl),
+        now + 30,
+    );
+    assert_eq!(
+        kick_block(&blocks, &crate::profile::ProfileName::from("kitty")).map(|b| b.streak),
+        Some(2)
+    );
 
     // A fresh map (new process) resumes the persisted block…
     let rehydrated: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     sync_kick_blocks_from_cache(&rehydrated, &["kitty".to_string()]);
-    assert_eq!(kick_block(&rehydrated, "kitty").map(|b| b.streak), Some(2));
+    assert_eq!(
+        kick_block(&rehydrated, &crate::profile::ProfileName::from("kitty")).map(|b| b.streak),
+        Some(2)
+    );
 
     // …and a successful kick clears map + file, so the next sync clears mirrors.
-    note_kick_outcome(&blocks, "kitty", true, None, now + 40);
-    assert_eq!(kick_block(&blocks, "kitty"), None);
+    note_kick_outcome(
+        &blocks,
+        &crate::profile::ProfileName::from("kitty"),
+        true,
+        None,
+        now + 40,
+    );
+    assert_eq!(
+        kick_block(&blocks, &crate::profile::ProfileName::from("kitty")),
+        None
+    );
     assert!(
-        load_profile_cache::<super::KickBlock>("kitty", KICK_BLOCK_CACHE_FILE).is_none(),
+        load_profile_cache::<super::KickBlock>(
+            &crate::profile::ProfileName::from("kitty"),
+            KICK_BLOCK_CACHE_FILE
+        )
+        .is_none(),
         "clearing must remove the cache file"
     );
     sync_kick_blocks_from_cache(&rehydrated, &["kitty".to_string()]);
     assert_eq!(
-        kick_block(&rehydrated, "kitty"),
+        kick_block(&rehydrated, &crate::profile::ProfileName::from("kitty")),
         None,
         "a mirroring instance drops the block once the file is gone"
     );
@@ -1450,18 +2107,24 @@ fn only_a_fresh_read_drives_a_switch_decision() {
         s.insert("failed".to_string(), FetchStatus::Failed);
     }
 
-    assert!(decision_fresh(&status, "fresh"));
+    assert!(decision_fresh(
+        &status,
+        &crate::profile::ProfileName::from("fresh")
+    ));
     assert!(
-        !decision_fresh(&status, "cached"),
+        !decision_fresh(&status, &crate::profile::ProfileName::from("cached")),
         "a possibly rolled-over cached window must not drive a switch"
     );
     assert!(
-        !decision_fresh(&status, "limited"),
+        !decision_fresh(&status, &crate::profile::ProfileName::from("limited")),
         "a synthetic rate-limited window must not drive a switch"
     );
-    assert!(!decision_fresh(&status, "failed"));
+    assert!(!decision_fresh(
+        &status,
+        &crate::profile::ProfileName::from("failed")
+    ));
     assert!(
-        !decision_fresh(&status, "absent"),
+        !decision_fresh(&status, &crate::profile::ProfileName::from("absent")),
         "no read yet → no decision"
     );
 }
@@ -1527,7 +2190,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
                 Profile::new("b".to_string(), None, None),
             ],
         };
-        cfg.set_auth_broken("a", broken);
+        cfg.set_auth_broken(&crate::profile::ProfileName::from("a"), broken);
         Arc::new(RankedMutex::new(cfg))
     };
 
@@ -1652,21 +2315,24 @@ fn decision_fresh_any_reads_both_the_oauth_and_third_party_stores() {
         ("tp-stale".to_string(), FetchStatus::Cached),
     ])));
 
-    assert!(decision_fresh_any(&oauth, &tp, "a"), "OAuth-fresh counts");
     assert!(
-        decision_fresh_any(&oauth, &tp, "b"),
+        decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("a")),
+        "OAuth-fresh counts"
+    );
+    assert!(
+        decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("b")),
         "third-party-fresh must count too — the whole point of the fix"
     );
     assert!(
-        !decision_fresh_any(&oauth, &tp, "stale"),
+        !decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("stale")),
         "OAuth Cached is not fresh"
     );
     assert!(
-        !decision_fresh_any(&oauth, &tp, "tp-stale"),
+        !decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("tp-stale")),
         "third-party Cached is not fresh"
     );
     assert!(
-        !decision_fresh_any(&oauth, &tp, "unknown"),
+        !decision_fresh_any(&oauth, &tp, &crate::profile::ProfileName::from("unknown")),
         "absent in both stores is not fresh"
     );
 }
@@ -1819,6 +2485,7 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
+        launch_store: None,
     }
 }
 
@@ -1829,8 +2496,12 @@ fn session_row(session_id: &str, start_profile: &str) -> crate::live_sessions::L
 fn register_live_row(row: &crate::live_sessions::LiveSession) -> std::fs::File {
     crate::live_sessions::register(row).expect("register row");
     let probe = row.current_member.as_deref().unwrap_or(&row.start_profile);
-    crate::runtime::hold_session_row_marker(probe, row.isolated, &row.session_id)
-        .expect("hold the row's liveness marker")
+    crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from(probe),
+        row.isolated,
+        &row.session_id,
+    )
+    .expect("hold the row's liveness marker")
 }
 
 /// A chain of plain OAuth members, every one `swap_eligible`, with `active` as the
@@ -2042,7 +2713,7 @@ fn a_session_on_a_disabled_member_is_moved_off_it() {
     config
         .lock()
         .unwrap()
-        .find_mut("a")
+        .find_mut(&crate::profile::ProfileName::from("a"))
         .expect("member a")
         .disabled = true;
 
@@ -2072,7 +2743,7 @@ fn a_session_walks_past_a_member_the_executor_would_refuse() {
     config
         .lock()
         .unwrap()
-        .find_mut("b")
+        .find_mut(&crate::profile::ProfileName::from("b"))
         .expect("member b")
         .base_url = Some("https://api.example/anthropic".into());
 
@@ -2162,7 +2833,10 @@ fn a_session_on_a_distrusted_member_gets_no_decision_unless_that_member_is_broke
         let _home = crate::testutil::HomeSandbox::new();
         let _marker = register_live_row(&session_row("4242-0", "a"));
         let config = session_config(&["a", "b"], Some("a"));
-        config.lock().unwrap().set_auth_broken("a", broken);
+        config
+            .lock()
+            .unwrap()
+            .set_auth_broken(&crate::profile::ProfileName::from("a"), broken);
         let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::from([(
             "a".to_string(),
             super::StreakCounts {
@@ -2207,7 +2881,7 @@ fn the_chain_cursor_indexes_the_config_chain_not_the_filtered_snapshot() {
     config
         .lock()
         .unwrap()
-        .find_mut("b")
+        .find_mut(&crate::profile::ProfileName::from("b"))
         .expect("member b")
         .disabled = true;
 
@@ -2471,7 +3145,7 @@ fn retry_after_defers_next_fetch_slot() {
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
     let outcome = |name: &str, retry_after: Option<Duration>| FetchOutcome {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         info: None,
         status: FetchStatus::RateLimited,
         rotated: None,
@@ -2500,6 +3174,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     let extra = 300_000 - REFRESH_INTERVAL_MS;
@@ -2545,6 +3221,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     let floor = RATE_LIMIT_MIN_BACKOFF_MS;
@@ -2563,6 +3241,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     assert!(
@@ -2580,6 +3260,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     let capped = MAX_RETRY_AFTER_MS - REFRESH_INTERVAL_MS;
@@ -2602,6 +3284,8 @@ fn retry_after_defers_next_fetch_slot() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     assert!(
@@ -2628,7 +3312,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
         refresh_failed: false,
         plan_override: None,
-        name: "a".to_string(),
+        name: crate::profile::ProfileName::from("a"),
         info: None,
         status,
         rotated: None,
@@ -2660,6 +3344,8 @@ fn consecutive_rate_limits_back_off_exponentially() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
         let after = now_ms();
         assert!(
@@ -2678,6 +3364,8 @@ fn consecutive_rate_limits_back_off_exponentially() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let before = now_ms();
     apply_outcome(
@@ -2688,6 +3376,8 @@ fn consecutive_rate_limits_back_off_exponentially() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
     assert!(
@@ -2719,7 +3409,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
     // A constant hint well under the ladder floor — present on every 429, so the
     // escalation below can only come from the streak ladder overriding it.
     let hinted = || FetchOutcome {
-        name: "a".to_string(),
+        name: crate::profile::ProfileName::from("a"),
         info: None,
         status: FetchStatus::RateLimited,
         rotated: None,
@@ -2750,6 +3440,8 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
         let after = now_ms();
         assert!(
@@ -2775,7 +3467,7 @@ fn transient_errors_preserve_rate_limit_streak() {
     let streaks: super::PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
 
     let outcome = |kind: FetchStatus| FetchOutcome {
-        name: "a".to_string(),
+        name: crate::profile::ProfileName::from("a"),
         info: None,
         status: kind,
         rotated: None,
@@ -2793,6 +3485,8 @@ fn transient_errors_preserve_rate_limit_streak() {
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
     };
     let stamp = || {
@@ -2841,6 +3535,7 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
     let status: StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
 
+    crate::testutil::register_names(&["idle", "stale"]);
     let now_secs = now_epoch_secs();
     let with_reset = |reset_secs: i64| UsageInfo {
         five_hour: Some(UsageWindow {
@@ -2852,14 +3547,30 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
 
     // Fresh cache (mtime ~30s ago) whose 5h window already reset (resets_at in the
     // past) — an idle account. Younger than one interval, so seeded `Fresh`.
-    write_profile_cache("idle", USAGE_CACHE_FILE, &with_reset(now_secs - 600));
-    let idle_path = profile_subpath("idle", "usage_cache.json").expect("idle path");
+    write_profile_cache(
+        &crate::profile::ProfileName::from("idle"),
+        USAGE_CACHE_FILE,
+        &with_reset(now_secs - 600),
+    );
+    let idle_path = profile_subpath(
+        &crate::profile::ProfileName::from("idle"),
+        "usage_cache.json",
+    )
+    .expect("idle path");
     set_mtime(&idle_path, SystemTime::now() - Duration::from_secs(30));
 
     // Stale cache (written 2h ago) whose window is still open — seeded as a starting
     // point with `Cached` status; the scheduler refreshes it in the background.
-    write_profile_cache("stale", USAGE_CACHE_FILE, &with_reset(now_secs + 3600));
-    let stale_path = profile_subpath("stale", "usage_cache.json").expect("stale path");
+    write_profile_cache(
+        &crate::profile::ProfileName::from("stale"),
+        USAGE_CACHE_FILE,
+        &with_reset(now_secs + 3600),
+    );
+    let stale_path = profile_subpath(
+        &crate::profile::ProfileName::from("stale"),
+        "usage_cache.json",
+    )
+    .expect("stale path");
     set_mtime(
         &stale_path,
         SystemTime::now() - Duration::from_secs(2 * 3600),
@@ -2871,7 +3582,7 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
             &store,
             &status,
             &last_fetched,
-            "idle",
+            &crate::profile::ProfileName::from("idle"),
             now,
             REFRESH_INTERVAL_MS
         ),
@@ -2882,7 +3593,7 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
             &store,
             &status,
             &last_fetched,
-            "stale",
+            &crate::profile::ProfileName::from("stale"),
             now,
             REFRESH_INTERVAL_MS
         ),
@@ -2893,7 +3604,7 @@ fn try_seed_cache_seeds_any_cache_and_resumes_timer() {
             &store,
             &status,
             &last_fetched,
-            "missing",
+            &crate::profile::ProfileName::from("missing"),
             now,
             REFRESH_INTERVAL_MS
         ),
@@ -2941,7 +3652,9 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
     let interval = REFRESH_INTERVAL_MS;
     let span = interval / 4;
     let now = EpochMs::from_millis(1_700_000_000_000);
-    let sp = |name: &str, t: EpochMs| deadline_spread(name, t, interval).0;
+    let sp = |name: &str, t: EpochMs| {
+        deadline_spread(&crate::profile::ProfileName::from(name), t, interval).0
+    };
 
     // Bounded and deterministic.
     assert!(sp("alpha", now) < span, "spread stays under interval/4");
@@ -2969,36 +3682,305 @@ fn deadline_spread_is_bounded_per_profile_and_per_cycle() {
     );
 
     // Degenerate interval → no spread.
-    assert_eq!(deadline_spread("alpha", now, 0).0, 0);
+    assert_eq!(
+        deadline_spread(&crate::profile::ProfileName::from("alpha"), now, 0).0,
+        0
+    );
 }
 
-/// `filter_suppressed` drops third-party entries whose name is in the session
-/// suppressed set and passes the rest through in order; an empty set (the steady
-/// state for healthy profiles) is a no-op fast path.
+/// `filter_suppressed` drops third-party entries suppressed under the SAME
+/// credential they still carry, and passes the rest through in order; an empty
+/// map (the steady state for healthy profiles) is a no-op fast path.
 #[test]
 fn filter_suppressed_drops_only_named_entries() {
-    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
-    suppressed.lock().unwrap().insert("no-data".to_string());
+    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let victim = tp_entry("no-data");
+    suppressed
+        .lock()
+        .unwrap()
+        .insert("no-data".to_string(), victim.credential_fingerprint());
 
     let snap = vec![tp_entry("ok"), tp_entry("no-data"), tp_entry("also-ok")];
     let out = filter_suppressed(&suppressed, snap);
     let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
     assert_eq!(names, vec!["ok", "also-ok"]);
 
-    // Empty set → identity (the fast path).
-    let empty: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
+    // Empty map → identity (the fast path).
+    let empty: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
     let snap2 = vec![tp_entry("ok"), tp_entry("no-data")];
     assert_eq!(filter_suppressed(&empty, snap2).len(), 2);
 }
 
+/// A re-login is the ONLY thing that can clear an `AuthExpired`, and a headless
+/// daemon has no `refetch_queue` writer — nothing in `src/daemon/` ever inserts
+/// one, so a name-keyed suppression outlived every re-login until the process
+/// restarted. The daemon DOES rebuild these entries from the reloaded config
+/// (`daemon::tick::rebuild_tokens`), so the changed credential is the signal.
+#[test]
+fn filter_suppressed_re_admits_an_entry_whose_credential_changed() {
+    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let expired = alibaba_entry("qwen", "dead-console-token");
+    suppressed
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), expired.credential_fingerprint());
+
+    // Same credential → still suppressed, no cadence retry.
+    assert!(filter_suppressed(&suppressed, vec![expired]).is_empty());
+
+    // Re-login wrote a new console session; the rebuilt entry carries it.
+    let relogged = alibaba_entry("qwen", "fresh-console-token");
+    let out = filter_suppressed(&suppressed, vec![relogged]);
+    assert_eq!(
+        out.len(),
+        1,
+        "a re-login must re-admit the profile without a restart or a timer",
+    );
+}
+
+/// The api key is part of the fingerprint too, so the generic no-data
+/// suppression clears on a rotated key by the same mechanism.
+#[test]
+fn filter_suppressed_re_admits_a_generic_entry_on_a_rotated_key() {
+    let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let old = tp_entry("proxy");
+    suppressed
+        .lock()
+        .unwrap()
+        .insert("proxy".to_string(), old.credential_fingerprint());
+    let mut rotated = tp_entry("proxy");
+    rotated.api_key = "a-different-key".to_string();
+    assert_eq!(filter_suppressed(&suppressed, vec![rotated]).len(), 1);
+}
+
 fn tp_entry(name: &str) -> ThirdPartyEntry {
     ThirdPartyEntry {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         target: crate::providers::ThirdPartyTarget::Generic {
             base_url: "https://example.com".to_string(),
         },
         api_key: "key".to_string(),
     }
+}
+
+fn alibaba_entry(name: &str, token: &str) -> ThirdPartyEntry {
+    ThirdPartyEntry {
+        name: crate::profile::ProfileName::from(name),
+        target: crate::providers::ThirdPartyTarget::Known {
+            provider: crate::providers::Provider::Alibaba,
+            console: Some(crate::profile::ConsoleCredential {
+                token: token.to_string(),
+                site: crate::profile::ConsoleSite::International,
+                region: "ap-southeast-1".to_string(),
+            }),
+        },
+        api_key: String::new(),
+    }
+}
+
+fn third_party_state(fetcher: ThirdPartyFetcher) -> super::SchedulerState {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    super::SchedulerState {
+        config: Arc::new(RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        })),
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(super::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher,
+    }
+}
+
+fn stub_auth_expired(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::AuthExpired)
+}
+
+fn stub_rate_limited(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::RateLimited { retry_after: None })
+}
+
+fn stub_network_error(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::Network)
+}
+
+#[test]
+fn fetch_third_party_due_inserts_generic_auth_expired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-dead"]);
+    let entry = tp_entry("generic-dead");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_auth_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state.suppressed_generic.lock().unwrap().get("generic-dead"),
+        Some(&fp)
+    );
+    assert!(crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_inserts_known_auth_expired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-dead"]);
+    let entry = alibaba_entry("qwen-dead", "console-token");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_auth_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state.suppressed_generic.lock().unwrap().get("qwen-dead"),
+        Some(&fp)
+    );
+    assert!(crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_inserts_generic_failed_without_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-no-data"]);
+    let entry = tp_entry("generic-no-data");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state
+            .suppressed_generic
+            .lock()
+            .unwrap()
+            .get("generic-no-data"),
+        Some(&fp)
+    );
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_does_not_insert_rate_limited() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-limited"]);
+    let entry = tp_entry("generic-limited");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_rate_limited);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_does_not_insert_cached() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["generic-cached"]);
+    let entry = tp_entry("generic-cached");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+}
+
+#[test]
+fn fetch_third_party_due_does_not_insert_known_failed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["qwen-failed"]);
+    let entry = alibaba_entry("qwen-failed", "console-token");
+    let name = entry.name.clone();
+    let fp = entry.credential_fingerprint();
+    crate::profile_cache::write_auth_expired(&name, fp);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(state.suppressed_generic.lock().unwrap().is_empty());
+    assert!(!crate::profile_cache::auth_expired_matches(&name, fp));
+    assert_eq!(
+        state.third_party_status.lock().unwrap().get("qwen-failed"),
+        Some(&super::FetchStatus::Failed)
+    );
+}
+
+/// Alibaba's quota surface cannot read the api key at all, so a console-only
+/// profile is still fetchable. Dropped from the work list it would never get a
+/// `fetch_status`, and the Usage tab would spin "loading" forever.
+#[test]
+fn collect_third_party_entries_keeps_a_keyless_alibaba_profile() {
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("qwen"));
+    p.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    p.provider =
+        crate::providers::Provider::from_base_url(p.base_url.as_deref().unwrap_or_default());
+    p.api_key = None;
+
+    let entries = collect_third_party_entries(std::slice::from_ref(&p));
+    assert_eq!(
+        entries.len(),
+        1,
+        "a console-only Alibaba profile still belongs on the third-party leg",
+    );
+    assert!(crate::usage::third_party_credentialed(&p));
+
+    // A keyless DeepSeek profile has no credential at all and stays out — the
+    // render layer says so instead of loading forever.
+    let mut ds = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    assert!(!crate::usage::third_party_credentialed(&ds));
+    assert!(collect_third_party_entries(std::slice::from_ref(&ds)).is_empty());
 }
 
 /// Third-party startup seed mirrors the OAuth one: any cached profile is seeded
@@ -3037,9 +4019,22 @@ fn bootstrap_third_party_seeds_any_cache() {
         best_effort: false,
     };
     // Fresh cache (just written) seeds `Fresh`; a 2h-old cache seeds `Cached`.
-    write_profile_cache("cached", THIRD_PARTY_CACHE_FILE, &stats(12.0));
-    write_profile_cache("stale", THIRD_PARTY_CACHE_FILE, &stats(20.0));
-    let stale_path = profile_subpath("stale", "third_party_cache.json").expect("stale path");
+    crate::testutil::register_names(&["cached", "stale"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("cached"),
+        THIRD_PARTY_CACHE_FILE,
+        &stats(12.0),
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("stale"),
+        THIRD_PARTY_CACHE_FILE,
+        &stats(20.0),
+    );
+    let stale_path = profile_subpath(
+        &crate::profile::ProfileName::from("stale"),
+        "third_party_cache.json",
+    )
+    .expect("stale path");
     set_mtime(
         &stale_path,
         SystemTime::now() - Duration::from_secs(2 * 3600),
@@ -3141,11 +4136,14 @@ fn a_disk_pair_that_moved_past_the_spent_token_is_returned_not_quarantined() {
 
     // We spent "rt-old"; the store moved to "rt-new" — someone else rotated.
     assert_eq!(
-        super::fresher_disk_pair(name, "rt-old"),
+        super::fresher_disk_pair(&crate::profile::ProfileName::from(name), "rt-old"),
         Some(("at-new".to_string(), Some("rt-new".to_string())))
     );
     // We spent "rt-new" itself and it 400d — a real revocation, quarantine.
-    assert_eq!(super::fresher_disk_pair(name, "rt-new"), None);
+    assert_eq!(
+        super::fresher_disk_pair(&crate::profile::ProfileName::from(name), "rt-new"),
+        None
+    );
 }
 
 /// The carry path must also LIFT a stale quarantine: the moved pair proves the
@@ -3176,15 +4174,23 @@ fn carrying_an_external_rotation_clears_a_stale_quarantine() {
         profiles: vec![p],
     };
     config.state.profiles = vec![name.into()];
-    config.set_auth_broken(name, true);
+    config.set_auth_broken(&crate::profile::ProfileName::from(name), true);
     let handle: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(Default::default()));
 
     // Spent "rt-old"; store holds "rt-new" → carry fires and lifts the flag.
-    let outcome = super::carry_external_rotation(&handle, name, "rt-old", &refetch);
+    let outcome = super::carry_external_rotation(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        "rt-old",
+        &refetch,
+    );
     assert!(outcome.is_some(), "a moved pair must carry");
     assert!(
-        !handle.lock().unwrap().is_auth_broken(name),
+        !handle
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
         "the carried (alive) chain must lift a stale quarantine"
     );
     assert!(
@@ -3193,11 +4199,22 @@ fn carrying_an_external_rotation_clears_a_stale_quarantine() {
     );
 
     // Spent the store's own pair → no carry, and the flag is left alone.
-    handle.lock().unwrap().set_auth_broken(name, true);
-    let outcome = super::carry_external_rotation(&handle, name, "rt-new", &refetch);
+    handle
+        .lock()
+        .unwrap()
+        .set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    let outcome = super::carry_external_rotation(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        "rt-new",
+        &refetch,
+    );
     assert!(outcome.is_none(), "an unchanged pair is a real revocation");
     assert!(
-        handle.lock().unwrap().is_auth_broken(name),
+        handle
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
         "a real revocation keeps the quarantine"
     );
 }
@@ -3207,13 +4224,22 @@ fn a_missing_or_tokenless_profile_never_reads_as_a_benign_double_spend() {
     let _home = crate::testutil::HomeSandbox::new();
     // No profile on disk at all.
     assert_eq!(
-        super::fresher_disk_pair("double-spend-missing", "rt-x"),
+        super::fresher_disk_pair(
+            &crate::profile::ProfileName::from("double-spend-missing"),
+            "rt-x"
+        ),
         None
     );
     // Profile exists but has no stored credentials.
     let p = crate::profile::Profile::new("double-spend-bare".to_string(), None, None);
     crate::profile::save_profile(&p).expect("save profile");
-    assert_eq!(super::fresher_disk_pair("double-spend-bare", "rt-x"), None);
+    assert_eq!(
+        super::fresher_disk_pair(
+            &crate::profile::ProfileName::from("double-spend-bare"),
+            "rt-x"
+        ),
+        None
+    );
 }
 
 // `token_clock_expired` gates whether a 429 on the usage fetch falls through to the
@@ -3353,8 +4379,9 @@ fn pre_rotation_other_errors_bail_to_cache() {
 }
 
 // `proactive_rotation_due` decides whether a profile rotates AHEAD of expiry
-// instead of waiting for a 401. Two inputs only: the `preemptive_rotation`
-// toggle (default ON) and whether the stored expiry sits inside the lead
+// instead of waiting for a 401. Three inputs: the `preemptive_rotation`
+// toggle (default ON), the CLA-ROLL flag (which ORs over the toggle, never
+// over the clock), and whether the stored expiry sits inside the lead
 // window. Liveness, active-ness and the Keychain are NOT inputs — every
 // non-isolated session reads the same credential file clauth rotates.
 
@@ -3363,6 +4390,7 @@ fn preemptive_rotation_is_on_by_default_and_the_toggle_still_disables_it() {
     assert!(crate::profile::AppState::default().preemptive_rotation);
     // Toggled off, a token deep inside the lead window stays lazy.
     assert!(!super::proactive_rotation_due(
+        false,
         false,
         Some(10_000),
         10_000,
@@ -3378,12 +4406,14 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // the 5-minute mark where the running claude would refresh it itself.
     assert!(super::proactive_rotation_due(
         true,
+        false,
         Some(10_000 + lead),
         10_000,
         interval
     ));
     assert!(super::proactive_rotation_due(
         true,
+        false,
         Some(10_000),
         10_000,
         interval
@@ -3391,6 +4421,7 @@ fn proactive_rotation_fires_only_inside_the_lead_window() {
     // Beyond the lead window → plain poll; nothing at stake yet.
     assert!(!super::proactive_rotation_due(
         true,
+        false,
         Some(10_000 + lead + 1),
         10_000,
         interval
@@ -3407,8 +4438,8 @@ fn proactive_lead_scales_with_the_poll_interval_with_a_floor() {
 }
 
 /// The whole point of the floor: Claude Code refreshes its own OAuth token
-/// once it is within 5 MINUTES of expiry (`docs/domain-knowledge.md`,
-/// measured against CC's shipped bundle). At the SHIPPED 90 s cadence the
+/// once it is within 5 MINUTES of expiry (measured against CC's shipped
+/// bundle). At the SHIPPED 90 s cadence the
 /// `3 × interval` term is only 4.5 min, which loses that race every time —
 /// the floor is what carries it. Reds if anyone drops the floor back under
 /// `300_000` or lowers it below the shipped interval's own term.
@@ -3432,7 +4463,9 @@ fn the_rotation_lead_clears_claude_codes_own_five_minute_refresh_threshold() {
 #[test]
 fn proactive_rotation_never_fires_on_unknown_expiry() {
     // Never spend a single-use refresh on a token whose expiry we can't prove.
-    assert!(!super::proactive_rotation_due(true, None, 10_000, 90_000));
+    assert!(!super::proactive_rotation_due(
+        true, false, None, 10_000, 90_000
+    ));
 }
 
 /// Liveness is not an input. Under the old gate a running `clauth start`
@@ -3446,11 +4479,13 @@ fn proactive_rotation_decides_on_the_toggle_and_the_clock_alone() {
     for now in [0i64, 10_000, 1_700_000_000_000] {
         assert!(super::proactive_rotation_due(
             true,
+            false,
             Some(now + lead),
             now,
             interval
         ));
         assert!(!super::proactive_rotation_due(
+            false,
             false,
             Some(now + lead),
             now,
@@ -3480,7 +4515,12 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         }),
         ..UsageInfo::default()
     };
-    write_profile_cache("kitty", USAGE_CACHE_FILE, &info);
+    crate::testutil::register_names(&["kitty"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &info,
+    );
 
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -3558,9 +4598,18 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
         )
     };
 
-    write_profile_cache("kitty", USAGE_CACHE_FILE, &at(10.0));
+    crate::testutil::register_names(&["kitty"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &at(10.0),
+    );
     hydrate(&["kitty".to_string()]);
-    write_profile_cache("kitty", USAGE_CACHE_FILE, &at(55.0));
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &at(55.0),
+    );
     hydrate(&["kitty".to_string()]);
 
     let seeded = store.lock().unwrap().get("kitty").cloned();
@@ -3584,7 +4633,12 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     let _home = crate::testutil::HomeSandbox::new();
 
-    write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+    crate::testutil::register_names(&["kitty"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &UsageInfo::default(),
+    );
 
     // The standby seed sources names from config (the display superset), so the
     // profile whose cache is hydrated must live there — as it does in production.
@@ -3603,22 +4657,30 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     // A manual `r` landed just before this tick: forced name + Queued mark.
     state.refetch_queue.lock().unwrap().insert("kitty".into());
-    mark_activity(&state.activity, "kitty", ProfileActivity::Queued);
+    mark_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("kitty"),
+        ProfileActivity::Queued,
+    );
 
     super::standdown_tick(&state, REFRESH_INTERVAL_MS);
 
@@ -3665,7 +4727,11 @@ fn standdown_sweeps_bootstrap_queued_marks() {
     use std::sync::atomic::{AtomicBool, AtomicU64};
     let _home = crate::testutil::HomeSandbox::new();
 
-    write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &UsageInfo::default(),
+    );
 
     // The standby seed sources names from config (the display superset), so the
     // profile whose cache is hydrated must live there — as it does in production.
@@ -3684,23 +4750,35 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(true),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     // Bootstrap pre-marked a cache-due profile; a rotate worker from the last
     // armed tick is still in flight on another.
-    mark_activity(&state.activity, "stale", ProfileActivity::Queued);
-    mark_activity(&state.activity, "kitty", ProfileActivity::Refreshing);
+    mark_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("stale"),
+        ProfileActivity::Queued,
+    );
+    mark_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("kitty"),
+        ProfileActivity::Refreshing,
+    );
 
     super::standdown_tick(&state, REFRESH_INTERVAL_MS);
 
@@ -3724,7 +4802,7 @@ fn standdown_sweeps_bootstrap_queued_marks() {
 /// below discriminate between the two branches — and keeps a regression cheap:
 ///   * armed + nothing due never calls `fetch_oauth_due`, so a broken lease
 ///     fails these asserts instead of firing a live request at the real endpoint
-///     (`tick` hardcodes the real fetcher; there is no seam to inject through it);
+///     (`fetch_oauth_due` hardcodes the real fetcher; there is no seam to inject through it);
 ///   * the `Queued` mark survives an armed tick (`clear_orphaned_forced` returns
 ///     early on an empty `forced` set, and no worker runs to clear it), while
 ///     `standdown_tick` sweeps EVERY `Queued` mark — so the sweep proves the
@@ -3745,7 +4823,12 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
     let other = crate::daemon::FetchLease::new();
     assert!(other.acquire(), "the first instance wins the lease");
 
-    write_profile_cache("kitty", USAGE_CACHE_FILE, &UsageInfo::default());
+    crate::testutil::register_names(&["kitty"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        USAGE_CACHE_FILE,
+        &UsageInfo::default(),
+    );
     // The standby seed sources names from config (the display superset), so the
     // profile whose cache is hydrated must live there — as it does in production.
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
@@ -3763,19 +4846,23 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // A DIFFERENT lease over the same file → its acquire() is denied while
         // `other` holds the flock.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     // Stamp `kitty` as just-fetched so it is NOT due this tick: an armed tick
@@ -3789,7 +4876,11 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
 
     // A bootstrap-only `Queued` mark: `standdown_tick` sweeps every Queued mark,
     // while an armed tick with nothing due leaves it in place.
-    mark_activity(&state.activity, "kitty", ProfileActivity::Queued);
+    mark_activity(
+        &state.activity,
+        &crate::profile::ProfileName::from("kitty"),
+        ProfileActivity::Queued,
+    );
 
     super::tick(&state);
 
@@ -3833,7 +4924,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         (200, r#"{"session":{"percent":42.5}}"#.to_string())
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let mut profile = crate::testutil::blank_profile(name);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
     profile.base_url = Some(base.clone());
     profile.api_key = Some("key".to_string());
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
@@ -3841,7 +4932,7 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         profiles: vec![profile],
     }));
     let entry = ThirdPartyEntry {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         target: crate::providers::ThirdPartyTarget::Generic {
             base_url: base.clone(),
         },
@@ -3859,18 +4950,22 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     };
 
     super::tick(&state);
@@ -3917,6 +5012,440 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
     );
 }
 
+/// Pins two tick legs the existing armed-tick test does not cover: the
+/// history-prune leg and the cadence-window throttle.
+///
+///   * **prune** — `last_history_prune` is seeded stale, so the tick's
+///     `prune_histories_if_due` fires and advances the stamp; deleting the
+///     call from `tick` leaves the stamp stale and reds this test.
+///   * **throttle** — a second tick immediately after the first must NOT
+///     re-fetch, because `partition_due` sees `last_fetched + interval` is
+///     still in the future; removing that gate makes the second tick fire a
+///     second HTTP request and `seen.len()` reads 2.
+///
+/// The OAuth/session-token leg is NOT pinned here: `tick` hardcodes the real
+/// fetcher against a constant `api.anthropic.com` URL with no injection seam,
+/// so an OAuth work-list would fire a live request. The `tokens` list is empty
+/// for the same reason as the test above.
+#[test]
+fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window() {
+    use super::HISTORY_PRUNE_INTERVAL_MS;
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+
+    let name = "gen";
+    // Allow 2 requests so a broken throttle RECORDS the second hit rather than
+    // timing out; assert below that only 1 arrives.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (200, r#"{"session":{"percent":42.5}}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url = Some(base.clone());
+    profile.api_key = Some("key".to_string());
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    }));
+    let entry = ThirdPartyEntry {
+        name: crate::profile::ProfileName::from(name),
+        target: crate::providers::ThirdPartyTarget::Generic {
+            base_url: base.clone(),
+        },
+        api_key: "key".to_string(),
+    };
+    let stale_prune = crate::usage::now_ms().saturating_sub(HISTORY_PRUNE_INTERVAL_MS + 1);
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(stale_prune),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+    };
+
+    // First tick: wins the lease, prunes histories, fetches.
+    super::tick(&state);
+
+    assert!(
+        state.last_history_prune.load(Ordering::Relaxed) > stale_prune,
+        "the history prune leg advanced the stale stamp"
+    );
+    assert!(
+        state.last_fetched.lock().unwrap().contains_key(name),
+        "the first tick stamped last_fetched"
+    );
+
+    // Second tick inside the cadence window: partition_due sees
+    // last_fetched + interval > now, so no fetch fires.
+    super::tick(&state);
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.len(),
+        1,
+        "a second tick inside the cadence window must not re-fetch: {seen:?}"
+    );
+}
+
+/// Production wiring pin for the queue election. Both lapsed members are due,
+/// but `tick` must elect exactly one BEFORE the OAuth fan-out; without that call
+/// both permissive `TokenEntry` snapshots kick and open together.
+#[test]
+fn auto_start_queue_election_is_wired_into_tick() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":1.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    // A correct run makes five requests (one kick, two usage, two profile).
+    // Six leaves room to record the second kick when the election wiring is
+    // removed: the listener, rather than a refused socket, then catches it.
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a"), auto_start_queue_profile("b")],
+    };
+    let tokens = super::collect_tokens(&app_config);
+    let lapsed = || UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+        }),
+        ..UsageInfo::default()
+    };
+    let store = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), lapsed()),
+        ("b".to_string(), lapsed()),
+    ])));
+    let auto_start_queue = crate::usage::new_auto_start_queue_state();
+    let state = super::SchedulerState {
+        config: Arc::new(RankedMutex::new(app_config)),
+        tokens: Arc::new(RankedMutex::new(tokens)),
+        store: store.clone(),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: auto_start_queue.clone(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+    };
+
+    super::tick(&state);
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|path| path.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "the tick elects one opener before the fan-out: {seen:?}"
+    );
+    assert!(
+        crate::usage::queue_anchor_cached(&auto_start_queue).is_some(),
+        "the elected kick moves the scheduler's shared queue anchor"
+    );
+    assert!(
+        !super::window_lapsed(&store, &"a".into(), crate::usage::now_epoch_secs()),
+        "the first queue member is elected and its stored window opens"
+    );
+}
+
+/// The landed-kick path distinguishes a live-window health re-test from a real
+/// lapsed-window open. Only the latter may move the queue anchor or emit the
+/// queue-open event, and the anchor must carry the real wall clock (not epoch 0).
+#[test]
+fn auto_start_queue_run_fetch_anchors_and_logs_only_a_lapsed_window_open() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":1.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    let mut entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("queued token");
+    entry.may_open_window = true;
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 4.0,
+                resets_at: Some(epoch_secs_to_iso(now_before + 3600)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::KickBlock {
+            streak: 1,
+            rejected: false,
+            until: None,
+            next_retry: now_before + 600,
+        },
+    )])));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+    let queue = crate::usage::new_auto_start_queue_state();
+    crate::usage::note_queue_open(&queue, &"a".into(), 42);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    let _live = super::run_fetch(
+        &config,
+        entry.clone(),
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&queue),
+        Some(42),
+        "a successful live-window re-test opens nothing and cannot re-phase the queue"
+    );
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .all(|line| !line.contains("5h auto-start window opened")),
+        "the live-window re-test must not claim a queue open: {:?}",
+        lines.snapshot()
+    );
+
+    store.lock().unwrap().insert(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now_before - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    );
+    let lapsed_started = crate::usage::now_epoch_secs();
+    let _lapsed = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &refetch,
+        &activity,
+        &streaks,
+        &blocks,
+        &weekly_reset_kicks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    let anchor = crate::usage::queue_anchor_cached(&queue).expect("landed lapsed kick anchor");
+    assert!(
+        anchor >= lapsed_started,
+        "the anchor carries the landed kick's wall clock, got {anchor} before {lapsed_started}"
+    );
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.contains("5h auto-start window opened"))
+            .count(),
+        1,
+        "exactly the lapsed leg emits the queue-open event: {:?}",
+        lines.snapshot()
+    );
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|path| path.starts_with("/v1/messages"))
+            .count(),
+        2,
+        "both the health re-test and lapsed open reach the kick endpoint: {seen:?}"
+    );
+}
+
+/// A failed elected kick is health state for that exact member. Keying the
+/// streak on a sibling would let the failed head keep winning forever.
+#[test]
+fn auto_start_queue_run_fetch_keys_a_failed_kick_to_the_elected_member() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":1.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(now + 5 * 3600),
+    );
+    let (base, server) = crate::testutil::serve_endpoints(4, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (403, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["elected".into(), "sibling".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![
+            auto_start_queue_profile("elected"),
+            auto_start_queue_profile("sibling"),
+        ],
+    };
+    let entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .find(|entry| entry.name == "elected")
+        .expect("elected token");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "elected".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let _outcome = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    let recorded_at = crate::usage::now_epoch_secs();
+    assert_eq!(
+        crate::usage::queue_failures(&queue, &"elected".into(), recorded_at),
+        1,
+        "the failed elected member owns the streak"
+    );
+    assert_eq!(
+        crate::usage::queue_failures(&queue, &"sibling".into(), recorded_at),
+        0,
+        "the untouched sibling owns no failure"
+    );
+
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen.iter()
+            .filter(|path| path.starts_with("/v1/messages"))
+            .count(),
+        1,
+        "the elected member made one failed kick attempt: {seen:?}"
+    );
+}
+
 // ── active-profile 429 ladder cap ────────────────────────────────────────────
 //
 // A deep back-off slot on the active row mostly buys staleness on the exact
@@ -3927,6 +5456,109 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
 // a sustained storm must climb the same drain ladder as idle profiles or the
 // capped re-polls keep the window pinned. Idle profiles always keep the full
 // ladder.
+
+/// The pre-kick refusal arm records the consumed slot: an ELECTED lapsed
+/// member refused before the kick could fire (a standing block whose retry
+/// clock has not come due) steps toward the skip threshold exactly like a
+/// failed kick does, with zero `/v1/messages` hits. Mutation: deleting the
+/// record call in `run_fetch`'s refusal arm reds this test.
+#[test]
+fn auto_start_queue_run_fetch_records_the_failure_when_refused_before_the_kick() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let usage_body = format!(
+        concat!(
+            r#"{{"five_hour":{{"utilization":0.0,"resets_at":"{}"}},"#,
+            r#""seven_day":{{"utilization":0.0,"resets_at":"{}"}}}}"#
+        ),
+        epoch_secs_to_iso(now_before + 5 * 3600),
+        epoch_secs_to_iso(now_before + 7 * 24 * 3600),
+    );
+    let kick_hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_hits = kick_hits.clone();
+    let (base, _server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            served_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (200, "{}".to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    let mut entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("queued token");
+    entry.may_open_window = true; // elected this tick
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(now_before - 60)), // lapsed
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    // A standing block whose retry clock has not come due: the refusal the
+    // arm exists for, distinct from the 429-streak refusal.
+    let blocks = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::KickBlock {
+            streak: 1,
+            rejected: false,
+            until: None,
+            next_retry: now_before + 600,
+        },
+    )])));
+    let weekly_reset_kicks: super::WeeklyResetKicks = Arc::new(RankedMutex::new(HashSet::new()));
+    let queue = crate::usage::new_auto_start_queue_state();
+
+    let _outcome = super::run_fetch(
+        &config,
+        entry,
+        &store,
+        &Arc::new(RankedMutex::new(HashSet::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &blocks,
+        &weekly_reset_kicks,
+        &queue,
+        REFRESH_INTERVAL_MS,
+    );
+    assert_eq!(
+        crate::usage::queue_failures(&queue, &"a".into(), crate::usage::now_epoch_secs()),
+        1,
+        "a refused pre-kick consumes the slot and records the failure"
+    );
+    assert_eq!(
+        kick_hits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the refusal must not fire a kick"
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&queue),
+        None,
+        "nothing opened: the anchor does not move"
+    );
+}
 
 #[test]
 fn active_profile_rate_limit_ladder_caps_at_one_extra_interval() {
@@ -4036,7 +5668,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
     streaks.lock().unwrap().insert("idle".to_string(), at_five);
 
     let outcome = |name: &str| FetchOutcome {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         info: None,
         status: FetchStatus::RateLimited,
         rotated: None,
@@ -4055,6 +5687,8 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         &streaks,
         REFRESH_INTERVAL_MS,
         true,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     apply_outcome(
         outcome("idle"),
@@ -4064,6 +5698,8 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
     let after = now_ms();
 
@@ -4117,17 +5753,21 @@ fn completion_order_state() -> super::SchedulerState {
         last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
         poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
         kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
         pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
         pending_switch_off: Arc::new(RankedMutex::new(false)),
         refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
-        suppressed_generic: Arc::new(RankedMutex::new(HashSet::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
         standdown_active: AtomicBool::new(false),
         last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
     }
 }
 
@@ -4136,7 +5776,7 @@ fn completion_order_state() -> super::SchedulerState {
 /// no `HomeSandbox` and stays parallel-safe.
 fn cached_outcome(name: &str) -> super::FetchOutcome {
     super::FetchOutcome {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         info: None,
         status: super::FetchStatus::Cached,
         rotated: None,
@@ -4747,8 +6387,8 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
 /// `spawn_refresher`'s kick-block seed must run on the CALLING thread, not
 /// inside the spawned tick worker: nothing joins that worker, so a home-
 /// derived path resolved on it could outlive a test's `HOME_OVERRIDE` and read
-/// the operator's real home — live the moment the seed grows a write leg
-/// (docs/architecture.md's 2026-06-06 convention). Entering through
+/// the operator's real home — live the moment the seed grows a write leg.
+/// Entering through
 /// `spawn_refresher` itself (never `sync_kick_blocks_from_cache` directly) is
 /// the only way to pin WHERE the seed runs; asserting immediately after return,
 /// with no sleep or yield, is what makes the race decide against a broken
@@ -4768,7 +6408,12 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         until: Some(1_700_000_600),
         next_retry: 1_700_000_100,
     };
-    write_profile_cache("kitty", KICK_BLOCK_CACHE_FILE, &cached);
+    crate::testutil::register_names(&["kitty"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("kitty"),
+        KICK_BLOCK_CACHE_FILE,
+        &cached,
+    );
 
     let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
         state: AppState::default(),
@@ -4787,13 +6432,14 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::clone(&kick_blocks),
+        crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(vec![])),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
-        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
         // Pre-armed shutdown: if the `cfg!(test)` spawn-skip is ever removed
         // while the seed hoist stays, the tick thread this would spawn breaks
         // at its loop-top check instead of looping past this sandbox teardown.
@@ -4841,7 +6487,7 @@ fn history_sample(utilization: f64) -> crate::usage::UsageInfo {
 /// `(ts, 5h utilization)` pairs recorded for `name`, oldest first — read back
 /// through the same parser both burn readers use.
 fn recorded_samples(name: &str) -> Vec<(u64, f64)> {
-    crate::profile::load_usage_history(name)
+    crate::profile::load_usage_history(&crate::profile::ProfileName::from(name))
         .into_iter()
         .filter_map(|(ts, info)| Some((ts, info.five_hour?.utilization)))
         .collect()
@@ -4880,13 +6526,19 @@ fn a_live_fetch_appends_the_sample_and_its_bridge() {
         .insert("alice".to_string(), history_sample(50.0));
 
     apply_outcome(
-        FetchOutcome::live("alice", history_sample(80.0), None),
+        FetchOutcome::live(
+            &crate::profile::ProfileName::from("alice"),
+            history_sample(80.0),
+            None,
+        ),
         &store,
         &status,
         &last_fetched,
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     let samples = recorded_samples("alice");
@@ -4914,7 +6566,9 @@ fn a_live_fetch_appends_the_sample_and_its_bridge() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let path = crate::profile::profile_history_path("alice").expect("history path");
+        let path =
+            crate::profile::profile_history_path(&crate::profile::ProfileName::from("alice"))
+                .expect("history path");
         let mode = std::fs::metadata(&path)
             .expect("history metadata")
             .permissions()
@@ -4939,9 +6593,19 @@ fn a_cached_body_appends_no_sample() {
     let _home = crate::testutil::HomeSandbox::new();
     let (store, status, last_fetched, streaks) = history_stores();
     // A cached outcome loads its body off disk, so seed one to recycle.
-    write_profile_cache("alice", USAGE_CACHE_FILE, &history_sample(80.0));
+    crate::testutil::register_names(&["alice"]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from("alice"),
+        USAGE_CACHE_FILE,
+        &history_sample(80.0),
+    );
 
-    let outcome = FetchOutcome::cached("alice", FetchStatus::RateLimited, None, None);
+    let outcome = FetchOutcome::cached(
+        &crate::profile::ProfileName::from("alice"),
+        FetchStatus::RateLimited,
+        None,
+        None,
+    );
     assert!(
         outcome.info.is_some(),
         "fixture must carry a body, or this asserts nothing about the gate"
@@ -4954,6 +6618,8 @@ fn a_cached_body_appends_no_sample() {
         &streaks,
         REFRESH_INTERVAL_MS,
         false,
+        false,
+        &Arc::new(RankedMutex::new(HashSet::new())),
     );
 
     assert!(
@@ -4973,13 +6639,19 @@ fn an_unchanged_live_sample_appends_nothing() {
     let (store, status, last_fetched, streaks) = history_stores();
     let apply = || {
         apply_outcome(
-            FetchOutcome::live("alice", history_sample(80.0), None),
+            FetchOutcome::live(
+                &crate::profile::ProfileName::from("alice"),
+                history_sample(80.0),
+                None,
+            ),
             &store,
             &status,
             &last_fetched,
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
     };
 
@@ -5012,13 +6684,19 @@ fn a_cold_store_does_not_re_append_the_last_recorded_sample() {
     let (store, status, last_fetched, streaks) = history_stores();
     let apply = |util: f64| {
         apply_outcome(
-            FetchOutcome::live("alice", history_sample(util), None),
+            FetchOutcome::live(
+                &crate::profile::ProfileName::from("alice"),
+                history_sample(util),
+                None,
+            ),
             &store,
             &status,
             &last_fetched,
             &streaks,
             REFRESH_INTERVAL_MS,
             false,
+            false,
+            &Arc::new(RankedMutex::new(HashSet::new())),
         );
     };
 
@@ -5062,7 +6740,8 @@ fn a_cold_store_does_not_re_append_the_last_recorded_sample() {
 /// per call, the disk write between two calls can cross a millisecond and the
 /// stamps drift apart — a 12%-of-runs flake, not a theoretical one.
 fn seed_stale_history(name: &str, now: u64) -> (u64, f64) {
-    let path = crate::profile::profile_history_path(name).expect("history path");
+    let path = crate::profile::profile_history_path(&crate::profile::ProfileName::from(name))
+        .expect("history path");
     std::fs::create_dir_all(path.parent().expect("profile dir")).expect("create profile dir");
     let line = |ts: u64, util: f64| {
         format!(
@@ -5084,7 +6763,7 @@ fn seed_stale_history(name: &str, now: u64) -> (u64, f64) {
 /// makes a log prunable is the file on disk, not whether the profile is
 /// currently pollable.
 fn history_profile(name: &str, disabled: bool) -> crate::profile::Profile {
-    let mut p = crate::testutil::blank_profile(name);
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
     p.disabled = disabled;
     p
 }
@@ -5132,13 +6811,14 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
+        crate::usage::new_auto_start_queue_state(),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(vec![])),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
-        Arc::new(RankedMutex::new(HashSet::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
         // Same pre-armed shutdown as the kick-block seed test: if the
         // `cfg!(test)` spawn-skip ever goes while this hoist stays, the tick
         // thread breaks at its loop top instead of outliving the sandbox.
@@ -5253,7 +6933,7 @@ fn a_401_under_a_live_session_rotates_and_retries() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let _pid = {
-        let sessions = crate::profile::profile_dir(name)
+        let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
             .expect("profile dir")
             .join("sessions");
         std::fs::create_dir_all(&sessions).expect("mkdir sessions");
@@ -5262,18 +6942,19 @@ fn a_401_under_a_live_session_rotates_and_retries() {
         f
     };
     assert!(
-        crate::runtime::has_live_session(name),
+        crate::runtime::has_live_session(&crate::profile::ProfileName::from(name)),
         "fixture must actually read as live, or this proves nothing"
     );
 
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     let entry = super::TokenEntry {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         access_token: "at-old".into(),
         refresh_token: Some("rt-old".into()),
         auto_start: false,
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
+        may_open_window: true,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -5294,7 +6975,7 @@ fn a_401_under_a_live_session_rotates_and_retries() {
     let stored = config
         .lock()
         .expect("config lock")
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-new"), "the pair persisted");
     // The whole point: the account is serving LIVE usage again, not the stale
@@ -5331,7 +7012,7 @@ fn auto_start_kick_rotates_under_a_live_session() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let _pid = {
-        let sessions = crate::profile::profile_dir(name)
+        let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
             .expect("profile dir")
             .join("sessions");
         std::fs::create_dir_all(&sessions).expect("mkdir sessions");
@@ -5339,9 +7020,16 @@ fn auto_start_kick_rotates_under_a_live_session() {
         f.lock().expect("lock pid");
         f
     };
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
 
-    let result = crate::oauth::auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -5378,7 +7066,7 @@ fn a_401_under_a_live_session_does_not_rotate_on_macos() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let _pid = {
-        let sessions = crate::profile::profile_dir(name)
+        let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
             .expect("profile dir")
             .join("sessions");
         std::fs::create_dir_all(&sessions).expect("mkdir sessions");
@@ -5387,18 +7075,19 @@ fn a_401_under_a_live_session_does_not_rotate_on_macos() {
         f
     };
     assert!(
-        crate::runtime::has_live_session(name),
+        crate::runtime::has_live_session(&crate::profile::ProfileName::from(name)),
         "fixture must read live"
     );
 
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     let entry = super::TokenEntry {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         access_token: "at-old".into(),
         refresh_token: Some("rt-old".into()),
         auto_start: false,
         access_expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
         auth_broken: false,
+        may_open_window: true,
     };
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -5415,7 +7104,7 @@ fn a_401_under_a_live_session_does_not_rotate_on_macos() {
     let stored = config
         .lock()
         .expect("config lock")
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(
         stored.as_deref(),
@@ -5444,7 +7133,7 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let _pid = {
-        let sessions = crate::profile::profile_dir(name)
+        let sessions = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
             .expect("profile dir")
             .join("sessions");
         std::fs::create_dir_all(&sessions).expect("mkdir sessions");
@@ -5452,9 +7141,16 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
         f.lock().expect("lock pid");
         f
     };
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
 
-    let result = crate::oauth::auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let result = crate::oauth::auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -5486,12 +7182,12 @@ fn auto_start_kick_does_not_rotate_under_a_live_session_on_macos() {
 /// on clippy `-D warnings` before a test runs.
 #[cfg(not(target_os = "macos"))]
 fn expired_lazy_config(name: &str) -> crate::profile::ConfigHandle {
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     {
         let mut cfg = config.lock().unwrap();
         cfg.state.preemptive_rotation = false;
         let oauth = cfg
-            .find_mut(name)
+            .find_mut(&crate::profile::ProfileName::from(name))
             .and_then(|p| p.credentials.as_mut())
             .and_then(|c| c.claude_ai_oauth.as_mut())
             .expect("the fixture profile carries an OAuth block");
@@ -5502,12 +7198,13 @@ fn expired_lazy_config(name: &str) -> crate::profile::ConfigHandle {
 
 fn rotation_entry(name: &str, access_expires_at: Option<i64>) -> super::TokenEntry {
     super::TokenEntry {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         access_token: "at-old".into(),
         refresh_token: Some("rt-old".into()),
         auto_start: false,
         access_expires_at,
         auth_broken: false,
+        may_open_window: true,
     }
 }
 
@@ -5520,11 +7217,15 @@ fn silence_profile_ttl(name: &str) {
         ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, write_profile_cache,
     };
     write_profile_cache(
-        name,
+        &crate::profile::ProfileName::from(name),
         ACCOUNT_ID_CACHE_FILE,
         &crate::profile::AccountId::from("uuid-anchor"),
     );
-    write_profile_cache(name, PROFILE_FETCHED_CACHE_FILE, &crate::usage::now_ms());
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        PROFILE_FETCHED_CACHE_FILE,
+        &crate::usage::now_ms(),
+    );
 }
 
 /// A disk cache to fall back onto, so a bail's status is the one the leg chose
@@ -5532,7 +7233,7 @@ fn silence_profile_ttl(name: &str) {
 /// there is nothing cached at all.
 fn seed_usage_cache(name: &str) {
     crate::profile_cache::write_profile_cache(
-        name,
+        &crate::profile::ProfileName::from(name),
         crate::profile_cache::USAGE_CACHE_FILE,
         &crate::usage::UsageInfo::default(),
     );
@@ -5698,7 +7399,7 @@ fn a_rate_limited_retry_keeps_the_pair_and_never_enqueues_a_refetch() {
         }
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -5757,7 +7458,7 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
         }
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     seed_usage_cache(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -5786,8 +7487,9 @@ fn a_failed_retry_keeps_the_pair_and_queues_a_refetch() {
 
 /// The rotation lock is unavailable, so the leg may not touch the credentials at
 /// all: it bails to cache without reaching the token endpoint. Forced by putting
-/// a DIRECTORY at `rotation.lock`, which is `EISDIR` when `open_pid_file` opens it
-/// read-write — one of the IO failures `acquire` returns `Err` for in production.
+/// a DIRECTORY at the path `rotation_lock_path` returns, which is `EISDIR` when
+/// `open_pid_file` opens it read-write — one of the IO failures `acquire`
+/// returns `Err` for in production.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
@@ -5807,12 +7509,13 @@ fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
         }
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     seed_usage_cache(name);
-    let lock_path = crate::profile::profile_subpath(name, "rotation.lock").expect("lock path");
+    let lock_path = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name))
+        .expect("lock path");
     std::fs::create_dir_all(&lock_path).expect("block the rotation lock");
     assert!(
-        crate::runtime::RotationGuard::acquire(name).is_err(),
+        crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name)).is_err(),
         "the fixture must actually deny the guard, or this proves nothing"
     );
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
@@ -5831,7 +7534,7 @@ fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
     let stored = config
         .lock()
         .unwrap()
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(
         stored.as_deref(),
@@ -5865,9 +7568,9 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
         }
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     seed_usage_cache(name);
-    crate::testutil::block_credentials_write(name);
+    crate::testutil::block_credentials_write(&crate::profile::ProfileName::from(name));
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
     let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
     let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -5881,8 +7584,11 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
     );
     // Proof the fixture failed the persist where it claims to: the crash-durable
     // sidecar is only cleared after a committed save.
-    let pending =
-        crate::profile::profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let pending = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     assert!(
         pending.is_file(),
         "the staged sidecar must survive, or the save never failed"
@@ -5897,7 +7603,7 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
     let stored = config
         .lock()
         .unwrap()
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(
         stored.as_deref(),
@@ -5944,7 +7650,7 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
         }
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     seed_usage_cache(name);
     silence_profile_ttl(name);
     // Strictly later than the fixture's stored expiry — the adopt's third gate.
@@ -5971,7 +7677,7 @@ fn a_fresher_live_mirror_is_adopted_before_any_refresh_is_spent() {
     let stored = config
         .lock()
         .unwrap()
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(
         stored.as_deref(),
@@ -6012,7 +7718,7 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
         }
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
     seed_usage_cache(name);
     silence_profile_ttl(name);
     let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
@@ -6027,7 +7733,10 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
         "the refresh must actually be attempted and rejected, or the retry never runs: {seen:?}"
     );
     assert!(
-        !config.lock().unwrap().is_auth_broken(name),
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
         "the adopted pair proves the chain is alive — quarantining here needs a manual login"
     );
     assert_eq!(
@@ -6041,8 +7750,1011 @@ fn an_adopt_after_a_rejected_refresh_keeps_the_profile_out_of_quarantine() {
     let stored = config
         .lock()
         .unwrap()
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-mirror-retry"));
     assert_eq!(outcome.status, super::FetchStatus::Cached);
+}
+
+/// CLA-ROLL: a rolling-token profile forces the preemptive leg regardless of the global
+/// toggle, because here the rotation is not only about the chain — its persist
+/// re-stamps the fed session token, and a stale sidecar has a live claude
+/// reading it.
+///
+/// The rolling-token axis ORs over `enabled` and NOTHING else. The last two rows are the
+/// ones that earn their keep: letting `feed` short-circuit the whole predicate
+/// (`feed || expiry_inside_window`) survives every other assertion in this file,
+/// so without them the conjunct is unpinned on exactly the axis this feature
+/// adds.
+#[test]
+fn rolling_token_forces_the_preemptive_leg() {
+    let interval = 90_000u64;
+    let lead = super::rotate_lead_ms(interval);
+    // Toggle OFF + feed ON → rotates inside the lead window anyway.
+    assert!(super::proactive_rotation_due(
+        false,
+        true,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
+    // Both off → inert, the stock pre-stamp behavior.
+    assert!(!super::proactive_rotation_due(
+        false,
+        false,
+        Some(10_000),
+        10_000,
+        interval
+    ));
+    // Feed OFF + toggle ON keeps the pre-stamp contract byte-for-byte.
+    assert!(super::proactive_rotation_due(
+        true,
+        false,
+        Some(10_000 + lead),
+        10_000,
+        interval
+    ));
+    // ── the conjunct, pinned on the rolling-token axis ──
+    // A rolling-token profile BEYOND the lead window still waits its turn.
+    assert!(!super::proactive_rotation_due(
+        false,
+        true,
+        Some(10_000 + lead + 1),
+        10_000,
+        interval
+    ));
+    // A rolling-token profile whose expiry we cannot prove never spends a single-use
+    // refresh — the rule in the doc comment holds on this axis too.
+    assert!(!super::proactive_rotation_due(
+        false, true, None, 10_000, interval
+    ));
+}
+
+fn rolling_profile_config(
+    rolling_names: &[&str],
+    plain_names: &[&str],
+) -> crate::profile::ConfigHandle {
+    let profiles = rolling_names
+        .iter()
+        .map(|n| {
+            let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n));
+            p.rolling_token = true;
+            p
+        })
+        .chain(
+            plain_names
+                .iter()
+                .map(|n| crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n))),
+        )
+        .collect();
+    Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: crate::profile::AppState {
+            profiles: rolling_names
+                .iter()
+                .chain(plain_names.iter())
+                .map(|n| (*n).into())
+                .collect(),
+            ..Default::default()
+        },
+        profiles,
+    }))
+}
+
+/// A rolling (refresh-less) sidecar expiring `exp_in_ms` from now. The chain
+/// grant carries a scope beyond the setup pair, like every real usage chain —
+/// `stamp_rolling_token` refuses anything less by design.
+fn write_rolling_sidecar(name: &str, exp_in_ms: i64) {
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &crate::profile::OAuthToken {
+            access_token: format!("{name}-rolled"),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+            scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp rolling sidecar");
+}
+
+/// A dying fed bearer gets the gate; a second tick inside the scan gap does
+/// not re-run it.
+#[test]
+fn claude_rolling_tick_restamps_a_dying_rolling_sidecar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-feed"], &[]);
+    write_rolling_sidecar("cl-feed", 60 * 60 * 1000); // +1h, inside the 2h horizon
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    super::claude_rolling_tick(&config, &pacing, now, &|name| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(name, "cl-feed");
+        crate::oauth::AuthGate::Ready
+    });
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the scan gap: no re-run even though the sidecar is still dying.
+    super::claude_rolling_tick(&config, &pacing, now + 1_000, &|_| {
+        panic!("inside the scan gap — must not re-run")
+    });
+}
+
+/// Fresh sidecars and non-rolling profiles are never the timer's business.
+#[test]
+fn claude_rolling_tick_ignores_fresh_and_non_rolling_profiles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-fresh"], &["cl-plain"]);
+    write_rolling_sidecar("cl-fresh", 6 * 60 * 60 * 1000); // clear of the horizon
+    write_rolling_sidecar("cl-plain", 60 * 60 * 1000); // dying, but the rolling token is OFF
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
+        panic!("'{name}' must not be re-stamped")
+    });
+}
+
+/// A Ready that leaves the sidecar STILL due (the degrade leg serving a live
+/// mint/bearer through transient chain trouble) paces like a transient — no
+/// per-scan re-run of the gate.
+#[test]
+fn claude_rolling_tick_ready_but_still_due_paces_like_transient() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-degrade"], &[]);
+    write_rolling_sidecar("cl-degrade", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let degrading = |_: &crate::profile::ProfileName| {
+        // Ready without advancing the sidecar — the degrade posture.
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Ready
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &degrading);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate: the still-due Ready must have widened.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + 60_000, &degrading);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a degrade-masked Ready paces like a transient, not per scan"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &degrading,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A transient gate failure widens the per-profile retry past the scan gap.
+#[test]
+fn claude_rolling_tick_transient_failure_widens_the_retry() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-flaky"], &[]);
+    write_rolling_sidecar("cl-flaky", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let flaky = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::Endpoint("connection reset"),
+            crate::format::Retry::Connection,
+        ))
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &flaky);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Re-open the scan gate; the per-profile widening must still hold.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + 60_000, &flaky);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "transient failure widens past the scan cadence"
+    );
+
+    // Past the widening → retried.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &flaky);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A DISABLED profile is off every operational surface by definition, and this
+/// leg can reach a guarded refresh — so sourcing candidates from the raw
+/// profile list instead of `enabled_profiles()` spends single-use refresh
+/// tokens, every 5 minutes, on accounts the operator took out of service.
+#[test]
+fn claude_rolling_tick_skips_a_disabled_profile() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-off"], &[]);
+    // Disable it the way `clauth disable` does.
+    {
+        let mut cfg = config.lock().expect("lock");
+        cfg.find_mut(&crate::profile::ProfileName::from("cl-off"))
+            .expect("profile")
+            .disabled = true;
+    }
+    write_rolling_sidecar("cl-off", 60 * 60 * 1000); // dying, inside the horizon
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|name| {
+        panic!("'{name}' is disabled and must never reach the re-stamp leg")
+    });
+}
+
+/// A standing `auth_broken` takes the Broken leash on EVERY verdict. Without
+/// it, a quarantined chain whose sidecar is running out its clock lands in the
+/// Ready-still-due arm and picks up a second 15-minute cadence on top of the
+/// poll leg's own backoff — bounded, but retrying a roll that
+/// `roll_from_stored_chain` routes to `ChainStale` by flag every time.
+#[test]
+fn claude_rolling_tick_quarantined_chain_takes_the_broken_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-quarantined"], &[]);
+    config
+        .lock()
+        .expect("lock")
+        .state
+        .auth_broken
+        .push("cl-quarantined".into());
+    write_rolling_sidecar("cl-quarantined", 60 * 60 * 1000); // dying
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let degrading = |_: &crate::profile::ProfileName| {
+        // Ready without advancing the sidecar — the degrade posture a dead
+        // chain produces (restore false / bearer still serving).
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Ready
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &degrading);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Where an unflagged profile would retry (past ROLLING_RETRY_MS), the
+    // quarantined one must still be leashed.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &degrading,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a standing quarantine must not re-run the gate on the transient cadence"
+    );
+
+    // The Broken leash is the one that reopens it.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &degrading,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// The OUTER scan gate itself: a second tick inside `ROLLING_SCAN_GAP_MS`
+/// runs no candidate scan at all — without touching `next_scan_ms`, which is
+/// how every other tick test opens the gate and why none of them could see
+/// this one. Deleting the gate ran the full scan every tick, silently.
+#[test]
+fn claude_rolling_tick_scan_gap_holds_a_second_tick_off() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-gap"], &[]);
+    write_rolling_sidecar("cl-gap", 60 * 60 * 1000); // dying, always due
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let counting = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Refreshed // clears any widening
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the gap, gate untouched: the scan must not run. Pinned on the
+    // SCAN STAMP, not only the gate_fn count — the per-profile retry widening
+    // can absorb a deleted gate's extra scans and leave the count intact,
+    // which is exactly how the deletion stayed invisible to every earlier
+    // test in this family.
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_SCAN_GAP_MS - 1,
+        &counting,
+    );
+    assert_eq!(
+        pacing.lock().unwrap().next_scan_ms,
+        now + super::ROLLING_SCAN_GAP_MS,
+        "a tick inside the gap must return before touching the scan stamp"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a tick inside the scan gap runs no candidate scan"
+    );
+
+    // Past the gap it runs again, the gate still untouched. (The per-profile
+    // retry widening is cleared first — a stub gate never advances the
+    // sidecar, and this test pins the OUTER gate, not the widening the
+    // still-due tests already own.)
+    pacing.lock().unwrap().retry_after_ms.clear();
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_SCAN_GAP_MS + 1,
+        &counting,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// Wall-clock stamps get CLAMPED against a backwards NTP step: a scan stamp
+/// or retry leash further out than its own maximum can only mean the clock
+/// moved back under it, and comparing alone would suppress the scan for the
+/// whole step while the sidecar it renews runs its clock down.
+#[test]
+fn claude_rolling_tick_survives_a_backwards_clock_step() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-ntp"], &[]);
+    write_rolling_sidecar("cl-ntp", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    // What a backwards step leaves behind: stamps hours in the "future".
+    pacing.lock().unwrap().next_scan_ms = now + 40 * super::ROLLING_SCAN_GAP_MS;
+    pacing.lock().unwrap().retry_after_ms.insert(
+        "cl-ntp".to_string(),
+        super::RetryHold {
+            not_before: now + 10 * super::ROLLING_BROKEN_RETRY_MS,
+            // The real fingerprint: the fixture's files do not change during
+            // the test, so the CLOCK clamp must be what releases this hold —
+            // a watch that released it early would fail the tick-2 assert.
+            watched: Some(crate::claude::credential_fingerprint(
+                &crate::profile::ProfileName::from("cl-ntp"),
+            )),
+        },
+    );
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let counting = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Refreshed
+    };
+    // Tick 1 clamps the scan stamp back into range (and runs nothing).
+    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Tick 2, one gap later: the scan runs and clamps the retry leash to at
+    // most one Broken leash from NOW — the profile is still leashed here.
+    let t2 = now + super::ROLLING_SCAN_GAP_MS + 1;
+    super::claude_rolling_tick(&config, &pacing, t2, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Tick 3, one clamped leash later: the profile runs. Unclamped, the
+    // ten-leash stamp would have held it for most of a day longer.
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        t2 + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &counting,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a backwards clock step delays the scan by at most its own bounds"
+    );
+}
+
+/// A Broken verdict takes the LONG leash: without it, a profile whose chain
+/// is terminally dead re-runs the whole gate — `RotationGuard` acquisition
+/// included — every scan, forever, for a condition only a re-login changes.
+#[test]
+fn claude_rolling_tick_broken_verdict_takes_the_long_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-dead"], &[]);
+    write_rolling_sidecar("cl-dead", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let broken = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Broken
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &broken);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Where a transient would retry, Broken must still be leashed.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(&config, &pacing, now + super::ROLLING_RETRY_MS + 1, &broken);
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a dead chain is not retried on the transient cadence"
+    );
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_BROKEN_RETRY_MS + 1,
+        &broken,
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// A Transient whose cause only a re-login clears takes the SAME long leash
+/// as Broken: an unrecorded grant paced on the 15-minute cadence re-logs the
+/// identical refusal ~24 times per bearer lifetime with no retry ever able to
+/// succeed. Genuinely transient causes must keep the short cadence — that
+/// asymmetry is the test.
+#[test]
+fn claude_rolling_tick_relogin_transients_take_the_long_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-grant"], &[]);
+    write_rolling_sidecar("cl-grant", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let unrecorded = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::RollingGrantUnrecorded("cl-grant".to_string()),
+            crate::format::Retry::Stated,
+        ))
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // Where an ordinary transient would retry, the re-login refusal is still
+    // leashed…
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &unrecorded,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "an unrecorded grant is not retried on the transient cadence"
+    );
+    // …and an ordinary transient keeps the short cadence on the same code
+    // path, so the long leash demonstrably keys off the CAUSE.
+    let ordinary = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::Endpoint("could not reach anthropic"),
+            crate::format::Retry::Wait,
+        ))
+    };
+    pacing.lock().unwrap().next_scan_ms = 0;
+    pacing.lock().unwrap().retry_after_ms.clear();
+    super::claude_rolling_tick(&config, &pacing, now, &ordinary);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &ordinary,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "a genuinely transient cause keeps the short cadence"
+    );
+}
+
+/// The long leash's exit is the OPERATOR'S FIX, not the clock: a re-login
+/// writes `credentials.json` and stamps nothing scheduler-side, so a hold that
+/// only time releases would sit on the prescribed recovery for up to six
+/// hours. The hold watches the profile's credential files; a change releases
+/// it on the next scan — and unchanged files demonstrably do NOT release it,
+/// or the leash would be no leash at all.
+#[test]
+fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-fix"], &[]);
+    write_rolling_sidecar("cl-fix", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let unrecorded = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::RollingGrantUnrecorded("cl-fix".to_string()),
+            crate::format::Retry::Stated,
+        ))
+    };
+    super::claude_rolling_tick(&config, &pacing, now, &unrecorded);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Inside the leash with NOTHING changed on disk: still held.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &unrecorded,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "unchanged credentials do not release the hold"
+    );
+
+    // The operator does exactly what the cause prescribed: a re-login, which
+    // lands as a `credentials.json` write and nothing else.
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-fix")).expect("dir");
+    std::fs::write(
+        dir.join("credentials.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-fresh-login".to_string(),
+                refresh_token: Some("rt-fresh-login".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write fresh login");
+
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 2,
+        &unrecorded,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the credential write releases the hold on the next scan, hours early"
+    );
+}
+
+/// The due predicate reads a MIS-FILL as due now: the content is the defect
+/// (its clock is irrelevant), switches refuse to install it, and this leg is
+/// the only one a running daemon has that can repair it. Without this, a
+/// mis-filled sidecar beside a healthy preserved mint sat unrepaired forever
+/// on any profile nobody switched to.
+#[test]
+fn claude_rolling_tick_reaches_the_gate_for_a_misfilled_sidecar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-mf"], &[]);
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("cl-mf")).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A rotating pair in the sidecar, expiry comfortably OUTSIDE the re-stamp
+    // horizon: only the content classification can make this due.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    super::claude_rolling_tick(&config, &pacing, crate::usage::now_ms(), &|_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Ready
+    });
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a mis-filled sidecar reaches the gate — the repair leg actually fires"
+    );
+}
+
+/// The backwards-clock clamp reads the hold's KIND off `watched`: a stretched
+/// SHORT hold clamps back to the 15-minute cadence, never to the six-hour
+/// leash — an unwatched six-hour hold would have no exit but the clock, the
+/// exact stall the watch exists to remove, handed to a profile that never
+/// earned the long leash.
+#[test]
+fn claude_rolling_tick_clamps_a_short_hold_to_its_own_leash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-clk"], &[]);
+    write_rolling_sidecar("cl-clk", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    // What a backwards step leaves behind on a SHORT (unwatched) hold.
+    pacing.lock().unwrap().retry_after_ms.insert(
+        "cl-clk".to_string(),
+        super::RetryHold {
+            not_before: now + 10 * super::ROLLING_BROKEN_RETRY_MS,
+            watched: None,
+        },
+    );
+
+    let calls = std::sync::atomic::AtomicUsize::new(0);
+    let counting = |_: &crate::profile::ProfileName| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        crate::oauth::AuthGate::Refreshed
+    };
+    // Tick 1: the clamp pulls the stamp back to the SHORT cadence; still held.
+    super::claude_rolling_tick(&config, &pacing, now, &counting);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // Tick 2, one short cadence later: the profile runs. Clamped to the long
+    // leash instead, this unwatched hold would sit for six hours with no
+    // credential-change exit.
+    pacing.lock().unwrap().next_scan_ms = 0;
+    super::claude_rolling_tick(
+        &config,
+        &pacing,
+        now + super::ROLLING_RETRY_MS + 1,
+        &counting,
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "a short hold clamps to its own leash, not the long one"
+    );
+}
+
+/// Names that leave the candidate set — profile deleted, disabled, or the
+/// flag turned off — take their retry stamps with them. Without the sweep the
+/// map grows monotonically over the daemon's lifetime, and a re-created
+/// profile of the same name inherits a stale leash it never earned.
+#[test]
+fn claude_rolling_tick_drops_retry_state_for_departed_profiles() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = rolling_profile_config(&["cl-alive"], &[]);
+    write_rolling_sidecar("cl-alive", 60 * 60 * 1000);
+    let pacing = crate::lockorder::RankedMutex::new(super::ClaudeRollingPacing::default());
+    let now = crate::usage::now_ms();
+    pacing.lock().unwrap().retry_after_ms.insert(
+        "cl-deleted".to_string(),
+        super::RetryHold {
+            not_before: now + super::ROLLING_BROKEN_RETRY_MS,
+            watched: None,
+        },
+    );
+    super::claude_rolling_tick(&config, &pacing, now, &|_| crate::oauth::AuthGate::Ready);
+    let p = pacing.lock().unwrap();
+    assert!(
+        !p.retry_after_ms.contains_key("cl-deleted"),
+        "a departed profile's stamp is swept on the next scan"
+    );
+}
+
+/// `elect_auto_start_queue`: the tick-level half of the interleaved auto-start queue
+/// (`usage::auto_start_queue`). Its whole job is to narrow the permissive `may_open_window`
+/// that `collect_tokens` sets down to at most ONE member per tick — the
+/// serialisation that stops `fetch_oauth_due_with`'s per-profile workers from
+/// each opening a window in the same tick.
+///
+/// Also pins the two sizing rules the gap depends on: queue size comes from the
+/// SNAPSHOT (every participating member) rather than from the due list (only
+/// this tick's cadence slots), and a member that cannot kick at all is excluded
+/// so the queue does not reserve a slot for a corpse.
+#[test]
+fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
+    use crate::profile::{AppConfig, AppState};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let now = crate::usage::now_epoch_secs();
+    let warming = |name: &str| {
+        let mut e = token(name);
+        e.auto_start = true;
+        e
+    };
+    // Queue MEMBERSHIP comes from the config (`usage::auto_start_queue::auto_start_queue_members`, the
+    // rule the `status.json` feed and the TUI's chips read too); the snapshot
+    // below is the work-list the election narrows.
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            // Opt in: the queue is default-off, and this test is the queue.
+            auto_start_queue: true,
+            ..Default::default()
+        },
+        profiles: vec![opted_in("a"), opted_in("b"), opted_in("c")],
+    }));
+
+    // All three have fetched, all three have lapsed windows: every one wants a
+    // kick, so only the queue can be what holds two of them back.
+    let lapsed = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now - 60)),
+        }),
+        ..Default::default()
+    };
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), lapsed.clone()),
+        ("b".to_string(), lapsed.clone()),
+        ("c".to_string(), lapsed.clone()),
+    ])));
+
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store,
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+    };
+
+    let snapshot = vec![warming("a"), warming("b"), warming("c")];
+
+    // Cold queue, nothing persisted: the chain head opens, the other two hold.
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    let elected: Vec<&str> = due
+        .iter()
+        .filter(|e| e.may_open_window)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        elected,
+        vec!["a"],
+        "exactly one member opens per tick, and it is the chain head"
+    );
+
+    // Inside the gap (a member opened a moment ago): NOBODY opens this tick.
+    // This is the spacing itself — without it all three reopen together and the
+    // whole feature is a no-op.
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - 60);
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| !e.may_open_window),
+        "inside the gap no member may open a window"
+    );
+
+    // One gap later the queue is due again. N=3 → 5h/3 less the tick tolerance.
+    let gap = crate::usage::queue_gap_secs(3, REFRESH_INTERVAL_MS);
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - gap);
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert_eq!(
+        due.iter().filter(|e| e.may_open_window).count(),
+        1,
+        "once the gap has passed exactly one member opens again"
+    );
+
+    // Queue size is read off the whole QUEUE, not the due list: with only one
+    // member due this tick the gap must still be 5h/3, not 5h/1. Anchored just
+    // PAST the 3-member gap and asserted in the ELECT direction: the
+    // right-sized gap elects `c`, while a gap wrongly sized off the 1-member
+    // due list (5h less tolerance) would still hold. The hold direction could
+    // not catch that mutant — `due` is a subset of the queue, so its gap is
+    // always the larger one.
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - gap - 60);
+    let mut only_c = vec![warming("c")];
+    super::elect_auto_start_queue(&state, &mut only_c, REFRESH_INTERVAL_MS, now);
+    assert!(
+        only_c[0].may_open_window,
+        "the gap is sized from the whole queue, so just past 5h/3 the lone due member opens"
+    );
+
+    // A member that cannot kick is not a queue member: quarantining the head
+    // shrinks N to 2, which widens the gap, and hands the slot to `b`. The
+    // quarantined profile itself is left UNSTAMPED — outside the queue the
+    // election neither gates nor grants, so it keeps the permissive flag
+    // `collect_tokens` set and keeps retrying on its own `kick_retry_due`
+    // ladder. Stamping it false would deny it the lapsed leg on every tick,
+    // permanently: only a landed kick clears a block.
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.set_auth_broken(&"a".into(), true);
+    }
+    state.auto_start_queue.lock().unwrap().last_open_at = None;
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    let may_open: Vec<&str> = due
+        .iter()
+        .filter(|e| e.may_open_window)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert_eq!(
+        may_open,
+        vec!["a", "b"],
+        "`b` is elected; auth-broken `a` holds no slot but keeps its \
+         permissive out-of-queue flag"
+    );
+    assert!(
+        !due.iter().any(|e| e.name == "c" && e.may_open_window),
+        "the unelected MEMBER is the one the election holds"
+    );
+
+    // Back to a whole 3-member queue for the two history-derived legs.
+    if let Ok(mut cfg) = state.config.lock() {
+        cfg.set_auth_broken(&"a".into(), false);
+    }
+    // An open NOBODY here fired: `c`'s window was opened out of band ten
+    // minutes ago (a real Claude Code session on that account), and the only
+    // record of it is the history series the poller writes. Seeded through the
+    // real writer so the bridge lines are present.
+    let reading = |reset: i64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(reset)),
+        }),
+        ..Default::default()
+    };
+    let out_of_band = now - 600;
+    let boundary = out_of_band + 5 * 3600;
+    let mut prev: Option<UsageInfo> = None;
+    for (ts, reset) in [
+        (now - 180, boundary),
+        (now - 90, boundary - 1),
+        (now, boundary),
+    ] {
+        let next = reading(reset);
+        crate::profile::append_usage_sample_at(&"c".into(), prev.as_ref(), &next, ts as u64 * 1000);
+        prev = Some(next);
+    }
+
+    // Nothing lapsed: every window is live, so no member wants one opened. The
+    // election answers without touching the anchor — an empty anchor stays
+    // empty even though the series above would have filled it. That skip is
+    // what keeps the replay off the majority of ticks (all windows live is the
+    // long middle of every cycle) while leaving the gate's answer identical:
+    // an election no one can win stamps every member shut regardless.
+    let live = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(epoch_secs_to_iso(now + 3600)),
+        }),
+        ..Default::default()
+    };
+    if let Ok(mut m) = state.store.lock() {
+        for name in ["a", "b", "c"] {
+            m.insert(name.to_string(), live.clone());
+        }
+    }
+    state.auto_start_queue.lock().unwrap().last_open_at = None;
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| !e.may_open_window),
+        "with nothing lapsed no member is elected"
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&state.auto_start_queue),
+        None,
+        "and the anchor is never derived on a tick that could not elect anyone"
+    );
+
+    // Now they lapse, with our own anchor a full gap stale — the pre-fix state
+    // that let the next member kick seconds after `c`'s out-of-band open and
+    // re-collapse the two windows. The series is the only thing that knows.
+    if let Ok(mut m) = state.store.lock() {
+        for name in ["a", "b", "c"] {
+            m.insert(name.to_string(), lapsed.clone());
+        }
+    }
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now - gap - 60);
+    let mut due = snapshot.clone();
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| !e.may_open_window),
+        "an out-of-band open gates the queue exactly as one of our own kicks does"
+    );
+    assert_eq!(
+        crate::usage::queue_anchor_cached(&state.auto_start_queue),
+        Some(out_of_band),
+        "and it becomes the anchor the next gap is measured from"
+    );
+}
+
+/// The toggle is a real off switch: with `auto_start_queue` false every entry
+/// keeps the permissive `may_open_window` `collect_tokens` set, which is exactly the
+/// pre-queue behaviour (every lapsed window reopens on its own tick).
+#[test]
+fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
+    use crate::profile::{AppConfig, AppState};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let now = crate::usage::now_epoch_secs();
+    // Both accounts opted in and eligible: with the toggle ON they would be a
+    // real 2-member queue, so an empty `may_open_window` set below could only come
+    // from the toggle itself.
+    let opted_in = |name: &str| {
+        let mut p = oauth_profile_disabled(name, false);
+        p.auto_start = true;
+        p
+    };
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            auto_start_queue: false,
+            ..Default::default()
+        },
+        profiles: vec![opted_in("a"), opted_in("b")],
+    }));
+    let state = super::SchedulerState {
+        config,
+        tokens: Arc::new(RankedMutex::new(vec![])),
+        store: Arc::new(RankedMutex::new(HashMap::new())),
+        status: Arc::new(RankedMutex::new(HashMap::new())),
+        refresh_interval: Arc::new(AtomicU64::new(REFRESH_INTERVAL_MS)),
+        next_refresh_per_profile: Arc::new(RankedMutex::new(HashMap::new())),
+        activity: Arc::new(RankedMutex::new(HashMap::new())),
+        last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
+        poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+        weekly_reset_kicks: Arc::new(RankedMutex::new(HashSet::new())),
+        auto_start_queue: crate::usage::new_auto_start_queue_state(),
+        pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
+        pending_switch_off: Arc::new(RankedMutex::new(false)),
+        refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
+        third_party_tokens: Arc::new(RankedMutex::new(vec![])),
+        third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        suppressed_generic: Arc::new(RankedMutex::new(HashMap::new())),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
+        standdown_active: AtomicBool::new(false),
+        last_history_prune: AtomicU64::new(crate::usage::now_ms()),
+        claude_rolling: crate::lockorder::RankedMutex::new(ClaudeRollingPacing::default()),
+        fetcher: crate::providers::fetch_third_party_usage,
+    };
+
+    let mut a = token("a");
+    a.auto_start = true;
+    let mut b = token("b");
+    b.auto_start = true;
+    let mut due = vec![a, b];
+    // Anchor pinned to now: with the queue ON this would hold everyone.
+    state.auto_start_queue.lock().unwrap().last_open_at = Some(now);
+    super::elect_auto_start_queue(&state, &mut due, REFRESH_INTERVAL_MS, now);
+    assert!(
+        due.iter().all(|e| e.may_open_window),
+        "with the toggle off the queue never narrows anything"
+    );
 }

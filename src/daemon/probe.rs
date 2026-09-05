@@ -32,8 +32,8 @@ use crate::profile::clauth_dir;
 
 /// How stale `status.json` may be before the `● daemon` dot flips green→amber.
 /// The daemon stamps it every ~1s loop tick, but a single tick can legitimately
-/// block up to the keychain shell-out's 20s kill deadline, so the window rides
-/// just above that. It also lands at the daemon's tightened
+/// block up to the keychain shell-outs' 20s total kill deadline (a
+/// read-modify-write at 10s each), so the window rides just above that. It also lands at the daemon's tightened
 /// [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE), so amber reads as "wedging,
 /// about to be aborted + restarted" rather than a transient slow tick.
 const DAEMON_STALE_MS: u64 = 30_000;
@@ -235,6 +235,25 @@ pub(crate) fn claim_singleton_with(
     Ok(claim)
 }
 
+/// Test-only: claim attempts each directory has seen, keyed by directory because
+/// tests run in parallel over distinct sandboxes. Lets a test pin "the retry leg
+/// did not run" by counting attempts instead of by a wall-clock bound.
+#[cfg(test)]
+static CLAIM_ATTEMPTS_BY_DIR: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Claim attempts `dir` has seen so far (test builds only).
+#[cfg(test)]
+fn claim_attempts(dir: &Path) -> u64 {
+    CLAIM_ATTEMPTS_BY_DIR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// One claim attempt. `standby` false (`--no-standby`) turns a lost race straight
 /// into [`Claim::Redundant`] without so much as creating the slot file.
 ///
@@ -243,6 +262,14 @@ pub(crate) fn claim_singleton_with(
 /// instance would otherwise announce a daemon that isn't there and exit 0. A
 /// hard failure exits non-zero, which a supervisor retries and an operator sees.
 fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
+    #[cfg(test)]
+    {
+        *CLAIM_ATTEMPTS_BY_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(dir.to_path_buf())
+            .or_insert(0) += 1;
+    }
     let active = crate::profile::open_state_file(&dir.join(super::LOCK_FILE))
         .context("failed to open the clauth daemon lock file")?;
     match active.try_lock() {
@@ -376,8 +403,8 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 /// Send SIGTERM (`hard` false) or SIGKILL (`hard` true) to `pid`, returning
 /// whether the signal command actually ran (`false` = it could not even be
 /// spawned, e.g. `kill` off PATH — which the caller distinguishes from "signalled
-/// but the process survived"). Shelling out keeps `unsafe_code = "forbid"` intact
-/// (`libc::kill` would need `unsafe`, and `signal_hook` only *receives*), matching
+/// but the process survived"). Shelling out spends no `unsafe` here
+/// (`libc::kill` would need it, and `signal_hook` only *receives*), matching
 /// the `/usr/bin/security` shell-out pattern already in the crate. A non-zero exit
 /// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
 /// way. Long-form flags so the call site documents itself.

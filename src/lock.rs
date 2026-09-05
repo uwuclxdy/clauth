@@ -30,18 +30,62 @@ use anyhow::{Context, Result};
 use crate::logline::logline;
 use crate::profile::clauth_dir;
 
-const LOCK_FILENAME: &str = ".lock";
+pub(crate) const LOCK_FILENAME: &str = ".lock";
 
 /// Deadline for taking the cross-process state flock before giving up with a
 /// [`StateLockTimeout`]. Sized to sit between two hard bounds: the macOS switch
-/// path holds this flock across the `/usr/bin/security` shell-out (up to its 20 s
-/// kill deadline, `keychain.rs`), so a shorter deadline would false-timeout a
-/// waiter during a legit slow switch; the daemon's 30 s `WATCHDOG_DEADLINE` caps
-/// it from above, so a main-loop drain waiting on the flock returns before the
-/// watchdog false-aborts.
-/// On Linux the flock is only ever held across sub-millisecond disk writes, so
-/// only a genuine wedge ever reaches this deadline.
+/// path holds this flock across the `/usr/bin/security` shell-outs (`keychain.rs`),
+/// so a shorter deadline would false-timeout a waiter during a legit slow switch;
+/// the daemon's 30 s `WATCHDOG_DEADLINE` caps it from above, so a main-loop drain
+/// waiting on the flock returns before the watchdog false-aborts. What keeps the
+/// first bound from moving is [`SUBPROCESS_BUDGET`], which caps the shell-outs of
+/// one hold in aggregate rather than one at a time. On Linux the flock is only
+/// ever held across sub-millisecond disk writes, so only a genuine wedge ever
+/// reaches this deadline.
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The flock deadline [`StateLock::acquire`] waits out: [`STATE_LOCK_TIMEOUT`],
+/// or a shorter value a test poses a wedge under. The one source of the deadline
+/// so a test can shrink the whole wait — the pre-teardown sync legs included —
+/// without sleeping 25 s per acquisition. Production never sets the override, so
+/// the deadline is [`STATE_LOCK_TIMEOUT`] everywhere outside `cfg(test)`.
+pub(crate) fn state_lock_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(t) = STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.get()) {
+        return t;
+    }
+    STATE_LOCK_TIMEOUT
+}
+
+/// Wall-clock ceiling on everything ONE state-lock hold may spend in
+/// subprocesses, shared across every call it makes rather than granted per call.
+///
+/// Only macOS shells out under this lock (`keychain.rs` → `/usr/bin/security`),
+/// and a per-call deadline cannot bound a hold: `switch_profile` adopting a first
+/// login runs the Keychain mirror TWICE in one acquisition (its
+/// `adopt_first_login` relinks the outgoing profile, then the switch relinks the
+/// incoming one), each a read plus a write. At a 10 s per-call deadline that hold
+/// reached 40 s against the 25 s [`STATE_LOCK_TIMEOUT`] a peer waits out, so a
+/// legitimate switch false-timed-out the peer — the outcome that constant exists
+/// to prevent. Bounding the shell-outs is what the daemon's own comment prescribed
+/// over loosening the deadlines above it.
+///
+/// 20 s leaves 5 s of [`STATE_LOCK_TIMEOUT`] for the disk work around the
+/// shell-outs, which is sub-millisecond. What a shared budget costs, and it is
+/// real: the LAST call under a hold gets only what earlier calls left, so a switch
+/// whose first mirror burned the budget on a stuck keychain fails loudly where it
+/// used to get a fresh deadline and might have finished. That trade is deliberate.
+/// A stuck keychain means an unanswered one-time ACL dialog or a locked keychain,
+/// both of which fail the switch anyway; the write path is idempotent, so the
+/// operator answers the dialog and retries.
+///
+/// It bounds ONE hold, not one tick: the daemon drains `pending_switch` and
+/// `pending_switch_off` under two SEPARATE acquisitions, so a tick doing both can
+/// still spend 2 × this against `WATCHDOG_DEADLINE`.
+/// Arming a second budget for a wider scope needs an arm-if-not-armed rule that
+/// [`StateLock::acquire_with_timeout`] does not have today, since it is the only
+/// armer.
+const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
 
 /// How often [`StateLock::acquire`] re-polls the flock while waiting. Small enough
 /// that a freed lock is taken promptly, large enough that the busy-wait costs
@@ -57,6 +101,18 @@ const LOCK_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[derive(Debug)]
 pub(crate) struct StateLockTimeout {
     waited: Duration,
+}
+
+impl StateLockTimeout {
+    /// A pre-built timeout for tests that pin how OTHER modules render this
+    /// error (contention, never a permissions fault) without staging a real
+    /// cross-process flock wait.
+    #[cfg(test)]
+    pub(crate) fn stub() -> Self {
+        Self {
+            waited: STATE_LOCK_TIMEOUT,
+        }
+    }
 }
 
 impl std::fmt::Display for StateLockTimeout {
@@ -82,6 +138,37 @@ thread_local! {
     static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
+// When this thread's [`SUBPROCESS_BUDGET`] runs out, or None when the thread
+// holds no state lock. Set by the OUTERMOST acquisition only, so a reentrant
+// hold keeps spending the budget it entered rather than resetting it — which is
+// the whole point, since the two mirrors of an adopting switch reach the
+// keychain through nested `with_state_lock` frames.
+thread_local! {
+    static HOLD_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+/// `base`, clamped to what is left of this thread's [`SUBPROCESS_BUDGET`].
+/// Returns `base` untouched when the thread holds no state lock, which is the
+/// right answer rather than a fallback: a caller outside the lock (`oauth.rs`
+/// mirrors a rotation after its lock closure ends) blocks no peer, so nothing is
+/// waiting on it to finish. An exhausted budget clamps to zero, which the
+/// subprocess layer refuses outright rather than spawning: nothing completes in
+/// zero time, and the write path hands its payload to the child before the
+/// deadline is ever checked.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "only the macOS Keychain shells out under this lock; the budget is pinned on every platform"
+    )
+)]
+pub(crate) fn clamp_to_hold_budget(base: Duration) -> Duration {
+    match HOLD_DEADLINE.get() {
+        Some(deadline) => base.min(deadline.saturating_duration_since(Instant::now())),
+        None => base,
+    }
+}
+
 // Test-only per-thread counter: increments once per OUTERMOST acquisition, i.e.
 // once per real flock wait. What it makes falsifiable is that a batching caller
 // takes the flock once for N items rather than N times — the difference between
@@ -91,6 +178,32 @@ thread_local! {
 thread_local! {
     pub(crate) static OUTERMOST_ACQUISITIONS: Cell<u64> = const { Cell::new(0) };
 }
+
+// Test seam shortening `state_lock_timeout` so a wedge can be posed without a
+// real 25 s wait. `None` is the production deadline. Thread-local, so a test
+// that shortens it only ever affects the thread it drops the runtime on.
+#[cfg(test)]
+thread_local! {
+    static STATE_LOCK_TIMEOUT_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// Set or clear the test-only deadline override. `None` restores
+/// [`STATE_LOCK_TIMEOUT`].
+#[cfg(test)]
+pub(crate) fn set_state_lock_timeout_override(timeout: Option<Duration>) {
+    STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.set(timeout));
+}
+
+/// Zero-sized proof that the current thread holds the cross-process state
+/// flock. Only [`with_state_lock`] mints it, handing one to its closure, so a
+/// writer of shared state ([`crate::profile::AppState::set_active`],
+/// [`crate::profile::Profile::set_credentials`]) can require it in its
+/// signature instead of leaving the hold to a comment.
+///
+/// Deliberately not `Copy` or `Clone`: a copied witness would outlive the
+/// hold it proves, keeping the compile-time contract bypassable.
+#[derive(Debug)]
+pub(crate) struct StateLockHeld(());
 
 #[must_use]
 pub(crate) struct StateLock {
@@ -107,7 +220,7 @@ impl StateLock {
     /// Acquire the state lock, bounding the cross-process flock wait by
     /// [`STATE_LOCK_TIMEOUT`]. A timeout surfaces as a [`StateLockTimeout`].
     pub(crate) fn acquire() -> Result<Self> {
-        Self::acquire_with_timeout(STATE_LOCK_TIMEOUT)
+        Self::acquire_with_timeout(state_lock_timeout())
     }
 
     /// [`acquire`](Self::acquire) with an explicit flock deadline. Split out so
@@ -165,6 +278,11 @@ impl StateLock {
         // already be held — STATE sits inside it; `RankGuard::enter` asserts it.
         let rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::State>();
 
+        // Arm the shared subprocess budget for this hold. After the rank guard,
+        // which panics on a rank violation: an arm before it would outlive the
+        // unwind with no `StateLock` left to disarm it.
+        HOLD_DEADLINE.set(Some(Instant::now() + SUBPROCESS_BUDGET));
+
         Ok(Self {
             _thread_guard: Some(guard),
             _rank: Some(rank),
@@ -176,7 +294,7 @@ impl StateLock {
 /// [`LOCK_POLL_INTERVAL`] until it is free or `timeout` elapses. A `WouldBlock`
 /// past the deadline returns [`StateLockTimeout`] (logged once so a wedge is
 /// diagnosable); a real IO error propagates as-is.
-fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<()> {
+pub(crate) fn lock_file_with_timeout(file: &File, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
         match file.try_lock() {
@@ -204,22 +322,26 @@ impl Drop for StateLock {
         DEPTH.set(new_depth);
 
         if new_depth == 0 {
-            // Outermost unwind. Close the flock file so other processes can
-            // acquire it, then release the thread mutex so other threads of
-            // this process can enter. Both happen when _thread_guard drops.
+            // Outermost unwind. Clearing the File from the guard closes the fd (releasing the flock for other processes); the thread mutex releases when _thread_guard drops at the end of this fn.
             if let Some(ref mut g) = self._thread_guard {
                 **g = None; // close the File → flock released
             }
+            // Nobody waits on this thread once the flock is free, so the next
+            // hold starts on a full budget. Cleared on a panic unwind too, since
+            // Drop runs there — a poisoned lock must not leave a spent budget
+            // behind to strangle the recovery path.
+            HOLD_DEADLINE.set(None);
         }
         // Reentrant calls have _thread_guard = None; nothing extra to do.
     }
 }
 
-/// Run `f` while holding the cross-process state lock. Re-entrant within the
-/// same thread; serializes concurrent calls from different threads.
-pub(crate) fn with_state_lock<T>(f: impl FnOnce() -> Result<T>) -> Result<T> {
+/// Run `f` while holding the cross-process state lock, handing it the
+/// [`StateLockHeld`] witness. Re-entrant within the same thread; serializes
+/// concurrent calls from different threads.
+pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateLockHeld) -> Result<T>) -> Result<T> {
     let _guard = StateLock::acquire()?;
-    f()
+    f(&StateLockHeld(()))
 }
 
 #[cfg(test)]

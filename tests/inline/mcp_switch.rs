@@ -94,6 +94,7 @@ fn seed_diverged(
     };
     config.state.active_profile = Some(active.into());
     config.state.profiles = vec![active.into(), target.into()];
+    crate::profile::save_app_state(&config.state).expect("persist state");
     config
 }
 
@@ -109,7 +110,12 @@ fn divergence_without_default_errors() {
         Some(creds("target-a", "target-r")),
     ));
 
-    let err = switch_profile_noninteractive(&config, "target", None, no_network);
+    let err = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        no_network,
+    );
     assert!(
         err.is_err(),
         "diverged active with no default must error, never prompt"
@@ -130,7 +136,7 @@ fn divergence_new_profile_default_errors() {
 
     let err = switch_profile_noninteractive(
         &config,
-        "target",
+        &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::NewProfile),
         no_network,
     );
@@ -154,7 +160,7 @@ fn divergence_overwrite_captures_relogin_into_outgoing() {
 
     let (previous, active) = switch_profile_noninteractive(
         &config,
-        "target",
+        &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Overwrite),
         no_network,
     )
@@ -163,9 +169,12 @@ fn divergence_overwrite_captures_relogin_into_outgoing() {
     assert_eq!(active, "target");
 
     // Overwrite = force-snapshot the live re-login into the OUTGOING profile.
-    let on_disk: ClaudeCredentials =
-        read_json_file(&profile_dir("active").unwrap().join("credentials.json"))
-            .expect("read outgoing creds");
+    let on_disk: ClaudeCredentials = read_json_file(
+        &profile_dir(&crate::profile::ProfileName::from("active"))
+            .unwrap()
+            .join("credentials.json"),
+    )
+    .expect("read outgoing creds");
     assert_eq!(
         on_disk.refresh_token(),
         Some("relogin-r"),
@@ -205,14 +214,14 @@ fn divergence_over_a_shell_switches_without_capturing() {
     // Positive control: the shell must be on the Diverged path the exemption
     // bypasses — otherwise this test would pass without exercising it.
     assert_eq!(
-        classify_credentials_link("active").unwrap(),
+        classify_credentials_link(&crate::profile::ProfileName::from("active")).unwrap(),
         LinkState::Diverged,
         "a blank-token shell still classifies Diverged",
     );
 
     let (previous, active) = switch_profile_noninteractive(
         &config,
-        "target",
+        &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Overwrite),
         no_network,
     )
@@ -221,9 +230,12 @@ fn divergence_over_a_shell_switches_without_capturing() {
     assert_eq!(active, "target");
 
     // The shell's blanks were never captured over the outgoing store.
-    let outgoing: ClaudeCredentials =
-        read_json_file(&profile_dir("active").unwrap().join("credentials.json"))
-            .expect("read outgoing creds");
+    let outgoing: ClaudeCredentials = read_json_file(
+        &profile_dir(&crate::profile::ProfileName::from("active"))
+            .unwrap()
+            .join("credentials.json"),
+    )
+    .expect("read outgoing creds");
     assert_eq!(
         outgoing.refresh_token(),
         Some("stored-r"),
@@ -258,7 +270,7 @@ fn divergence_discard_drops_relogin_and_relinks_target() {
 
     let (previous, active) = switch_profile_noninteractive(
         &config,
-        "target",
+        &crate::profile::ProfileName::from("target"),
         Some(DivergenceChoice::Discard),
         no_network,
     )
@@ -282,9 +294,12 @@ fn divergence_discard_drops_relogin_and_relinks_target() {
 
     // The OUTGOING profile's stored chain is untouched — the foreign login was
     // never captured into it.
-    let outgoing: ClaudeCredentials =
-        read_json_file(&profile_dir("active").unwrap().join("credentials.json"))
-            .expect("read outgoing creds");
+    let outgoing: ClaudeCredentials = read_json_file(
+        &profile_dir(&crate::profile::ProfileName::from("active"))
+            .unwrap()
+            .join("credentials.json"),
+    )
+    .expect("read outgoing creds");
     assert_eq!(
         outgoing.refresh_token(),
         Some("stored-r"),
@@ -310,7 +325,7 @@ fn divergence_discard_to_a_ghost_target_bails_before_side_effects() {
 
     let err = switch_profile_noninteractive(
         &config,
-        "ghost",
+        &crate::profile::ProfileName::from("ghost"),
         Some(DivergenceChoice::Discard),
         no_network,
     )
@@ -331,7 +346,7 @@ fn divergence_discard_to_a_ghost_target_bails_before_side_effects() {
         "the ghost bail must not touch the uncaptured live login",
     );
     assert!(matches!(
-        classify_credentials_link("active").expect("classify"),
+        classify_credentials_link(&crate::profile::ProfileName::from("active")).expect("classify"),
         LinkState::Diverged
     ));
     assert_eq!(
@@ -359,7 +374,7 @@ fn divergence_overwrite_to_a_ghost_target_bails_before_capture() {
 
     let err = switch_profile_noninteractive(
         &config,
-        "ghost",
+        &crate::profile::ProfileName::from("ghost"),
         Some(DivergenceChoice::Overwrite),
         no_network,
     )
@@ -370,9 +385,12 @@ fn divergence_overwrite_to_a_ghost_target_bails_before_capture() {
     );
 
     // Bail fires before the snapshot: outgoing's stored chain is untouched.
-    let outgoing: ClaudeCredentials =
-        read_json_file(&profile_dir("active").unwrap().join("credentials.json"))
-            .expect("read outgoing creds");
+    let outgoing: ClaudeCredentials = read_json_file(
+        &profile_dir(&crate::profile::ProfileName::from("active"))
+            .unwrap()
+            .join("credentials.json"),
+    )
+    .expect("read outgoing creds");
     assert_eq!(
         outgoing.refresh_token(),
         Some("stored-r"),
@@ -397,25 +415,33 @@ fn non_diverged_switch_takes_plain_path() {
     let target_profile = stored_profile("target", Some(creds("target-a", "target-r")));
 
     // Link the live path to the active profile so it classifies as LinkedTo.
-    crate::claude::force_link_profile_credentials("active").expect("link active");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
-    let config = handle(AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("active".into()),
             profiles: vec!["active".into(), "target".into()],
             ..Default::default()
         },
         profiles: vec![active_profile, target_profile],
-    });
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let config = handle(config);
 
     assert_eq!(
-        classify_credentials_link("active").expect("classify"),
+        classify_credentials_link(&crate::profile::ProfileName::from("active")).expect("classify"),
         LinkState::LinkedTo,
         "precondition: active is cleanly linked, not diverged",
     );
 
-    let (previous, active) =
-        switch_profile_noninteractive(&config, "target", None, no_network).expect("plain switch");
+    let (previous, active) = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        no_network,
+    )
+    .expect("plain switch");
     assert_eq!(previous.as_deref(), Some("active"));
     assert_eq!(active, "target");
 }
@@ -430,7 +456,8 @@ fn non_diverged_switch_refuses_a_disabled_target() {
     let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
     let mut target_profile = stored_profile("target", Some(creds("target-a", "target-r")));
     target_profile.disabled = true;
-    crate::claude::force_link_profile_credentials("active").expect("link active");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
     let config = handle(AppConfig {
         state: AppState {
@@ -441,14 +468,22 @@ fn non_diverged_switch_refuses_a_disabled_target() {
         profiles: vec![active_profile, target_profile],
     });
 
-    let err = switch_profile_noninteractive(&config, "target", None, no_network)
-        .expect_err("a disabled target must be refused");
+    let err = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        no_network,
+    )
+    .expect_err("a disabled target must be refused");
     assert_eq!(
         err.to_string(),
         "'target': account is disabled, run `clauth enable target`"
     );
     assert!(
-        config.lock().unwrap().is_active("active"),
+        config
+            .lock()
+            .unwrap()
+            .is_active(&crate::profile::ProfileName::from("active")),
         "a refused switch must leave the active profile unchanged"
     );
 }
@@ -486,7 +521,8 @@ fn non_diverged_switch_refuses_a_disabled_expired_target_before_any_refresh() {
     let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
     let mut target_profile = stored_profile("target", Some(creds_expired("dead-a", "dead-r")));
     target_profile.disabled = true;
-    crate::claude::force_link_profile_credentials("active").expect("link active");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
     let config = handle(AppConfig {
         state: AppState {
@@ -498,8 +534,13 @@ fn non_diverged_switch_refuses_a_disabled_expired_target_before_any_refresh() {
     });
     let called = std::sync::atomic::AtomicBool::new(false);
 
-    let err = switch_profile_noninteractive(&config, "target", None, spy_refresher(&called))
-        .expect_err("a disabled target must be refused");
+    let err = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        spy_refresher(&called),
+    )
+    .expect_err("a disabled target must be refused");
     assert_eq!(
         err.to_string(),
         "'target': account is disabled, run `clauth enable target`"
@@ -509,7 +550,10 @@ fn non_diverged_switch_refuses_a_disabled_expired_target_before_any_refresh() {
         "the refresher must never run for a disabled target"
     );
     assert!(
-        config.lock().unwrap().is_active("active"),
+        config
+            .lock()
+            .unwrap()
+            .is_active(&crate::profile::ProfileName::from("active")),
         "a refused switch must leave the active profile unchanged"
     );
 }
@@ -522,7 +566,8 @@ fn non_diverged_switch_refreshes_a_non_disabled_expired_target() {
     let _home = HomeSandbox::new();
     let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
     let target_profile = stored_profile("target", Some(creds_expired("live-a", "live-r")));
-    crate::claude::force_link_profile_credentials("active").expect("link active");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
     let config = handle(AppConfig {
         state: AppState {
@@ -534,7 +579,12 @@ fn non_diverged_switch_refreshes_a_non_disabled_expired_target() {
     });
     let called = std::sync::atomic::AtomicBool::new(false);
 
-    let _ = switch_profile_noninteractive(&config, "target", None, spy_refresher(&called));
+    let _ = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        spy_refresher(&called),
+    );
     assert!(
         called.load(std::sync::atomic::Ordering::SeqCst),
         "positive control: a non-disabled expired target must invoke the refresher"
@@ -549,7 +599,8 @@ fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
     let _home = HomeSandbox::new();
     let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
     let target_profile = stored_profile("target", Some(creds_expired("dead-a", "dead-r")));
-    crate::claude::force_link_profile_credentials("active").expect("link active");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
     let config = handle(AppConfig {
         state: AppState {
@@ -565,16 +616,31 @@ fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
             crate::oauth::TokenFailure::Status(400),
         ))
     };
-    let err = switch_profile_noninteractive(&config, "target", None, revoked)
-        .expect_err("a revoked target must refuse the switch");
+    let err = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        revoked,
+    )
+    .expect_err("a revoked target must refuse the switch");
     assert!(
         err.to_string().contains("clauth login target"),
         "the refusal names the recovery, got: {err}"
     );
 
     // The refusal quarantined the target and left the active link untouched.
-    assert!(config.lock().unwrap().is_auth_broken("target"));
-    assert!(config.lock().unwrap().is_active("active"));
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from("target"))
+    );
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_active(&crate::profile::ProfileName::from("active"))
+    );
     let live_now: ClaudeCredentials = read_json_file(
         &crate::profile::claude_dir()
             .unwrap()
@@ -595,7 +661,8 @@ fn noninteractive_switch_transient_failure_refuses_without_quarantine() {
     let _home = HomeSandbox::new();
     let active_profile = stored_profile("active", Some(creds("stored-a", "stored-r")));
     let target_profile = stored_profile("target", Some(creds_expired("t-a", "t-r")));
-    crate::claude::force_link_profile_credentials("active").expect("link active");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
     let config = handle(AppConfig {
         state: AppState {
@@ -606,17 +673,30 @@ fn noninteractive_switch_transient_failure_refuses_without_quarantine() {
         profiles: vec![active_profile, target_profile],
     });
 
-    let err = switch_profile_noninteractive(&config, "target", None, no_network)
-        .expect_err("a transient refresh failure must refuse the switch");
+    let err = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        None,
+        no_network,
+    )
+    .expect_err("a transient refresh failure must refuse the switch");
     assert!(
         err.to_string().contains("could not refresh"),
         "the refusal explains the transient cause, got: {err}"
     );
     assert!(
-        !config.lock().unwrap().is_auth_broken("target"),
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from("target")),
         "a transient blip must never quarantine"
     );
-    assert!(config.lock().unwrap().is_active("active"));
+    assert!(
+        config
+            .lock()
+            .unwrap()
+            .is_active(&crate::profile::ProfileName::from("active"))
+    );
 }
 
 /// Switching to the already-active profile must never run the AUTH-1 gate:
@@ -629,28 +709,39 @@ fn noninteractive_switch_transient_failure_refuses_without_quarantine() {
 fn switch_to_the_active_profile_never_gates() {
     let _home = HomeSandbox::new();
     let active_profile = stored_profile("active", Some(creds_expired("live-a", "live-r")));
-    crate::claude::force_link_profile_credentials("active").expect("link active");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
-    let config = handle(AppConfig {
+    let config = AppConfig {
         state: AppState {
             active_profile: Some("active".into()),
             profiles: vec!["active".into()],
             ..Default::default()
         },
         profiles: vec![active_profile],
-    });
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let config = handle(config);
 
     let revoked = |_: &str, _: Option<&str>| {
         Err(crate::oauth::RefreshError::Invalid(
             crate::oauth::TokenFailure::Status(400),
         ))
     };
-    let (previous, active) = switch_profile_noninteractive(&config, "active", None, revoked)
-        .expect("switch-to-active must no-op, never gate");
+    let (previous, active) = switch_profile_noninteractive(
+        &config,
+        &crate::profile::ProfileName::from("active"),
+        None,
+        revoked,
+    )
+    .expect("switch-to-active must no-op, never gate");
     assert_eq!(previous.as_deref(), Some("active"));
     assert_eq!(active, "active");
     assert!(
-        !config.lock().unwrap().is_auth_broken("active"),
+        !config
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from("active")),
         "the exempt path must never quarantine the active profile"
     );
 }

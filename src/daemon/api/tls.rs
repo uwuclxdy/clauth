@@ -120,7 +120,7 @@ fn tls_config_path() -> Result<PathBuf> {
 /// confusing "no such file" naming a path they never configured.
 pub(crate) fn cert_dir() -> Result<PathBuf> {
     let path = tls_config_path()?;
-    crate::lock::with_state_lock(|| {
+    crate::lock::with_state_lock(|_| {
         let Ok(body) = std::fs::read_to_string(&path) else {
             let dir = default_cert_dir()?;
             write_tls_config(&path, &dir)?;
@@ -211,9 +211,7 @@ fn fqdn() -> Result<String> {
         .args(args)
         .stdin(std::process::Stdio::null())
         .output()
-        .with_context(|| {
-            format!("could not run `{program}` to determine this host's FQDN")
-        })?;
+        .with_context(|| format!("could not run `{program}` to determine this host's FQDN"))?;
     if !out.status.success() {
         // The stderr is the whole diagnosis when this fails (an unresolvable
         // computer name, a missing shell), and it is otherwise discarded.

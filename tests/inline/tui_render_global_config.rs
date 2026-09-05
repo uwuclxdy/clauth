@@ -31,8 +31,20 @@ fn toggles() -> RowState {
         switch_off_when_budget_spent: true,
         preemptive: false,
         refresh_spent: true,
+        auto_start_queue: true,
+        any_auto_start: true,
         reset_display: ResetDisplay::Relative,
         clock_format: ClockFormat::H24,
+    }
+}
+
+fn tunables() -> RowTunables {
+    RowTunables {
+        refresh_interval_ms: 60_000,
+        weekly_pct: 95.0,
+        burn_floor_pct: 98.0,
+        burn_horizon_ms: 60_000,
+        default_divergence: None,
     }
 }
 
@@ -53,17 +65,7 @@ fn key_cell_is_uniform_width() {
 fn every_blurred_row_starts_its_value_at_the_shared_column() {
     let value_col = 2 + KEY_W + KEY_GUTTER;
     for r in GLOBAL_CONFIG_ROWS {
-        let line = line_text(&detail_row(
-            r,
-            false,
-            toggles(),
-            60_000,
-            95.0,
-            98.0,
-            60_000,
-            None,
-            None,
-        ));
+        let line = line_text(&detail_row(r, false, toggles(), tunables(), None));
         let before: String = line.chars().take(value_col).collect();
         assert!(
             before.ends_with(&" ".repeat(KEY_GUTTER)),
@@ -82,17 +84,7 @@ fn every_blurred_row_starts_its_value_at_the_shared_column() {
 #[test]
 fn selection_caret_is_bold_like_every_other_card() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let line = detail_row(
-        GlobalConfigRow::Theme,
-        true,
-        toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
-        None,
-    );
+    let line = detail_row(GlobalConfigRow::Theme, true, toggles(), tunables(), None);
     let caret = &line.spans[0];
     assert!(
         caret.style.add_modifier.contains(Modifier::BOLD),
@@ -199,6 +191,48 @@ fn edit_line_buffer_starts_at_the_value_column() {
     }
 }
 
+/// `auto-start queue` is a pure on/off toggle, and BOTH hint strings are
+/// pinned whole: this row is the queue's only control, so a reworded hint is a
+/// user-facing change nothing else would catch.
+#[test]
+fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let on = line_text(&detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        toggles(),
+        tunables(),
+        None,
+    ));
+    assert!(on.contains("auto-start queue"), "{on}");
+    assert!(on.contains(theme::toggle_on()), "on state glyph: {on}");
+
+    let mut off = toggles();
+    off.auto_start_queue = false;
+    let off_line = line_text(&detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        off,
+        tunables(),
+        None,
+    ));
+    assert!(
+        off_line.contains(theme::toggle_off()),
+        "off state glyph: {off_line}"
+    );
+
+    assert_eq!(
+        row_hint(GlobalConfigRow::AutoStartQueue, toggles(), tunables()).as_deref(),
+        Some("space auto-start windows evenly, so one resets every 5h / accounts"),
+    );
+    let mut off = toggles();
+    off.auto_start_queue = false;
+    assert_eq!(
+        row_hint(GlobalConfigRow::AutoStartQueue, off, tunables()).as_deref(),
+        Some("auto-start usage windows as soon as possible"),
+    );
+}
+
 /// `refresh spent` is a pure on/off boolean — a cloudy-tui toggle (`─●` / `○─`),
 /// not a 2-option cycle row (`[on]  off`).
 #[test]
@@ -208,11 +242,7 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
         GlobalConfigRow::RefreshSpentAccounts,
         false,
         toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     ));
     assert!(on.contains(theme::toggle_on()), "on state glyph: {on}");
@@ -227,11 +257,7 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
         GlobalConfigRow::RefreshSpentAccounts,
         false,
         off,
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     ));
     assert!(
@@ -241,6 +267,45 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
     assert!(
         !off_line.contains("  on"),
         "must not render the cycle on-option: {off_line}"
+    );
+}
+
+/// With no account opted into `auto_start` there is nothing to space, so the
+/// queue row renders as a cloudy-tui disabled row (whole content faint, knob
+/// included) — it must never read as an armed setting. One opted-in account
+/// makes it a live toggle again.
+#[test]
+fn auto_start_queue_dims_when_no_account_opts_in() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut none_opted = toggles();
+    none_opted.any_auto_start = false;
+    let dimmed = detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        none_opted,
+        tunables(),
+        None,
+    );
+    assert!(
+        dimmed
+            .spans
+            .iter()
+            .all(|s| s.content.trim().is_empty() || s.style.fg == theme::faint().fg),
+        "every content span must be faint while inert: {:?}",
+        dimmed.spans,
+    );
+
+    let live = detail_row(
+        GlobalConfigRow::AutoStartQueue,
+        false,
+        toggles(),
+        tunables(),
+        None,
+    );
+    assert!(
+        live.spans.iter().any(|s| s.style.fg == theme::accent().fg),
+        "an opted-in account brings the on-state knob back to accent: {:?}",
+        live.spans,
     );
 }
 
@@ -256,11 +321,7 @@ fn money_spent_dims_when_spend_budget_is_off() {
         GlobalConfigRow::SwitchOffWhenBudgetSpent,
         false,
         toggles(), // spend_budget: false
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     );
     assert!(
@@ -278,11 +339,7 @@ fn money_spent_dims_when_spend_budget_is_off() {
         GlobalConfigRow::SwitchOffWhenBudgetSpent,
         true,
         on,
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     ));
     assert!(
@@ -297,12 +354,12 @@ fn money_spent_hint_states_the_halt_not_inertness() {
     // and states what the setting does. `toggles()` has switch-off-when-spent on.
     let hint = row_hint(
         GlobalConfigRow::SwitchOffWhenBudgetSpent,
-        None,
         toggles(),
-        90_000,
-        98.0,
-        98.0,
-        60_000,
+        RowTunables {
+            refresh_interval_ms: 90_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
     )
     .expect("the money-spent row carries a behavior hint");
     assert!(!hint.contains("inert"), "gate clause dropped: {hint}");
@@ -317,11 +374,11 @@ fn a_non_default_value_shows_a_faint_default_reminder() {
         GlobalConfigRow::RefreshInterval,
         false,
         toggles(),
-        30_000,
-        98.0,
-        98.0,
-        60_000,
-        None,
+        RowTunables {
+            refresh_interval_ms: 30_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
         None,
     ));
     assert!(
@@ -332,11 +389,11 @@ fn a_non_default_value_shows_a_faint_default_reminder() {
         GlobalConfigRow::RefreshInterval,
         false,
         toggles(),
-        90_000,
-        98.0,
-        98.0,
-        60_000,
-        None,
+        RowTunables {
+            refresh_interval_ms: 90_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
         None,
     ));
     assert!(
@@ -351,23 +408,22 @@ fn a_non_default_value_shows_a_faint_default_reminder() {
 fn value_rows_interpolate_the_live_value_into_their_hint() {
     let refresh = row_hint(
         GlobalConfigRow::RefreshInterval,
-        None,
         toggles(),
-        30_000,
-        98.0,
-        98.0,
-        60_000,
+        RowTunables {
+            refresh_interval_ms: 30_000,
+            weekly_pct: 98.0,
+            ..tunables()
+        },
     )
     .expect("refresh row has a hint");
     assert!(refresh.contains("every 30s"), "{refresh}");
     let weekly = row_hint(
         GlobalConfigRow::WeeklyThreshold,
-        None,
         toggles(),
-        90_000,
-        95.0,
-        98.0,
-        60_000,
+        RowTunables {
+            refresh_interval_ms: 90_000,
+            ..tunables()
+        },
     )
     .expect("weekly row has a hint");
     assert!(weekly.contains("95%"), "{weekly}");
@@ -382,7 +438,7 @@ fn value_rows_interpolate_the_live_value_into_their_hint() {
 fn burn_tunables_dim_when_burn_aware_is_off() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     for r in [GlobalConfigRow::BurnFloor, GlobalConfigRow::BurnHorizon] {
-        let dimmed = detail_row(r, false, toggles(), 60_000, 95.0, 98.0, 60_000, None, None);
+        let dimmed = detail_row(r, false, toggles(), tunables(), None);
         assert!(
             dimmed
                 .spans
@@ -394,9 +450,7 @@ fn burn_tunables_dim_when_burn_aware_is_off() {
 
         let mut on = toggles();
         on.burn_aware = true;
-        let live = line_text(&detail_row(
-            r, true, on, 60_000, 95.0, 98.0, 60_000, None, None,
-        ));
+        let live = line_text(&detail_row(r, true, on, tunables(), None));
         assert!(
             live.contains('['),
             "{r:?} burn-aware on: live + focused brackets the active preset: {live}"
@@ -417,11 +471,7 @@ fn rotation_row_is_live_on_every_platform() {
         GlobalConfigRow::PreemptiveRotation,
         false,
         toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     );
     assert!(
@@ -437,12 +487,12 @@ fn rotation_row_is_live_on_every_platform() {
     for (state, want) in [(toggles(), "rejects"), (on, "before it expires")] {
         let hint = row_hint(
             GlobalConfigRow::PreemptiveRotation,
-            None,
             state,
-            90_000,
-            98.0,
-            98.0,
-            60_000,
+            RowTunables {
+                refresh_interval_ms: 90_000,
+                weekly_pct: 98.0,
+                ..tunables()
+            },
         )
         .expect("the rotation row carries a hint");
         assert!(
@@ -534,11 +584,7 @@ fn reset_display_row_shows_all_three_shapes() {
             GlobalConfigRow::ResetShape,
             true,
             rows,
-            60_000,
-            95.0,
-            98.0,
-            60_000,
-            None,
+            tunables(),
             None,
         ));
         assert!(
@@ -560,11 +606,7 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
         GlobalConfigRow::ClockNotation,
         false,
         toggles(),
-        60_000,
-        95.0,
-        98.0,
-        60_000,
-        None,
+        tunables(),
         None,
     );
     assert!(
@@ -583,11 +625,7 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
             GlobalConfigRow::ClockNotation,
             true,
             rows,
-            60_000,
-            95.0,
-            98.0,
-            60_000,
-            None,
+            tunables(),
             None,
         ));
         assert!(
@@ -601,9 +639,7 @@ fn clock_row_dims_until_a_reset_renders_a_clock() {
 /// changes on screen, and the notation hint is where "local timezone" is stated.
 #[test]
 fn reset_rows_hints_track_their_value() {
-    let hint = |rows: RowState, row| {
-        row_hint(row, None, rows, 60_000, 95.0, 98.0, 60_000).expect("row has a hint")
-    };
+    let hint = |rows: RowState, row| row_hint(row, rows, tunables()).expect("row has a hint");
     let mut rows = toggles();
     assert!(hint(rows, GlobalConfigRow::ResetShape).contains("how long"));
     rows.reset_display = ResetDisplay::Clock;

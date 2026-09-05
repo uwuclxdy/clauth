@@ -70,7 +70,19 @@ pub(crate) enum Command {
     ///
     /// An existing name re-authenticates in place: the fresh credential set
     /// replaces the old one while the profile's chain slot, env, and model
-    /// settings survive.
+    /// settings survive. A browser login also leaves a stored endpoint and a
+    /// working api key standing, since it renews the subscription login and
+    /// that account's inference runs on the key. On an Alibaba Model Studio profile a bare login opens
+    /// that console instead, capturing the session its usage figures need; that
+    /// session expires 48 hours after the aliyun sign-in behind it rather than
+    /// after this login, so it can arrive with minutes left. That profile's
+    /// endpoint and api key are left untouched.
+    ///
+    /// Starting an Alibaba account from nothing therefore takes two steps: give
+    /// it a Model Studio endpoint first (a Qwen preset on the Setup tab, or
+    /// --base-url here), then run a bare login on that name. Which console a
+    /// session is captured from is read off the endpoint, so a name with no
+    /// endpoint yet has no console to open.
     Login(LoginArgs),
 
     /// Remove a profile and all its credentials
@@ -99,9 +111,50 @@ pub(crate) enum Command {
         yes: bool,
     },
 
+    /// Restore or remove a profile's long-lived session token
+    ///
+    /// The bare form is the inverse of `rolling-token`: it restores the static
+    /// `claude setup-token` mint the rolling token superseded, so sessions go
+    /// back to a year-scale bearer carrying two scopes, which nothing has to
+    /// re-stamp.
+    ///
+    /// `--clear` is the FULL exit instead: it removes the long-lived token,
+    /// the preserved mint backup, and the rolling-token flag together, so the
+    /// profile's stored OAuth login is what switches install again and
+    /// nothing re-creates a sidecar afterwards. The live credentials are
+    /// relinked when the profile is active, and the clear is refused when the
+    /// profile stores no other login.
+    #[command(name = "static-token")]
+    StaticToken {
+        /// Profile whose long-lived token to operate on.
+        profile: String,
+        /// Remove the long-lived token, its preserved mint backup, and the
+        /// rolling-token flag, instead of restoring the mint.
+        #[arg(long)]
+        clear: bool,
+        /// Skip `--clear`'s confirm prompt. Required on a non-TTY stdin.
+        #[arg(long, short = 'y', requires = "clear")]
+        yes: bool,
+    },
+
     /// Restore a disabled profile to every operational surface
     Enable {
         /// Profile to re-enable.
+        profile: String,
+    },
+
+    /// Serve a profile's sessions a rolling token from its usage chain
+    ///
+    /// The daemon re-stamps `session-token.json` with the usage chain's current
+    /// access token: full scopes and the account's `subscriptionType`, but NO
+    /// refresh token. Sessions run bearers that unlock plan-gated models while
+    /// the rotating chain stays clauth-private.
+    ///
+    /// Needs the clauth daemon running: the bearer dies in hours, and the
+    /// daemon's scan is what re-stamps it before then.
+    #[command(name = "rolling-token")]
+    RollingToken {
+        /// Profile to arm.
         profile: String,
     },
 
@@ -126,6 +179,19 @@ pub(crate) enum Command {
         /// Alias for --all.
         #[arg(long)]
         disabled: bool,
+    },
+
+    /// List the delegate jobs clauth is holding
+    ///
+    /// One row per record in ~/.clauth/jobs/: background runs still going,
+    /// blocking runs whose caller is still waiting, finished results nothing
+    /// has collected yet, and runs whose server died. Read-only — stopping one
+    /// is the `monitor` tool's job. An empty store exits 0.
+    Jobs {
+        /// Emit a stable newest-first JSON array instead of the table. The
+        /// field set is fixed; a figure the record does not have is null.
+        #[arg(long)]
+        json: bool,
     },
 
     /// List Claude Code sessions as a table
@@ -230,6 +296,19 @@ pub(crate) enum Command {
     /// Run the stdio MCP server (claude code launches this)
     Mcp,
 
+    /// Set the herdr plugin up, or take it back out
+    ///
+    /// `clauth herdr install` runs herdr's own installer, then adds the two
+    /// things a herdr plugin cannot declare for itself: the keybinding that
+    /// opens the dashboard, and the sidebar row that renders which account
+    /// each Claude Code pane burns. Both land in the user's herdr
+    /// `config.toml`, and herdr validates the result before it is written.
+    /// `clauth herdr uninstall` reverses both halves together.
+    Herdr {
+        #[command(subcommand)]
+        cmd: HerdrCommand,
+    },
+
     /// Print a shell completion script, or install one
     ///
     /// `clauth completions <bash|zsh|fish>` prints the script to stdout.
@@ -260,6 +339,18 @@ pub(crate) enum Command {
     #[command(hide = true)]
     McpAwaitJob,
 
+    /// The bundled UserPromptSubmit / PostToolUse / SessionStart hook body: read
+    /// the hook payload on stdin and tell the conversation when the account
+    /// behind it changed.
+    #[command(hide = true)]
+    HookProfileChangedNote,
+
+    /// The bundled SessionStart self-heal body: repair a broken plugin
+    /// registration through agentgear. Prints only when something changed, so a
+    /// healthy session start says nothing.
+    #[command(hide = true)]
+    SelfHeal,
+
     /// Not a command. Kept only to redirect anyone who guesses it.
     #[command(hide = true)]
     Run {
@@ -277,19 +368,13 @@ pub(crate) enum Command {
 /// `clauth start`'s flags, the profile, and the `claude` passthrough.
 #[derive(Args, Debug)]
 pub(crate) struct StartArgs {
-    /// Inject the profile's credentials into a clean throwaway runtime,
-    /// dropping operator memory, plugins, and hooks. Run it in a clean cwd for
-    /// a blind session.
+    /// Uses a clean throwaway runtime, without your CLAUDE.md, plugins, hooks,
+    /// skills, MCP servers or tools. Run it in a clean cwd for a blind session.
+    /// Useful for testing or benchmarking. Transcripts and session state are
+    /// lifted into the global store as clauth start shuts down, so the session
+    /// stays resumable and its tokens counted. A hard kill skips that.
     #[arg(long)]
     pub(crate) isolated: bool,
-    /// Lift the run's transcripts + session sidecar state into the global
-    /// store, overriding the profile's auto_rescue setting.
-    #[arg(long, requires = "isolated", overrides_with = "no_rescue")]
-    pub(crate) rescue: bool,
-    /// Discard the run's isolated store, overriding the profile's auto_rescue
-    /// setting.
-    #[arg(long, requires = "isolated", overrides_with = "rescue")]
-    pub(crate) no_rescue: bool,
     /// Follow the fallback chain, moving to the next account as each runs out
     ///
     /// The session starts on this profile and swaps onto the next chain member
@@ -323,20 +408,13 @@ impl StartArgs {
             Isolation::Shared
         }
     }
-
-    /// `--rescue`/`--no-rescue` override the profile's auto_rescue setting;
-    /// neither flag leaves it alone. clap's mutual `overrides_with` means the
-    /// last one on the command line is the one that survives.
-    pub(crate) fn rescue_override(&self) -> Option<bool> {
-        match (self.rescue, self.no_rescue) {
-            (true, _) => Some(true),
-            (_, true) => Some(false),
-            _ => None,
-        }
-    }
 }
 
 /// `clauth login`'s profile plus its auth-method flags.
+///
+/// Capturing a long-lived token lives here as `--setup-token` because it IS a
+/// login; removing one is `clauth static-token <profile> --clear`, a verb rather
+/// than a flag, matching how `enable`/`disable` toggle per-profile state.
 #[derive(Args, Debug)]
 pub(crate) struct LoginArgs {
     /// Profile to log in as. An existing name re-authenticates it in place.
@@ -362,9 +440,81 @@ pub(crate) struct LoginArgs {
     pub(crate) model: Option<String>,
 }
 
+/// `login` flags in completion order. The single source the bash/zsh/fish
+/// scripts in `completions.rs` splice in, so a new login flag is added here
+/// and nowhere else.
+pub(crate) const LOGIN_FLAGS: &[&str] = &[
+    "--base-url",
+    "--api-key",
+    "--setup-token",
+    "--yes",
+    "-y",
+    "--model",
+];
+
 impl LoginArgs {
     /// API-key mode: capture a base_url + api_key pair instead of browser OAuth.
     pub(crate) fn is_api_mode(&self) -> bool {
         self.base_url.is_some() || self.api_key.is_some()
     }
+}
+
+/// `clauth herdr <cmd>`: install and uninstall the plugin and its config wiring.
+#[derive(Subcommand, Debug)]
+pub(crate) enum HerdrCommand {
+    /// Install the plugin into herdr and wire it into herdr's own config
+    ///
+    /// herdr's installer prints every command the plugin would run as you and
+    /// asks before registering it; this passes that prompt straight through
+    /// rather than answering it. A plugin already linked from a local checkout
+    /// refuses the install: it names the tree and the two ways out.
+    Install {
+        /// Key that opens the dashboard, in herdr's own binding syntax
+        /// (`prefix+a`, `ctrl+alt+c`). Prompted for when omitted.
+        #[arg(long, value_name = "SPEC")]
+        key: Option<String>,
+        /// Install the plugin and leave herdr's config.toml untouched.
+        #[arg(long)]
+        no_config: bool,
+        /// Skip both confirm prompts, herdr's install preview included.
+        /// Required on a non-TTY stdin, which gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Uninstall the plugin from herdr and drop the config clauth added
+    ///
+    /// Takes the keybinding and sidebar row `install` wrote back out of herdr's `config.toml`, leaving anything else in the file alone, then runs herdr's uninstall.
+    Uninstall {
+        /// Uninstall the plugin and leave herdr's config.toml untouched.
+        #[arg(long)]
+        no_config: bool,
+        /// Skip the confirm prompt. Required on a non-TTY stdin, which gets no prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Print one herdr knob for the plugin scripts
+    ///
+    /// `clauth herdr config get <key>` prints the knob's value on its own
+    /// line, shell-shaped (`fit|half|split-right|split-top`, `on|off`, or the
+    /// bare number).
+    /// Hidden from help: this is the scripts' read path, not a human surface.
+    #[command(hide = true)]
+    Config {
+        #[command(subcommand)]
+        cmd: HerdrConfigCommand,
+    },
+}
+
+/// `clauth herdr config <cmd>`: the plugin scripts' read path for the knobs
+/// persisted under `[herdr]` in profiles.toml.
+#[derive(Subcommand, Debug)]
+pub(crate) enum HerdrConfigCommand {
+    /// Print one knob's value on its own line
+    Get {
+        /// Knob name: popup_width, pane_tag, tag_watch_secs, border_label,
+        /// delegate_dot, delegate_row_text.
+        key: String,
+    },
 }

@@ -44,6 +44,12 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "relogin_is_diverged",
             "overwrite_confirm",
             "overwrite_cancel",
+            // rolling session token (#59): the arm/restore verbs and the
+            // sidecar state they manage — what a switch installs.
+            "rolling_gate_",
+            "stamp_rolling_token_writes",
+            "first_stamp_preserves_the_mint",
+            "restore_static_mint_round_trip",
         ],
     ),
     (
@@ -86,6 +92,14 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "wrap_off_",
             "find_recovered_",
             "sink_active_",
+            // Interleaved auto-start: membership, gap arithmetic, the
+            // history-series classifier, the per-tick election, and the chip.
+            // ONE prefix, and every test of the feature is rooted at it, so a
+            // deleted test reds this row while nothing else in the test tree
+            // can match by accident — a bare `queue_` would also match the
+            // `build_status_auto_start_queue_` status tests, and `queue` alone
+            // matches every name carrying that substring.
+            "auto_start_queue_",
         ],
     ),
     (
@@ -97,15 +111,18 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        // the MCP server's tools, plus the Plugin tab that proves the wiring.
+        // the MCP server's tools, the bundled hooks, plus the Plugin tab that
+        // proves the wiring.
         "From inside Claude",
         &[
+            "every_bundled_hook_command_parses_as_a_subcommand",
+            "the_first_fire_is_a_baseline_and_a_move_is_announced_once",
             "installed_records",
             "marketplace_known",
             "manual_mcp_wiring",
             "wire_mcp_server",
             "global_entry_drifted",
-            "which_tool_reports_the_cached_tier_not_the_login_claim",
+            "session_scope_resolves_the_tier_through_the_which_tiers",
             "valid_switch_repoints_active_through_the_blocking_task",
             "unknown_target_is_rejected_without_stripping_live_creds",
             "divergence_overwrite_captures_relogin_into_outgoing",
@@ -134,6 +151,11 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "live_session_included",
             "force_true_bypasses",
             "rotation_guard_is_independent",
+            // rolling session token (#59): the daemon leg — the tick that
+            // re-stamps the sidecar and the gate it goes through.
+            "claude_rolling_tick_",
+            "restamp_",
+            "rolling_token_forces_the_preemptive_leg",
         ],
     ),
     (

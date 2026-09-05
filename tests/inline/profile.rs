@@ -203,30 +203,25 @@ fn preemptive_rotation_defaults_true_and_an_explicit_off_survives_a_round_trip()
     );
 }
 
-// `auto_rescue` (isolated-transcript rescue) shares `preemptive_rotation`'s
-// serde contract exactly: absent from old state files → false (stock discards
-// an isolated store on teardown), on renders explicitly, off is omitted.
+// `auto_rescue` was the opt-in behind the isolated-transcript rescue, which every
+// isolated run now gets unconditionally. `AppState` carries no
+// `deny_unknown_fields`, so a profiles.toml written while the key existed still
+// loads — the key is ignored rather than refused, and nothing renders it back.
+// The load half is the one that matters: refusing it would lock an operator out
+// of every account on the first launch after an upgrade.
 #[test]
-fn auto_rescue_defaults_false_and_round_trips() {
-    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
-    assert!(!state.auto_rescue);
-
-    let on = AppState {
-        auto_rescue: true,
-        ..AppState::default()
-    };
-    let rendered_on = toml::to_string_pretty(&on).expect("render on state");
+fn a_profiles_toml_carrying_the_removed_auto_rescue_key_still_loads() {
+    let state: AppState = toml::from_str("profiles = []\nauto_rescue = true\n")
+        .expect("a state file from before the key was removed must still parse");
     assert!(
-        rendered_on.contains("auto_rescue = true"),
-        "on must render explicitly, got:\n{rendered_on}"
+        state.active_profile.is_none() && state.profiles.is_empty(),
+        "the rest of the file loads as it always did"
     );
-    let reparsed: AppState = toml::from_str(&rendered_on).expect("reparse on state");
-    assert!(reparsed.auto_rescue);
 
-    let rendered_off = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    let rendered = toml::to_string_pretty(&state).expect("render state");
     assert!(
-        !rendered_off.contains("auto_rescue"),
-        "off (default) must be omitted, got:\n{rendered_off}"
+        !rendered.contains("auto_rescue"),
+        "the key is dropped on the next save, not carried forward: \n{rendered}"
     );
 }
 
@@ -372,21 +367,21 @@ fn set_auth_broken_reports_transitions_and_is_idempotent() {
         profiles: Vec::new(),
     };
     assert!(
-        config.set_auth_broken("x", true),
+        config.set_auth_broken(&crate::profile::ProfileName::from("x"), true),
         "clear→broken is a transition"
     );
-    assert!(config.is_auth_broken("x"));
+    assert!(config.is_auth_broken(&crate::profile::ProfileName::from("x")));
     assert!(
-        !config.set_auth_broken("x", true),
+        !config.set_auth_broken(&crate::profile::ProfileName::from("x"), true),
         "broken→broken is a no-op (no duplicate log)"
     );
     assert!(
-        config.set_auth_broken("x", false),
+        config.set_auth_broken(&crate::profile::ProfileName::from("x"), false),
         "broken→clear is a transition"
     );
-    assert!(!config.is_auth_broken("x"));
+    assert!(!config.is_auth_broken(&crate::profile::ProfileName::from("x")));
     assert!(
-        !config.set_auth_broken("x", false),
+        !config.set_auth_broken(&crate::profile::ProfileName::from("x"), false),
         "clear→clear is a no-op"
     );
 }
@@ -434,6 +429,7 @@ fn auth_broken_round_trips_and_is_omitted_when_empty() {
 // profile.
 #[test]
 fn remove_drops_auth_broken_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut config = AppConfig {
         state: AppState {
             profiles: vec!["a".into(), "b".into()],
@@ -444,15 +440,19 @@ fn remove_drops_auth_broken_entry() {
             Profile::new("b".to_string(), None, None),
         ],
     };
-    config.set_auth_broken("a", true);
-    config.set_auth_broken("b", true);
-    config.remove("a");
+    config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
+    crate::lock::with_state_lock(|held| {
+        config.remove(&crate::profile::ProfileName::from("a"), held);
+        Ok(())
+    })
+    .expect("remove");
     assert!(
-        !config.is_auth_broken("a"),
+        !config.is_auth_broken(&crate::profile::ProfileName::from("a")),
         "removed name leaves the quarantine"
     );
     assert!(
-        config.is_auth_broken("b"),
+        config.is_auth_broken(&crate::profile::ProfileName::from("b")),
         "the other quarantine is untouched"
     );
 }
@@ -461,6 +461,7 @@ fn remove_drops_auth_broken_entry() {
 // that dropped it would silently un-quarantine a dead login.
 #[test]
 fn rename_carries_auth_broken_entry() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut config = AppConfig {
         state: AppState {
             profiles: vec!["old".into()],
@@ -468,14 +469,22 @@ fn rename_carries_auth_broken_entry() {
         },
         profiles: vec![Profile::new("old".to_string(), None, None)],
     };
-    config.set_auth_broken("old", true);
-    config.rename_all_occurrences("old", "new");
+    config.set_auth_broken(&crate::profile::ProfileName::from("old"), true);
+    crate::lock::with_state_lock(|held| {
+        config.rename_all_occurrences(
+            &crate::profile::ProfileName::from("old"),
+            &crate::profile::ProfileName::from("new"),
+            held,
+        );
+        Ok(())
+    })
+    .expect("rename");
     assert!(
-        !config.is_auth_broken("old"),
+        !config.is_auth_broken(&crate::profile::ProfileName::from("old")),
         "old name no longer quarantined"
     );
     assert!(
-        config.is_auth_broken("new"),
+        config.is_auth_broken(&crate::profile::ProfileName::from("new")),
         "quarantine follows the rename"
     );
 }
@@ -500,8 +509,8 @@ fn oauth_credentials() -> ClaudeCredentials {
 /// Out-of-band per-profile thresholds are CLAMPED to the band at load, while the
 /// app-level weekly line RESETS TO DEFAULT (pinned separately by
 /// `weekly_switch_threshold_out_of_band_resets_to_default_at_load`). Two
-/// deliberately different normalizations, one line apart in `docs/fallback.md`
-/// and one line apart in the source — exactly the shape a well-meaning "unify
+/// deliberately different normalizations, one line apart in the source —
+/// exactly the shape a well-meaning "unify
 /// the threshold handling" refactor collapses into one rule, silently moving
 /// every hand-edited config to the wrong value. A garbage `fallback_threshold`
 /// left raw would also drive the auto-switch walk off a nonsense line, so the
@@ -510,17 +519,21 @@ fn oauth_credentials() -> ClaudeCredentials {
 fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
     let _home = HomeSandbox::new();
     let name = "clamp-test";
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
 
     // Hand-edit the per-profile config the way a user would.
-    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
     std::fs::write(
         &config_path,
         "fallback_threshold = 250.0\nbell_threshold = -30.0\n",
     )
     .expect("write config.toml");
 
-    let loaded = load_profile(name).expect("load_profile");
+    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
     assert_eq!(
         loaded.fallback_threshold,
         Some(100.0),
@@ -539,7 +552,7 @@ fn out_of_band_per_profile_thresholds_clamp_to_the_band_at_load() {
         "fallback_threshold = 73.5\nbell_threshold = 12.0\n",
     )
     .expect("rewrite config.toml");
-    let loaded = load_profile(name).expect("load_profile");
+    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
     assert_eq!(loaded.fallback_threshold, Some(73.5));
     assert_eq!(loaded.bell_threshold, Some(12.0));
 }
@@ -586,13 +599,19 @@ fn switch_off_when_spent_keeps_its_wrap_off_key_on_disk() {
 fn non_finite_max_auto_spend_reads_as_zero_at_load() {
     let _home = HomeSandbox::new();
     let name = "spend-ceiling-test";
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
-    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
 
     for raw in ["max_auto_spend = inf\n", "max_auto_spend = nan\n"] {
         std::fs::write(&config_path, raw).expect("write config.toml");
         assert_eq!(
-            load_profile(name).expect("load_profile").max_auto_spend,
+            load_profile(&crate::profile::ProfileName::from(name))
+                .expect("load_profile")
+                .max_auto_spend,
             Some(0.0),
             "{raw:?} must not survive the load boundary as a spendable ceiling"
         );
@@ -601,14 +620,18 @@ fn non_finite_max_auto_spend_reads_as_zero_at_load() {
     // A negative ceiling floors at $0 rather than staying raw...
     std::fs::write(&config_path, "max_auto_spend = -5.0\n").expect("write config.toml");
     assert_eq!(
-        load_profile(name).expect("load_profile").max_auto_spend,
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .max_auto_spend,
         Some(0.0)
     );
 
     // ...and an ordinary ceiling is passed through untouched.
     std::fs::write(&config_path, "max_auto_spend = 12.5\n").expect("write config.toml");
     assert_eq!(
-        load_profile(name).expect("load_profile").max_auto_spend,
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .max_auto_spend,
         Some(12.5)
     );
 }
@@ -623,48 +646,67 @@ fn non_finite_max_auto_spend_reads_as_zero_at_load() {
 fn non_finite_percent_fields_read_as_unset_at_load() {
     let _home = HomeSandbox::new();
     let name = "finite-pct-test";
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
-    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
 
     for raw in ["nan", "inf", "-inf"] {
         std::fs::write(&config_path, format!("fallback_threshold = {raw}\n"))
             .expect("write config.toml");
         assert_eq!(
-            load_profile(name).expect("load_profile").fallback_threshold,
+            load_profile(&crate::profile::ProfileName::from(name))
+                .expect("load_profile")
+                .fallback_threshold,
             None,
             "fallback_threshold = {raw} must not survive the load boundary"
         );
         // The rewrite that load just performed has to still be parseable.
-        load_profile(name).expect("re-load after the fallback_threshold rewrite");
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("re-load after the fallback_threshold rewrite");
 
         std::fs::write(&config_path, format!("bell_threshold = {raw}\n"))
             .expect("write config.toml");
         assert_eq!(
-            load_profile(name).expect("load_profile").bell_threshold,
+            load_profile(&crate::profile::ProfileName::from(name))
+                .expect("load_profile")
+                .bell_threshold,
             None,
             "bell_threshold = {raw} must not survive the load boundary"
         );
-        load_profile(name).expect("re-load after the bell_threshold rewrite");
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("re-load after the bell_threshold rewrite");
     }
 }
 
 /// The load boundary drops a base_url ONLY when a stored OAuth pair could leak
-/// to it (pair present + no usable key). A pure api account with a cleared key
-/// keeps its base_url shell so `clear_profile_api_key` stays re-loginable — the
-/// same normalize-at-load discipline as `max_auto_spend`, scoped to the leak.
+/// to it (pair present + no usable key AND no env token — an
+/// `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY` env entry authenticates the
+/// spawned `claude`, so the bearer never reaches the endpoint; the same env
+/// reading `has_inference_auth` applies on the preserve side). A pure api
+/// account with a cleared key keeps its base_url shell so
+/// `clear_profile_api_key` stays re-loginable — the same normalize-at-load
+/// discipline as `max_auto_spend`, scoped to the leak.
 #[test]
 fn base_url_dropped_only_when_a_stored_pair_could_leak() {
     let _home = HomeSandbox::new();
     let name = "endpoint-key-gate";
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
-    let config_path = profile_subpath(name, "config.toml").expect("config path");
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
     let endpoint = "https://api.z.ai/anthropic";
 
     // No stored pair + no key: nothing to leak, so the base_url shell is kept —
     // a cleared api account (`clear_profile_api_key`) must stay re-loginable.
     std::fs::write(&config_path, format!("base_url = \"{endpoint}\"\n")).expect("write config");
-    let pure = load_profile(name).expect("load_profile");
+    let pure = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
     assert_eq!(
         pure.base_url.as_deref(),
         Some(endpoint),
@@ -678,7 +720,7 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
         serde_json::to_string(&oauth_credentials()).expect("ser creds"),
     )
     .expect("write credentials.json");
-    let hybrid = load_profile(name).expect("load_profile");
+    let hybrid = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
     assert_eq!(
         hybrid.base_url, None,
         "a stored pair with no key must not route to the endpoint"
@@ -694,7 +736,12 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
         format!("base_url = \"{endpoint}\"\napi_key = \"   \"\n"),
     )
     .expect("write config");
-    assert_eq!(load_profile(name).expect("load_profile").base_url, None);
+    assert_eq!(
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .base_url,
+        None
+    );
 
     // A real key on the same hybrid keeps the endpoint and its provider.
     std::fs::write(
@@ -702,11 +749,302 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
         format!("base_url = \"{endpoint}\"\napi_key = \"sk-real\"\n"),
     )
     .expect("write config");
-    let keyed = load_profile(name).expect("load_profile");
+    let keyed = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
     assert_eq!(keyed.base_url.as_deref(), Some(endpoint));
     assert!(
         keyed.provider.is_some(),
         "a keyed z.ai endpoint keeps its provider"
+    );
+
+    // An env token is the third credential shape the pair cannot leak through:
+    // the settings writer applies `profile.env` last, so the spawned claude
+    // authenticates with the token and the bearer never reaches the endpoint.
+    // The preserve arm counts this shape (`has_inference_auth`), so the load
+    // boundary must keep it too, or a preserved endpoint dies at the next load.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"env-bearer\"\n"),
+    )
+    .expect("write config");
+    let env_token = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert_eq!(
+        env_token.base_url.as_deref(),
+        Some(endpoint),
+        "an env token authenticates the endpoint, so the pair cannot leak"
+    );
+
+    // The `ANTHROPIC_API_KEY` env spelling counts the same way.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_API_KEY = \"env-key\"\n"),
+    )
+    .expect("write config");
+    let env_key = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert_eq!(env_key.base_url.as_deref(), Some(endpoint));
+
+    // A whitespace-only env token is no token, the same trim test the
+    // preserve side applies — the pair would still reach the endpoint.
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"   \"\n"),
+    )
+    .expect("write config");
+    assert_eq!(
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .base_url,
+        None,
+        "a blank env token is no credential, so the pair would still leak"
+    );
+}
+
+/// `stored_usage_cache_is_third_party` answers the question
+/// `load_profile(&crate::profile::ProfileName::from(…)).usage_cache_is_third_party()` answers, without recovering a
+/// staged rotation — that recovery takes the state flock and rewrites
+/// `credentials.json`, which a caller under a leaf lock (the MCP digest's 5 Hz
+/// sample) can never do.
+///
+/// Two readers of one rule, so they are pinned to agree across every state the
+/// rule branches on: both disjuncts (a recognised provider, and a generic
+/// endpoint with a key) and both answers, or a reader stuck on either constant
+/// passes. The ONE state where they legitimately disagree is pinned separately
+/// below, in its direction, rather than left out of a docstring claiming
+/// agreement everywhere.
+#[test]
+fn the_lock_free_third_party_read_agrees_with_a_full_load() {
+    let _home = HomeSandbox::new();
+    let name = "endpoint-agreement";
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let known = "https://api.z.ai/anthropic";
+    // No typed integration claims this one, so it exercises the second disjunct
+    // (`base_url` + `api_key`) that `provider.is_some()` alone never reaches.
+    let generic = "http://127.0.0.1:4000";
+    let creds = serde_json::to_string(&oauth_credentials()).expect("ser creds");
+
+    let mut seen = Vec::new();
+    for (label, config, pair) in [
+        ("no endpoint at all", String::new(), false),
+        (
+            "recognised endpoint, no pair, no key",
+            format!("base_url = \"{known}\"\n"),
+            false,
+        ),
+        (
+            "recognised endpoint + pair, no usable key",
+            format!("base_url = \"{known}\"\napi_key = \"   \"\n"),
+            true,
+        ),
+        (
+            "recognised endpoint + pair + real key",
+            format!("base_url = \"{known}\"\napi_key = \"sk-real\"\n"),
+            true,
+        ),
+        (
+            "generic endpoint + key",
+            format!("base_url = \"{generic}\"\napi_key = \"sk-real\"\n"),
+            false,
+        ),
+        (
+            "generic endpoint, no key",
+            format!("base_url = \"{generic}\"\n"),
+            false,
+        ),
+    ] {
+        std::fs::write(&config_path, &config).expect("write config");
+        if pair {
+            std::fs::write(&cred_path, &creds).expect("write credentials.json");
+        } else {
+            let _ = std::fs::remove_file(&cred_path);
+        }
+        let full = load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .usage_cache_is_third_party();
+        assert_eq!(
+            stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(name)),
+            full,
+            "the lock-free read disagrees with the load boundary on: {label}",
+        );
+        seen.push(full);
+    }
+    assert!(
+        seen.contains(&true) && seen.contains(&false),
+        "the fixture must exercise both answers, or a constant reader passes: {seen:?}",
+    );
+    assert!(
+        seen[4],
+        "a generic api-key endpoint's usage lives in the third-party cache too, \
+         which is the half `provider.is_some()` answers wrong: {seen:?}",
+    );
+}
+
+/// The ruled preserve shape must keep reading the figures the chain feeds:
+/// an env-token account's inference spends on the token, and the pair serves
+/// usage polling — so the load boundary classifies it OAuth-cache even though
+/// the endpoint (and its provider) survive. The third-party leg can never
+/// fetch it (`third_party_credentialed` is api-key-only), so classifying it
+/// third-party would leave every usage surface reading a cache nothing
+/// writes, over the chain-fed figures the ruling assigns it.
+#[test]
+fn an_env_token_profile_with_a_stored_pair_reads_usage_from_the_chain_cache() {
+    let _home = HomeSandbox::new();
+    let name = "env-token-usage";
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let endpoint = "https://api.z.ai/anthropic";
+    std::fs::write(
+        &config_path,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"env-bearer\"\n"),
+    )
+    .expect("write config");
+    std::fs::write(
+        &cred_path,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write credentials.json");
+
+    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert_eq!(
+        loaded.base_url.as_deref(),
+        Some(endpoint),
+        "fixture: the endpoint survives (the env token authenticates it)"
+    );
+    assert!(
+        loaded.provider.is_some(),
+        "fixture: the recognised provider derives from the surviving endpoint"
+    );
+    assert!(
+        !loaded.usage_cache_is_third_party(),
+        "the chain feeds usage polling for an env-token account, so the \
+         figures live in the OAuth cache"
+    );
+    assert!(
+        loaded.third_party_usage.is_none(),
+        "and the load seeds no third-party figures from a cache nothing writes"
+    );
+    assert!(
+        !stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(name)),
+        "the lock-free reader answers the same"
+    );
+
+    // The pairless env-token shape stays third-party: with no chain there are
+    // no chain figures, so the third-party reading — and its keyless hint — is
+    // what remains.
+    let _ = std::fs::remove_file(&cred_path);
+    let pairless = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    assert!(
+        pairless.usage_cache_is_third_party(),
+        "no chain means no chain figures, so the third-party reading (and its \
+         keyless hint) is the honest answer"
+    );
+}
+
+/// The one state the two readers do NOT agree on, pinned in its direction so it
+/// stays a known cost rather than a surprise: a pair staged as
+/// `credentials.json.pending` and never committed. The lock-free read stats the
+/// COMMITTED file only, so it sees no credentials, keeps the `base_url` that a
+/// full load would drop (the pair would otherwise reach the endpoint), and
+/// answers `true` where `load_profile` answers `false`. Both spellings are
+/// pinned in the same direction: with an env token the endpoint survives BOTH
+/// reads (the pair never reaches it) and the disagreement is the
+/// classification alone — the adopting load reads the chain cache, the stored
+/// read still answers third-party.
+///
+/// Only the MCP digest's sample can observe it — every other caller runs
+/// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
+/// and the cost is one digest call watching the wrong cache, so no refresh is
+/// reported for it.
+#[test]
+fn a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently() {
+    let _home = HomeSandbox::new();
+    let name = "endpoint-staged";
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
+    let endpoint = "https://api.z.ai/anthropic";
+    std::fs::write(&config_path, format!("base_url = \"{endpoint}\"\n")).expect("write config");
+    // Staged but never committed: no `credentials.json` on disk.
+    let pending = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
+    std::fs::write(
+        &pending,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write pending sidecar");
+
+    // The lock-free read FIRST: `load_profile` consumes the sidecar, and after
+    // that there is nothing left to disagree about.
+    assert!(
+        stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(name)),
+        "the committed file is empty, so this read keeps the endpoint",
+    );
+    assert!(
+        !load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .usage_cache_is_third_party(),
+        "the full load adopts the staged pair and drops the endpoint with it",
+    );
+
+    // The env-token spelling of the same state, in the same direction. Its own
+    // name: the first leg's adopt commits `credentials.json`, which would read
+    // as "has credentials" and there would be nothing to disagree about.
+    let env_name = "endpoint-staged-env";
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(env_name),
+    ))
+    .expect("save env profile");
+    let env_config = profile_subpath(&crate::profile::ProfileName::from(env_name), "config.toml")
+        .expect("env config path");
+    let env_pending = profile_subpath(
+        &crate::profile::ProfileName::from(env_name),
+        "credentials.json.pending",
+    )
+    .expect("env pending path");
+    std::fs::write(
+        &env_config,
+        format!("base_url = \"{endpoint}\"\n\n[env]\nANTHROPIC_AUTH_TOKEN = \"env-bearer\"\n"),
+    )
+    .expect("write env config");
+    std::fs::write(
+        &env_pending,
+        serde_json::to_string(&oauth_credentials()).expect("ser creds"),
+    )
+    .expect("write env pending sidecar");
+
+    assert!(
+        stored_usage_cache_is_third_party(&crate::profile::ProfileName::from(env_name)),
+        "the committed file is empty, so this read answers third-party",
+    );
+    let env_loaded =
+        load_profile(&crate::profile::ProfileName::from(env_name)).expect("load_profile");
+    assert_eq!(
+        env_loaded.base_url.as_deref(),
+        Some(endpoint),
+        "the env token keeps the endpoint on both readers — only the \
+         classification disagrees"
+    );
+    assert!(
+        !env_loaded.usage_cache_is_third_party(),
+        "the adopting load reads the chain cache, the same answer the ruled \
+         shape gets with a committed pair"
     );
 }
 
@@ -714,8 +1052,8 @@ fn base_url_dropped_only_when_a_stored_pair_could_leak() {
 //
 // `stage_rotated_credentials` writes a rotated pair to `credentials.json.pending`
 // BEFORE `save_profile`, so a crash between the OAuth response and the commit
-// can't lose a single-use refresh token (`docs/oauth.md`, crash-durable
-// rotation). That guarantee reduces to ONE mtime compare in
+// can't lose a single-use refresh token. That guarantee reduces to ONE mtime
+// compare in
 // `recover_pending_credentials`, and until now only the sidecar's file *mode* was
 // tested — never the decision. Both ways of getting it wrong are silent and
 // unrecoverable: adopt too eagerly and a clean commit is overwritten by the pair
@@ -745,7 +1083,7 @@ fn refresh_token_of(creds: &Option<ClaudeCredentials>) -> Option<&str> {
 }
 
 fn seed_committed(name: &str, creds: &ClaudeCredentials) {
-    let mut profile = crate::testutil::blank_profile(name);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
     profile.credentials = Some(creds.clone());
     save_profile(&profile).expect("save_profile");
 }
@@ -761,15 +1099,24 @@ fn pending_sidecar_newer_than_the_commit_is_adopted_and_written_through() {
     seed_committed(name, &committed);
 
     let staged = pair("new-access", "new-refresh");
-    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &staged)
+        .expect("stage_rotated_credentials");
 
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
-    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     let now = std::time::SystemTime::now();
     crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
     crate::testutil::set_mtime(&pending_path, now);
 
-    let got = recover_pending_credentials(name, Some(committed.clone()));
+    let got = recover_pending_credentials(
+        &crate::profile::ProfileName::from(name),
+        Some(committed.clone()),
+    );
     assert_eq!(
         refresh_token_of(&got),
         Some("new-refresh"),
@@ -803,15 +1150,24 @@ fn pending_sidecar_older_than_the_commit_is_discarded_not_reinstalled() {
     seed_committed(name, &committed);
 
     let superseded = pair("spent-access", "spent-refresh");
-    stage_rotated_credentials(name, &superseded).expect("stage_rotated_credentials");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &superseded)
+        .expect("stage_rotated_credentials");
 
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
-    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     let now = std::time::SystemTime::now();
     crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
     crate::testutil::set_mtime(&cred_path, now);
 
-    let got = recover_pending_credentials(name, Some(committed.clone()));
+    let got = recover_pending_credentials(
+        &crate::profile::ProfileName::from(name),
+        Some(committed.clone()),
+    );
     assert_eq!(
         refresh_token_of(&got),
         Some("live-refresh"),
@@ -846,16 +1202,25 @@ fn pending_sidecar_with_an_equal_mtime_is_adopted() {
     seed_committed(name, &committed);
 
     let staged = pair("tie-access", "tie-refresh");
-    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &staged)
+        .expect("stage_rotated_credentials");
 
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
-    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     let same = std::time::SystemTime::now();
     crate::testutil::set_mtime(&cred_path, same);
     crate::testutil::set_mtime(&pending_path, same);
 
     assert_eq!(
-        refresh_token_of(&recover_pending_credentials(name, Some(committed))),
+        refresh_token_of(&recover_pending_credentials(
+            &crate::profile::ProfileName::from(name),
+            Some(committed)
+        )),
         Some("tie-refresh"),
         "an equal mtime must adopt: the compare is `pending >= committed`",
     );
@@ -870,18 +1235,26 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
     let _home = HomeSandbox::new();
     let name = "pending-adopt-absent";
     // Seed the profile dir without credentials so only the sidecar exists.
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
 
     let staged = pair("only-access", "only-refresh");
-    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &staged)
+        .expect("stage_rotated_credentials");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
     assert!(
         !cred_path.exists(),
         "precondition: no committed credentials"
     );
 
     assert_eq!(
-        refresh_token_of(&recover_pending_credentials(name, None)),
+        refresh_token_of(&recover_pending_credentials(
+            &crate::profile::ProfileName::from(name),
+            None
+        )),
         Some("only-refresh"),
         "with no commit to compare against, the staged pair is the only live one",
     );
@@ -895,14 +1268,22 @@ fn pending_sidecar_is_adopted_when_no_commit_exists_at_all() {
 fn a_bare_store_stamp_does_not_discard_a_sidecar_staged_before_it() {
     let _home = HomeSandbox::new();
     let name = "pending-stamped-store";
+    // The receipt below is a cache write, gated on the on-disk record.
+    crate::testutil::register_names(&[name]);
     let committed = pair("old-access", "old-refresh");
     seed_committed(name, &committed);
 
     let staged = pair("orphan-access", "orphan-refresh");
-    stage_rotated_credentials(name, &staged).expect("stage_rotated_credentials");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &staged)
+        .expect("stage_rotated_credentials");
 
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
-    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     let now = std::time::SystemTime::now();
     let last_write = now - std::time::Duration::from_secs(120);
     crate::testutil::set_mtime(&cred_path, last_write);
@@ -910,11 +1291,19 @@ fn a_bare_store_stamp_does_not_discard_a_sidecar_staged_before_it() {
 
     // What a swap onto this member leaves: the store's mtime moved to `now`, no
     // byte of it written, and the receipt that says so.
-    crate::profile_cache::write_touch_receipt(name, &cred_path, now, Some(last_write));
+    crate::profile_cache::write_touch_receipt(
+        &crate::profile::ProfileName::from(name),
+        &cred_path,
+        now,
+        Some(last_write),
+    );
     crate::testutil::set_mtime(&cred_path, now);
 
     assert_eq!(
-        refresh_token_of(&recover_pending_credentials(name, Some(committed))),
+        refresh_token_of(&recover_pending_credentials(
+            &crate::profile::ProfileName::from(name),
+            Some(committed)
+        )),
         Some("orphan-refresh"),
         "the stamp moved no bytes, so the staged pair is still the newest write",
     );
@@ -930,15 +1319,21 @@ fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
     let name = "pending-stamped-then-committed";
     let superseded = pair("spent-access", "spent-refresh");
     seed_committed(name, &superseded);
-    stage_rotated_credentials(name, &superseded).expect("stage_rotated_credentials");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &superseded)
+        .expect("stage_rotated_credentials");
 
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
-    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     let now = std::time::SystemTime::now();
     let stamped = now - std::time::Duration::from_secs(30);
     crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
     crate::profile_cache::write_touch_receipt(
-        name,
+        &crate::profile::ProfileName::from(name),
         &cred_path,
         stamped,
         Some(now - std::time::Duration::from_secs(120)),
@@ -952,7 +1347,10 @@ fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
     crate::testutil::set_mtime(&cred_path, now);
 
     assert_eq!(
-        refresh_token_of(&recover_pending_credentials(name, Some(live))),
+        refresh_token_of(&recover_pending_credentials(
+            &crate::profile::ProfileName::from(name),
+            Some(live)
+        )),
         Some("live-refresh"),
         "a commit newer than the sidecar still wins; the stamp's receipt is spent",
     );
@@ -966,16 +1364,27 @@ fn a_commit_landing_after_a_stamp_still_discards_the_sidecar() {
 fn a_touch_receipt_only_resolves_the_store_it_names() {
     let _home = HomeSandbox::new();
     let name = "receipt-scope";
+    crate::testutil::register_names(&[name]);
     seed_committed(name, &pair("access", "refresh"));
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
-    let sidecar = profile_subpath(name, "session-token.json").expect("sidecar path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let sidecar = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "session-token.json",
+    )
+    .expect("sidecar path");
     std::fs::write(&sidecar, b"{}\n").expect("write sidecar");
 
     let now = std::time::SystemTime::now();
     let displaced = now - std::time::Duration::from_secs(300);
     crate::testutil::set_mtime(&cred_path, now);
     crate::testutil::set_mtime(&sidecar, now);
-    crate::profile_cache::write_touch_receipt(name, &sidecar, now, Some(displaced));
+    crate::profile_cache::write_touch_receipt(
+        &crate::profile::ProfileName::from(name),
+        &sidecar,
+        now,
+        Some(displaced),
+    );
 
     assert_eq!(
         crate::profile_cache::effective_write_time(&sidecar),
@@ -1040,11 +1449,13 @@ fn credential_and_cache_files_have_restricted_permissions() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(creds.clone()),
         usage: None,
         fetch_status: None,
@@ -1055,10 +1466,12 @@ fn credential_and_cache_files_have_restricted_permissions() {
     // flock (rank-ordered) and writes credentials.json before config.toml.
     save_profile(&profile).expect("save_profile");
 
-    let dir_mode = std::fs::metadata(profile_dir(name).expect("profile_dir"))
-        .expect("dir metadata")
-        .permissions()
-        .mode();
+    let dir_mode = std::fs::metadata(
+        profile_dir(&crate::profile::ProfileName::from(name)).expect("profile_dir"),
+    )
+    .expect("dir metadata")
+    .permissions()
+    .mode();
     assert_eq!(
         dir_mode & 0o777,
         0o700,
@@ -1066,7 +1479,8 @@ fn credential_and_cache_files_have_restricted_permissions() {
         dir_mode & 0o777,
     );
 
-    let cred_path = profile_subpath(name, "credentials.json").expect("cred path");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
     let cred_mode = std::fs::metadata(&cred_path)
         .expect("credentials.json metadata")
         .permissions()
@@ -1079,8 +1493,13 @@ fn credential_and_cache_files_have_restricted_permissions() {
     );
 
     // Stage the rotation sidecar and assert its mode too.
-    stage_rotated_credentials(name, &creds).expect("stage_rotated_credentials");
-    let pending_path = profile_subpath(name, "credentials.json.pending").expect("pending path");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &creds)
+        .expect("stage_rotated_credentials");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     let pending_mode = std::fs::metadata(&pending_path)
         .expect("credentials.json.pending metadata")
         .permissions()
@@ -1111,9 +1530,21 @@ fn credential_and_cache_files_have_restricted_permissions() {
     // The swap executor's touch receipt: it holds no secret, but it is a writer
     // under `~/.clauth` and the invariant is the whole tree, so a future writer
     // swapped off the per-profile cache path has to fail here.
-    crate::profile_cache::write_touch_receipt(name, &cred_path, std::time::SystemTime::now(), None);
+    // Registered AFTER the empty `save_app_state` above, which rewrote the
+    // record the cache-write gate reads.
+    crate::testutil::register_names(&[name]);
+    crate::profile_cache::write_touch_receipt(
+        &crate::profile::ProfileName::from(name),
+        &cred_path,
+        std::time::SystemTime::now(),
+        None,
+    );
     let receipt_mode = std::fs::metadata(
-        profile_subpath(name, crate::profile_cache::TOUCH_RECEIPT_FILE).expect("receipt path"),
+        profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::TOUCH_RECEIPT_FILE,
+        )
+        .expect("receipt path"),
     )
     .expect("touch-receipt.json metadata")
     .permissions()
@@ -1137,14 +1568,21 @@ fn disabling_persists_and_leaves_credentials_byte_unchanged() {
     let mut profile = Profile::new(name.to_string(), None, None);
     profile.credentials = Some(oauth_credentials());
     save_profile(&profile).expect("save_profile (enabled)");
-    assert!(!load_profile(name).expect("load_profile").is_disabled());
+    assert!(
+        !load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .is_disabled()
+    );
 
-    let cred_path = profile_credentials_path(name).expect("cred path");
+    let cred_path =
+        profile_credentials_path(&crate::profile::ProfileName::from(name)).expect("cred path");
     let creds_before = std::fs::read(&cred_path).expect("read credentials.json");
-    let mut dir_entries_before: Vec<_> = std::fs::read_dir(profile_dir(name).expect("profile_dir"))
-        .expect("read_dir")
-        .map(|e| e.expect("dir entry").file_name())
-        .collect();
+    let mut dir_entries_before: Vec<_> = std::fs::read_dir(
+        profile_dir(&crate::profile::ProfileName::from(name)).expect("profile_dir"),
+    )
+    .expect("read_dir")
+    .map(|e| e.expect("dir entry").file_name())
+    .collect();
     dir_entries_before.sort_unstable();
 
     profile.disabled = true;
@@ -1155,24 +1593,29 @@ fn disabling_persists_and_leaves_credentials_byte_unchanged() {
         creds_before, creds_after,
         "disabling an account must never touch its stored credentials"
     );
-    let mut dir_entries_after: Vec<_> = std::fs::read_dir(profile_dir(name).expect("profile_dir"))
-        .expect("read_dir")
-        .map(|e| e.expect("dir entry").file_name())
-        .collect();
+    let mut dir_entries_after: Vec<_> = std::fs::read_dir(
+        profile_dir(&crate::profile::ProfileName::from(name)).expect("profile_dir"),
+    )
+    .expect("read_dir")
+    .map(|e| e.expect("dir entry").file_name())
+    .collect();
     dir_entries_after.sort_unstable();
     assert_eq!(
         dir_entries_before, dir_entries_after,
         "disabling an account must never add or remove files in its profile directory"
     );
 
-    let raw = std::fs::read_to_string(profile_config_path(name).expect("config path"))
-        .expect("read config.toml");
+    let raw = std::fs::read_to_string(
+        profile_config_path(&crate::profile::ProfileName::from(name)).expect("config path"),
+    )
+    .expect("read config.toml");
     assert!(
         raw.contains("disabled = true"),
         "disabled=true must be a real, serialized key in config.toml"
     );
 
-    let reloaded = load_profile(name).expect("load_profile (disabled)");
+    let reloaded = load_profile(&crate::profile::ProfileName::from(name))
+        .expect("load_profile (&crate::profile::ProfileName::from(disabled))");
     assert!(reloaded.is_disabled(), "reload must observe the toggle");
     assert_eq!(
         reloaded.access_token(),
@@ -1193,9 +1636,12 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
 
     let _home = HomeSandbox::new();
     let name = "perm-test-usage-cache";
+    // The record carries the name, the dir does not — the write under test is
+    // the thing that has to create it.
+    crate::testutil::register_names(&[name]);
 
     // Fresh profile: its dir must not exist before the cache write.
-    let dir = profile_dir(name).expect("profile_dir");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("profile_dir");
     assert!(
         !dir.exists(),
         "precondition: profile dir must not pre-exist for a fresh profile"
@@ -1203,7 +1649,11 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
 
     // Drive the actual production writer.
     let info = crate::usage::UsageInfo::default();
-    crate::profile_cache::write_profile_cache(name, crate::profile_cache::USAGE_CACHE_FILE, &info);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &info,
+    );
 
     let dir_mode = std::fs::metadata(&dir)
         .expect("freshly-created profile dir metadata")
@@ -1216,7 +1666,8 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
         dir_mode & 0o777,
     );
 
-    let cache_path = profile_subpath(name, "usage_cache.json").expect("cache path");
+    let cache_path = profile_subpath(&crate::profile::ProfileName::from(name), "usage_cache.json")
+        .expect("cache path");
     let cache_mode = std::fs::metadata(&cache_path)
         .expect("usage_cache.json metadata")
         .permissions()
@@ -1240,7 +1691,10 @@ fn load_config_repairs_a_loose_clauth_tree() {
 
     let home = HomeSandbox::new();
     let name = "perm-test-repair";
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
     save_app_state(&AppState {
         profiles: vec![name.into()],
         ..Default::default()
@@ -1248,7 +1702,7 @@ fn load_config_repairs_a_loose_clauth_tree() {
     .expect("save_app_state");
 
     let clauth = clauth_dir().expect("clauth_dir");
-    let profile = profile_dir(name).expect("profile_dir");
+    let profile = profile_dir(&crate::profile::ProfileName::from(name)).expect("profile_dir");
     let runtime = profile.join("runtime");
     let sessions = profile.join("sessions");
     std::fs::create_dir_all(&runtime).expect("mkdir runtime");
@@ -1299,10 +1753,12 @@ fn load_config_repairs_a_loose_clauth_tree() {
 fn profile_config_reads_models_table() {
     let toml = "[models]\n\
         default = \"opusplan\"\n\
-        haiku = \"claude-haiku-4-5\"\n";
+        haiku = \"claude-haiku-4-5\"\n\
+        fable = \"claude-fable-5\"\n";
     let cfg: ProfileConfig = toml::from_str(toml).expect("parse models table");
     assert_eq!(cfg.models.default.as_deref(), Some("opusplan"));
     assert_eq!(cfg.models.haiku.as_deref(), Some("claude-haiku-4-5"));
+    assert_eq!(cfg.models.fable.as_deref(), Some("claude-fable-5"));
     assert_eq!(cfg.models.sonnet, None);
 }
 
@@ -1317,6 +1773,7 @@ fn model_settings_round_trip_through_config_toml() {
         opus: Some("claude-opus-4-8[1m]".to_string()),
         sonnet: None,
         haiku: None,
+        fable: Some("claude-fable-5".to_string()),
         subagent: Some("claude-haiku-4-5".to_string()),
     };
     let rendered = render_config_toml(&profile);
@@ -1382,7 +1839,10 @@ fn weekly_switch_threshold_absent_loads_as_default() {
 #[test]
 fn reload_fingerprint_is_stable_with_no_change() {
     let _home = crate::testutil::HomeSandbox::new();
-    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("p"),
+    ))
+    .expect("save_profile");
     save_app_state(&AppState {
         profiles: vec!["p".into()],
         ..Default::default()
@@ -1446,8 +1906,13 @@ fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
 #[test]
 fn reload_fingerprint_advances_when_a_config_toml_is_edited() {
     let _home = crate::testutil::HomeSandbox::new();
-    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
-    let cfg = profile_dir("p").expect("profile_dir").join("config.toml");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("p"),
+    ))
+    .expect("save_profile");
+    let cfg = profile_dir(&crate::profile::ProfileName::from("p"))
+        .expect("profile_dir")
+        .join("config.toml");
     let before = reload_fingerprint();
     let before_mtime = before
         .config_mtimes
@@ -1475,8 +1940,13 @@ fn reload_fingerprint_advances_when_a_config_toml_is_edited() {
 #[test]
 fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
     let _home = crate::testutil::HomeSandbox::new();
-    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
-    let cfg = profile_dir("p").expect("profile_dir").join("config.toml");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("p"),
+    ))
+    .expect("save_profile");
+    let cfg = profile_dir(&crate::profile::ProfileName::from("p"))
+        .expect("profile_dir")
+        .join("config.toml");
     let before = reload_fingerprint();
     assert!(
         before
@@ -1544,12 +2014,19 @@ fn wait_for_a_distinguishable_mtime(sidecar: &std::path::Path) {
 #[test]
 fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
     let _home = crate::testutil::HomeSandbox::new();
-    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("p"),
+    ))
+    .expect("save_profile");
     let minted_at: i64 = 1_700_000_000_000;
     let before = reload_fingerprint();
 
-    crate::claude::write_session_token("p", &format!("sk-ant-{}", "m".repeat(40)), minted_at)
-        .expect("mint a session token");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from("p"),
+        &format!("sk-ant-{}", "m".repeat(40)),
+        minted_at,
+    )
+    .expect("mint a session token");
     let after_add = reload_fingerprint();
     assert_ne!(
         before, after_add,
@@ -1557,12 +2034,12 @@ fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
     );
 
     wait_for_a_distinguishable_mtime(
-        &profile_dir("p")
+        &profile_dir(&crate::profile::ProfileName::from("p"))
             .expect("profile_dir")
             .join("session-token.json"),
     );
     crate::claude::write_session_token(
-        "p",
+        &crate::profile::ProfileName::from("p"),
         &format!("sk-ant-{}", "r".repeat(40)),
         minted_at + 60 * 60 * 1000,
     )
@@ -1583,8 +2060,11 @@ fn reload_fingerprint_bumps_when_a_session_token_is_added_or_changed() {
 #[test]
 fn reload_fingerprint_catches_a_sidecar_write_no_expiry_can_see() {
     let _home = crate::testutil::HomeSandbox::new();
-    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
-    let sidecar = profile_dir("p")
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("p"),
+    ))
+    .expect("save_profile");
+    let sidecar = profile_dir(&crate::profile::ProfileName::from("p"))
         .expect("profile_dir")
         .join("session-token.json");
 
@@ -1597,12 +2077,20 @@ fn reload_fingerprint_catches_a_sidecar_write_no_expiry_can_see() {
     );
 
     let minted_at: i64 = 1_700_000_000_000;
-    crate::claude::write_session_token("p", &format!("sk-ant-{}", "m".repeat(40)), minted_at)
-        .expect("mint");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from("p"),
+        &format!("sk-ant-{}", "m".repeat(40)),
+        minted_at,
+    )
+    .expect("mint");
     let after_mint = reload_fingerprint();
     wait_for_a_distinguishable_mtime(&sidecar);
-    crate::claude::write_session_token("p", &format!("sk-ant-{}", "r".repeat(40)), minted_at)
-        .expect("re-mint at the same stamped horizon");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from("p"),
+        &format!("sk-ant-{}", "r".repeat(40)),
+        minted_at,
+    )
+    .expect("re-mint at the same stamped horizon");
     assert_ne!(
         after_mint,
         reload_fingerprint(),
@@ -1618,24 +2106,48 @@ fn reload_fingerprint_catches_a_sidecar_write_no_expiry_can_see() {
 #[test]
 fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
     let _home = crate::testutil::HomeSandbox::new();
-    save_profile(&crate::testutil::blank_profile("p")).expect("save_profile");
+    // The receipt below is a cache write, gated on the on-disk record.
+    crate::testutil::register_names(&["p"]);
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("p"),
+    ))
+    .expect("save_profile");
     crate::claude::write_session_token(
-        "p",
+        &crate::profile::ProfileName::from("p"),
         &format!("sk-ant-{}", "m".repeat(40)),
         1_700_000_000_000,
     )
     .expect("mint a session token");
-    let sidecar = profile_dir("p")
+    let sidecar = profile_dir(&crate::profile::ProfileName::from("p"))
         .expect("profile_dir")
         .join("session-token.json");
-    let minted = std::fs::metadata(&sidecar)
-        .and_then(|m| m.modified())
-        .expect("mint mtime");
+    // Backdated rather than read off the mint, so the re-mint at the bottom
+    // CANNOT land on the same `SystemTime`. Both writes are real and both
+    // stamp "now": two of them inside one filesystem timestamp tick left the
+    // two fingerprints byte-identical at 100ns precision, and the closing
+    // `assert_ne!` then read a retired receipt as a live one — 1 run in 3
+    // under the full suite. An hour is a value the clock cannot produce here.
+    //
+    // NOT the sibling tests' `wait_for_a_distinguishable_mtime`, which is the
+    // established answer to this same hazard: it waits for a write to land past
+    // the path's CURRENT mtime, and by the re-mint below that is the receipted
+    // `stamped` half a minute in the FUTURE, so it would wait out its own 2 s
+    // deadline and fail. Backdating still leaves the re-mint a real write and
+    // the thing under test — a write that stopped moving the mtime leaves the
+    // sidecar on this value, which is the one `before` was taken at, so the
+    // closing assertion reds exactly as it should.
+    let minted = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    crate::testutil::set_mtime(&sidecar, minted);
 
     let before = reload_fingerprint();
     // What a swap onto this token-mode member leaves behind.
     let stamped = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
-    crate::profile_cache::write_touch_receipt("p", &sidecar, stamped, Some(minted));
+    crate::profile_cache::write_touch_receipt(
+        &crate::profile::ProfileName::from("p"),
+        &sidecar,
+        stamped,
+        Some(minted),
+    );
     crate::testutil::set_mtime(&sidecar, stamped);
 
     assert_eq!(
@@ -1647,7 +2159,7 @@ fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
     // And the receipt covers exactly that one stamp: the next real write retires
     // it, so the reload fires again.
     crate::claude::write_session_token(
-        "p",
+        &crate::profile::ProfileName::from("p"),
         &format!("sk-ant-{}", "r".repeat(40)),
         1_700_000_000_000,
     )
@@ -1667,10 +2179,20 @@ fn reload_fingerprint_ignores_a_bare_session_token_stamp() {
 #[test]
 fn reload_fingerprint_catches_a_non_newest_config_edit() {
     let _home = crate::testutil::HomeSandbox::new();
-    save_profile(&crate::testutil::blank_profile("a")).expect("save a");
-    save_profile(&crate::testutil::blank_profile("b")).expect("save b");
-    let cfg_a = profile_dir("a").expect("profile_dir a").join("config.toml");
-    let cfg_b = profile_dir("b").expect("profile_dir b").join("config.toml");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("a"),
+    ))
+    .expect("save a");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from("b"),
+    ))
+    .expect("save b");
+    let cfg_a = profile_dir(&crate::profile::ProfileName::from("a"))
+        .expect("profile_dir a")
+        .join("config.toml");
+    let cfg_b = profile_dir(&crate::profile::ProfileName::from("b"))
+        .expect("profile_dir b")
+        .join("config.toml");
     let base = std::time::SystemTime::now();
     // b stays the newest throughout; a is edited but kept below b.
     crate::testutil::set_mtime(&cfg_b, base + std::time::Duration::from_secs(100));
@@ -1773,8 +2295,12 @@ fn weekly_threshold_round_trips_through_config_toml() {
 fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
     let _home = HomeSandbox::new();
     let name = "weekly-reset-test";
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
-    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
 
     for (raw, expect, why) in [
         (
@@ -1810,7 +2336,9 @@ fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
     ] {
         std::fs::write(&config_path, raw).expect("write config.toml");
         assert_eq!(
-            load_profile(name).expect("load_profile").weekly_threshold,
+            load_profile(&crate::profile::ProfileName::from(name))
+                .expect("load_profile")
+                .weekly_threshold,
             expect,
             "{why}: {raw:?}"
         );
@@ -1826,11 +2354,15 @@ fn weekly_threshold_out_of_band_resets_to_unset_at_load() {
 fn usage_gates_default_on_through_the_load_boundary() {
     let _home = HomeSandbox::new();
     let name = "gate-default-test";
-    save_profile(&crate::testutil::blank_profile(name)).expect("save_profile");
-    let config_path = profile_subpath(name, "config.toml").expect("config path");
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
     std::fs::write(&config_path, "").expect("write empty config.toml");
 
-    let loaded = load_profile(name).expect("load_profile");
+    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
     assert!(loaded.check_weekly, "absent check_weekly loads as ON");
     assert!(loaded.check_scoped, "absent check_scoped loads as ON");
 
@@ -1841,7 +2373,343 @@ check_scoped = false
 ",
     )
     .expect("write config.toml");
-    let loaded = load_profile(name).expect("load_profile");
+    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
     assert!(!loaded.check_weekly, "an explicit false survives the load");
     assert!(!loaded.check_scoped, "an explicit false survives the load");
+}
+
+/// The Alibaba console session survives a save/load round trip through
+/// `config.toml`'s `[console]` table, and its file keeps the 0600 posture every
+/// credential under `~/.clauth` carries.
+#[test]
+fn a_console_session_round_trips_through_config_toml() {
+    let _home = HomeSandbox::new();
+    let name = "console-round-trip";
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    profile.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token-value".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    save_profile(&profile).expect("save_profile");
+
+    let loaded = load_profile(&crate::profile::ProfileName::from(name)).expect("load_profile");
+    let console = loaded
+        .console
+        .expect("console session survives the round trip");
+    assert_eq!(console.token, "console-token-value");
+    assert_eq!(console.site, crate::profile::ConsoleSite::International);
+    assert_eq!(console.region, "ap-southeast-1");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+            .expect("config path");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the console token is a credential");
+    }
+}
+
+/// A `[console]` table with no token is no session at all — a half-filled table
+/// (a hand-edit, or a login that never completed) must not reach the fetch layer
+/// as a credential. An unset site/region takes the vendor default instead of
+/// failing the whole profile load.
+#[test]
+fn a_console_table_without_a_token_reads_as_no_session() {
+    let _home = HomeSandbox::new();
+    let name = "console-partial";
+    save_profile(&crate::testutil::blank_profile(
+        &crate::profile::ProfileName::from(name),
+    ))
+    .expect("save_profile");
+    let config_path = profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+        .expect("config path");
+
+    std::fs::write(&config_path, "[console]\nsite = \"international\"\n").expect("write");
+    assert!(
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .console
+            .is_none()
+    );
+
+    std::fs::write(&config_path, "[console]\ntoken = \"   \"\n").expect("write");
+    assert!(
+        load_profile(&crate::profile::ProfileName::from(name))
+            .expect("load_profile")
+            .console
+            .is_none(),
+        "a blank token is the same state as an absent one"
+    );
+
+    std::fs::write(&config_path, "[console]\ntoken = \"t\"\n").expect("write");
+    let console = load_profile(&crate::profile::ProfileName::from(name))
+        .expect("load_profile")
+        .console
+        .expect("a token alone is a usable session");
+    assert_eq!(console.region, "cn-beijing", "the default region");
+    assert_eq!(console.site, crate::profile::ConsoleSite::Domestic);
+}
+
+/// The `[console]` block ships into every `config.toml`, so its copy is the one
+/// place this claim reaches users unprompted — and "the session lasts 48 hours"
+/// is false. The 48h runs from the operator's aliyun BROWSER sign-in, not from
+/// the `clauth login`: two tokens minted ~4h apart report the same
+/// `sessionCreateTimeStamp`/`sessionExpireTimeStamp`, so a fresh login inherits
+/// whatever is left and can be worth minutes.
+#[test]
+fn the_console_template_does_not_promise_a_fresh_48_hours() {
+    let rendered = render_config_toml(&Profile::new("p".to_string(), None, None));
+    assert!(
+        !rendered.contains("lasts 48 hours"),
+        "a login does not restart the clock, so the template must not say it does",
+    );
+    assert!(
+        rendered.contains("browser sign-in"),
+        "the template has to name what the clock actually runs from",
+    );
+}
+
+/// The dead-credential record is a new writer under `~/.clauth`, so the
+/// tree-wide 0600/0700 invariant covers it — the rule is the TREE, not the
+/// secrets in it, and this file holds a hash of a live credential.
+#[cfg(unix)]
+#[test]
+fn the_auth_expired_record_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["perm-auth-record"]);
+    crate::profile_cache::write_auth_expired(
+        &crate::profile::ProfileName::from("perm-auth-record"),
+        0x0123_4567_89ab_cdef,
+    );
+    assert!(crate::profile_cache::auth_expired_matches(
+        &crate::profile::ProfileName::from("perm-auth-record"),
+        0x0123_4567_89ab_cdef
+    ));
+    assert!(
+        !crate::profile_cache::auth_expired_matches(
+            &crate::profile::ProfileName::from("perm-auth-record"),
+            1
+        ),
+        "a record for another credential is inert"
+    );
+
+    let path = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("perm-auth-record"),
+        crate::profile_cache::THIRD_PARTY_AUTH_FILE,
+    )
+    .expect("cache path");
+    let mode = std::fs::metadata(&path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600, "got {mode:#o}");
+
+    crate::profile_cache::clear_auth_expired(&crate::profile::ProfileName::from(
+        "perm-auth-record",
+    ));
+    assert!(!crate::profile_cache::auth_expired_matches(
+        &crate::profile::ProfileName::from("perm-auth-record"),
+        0x0123_4567_89ab_cdef
+    ));
+}
+
+/// `save_profile` must not drop non-login blocks (e.g. `mcpOAuth`) that a Claude
+/// login-token refresh rewrites over — those are per-MCP-server logins
+/// independent of the account. Synthetic tokens only.
+#[test]
+fn save_profile_preserves_mcp_oauth_across_a_login_refresh() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("acct".to_string(), None, None);
+    profile.credentials = Some(pair("login-v1", "refresh-v1"));
+    save_profile(&profile).expect("save v1");
+
+    // Claude Code authenticates an MCP server, writing an mcpOAuth block into the
+    // store file alongside the login.
+    let cred_path =
+        profile_credentials_path(&crate::profile::ProfileName::from("acct")).expect("cred path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    stored["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    std::fs::write(&cred_path, serde_json::to_vec(&stored).unwrap()).expect("write mcp block");
+
+    // A Claude login-token rotation re-saves the profile with a new login.
+    profile.credentials = Some(pair("login-v2", "refresh-v2"));
+    save_profile(&profile).expect("save v2");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read after")).expect("parse");
+    assert_eq!(
+        after["claudeAiOauth"]["accessToken"], "login-v2",
+        "the Claude login rotated to v2"
+    );
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP-server login survived the login refresh"
+    );
+}
+
+/// The crash-recovery leg is the one write that reaches `credentials.json`
+/// without going through `save_profile`, so it owes the same preservation. The
+/// staged sidecar holds the rotated login alone; writing those bytes raw drops
+/// the MCP-server logins the store carries, and the sidecar is consumed right
+/// after, so nothing can recover them.
+#[test]
+fn pending_recovery_preserves_the_stores_mcp_oauth() {
+    let _home = HomeSandbox::new();
+    let name = "pending-preserve-mcp";
+    let committed = pair("old-access", "old-refresh");
+    seed_committed(name, &committed);
+
+    // Claude Code authenticated an MCP server through the store.
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    stored["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    std::fs::write(&cred_path, serde_json::to_vec(&stored).unwrap()).expect("write mcp block");
+
+    // A rotation stages, then the commit never lands.
+    let staged = pair("new-access", "new-refresh");
+    stage_rotated_credentials(&crate::profile::ProfileName::from(name), &staged)
+        .expect("stage_rotated_credentials");
+    let pending_path = profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&cred_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&pending_path, now);
+
+    recover_pending_credentials(&crate::profile::ProfileName::from(name), Some(committed));
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("re-read")).expect("parse");
+    assert_eq!(
+        after["claudeAiOauth"]["refreshToken"], "new-refresh",
+        "the adopted rotation still lands"
+    );
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP-server login survives an interrupted rotation"
+    );
+}
+
+#[test]
+fn rolling_token_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.rolling_token = true;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.rolling_token);
+}
+
+/// The pre-rename `session_feed` spelling is deliberately NOT aliased: no
+/// released clauth ever wrote it, and a permanent alias for something that
+/// never shipped is pure legacy surface. An unknown key parses as OFF.
+#[test]
+fn the_pre_rename_session_feed_key_is_not_carried() {
+    let legacy: ProfileConfig =
+        toml::from_str("session_feed = true\n").expect("parse legacy config");
+    assert!(
+        !legacy.rolling_token,
+        "installs that ran the feature branch re-run `clauth rolling-token <p>` once"
+    );
+}
+
+/// A test that forgets its sandbox must fail rather than reach the operator's
+/// tree: `~/.clauth` is live state a running clauth writes and flocks, so a
+/// stray write lands in their accounts and a stray `~/.clauth/.lock` wait times
+/// the test out on contention it never staged.
+#[test]
+fn resolving_a_home_with_no_sandbox_held_panics() {
+    // Hold the lock a sandbox holds and set NO override: under a shared-process
+    // runner a parallel sandbox would otherwise answer this call.
+    let _guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let reached = std::panic::catch_unwind(|| home_dir().map(|p| p.display().to_string()));
+
+    let payload = match reached {
+        Ok(home) => panic!("a sandbox-less test resolved a home instead of panicking: {home:?}"),
+        Err(payload) => payload,
+    };
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(
+        message.contains("HomeSandbox"),
+        "the panic must name the fix, got: {message}"
+    );
+}
+
+/// `login_is_oauth` answers credential typing; its doc must say so rather
+/// than claiming the routing question for the managed field. Pinned in
+/// source: a doc that reads as the whole routing rule is what routed
+/// readers to the wrong answer.
+#[test]
+fn login_is_oauth_doc_names_the_managed_half_and_points_at_the_routing_answer() {
+    let src = include_str!("../../src/profile.rs");
+    let before = &src[..src
+        .find("pub(crate) fn login_is_oauth(")
+        .expect("login_is_oauth is defined")];
+    let doc = &before[before
+        .rfind("/// Credential typing")
+        .expect("the doc opens with its subject")..];
+    assert!(
+        doc.contains("managed `base_url` field alone"),
+        "the doc names the half: {doc}"
+    );
+    assert!(
+        doc.contains("[`stored_endpoint`]"),
+        "the doc points at the reader that answers both halves: {doc}"
+    );
+}
+
+/// `routing_endpoint` reads both halves in the producer's order: an explicit
+/// env entry wins over the managed field, and a blank one is no override.
+/// Pinned because the blank test is what keeps an empty
+/// `ANTHROPIC_BASE_URL` from rerouting a roster row and a cost clause to
+/// nothing.
+#[test]
+fn routing_endpoint_reads_env_first_and_a_blank_entry_is_no_override() {
+    let mut p = Profile::new(
+        "p".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    assert_eq!(
+        p.routing_endpoint(),
+        Some("https://api.deepseek.com/anthropic"),
+        "the managed field alone answers when no env entry exists"
+    );
+    p.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "http://localhost:4000".to_string(),
+    );
+    assert_eq!(
+        p.routing_endpoint(),
+        Some("http://localhost:4000"),
+        "an explicit env entry wins, the producer's own order"
+    );
+    p.env
+        .insert("ANTHROPIC_BASE_URL".to_string(), "   ".to_string());
+    assert_eq!(
+        p.routing_endpoint(),
+        Some("https://api.deepseek.com/anthropic"),
+        "a blank entry is no override"
+    );
 }

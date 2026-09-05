@@ -18,17 +18,20 @@ use crate::profile::AppConfig;
 const TICK: Duration = Duration::from_millis(80);
 
 /// Launch the full-screen TUI. Returns on quit (q/⎋/Ctrl+C) or fatal error.
-pub(crate) fn run(config: AppConfig) -> Result<()> {
+/// `herdr_mode` is decided once by `cmd_tui` from `HERDR_ENV` and applied to
+/// the constructed [`app::App`] via [`app::App::with_herdr_mode`]; nothing
+/// else here reads the environment.
+pub(crate) fn run(config: AppConfig, herdr_mode: bool) -> Result<()> {
     // `try_init` owns raw mode + alt screen and installs a restore panic hook,
     // so a panic mid-draw no longer leaves the terminal corrupted.
     let mut terminal = ratatui::try_init().context("Failed to initialize the terminal")?;
-    let outcome = run_loop(&mut terminal, config);
+    let outcome = run_loop(&mut terminal, config, herdr_mode);
     ratatui::restore();
     outcome
 }
 
-fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig) -> Result<()> {
-    let mut application = app::App::new(config);
+fn run_loop(terminal: &mut DefaultTerminal, config: AppConfig, herdr_mode: bool) -> Result<()> {
+    let mut application = app::App::new(config).with_herdr_mode(herdr_mode);
     // Non-blocking reconcile: fast path runs inline; verdict sequenced via
     // `StartupSignal`. Bootstrap is spawned from `on_tick` once reconcile
     // settles — neither blocks the first paint.

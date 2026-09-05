@@ -58,6 +58,19 @@ pub(super) fn fetch(
                 // Host-level throttle: stop probing, let the caller defer.
                 return Err(ThirdPartyError::RateLimited { retry_after });
             }
+            Err(ThirdPartyError::AuthExpired) => {
+                // Only a HINT 401 proves the key died: that endpoint worked
+                // before, so its verdict is about the credential, not the
+                // route. A candidate path is a guess — hosts that 401
+                // unmatched routes exist, and a false verdict here writes a
+                // durable record a key re-entry cannot clear (the fingerprint
+                // hashes the key, so re-entering the SAME key matches the
+                // record again). A candidate 401 is just another miss.
+                if Some(path) == hint {
+                    return Err(ThirdPartyError::AuthExpired);
+                }
+                continue;
+            }
             Err(_) => continue, // 404 / network / parse — try the next candidate
         };
         let Ok(value) = serde_json::from_str::<Value>(&text) else {

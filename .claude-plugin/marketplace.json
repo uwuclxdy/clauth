@@ -1,6 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "clauth",
+  "description": "Expose clauth profiles to the session: list/usage, switch, delegate.",
   "owner": {
     "name": "uwuclxdy"
   },
@@ -8,7 +9,7 @@
     {
       "name": "clauth",
       "source": "./plugins",
-      "version": "0.14.1",
+      "description": "Expose clauth profiles to the session: list/usage, switch, delegate.",
       "category": "developer-tools"
     }
   ]

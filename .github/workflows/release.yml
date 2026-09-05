@@ -73,7 +73,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
       - name: Prepare asset
         run: cp "target/${{ matrix.target }}/release/clauth${{ matrix.ext }}" "${{ matrix.asset_name }}${{ matrix.ext }}"
       - name: Attest build provenance   # keyless SLSA provenance; audit with `gh attestation verify`

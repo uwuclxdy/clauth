@@ -11,7 +11,8 @@ use crate::profile::DivergenceChoice;
 
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
-    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal, Tab,
+    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal,
+    NamePromptForm, PresetPickerForm, Tab,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -27,6 +28,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
+        Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
+        Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
@@ -225,6 +228,20 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         .padding(Padding::new(2, 2, 1, 1))
 }
 
+/// [`modal_block`] plus the contract's title-right meta slot, for a modal whose
+/// contents are scoped to one named thing. The name keeps its own case (it is a
+/// proper noun, not a structural label) and stays `TEXT_DIM` — it is data about
+/// the modal, so it takes neither the title's italic nor any bold.
+fn modal_block_with_meta(title: &str, meta: Option<&str>) -> Block<'static> {
+    let block = modal_block(title);
+    match meta {
+        Some(meta) => block.title(
+            Line::from(Span::styled(format!(" {meta} "), theme::dim())).alignment(Alignment::Right),
+        ),
+        None => block,
+    }
+}
+
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
         // The one non-confirm modal: an in-use account can't be acted on.
@@ -240,6 +257,7 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::Switch(_)
             | ConfirmAction::RotateAll
             | ConfirmAction::RotateOne(_)
+            | ConfirmAction::DisableOne(_)
             | ConfirmAction::CaptureOverwrite(..)
             | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)
@@ -485,6 +503,64 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     frame.set_cursor_position((cx, cy));
 }
 
+/// The Setup menu's shared name prompt. Same geometry trick as
+/// [`draw_capture_name`] — the input is line index 2, so the native cursor can
+/// be placed without re-measuring what `draw_modal` already sized.
+fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
+    let lines = vec![
+        Line::from(Span::styled(form.action.blurb(), theme::dim())),
+        Line::from(""),
+        labelled_input("name", &form.input, true),
+    ];
+
+    let title = form.action.title();
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (content_w + 6)
+        .max(title.chars().count() as u16 + 4)
+        .min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let rect = centered(area, w, h);
+    let inner_x = rect.x.saturating_add(3);
+    let inner_y = rect.y.saturating_add(2);
+
+    draw_modal(frame, area, title, lines);
+
+    // x = edit gutter "✎ " (2) + label "name" (4) + " " (1) + cols before caret
+    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(&form.input) as u16);
+    let cy = inner_y.saturating_add(2);
+    frame.set_cursor_position((cx, cy));
+}
+
+/// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`
+/// tail so the two groups read apart without a second rule.
+fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm) {
+    let last = form.presets.len().saturating_sub(1);
+    let cursor = form.cursor.min(last);
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            format!("sets the base url and models on '{}'.", form.target),
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
+    for (i, preset) in form.presets.iter().enumerate() {
+        let mut line = option_line(i == cursor, preset.name.clone());
+        if preset.builtin {
+            line.push_span(Span::styled("  built-in", theme::dim()));
+        }
+        lines.push(line);
+    }
+    // `d` reaches nothing else from here, so the picker has to teach it.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "d deletes a saved preset",
+        theme::dim(),
+    )));
+
+    draw_modal(frame, area, "PRESET", lines);
+}
+
 /// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
@@ -529,7 +605,11 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{21b5}", "open settings · edit field · flip toggle"),
                 ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
                 ("space", "cycle the model preset (model row)"),
-                ("env", "+ add env · \u{21b5} edits a value · a removes"),
+                ("env", "+ add env · \u{21b5} edits a value"),
+                (
+                    "a",
+                    "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+                ),
                 (
                     "disable / enable",
                     "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
@@ -561,11 +641,16 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Plugin => vec![(
             "plugin",
             &[
-                ("\u{2191}\u{2193}", "pick check · scroll detail"),
-                ("\u{21b5}", "open the selected row's detail"),
+                (
+                    "\u{2191}\u{2193}",
+                    "pick check · scroll detail · walk herdr options",
+                ),
+                ("\u{21b5}", "open detail · activate an option"),
+                ("space", "activate the focused herdr option"),
+                ("+ / -", "step the tag refresh"),
                 ("f", "apply the selected row's fix"),
                 ("r", "re-run all checks"),
-                ("esc", "back to the list"),
+                ("esc", "back to the list · close the editor"),
             ][..],
         )],
         Tab::Fallback => vec![(
@@ -783,6 +868,11 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     const HOTKEY_W: u16 = 1; // 1 char for hotkey letter, or 1 space if none
     const GUTTER: u16 = 2; // "❯ " or "  "
 
+    // The rule between the account-scoped items and the tab-global ones. Only
+    // when both groups exist — a one-group menu needs nothing separated.
+    let rule_at = (state.scoped_len > 0 && state.scoped_len < state.items.len())
+        .then_some(state.scoped_len as u16);
+
     // Render rows with right-aligned hotkeys — can't use draw_modal because that
     // wraps all lines in one Paragraph, preventing per-row background tinting.
     // Custom draw: measure → size → clear → border → per-row widgets.
@@ -794,22 +884,51 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         .unwrap_or(0) as u16;
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
+    // Both border breaks have to fit: ` ACTIONS ` on the left, ` <account> ` on
+    // the right, 2 corners and at least one dash of chrome between them.
+    let title_w = title.chars().count() as u16
+        + 2
+        + state
+            .context
+            .as_ref()
+            .map_or(0, |c| c.chars().count() as u16 + 2);
     let w = (content_w + 6)
-        .max(title.chars().count() as u16 + 4)
+        .max(title_w + 3)
         .min(area.width.saturating_sub(4));
-    // items rows + 4 chrome (border + padding)
-    let h = (state.items.len() as u16 + 4).min(area.height.saturating_sub(4));
+    // items rows + the rule + 4 chrome (border + padding)
+    let h = (state.items.len() as u16 + u16::from(rule_at.is_some()) + 4)
+        .min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
-    let block = modal_block(title);
+    let block = modal_block_with_meta(title, state.context.as_deref());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+
+    if let Some(at) = rule_at {
+        let y = inner.y + at;
+        if y < inner.y + inner.height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "─".repeat(inner.width as usize),
+                    theme::line(),
+                )))
+                .style(theme::base()),
+                Rect {
+                    y,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+    }
 
     let inner_w = inner.width;
     for (i, item) in state.items.iter().enumerate() {
         let focused = i == state.cursor;
-        let y = inner.y + i as u16;
+        // Rows below the rule sit one further down; the cursor never lands on
+        // it, so `items` stays the only index anything else needs.
+        let y = inner.y + i as u16 + u16::from(rule_at.is_some_and(|at| i as u16 >= at));
         if y >= inner.y + inner.height {
             break;
         }

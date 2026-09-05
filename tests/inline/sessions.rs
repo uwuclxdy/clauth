@@ -7,7 +7,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -52,8 +51,30 @@ fn tool_result_line(sid: &str) -> String {
 /// model, and input/output token counts. `parse_file` requires a timestamp, so
 /// one is always stamped.
 fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, output: u64) -> String {
+    usage_line_at(
+        sid,
+        cwd,
+        msg_id,
+        model,
+        input,
+        output,
+        "2026-06-11T10:30:00+00:00",
+    )
+}
+
+/// `usage_line` at an explicit UTC timestamp — the hour byte (offset 11) drives
+/// the peak/off-peak tier.
+fn usage_line_at(
+    sid: &str,
+    cwd: &str,
+    msg_id: &str,
+    model: &str,
+    input: u64,
+    output: u64,
+    timestamp: &str,
+) -> String {
     json!({
-        "sessionId": sid, "cwd": cwd, "timestamp": "2026-06-11T10:30:00+00:00",
+        "sessionId": sid, "cwd": cwd, "timestamp": timestamp,
         "message": {
             "id": msg_id, "role": "assistant", "model": model,
             "usage": {
@@ -65,21 +86,79 @@ fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, outpu
     .to_string()
 }
 
+// ── price-table builders ─────────────────────────────────────────────────────
+
+/// One unconstrained price entry at the given input/output rates (cache 0).
+fn flat_entry(input: f64, output: f64) -> crate::pricing::PriceEntry {
+    crate::pricing::PriceEntry {
+        input,
+        output,
+        cache_read: 0.0,
+        cache_write: 0.0,
+        constraint: None,
+    }
+}
+
+/// An exact-match model from its price entries.
+fn priced_model(id: &str, entries: Vec<crate::pricing::PriceEntry>) -> crate::pricing::PricedModel {
+    crate::pricing::PricedModel {
+        id: id.to_owned(),
+        prices: entries,
+        effective_at: None,
+    }
+}
+
 /// A `PriceTable` from `(model_id, input_rate, output_rate)` rows; cache rates 0.
 fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
-    let mut rates = HashMap::new();
-    for &(id, input, output) in rows {
-        rates.insert(
-            id.to_owned(),
-            crate::pricing::ModelRate {
-                input,
-                output,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            },
-        );
-    }
-    crate::pricing::PriceTable::from_rates(rates)
+    crate::pricing::PriceTable::capture(
+        rows.iter()
+            .map(|&(id, input, output)| priced_model(id, vec![flat_entry(input, output)]))
+            .collect(),
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
+}
+
+/// (model id, peak input/output, off-peak input/output) per-token rates.
+type WindowRates<'a> = (&'a str, (f64, f64), (f64, f64));
+
+/// deepseek-chat-shaped pricing: an off-peak fallback entry plus a peak
+/// `00:30–16:30Z` time-window entry, which reversed-entry selection prefers
+/// while it is active. Hour 0 prices off-peak and hour 16 peak.
+fn windowed_table(rows: &[WindowRates<'_>]) -> crate::pricing::PriceTable {
+    use crate::pricing::Constraint;
+    crate::pricing::PriceTable::capture(
+        rows.iter()
+            .map(|&(id, peak, off_peak)| {
+                priced_model(
+                    id,
+                    vec![
+                        flat_entry(off_peak.0, off_peak.1),
+                        crate::pricing::PriceEntry {
+                            input: peak.0,
+                            output: peak.1,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                            constraint: Some(Constraint::TimeWindow {
+                                start: "00:30:00Z".to_owned(),
+                                end: "16:30:00Z".to_owned(),
+                            }),
+                        },
+                    ],
+                )
+            })
+            .collect(),
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
 }
 
 fn find<'a>(groups: &'a [WorkspaceGroup], id: &str) -> Option<&'a SessionInfo> {
@@ -509,6 +588,138 @@ fn annotate_sums_tokens_and_cost_across_models() {
 }
 
 #[test]
+fn annotate_prices_peak_and_off_peak_hours_at_their_tiers() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-win/swin.jsonl");
+    // Two responses an hour apart: hour 0 prices off-peak, hour 16 peak —
+    // per the settled hour-granularity formula (window 00:30–16:30Z sampled
+    // at the hour's start).
+    write_jsonl(
+        &path,
+        &[
+            usage_line_at(
+                "swin",
+                "/w/win",
+                "w1",
+                "deepseek-chat",
+                1000,
+                0,
+                "2026-06-11T00:10:00+00:00",
+            ),
+            usage_line_at(
+                "swin",
+                "/w/win",
+                "w2",
+                "deepseek-chat",
+                1000,
+                0,
+                "2026-06-11T16:10:00+00:00",
+            ),
+        ],
+    );
+    let table = windowed_table(&[("deepseek-chat", (2e-6, 4e-6), (1e-6, 2e-6))]);
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "swin").expect("session indexed");
+    assert_eq!(info.tokens, Some(2000));
+    // 1000 * 1e-6 (off-peak) + 1000 * 2e-6 (peak) = $0.003 — neither the
+    // all-off-peak ($0.002) nor the all-peak ($0.004) flat total.
+    let cost = info.cost.expect("priced");
+    assert!((cost - 0.003).abs() < 1e-9, "got {cost}");
+}
+
+#[test]
+fn annotate_priced_zero_cost_session_is_some_zero() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-zero/szero.jsonl");
+    // A token-bearing row with zero counts on a priced model: the session has
+    // usage, the model has a rate ⇒ Some(0.0), distinct from all-unpriced None.
+    write_jsonl(
+        &path,
+        &[usage_line(
+            "szero",
+            "/w/zero",
+            "z1",
+            "claude-opus-4-8",
+            0,
+            0,
+        )],
+    );
+    let table = price_table(&[("claude-opus-4-8", 1e-6, 2e-6)]);
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "szero").expect("session indexed");
+    assert_eq!(info.tokens, Some(0));
+    assert_eq!(info.cost, Some(0.0));
+}
+
+#[test]
+fn annotate_prices_each_day_at_its_dated_rate() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-dated/sdated.jsonl");
+    // Two usage days straddling a 06-12 rate change: each (model, day) pair
+    // prices at the snapshot live on its own date — 06-11 at the old rate,
+    // 06-13 at the new one.
+    write_jsonl(
+        &path,
+        &[
+            usage_line_at(
+                "sdated",
+                "/w/dated",
+                "d1",
+                "m",
+                1000,
+                0,
+                "2026-06-11T10:30:00+00:00",
+            ),
+            usage_line_at(
+                "sdated",
+                "/w/dated",
+                "d2",
+                "m",
+                1000,
+                0,
+                "2026-06-13T10:30:00+00:00",
+            ),
+        ],
+    );
+    let cheap = priced_model("m", vec![flat_entry(1e-6, 0.0)]);
+    let dear = priced_model("m", vec![flat_entry(2e-6, 0.0)]);
+    let table = crate::pricing::PriceTable::capture(
+        vec![dear.clone()],
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        vec![
+            crate::pricing::RateSnapshot {
+                captured: "2026-06-01".to_owned(),
+                models: vec![cheap],
+            },
+            crate::pricing::RateSnapshot {
+                captured: "2026-06-12".to_owned(),
+                models: vec![dear],
+            },
+        ],
+    );
+
+    let mut groups = build_index();
+    annotate_all(&mut groups, Some(&table));
+
+    let info = find(&groups, "sdated").expect("session indexed");
+    assert_eq!(info.tokens, Some(2000));
+    // 1000 * 1e-6 (06-11) + 1000 * 2e-6 (06-13) = $0.003, not $0.004 at the
+    // newest rate for both.
+    let cost = info.cost.expect("priced");
+    assert!((cost - 0.003).abs() < 1e-9, "got {cost}");
+}
+
+#[test]
 fn annotate_leaves_tokenless_session_blank() {
     let sb = HomeSandbox::new();
     let path = sb.home().join(".claude/projects/-w-none/snone.jsonl");
@@ -569,6 +780,8 @@ fn annotate_dedupes_carried_forward_line_by_tok_key() {
     let info = find(&groups, "sdupe").expect("session indexed");
     // Single-counted: 1000 + 500, NOT doubled to 3000.
     assert_eq!(info.tokens, Some(1500));
+    // No table ⇒ cost stays None, however many tokens the file carries.
+    assert_eq!(info.cost, None);
 }
 
 // ── A3: session → last-ran-profile stamp/read ────────────────────────────────
@@ -658,6 +871,124 @@ fn contested_shared_session_reads_back_unknown() {
     );
 }
 
+/// Stage the exact per-conversation record the hook writes:
+/// `~/.clauth/conversations/<id>.json`, carrying the account the hook resolved.
+/// `resolved: null` is the shape of a record that never attributed an account.
+fn stage_record(sb: &HomeSandbox, id: &str, resolved: Option<&str>) {
+    let dir = sb.home().join(".clauth/conversations");
+    fs::create_dir_all(&dir).unwrap();
+    crate::profile::atomic_write_600(
+        &dir.join(format!("{id}.json")),
+        serde_json::to_vec(&json!({ "resolved": resolved })).unwrap(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn exact_observation_survives_both_runs_and_shows_in_listing() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let s = projects.join("-w-exact/exactE.jsonl");
+    write_jsonl(&s, &[user_line("exactE", "/w/exact", "one profile's work")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&s, t0);
+    stage_record(&sb, "exactE", Some("exact"));
+
+    // Both concurrent runs' exits sweep the same shared-store transcript: its
+    // mtime is inside each run's window, so each sweep would claim it.
+    stamp_run_sessions("A", &projects, false, t0);
+    stamp_run_sessions("B", &projects, false, t0);
+
+    // The exact per-conversation observation is the attribution, whatever the
+    // sweeps saw — and the listing shows it.
+    let mut groups = groups_of(&["exactE"]);
+    annotate_owners(&mut groups);
+    assert_eq!(
+        find(&groups, "exactE").unwrap().last_ran_profile.as_deref(),
+        Some("exact")
+    );
+    assert_eq!(owner_of("exactE").as_deref(), Some("exact"));
+    // The sweep skipped the id: no Known, no Contested stamp for it at all.
+    let store = load_store(&store_path().unwrap());
+    assert_eq!(store.sessions.get("exactE"), None);
+}
+
+#[test]
+fn exact_observation_outranks_a_stale_store_entry() {
+    let sb = HomeSandbox::new();
+    // A store entry a pre-fix sweep stamped, naming a different profile than
+    // the exact observation does today.
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("exactE".into(), SessionOwner::Known("old".into()));
+    save_store(&path, &store).unwrap();
+    stage_record(&sb, "exactE", Some("exact"));
+
+    let mut groups = groups_of(&["exactE"]);
+    annotate_owners(&mut groups);
+    assert_eq!(
+        find(&groups, "exactE").unwrap().last_ran_profile.as_deref(),
+        Some("exact"),
+        "the exact observation is authoritative over a stale stored stamp"
+    );
+}
+
+#[test]
+fn sweep_still_stamps_ids_the_exact_writer_never_saw() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let main = projects.join("-w-nr/never.jsonl");
+    let agent = projects.join("-w-nr/agent-1a2b3c4d.jsonl");
+    write_jsonl(&main, &[user_line("never", "/w/nr", "unrecorded")]);
+    write_jsonl(&agent, &[user_line("agent-1a2b3c4d", "/w/nr", "sub work")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&main, t0);
+    set_mtime(&agent, t0);
+
+    // No record for either id — the exact writer never saw them, so the sweep
+    // stays their only observer, including the contested fold.
+    stamp_run_sessions("A", &projects, false, t0);
+    stamp_run_sessions("B", &projects, false, t0);
+
+    let mut groups = groups_of(&["never", "agent-1a2b3c4d"]);
+    annotate_owners(&mut groups);
+    assert_eq!(find(&groups, "never").unwrap().last_ran_profile, None);
+    assert_eq!(
+        find(&groups, "agent-1a2b3c4d").unwrap().last_ran_profile,
+        None
+    );
+    let store = load_store(&store_path().unwrap());
+    assert_eq!(store.sessions.get("never"), Some(&SessionOwner::Contested));
+    assert_eq!(
+        store.sessions.get("agent-1a2b3c4d"),
+        Some(&SessionOwner::Contested)
+    );
+}
+
+#[test]
+fn record_without_attribution_does_not_skip_the_sweep() {
+    let sb = HomeSandbox::new();
+    let projects = sb.home().join(".claude/projects");
+    let s = projects.join("-w-bl/blankB.jsonl");
+    write_jsonl(&s, &[user_line("blankB", "/w/bl", "attribution failed")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&s, t0);
+    // The record exists but never attributed an account (an unattributable
+    // reading): the exact writer does not own the id, so the sweep stamps it.
+    stage_record(&sb, "blankB", None);
+
+    stamp_run_sessions("B", &projects, false, t0);
+
+    let store = load_store(&store_path().unwrap());
+    assert_eq!(
+        store.sessions.get("blankB"),
+        Some(&SessionOwner::Known("B".into()))
+    );
+    assert_eq!(owner_of("blankB").as_deref(), Some("B"));
+}
+
 #[test]
 fn annotate_owners_sets_only_known_entries() {
     let _sb = HomeSandbox::new();
@@ -681,6 +1012,435 @@ fn annotate_owners_sets_only_known_entries() {
     );
     assert_eq!(find(&groups, "contest").unwrap().last_ran_profile, None);
     assert_eq!(find(&groups, "absent").unwrap().last_ran_profile, None);
+}
+
+// ── owner-store prune ────────────────────────────────────────────────────────
+
+/// The prune walks the full depth, not the resume-visible depth: a nested
+/// per-session tree (`subagents/`) holds real transcripts deeper than
+/// `TOP_LEVEL_DEPTH`, and pruning on the shallow walk would reap them. The
+/// "gone" id has no transcript at all. Driven through `stamp_run_sessions`, the
+/// production wiring, with both transcripts outside the run window so the prune
+/// — not the fold — is the only writer.
+#[test]
+fn prune_removes_a_gone_transcript_and_keeps_a_nested_one() {
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("gone".into(), SessionOwner::Known("A".into()));
+    store
+        .sessions
+        .insert("agent-nested".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    // A top-level transcript keeps the walk non-empty under a shallow-walk
+    // mutation, so the empty-walk guard cannot mask it. The nested transcript
+    // below is depth 5, invisible to TOP_LEVEL_DEPTH and visible to
+    // WALK_MAX_DEPTH.
+    let projects = global_projects(&sb);
+    let top = projects.join("-w-n/top.jsonl");
+    write_jsonl(&top, &[user_line("top", "/w/n", "top work")]);
+    let nested = projects.join("-w-n/s-main/subagents/agent-nested.jsonl");
+    write_jsonl(&nested, &[user_line("agent-nested", "/w/n", "sub work")]);
+
+    // Both predate the run window, so the run folds no ids and the nested keep
+    // can only come from the full-depth walk. A TOP_LEVEL_DEPTH walk would miss
+    // `agent-nested` and reap it.
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&top, t0);
+    set_mtime(&nested, t0);
+    stamp_run_sessions("shared", &projects, false, t0 + Duration::from_secs(60));
+
+    let reloaded = load_store(&path);
+    assert_eq!(
+        reloaded.sessions.get("gone"),
+        None,
+        "a gone transcript is reaped"
+    );
+    assert_eq!(
+        reloaded.sessions.get("agent-nested"),
+        Some(&SessionOwner::Known("A".into())),
+        "a transcript nested past the resume depth is still live"
+    );
+}
+
+/// The grace keep: an id with no global transcript is kept while its main-scope
+/// record last fired within the missing-transcript grace, and reaped once the
+/// record has gone silent past it. Deleting the grace clause reaps the fresh id
+/// too, since the walked tree holds no transcript for it.
+#[test]
+fn prune_keeps_a_grace_record_and_reaps_a_silent_one() {
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("grace-fresh".into(), SessionOwner::Known("A".into()));
+    store
+        .sessions
+        .insert("grace-silent".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    // A non-empty global walk, so the empty-walk guard cannot mask the keep.
+    let projects = global_projects(&sb);
+    let top = projects.join("-w-top/top.jsonl");
+    write_jsonl(&top, &[user_line("top", "/w/top", "top work")]);
+
+    // Neither id has a transcript in the walked tree; the keep must come from
+    // the record mtime alone. `grace-fresh` fired now, `grace-silent` long ago.
+    stage_record(&sb, "grace-fresh", Some("A"));
+    stage_record(&sb, "grace-silent", Some("A"));
+    set_mtime(
+        &sb.home().join(".clauth/conversations/grace-silent.json"),
+        SystemTime::UNIX_EPOCH,
+    );
+
+    let mut paths = Vec::new();
+    let walk_complete = collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+    assert!(walk_complete);
+
+    let mut live = load_store(&path);
+    prune_owner_store(&mut live, &paths, walk_complete);
+
+    assert_eq!(
+        live.sessions.get("grace-fresh"),
+        Some(&SessionOwner::Known("A".into())),
+        "a record fired within the grace keeps its owner with no transcript"
+    );
+    assert_eq!(
+        live.sessions.get("grace-silent"),
+        None,
+        "a record silent past the grace is reaped"
+    );
+}
+
+/// The isolated keep: an id whose only transcript sits in a LIVE isolated store
+/// is kept even though the walked global tree has no transcript for it; the same
+/// id is reaped once no live isolated store holds it. Deleting the isolated
+/// clause reaps the id while its holder is still live.
+#[test]
+fn prune_keeps_a_live_isolated_owner_and_reaps_it_once_dead() {
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("iso-hold".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    // A non-empty global walk, so the empty-walk guard cannot mask the keep.
+    let projects = global_projects(&sb);
+    let top = projects.join("-w-top/top.jsonl");
+    write_jsonl(&top, &[user_line("top", "/w/top", "top work")]);
+
+    // The id's only transcript is inside a live isolated store.
+    let iso = sb
+        .home()
+        .join(".clauth/profiles/iso/runtime-isolated/projects/-w-iso/iso-hold.jsonl");
+    write_jsonl(&iso, &[user_line("iso-hold", "/w/iso", "iso work")]);
+    let sessions_dir = sb.home().join(".clauth/profiles/iso/sessions-isolated");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    let lock_file = crate::runtime::open_pid_file(&sessions_dir.join("12345")).unwrap();
+    lock_file.lock().unwrap(); // held so the runtime reads as live
+
+    let mut paths = Vec::new();
+    let walk_complete = collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+    assert!(walk_complete);
+
+    let mut live = load_store(&path);
+    prune_owner_store(&mut live, &paths, walk_complete);
+    assert_eq!(
+        live.sessions.get("iso-hold"),
+        Some(&SessionOwner::Known("A".into())),
+        "a live isolated store keeps the owner with no global transcript"
+    );
+
+    // Release the liveness marker: the same store now holds nothing live.
+    drop(lock_file);
+
+    let mut live = load_store(&path);
+    prune_owner_store(&mut live, &paths, walk_complete);
+    assert_eq!(
+        live.sessions.get("iso-hold"),
+        None,
+        "the owner is reaped once no live isolated store holds it"
+    );
+}
+
+/// `collect_jsonl` fails soft on an unreadable dir by returning an empty vec,
+/// which reads identically to "no transcripts exist" — pruning then would wipe
+/// the store. The guard refuses an empty walk.
+#[test]
+fn prune_refuses_an_empty_walk() {
+    let _sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("any-id".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    // No global projects dir exists, so the walk returns zero paths.
+    let mut live = load_store(&path);
+    let changed = prune_owner_store(&mut live, &[], true);
+    assert!(!changed, "an empty walk must be refused");
+    assert_eq!(
+        live.sessions.get("any-id"),
+        Some(&SessionOwner::Known("A".into())),
+        "the refused prune left the store untouched"
+    );
+
+    let reloaded = load_store(&path);
+    assert_eq!(
+        reloaded.sessions.get("any-id"),
+        Some(&SessionOwner::Known("A".into())),
+        "an empty walk must never wipe the store"
+    );
+}
+
+/// The guard lives on the RUN, not on what the walk happened to return. An
+/// isolated run walks a throwaway tree, so its prune must be skipped outright —
+/// even while the global store is non-empty and would otherwise prune. Driven
+/// through `stamp_run_sessions`, the production wiring.
+#[test]
+fn an_isolated_run_performs_no_prune() {
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("gone".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    // A non-empty GLOBAL walk, so dropping the isolated guard would prune
+    // `gone`. The isolated run's own stamp walks a different tree.
+    let global = global_projects(&sb).join("-w-live/keep.jsonl");
+    write_jsonl(&global, &[user_line("keep", "/w/live", "still here")]);
+
+    let projects = iso_projects(&sb);
+    let iso_t = projects.join("-w-iso/isos.jsonl");
+    write_jsonl(&iso_t, &[user_line("isos", "/w/iso", "iso work")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&iso_t, t0);
+
+    stamp_run_sessions("iso", &projects, true, t0);
+
+    let reloaded = load_store(&path);
+    assert_eq!(
+        reloaded.sessions.get("gone"),
+        Some(&SessionOwner::Known("A".into())),
+        "an isolated run must perform no prune"
+    );
+    assert_eq!(
+        reloaded.sessions.get("isos"),
+        Some(&SessionOwner::Known("iso".into())),
+        "and it still stamps its own sessions"
+    );
+}
+
+/// The prune is wired into the shared-run teardown leg: `stamp_run_sessions`
+/// with `isolated == false` drops a stale owner alongside folding this run's
+/// sessions in.
+#[test]
+fn a_shared_run_prunes_stale_owners() {
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("gone".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    let projects = global_projects(&sb);
+    let fresh = projects.join("-w-new/freshS.jsonl");
+    write_jsonl(&fresh, &[user_line("freshS", "/w/new", "new")]);
+    let run_start = SystemTime::now();
+    set_mtime(&fresh, run_start + Duration::from_secs(1));
+
+    stamp_run_sessions("shared", &projects, false, run_start);
+
+    let reloaded = load_store(&path);
+    assert_eq!(
+        reloaded.sessions.get("gone"),
+        None,
+        "the shared run pruned the stale owner"
+    );
+    assert_eq!(
+        reloaded.sessions.get("freshS"),
+        Some(&SessionOwner::Known("shared".into())),
+        "and stamped this run's session"
+    );
+}
+
+/// A shared teardown whose window caught no ids still prunes: the prune is not
+/// gated on folding anything. A stale owner whose transcript is gone is reaped
+/// even while the walk finds only transcripts outside the run's window.
+#[test]
+fn a_shared_run_with_no_in_window_ids_still_prunes() {
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("gone".into(), SessionOwner::Known("A".into()));
+    store
+        .sessions
+        .insert("old".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    let projects = global_projects(&sb);
+    // One transcript OUTSIDE the run's window, so the run folds no ids — but
+    // the walk is non-empty, so the prune still runs and reaps `gone` (whose
+    // transcript is absent) while keeping `old` (whose transcript the walk saw).
+    let old = projects.join("-w-old/old.jsonl");
+    write_jsonl(&old, &[user_line("old", "/w/old", "pre-window work")]);
+    let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+    set_mtime(&old, t0);
+
+    stamp_run_sessions("shared", &projects, false, t0 + Duration::from_secs(60));
+
+    let reloaded = load_store(&path);
+    assert_eq!(
+        reloaded.sessions.get("gone"),
+        None,
+        "a window with no ids still prunes the gone owner"
+    );
+    assert_eq!(
+        reloaded.sessions.get("old"),
+        Some(&SessionOwner::Known("A".into())),
+        "and keeps the owner whose transcript the walk saw"
+    );
+}
+
+/// The walk reports a subtree it could not read. The prune must refuse that
+/// incomplete walk rather than reaping every owner whose transcript sat in the
+/// unseen subtree — a partial walk reading as a complete one is a bulk reap.
+#[cfg(unix)]
+#[test]
+fn prune_refuses_an_incomplete_walk() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("live".into(), SessionOwner::Known("A".into()));
+    store
+        .sessions
+        .insert("gone".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    let projects = global_projects(&sb);
+    // A top-level transcript keeps the walk's non-empty guard from firing, so
+    // the refusal below can only come from the incomplete guard.
+    let top = projects.join("-w-p/top.jsonl");
+    write_jsonl(&top, &[user_line("top", "/w/p", "top work")]);
+    // A nested dir the walk cannot read, holding `gone`'s transcript: a bulk
+    // reap would drop `gone` because the walk never saw it.
+    let unreadable = projects.join("-w-p/s-main/subagents/unreadable-dir");
+    write_jsonl(
+        &unreadable.join("gone.jsonl"),
+        &[user_line("gone", "/w/p", "hidden")],
+    );
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&unreadable).is_ok() {
+        // Running with rights that ignore the mode (root): the pose cannot be
+        // posed, so assert nothing rather than pass vacuously.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
+
+    let mut paths = Vec::new();
+    let walk_complete = collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+    assert!(
+        !walk_complete,
+        "the unreadable subtree marks the walk incomplete"
+    );
+
+    let mut live = load_store(&path);
+    let changed = prune_owner_store(&mut live, &paths, walk_complete);
+    assert!(
+        !changed,
+        "an incomplete walk must be refused, never bulk-reaped"
+    );
+
+    let reloaded = load_store(&path);
+    assert_eq!(
+        reloaded.sessions.get("gone"),
+        Some(&SessionOwner::Known("A".into())),
+        "the refused prune leaves the stale owner standing"
+    );
+    assert_eq!(
+        reloaded.sessions.get("live"),
+        Some(&SessionOwner::Known("A".into())),
+        "and the live owner is untouched"
+    );
+
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// A symlinked project dir hides its subtree from the walk, which never follows
+/// links. `collect_jsonl` must mark that walk incomplete so the prune refuses
+/// rather than reaping every owner whose transcript sits under the link.
+#[cfg(unix)]
+#[test]
+fn prune_refuses_a_walk_that_skipped_a_symlinked_project_dir() {
+    let sb = HomeSandbox::new();
+    let path = store_path().unwrap();
+    let mut store = SessionProfiles::default();
+    store
+        .sessions
+        .insert("hidden".into(), SessionOwner::Known("A".into()));
+    store
+        .sessions
+        .insert("top".into(), SessionOwner::Known("A".into()));
+    save_store(&path, &store).unwrap();
+
+    let projects = global_projects(&sb);
+    let top = projects.join("-w-top/top.jsonl");
+    write_jsonl(&top, &[user_line("top", "/w/top", "top work")]);
+
+    // The linked-away project dir holds `hidden`'s only transcript.
+    let outside = sb.home().join("linked-store");
+    let hidden = outside.join("hidden.jsonl");
+    write_jsonl(&hidden, &[user_line("hidden", "/w/link", "hidden work")]);
+    std::os::unix::fs::symlink(&outside, projects.join("-w-link")).unwrap();
+
+    let mut paths = Vec::new();
+    let walk_complete = collect_jsonl(&projects, WALK_MAX_DEPTH, &mut paths);
+    assert!(
+        !walk_complete,
+        "a skipped symlinked dir marks the walk incomplete"
+    );
+
+    let mut live = load_store(&path);
+    let changed = prune_owner_store(&mut live, &paths, walk_complete);
+    assert!(!changed, "an incomplete walk must be refused");
+    assert_eq!(
+        live.sessions.get("hidden"),
+        Some(&SessionOwner::Known("A".into())),
+        "the owner under the symlink is never reaped"
+    );
+}
+
+/// A walk capped at depth 0 cannot descend into its target dir at all, so it did
+/// not see everything under it and must report incomplete — the flag the prune
+/// relies on to refuse rather than bulk-reap.
+#[test]
+fn collect_jsonl_reports_a_depth_cap_truncation() {
+    let sb = HomeSandbox::new();
+    let projects = global_projects(&sb);
+    let deep = projects.join("-w-d/d1/deep.jsonl");
+    write_jsonl(&deep, &[user_line("deep", "/w/d", "deep work")]);
+
+    let mut paths = Vec::new();
+    assert!(
+        !collect_jsonl(&projects, 0, &mut paths),
+        "a walk capped before it can descend did not see everything"
+    );
 }
 
 // ── Session rescue: move an isolated transcript into the global store ─────────

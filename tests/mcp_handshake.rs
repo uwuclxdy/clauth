@@ -16,13 +16,46 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Write;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const PROTOCOL: &str = "2026-07-28";
+
+/// Everything herdr injects into a pane process that the server reads. The
+/// child runs the real serve path, which resolves a herdr pane reporter from
+/// exactly these, so a run started from a herdr pane would otherwise report
+/// this test's agent state at the operator's live session.
+const HERDR_VARS: [&str; 5] = [
+    "HERDR_PANE_ID",
+    "HERDR_SOCKET_PATH",
+    "HERDR_TAB_ID",
+    "HERDR_WORKSPACE_ID",
+    "HERDR_ENV",
+];
+
+/// A path no herdr binary can resolve to, so the reporter's second gate fails
+/// as well: cleared vars alone would still leave a `PATH` herdr reachable.
+const NO_HERDR_BIN: &str = "/nonexistent/clauth-mcp-handshake-no-herdr";
+
+/// The spawn every case in this file uses.
+fn server_command(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_clauth"));
+    command
+        .arg("mcp")
+        .env("HOME", home)
+        .env("CLAUTH_MCP_PROBE", "1")
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env("HERDR_BIN_PATH", NO_HERDR_BIN);
+    for var in HERDR_VARS {
+        command.env_remove(var);
+    }
+    command
+}
 
 /// The `_meta` envelope every request carries now that there is no handshake to
 /// hang it on. Both keys are required; a missing one is a malformed request.
@@ -39,11 +72,7 @@ fn client_meta(version: &str) -> Value {
 /// there, and `CLAUTH_MCP_PROBE` keeps it off the live-session tally.
 fn handshake(requests: &[Value]) -> HashMap<i64, Value> {
     let home = TempDir::new().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_clauth"))
-        .arg("mcp")
-        .env("HOME", home.path())
-        .env("CLAUTH_MCP_PROBE", "1")
-        .env_remove("CLAUDE_CONFIG_DIR")
+    let mut child = server_command(home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -86,6 +115,40 @@ fn discover_and_list() -> HashMap<i64, Value> {
             "params": { "_meta": client_meta(PROTOCOL) }
         }),
     ])
+}
+
+/// The only case here that drives the serve path's herdr reporter. Every other
+/// test in the crate builds its server in-process and carries no reporter, so
+/// this spawn is the one that would reach a real pane, and the run's own
+/// environment decides that. Assert the neutralization on the command rather
+/// than the outcome: a reporter that stays silent proves nothing on a box that
+/// runs no herdr at all.
+#[test]
+fn the_spawn_cannot_reach_a_live_herdr() {
+    let home = TempDir::new().unwrap();
+    let command = server_command(home.path());
+    let env: HashMap<_, _> = command
+        .get_envs()
+        .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+        .collect();
+
+    for var in HERDR_VARS {
+        assert_eq!(
+            env.get(OsStr::new(var)),
+            Some(&None),
+            "{var} must be cleared for the child, got: {:?}",
+            env.get(OsStr::new(var))
+        );
+    }
+    let bin = env
+        .get(OsStr::new("HERDR_BIN_PATH"))
+        .expect("HERDR_BIN_PATH is pinned, never inherited")
+        .as_ref()
+        .expect("pinned to a path, not cleared");
+    assert!(
+        !Path::new(bin).exists(),
+        "HERDR_BIN_PATH must resolve to nothing, got: {bin:?}"
+    );
 }
 
 #[test]
@@ -170,16 +233,10 @@ fn tools_list_returns_the_whole_tool_surface() {
         .filter_map(|tool| tool["name"].as_str())
         .collect();
     names.sort_unstable();
-    assert_eq!(
-        names,
-        [
-            "delegate",
-            "delegate_result",
-            "list_profiles",
-            "switch",
-            "which"
-        ]
-    );
+    // Four tools, the slice-1 surface: `delegate` keeps its name because the
+    // bundled PostToolUse hook matcher is anchored `delegate$` — a rename there
+    // silently breaks result auto-delivery.
+    assert_eq!(names, ["delegate", "monitor", "profiles", "switch_profile"]);
     for tool in result["tools"].as_array().expect("tools") {
         assert!(
             tool["inputSchema"].is_object(),

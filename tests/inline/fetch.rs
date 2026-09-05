@@ -124,19 +124,34 @@ fn spent_resume_in_secs_takes_the_latest_maxed_reset() {
 fn identity_anchor_backfills_only_when_missing() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
 
-    seed_identity_anchor("acme", &raw_profile(Some("uuid-live")));
+    seed_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        &raw_profile(Some("uuid-live")),
+    );
     assert_eq!(
-        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
         Some("uuid-live"),
         "missing anchor is seeded from the parsed /profile response"
     );
 
     // An existing anchor is authoritative (login re-seeds it; the ride-along
     // must never churn it).
-    seed_identity_anchor("acme", &raw_profile(Some("uuid-later")));
+    seed_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        &raw_profile(Some("uuid-later")),
+    );
     assert_eq!(
-        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
         Some("uuid-live"),
         "a present anchor is never overwritten by the ride-along"
     );
@@ -147,10 +162,19 @@ fn identity_anchor_refuses_blank_or_absent_uuid() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
 
-    seed_identity_anchor("acme", &raw_profile(None));
-    seed_identity_anchor("acme", &raw_profile(Some("  ")));
+    seed_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        &raw_profile(None),
+    );
+    seed_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        &raw_profile(Some("  ")),
+    );
     assert_eq!(
-        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE),
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            ACCOUNT_ID_CACHE_FILE
+        ),
         None,
         "no anchor may be minted from an absent or blank uuid"
     );
@@ -263,20 +287,25 @@ fn a_login_bodys_blank_uuid_reads_as_no_identity() {
 fn a_login_anchor_overwrites_the_previous_account() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
 
     seed_login_anchor(
-        "acme",
+        &crate::profile::ProfileName::from("acme"),
         Some(&crate::profile::AccountId::from("uuid-first".to_string())),
     );
     // The reauth-onto-a-DIFFERENT-account case: `clauth login` is the
     // authoritative (re)seeder, so unlike the ride-along backfill it must
     // replace the anchor rather than keep proving the old identity.
     seed_login_anchor(
-        "acme",
+        &crate::profile::ProfileName::from("acme"),
         Some(&crate::profile::AccountId::from("uuid-second".to_string())),
     );
     assert_eq!(
-        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
         Some("uuid-second"),
         "a login re-seeds the anchor unconditionally"
     );
@@ -286,27 +315,35 @@ fn a_login_anchor_overwrites_the_previous_account() {
 fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
 
     // A failed probe (`None`) or shape drift must never mint an anchor…
-    seed_login_anchor("acme", None);
+    seed_login_anchor(&crate::profile::ProfileName::from("acme"), None);
     seed_login_anchor(
-        "acme",
+        &crate::profile::ProfileName::from("acme"),
         Some(&crate::profile::AccountId::from("  ".to_string())),
     );
     assert_eq!(
-        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE),
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            ACCOUNT_ID_CACHE_FILE
+        ),
         None,
         "no anchor may be minted from an absent or blank uuid"
     );
 
     // …and must never wipe a good one either.
     seed_login_anchor(
-        "acme",
+        &crate::profile::ProfileName::from("acme"),
         Some(&crate::profile::AccountId::from("uuid-good".to_string())),
     );
-    seed_login_anchor("acme", None);
+    seed_login_anchor(&crate::profile::ProfileName::from("acme"), None);
     assert_eq!(
-        load_profile_cache::<String>("acme", ACCOUNT_ID_CACHE_FILE).as_deref(),
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
         Some("uuid-good"),
         "a probe failure leaves the existing anchor intact"
     );
@@ -845,34 +882,66 @@ fn take_profile_fetch_honors_ttl_force_and_expiry() {
     // First load (no stamp) → fetch; then the same name within the hour → reuse,
     // even though the prior attempt may have failed to yield a plan.
     assert!(
-        take_profile_fetch("ttl-first", false, t0),
+        take_profile_fetch(&crate::profile::ProfileName::from("ttl-first"), false, t0),
         "first load pulls /profile"
     );
     assert!(
-        !take_profile_fetch("ttl-first", false, t0 + 60_000),
+        !take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-first"),
+            false,
+            t0 + 60_000
+        ),
         "within the TTL the cached plan is reused — no per-tick re-pull"
     );
 
     // `force` overrides a fresh TTL (separate name to avoid cross-talk).
-    assert!(take_profile_fetch("ttl-force", false, t0));
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-force"),
+        false,
+        t0
+    ));
     assert!(
-        take_profile_fetch("ttl-force", true, t0 + 60_000),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-force"),
+            true,
+            t0 + 60_000
+        ),
         "force (401 retry) re-pulls /profile despite a fresh TTL"
     );
 
     // Past the TTL → re-pull.
-    assert!(take_profile_fetch("ttl-stale", false, t0));
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-stale"),
+        false,
+        t0
+    ));
     assert!(
-        take_profile_fetch("ttl-stale", false, t0 + PROFILE_TTL_MS + 1),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-stale"),
+            false,
+            t0 + PROFILE_TTL_MS + 1
+        ),
         "a plan past the TTL is re-pulled"
     );
 
     // Manual single refresh expires the clock → re-pull even within the hour.
-    assert!(take_profile_fetch("ttl-expire", false, t0));
-    assert!(!take_profile_fetch("ttl-expire", false, t0 + 60_000));
-    expire_profile_ttl("ttl-expire");
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-expire"),
+        false,
+        t0
+    ));
+    assert!(!take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-expire"),
+        false,
+        t0 + 60_000
+    ));
+    expire_profile_ttl(&crate::profile::ProfileName::from("ttl-expire"));
     assert!(
-        take_profile_fetch("ttl-expire", false, t0 + 120_000),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-expire"),
+            false,
+            t0 + 120_000
+        ),
         "expiring the TTL forces a re-pull"
     );
 }
@@ -886,12 +955,22 @@ fn take_profile_fetch_honors_ttl_force_and_expiry() {
 
 /// Give `name` an identity anchor, the gate that lets its durable stamp count.
 fn anchor(name: &str) {
-    write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &"uuid-anchored".to_string());
+    // The cache write is gated on the on-disk record; an unlanded anchor would
+    // turn every durable-stamp test into its "unanchored" sibling.
+    crate::testutil::register_names(&[name]);
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        ACCOUNT_ID_CACHE_FILE,
+        &"uuid-anchored".to_string(),
+    );
 }
 
 /// The persisted `/profile` attempt stamp, as the next process would read it.
 fn durable_stamp(name: &str) -> Option<u64> {
-    load_profile_cache::<u64>(name, PROFILE_FETCHED_CACHE_FILE)
+    load_profile_cache::<u64>(
+        &crate::profile::ProfileName::from(name),
+        PROFILE_FETCHED_CACHE_FILE,
+    )
 }
 
 #[test]
@@ -901,7 +980,11 @@ fn a_relaunch_inside_the_hour_reuses_the_durable_stamp() {
     anchor("ttl-relaunch");
 
     assert!(
-        take_profile_fetch("ttl-relaunch", false, t0),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-relaunch"),
+            false,
+            t0
+        ),
         "first ever load has no stamp anywhere → pull /profile"
     );
     assert_eq!(
@@ -910,9 +993,13 @@ fn a_relaunch_inside_the_hour_reuses_the_durable_stamp() {
         "the attempt is stamped to disk, not just to the map"
     );
 
-    forget_profile_memo("ttl-relaunch");
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-relaunch"));
     assert!(
-        !take_profile_fetch("ttl-relaunch", false, t0 + 60_000),
+        !take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-relaunch"),
+            false,
+            t0 + 60_000
+        ),
         "a relaunch inside the hour must reuse the cached plan — the whole point"
     );
 }
@@ -923,10 +1010,18 @@ fn a_durable_stamp_past_the_ttl_still_re_pulls() {
     let t0 = 1_000_000_000_000u64;
     anchor("ttl-durable-stale");
 
-    assert!(take_profile_fetch("ttl-durable-stale", false, t0));
-    forget_profile_memo("ttl-durable-stale");
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-durable-stale"),
+        false,
+        t0
+    ));
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-durable-stale"));
     assert!(
-        take_profile_fetch("ttl-durable-stale", false, t0 + PROFILE_TTL_MS + 1),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-durable-stale"),
+            false,
+            t0 + PROFILE_TTL_MS + 1
+        ),
         "the hour lapses across a restart like any other — the stamp is a clock, not a mute"
     );
 }
@@ -938,10 +1033,18 @@ fn an_unanchored_profile_ignores_the_durable_stamp() {
     // No `anchor()` — `seed_identity_anchor`'s backfill rides the /profile body,
     // and deferring it by an hour is exactly what wedges an unanchored profile in
     // `auth_broken` once its stored pair dies.
-    assert!(take_profile_fetch("ttl-unanchored", false, t0));
-    forget_profile_memo("ttl-unanchored");
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-unanchored"),
+        false,
+        t0
+    ));
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-unanchored"));
     assert!(
-        take_profile_fetch("ttl-unanchored", false, t0 + 60_000),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-unanchored"),
+            false,
+            t0 + 60_000
+        ),
         "an anchor-less profile pays one /profile per launch until the backfill lands"
     );
 }
@@ -952,15 +1055,23 @@ fn a_blank_anchor_counts_as_absent_for_the_durable_stamp() {
     let t0 = 1_000_000_000_000u64;
     // Shape drift, not an identity — same contract as `seed_identity_anchor`.
     write_profile_cache(
-        "ttl-blank-anchor",
+        &crate::profile::ProfileName::from("ttl-blank-anchor"),
         ACCOUNT_ID_CACHE_FILE,
         &"   ".to_string(),
     );
 
-    assert!(take_profile_fetch("ttl-blank-anchor", false, t0));
-    forget_profile_memo("ttl-blank-anchor");
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-blank-anchor"),
+        false,
+        t0
+    ));
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-blank-anchor"));
     assert!(
-        take_profile_fetch("ttl-blank-anchor", false, t0 + 60_000),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-blank-anchor"),
+            false,
+            t0 + 60_000
+        ),
         "a blank uuid is no anchor, so its durable stamp must not be honored"
     );
 }
@@ -971,14 +1082,18 @@ fn expire_profile_ttl_clears_the_durable_stamp_too() {
     let t0 = 1_000_000_000_000u64;
     anchor("ttl-expire-durable");
 
-    assert!(take_profile_fetch("ttl-expire-durable", false, t0));
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-expire-durable"),
+        false,
+        t0
+    ));
     assert!(!take_profile_fetch(
-        "ttl-expire-durable",
+        &crate::profile::ProfileName::from("ttl-expire-durable"),
         false,
         t0 + 60_000
     ));
 
-    expire_profile_ttl("ttl-expire-durable");
+    expire_profile_ttl(&crate::profile::ProfileName::from("ttl-expire-durable"));
     assert_eq!(
         durable_stamp("ttl-expire-durable"),
         None,
@@ -987,7 +1102,11 @@ fn expire_profile_ttl_clears_the_durable_stamp_too() {
     // Dropping only the memo would fall straight back to the fresh disk stamp and
     // silently reduce the manual refresh to a no-op for /profile.
     assert!(
-        take_profile_fetch("ttl-expire-durable", false, t0 + 120_000),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-expire-durable"),
+            false,
+            t0 + 120_000
+        ),
         "expiring the TTL forces a re-pull"
     );
 }
@@ -998,10 +1117,18 @@ fn force_bypasses_a_fresh_durable_stamp_and_restamps_it() {
     let t0 = 1_000_000_000_000u64;
     anchor("ttl-force-durable");
 
-    assert!(take_profile_fetch("ttl-force-durable", false, t0));
-    forget_profile_memo("ttl-force-durable");
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-force-durable"),
+        false,
+        t0
+    ));
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-force-durable"));
     assert!(
-        take_profile_fetch("ttl-force-durable", true, t0 + 60_000),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-force-durable"),
+            true,
+            t0 + 60_000
+        ),
         "a 401 retry re-pulls /profile despite a fresh durable stamp"
     );
     assert_eq!(
@@ -1019,22 +1146,30 @@ fn a_failing_endpoint_stays_capped_across_restarts() {
 
     // The decision is taken BEFORE the request, so an attempt that yields no plan
     // (a persistently 500ing /profile) is stamped exactly like a successful one.
-    assert!(take_profile_fetch("ttl-storm", false, t0));
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-storm"),
+        false,
+        t0
+    ));
     assert_eq!(
         durable_stamp("ttl-storm"),
         Some(t0),
         "a failure can't un-stamp an attempt"
     );
 
-    forget_profile_memo("ttl-storm");
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-storm"));
     assert!(
-        !take_profile_fetch("ttl-storm", false, t0 + 60_000),
+        !take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-storm"),
+            false,
+            t0 + 60_000
+        ),
         "a failing endpoint must not become a per-launch storm either"
     );
 }
 
 /// The TUI holds the `Config` guard across its account swaps (`let mut cfg =
-/// app.config(); overwrite_captured_profile(&mut cfg, ..)`), so the clock is taken
+/// app.config(); overwrite_captured_profile(&mut cfg, &crate::profile::ProfileName::from(..))`), so the clock is taken
 /// at rank `Config`. Rank `ProfileTtl` INSIDE it or every debug-build TUI
 /// rename/delete/reauth/logout panics on the lock-order assert. The action tests
 /// pass a bare `&mut AppConfig` and never enter the ranked guard, so this is the
@@ -1046,9 +1181,13 @@ fn the_ttl_clock_is_reachable_under_the_config_guard() {
 
     // Both halves of the swap path: a lock-order violation panics here, it does
     // not merely return the wrong answer.
-    expire_profile_ttl("ttl-under-config");
+    expire_profile_ttl(&crate::profile::ProfileName::from("ttl-under-config"));
     assert!(
-        take_profile_fetch("ttl-under-config", false, 1_000_000_000_000),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-under-config"),
+            false,
+            1_000_000_000_000
+        ),
         "the clock stays usable while the guard the TUI swaps hold is held"
     );
 }
@@ -1064,14 +1203,18 @@ fn a_stamp_in_the_future_is_not_freshness() {
     // that the stamp is durable, would mute /profile across every restart until
     // real time caught up.
     assert!(take_profile_fetch(
-        "ttl-rollback",
+        &crate::profile::ProfileName::from("ttl-rollback"),
         false,
         t0 + PROFILE_TTL_MS
     ));
-    forget_profile_memo("ttl-rollback");
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-rollback"));
 
     assert!(
-        take_profile_fetch("ttl-rollback", false, t0),
+        take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-rollback"),
+            false,
+            t0
+        ),
         "a stamp in the future is not trustworthy freshness — fail toward fetching"
     );
     assert_eq!(
@@ -1087,19 +1230,37 @@ fn the_durable_stamp_is_read_at_most_once_per_process() {
     let t0 = 1_000_000_000_000u64;
     anchor("ttl-memo");
 
-    assert!(take_profile_fetch("ttl-memo", false, t0));
-    forget_profile_memo("ttl-memo");
+    assert!(take_profile_fetch(
+        &crate::profile::ProfileName::from("ttl-memo"),
+        false,
+        t0
+    ));
+    forget_profile_memo(&crate::profile::ProfileName::from("ttl-memo"));
     assert!(
-        !take_profile_fetch("ttl-memo", false, t0 + 60_000),
+        !take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-memo"),
+            false,
+            t0 + 60_000
+        ),
         "the cold map falls back to the durable stamp"
     );
 
     // Both inputs deleted: a per-tick disk read would now see an unanchored
     // profile with no stamp and fire.
-    remove_profile_cache("ttl-memo", PROFILE_FETCHED_CACHE_FILE);
-    remove_profile_cache("ttl-memo", ACCOUNT_ID_CACHE_FILE);
+    remove_profile_cache(
+        &crate::profile::ProfileName::from("ttl-memo"),
+        PROFILE_FETCHED_CACHE_FILE,
+    );
+    remove_profile_cache(
+        &crate::profile::ProfileName::from("ttl-memo"),
+        ACCOUNT_ID_CACHE_FILE,
+    );
     assert!(
-        !take_profile_fetch("ttl-memo", false, t0 + 120_000),
+        !take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-memo"),
+            false,
+            t0 + 120_000
+        ),
         "the memoized stamp answers every later tick — one disk read per profile per process"
     );
 }
@@ -1262,7 +1423,7 @@ fn blind_fields_parse_defensively() {
 
 // ── get_json emits Claude Code's exact per-client header set (wire parity) ────
 //
-// Captured 2026-07-14 against CC 2.1.209 (docs/wire-parity.md): CC polls /usage
+// Captured 2026-07-14 against CC 2.1.209: CC polls /usage
 // with its claude-cli client (+anthropic-beta, no cache-control) and reads
 // /profile with a plain axios client (axios UA, Cache-Control: no-cache, no
 // beta). This drives the REAL get_json builder against a loopback listener and
@@ -1298,7 +1459,13 @@ fn capture_get_json_headers(client: AuthClient, path: &str) -> String {
         m.clear();
     }
     let url = format!("http://127.0.0.1:{port}{path}");
-    let _ = get_json(&url, "TESTTOKEN", None, "wiretest", client);
+    let _ = get_json(
+        &url,
+        "TESTTOKEN",
+        None,
+        &crate::profile::ProfileName::from("wiretest"),
+        client,
+    );
     server.join().expect("listener thread")
 }
 
@@ -1372,7 +1539,7 @@ fn get_json_emits_cc_per_client_wire_headers() {
 /// ureq 3 answers a non-2xx with `Err(Error::StatusCode)` by DEFAULT, which once
 /// turned every `status >= 400` branch on the `Ok` response into dead code here:
 /// the 401 → rotate leg and the 429 retry-after read never fired, and every HTTP
-/// error collapsed into `Network` (`docs/architecture.md`, 2026-06-07). The whole
+/// error collapsed into `Network` (2026-06-07). The whole
 /// fix is one builder flag on this agent, and nothing pinned it — dropping the
 /// flag, or rebuilding the agent without it, would strand rotation exactly the
 /// same way while every offline test in the tree kept passing, because no offline

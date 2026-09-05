@@ -25,11 +25,13 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -65,6 +67,61 @@ fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
     lines.iter().map(line_text).find(|t| t.contains("resumes:"))
 }
 
+/// `QueueView` is the one resolver every chip goes through: membership from
+/// the shared rule, the slot from the anchor. Pinned here because a view that
+/// answered `None` for everyone would silently remove every chip on every
+/// surface without failing a single render test.
+#[test]
+fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let opted = |name: &str| {
+        let mut p = profile(name, 95.0, 10.0, 3600);
+        p.auto_start = true;
+        p.credentials = Some(ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: format!("{name}-access"),
+                refresh_token: None,
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        });
+        p
+    };
+    let mut cfg = config_with(
+        vec![opted("a"), opted("b"), profile("c", 95.0, 0.0, 3600)],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    cfg.state.auto_start_queue = true;
+
+    let none = std::collections::HashMap::new();
+    let view = super::super::panes::QueueView::new(&cfg, &none, None);
+    let slot = view.slot("a").expect("an opted-in member holds a slot");
+    assert_eq!((slot.position, slot.total), (1, 2));
+    assert_eq!(view.slot("b").map(|s| s.position), Some(2));
+    assert_eq!(view.slot("c"), None, "no opt-in, no slot");
+    assert_eq!(
+        slot.next_in, None,
+        "no anchor: the queue is due, nothing to count down"
+    );
+
+    // A switch-grade-blocked member holds no slot, and the queue re-sizes.
+    let lifts = std::collections::HashMap::from([("a".to_string(), 0i64)]);
+    let view = super::super::panes::QueueView::new(&cfg, &lifts, None);
+    assert_eq!(view.slot("a"), None, "blocked: no slot");
+    assert_eq!(view.slot("b").map(|s| (s.position, s.total)), Some((1, 1)));
+
+    // The toggle off is a real off switch on this surface too.
+    cfg.state.auto_start_queue = false;
+    let view = super::super::panes::QueueView::new(&cfg, &none, None);
+    assert_eq!(view.slot("a"), None);
+}
+
+// The auto-start queue line no longer renders on the Fallback card (owner
+// 2026-09-01): it moved to the Usage tab, under `plan`, and shows for any
+// account with `auto_start` on, queue toggle or no queue toggle.
+
 // Whole chain exhausted: the caption renders under whichever member is
 // selected, naming the soonest-resuming one (b resets sooner than a).
 #[test]
@@ -75,16 +132,11 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
 
     let on_a = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
@@ -92,16 +144,11 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
 
     let on_b = member_detail(
         &cfg,
-        "b",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("b"),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
@@ -117,16 +164,11 @@ fn partially_exhausted_chain_hides_resumes_hint() {
 
     let lines = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     assert!(
@@ -152,16 +194,13 @@ fn last_resort_hint_wraps_on_a_narrow_pane() {
         .unwrap();
     let lines = member_detail(
         &cfg,
-        "a",
-        true,
-        lr,
-        false,
-        None,
-        None,
-        None,
-        28,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: lr,
+            width: 28,
+            ..Default::default()
+        },
     )
     .0;
     let texts: Vec<String> = lines.iter().map(line_text).collect();
@@ -193,16 +232,13 @@ fn last_resort_hint_names_the_currently_marked_member() {
 
     let lines = member_detail(
         &cfg,
-        "a",
-        true,
-        4,
-        false,
-        None,
-        None,
-        None,
-        80,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: 4,
+            width: 80,
+            ..Default::default()
+        },
     )
     .0;
     let hint = lines
@@ -221,16 +257,13 @@ fn usage_gate_rows_hint_the_current_state() {
         let cfg = config_with(vec![p], Some("a"), vec!["a"]);
         member_detail(
             &cfg,
-            "a",
-            true,
-            cursor,
-            false,
-            None,
-            None,
-            None,
-            80,
-            None,
-            Default::default(),
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                focused: true,
+                row_cursor: cursor,
+                width: 80,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -291,16 +324,11 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
     let cfg = config_with(vec![scoped(true)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        80,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 80,
+            ..Default::default()
+        },
     )
     .0;
     let pill = lines
@@ -313,16 +341,11 @@ fn scoped_spent_pill_names_the_window_and_respects_the_gate() {
     let cfg = config_with(vec![scoped(false)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        80,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 80,
+            ..Default::default()
+        },
     )
     .0;
     assert!(
@@ -344,7 +367,11 @@ fn max_spend_hint_covers_every_spend_state() {
         a.usage.as_mut().unwrap().spend = spend;
         let mut cfg = config_with(vec![a], Some("a"), vec!["a"]);
         cfg.state.spend_budget_switching = budget_on;
-        max_spend_hint(&cfg, "a", cfg.profiles[0].max_auto_spend.unwrap_or(0.0))
+        max_spend_hint(
+            &cfg,
+            &crate::profile::ProfileName::from("a"),
+            cfg.profiles[0].max_auto_spend.unwrap_or(0.0),
+        )
     };
     let billing = |enabled: bool, used: Option<f64>| SpendInfo {
         enabled,
@@ -396,16 +423,13 @@ fn last_resort_value_aligns_with_other_rows() {
     let cfg = config_with(vec![a], Some("a"), vec!["a"]);
     let texts: Vec<String> = member_detail(
         &cfg,
-        "a",
-        true,
-        1,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: 1,
+            width: 60,
+            ..Default::default()
+        },
     )
     .0
     .iter()
@@ -457,16 +481,13 @@ fn max_spend_row_renders_off_at_zero_and_dollars_when_set() {
     let row = |c: &crate::profile::AppConfig| -> String {
         member_detail(
             c,
-            "a",
-            true,
-            1,
-            false,
-            None,
-            None,
-            None,
-            60,
-            None,
-            Default::default(),
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                focused: true,
+                row_cursor: 1,
+                width: 60,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -509,7 +530,7 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
 }
 
 /// A disabled chain member — still configured in `fallback_chain` on disk,
-/// only the walk skips it (see `Profile::is_disabled` / `docs/fallback.md`)
+/// only the walk skips it (see `Profile::is_disabled`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
 /// marker, with the `[ disabled ]` label reaching the operator through the
 /// detail card's `reason_pill`. The add-picker exclusion (a disabled account
@@ -604,7 +625,9 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
     let mut cfg = config_with(vec![a], Some("other"), vec!["acct"]);
     cfg.state.auth_broken.push("acct".into());
 
-    let p = cfg.find("acct").unwrap();
+    let p = cfg
+        .find(&crate::profile::ProfileName::from("acct"))
+        .unwrap();
     assert_eq!(
         blocked_reason(&cfg, p, None),
         Some(BlockedReason::Disabled),
@@ -615,7 +638,13 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
     let mut enabled = cfg.clone();
     enabled.profiles[0].disabled = false;
     assert_eq!(
-        blocked_reason(&enabled, enabled.find("acct").unwrap(), None),
+        blocked_reason(
+            &enabled,
+            enabled
+                .find(&crate::profile::ProfileName::from("acct"))
+                .unwrap(),
+            None
+        ),
         Some(BlockedReason::Canceled),
         "without the disabled bit the canceled rung wins"
     );
@@ -634,7 +663,12 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
     a.disabled = true;
     let cfg = config_with(vec![a], Some("acct"), vec!["acct"]);
     assert_eq!(
-        blocked_reason(&cfg, cfg.find("acct").unwrap(), None),
+        blocked_reason(
+            &cfg,
+            cfg.find(&crate::profile::ProfileName::from("acct"))
+                .unwrap(),
+            None
+        ),
         None,
         "a disabled ACTIVE member has headroom and reports no block"
     );
@@ -643,7 +677,13 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
     let mut inactive = cfg.clone();
     inactive.state.active_profile = Some("other".into());
     assert_eq!(
-        blocked_reason(&inactive, inactive.find("acct").unwrap(), None),
+        blocked_reason(
+            &inactive,
+            inactive
+                .find(&crate::profile::ProfileName::from("acct"))
+                .unwrap(),
+            None
+        ),
         Some(BlockedReason::Disabled),
         "a disabled NON-active member reports the block"
     );
@@ -658,16 +698,11 @@ fn blocked_member_shows_the_worst_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 97.0, 7200)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -694,16 +729,12 @@ fn kick_rejected_member_shows_the_claude_code_blocked_pill() {
     let until = now_epoch_secs() + 7200;
     let lines = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        Some(until),
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            kick_lift: Some(until),
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let pill = line_text(&lines[0]);
@@ -744,16 +775,11 @@ fn headroom_member_shows_no_reason_pill() {
     let cfg = config_with(vec![profile("a", 95.0, 40.0, 7200)], Some("a"), vec!["a"]);
     let lines = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let first = line_text(&lines[0]);
@@ -786,16 +812,11 @@ fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_heigh
     let at_width = |cfg: &AppConfig, width: usize| -> (usize, usize) {
         let (lines, rows_start) = member_detail(
             cfg,
-            "a",
-            false,
-            0,
-            false,
-            None,
-            None,
-            None,
-            width,
-            None,
-            Default::default(),
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                width,
+                ..Default::default()
+            },
         );
         let first_row_at = lines
             .iter()
@@ -1003,16 +1024,11 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     // second bridges with `│` at col 0 while the rail is still open.
     let (lines, _) = member_detail(
         &cfg,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     );
     let block: Vec<String> = lines.iter().take(4).map(line_text).collect();
     assert_eq!(
@@ -1033,16 +1049,11 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     enabled.state.auth_broken.push("a".into());
     let (lines, _) = member_detail(
         &enabled,
-        "a",
-        false,
-        0,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 60,
+            ..Default::default()
+        },
     );
     assert_eq!(
         lines.iter().take(2).map(line_text).collect::<Vec<_>>(),
@@ -1143,7 +1154,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
     ];
     let mut seen: Vec<String> = Vec::new();
     for reason in all {
-        let fix = reason_fix(&reason, "acct");
+        let fix = reason_fix(&reason, &crate::profile::ProfileName::from("acct"));
         assert!(!fix.trim().is_empty(), "{reason:?} has no fix copy");
         assert_eq!(
             fix,
@@ -1179,16 +1190,13 @@ fn max_spend_dims_when_spend_budget_is_off() {
 
     let off = member_detail(
         &cfg,
-        "a",
-        true,
-        2,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: 2,
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let off_val = off
@@ -1204,16 +1212,13 @@ fn max_spend_dims_when_spend_budget_is_off() {
     cfg.state.spend_budget_switching = true;
     let on = member_detail(
         &cfg,
-        "a",
-        true,
-        2,
-        false,
-        None,
-        None,
-        None,
-        60,
-        None,
-        Default::default(),
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: 2,
+            width: 60,
+            ..Default::default()
+        },
     )
     .0;
     let on_val = on
@@ -1236,16 +1241,13 @@ fn weekly_at_row_distinguishes_default_override_and_gated_off() {
         let cfg = config_with(vec![p], Some("a"), vec!["a"]);
         member_detail(
             &cfg,
-            "a",
-            true,
-            1,
-            false,
-            None,
-            None,
-            None,
-            80,
-            None,
-            Default::default(),
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                focused: true,
+                row_cursor: 1,
+                width: 80,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -1307,16 +1309,13 @@ fn weekly_at_default_reminder_only_shows_when_value_differs_from_default() {
         let cfg = config_with(vec![p], Some("a"), vec!["a"]);
         member_detail(
             &cfg,
-            "a",
-            true,
-            1,
-            false,
-            None,
-            None,
-            None,
-            80,
-            None,
-            Default::default(),
+            &crate::profile::ProfileName::from("a"),
+            MemberCard {
+                focused: true,
+                row_cursor: 1,
+                width: 80,
+                ..Default::default()
+            },
         )
         .0
         .iter()
@@ -1361,16 +1360,18 @@ fn edit_glyph_is_bold_like_the_selection_caret() {
     let line = detail_row(
         FallbackRow::Threshold,
         true,
-        80.0,
-        None,
-        98.0,
-        true,
-        true,
-        false,
-        false,
-        0.0,
-        false,
-        false,
+        MemberRow {
+            threshold: 80.0,
+            weekly_override: None,
+            weekly_default: 98.0,
+            check_weekly: true,
+            check_scoped: true,
+            last_resort: false,
+            preferred: false,
+            max_spend: 0.0,
+            spend_budget: false,
+            armed_remove: false,
+        },
         Some(&input),
     );
     let glyph = &line.spans[0];
@@ -1399,17 +1400,9 @@ fn live_row(
     last_swap_at: Option<u64>,
 ) -> crate::live_sessions::LiveSession {
     crate::live_sessions::LiveSession {
-        session_id: session_id.to_string(),
-        start_profile: member.to_string(),
-        pid: 4242,
-        started_at: 1_700_000_000_000,
-        cwd: None,
-        isolated: false,
         follows_chain,
-        intended_member: None,
-        chain_cursor: None,
-        current_member: None,
         last_swap_at,
+        ..crate::testutil::live_row(session_id, member)
     }
 }
 
@@ -1501,7 +1494,7 @@ fn the_session_block_emits_the_follower_qualifier_when_one_session_follows() {
         live_row("4242-0", "a", true, None),
         live_row("4242-1", "a", false, None),
     ])
-    .member("a");
+    .member(&crate::profile::ProfileName::from("a"));
 
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
@@ -1518,7 +1511,7 @@ fn the_session_block_omits_the_qualifier_when_no_session_follows() {
         live_row("4242-0", "a", false, None),
         live_row("4242-1", "a", false, None),
     ])
-    .member("a");
+    .member(&crate::profile::ProfileName::from("a"));
 
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
@@ -1528,7 +1521,7 @@ fn the_session_block_omits_the_qualifier_when_no_session_follows() {
 
 /// Once a session HAS swapped onto this member, `current_member` stops being an
 /// instantaneous fact: Claude Code re-reads its credentials on its next request
-/// and nothing observes the pickup (`docs/plan/multi-session-fallback.md` §12).
+/// and nothing observes the pickup.
 /// The card says so rather than inventing a "not yet picked up" state the
 /// registry cannot see.
 #[test]
@@ -1538,7 +1531,7 @@ fn the_session_block_dates_the_last_swap_and_says_when_it_is_picked_up() {
     let swapped_at = crate::usage::now_ms().saturating_sub(3 * 3_600_000 + 1_800_000);
     let sessions =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, Some(swapped_at))])
-            .member("a");
+            .member(&crate::profile::ProfileName::from("a"));
 
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
@@ -1561,7 +1554,7 @@ fn a_swap_this_very_second_reads_as_just_now() {
         false,
         Some(crate::usage::now_ms()),
     )])
-    .member("a");
+    .member(&crate::profile::ProfileName::from("a"));
 
     assert_eq!(
         card_texts(&live_session_lines(sessions, 60)),
@@ -1574,20 +1567,22 @@ fn a_swap_this_very_second_reads_as_just_now() {
 }
 
 /// The age line follows the cloudy-tui Time-formatting contract: ONE unit, the
-/// largest that is at least 1, and an absolute ISO date at 30 days and beyond.
+/// largest that is at least 1, and the local prose stamp at 30 days and beyond.
 /// The two-unit `humanize_duration` the countdowns use would render `1d 4h ago`
 /// here and never reach a date at all — it stays on the countdowns, where a
 /// duration is what is being shown.
 ///
 /// Every relative fixture sits MID-unit so the wall clock cannot walk it across
-/// a boundary mid-test; the ISO case uses a fixed epoch, so its expectation is a
-/// literal rather than a date recomputed from the code under test.
+/// a boundary mid-test; the stamp case uses a fixed epoch, so its expectation
+/// derives through chrono's own `format` rather than a literal — a literal would
+/// tie the pin to the runner's zone, and the second derivation is what keeps it
+/// a claim about the code instead of a copy of the code's arithmetic.
 #[test]
 fn the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days() {
     let age_line = |at: u64| -> String {
         let sessions =
             crate::live_sessions::LiveTally::of([live_row("4242-0", "a", false, Some(at))])
-                .member("a");
+                .member(&crate::profile::ProfileName::from("a"));
         card_texts(&live_session_lines(sessions, 60))
             .into_iter()
             .find(|t| t.starts_with("last swap"))
@@ -1603,8 +1598,15 @@ fn the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days() {
     assert_eq!(age_line(ago(2 * 3_600_000 + 1_800_000)), "2h ago");
     assert_eq!(age_line(ago(3 * 86_400_000 + 43_200_000)), "3d ago");
     assert_eq!(age_line(ago(12 * 86_400_000)), "1w ago");
-    // 2023-11-14T22:13:20Z — permanently past 30 days, so the arm is the date.
-    assert_eq!(age_line(1_700_000_000_000), "2023-11-14");
+    // 2023-11-14T22:13:20Z — permanently past 30 days, so the arm is the local
+    // stamp, derived through chrono's own `format` (a second derivation of the
+    // same claim), so the pin holds in any zone, UTC included.
+    let expected = chrono::DateTime::from_timestamp(1_700_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert_eq!(age_line(1_700_000_000_000), expected);
 }
 
 /// An account hosting nothing says nothing — no row at all rather than
@@ -1627,11 +1629,17 @@ fn the_session_block_is_absent_when_nothing_is_live() {
 #[test]
 fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
     let cfg = config_with(vec![profile("a", 95.0, 10.0, 3600)], None, vec!["a"]);
-    let sessions =
-        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)]).member("a");
+    let sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)])
+        .member(&crate::profile::ProfileName::from("a"));
 
     let (lines, rows_start) = member_detail(
-        &cfg, "a", false, 0, false, None, None, None, 60, None, sessions,
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            sessions,
+            width: 60,
+            ..Default::default()
+        },
     );
     let texts = card_texts(&lines);
 
@@ -1786,7 +1794,13 @@ fn member_detail_rows_start_clears_the_session_block_at_every_height() {
     let start_and_first_row =
         |sessions: crate::live_sessions::MemberSessions, width: usize| -> (usize, usize, usize) {
             let (lines, rows_start) = member_detail(
-                &cfg, "a", false, 0, false, None, None, None, width, None, sessions,
+                &cfg,
+                &crate::profile::ProfileName::from("a"),
+                MemberCard {
+                    sessions,
+                    width,
+                    ..Default::default()
+                },
             );
             let first_row_at = lines
                 .iter()
@@ -1801,8 +1815,8 @@ fn member_detail_rows_start_clears_the_session_block_at_every_height() {
     assert_eq!(bare, 3, "gauge + headroom + blank");
 
     // Count only: the block's own leading blank plus the `live` row.
-    let counted =
-        crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)]).member("a");
+    let counted = crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)])
+        .member(&crate::profile::ProfileName::from("a"));
     let (start, row, _) = start_and_first_row(counted, 60);
     assert_eq!(start, row, "count only: rows_start indexes the first row");
     assert_eq!(start, bare + 2, "blank + the `live` row");
@@ -1811,7 +1825,7 @@ fn member_detail_rows_start_clears_the_session_block_at_every_height() {
     let swapped_at = crate::usage::now_ms().saturating_sub(3 * 3_600_000 + 1_800_000);
     let dated =
         crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, Some(swapped_at))])
-            .member("a");
+            .member(&crate::profile::ProfileName::from("a"));
     let (start, row, _) = start_and_first_row(dated, 60);
     assert_eq!(start, row, "dated swap: rows_start indexes the first row");
     assert_eq!(start, bare + 4, "blank + `live` + `last swap` + the caveat");

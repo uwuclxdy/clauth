@@ -18,6 +18,7 @@ fn row(session_id: &str, profile: &str) -> LiveSession {
         chain_cursor: None,
         current_member: None,
         last_swap_at: None,
+        launch_store: None,
     }
 }
 
@@ -82,6 +83,38 @@ fn each_writers_update_preserves_the_others_fields() {
     );
     assert_eq!(after.last_swap_at, Some(1_700_000_009_000));
     assert_eq!(after.chain_cursor, Some(2));
+}
+
+/// A delegate's row is registered by the `clauth mcp` that spawns it (that
+/// process's `std::process::id()` is what register reads) and re-keyed onto the
+/// delegate child right after spawn. `set_pid` is the mutator behind the
+/// re-key, and it must move nothing else — the daemon's decision fields least
+/// of all.
+#[test]
+fn set_pid_rekeys_the_row_and_touches_nothing_else() {
+    let _home = HomeSandbox::new();
+    register(&row("4242-0", "work")).expect("register");
+    update_as_daemon("4242-0", |d| d.set_intended_member("kerry")).expect("daemon update");
+
+    update_as_session("4242-0", |s| s.set_pid(7777)).expect("session update");
+
+    let after = list().pop().expect("one row");
+    assert_eq!(after.pid, 7777, "the row names the re-keyed process");
+    assert_eq!(
+        after.session_id, "4242-0",
+        "the id is not part of the re-key"
+    );
+    assert_eq!(
+        after.start_profile, "work",
+        "the launch member is untouched"
+    );
+    assert_eq!(
+        after.intended_member.as_deref(),
+        Some("kerry"),
+        "the daemon's field survives the re-key"
+    );
+    assert_eq!(after.current_member, None);
+    assert_eq!(after.cwd.as_deref(), Some(Path::new("/w/proj")));
 }
 
 /// THE LOST-UPDATE TEST. The load has to happen INSIDE the state lock, not just
@@ -191,7 +224,12 @@ fn a_malformed_session_id_is_refused() {
 fn a_session_that_never_swapped_counts_on_the_account_it_launched_on() {
     let tally = LiveTally::from_live_rows([row("4242-0", "work")]);
 
-    assert_eq!(tally.member("work").sessions, 1);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
+        1
+    );
 }
 
 /// The other direction: once a session has swapped, the launch account is a
@@ -204,8 +242,18 @@ fn a_swapped_session_counts_on_its_current_member_and_not_its_launch_one() {
 
     let tally = LiveTally::from_live_rows([swapped]);
 
-    assert_eq!(tally.member("spare").sessions, 1);
-    assert_eq!(tally.member("work").sessions, 0);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("spare"))
+            .sessions,
+        1
+    );
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
+        0
+    );
 }
 
 /// `follows_chain` is what separates a session the chain can move from a pinned
@@ -219,8 +267,18 @@ fn only_opted_in_sessions_count_as_following_the_chain() {
 
     let tally = LiveTally::from_live_rows([pinned, follower]);
 
-    assert_eq!(tally.member("work").sessions, 2);
-    assert_eq!(tally.member("work").following, 1);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
+        2
+    );
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .following,
+        1
+    );
 }
 
 /// The card names when a session last landed here, so the newest swap onto an
@@ -241,8 +299,18 @@ fn the_newest_swap_onto_an_account_is_the_one_reported() {
     // order and disagree with production at random.
     let tally = LiveTally::from_live_rows([new, old, never]);
 
-    assert_eq!(tally.member("spare").last_swap_at, Some(1_700_000_020_000));
-    assert_eq!(tally.member("work").last_swap_at, None);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("spare"))
+            .last_swap_at,
+        Some(1_700_000_020_000)
+    );
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .last_swap_at,
+        None
+    );
 }
 
 /// An account hosting nothing reports zeroes, never a missing-key panic — the
@@ -251,7 +319,10 @@ fn the_newest_swap_onto_an_account_is_the_one_reported() {
 fn an_account_with_no_sessions_tallies_empty() {
     let tally = LiveTally::from_live_rows([row("4242-0", "work")]);
 
-    assert_eq!(tally.member("idle"), MemberSessions::default());
+    assert_eq!(
+        tally.member(&crate::profile::ProfileName::from("idle")),
+        MemberSessions::default()
+    );
 }
 
 /// Row GC runs from `gc_stale_runtimes` at daemon STARTUP, not per tick, so a
@@ -265,12 +336,16 @@ fn collect_drops_a_row_whose_session_is_no_longer_running() {
     let dead = row("4242-1", "work");
     register(&live).expect("register the live row");
     register(&dead).expect("register the dead row");
-    let _marker = crate::runtime::hold_session_row_marker(&live.start_profile, false, "4242-0")
-        .expect("hold the live session's marker");
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from(live.start_profile.clone()),
+        false,
+        "4242-0",
+    )
+    .expect("hold the live session's marker");
 
     assert_eq!(
         LiveTally::collect(&config_with(vec![], "work"))
-            .member("work")
+            .member(&crate::profile::ProfileName::from("work"))
             .sessions,
         1,
         "only the row whose marker is still held is a live session"
@@ -294,18 +369,26 @@ fn a_swapped_session_counts_on_current_member_after_its_launch_marker_is_removed
     // Hold the marker for `current_member` ("spare"), not `start_profile`
     // ("work"). The procedure `clauth delete work --force` removed the
     // work markers, so only the spare marker exists.
-    let _marker = crate::runtime::hold_session_row_marker("spare", false, "4242-0")
-        .expect("hold the spare member's marker");
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("spare"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the spare member's marker");
 
     let config = config_with(vec![], "work");
     assert_eq!(
-        LiveTally::collect(&config).member("spare").sessions,
+        LiveTally::collect(&config)
+            .member(&crate::profile::ProfileName::from("spare"))
+            .sessions,
         1,
         "the swapped session must count on current_member when its \
          start_profile marker is absent"
     );
     assert_eq!(
-        LiveTally::collect(&config).member("work").sessions,
+        LiveTally::collect(&config)
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
         0,
         "the swapped session must not count on the launch account"
     );
@@ -323,12 +406,16 @@ fn a_session_that_never_swapped_probes_start_profile_in_collect() {
     };
     register(&never).expect("register the row");
     // Only the start_profile marker exists.
-    let _marker = crate::runtime::hold_session_row_marker("work", false, "4242-0")
-        .expect("hold the start_profile marker");
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("work"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the start_profile marker");
 
     assert_eq!(
         LiveTally::collect(&config_with(vec![], "work"))
-            .member("work")
+            .member(&crate::profile::ProfileName::from("work"))
             .sessions,
         1,
         "a session that never swapped must count on the launch account"
@@ -338,7 +425,7 @@ fn a_session_that_never_swapped_probes_start_profile_in_collect() {
 // ── bare `claude` sessions ───────────────────────────────────────────────────
 
 fn oauth_profile(name: &str, refresh: &str) -> crate::profile::Profile {
-    let mut profile = crate::testutil::blank_profile(name);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: format!("at-{name}"),
@@ -386,7 +473,7 @@ fn a_held_bare_marker_counts_on_the_account_the_credential_link_resolves_to() {
     let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
 
     assert_eq!(
-        LiveTally::collect(&config).member("work"),
+        LiveTally::collect(&config).member(&crate::profile::ProfileName::from("work")),
         MemberSessions {
             sessions: 1,
             following: 1,
@@ -413,9 +500,14 @@ fn bare_attribution_follows_the_credential_link_not_the_active_profile() {
     let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
 
     let tally = LiveTally::collect(&config);
-    assert_eq!(tally.member("spare").sessions, 1);
     assert_eq!(
-        tally.member("work"),
+        tally
+            .member(&crate::profile::ProfileName::from("spare"))
+            .sessions,
+        1
+    );
+    assert_eq!(
+        tally.member(&crate::profile::ProfileName::from("work")),
         MemberSessions::default(),
         "the account the link does NOT resolve to hosts nothing"
     );
@@ -431,7 +523,9 @@ fn releasing_a_bare_marker_stops_it_counting() {
 
     let bare = crate::runtime::register_bare_session().expect("hold a bare marker");
     assert_eq!(
-        LiveTally::collect(&config).member("work").sessions,
+        LiveTally::collect(&config)
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
         1,
         "positive control: the marker counts while it is held"
     );
@@ -444,7 +538,11 @@ fn releasing_a_bare_marker_stops_it_counting() {
     // `runtime`'s `has_live_session_true_when_any_session_alive`.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let settled = loop {
-        if LiveTally::collect(&config).member("work").sessions == 0 {
+        if LiveTally::collect(&config)
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions
+            == 0
+        {
             break true;
         }
         if std::time::Instant::now() >= deadline {
@@ -483,12 +581,14 @@ fn bare_attribution_ignores_the_readers_own_config_dir() {
 
     let tally = LiveTally::collect(&config);
     assert_eq!(
-        tally.member("work").sessions,
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
         1,
         "the bare session belongs to the account the global link resolves to"
     );
     assert_eq!(
-        tally.member("spare"),
+        tally.member(&crate::profile::ProfileName::from("spare")),
         MemberSessions::default(),
         "the READER's own runtime profile hosts nothing"
     );

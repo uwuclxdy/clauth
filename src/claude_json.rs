@@ -57,44 +57,27 @@ const PER_PROFILE_FIELDS: &[&str] = &[
     "customApiKeyResponses",
 ];
 
-/// Newest mtime from the last [`sync_once`] that did work. Short-circuits ticks
-/// where no file is newer — no reads, parses, or writes.
+/// Newest mtime from the last [`sync_once`] that did work; the key for
+/// [`crate::jsonsync::run_with_cache`]'s fast path.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
 
 /// Every `.claude.json` clauth reconciles: the global file plus each SHARED
-/// per-session runtime copy. Enumerated through
-/// [`crate::runtime::shared_runtime_dirs`] rather than a fixed
-/// `<profile>/runtime` path — every session owns its own `runtime-<sid>`, so a
-/// fixed path would reconcile nothing while every session ran. Isolated copies
-/// stay out for the same reason they do in `settings_sync`: an isolated runtime
-/// is built from an empty base and must neither win nor receive.
+/// per-session runtime copy, via [`crate::jsonsync::runtime_files_under`].
 fn known_paths() -> Result<Vec<PathBuf>> {
-    let mut paths = vec![home_dir()?.join(".claude.json")];
-    paths.extend(
-        crate::runtime::shared_runtime_dirs()
-            .into_iter()
-            .map(|dir| dir.join(".claude.json")),
-    );
-    Ok(paths)
+    Ok(crate::jsonsync::runtime_files_under(
+        &home_dir()?,
+        ".claude.json",
+    ))
 }
 
-/// Reconcile all known `.claude.json` files once. Stat-only fast path: skips
-/// reads when no file is newer than `LAST_SYNCED`. Advances `LAST_SYNCED` only
-/// on success, so transient errors retry next tick.
+/// Reconcile all known `.claude.json` files once, behind the `LAST_SYNCED`
+/// mtime fast path in [`crate::jsonsync::run_with_cache`].
 pub(crate) fn sync_once() -> Result<()> {
     let paths = known_paths()?;
-    let Some(newest) = crate::jsonsync::newest_mtime(&paths) else {
-        return Ok(());
-    };
-    {
-        let last = LAST_SYNCED.lock().unwrap_or_else(|p| p.into_inner());
-        if last.is_some_and(|l| newest <= l) {
-            return Ok(());
-        }
-    }
-    sync_paths(&paths)?;
-    *LAST_SYNCED.lock().unwrap_or_else(|p| p.into_inner()) = Some(newest);
-    Ok(())
+    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || {
+        sync_paths(&paths)?;
+        Ok(true)
+    })
 }
 
 /// Reconcile the given `.claude.json` copies. Every field is shared except
@@ -135,7 +118,7 @@ pub(crate) fn home_oauth_account_uuid() -> Option<AccountId> {
 /// `~/.claude.json` on profile switch (issue #17). Claude Code trusts a
 /// cached identity block and does not re-derive it from a relinked
 /// credentials file on a normal startup; dropping the block instead lets it
-/// self-heal — probed on CC 2.1.201 (`docs/issue-17-oauthaccount.md`): an
+/// self-heal — probed on CC 2.1.201: an
 /// absent block re-derives the correct identity from the token within
 /// seconds, a present-but-wrong one never self-corrects.
 ///

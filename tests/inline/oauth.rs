@@ -62,11 +62,13 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -96,7 +98,9 @@ use crate::testutil::HomeSandbox;
 /// returned file for as long as the session should read as live — dropping it
 /// releases the flock.
 fn arm_live_session(name: &str) -> std::fs::File {
-    let sessions = profile_dir(name).expect("profile_dir").join("sessions");
+    let sessions = profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile_dir")
+        .join("sessions");
     std::fs::create_dir_all(&sessions).expect("create sessions dir");
     let file = open_pid_file(&sessions.join("test-pid")).expect("open pid file");
     file.lock().expect("lock pid file");
@@ -130,7 +134,10 @@ fn live_session_included_when_force_false() {
     let candidates = rotation_candidates(&config, false);
     assert_eq!(
         candidates,
-        vec![(name.to_string(), "rt-ghi".to_string())],
+        vec![(
+            crate::profile::ProfileName::from(name),
+            "rt-ghi".to_string()
+        )],
         "a live session shares one credential file with clauth, so it follows a \
          rotation instead of being burned by one"
     );
@@ -148,7 +155,10 @@ fn live_session_included_with_force_true() {
     let candidates = rotation_candidates(&config, true);
     assert_eq!(
         candidates,
-        vec![(name.to_string(), "rt-jkl".to_string())],
+        vec![(
+            crate::profile::ProfileName::from(name),
+            "rt-jkl".to_string()
+        )],
         "liveness is not a rotation gate in either force mode"
     );
 
@@ -187,11 +197,13 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -216,14 +228,22 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, _rx) = mpsc::channel();
 
-    let result = rotate_one_inner(&config, "test-rotate-one-no-rt", Some(&activity), &tx);
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from("test-rotate-one-no-rt"),
+        Some(&activity),
+        &tx,
+    );
 
     assert!(
         matches!(result, RotateOutcome::Persisted(false)),
         "rotate_one_inner should return Persisted(false) when no refresh token"
     );
     assert!(
-        is_idle(&activity, "test-rotate-one-no-rt"),
+        is_idle(
+            &activity,
+            &crate::profile::ProfileName::from("test-rotate-one-no-rt")
+        ),
         "activity slot must remain Idle when rotation short-circuits at no-token"
     );
 }
@@ -242,11 +262,13 @@ fn profile_without_refresh_token_excluded() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at".to_string(),
@@ -284,11 +306,12 @@ fn rotation_guard_is_independent_across_profiles() {
     let _home = HomeSandbox::new();
     let a = "test-rotation-guard-indep-a";
     let b = "test-rotation-guard-indep-b";
-    let held_a = RotationGuard::acquire(a).expect("acquire a");
+    let held_a = RotationGuard::acquire(&crate::profile::ProfileName::from(a)).expect("acquire a");
 
     let (tx, rx) = mpsc::channel();
     let worker = std::thread::spawn(move || {
-        let held_b = RotationGuard::acquire(b).expect("acquire b while a is held"); // distinct lock file → must not block
+        let held_b = RotationGuard::acquire(&crate::profile::ProfileName::from(b))
+            .expect("acquire b while a is held"); // distinct lock file → must not block
         tx.send(()).expect("signal acquired");
         drop(held_b);
     });
@@ -333,11 +356,13 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "at-old".to_string(),
@@ -357,6 +382,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         profiles: vec![profile],
     };
     config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("persist state");
     config
 }
 
@@ -373,11 +399,13 @@ fn third_party_config(name: &str) -> AppConfig {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -407,7 +435,50 @@ fn gate_third_party_bypasses() {
     let name = "test-gate-third-party";
     let handle = Arc::new(RankedMutex::new(third_party_config(name)));
     assert!(matches!(
-        ensure_installable(&handle, name, never_refresh),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+}
+
+/// The quarantine flag cannot route a third-party (custom-endpoint) profile
+/// into the gate's `Broken` arm: non-OAuth targets pass through as `Ready`, so
+/// no AUTH-1 surface (CLI/MCP switch, TUI toast, daemon tick) can hand a
+/// quarantined keyless third-party target `login_expired`'s bare
+/// `clauth login <name>` — for that state the fix is the `--api-key` command,
+/// and the surface that refuses on it is the MCP pre-flight's keyless arm.
+/// Reds if a gate change ever routes third-party targets into the OAuth arm
+/// without revisiting that copy.
+#[test]
+fn gate_passes_a_quarantined_keyless_third_party_target_through() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-tp-quarantined-keyless";
+    let target = crate::profile::ProfileName::from(name);
+    let mut config = third_party_config(name);
+    {
+        #[allow(clippy::expect_used, reason = "test")]
+        let p = config.profiles.get_mut(0).expect("fixture profile");
+        p.api_key = None;
+        p.provider = Some(crate::providers::Provider::DeepSeek);
+    }
+    config.set_auth_broken(&target, true);
+    let handle = Arc::new(RankedMutex::new(config));
+    {
+        #[allow(clippy::expect_used, reason = "test")]
+        let cfg = handle.lock().expect("lock");
+        #[allow(clippy::expect_used, reason = "test")]
+        let p = cfg.find(&target).expect("profile");
+        assert!(
+            p.is_third_party() && !crate::claude::has_inference_auth(p),
+            "the fixture must be the keyless third-party shape"
+        );
+        assert!(cfg.is_auth_broken(&target), "the fixture must be flagged");
+    }
+    assert!(matches!(
+        ensure_installable(&handle, &target, never_refresh),
         AuthGate::Ready
     ));
 }
@@ -423,7 +494,11 @@ fn gate_valid_token_ready_without_refresh() {
         Some(future_expiry()),
     )));
     assert!(matches!(
-        ensure_installable(&handle, name, never_refresh),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
         AuthGate::Ready
     ));
 }
@@ -456,7 +531,7 @@ fn gate_refreshes_an_expiring_token_under_a_live_session() {
     };
     assert!(
         matches!(
-            ensure_installable(&handle, name, refresher),
+            ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
             AuthGate::Refreshed
         ),
         "a live session must not downgrade the gate to installing a spent token"
@@ -465,7 +540,7 @@ fn gate_refreshes_an_expiring_token_under_a_live_session() {
     let stored = handle
         .lock()
         .expect("config lock")
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-new"));
 
@@ -488,7 +563,11 @@ fn gate_installs_as_is_under_a_live_session_on_macos() {
     )));
     assert!(
         matches!(
-            ensure_installable(&handle, name, never_refresh),
+            ensure_installable(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                never_refresh
+            ),
             AuthGate::Ready
         ),
         "macOS must install as-is rather than sign the session out"
@@ -516,12 +595,14 @@ fn gate_refreshes_expiring_token_and_installs() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, name, refresher),
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Refreshed
     ));
     #[allow(clippy::expect_used, reason = "test")]
     let cfg = handle.lock().expect("lock");
-    let p = cfg.find(name).expect("profile");
+    let p = cfg
+        .find(&crate::profile::ProfileName::from(name))
+        .expect("profile");
     assert_eq!(
         p.access_token(),
         Some("at-new"),
@@ -533,7 +614,7 @@ fn gate_refreshes_expiring_token_and_installs() {
         "rotated refresh token stored"
     );
     assert!(
-        !cfg.is_auth_broken(name),
+        !cfg.is_auth_broken(&crate::profile::ProfileName::from(name)),
         "a successful refresh is not broken"
     );
 }
@@ -551,13 +632,13 @@ fn gate_invalid_refresh_marks_broken_and_refuses() {
     let refresher =
         |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
     assert!(matches!(
-        ensure_installable(&handle, name, refresher),
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Broken
     ));
     #[allow(clippy::expect_used, reason = "test")]
     let cfg = handle.lock().expect("lock");
     assert!(
-        cfg.is_auth_broken(name),
+        cfg.is_auth_broken(&crate::profile::ProfileName::from(name)),
         "a revoked refresh token quarantines the profile"
     );
 }
@@ -575,13 +656,13 @@ fn gate_transient_refresh_does_not_quarantine() {
     let refresher =
         |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Transient(TokenFailure::Transport));
     assert!(matches!(
-        ensure_installable(&handle, name, refresher),
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Transient(_)
     ));
     #[allow(clippy::expect_used, reason = "test")]
     let cfg = handle.lock().expect("lock");
     assert!(
-        !cfg.is_auth_broken(name),
+        !cfg.is_auth_broken(&crate::profile::ProfileName::from(name)),
         "a network blip must not quarantine a healthy account"
     );
 }
@@ -597,12 +678,16 @@ fn gate_expiring_without_refresh_token_is_broken() {
         Some(past_expiry()),
     )));
     assert!(matches!(
-        ensure_installable(&handle, name, never_refresh),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
         AuthGate::Broken
     ));
     #[allow(clippy::expect_used, reason = "test")]
     let cfg = handle.lock().expect("lock");
-    assert!(cfg.is_auth_broken(name));
+    assert!(cfg.is_auth_broken(&crate::profile::ProfileName::from(name)));
 }
 
 /// A standing quarantine overrides a still-valid clock: the chain's last
@@ -617,7 +702,7 @@ fn gate_flagged_profile_refreshes_despite_a_valid_clock() {
     let _home = HomeSandbox::new();
     let name = "test-gate-flagged-recovers";
     let mut config = oauth_config(name, Some("rt-relogin"), Some(future_expiry()));
-    config.set_auth_broken(name, true);
+    config.set_auth_broken(&crate::profile::ProfileName::from(name), true);
     let handle = Arc::new(RankedMutex::new(config));
     let refresher = |_rt: &str, _scopes: Option<&str>| {
         Ok(TokenResponse {
@@ -628,16 +713,18 @@ fn gate_flagged_profile_refreshes_despite_a_valid_clock() {
         })
     };
     assert!(matches!(
-        ensure_installable(&handle, name, refresher),
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Refreshed
     ));
     #[allow(clippy::expect_used, reason = "test")]
     let cfg = handle.lock().expect("lock");
     assert!(
-        !cfg.is_auth_broken(name),
+        !cfg.is_auth_broken(&crate::profile::ProfileName::from(name)),
         "a recovered chain lifts the quarantine on the way through the gate"
     );
-    let p = cfg.find(name).unwrap_or_else(|| panic!("profile"));
+    let p = cfg
+        .find(&crate::profile::ProfileName::from(name))
+        .unwrap_or_else(|| panic!("profile"));
     assert_eq!(p.access_token(), Some("at-recovered"));
 }
 
@@ -648,18 +735,18 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
     let _home = HomeSandbox::new();
     let name = "test-gate-flagged-dead";
     let mut config = oauth_config(name, Some("rt-revoked"), Some(future_expiry()));
-    config.set_auth_broken(name, true);
+    config.set_auth_broken(&crate::profile::ProfileName::from(name), true);
     let handle = Arc::new(RankedMutex::new(config));
     let refresher =
         |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
     assert!(matches!(
-        ensure_installable(&handle, name, refresher),
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Broken
     ));
     #[allow(clippy::expect_used, reason = "test")]
     let cfg = handle.lock().expect("lock");
     assert!(
-        cfg.is_auth_broken(name),
+        cfg.is_auth_broken(&crate::profile::ProfileName::from(name)),
         "a dead chain keeps the quarantine"
     );
 }
@@ -714,7 +801,7 @@ fn token_parse_error_redacts_the_2xx_body() {
 /// without the confirmation takes a healthy account out of rotation, and when
 /// the cause is our own request shape it takes EVERY account at once. 401 stays
 /// terminal regardless of body (some proxies answer it for a dead token).
-/// Bodies are real bytes captured from the live endpoint (`docs/wire-parity.md`).
+/// Bodies are real bytes captured from the live endpoint.
 #[test]
 fn refresh_rejection_terminal_truth_table() {
     // Dead refresh token — the flat OAuth2 envelope.
@@ -754,7 +841,7 @@ fn refresh_rejection_terminal_truth_table() {
 // ── canonicalize_scopes (refresh `scope` byte-parity with Claude Code) ────────
 
 /// CC emits the refresh `scope` in a fixed order regardless of how the
-/// credential file stored the granted scopes (`docs/wire-parity.md`). Reorder to
+/// credential file stored the granted scopes. Reorder to
 /// that canonical order, preserving the exact granted set.
 #[test]
 fn canonicalize_scopes_matches_claude_code_order() {
@@ -828,7 +915,10 @@ mod keychain_mirror_gate {
     fn missing_live_file_is_not_foreign() {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
-        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+        assert!(!super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 
     #[test]
@@ -836,7 +926,10 @@ mod keychain_mirror_gate {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
         write_live_file("new-token");
-        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+        assert!(!super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 
     #[test]
@@ -847,7 +940,10 @@ mod keychain_mirror_gate {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
         write_live_file("old-token");
-        assert!(!super::live_login_is_foreign("alpha", "old-token"));
+        assert!(!super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 
     #[test]
@@ -857,11 +953,14 @@ mod keychain_mirror_gate {
         let _home = HomeSandbox::new();
         save_profile_with("alpha", "new-token");
         write_live_file("someone-elses-token");
-        assert!(super::live_login_is_foreign("alpha", "old-token"));
+        assert!(super::live_login_is_foreign(
+            &crate::profile::ProfileName::from("alpha"),
+            "old-token"
+        ));
     }
 }
 
-// ── try_adopt_live_rotation (rotation coherence, the adopt-don't-race half) ──
+// ── try_adopt_live_rotation (rotation coherence, &crate::profile::ProfileName::from(the adopt-don't-race half)) ──
 //
 // The running claude and clauth hold ONE single-use refresh family; when CC
 // rotates first, its file mirror (~/.claude/.credentials.json) carries the
@@ -879,7 +978,8 @@ mod adopt_live_rotation {
     /// The per-profile rotation lock `try_adopt_live_rotation` demands proof
     /// of (production callers hold it across the whole rotation leg).
     fn guard(name: &str) -> crate::runtime::RotationGuard {
-        crate::runtime::RotationGuard::acquire(name).expect("rotation guard")
+        crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+            .expect("rotation guard")
     }
 
     fn creds_with(access: &str, expires_at: Option<i64>) -> crate::profile::ClaudeCredentials {
@@ -918,6 +1018,7 @@ mod adopt_live_rotation {
         };
         config.state.profiles = vec![name.into()];
         config.state.active_profile = Some(name.into());
+        crate::profile::save_app_state(&config.state).expect("persist state");
         let live = crate::profile::claude_dir()
             .unwrap()
             .join(".credentials.json");
@@ -934,7 +1035,7 @@ mod adopt_live_rotation {
         handle
             .lock()
             .unwrap()
-            .find(name)
+            .find(&crate::profile::ProfileName::from(name))
             .and_then(|p| p.access_token().map(str::to_string))
             .expect("stored access token")
     }
@@ -944,8 +1045,12 @@ mod adopt_live_rotation {
         let _home = HomeSandbox::new();
         let name = "adopt-ok";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
-        let adopted =
-            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
         // The adopted pair is returned so the caller syncs its TokenList —
         // without it, the next poll runs on the superseded entry.
         assert_eq!(
@@ -956,7 +1061,7 @@ mod adopt_live_rotation {
         // The identity anchor is cached for future dead-store adopts.
         assert_eq!(
             crate::profile_cache::load_profile_cache::<String>(
-                name,
+                &crate::profile::ProfileName::from(name),
                 crate::profile_cache::ACCOUNT_ID_CACHE_FILE
             )
             .as_deref(),
@@ -971,16 +1076,21 @@ mod adopt_live_rotation {
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         // Stored token answers uuid-1; the mirror token answers uuid-2 — a
         // manual CC /login into another account must never be captured.
-        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
-            Some(
-                if tok == "at-mirror" {
-                    "uuid-2"
-                } else {
-                    "uuid-1"
-                }
-                .into(),
-            )
-        });
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|tok| {
+                Some(
+                    if tok == "at-mirror" {
+                        "uuid-2"
+                    } else {
+                        "uuid-1"
+                    }
+                    .into(),
+                )
+            },
+        );
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
@@ -992,9 +1102,12 @@ mod adopt_live_rotation {
         // Stored token already expired → its own uuid can't be fetched, and no
         // cached anchor exists. Identity unprovable ⇒ refuse.
         let handle = setup(name, past_expiry(), future_expiry());
-        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
-            (tok == "at-mirror").then(|| "uuid-1".into())
-        });
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|tok| (tok == "at-mirror").then(|| "uuid-1".into()),
+        );
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
@@ -1005,13 +1118,16 @@ mod adopt_live_rotation {
         let name = "adopt-cached-anchor";
         let handle = setup(name, past_expiry(), future_expiry());
         crate::profile_cache::write_profile_cache(
-            name,
+            &crate::profile::ProfileName::from(name),
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
             &"uuid-1".to_string(),
         );
-        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|tok| {
-            (tok == "at-mirror").then(|| "uuid-1".into())
-        });
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|tok| (tok == "at-mirror").then(|| "uuid-1".into()),
+        );
         assert!(adopted.is_some());
         assert_eq!(stored_access(&handle, name), "at-mirror");
     }
@@ -1039,7 +1155,12 @@ mod adopt_live_rotation {
             }
         };
 
-        let first = try_adopt_live_rotation(&handle, name, &guard(name), &identity);
+        let first = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &identity,
+        );
         assert_eq!(first, None, "identity unprovable → refuse");
         assert_eq!(
             stored_calls.get(),
@@ -1048,16 +1169,26 @@ mod adopt_live_rotation {
         );
         assert_eq!(
             mirror_calls.get(),
-            0,
-            "a missing expected identity short-circuits before the mirror is probed"
+            1,
+            "the live token is probed for the announcement key, not for the verdict"
         );
 
-        let second = try_adopt_live_rotation(&handle, name, &guard(name), &identity);
+        let second = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &identity,
+        );
         assert_eq!(second, None);
         assert_eq!(
             stored_calls.get(),
             1,
             "a second leg must not re-spend a /profile on the same dead stored token"
+        );
+        assert_eq!(
+            mirror_calls.get(),
+            2,
+            "the raw test closure re-probes per leg; production memoizes per token"
         );
     }
 
@@ -1080,7 +1211,12 @@ mod adopt_live_rotation {
         };
 
         assert_eq!(
-            try_adopt_live_rotation(&handle, name, &guard(name), &identity),
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity
+            ),
             None
         );
         assert_eq!(stored_calls.get(), 1, "first leg probes and suppresses");
@@ -1090,7 +1226,12 @@ mod adopt_live_rotation {
             crate::usage::now_ms() - 1,
         );
         assert_eq!(
-            try_adopt_live_rotation(&handle, name, &guard(name), &identity),
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity
+            ),
             None
         );
         assert_eq!(
@@ -1100,6 +1241,503 @@ mod adopt_live_rotation {
         );
     }
 
+    /// A standing refusal is announced once, not once per rotation leg: while
+    /// the live slot stays unadoptable the classify gate keeps reading
+    /// `Diverged`, so every leg reaches the same refusal and an unconditional
+    /// line drowns the daemon and TUI logs in identical copies.
+    #[test]
+    fn a_standing_adopt_refusal_is_announced_once_per_state() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-once";
+        // Stored token dead + no cached anchor → identity unprovable, the
+        // standing state this pins.
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        for _ in 0..3 {
+            assert_eq!(
+                try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name),
+                    &guard(name),
+                    &identity,
+                ),
+                None
+            );
+        }
+
+        assert_eq!(
+            sink.snapshot(),
+            vec![
+                "clauth: live login for 'adopt-refusal-once' is newer but its identity can't \
+                 be proven (no cached account id and the stored token is dead). Not adopting; \
+                 resolve in the clauth TUI or re-run clauth login adopt-refusal-once"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// A state CHANGE — the refusal reason flips — announces again: the dedupe
+    /// key carries the reason (plus the live account for the foreign arm), so
+    /// a new standing state is never mistaken for the one already announced,
+    /// and each state still announces only once.
+    #[test]
+    fn a_refusal_reason_flip_announces_the_new_state_once() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-flip";
+        // Dead stored token + no cached anchor → unprovable; the anchor
+        // written mid-test flips later legs onto the provably-foreign arm.
+        let handle = setup(name, past_expiry(), future_expiry());
+        let unprovable: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        for _ in 0..2 {
+            assert_eq!(
+                try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name),
+                    &guard(name),
+                    &unprovable,
+                ),
+                None
+            );
+        }
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &"uuid-1".to_string(),
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                try_adopt_live_rotation(
+                    &handle,
+                    &crate::profile::ProfileName::from(name),
+                    &guard(name),
+                    &foreign,
+                ),
+                None
+            );
+        }
+
+        assert_eq!(
+            sink.snapshot(),
+            vec![
+                "clauth: live login for 'adopt-refusal-flip' is newer but its identity can't \
+                 be proven (no cached account id and the stored token is dead). Not adopting; \
+                 resolve in the clauth TUI or re-run clauth login adopt-refusal-flip"
+                    .to_string(),
+                "clauth: live login for 'adopt-refusal-flip' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 intentional"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// The once-per-state record lives beside the other per-profile caches,
+    /// not in process memory: the rotation leg runs in TWO processes (the
+    /// daemon scheduler and the TUI's in-process scheduler), so a memory
+    /// record would let each process announce the same standing state anew.
+    #[test]
+    fn the_adopt_refusal_record_is_durable_on_disk() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-durable";
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "nothing announced yet, so no record"
+        );
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .as_deref(),
+            Some("unprovable-identity:uuid-1"),
+            "the announcement is recorded on disk, where the other process reads it"
+        );
+    }
+
+    /// A successful adopt resolves the divergence the refusal announced, so
+    /// the record drops and a future standing refusal is news again.
+    #[test]
+    fn a_resolving_adopt_clears_the_refusal_record() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-clear";
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> =
+            |tok| (tok == "at-mirror").then(|| "uuid-1".into());
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            ),
+            None,
+            "identity unprovable until the anchor lands"
+        );
+        assert!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .is_some(),
+            "the standing refusal is recorded"
+        );
+
+        // The cached anchor lands (a re-login's backfill): the same live
+        // mirror is now provably the profile's own account, so it adopts.
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &"uuid-1".to_string(),
+        );
+        assert!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            )
+            .is_some()
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "the resolved state no longer suppresses a future announcement"
+        );
+    }
+
+    /// A leg that observes the link healthy again drops the record, so a
+    /// re-occurring standing state announces like the first one.
+    #[test]
+    fn a_resolved_link_clears_the_record_so_a_recurrence_announces_again() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-recur";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .as_deref(),
+            Some("foreign-account:uuid-2"),
+        );
+
+        // Resolution without an adopt: the live slot is rewritten to the
+        // profile's own pair, so the link classifies LinkedTo again.
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with("at-old", Some(future_expiry()))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "the healthy leg observed the resolution and dropped the record"
+        );
+
+        // Re-divergence: the SAME foreign mirror returns, and the state is
+        // news again.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with("at-mirror", Some(future_expiry() + 3_600_000)))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            sink.snapshot(),
+            vec![
+                "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 intentional"
+                    .to_string(),
+                "clauth: live login for 'adopt-refusal-recur' belongs to a DIFFERENT account. \
+                 Not adopting; capture it via the clauth TUI divergence flow if that was \
+                 intentional"
+                    .to_string(),
+            ],
+        );
+    }
+
+    /// A DIFFERENT foreign login is a state change worth a line, while the
+    /// same login's token churn (CC rewriting the mirror on every launch) is
+    /// not: the dedupe key carries the live account id for this reason.
+    #[test]
+    fn a_different_foreign_login_announces_while_same_account_churn_stays_silent() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-swap";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                match tok {
+                    "at-mirror-3" => "uuid-3",
+                    tok if tok.starts_with("at-mirror") => "uuid-2",
+                    _ => "uuid-1",
+                }
+                .into(),
+            )
+        };
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        let leg = || {
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            )
+        };
+
+        assert_eq!(leg(), None, "uuid-2 mirror is foreign to the stored uuid-1");
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // Same account, fresh pair: the standing state did not change.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with(
+                "at-mirror-2",
+                Some(future_expiry() + 7_200_000),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(leg(), None);
+        assert_eq!(sink.snapshot().len(), 1, "same-account churn stays silent");
+
+        // A different foreign account lands: news again.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with(
+                "at-mirror-3",
+                Some(future_expiry() + 10_800_000),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(leg(), None);
+        assert_eq!(
+            sink.snapshot().len(),
+            2,
+            "a different foreign login announces"
+        );
+        assert_eq!(leg(), None);
+        assert_eq!(sink.snapshot().len(), 2, "and it announces only once");
+    }
+
+    /// A profile that gains a session token leaves the adopt story entirely
+    /// (the refusal sites are unreachable behind the first gate), so a record
+    /// from its OAuth era must not outlive the regime switch: cleared here, a
+    /// later OAuth re-divergence announces fresh.
+    #[test]
+    fn a_session_token_regime_switch_clears_a_stale_refusal_record() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-regime";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let foreign: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            )
+            .is_some(),
+            "the standing refusal is recorded"
+        );
+
+        // Regime switch: a long-lived session-token sidecar (no refresh
+        // token) engages the split, and the adopt gates stop applying.
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&crate::profile::ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "static-mint".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(future_expiry() + 86_400_000),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &foreign,
+            ),
+            None
+        );
+        assert_eq!(
+            crate::profile_cache::load_profile_cache::<String>(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::ADOPT_REFUSAL_FILE
+            ),
+            None,
+            "the OAuth-era record does not outlive the regime switch"
+        );
+    }
+
+    /// The unprovable refusal keys on the live account too: a different login
+    /// under the same anchorless state is a state change worth a line, while
+    /// the same login's token churn stays silent.
+    #[test]
+    fn a_different_login_under_an_unprovable_state_announces_again() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-refusal-unprovable-swap";
+        let handle = setup(name, past_expiry(), future_expiry());
+        let identity: fn(&str) -> Option<crate::profile::AccountId> = |tok| {
+            Some(
+                if tok == "at-mirror-2" {
+                    "uuid-2"
+                } else {
+                    "uuid-1"
+                }
+                .into(),
+            )
+        };
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        let sink = crate::logline::LogLines::new();
+        let _capture = sink.capture_here();
+        let leg = || {
+            try_adopt_live_rotation(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                &guard(name),
+                &identity,
+            )
+        };
+
+        assert_eq!(leg(), None, "uuid-1 mirror is unprovable");
+        assert_eq!(sink.snapshot().len(), 1);
+
+        // A different live login under the same anchorless state: news.
+        std::fs::write(
+            &live,
+            serde_json::to_vec(&creds_with(
+                "at-mirror-2",
+                Some(future_expiry() + 7_200_000),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(leg(), None);
+        assert_eq!(
+            sink.snapshot().len(),
+            2,
+            "a different login under the unprovable state announces"
+        );
+        assert_eq!(leg(), None);
+        assert_eq!(sink.snapshot().len(), 2, "and it announces only once");
+    }
+
     #[test]
     fn refuses_a_stale_or_equal_mirror() {
         let _home = HomeSandbox::new();
@@ -1107,8 +1745,12 @@ mod adopt_live_rotation {
         // Mirror expiry equals the store's — nothing fresher to adopt.
         let expiry = future_expiry();
         let handle = setup(name, expiry, expiry);
-        let adopted =
-            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
@@ -1119,8 +1761,12 @@ mod adopt_live_rotation {
         let name = "adopt-inactive";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         handle.lock().unwrap().state.active_profile = None;
-        let adopted =
-            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
@@ -1133,7 +1779,12 @@ mod adopt_live_rotation {
         let _home = HomeSandbox::new();
         let name = "adopt-blank-id";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
-        let adopted = try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("  ".into()));
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("  ".into()),
+        );
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
     }
@@ -1148,12 +1799,22 @@ mod adopt_live_rotation {
         let _home = HomeSandbox::new();
         let name = "adopt-quarantined";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
-        handle.lock().unwrap().set_auth_broken(name, true);
-        let adopted =
-            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        handle
+            .lock()
+            .unwrap()
+            .set_auth_broken(&crate::profile::ProfileName::from(name), true);
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
         assert!(adopted.is_some(), "the fresher same-account pair adopts");
         assert!(
-            !handle.lock().unwrap().is_auth_broken(name),
+            !handle
+                .lock()
+                .unwrap()
+                .is_auth_broken(&crate::profile::ProfileName::from(name)),
             "an adopted (alive) chain lifts a stale quarantine"
         );
     }
@@ -1172,16 +1833,25 @@ mod adopt_live_rotation {
         let name = "adopt-session-token";
         let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
         let mint = format!("sk-ant-oat01-{}", "x".repeat(40));
-        crate::claude::write_session_token(name, &mint, crate::usage::now_ms() as i64)
-            .expect("write session token");
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from(name),
+            &mint,
+            crate::usage::now_ms() as i64,
+        )
+        .expect("write session token");
         assert_eq!(
-            crate::claude::classify_credentials_link(name).expect("classify"),
+            crate::claude::classify_credentials_link(&crate::profile::ProfileName::from(name))
+                .expect("classify"),
             crate::claude::LinkState::Diverged,
             "fixture precondition: the live slot no longer holds the static token"
         );
 
-        let adopted =
-            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
         assert_eq!(adopted, None);
         assert_eq!(
             stored_access(&handle, name),
@@ -1189,7 +1859,7 @@ mod adopt_live_rotation {
             "the clauth-private usage pair must survive"
         );
         let on_disk: crate::profile::ClaudeCredentials = crate::profile::read_json_file(
-            &crate::profile::profile_dir(name)
+            &crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
                 .expect("profile dir")
                 .join("credentials.json"),
         )
@@ -1223,8 +1893,12 @@ mod adopt_live_rotation {
             "fixture precondition: CC's rename leaves a regular file, not our link"
         );
 
-        let adopted =
-            try_adopt_live_rotation(&handle, name, &guard(name), &|_| Some("uuid-1".into()));
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
         assert!(adopted.is_some(), "the fresher same-account pair adopts");
 
         assert!(
@@ -1235,8 +1909,97 @@ mod adopt_live_rotation {
             "the adopt must restore the symlink, or clauth's next rotation never reaches CC"
         );
         assert_eq!(
-            crate::claude::classify_credentials_link(name).expect("classify"),
+            crate::claude::classify_credentials_link(&crate::profile::ProfileName::from(name))
+                .expect("classify"),
             crate::claude::LinkState::LinkedTo,
+        );
+    }
+
+    /// A live file carrying `mcpOAuth` survives the adopt with that key
+    /// intact. Before the carry the relink pointed the live slot at a store
+    /// holding the login alone, and Claude Code lost every MCP-server session on
+    /// a leg that runs unattended roughly every 8 hours.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn an_adopt_keeps_the_live_files_mcp_oauth() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-mcp";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+
+        // Claude Code authenticated an MCP server before it rotated its login.
+        let live = crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json");
+        let mut body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&live).unwrap()).unwrap();
+        body["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+        std::fs::write(&live, serde_json::to_vec(&body).unwrap()).unwrap();
+
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
+        assert!(
+            adopted.is_some(),
+            "the same-account fresher pair is adopted"
+        );
+
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&live).unwrap()).unwrap();
+        assert_eq!(
+            after["claudeAiOauth"]["accessToken"], "at-mirror",
+            "the adopted login is what the live slot serves"
+        );
+        assert_eq!(
+            after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+            "the MCP-server login survives the post-adopt relink"
+        );
+    }
+
+    /// The adopt persists a whole profile, so it must not recreate the directory
+    /// of a profile deleted while the rotation guard was held across the identity
+    /// HTTP window. `name` stays active on the stale handle but is already gone
+    /// on disk; the fresh membership read refuses before `save_profile`.
+    #[test]
+    fn adopt_does_not_resurrect_a_deleted_profile() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-resurrect";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+
+        // CLI account mutation on a config where `name` is NOT active, so the
+        // delete leaves the live mirror file alone (the adopt's classify gate
+        // still reads it as Diverged rather than Missing).
+        let mut disk = crate::profile::load_config().expect("load disk config");
+        disk.state.active_profile = None;
+        let rotation = guard(name);
+        crate::actions::delete_profile(
+            &mut disk,
+            &crate::profile::ProfileName::from(name),
+            false,
+            &rotation,
+        )
+        .expect("delete");
+        assert!(
+            !crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("dir")
+                .exists(),
+            "fixture precondition: the delete removed the directory"
+        );
+
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &rotation,
+            &|_| Some("uuid-1".into()),
+        );
+        assert_eq!(adopted, None, "a deleted profile must not be adopted");
+        assert!(
+            !crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("dir")
+                .exists(),
+            "the deleted profile's directory must stay deleted"
         );
     }
 }
@@ -1253,7 +2016,8 @@ mod adopt_live_rotation {
 /// The rotation lock the guard leg demands proof of (production callers hold
 /// it across the whole refresh window).
 fn gate_guard(name: &str) -> crate::runtime::RotationGuard {
-    crate::runtime::RotationGuard::acquire(name).expect("rotation guard")
+    crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+        .expect("rotation guard")
 }
 
 /// Persist a peer's rotation to the on-disk profile store — the state a
@@ -1285,9 +2049,70 @@ fn gate_under_guard_installs_a_sibling_refreshed_pair_as_is() {
         Some(future_expiry()),
     )));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
+}
+
+/// A sidecar repair that failed on the bounded state-flock wait is CONTENTION
+/// — another clauth process is busy under ~/.clauth, on macOS possibly across
+/// a 20-second Keychain shell-out — and must never render as
+/// `SidecarWriteFailed`'s "check permissions", which sends the operator
+/// hunting a fault that does not exist. Any other error keeps the fault copy.
+#[test]
+fn a_state_lock_timeout_reads_as_contention_not_permissions() {
+    let busy = anyhow::Error::new(crate::lock::StateLockTimeout::stub())
+        .context("quarantine session-token.json");
+    let t = sidecar_repair_transient(&crate::profile::ProfileName::from("busy"), &busy);
+    assert!(
+        t.text().contains("another clauth process holds"),
+        "contention names the holder, got: {}",
+        t.text()
+    );
+    assert!(
+        !t.text().contains("check permissions"),
+        "contention must not prescribe a permissions hunt, got: {}",
+        t.text()
+    );
+
+    let fault = anyhow::anyhow!("read-only file system").context("write session-token.json");
+    let t = sidecar_repair_transient(&crate::profile::ProfileName::from("busy"), &fault);
+    assert!(
+        t.text().contains("check permissions on ~/.clauth"),
+        "a genuine filesystem fault keeps the fault copy, got: {}",
+        t.text()
+    );
+}
+
+/// The install-gate grace IS Claude Code's refresh threshold, shared with the
+/// backup-restore verdicts: identical bytes must never read as dead in the
+/// backup slot ([`crate::claude::BACKUP_EXPIRY_GRACE_MS`]) and installable in
+/// the live one. A mint with three minutes of life sits inside CC's own
+/// five-minute refresh window — a refresh-less credential the client is
+/// already trying to refresh — so every gate this constant feeds must treat
+/// it as expiring.
+#[test]
+fn the_install_grace_is_ccs_refresh_window_shared_with_the_backup_verdicts() {
+    assert_eq!(
+        AUTH_GATE_GRACE_MS,
+        crate::claude::BACKUP_EXPIRY_GRACE_MS,
+        "one number, one home — the two slots must agree on what dead means"
+    );
+    let now = crate::usage::now_ms() as i64;
+    assert!(
+        expiring(Some(now + 3 * 60 * 1000), false),
+        "three minutes of life is inside CC's five-minute refresh window"
+    );
+    assert!(
+        !expiring(Some(now + 10 * 60 * 1000), false),
+        "ten minutes clears the window"
+    );
 }
 
 /// Still expiring under the guard → the refresher is fed the CURRENTLY stored
@@ -1314,7 +2139,13 @@ fn gate_under_guard_spends_the_currently_stored_refresh_token() {
         })
     };
     assert!(matches!(
-        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Refreshed
     ));
 }
@@ -1335,11 +2166,22 @@ fn gate_under_guard_adopts_a_cross_process_rotation_from_disk() {
     )));
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
     assert_eq!(
-        handle.lock().unwrap().find(name).unwrap().refresh_token(),
+        handle
+            .lock()
+            .unwrap()
+            .find(&crate::profile::ProfileName::from(name))
+            .unwrap()
+            .refresh_token(),
         Some("rt-peer"),
         "the adopted disk pair must replace the stale in-memory snapshot"
     );
@@ -1368,9 +2210,99 @@ fn gate_under_guard_spends_the_disk_pair_after_an_external_rotation() {
         })
     };
     assert!(matches!(
-        gate_under_guard(&handle, name, refresher, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            refresher,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Refreshed
     ));
+}
+
+/// A wedged state flock during the adoption leg must not send the stale
+/// in-memory pair into the refresh: the gate yields Transient with the
+/// contention copy, the refresher never runs (the already-spent single-use
+/// token stays unspent), and the disk pair is not half-adopted. The wedge is
+/// a second open file description holding the flock — which conflicts exactly
+/// as a second process would (same pose as the teardown wedge in
+/// `runtime.rs`) — and the deadline override keeps the wait off the real 25 s.
+#[test]
+fn gate_under_guard_refuses_when_the_adoption_flock_is_wedged() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-flock-wedge";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-stale"),
+        Some(past_expiry()),
+    )));
+    save_disk_profile(name, "rt-peer", Some(future_expiry()));
+
+    let lock_path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join(crate::lock::LOCK_FILENAME);
+    let holder = crate::profile::open_state_file(&lock_path).expect("open holder");
+    holder.lock().expect("hold the flock");
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(50)));
+    let gate = gate_under_guard(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+        &gate_guard(name),
+        AUTH_GATE_GRACE_MS,
+    );
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+
+    let AuthGate::Transient(t) = gate else {
+        panic!("a wedged adoption flock must refuse the gate");
+    };
+    assert!(
+        t.text().contains("another clauth process holds"),
+        "the timeout reads as contention, got: {}",
+        t.text()
+    );
+    assert_eq!(
+        handle
+            .lock()
+            .unwrap()
+            .find(&crate::profile::ProfileName::from(name))
+            .unwrap()
+            .refresh_token(),
+        Some("rt-stale"),
+        "a failed adoption must not half-land the disk pair"
+    );
+}
+
+/// The adoption flock's failure maps contention and fault to different
+/// verdicts — the same split as the sidecar repair leg. A timeout is a busy
+/// sibling (retry), never a "check permissions" hunt; a genuine IO fault
+/// keeps the fault copy.
+#[test]
+fn an_adoption_flock_failure_splits_contention_from_fault() {
+    let busy =
+        anyhow::Error::new(crate::lock::StateLockTimeout::stub()).context("adopt disk rotation");
+    let t = adopt_lock_transient(&crate::profile::ProfileName::from("busy"), &busy);
+    assert!(
+        t.text().contains("another clauth process holds"),
+        "contention names the holder, got: {}",
+        t.text()
+    );
+    assert!(
+        !t.text().contains("check permissions"),
+        "contention must not prescribe a permissions hunt, got: {}",
+        t.text()
+    );
+
+    let fault = anyhow::anyhow!("read-only file system").context("open state lock");
+    let t = adopt_lock_transient(&crate::profile::ProfileName::from("busy"), &fault);
+    assert!(
+        t.text().contains("check permissions on ~/.clauth"),
+        "a genuine filesystem fault keeps the fault copy, got: {}",
+        t.text()
+    );
 }
 
 /// A differing disk pair proves the chain is alive, so a standing in-memory
@@ -1386,14 +2318,26 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
         Some("rt-stale"),
         Some(future_expiry()),
     )));
-    handle.lock().unwrap().set_auth_broken(name, true);
+    handle
+        .lock()
+        .unwrap()
+        .set_auth_broken(&crate::profile::ProfileName::from(name), true);
     save_disk_profile(name, "rt-peer", Some(future_expiry()));
     assert!(matches!(
-        gate_under_guard(&handle, name, never_refresh, &gate_guard(name)),
+        gate_under_guard(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh,
+            &gate_guard(name),
+            AUTH_GATE_GRACE_MS
+        ),
         AuthGate::Ready
     ));
     assert!(
-        !handle.lock().unwrap().is_auth_broken(name),
+        !handle
+            .lock()
+            .unwrap()
+            .is_auth_broken(&crate::profile::ProfileName::from(name)),
         "an adopted (alive) chain lifts a stale quarantine"
     );
 }
@@ -1401,7 +2345,7 @@ fn gate_under_guard_disk_adoption_lifts_a_stale_quarantine() {
 // ── token-endpoint request bodies (platform.claude.com wire parity) ──────────
 //
 // The exact JSON body CC's axios client posts to platform.claude.com/v1/oauth/
-// token, captured 2026-07-14 against CC 2.1.209 (docs/wire-parity.md). Field
+// token, captured 2026-07-14 against CC 2.1.209. Field
 // set is compared order-independently (a JSON body's key order is not a wire
 // signal); `scope` value + canonical order carry their own assertions.
 
@@ -1469,7 +2413,7 @@ fn token_endpoint_constants_match_cc_wire() {
 // ── kick emits Claude Code's /v1/messages client shape (wire parity) ─────────
 //
 // The window-priming POST carries CC's SDK instrumentation + full beta set
-// (captured 2026-07-14, CC 2.1.209, docs/wire-parity.md). Drives the REAL
+// (captured 2026-07-14, CC 2.1.209). Drives the REAL
 // kick_to builder against a loopback listener and asserts the emitted bytes.
 // Deliberately partial vs a real stainless client (no host-derived
 // arch/os/runtime-version, no per-session ids) — asserted here so the boundary
@@ -1740,10 +2684,10 @@ fn gate_session_token_ready_even_when_auth_broken() {
     let _home = HomeSandbox::new();
     let name = "test-gate-session-token";
     let mut config = oauth_config(name, Some("rt-dead"), Some(past_expiry()));
-    config.set_auth_broken(name, true);
+    config.set_auth_broken(&crate::profile::ProfileName::from(name), true);
     // Materialize the profile dir, then the session token beside it.
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
-    let dir = crate::profile::profile_dir(name).expect("dir");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
     std::fs::write(
         dir.join("session-token.json"),
         serde_json::to_vec(&ClaudeCredentials {
@@ -1760,9 +2704,73 @@ fn gate_session_token_ready_even_when_auth_broken() {
     .expect("write session token");
     let handle = Arc::new(RankedMutex::new(config));
     assert!(matches!(
-        ensure_installable(&handle, name, never_refresh),
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
         AuthGate::Ready
     ));
+}
+
+/// CLA-SPLIT: the install arm reads a mint with the SAME grace every other
+/// verdict on these bytes uses (`AUTH_GATE_GRACE_MS` = CC's five-minute
+/// refresh threshold = the backup-restore rule). Three minutes of life is
+/// inside CC's own refresh window — a refresh-less credential the client
+/// immediately tries to refresh, signing the session out — so the switch must
+/// refuse it exactly where `clauth static-token` calls the identical bytes
+/// EXPIRED; ten minutes clears the window and installs. Zero grace here was
+/// the one arm that INSTALLS a mint while every other slot called it dead.
+#[test]
+fn gate_refuses_a_mint_inside_ccs_refresh_window() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-mint-window";
+    let config = oauth_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    let mint = |exp_in_ms: i64| {
+        std::fs::write(
+            dir.join("session-token.json"),
+            serde_json::to_vec(&ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "oat-static".to_string(),
+                    refresh_token: None,
+                    expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
+                    scopes: None,
+                    subscription_type: None,
+                }),
+            })
+            .expect("ser"),
+        )
+        .expect("write session token");
+    };
+    let handle = Arc::new(RankedMutex::new(config));
+
+    mint(3 * 60 * 1000);
+    assert!(
+        matches!(
+            ensure_installable(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                never_refresh
+            ),
+            AuthGate::Broken
+        ),
+        "three minutes of life is inside CC's refresh window — refused"
+    );
+
+    mint(10 * 60 * 1000);
+    assert!(
+        matches!(
+            ensure_installable(
+                &handle,
+                &crate::profile::ProfileName::from(name),
+                never_refresh
+            ),
+            AuthGate::Ready
+        ),
+        "ten minutes clears the window — installs as-is"
+    );
 }
 
 // ── rotate_one_inner, driven offline ─────────────────────────────────────────
@@ -1775,7 +2783,10 @@ fn gate_session_token_ready_even_when_auth_broken() {
 /// A live-session profile whose stored pair the leg would spend.
 fn live_rotate_fixture(name: &str) -> (crate::profile::ConfigHandle, std::fs::File) {
     let pid = arm_live_session(name);
-    (crate::testutil::rotation_fixture_config(name), pid)
+    (
+        crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name)),
+        pid,
+    )
 }
 
 /// Off macOS the session shares the credential file, so the leg MUST rotate:
@@ -1797,7 +2808,12 @@ fn rotate_one_inner_rotates_under_a_live_session() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, rx) = mpsc::channel();
 
-    let result = rotate_one_inner(&config, name, Some(&activity), &tx);
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        Some(&activity),
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert_eq!(
@@ -1835,7 +2851,12 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
     let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
     let (tx, rx) = mpsc::channel();
 
-    let result = rotate_one_inner(&config, name, Some(&activity), &tx);
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        Some(&activity),
+        &tx,
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -1844,7 +2865,7 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
     );
     assert!(matches!(result, RotateOutcome::Persisted(false)));
     assert!(
-        is_idle(&activity, name),
+        is_idle(&activity, &crate::profile::ProfileName::from(name)),
         "a skipped rotation stamps nothing"
     );
     assert!(rx.try_recv().is_err(), "the silent skip emits no OpResult");
@@ -1852,7 +2873,7 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
     let stored = config
         .lock()
         .expect("config lock")
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-old"), "the pair is untouched");
     drop(pid);
@@ -1883,9 +2904,16 @@ fn the_kick_reserves_the_shared_anthropic_request_slot() {
         "the probe must start unreserved, or a leftover slot would pass for the kick's"
     );
     let before = crate::usage::now_ms();
-    let config = crate::testutil::rotation_fixture_config(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
 
-    let result = auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let result = auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+    );
     let seen = server.join().expect("listener");
 
     assert!(result.opened, "the 200 opens the window: {seen:?}");
@@ -1921,10 +2949,17 @@ fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
         }
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
-    let config = crate::testutil::rotation_fixture_config(name);
-    crate::testutil::block_credentials_write(name);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    crate::testutil::block_credentials_write(&crate::profile::ProfileName::from(name));
 
-    let result = auto_start_kick(&config, name, "at-old", Some("rt-old"), None, None);
+    let result = auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+    );
     let seen = server.join().expect("listener");
 
     assert!(
@@ -1933,8 +2968,11 @@ fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
     );
     // Proof the fixture failed the persist where it claims to: the crash-durable
     // sidecar is only cleared after a committed save.
-    let pending =
-        crate::profile::profile_subpath(name, "credentials.json.pending").expect("pending path");
+    let pending = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from(name),
+        "credentials.json.pending",
+    )
+    .expect("pending path");
     assert!(
         pending.is_file(),
         "the staged sidecar must survive, or the save never failed"
@@ -2018,11 +3056,12 @@ fn oauth_error_types_have_no_printable_escape_hatch() {
 // ── every Retry selection, pinned at the CALL SITE that chooses it ───────────
 //
 // `format.rs` pins the Retry→copy MAPPING. That is not the same thing and does
-// not defend it: flipping `Retry::Stated` to `Retry::Connection` at a call site
-// leaves the mapping correct and restores the exact defect the enum exists to
-// remove — two contradictory reasons to retry in one sentence. Four of the six
-// selections survived the whole suite until these landed, so each one below
-// reaches its real call site and asserts the sentence an operator reads.
+// not defend it: flipping `Retry::Stated` to a suffix-bearing retry at a call
+// site leaves the mapping correct and now fails loudly at construction (the
+// guard) instead of rendering two contradictory reasons to retry in one
+// sentence. Four of the six selections survived the whole suite until these
+// landed, so each one below reaches its real call site and asserts the
+// sentence an operator reads.
 
 /// The guard-refusal copy must describe the condition that actually produces
 /// it, and name one next step rather than two.
@@ -2047,18 +3086,32 @@ fn guard_acquire_failure_names_the_filesystem_cause() {
         Some("rt-ok"),
         Some(past_expiry()),
     )));
-    // A regular file where the profile DIRECTORY belongs: `acquire` creates
-    // `<profile>/rotation.lock`, so its `mkdir_700` of the parent fails.
+    // A regular file where the lock's PARENT directory belongs, so `acquire`'s
+    // `mkdir_700` of it fails. Aimed via `rotation_lock_path` rather than at the
+    // profile dir: the lock no longer lives there, so occupying the profile dir
+    // stopped denying the guard at all.
     #[allow(clippy::expect_used, reason = "test")]
-    let dir = crate::profile::profile_dir(name).expect("profile dir");
-    if let Some(parent) = dir.parent() {
-        #[allow(clippy::expect_used, reason = "test")]
-        std::fs::create_dir_all(parent).expect("profile parent");
-    }
+    let lock = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name))
+        .expect("rotation lock path");
     #[allow(clippy::expect_used, reason = "test")]
-    std::fs::write(&dir, b"not a directory").expect("occupy the profile dir path");
+    let locks_dir = lock.parent().expect("lock parent");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
+    #[allow(clippy::expect_used, reason = "test")]
+    let denied =
+        crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name)).is_err();
+    assert!(
+        denied,
+        "the fixture must actually deny the guard, or this proves nothing"
+    );
 
-    let AuthGate::Transient(t) = ensure_installable(&handle, name, never_refresh) else {
+    let AuthGate::Transient(t) = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    ) else {
         panic!("an unacquirable rotation guard must refuse transiently");
     };
     assert_eq!(
@@ -2085,16 +3138,24 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
     use std::sync::mpsc;
     let _home = HomeSandbox::new();
     let name = "rotate-lock-unavailable";
-    // Same fixture as the gate pin: a regular file where the profile DIRECTORY
-    // belongs, so `RotationGuard::acquire`'s `mkdir_700` fails.
+    // Same fixture as the gate pin: a regular file where the lock's PARENT
+    // directory belongs, so `RotationGuard::acquire`'s `mkdir_700` fails.
     #[allow(clippy::expect_used, reason = "test")]
-    let dir = crate::profile::profile_dir(name).expect("profile dir");
-    if let Some(parent) = dir.parent() {
-        #[allow(clippy::expect_used, reason = "test")]
-        std::fs::create_dir_all(parent).expect("profile parent");
-    }
+    let lock = crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name))
+        .expect("rotation lock path");
     #[allow(clippy::expect_used, reason = "test")]
-    std::fs::write(&dir, b"not a directory").expect("occupy the profile dir path");
+    let locks_dir = lock.parent().expect("lock parent");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::create_dir_all(locks_dir.parent().expect("clauth dir")).expect("clauth dir");
+    #[allow(clippy::expect_used, reason = "test")]
+    std::fs::write(locks_dir, b"not a directory").expect("occupy the locks dir path");
+    #[allow(clippy::expect_used, reason = "test")]
+    let denied =
+        crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name)).is_err();
+    assert!(
+        denied,
+        "the fixture must actually deny the guard, or this proves nothing"
+    );
 
     let config = Arc::new(RankedMutex::new(oauth_config(
         name,
@@ -2107,7 +3168,13 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
     let (tx, rx) = mpsc::channel();
 
     assert!(
-        !rotate_one(&config, name, &refetch, &activity, &tx),
+        !rotate_one(
+            &config,
+            &crate::profile::ProfileName::from(name),
+            &refetch,
+            &activity,
+            &tx
+        ),
         "an unacquirable lock persists nothing"
     );
     #[allow(clippy::expect_used, reason = "test")]
@@ -2117,7 +3184,11 @@ fn the_unavailable_lock_has_one_spelling_across_both_legs() {
         Err(e) => e.to_string(),
     };
 
-    let AuthGate::Transient(gate) = ensure_installable(&config, name, never_refresh) else {
+    let AuthGate::Transient(gate) = ensure_installable(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    ) else {
         panic!("the gate must refuse the same condition transiently");
     };
     assert_eq!(
@@ -2146,7 +3217,11 @@ fn poisoned_config_refusal_offers_no_retry() {
     })
     .join();
 
-    let AuthGate::Transient(t) = ensure_installable(&handle, name, never_refresh) else {
+    let AuthGate::Transient(t) = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    ) else {
         panic!("a poisoned config mutex must refuse transiently");
     };
     assert_eq!(
@@ -2167,9 +3242,9 @@ fn an_unparseable_2xx_tells_the_operator_to_wait() {
     });
     let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
     let (tx, rx) = mpsc::channel();
-    let cfg = crate::testutil::rotation_fixture_config(name);
+    let cfg = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
 
-    rotate_one_inner(&cfg, name, None, &tx);
+    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
@@ -2204,7 +3279,8 @@ fn a_failed_persist_after_a_good_refresh_offers_a_retry() {
     // `save_profile`'s credential write fails — the one reachable way to make
     // `apply_rotated_tokens_locked` err without breaking an earlier step.
     #[allow(clippy::expect_used, reason = "test")]
-    let dir = crate::profile::profile_dir(name).expect("profile dir");
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("profile dir");
     #[allow(clippy::expect_used, reason = "test")]
     std::fs::create_dir_all(dir.join("credentials.json")).expect("occupy the credentials path");
 
@@ -2216,7 +3292,9 @@ fn a_failed_persist_after_a_good_refresh_offers_a_retry() {
             scope: None,
         })
     };
-    let AuthGate::Transient(t) = ensure_installable(&handle, name, refresher) else {
+    let AuthGate::Transient(t) =
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher)
+    else {
         panic!("a failed persist must refuse transiently, never install");
     };
     assert_eq!(
@@ -2257,8 +3335,14 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
     let (tx, rx) = mpsc::channel();
 
     let dead = "rotate-refusal-dead";
-    let dead_cfg = crate::testutil::rotation_fixture_config(dead);
-    rotate_one_inner(&dead_cfg, dead, None, &tx);
+    let dead_cfg =
+        crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(dead));
+    rotate_one_inner(
+        &dead_cfg,
+        &crate::profile::ProfileName::from(dead),
+        None,
+        &tx,
+    );
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
@@ -2280,8 +3364,14 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
     );
 
     let flaky = "rotate-refusal-flaky";
-    let flaky_cfg = crate::testutil::rotation_fixture_config(flaky);
-    rotate_one_inner(&flaky_cfg, flaky, None, &tx);
+    let flaky_cfg =
+        crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(flaky));
+    rotate_one_inner(
+        &flaky_cfg,
+        &crate::profile::ProfileName::from(flaky),
+        None,
+        &tx,
+    );
     #[allow(clippy::expect_used, reason = "test")]
     let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
     let msg = match outcome {
@@ -2307,6 +3397,130 @@ fn rotate_refusal_carries_no_wire_bytes_in_either_direction() {
     );
 }
 
+/// The dead-chain toast on a keyless third-party profile: `login_expired`'s
+/// bare `clauth login <name>` runs the browser flow and leaves the missing key
+/// missing, so the arm carries the pre-flight's keyless sentence instead — the
+/// command that clears the state the profile is actually in. The OAuth shape
+/// keeps the shared login hint, pinned one test up.
+#[test]
+fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-keyless-third-party";
+    let (base, server) = crate::testutil::serve_endpoints(1, |_, _| {
+        (400, r#"{"error": "invalid_grant"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+
+    // A hybrid the endpoint edit produced: browser-login credentials that
+    // predate setting the endpoint (setting one never drops them), so the
+    // rotate leg still spends the dying chain while inference has no key.
+    let mut profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        None,
+    );
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    let cfg: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
+
+    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a dead chain is never a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(
+        msg,
+        "profile has no api key: rotate-keyless-third-party (run \
+         `clauth login rotate-keyless-third-party --api-key <key>`)"
+    );
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the leg actually answered the endpoint"
+    );
+}
+
+/// The same toast on a KEYED third-party hybrid: "name the split state" (owner
+/// ruling, 2026-08-30) reaches this surface too — the rotate leg spends any
+/// profile holding a refresh token, so a hybrid's dying chain lands here with
+/// its api key still working.
+#[test]
+fn rotate_names_the_split_state_for_a_keyed_third_party_profile() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-keyed-third-party";
+    let (base, server) = crate::testutil::serve_endpoints(1, |_, _| {
+        (400, r#"{"error": "invalid_grant"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let (tx, rx) = mpsc::channel();
+
+    let mut profile = crate::profile::Profile::new(
+        name.to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-live".to_string()),
+    );
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    };
+    config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    let cfg: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(config));
+
+    rotate_one_inner(&cfg, &crate::profile::ProfileName::from(name), None, &tx);
+    #[allow(clippy::expect_used, reason = "test")]
+    let OpResult { outcome, .. } = rx.try_recv().expect("the HTTP leg emits an OpResult");
+    let msg = match outcome {
+        Ok(()) => panic!("a dead chain is never a completed rotation"),
+        Err(e) => e.to_string(),
+    };
+    assert_eq!(
+        msg,
+        "stored OAuth chain is dead, its api key still works: rotate-keyed-third-party \
+         (run `clauth login rotate-keyed-third-party --api-key <key>` to clear the quarantine)"
+    );
+
+    #[allow(clippy::expect_used, reason = "test")]
+    let seen = server.join().expect("listener");
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string()],
+        "proof of execution: the leg actually answered the endpoint"
+    );
+}
+
 /// The terminal-vs-transient split is what the `auth_broken` quarantine rests
 /// on, and it now lives entirely inside `refresh_result` — the body that decides
 /// it is dropped the instant it has decided. Driven over the real wire in BOTH
@@ -2326,13 +3540,20 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
     )));
     assert!(
         matches!(
-            ensure_installable(&dead_cfg, dead, refresh_result),
+            ensure_installable(
+                &dead_cfg,
+                &crate::profile::ProfileName::from(dead),
+                refresh_result
+            ),
             AuthGate::Broken
         ),
         "a confirmed invalid_grant is still terminal"
     );
     #[allow(clippy::expect_used, reason = "test")]
-    let dead_flagged = dead_cfg.lock().expect("lock").is_auth_broken(dead);
+    let dead_flagged = dead_cfg
+        .lock()
+        .expect("lock")
+        .is_auth_broken(&crate::profile::ProfileName::from(dead));
     assert!(dead_flagged, "a dead refresh token still quarantines");
 
     let flaky = "gate-wire-flaky";
@@ -2341,11 +3562,18 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
         Some("rt-ok"),
         Some(past_expiry()),
     )));
-    let AuthGate::Transient(e) = ensure_installable(&flaky_cfg, flaky, refresh_result) else {
+    let AuthGate::Transient(e) = ensure_installable(
+        &flaky_cfg,
+        &crate::profile::ProfileName::from(flaky),
+        refresh_result,
+    ) else {
         panic!("a 5xx the endpoint never confirmed must stay transient");
     };
     #[allow(clippy::expect_used, reason = "test")]
-    let flaky_flagged = flaky_cfg.lock().expect("lock").is_auth_broken(flaky);
+    let flaky_flagged = flaky_cfg
+        .lock()
+        .expect("lock")
+        .is_auth_broken(&crate::profile::ProfileName::from(flaky));
     assert!(
         !flaky_flagged,
         "a 5xx must never quarantine — the retry is what recovers it"
@@ -2379,5 +3607,1558 @@ fn refresh_classification_survives_the_real_wire_in_both_directions() {
         seen,
         vec!["/v1/oauth/token".to_string(); 2],
         "proof of execution: both legs actually answered the endpoint"
+    );
+}
+
+/// `oauth_config` with the rolling token enabled and a plan-capable chain
+/// (full scopes + subscriptionType) — the shape `clauth rolling-token <p>`
+/// requires.
+fn rolling_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
+    let mut config = oauth_config(name, refresh_token, expires_at);
+    let p = config.profiles.first_mut().expect("profile");
+    p.rolling_token = true;
+    if let Some(oauth) = p
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.scopes = Some(vec!["user:profile".into(), "user:inference".into()]);
+        oauth.subscription_type = Some("max".into());
+    }
+    config
+}
+
+/// Read the sidecar's OAuth block back for assertions.
+fn sidecar_oauth(name: &str) -> Option<OAuthToken> {
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    let creds: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).ok()?).ok()?;
+    creds.claude_ai_oauth
+}
+
+/// Fresh fed sidecar → install as-is; neither the chain clock nor the
+/// refresher is consulted (the chain here is stone dead).
+#[test]
+fn rolling_gate_fresh_sidecar_ready_without_refresh() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-fresh";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-fed", "sidecar untouched");
+}
+
+/// The flag is re-read from DISK under the guard, on both wait arms: the
+/// in-memory config that routed here can predate a completed
+/// `static-token --clear` (a separate process the daemon's snapshot never
+/// sees), and stamping from that stale routing would re-create the very
+/// sidecar the operator was just told is gone — with the flag now off so
+/// nothing ever re-stamps it. The scheduler leg reports Ready (its still-due
+/// re-read then drops the pacing hold); the switch-in leg drops the guard and
+/// falls to the vanilla gate, which installs the stored login.
+#[test]
+fn rolling_gate_disk_disarm_under_the_guard_stops_the_stamp() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-cleared";
+    // In-memory: ARMED, with a comfortable chain a roll would happily stamp.
+    let config = rolling_config(name, Some("rt-live"), Some(future_expiry()));
+    // On disk: the clear already landed — flag off, no sidecar, no backup.
+    let mut on_disk = config.profiles[0].clone();
+    on_disk.rolling_token = false;
+    crate::profile::save_profile(&on_disk).expect("save profile");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "fixture: the profile is cleared"
+    );
+    let handle = Arc::new(RankedMutex::new(config));
+
+    // The scheduler leg (NoWait).
+    let gate = restamp_rolling_token(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    );
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "the scheduler leg has nothing to re-stamp"
+    );
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared on the scheduler leg"
+    );
+
+    // The switch-in leg (Block) — the vanilla fallback serves the login.
+    let gate = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    );
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "the vanilla fallback serves the login"
+    );
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared on the switch-in leg"
+    );
+}
+
+/// Stale fed sidecar + comfortably live stored chain → re-stamped from the
+/// store, no refresh spent, chain metadata (subscriptionType) carried.
+#[test]
+fn rolling_gate_stale_sidecar_feeds_from_comfortable_chain_without_spend() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-nospend";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-old",
+        "re-stamped from the stored chain"
+    );
+    assert!(
+        oauth.refresh_token.is_none(),
+        "the pair never leaves clauth custody"
+    );
+    assert_eq!(oauth.subscription_type.as_deref(), Some("max"));
+    assert_eq!(oauth.expires_at, Some(future_expiry_of(&handle, name)));
+}
+
+/// The chain expiry the gate fed from — read back from the handle so the
+/// assertion tracks the fixture rather than re-deriving clock math.
+fn future_expiry_of(handle: &crate::profile::ConfigHandle, name: &str) -> i64 {
+    handle
+        .lock()
+        .expect("config")
+        .find(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.access_token_expires_at())
+        .expect("chain expiry")
+}
+
+/// Stale sidecar + stale chain → guarded refresh; the rotation persist
+/// re-stamps the sidecar with the freshly minted access token.
+#[test]
+fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-refresh";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        AuthGate::Refreshed
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-new",
+        "hook re-stamped the rotated access token"
+    );
+    assert!(oauth.refresh_token.is_none());
+}
+
+/// Feed flag on but NO sidecar yet → the gate arms it through the refresh
+/// leg instead of falling through to a vanilla pair install (which would put
+/// the shared rotating chain in front of sessions).
+#[test]
+fn rolling_gate_absent_sidecar_arms_instead_of_vanilla_install() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-arm";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-armed".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        AuthGate::Refreshed
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar armed");
+    assert_eq!(oauth.access_token, "at-armed");
+    assert!(oauth.refresh_token.is_none());
+    let expected = crate::claude::install_source_path(&crate::profile::ProfileName::from(name))
+        .expect("source");
+    assert!(
+        expected.ends_with("session-token.json"),
+        "the armed sidecar is now the install source"
+    );
+}
+
+/// Terminally dead chain + preserved static mint → degrade to the mint
+/// (Ready) instead of benching the account; the backup is consumed.
+#[test]
+fn rolling_gate_dead_chain_restores_static_mint() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-degrade";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    // A genuine mint first (1yr horizon, no subscriptionType)…
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    // …then the roll takes over, preserving it…
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    assert!(matches!(
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "sk-ant-oat01-mint", "the mint is back");
+    let backup = profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("dir")
+        .join("session-token.static.json");
+    assert!(!backup.exists(), "backup consumed by the restore");
+}
+
+/// Terminally dead chain and no mint to fall back to → Broken stands (the
+/// pre-stamp refusal), never a vanilla install of the dead pair.
+#[test]
+fn rolling_gate_dead_chain_without_backup_stays_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-broken";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    assert!(matches!(
+        ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+        AuthGate::Broken
+    ));
+}
+
+/// The rotation persist re-stamps a feed-enabled profile's sidecar (parked or
+/// active) and preserves a genuine mint on first contact; a non-feed split
+/// profile's sidecar stays untouched (the CLA-SPLIT quiet branch).
+#[test]
+fn rotation_hook_stamps_enabled_profiles_and_preserves_the_mint() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-hook";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let handle = Arc::new(RankedMutex::new(config));
+    apply_rotated_tokens_locked(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-rotated", "rotation fed the sidecar");
+    assert!(oauth.refresh_token.is_none());
+    let backup = profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("dir")
+        .join("session-token.static.json");
+    let backed: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(&backup).expect("backup")).expect("parse");
+    assert_eq!(
+        backed.access_token(),
+        Some("sk-ant-oat01-mint"),
+        "first roll preserved the mint"
+    );
+}
+
+/// The rotation hook's stamp decision is the same disk re-read as the install
+/// gate's: the in-memory profile a rotation leg persists from can predate a
+/// completed `static-token --clear` (a separate process the daemon's snapshot
+/// never sees), and stamping from that stale routing re-creates the very
+/// sidecar the operator was just told is gone — with the flag now off so
+/// nothing ever re-stamps it. The hook's whole-profile save must not
+/// resurrect the cleared flag either, or the daemon's next reload re-arms it.
+#[test]
+fn rotation_hook_disk_disarm_stops_the_stamp() {
+    let _home = HomeSandbox::new();
+    let name = "test-hook-cleared";
+    // In-memory: ARMED, with a comfortable chain a roll would happily stamp.
+    let config = rolling_config(name, Some("rt-live"), Some(future_expiry()));
+    // On disk: the clear already landed — flag off, no sidecar.
+    let mut on_disk = config.profiles[0].clone();
+    on_disk.rolling_token = false;
+    crate::profile::save_profile(&on_disk).expect("save profile");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "fixture: the profile is cleared"
+    );
+    let handle = Arc::new(RankedMutex::new(config));
+    // Every production caller holds the RotationGuard across the hook — the
+    // lock the clear serializes on.
+    let _guard =
+        RotationGuard::acquire(&crate::profile::ProfileName::from(name)).expect("rotation guard");
+    apply_rotated_tokens_locked(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    assert!(
+        !dir.join("session-token.json").exists(),
+        "a cleared profile stays cleared through the rotation hook"
+    );
+    assert!(
+        !crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+            .expect("disk profile")
+            .rolling_token,
+        "the hook's whole-profile save did not resurrect the cleared flag"
+    );
+}
+
+/// Same rotation on a split profile WITHOUT the rolling token: the sidecar is the
+/// static mint and stays byte-identical (the designed quiet steady state).
+#[test]
+fn rotation_hook_leaves_non_rolling_split_sidecars_alone() {
+    let _home = HomeSandbox::new();
+    let name = "test-nofeed-hook";
+    let config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let handle = Arc::new(RankedMutex::new(config));
+    apply_rotated_tokens_locked(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "sk-ant-oat01-mint", "mint untouched");
+}
+
+/// A mis-filled sidecar (rotating pair) is never overwritten by the roll —
+/// the DANGER evidence survives for the operator to see.
+#[test]
+fn rotation_hook_never_overwrites_a_misfilled_sidecar() {
+    let _home = HomeSandbox::new();
+    let name = "test-misfill-hook";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+    let handle = Arc::new(RankedMutex::new(config));
+    apply_rotated_tokens_locked(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-misfill",
+        "mis-fill evidence survives"
+    );
+    assert_eq!(oauth.refresh_token.as_deref(), Some("rt-misfill"));
+}
+
+/// Feed profile + mis-filled sidecar + preserved mint → the gate heals
+/// (quarantine + restore) and installs the mint; the pair never fronts CC.
+#[test]
+fn rolling_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-heal";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed preserves mint");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("misfill");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    // Healed AND re-armed in one pass: the restored mint is immediately
+    // superseded by a fed bearer from the comfortable chain (no spend).
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-old",
+        "healed then re-stamped from the chain"
+    );
+    assert!(oauth.refresh_token.is_none());
+    let source = crate::claude::install_source_path(&crate::profile::ProfileName::from(name))
+        .expect("source");
+    assert!(
+        source.ends_with("session-token.json"),
+        "the pair is never the install source after a heal"
+    );
+}
+
+/// A static MINT on a feed profile is a fallback, not a fresh fed token — the
+/// gate supersedes it from the comfortable chain (no spend) and the mint
+/// lands in the degrade backup. Regression for the deploy-day bug where the
+/// mint's ~1yr stamp read as "fresh" and arming never fed anything.
+#[test]
+fn rolling_gate_supersedes_a_static_mint_with_a_fed_bearer() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-mint-supersede";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-old", "fed from the stored chain");
+    assert!(oauth.refresh_token.is_none());
+    let backup: ClaudeCredentials = serde_json::from_slice(
+        &std::fs::read(
+            profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("dir")
+                .join("session-token.static.json"),
+        )
+        .expect("backup"),
+    )
+    .expect("parse");
+    assert_eq!(
+        backup.access_token(),
+        Some("sk-ant-oat01-mint"),
+        "the superseded mint became the degrade backup"
+    );
+}
+
+/// Feed profile + mis-filled sidecar + NO backup → the disengaged-vanilla
+/// posture stands (documented CLA-SPLIT-3 semantics): the plain gate runs and
+/// a comfortable chain installs credentials.json, loudly.
+#[test]
+fn rolling_gate_misfill_without_backup_keeps_the_disengaged_vanilla_posture() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-misfill-vanilla";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("misfill");
+    let handle = Arc::new(RankedMutex::new(config));
+    assert!(matches!(
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    let source = crate::claude::install_source_path(&crate::profile::ProfileName::from(name))
+        .expect("source");
+    assert!(
+        source.ends_with("credentials.json"),
+        "no backup to degrade to — disengaged split behaves as vanilla"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CLA-ROLL: scheduler-leg re-stamp (`restamp_rolling_token`) — renew the fed
+// bearer HOURS before its clock death, not seconds.
+// ---------------------------------------------------------------------------
+
+/// Epoch-ms comfortably beyond the re-stamp horizon — a chain the no-spend
+/// re-stamp path may clone from.
+fn beyond_horizon_expiry() -> i64 {
+    crate::usage::now_ms() as i64 + 6 * 3_600_000
+}
+
+/// The due predicate fires for an armed, exp-carrying sidecar inside the
+/// horizon — and for a MIS-FILL at any clock, because the content is the
+/// defect and this leg is the only one a running daemon has that can repair
+/// it. Absent sidecars stay the switch-time gate's job.
+#[test]
+fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
+    let _home = HomeSandbox::new();
+    let now = crate::usage::now_ms() as i64;
+    let name = "test-restamp-due";
+    assert!(
+        !rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        "absent sidecar is not the timer's job"
+    );
+    // A rotating pair with 8h of clock — comfortably OUTSIDE the horizon, so
+    // only the content classification can make it due. This is the arm whose
+    // deletion turns the daemon-side heal back into dead code.
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(beyond_horizon_expiry()),
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("write misfill");
+    assert!(
+        rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        "a mis-fill is due NOW, whatever its clock says"
+    );
+    std::fs::remove_file(dir.join("session-token.json")).expect("clean the misfill fixture");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-rolled".to_string(),
+            refresh_token: None,
+            expires_at: Some(beyond_horizon_expiry()),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp");
+    assert!(
+        !rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        "a bearer clear of the horizon is left alone"
+    );
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-rolled-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h,  inside the 2h horizon
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp");
+    assert!(
+        rolling_sidecar_restamp_due(&crate::profile::ProfileName::from(name), now),
+        "a bearer inside the horizon is due"
+    );
+}
+
+/// A dying fed bearer + a chain clear of the horizon → no-spend re-stamp,
+/// exactly where the switch gate (minutes-tight grace) would have no-opped —
+/// the contrast that pins the horizon semantics.
+#[test]
+fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
+    let _home = HomeSandbox::new();
+    let name = "test-restamp-nospend";
+    let config = rolling_config(name, Some("rt-good"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h: dying,  but "fresh" to the switch gate
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    // Switch gate: +1h clears the five-minute grace → install as-is, no re-stamp.
+    assert!(matches!(
+        ensure_installable(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-fed-dying",
+        "the switch gate leaves a +1h bearer alone"
+    );
+    // Re-feed leg: +1h is inside the 2h horizon → re-stamped from the chain,
+    // still without spending a refresh.
+    assert!(matches!(
+        restamp_rolling_token(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            never_refresh
+        ),
+        AuthGate::Ready
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(oauth.access_token, "at-old", "re-stamped from the chain");
+    assert!(oauth.refresh_token.is_none(), "pair never leaves custody");
+}
+
+/// Dying bearer + chain itself inside the horizon (they usually share an
+/// expiry — the fed token IS the chain's access token) → guarded refresh; the
+/// rotation hook re-stamps the freshly minted token.
+#[test]
+fn restamp_rotates_when_the_chain_is_inside_the_horizon_too() {
+    let _home = HomeSandbox::new();
+    let name = "test-restamp-rotate";
+    let config = rolling_config(name, Some("rt-old"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Ok(TokenResponse {
+            access_token: "at-new".to_string(),
+            refresh_token: "rt-new".to_string(),
+            expires_in: 8 * 3600,
+            scope: None,
+        })
+    };
+    assert!(matches!(
+        restamp_rolling_token(&handle, &crate::profile::ProfileName::from(name), refresher),
+        AuthGate::Refreshed
+    ));
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-new",
+        "hook re-stamped the rotated token"
+    );
+    assert!(oauth.refresh_token.is_none());
+}
+
+/// The missing arm of the dead-chain degrade: a preserved mint whose stamped
+/// `expiresAt` has PASSED. Restoring it would install a credential that signs
+/// every session out on first use (the Incident C shape the vanilla gate's
+/// clock check guards), so the restore refuses, the backup survives as
+/// evidence, and with nothing live to serve the verdict is Broken — never
+/// Ready-on-a-dead-mint.
+#[test]
+fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
+    let _home = HomeSandbox::new();
+    let name = "test-expired-backup";
+    let config = rolling_config(name, Some("rt-dead"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    // A backup that aged out on the shelf: mint-scoped, stamped in the past.
+    let expired_mint = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-aged-out".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec_pretty(&expired_mint).expect("ser"),
+    )
+    .expect("write backup");
+    // The sidecar holds the last rolling bearer, itself past its clock.
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-rolled-dead".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+        },
+    )
+    .expect("stamp");
+    let handle = Arc::new(RankedMutex::new(config));
+    let refresher =
+        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    assert!(
+        matches!(
+            ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
+            AuthGate::Broken
+        ),
+        "an expired backup must not launder a dead chain into Ready"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "the refused backup stays on disk instead of being consumed"
+    );
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "at-rolled-dead",
+        "and the expired mint never reached the sidecar"
+    );
+}
+
+/// The scheduler's re-stamp leg must never park behind a held rotation lock:
+/// it runs inline on the tick thread and this gate's waiting form carries no
+/// deadline, so a `clauth start` holding the lock across its recursive copy would
+/// stall every account's poll. With the lock held, the gate answers Transient
+/// promptly (the NoWait path) instead of blocking until release.
+#[test]
+fn restamp_never_parks_behind_a_held_rotation_lock() {
+    let _home = HomeSandbox::new();
+    let name = "test-noblock";
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    // A rolling sidecar inside the re-stamp horizon, so the gate has work
+    // that reaches the lock.
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-dying".to_string(),
+            refresh_token: None,
+            expires_at: Some(future_expiry()), // +1h,  inside the 2h horizon
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: None,
+        },
+    )
+    .expect("stamp");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+        .expect("hold the lock");
+    let handle = Arc::new(RankedMutex::new(config));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let refresher =
+            |_rt: &str, _scopes: Option<&str>| panic!("a held lock must never reach the refresher");
+        let gate = restamp_rolling_token(
+            &handle,
+            &crate::profile::ProfileName::from("test-noblock"),
+            refresher,
+        );
+        let text = match gate {
+            AuthGate::Transient(e) => Some(e.text()),
+            _ => None,
+        };
+        tx.send(text).expect("send");
+    });
+    // Generous for a loaded runner, tiny next to the block it guards against
+    // (the lock is held for the whole wait, so a parking implementation can
+    // only fail this by timeout).
+    let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(guard);
+    worker.join().expect("worker");
+    let text = verdict
+        .expect("the re-stamp leg parked behind a held rotation lock")
+        .expect("a held lock answers Transient, never Ready and never a wait");
+    // The HELD copy, not the UNAVAILABLE one: this is genuine contention, and
+    // the arm whose copy upstream corrected in round 1 describes a filesystem
+    // fault that is not what happened here. Derived from the renderer rather
+    // than re-spelled: the two arms render different sentences, so a swap still
+    // reds, and the literal stays pinned once, in `format`'s copy table.
+    assert_eq!(
+        text,
+        crate::format::Transient::new(
+            crate::format::Cause::RotationLockHeld(name.to_string()),
+            crate::format::Retry::Stated,
+        )
+        .text(),
+        "a held lock renders as contention, not as the filesystem-fault arm"
+    );
+}
+
+/// The mis-fill arm is the one path that leaves [`rolling_install_gate`] for
+/// the vanilla gate — whose own acquire BLOCKS — so the NoWait axis must
+/// cover it too, or the non-parking property holds everywhere except on the
+/// arm that widened last. The scenario that defeats it: a mis-filled sidecar,
+/// an EXPIRED preserved mint (so the heal has nothing live to restore), an
+/// expiring chain (so the vanilla gate would proceed to its blocking
+/// acquire), and a `clauth start` holding the rotation lock. The tick's leg
+/// must answer Transient with the mis-fill's own cause, promptly, touching
+/// neither the refresher nor the evidence on disk.
+#[test]
+fn restamp_on_a_misfill_with_no_live_backup_never_takes_the_vanilla_gate() {
+    let _home = HomeSandbox::new();
+    let name = "test-misfill-nowait";
+    // Chain inside the vanilla gate's own grace: the fall-through would not
+    // stop at the pre-check but go on to acquire the held lock and refresh.
+    let config = rolling_config(name, Some("rt-live"), Some(now_ms() as i64 + 10_000));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    // The mis-fill: a rotating pair in the sidecar.
+    let pair = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-misfill".to_string(),
+            refresh_token: Some("rt-misfill".to_string()),
+            expires_at: Some(now_ms() as i64 + 3_600_000),
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&pair).expect("ser"),
+    )
+    .expect("misfill");
+    // The preserved mint: genuine, but past its clock — nothing live to heal
+    // with, and refused without being consumed.
+    let dead_mint = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-dead-mint".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_ms() as i64 - 1_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:sessions:claude_code".to_string(),
+            ]),
+            subscription_type: None,
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.static.json"),
+        serde_json::to_vec(&dead_mint).expect("ser"),
+    )
+    .expect("expired backup");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+        .expect("hold the lock");
+    let handle = Arc::new(RankedMutex::new(config));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let refresher = |_rt: &str, _scopes: Option<&str>| {
+            panic!("the NoWait leg must never do the vanilla gate's refresh work")
+        };
+        let gate = restamp_rolling_token(
+            &handle,
+            &crate::profile::ProfileName::from("test-misfill-nowait"),
+            refresher,
+        );
+        let text = match gate {
+            AuthGate::Transient(e) => Some(e.text()),
+            _ => None,
+        };
+        tx.send(text).expect("send");
+    });
+    let verdict = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(guard);
+    worker.join().expect("worker");
+    let text = verdict
+        .expect("the re-stamp leg parked behind the vanilla gate's blocking acquire")
+        .expect("a disengaged mis-fill answers Transient on the NoWait leg, never vanilla-Ready");
+    assert!(
+        text.contains("rotating pair and no live mint backup"),
+        "the mis-fill's own cause, not a lock or write flavor: {text}"
+    );
+    assert!(
+        dir.join("session-token.static.json").exists(),
+        "the expired mint stays on disk as evidence"
+    );
+    let sidecar: crate::profile::ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    assert_eq!(
+        sidecar.access_token(),
+        Some("at-misfill"),
+        "the sidecar is untouched — the evidence quarantine is the CLI's explicit-intent path"
+    );
+}
+
+/// A profile whose chain grant is UNRECORDED (no scopes, no plan stamp — the
+/// shape `stamp_rolling_token` refuses) but whose sidecar holds a live,
+/// installable mint must still switch in on that mint. The GrantUnusable
+/// verdict's first cut returned Transient unconditionally and turned this
+/// profile into a hard switch refusal — losing the live-sidecar fallback the
+/// old WriteFailed path had (verification fleet, round 3).
+#[test]
+fn rolling_gate_unrecorded_grant_still_installs_a_live_mint() {
+    let _home = HomeSandbox::new();
+    let name = "test-grant-mint";
+    // A LIVE chain with no recorded grant at all.
+    let config = rolling_config(name, Some("rt-live"), Some(beyond_horizon_expiry()));
+    let mut profile = config.profiles[0].clone();
+    if let Some(oauth) = profile
+        .credentials
+        .as_mut()
+        .and_then(|c| c.claude_ai_oauth.as_mut())
+    {
+        oauth.scopes = None;
+        oauth.subscription_type = None;
+    }
+    crate::profile::save_profile(&profile).expect("save profile");
+    let config = Arc::new(RankedMutex::new(crate::profile::AppConfig {
+        state: config.state.clone(),
+        profiles: vec![profile],
+    }));
+    // The sidecar: a genuine live mint.
+    crate::claude::write_session_token(
+        &crate::profile::ProfileName::from(name),
+        "sk-ant-oat01-live-mint",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        panic!("a live chain with an unusable grant must not spend a refresh")
+    };
+    assert!(
+        matches!(
+            ensure_installable(&config, &crate::profile::ProfileName::from(name), refresher),
+            AuthGate::Ready
+        ),
+        "the live mint installs; the unusable grant only stops the ROLL"
+    );
+    let oauth = sidecar_oauth(name).expect("sidecar");
+    assert_eq!(
+        oauth.access_token, "sk-ant-oat01-live-mint",
+        "mint untouched"
+    );
+}
+
+// ── stale-config persist gates (lock-race row 3) ─────────────────────────────
+//
+// A daemon leg persists a whole profile/state from an in-memory config that a
+// concurrent CLI delete/rename can have already moved past. Each test deletes a
+// profile through the CLI action while a separate handle holds the pre-delete
+// snapshot, then drives the persist leg and asserts the deleted profile stays
+// gone.
+
+/// A rotation that lands after the profile was deleted must not recreate its
+/// directory: `save_profile` opens with `mkdir_700`, so the pre-fix leg
+/// resurrected the account's whole directory tree.
+#[test]
+fn rotated_tokens_do_not_resurrect_a_deleted_profile() {
+    let _home = HomeSandbox::new();
+    let name = "rotate-resurrect";
+    let mut profile = Profile::new(name.to_string(), None, None);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(future_expiry()),
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![name.into()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+
+    // The leg's handle is a snapshot taken BEFORE the delete.
+    let stale = Arc::new(RankedMutex::new(config.clone()));
+
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from(name))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from(name),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+    assert!(
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .exists(),
+        "fixture precondition: the delete removed the directory"
+    );
+
+    let tok = TokenResponse {
+        access_token: "at-new".to_string(),
+        refresh_token: "rt-new".to_string(),
+        expires_in: 3600,
+        scope: None,
+    };
+    assert!(
+        apply_rotated_tokens_locked(&stale, &crate::profile::ProfileName::from(name), tok).is_err(),
+        "a persist to a deleted profile must refuse"
+    );
+    assert!(
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("dir")
+            .exists(),
+        "the deleted profile's directory must stay deleted"
+    );
+}
+
+/// The durable record of a quarantine names the same recovery the live
+/// surfaces do, split the same three ways: this leg fires for a third-party
+/// hybrid (the scheduler spends any profile holding a refresh token), and a
+/// log that prescribes the bare browser login there contradicts the toast the
+/// same event raises.
+#[test]
+fn the_quarantine_logline_splits_the_recovery_like_every_other_surface() {
+    let _home = HomeSandbox::new();
+    let mk = |name: &str, base_url: Option<&str>, api_key: Option<&str>| {
+        let p = Profile::new(
+            name.to_string(),
+            base_url.map(str::to_string),
+            api_key.map(str::to_string),
+        );
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let oauth = mk("ql-oauth", None, None);
+    let keyed = mk(
+        "ql-keyed",
+        Some("https://api.deepseek.com/anthropic"),
+        Some("sk-live"),
+    );
+    let keyless = mk(
+        "ql-keyless",
+        Some("https://api.deepseek.com/anthropic"),
+        None,
+    );
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["ql-oauth".into(), "ql-keyed".into(), "ql-keyless".into()],
+            ..AppState::default()
+        },
+        profiles: vec![oauth, keyed, keyless],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let handle = Arc::new(RankedMutex::new(config));
+
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    for name in ["ql-oauth", "ql-keyed", "ql-keyless"] {
+        mark_auth_broken(&handle, &crate::profile::ProfileName::from(name), true);
+    }
+
+    assert_eq!(
+        sink.snapshot(),
+        vec![
+            "clauth: login for 'ql-oauth' has expired: refresh token revoked or invalid: \
+             run clauth login ql-oauth (flagged auth_broken)"
+                .to_string(),
+            "clauth: stored OAuth chain is dead, its api key still works: ql-keyed (run \
+             `clauth login ql-keyed --api-key <key>` to clear the quarantine) (flagged auth_broken)"
+                .to_string(),
+            "clauth: profile has no api key: ql-keyless (run `clauth login ql-keyless \
+             --api-key <key>`) (flagged auth_broken)"
+                .to_string(),
+        ],
+    );
+}
+
+/// The quarantine write re-serializes the whole profile list, so it used to
+/// restore a deleted profile's ROW in `profiles.toml` (not only its directory).
+/// It must write only the flag onto the current on-disk state.
+#[test]
+fn mark_auth_broken_does_not_resurrect_a_deleted_profiles_row() {
+    let _home = HomeSandbox::new();
+    let mk = |n: &str| {
+        let p = Profile::new(n.to_string(), None, None);
+        crate::profile::save_profile(&p).expect("save profile");
+        p
+    };
+    let kept = mk("kept-row");
+    let victim = mk("victim-row");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["kept-row".into(), "victim-row".into()],
+            ..AppState::default()
+        },
+        profiles: vec![kept, victim],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let stale = Arc::new(RankedMutex::new(config.clone()));
+
+    let guard =
+        crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("victim-row"))
+            .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("victim-row"),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+
+    mark_auth_broken(
+        &stale,
+        &crate::profile::ProfileName::from("victim-row"),
+        true,
+    );
+
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded
+            .find(&crate::profile::ProfileName::from("victim-row"))
+            .is_none(),
+        "a deleted profile's row must not come back through the quarantine write"
+    );
+    assert!(
+        reloaded
+            .find(&crate::profile::ProfileName::from("kept-row"))
+            .is_some(),
+        "the surviving profile's row is untouched"
+    );
+}
+
+/// Fixture for the dead-chain splitter tests: a recognised third-party
+/// profile (provider derived from the base_url) whose own-endpoint arm the
+/// splitter reaches, persisted so a verdict can be seeded against it
+/// (`write_auth_expired` lands only for configured profiles). `env` seeds an
+/// env auth entry (`ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_API_KEY`).
+fn dead_chain_copy_fixture(
+    name: &str,
+    base_url: &str,
+    key: Option<&str>,
+    env: Option<(&str, &str)>,
+) -> Profile {
+    let mut profile = Profile::new(
+        name.to_string(),
+        Some(base_url.to_string()),
+        key.map(str::to_string),
+    );
+    if let Some((k, v)) = env {
+        profile.env.insert(k.to_string(), v.to_string());
+    }
+    crate::profile::save_profile(&profile).expect("save fixture profile");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile.clone()],
+    };
+    config.state.profiles.push(name.into());
+    crate::profile::save_app_state(&config.state).expect("save app state");
+    profile
+}
+
+/// A `AuthExpired` verdict matching the profile's CURRENT credential retires
+/// the dead-chain sentence: a key the verdict pronounces dead is no
+/// credential, so the splitter renders the keyless sentence instead of "its
+/// api key still works". The pin seeds the verdict through the same
+/// fingerprint spelling the site consults, so the two can never diverge.
+#[test]
+fn dead_chain_copy_renders_keyless_when_the_verdict_matches_the_current_key() {
+    let _home = HomeSandbox::new();
+    let name = "tp-verdict-matches";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        Some("sk-fixture"),
+        None,
+    );
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("the fixture must carry a third-party credential");
+    crate::profile_cache::write_auth_expired(&profile.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "the seeded verdict must land before the choice is pinned"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_keyless(&profile.name))
+    );
+}
+
+/// No verdict: the splitter's dead-chain sentence stays byte-identical.
+#[test]
+fn dead_chain_copy_without_a_verdict_keeps_the_dead_chain_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-no-verdict";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        Some("sk-fixture"),
+        None,
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// A verdict recorded under a different credential is inert: the profile
+/// re-logged in with a new key, so the old verdict must not retire the live
+/// sentence.
+#[test]
+fn dead_chain_copy_ignores_a_verdict_for_another_credential() {
+    let _home = HomeSandbox::new();
+    let name = "tp-stale-verdict";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        Some("sk-current"),
+        None,
+    );
+    let old = Profile::new(
+        "tp-stale-verdict-old".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-old".to_string()),
+    );
+    let old_fp = crate::usage::profile_credential_fingerprint(&old)
+        .expect("the stale fixture must carry a third-party credential");
+    crate::profile_cache::write_auth_expired(&profile.name, old_fp);
+    assert!(
+        !crate::profile_cache::auth_expired_matches(
+            &profile.name,
+            crate::usage::profile_credential_fingerprint(&profile)
+                .expect("the fixture must carry a third-party credential")
+        ),
+        "a verdict for the previous credential must not match the current one"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// An `[env]`-token profile with no api key has no key the split sentence
+/// could claim still works, and no third-party credential to fingerprint, so
+/// no verdict consult can reach the shape: the own-endpoint arm renders the
+/// keyless sentence for it outright, without one (owner ruling 2026-09-02 —
+/// the sentence is literally true for this profile).
+#[test]
+fn dead_chain_copy_env_token_without_a_key_renders_the_keyless_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-env-token";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        None,
+        Some(("ANTHROPIC_AUTH_TOKEN", "env-tok")),
+    );
+    assert!(
+        !crate::claude::has_usable_api_key(&profile),
+        "the fixture must hold no usable api key for the keyless leg to reach"
+    );
+    assert!(
+        crate::usage::profile_credential_fingerprint(&profile).is_none(),
+        "an env-token-only profile must have no third-party credential to fingerprint"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_keyless(&profile.name))
+    );
+}
+
+/// An env-carried `ANTHROPIC_API_KEY` is a key, so the keyless sentence is
+/// not literally true for that shape: it keeps the pre-fix dead-chain
+/// sentence, byte-identical (owner ruling 2026-09-02: env-key keeps
+/// dead-chain).
+#[test]
+fn dead_chain_copy_env_carried_api_key_keeps_the_dead_chain_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-env-key";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://api.deepseek.com/anthropic",
+        None,
+        Some(("ANTHROPIC_API_KEY", "env-key")),
+    );
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "the fixture must reach the own-endpoint arm"
+    );
+    assert!(
+        !crate::claude::has_usable_api_key(&profile),
+        "the fixture must hold no field api key for the leg to reach the env discriminator"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// Attach a console session to a fixture profile, so the shape the dead-console
+/// sentence describes — a console that was actually captured — is the one under
+/// test. In memory only: the splitter reads the profile it is handed, and
+/// `auth_expired_matches` is keyed by name and takes the fingerprint as an
+/// argument, so nothing here re-reads the profile from disk.
+fn with_console(profile: &mut Profile, token: &str) {
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+}
+
+/// The verdict consult is re-pointed for Alibaba: its usage fetch
+/// authenticates with the console session, never the api key, so a matching
+/// verdict records a dead console while the key may be live. The dead-console
+/// sentence renders — the dead-chain one would name the wrong half, and the
+/// keyless one would mis-claim a live key.
+#[test]
+fn dead_chain_copy_alibaba_renders_the_dead_console_sentence_on_a_matching_verdict() {
+    let _home = HomeSandbox::new();
+    let name = "tp-alibaba-console-verdict";
+    let mut profile = dead_chain_copy_fixture(
+        name,
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
+        Some("sk-fixture"),
+        None,
+    );
+    with_console(&mut profile, "console-captured");
+    assert_eq!(
+        profile.provider,
+        Some(crate::providers::Provider::Alibaba),
+        "the fixture base_url must resolve to the Alibaba provider"
+    );
+    assert!(
+        crate::claude::has_own_inference_endpoint(&profile),
+        "the fixture must reach the own-endpoint arm"
+    );
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("an Alibaba profile always carries a fetchable credential");
+    crate::profile_cache::write_auth_expired(&profile.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "the seeded verdict must land before the choice is pinned"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_console(&profile.name))
+    );
+}
+
+/// A verdict recorded against a console the profile has since replaced is
+/// inert: a re-capture moves the console token, so nothing measured the CURRENT
+/// session as dead and the split sentence stays, byte-identical. The stale
+/// credential varied here is the console rather than the api key, because the
+/// console is the only half an Alibaba verdict is ever about.
+#[test]
+fn dead_chain_copy_alibaba_ignores_a_verdict_for_a_replaced_console() {
+    let _home = HomeSandbox::new();
+    let name = "tp-alibaba-stale-verdict";
+    let mut profile = dead_chain_copy_fixture(
+        name,
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
+        Some("sk-current"),
+        None,
+    );
+    with_console(&mut profile, "console-expired");
+    let old_fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("the stale fixture must carry a fetchable credential");
+    crate::profile_cache::write_auth_expired(&profile.name, old_fp);
+    with_console(&mut profile, "console-recaptured");
+    assert!(
+        !crate::profile_cache::auth_expired_matches(
+            &profile.name,
+            crate::usage::profile_credential_fingerprint(&profile)
+                .expect("the fixture must carry a fetchable credential")
+        ),
+        "a verdict for the replaced console must not match the current one"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
+    );
+}
+
+/// `alibaba::fetch` collapses "no console" into "dead console" because neither
+/// is worth a request, and the verdict inherits that collapse. Copy is where
+/// the two states differ: "expired" and "re-capture" are both false for a
+/// profile that never captured one, so it keeps the dead-chain sentence even
+/// though its verdict matches.
+#[test]
+fn dead_chain_copy_alibaba_without_a_console_keeps_the_dead_chain_sentence() {
+    let _home = HomeSandbox::new();
+    let name = "tp-alibaba-never-captured";
+    let profile = dead_chain_copy_fixture(
+        name,
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com",
+        Some("sk-fixture"),
+        None,
+    );
+    assert!(
+        profile.console.is_none(),
+        "the fixture must model a profile that never captured a console"
+    );
+    let fp = crate::usage::profile_credential_fingerprint(&profile)
+        .expect("an Alibaba profile always carries a fetchable credential");
+    crate::profile_cache::write_auth_expired(&profile.name, fp);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&profile.name, fp),
+        "the seeded verdict must land before the choice is pinned"
+    );
+    assert_eq!(
+        third_party_dead_chain_copy(Some(&profile), &profile.name),
+        Some(crate::format::third_party_dead_chain(&profile.name))
     );
 }

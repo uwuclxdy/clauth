@@ -8,8 +8,8 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    LoginSession, PluginFocus, StatusFocus, Tab, TokenView, config_rows, fallback_hint,
-    has_sub_focus,
+    HERDR_OPTIONS, HerdrOption, LoginSession, PluginFocus, StatusFocus, Tab, TokenView,
+    build_action_menu, config_rows, fallback_hint, has_sub_focus, herdr_config_writable,
 };
 use super::super::theme;
 use super::format::spinner_frame;
@@ -142,34 +142,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ],
             StatusFocus::Detail => &[("↑↓", "scroll"), ("a", "actions"), ("?", "help")],
         },
-        Tab::Plugin => {
-            // `f` only fixes a row that actually offers one — don't advertise it as a
-            // hint on rows where pressing it is a no-op.
-            match (app.plugin.focus, app.plugin.selected_fix().is_some()) {
-                (PluginFocus::List, true) => &[
-                    ("↑↓", "row"),
-                    ("↵", "detail"),
-                    ("r", "refresh"),
-                    ("f", "fix"),
-                    ("?", "help"),
-                ],
-                (PluginFocus::List, false) => &[
-                    ("↑↓", "row"),
-                    ("↵", "detail"),
-                    ("r", "refresh"),
-                    ("?", "help"),
-                ],
-                (PluginFocus::Detail, true) => &[
-                    ("↑↓", "scroll"),
-                    ("r", "refresh"),
-                    ("f", "fix"),
-                    ("?", "help"),
-                ],
-                (PluginFocus::Detail, false) => {
-                    &[("↑↓", "scroll"), ("r", "refresh"), ("?", "help")]
-                }
-            }
-        }
+        Tab::Plugin => plugin_hints(app),
         Tab::Fallback => match fallback_hint(app) {
             FallbackHint::Empty => &[("?", "help")],
             FallbackHint::ChainMember => &[
@@ -245,7 +218,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 | FallbackHint::DetailWeeklyAtEdit
                 | FallbackHint::DetailRemoveArmed
         ))
-        || (app.tab == Tab::Config && app.refresh_interval_draft.is_some()));
+        || (app.tab == Tab::Config && app.refresh_interval_draft.is_some())
+        || (app.tab == Tab::Plugin && app.plugin.herdr_tag_draft.is_some()));
 
     let mut hints: Vec<(&str, &str)> = std::iter::once(TAB_NAV)
         .chain(tail.iter().copied())
@@ -253,6 +227,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     if show_q {
         hints.push(("q", q_label));
+    }
+
+    // `a` opens nothing where the context carries no action of its own (the
+    // whole Fallback tab, a Setup text row). Reading the real menu keeps the
+    // hint honest per row instead of leaving each arm's literal to drift.
+    if build_action_menu(app).items.is_empty() {
+        hints.retain(|(key, _)| *key != "a");
     }
 
     // Measured degradation for narrow terminals: while the row overflows, drop
@@ -294,6 +275,132 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .alignment(Alignment::Left),
         area,
     );
+}
+
+/// Plugin tab hints. `f` only fixes a row that actually offers one — never
+/// advertised where pressing it is a no-op. The herdr detail walks focusable
+/// option rows instead of scrolling, so its hints name the row's own keys.
+fn plugin_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    match app.plugin.focus {
+        PluginFocus::List => {
+            if app.plugin.selected_fix().is_some() {
+                &[
+                    ("↑↓", "row"),
+                    ("↵", "detail"),
+                    ("r", "refresh"),
+                    ("f", "fix"),
+                    ("?", "help"),
+                ]
+            } else {
+                &[
+                    ("↑↓", "row"),
+                    ("↵", "detail"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                ]
+            }
+        }
+        PluginFocus::Detail => plugin_detail_hints(app),
+    }
+}
+
+/// Plugin detail hints, row-aware for the herdr options section: the tag
+/// editor owns the keyboard while open (⏎ saves, ⎋ discards), the
+/// tag-refresh row advertises its stepper keys, the delegate-row row its
+/// confirm — and an inert delegate-row row advertises no activation key at
+/// all, since the key is a no-op there.
+fn plugin_detail_hints(app: &App) -> &'static [(&'static str, &'static str)] {
+    if app.plugin.herdr_tag_draft.is_some() {
+        return &[("↵", "save"), ("←→", "caret"), ("esc", "cancel")];
+    }
+    let fix = app.plugin.selected_fix().is_some();
+    if !app
+        .plugin
+        .selected_check()
+        .is_some_and(|c| c.label == "herdr")
+    {
+        return if fix {
+            &[
+                ("↑↓", "scroll"),
+                ("r", "refresh"),
+                ("f", "fix"),
+                ("?", "help"),
+            ]
+        } else {
+            &[("↑↓", "scroll"), ("r", "refresh"), ("?", "help")]
+        };
+    }
+    // `r` and `f` keep working while the options rows hold the cursor, so they
+    // keep their hints (f only when the check offers a fix).
+    match HERDR_OPTIONS.get(app.plugin.herdr_options_cursor) {
+        Some(HerdrOption::TagRefresh) => {
+            if fix {
+                &[
+                    ("↑↓", "row"),
+                    ("+", "raise"),
+                    ("-", "lower"),
+                    ("↵", "type"),
+                    ("r", "refresh"),
+                    ("f", "fix"),
+                    ("?", "help"),
+                ]
+            } else {
+                &[
+                    ("↑↓", "row"),
+                    ("+", "raise"),
+                    ("-", "lower"),
+                    ("↵", "type"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                ]
+            }
+        }
+        Some(HerdrOption::DelegateRowText) if herdr_config_writable(app) => {
+            if fix {
+                &[
+                    ("↑↓", "row"),
+                    ("space/↵", "rewrite row"),
+                    ("r", "refresh"),
+                    ("f", "fix"),
+                    ("?", "help"),
+                ]
+            } else {
+                &[
+                    ("↑↓", "row"),
+                    ("space/↵", "rewrite row"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                ]
+            }
+        }
+        // The inert delegate-row row advertises no activation key — it is a
+        // no-op there.
+        Some(HerdrOption::DelegateRowText) => {
+            if fix {
+                &[("↑↓", "row"), ("r", "refresh"), ("f", "fix"), ("?", "help")]
+            } else {
+                &[("↑↓", "row"), ("r", "refresh"), ("?", "help")]
+            }
+        }
+        _ => {
+            if fix {
+                &[
+                    ("↑↓", "row"),
+                    ("space/↵", "cycle / toggle"),
+                    ("r", "refresh"),
+                    ("f", "fix"),
+                    ("?", "help"),
+                ]
+            } else {
+                &[
+                    ("↑↓", "row"),
+                    ("space/↵", "cycle / toggle"),
+                    ("r", "refresh"),
+                    ("?", "help"),
+                ]
+            }
+        }
+    }
 }
 
 /// Shrink a rect by `pad` columns on each side (clamped), leaving the row intact.

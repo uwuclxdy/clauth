@@ -28,10 +28,10 @@ use super::panes::{
     draw_selector_list, master_detail, picker_row, section_box, section_box_loading,
     section_box_verbatim,
 };
-use crate::pricing::PriceTable;
+use crate::pricing::{HourTokens, PriceTable};
 use crate::tokens::{
-    ModelTokens, PeriodModel, TokenStats, bucket_activity, bucket_tokens, current_bucket_bounds,
-    effective_cache_basis, is_anthropic, model_display_name, today_date,
+    DaySummary, ModelTokens, PeriodDay, PeriodModel, TokenStats, bucket_activity, bucket_tokens,
+    current_bucket_bounds, effective_cache_basis, is_anthropic, model_display_name, today_date,
 };
 
 /// Key column width for label:value rows (`sessions` (8) + a 2-cell gap).
@@ -130,21 +130,15 @@ fn money_style() -> Style {
     Style::default().fg(theme::accent_2_color())
 }
 
-/// A `label  $cost` row summing API-equivalent cost over `models`. Shows `—` when
-/// no price table has loaded yet, and a trailing `+` when the figure is a floor
-/// rather than a total — some models carry tokens but no matching rate, or the
-/// caller knows the token set itself is incomplete (`floor`).
-fn cost_line(
-    label: &str,
-    prices: Option<&PriceTable>,
-    models: &[ModelTokens],
-    floor: bool,
-) -> Line<'static> {
-    let value = match prices {
-        Some(p) => {
-            let (total, unpriced) = p.total_cost(models);
-            let mut s = fmt_money(total);
-            if unpriced > 0 || floor {
+/// A `label  $cost` row. Shows `—` when no price table has loaded yet, and a
+/// trailing `+` when the figure is a floor rather than a total — some models
+/// carry tokens but no matching rate, or the caller knows the token set itself
+/// is incomplete.
+fn cost_line(label: &str, cost: Option<(f64, bool)>) -> Line<'static> {
+    let value = match cost {
+        Some((usd, floor)) => {
+            let mut s = fmt_money(usd);
+            if floor {
                 s.push('+');
             }
             s
@@ -152,6 +146,215 @@ fn cost_line(
         None => "—".to_string(),
     };
     Line::from(vec![key(label), Span::styled(value, money_style())])
+}
+
+// ── cost resolution (dated + hourly rates) ──────────────────────────────────
+
+/// Per-bucket USD cost (input/output/cache) of one model over some window —
+/// the model-detail card's breakdown.
+#[derive(Debug, Clone, Copy, Default)]
+struct CostSplit {
+    input: f64,
+    output: f64,
+    cache: f64,
+}
+
+impl CostSplit {
+    fn add(&mut self, other: Self) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache += other.cache;
+    }
+
+    fn total(&self) -> f64 {
+        self.input + self.output + self.cache
+    }
+}
+
+/// One model's period cost: the USD sum plus how many token-bearing days were
+/// priced nowhere (a floor marker).
+struct PeriodCost {
+    usd: f64,
+    unpriced: usize,
+}
+
+/// Token total of one hour bucket (the cache-inclusive count — cost prices
+/// every bucket).
+fn hour_total(h: &HourTokens) -> u64 {
+    h.input
+        .saturating_add(h.output)
+        .saturating_add(h.cache_read)
+        .saturating_add(h.cache_create)
+}
+
+/// Token total of one period day: its hourly buckets when carried, else the
+/// flat split.
+fn day_tokens(d: &PeriodDay) -> u64 {
+    match &d.hours {
+        Some(hours) => hours.iter().map(hour_total).sum(),
+        None => d.split.total(),
+    }
+}
+
+/// Fold per-model cost contributions into `(total_usd, floor)`: a `None` cost
+/// with nonzero tokens marks the summed figure as a floor (`+`).
+fn priced_total<I>(contribs: I) -> (f64, bool)
+where
+    I: IntoIterator<Item = (Option<f64>, u64)>,
+{
+    let mut total = 0.0;
+    let mut floor = false;
+    for (cost, tokens) in contribs {
+        match cost {
+            Some(c) => total += c,
+            None if tokens > 0 => floor = true,
+            None => {}
+        }
+    }
+    (total, floor)
+}
+
+/// Today-card cost: each model's hourly buckets priced through `cost_day` at
+/// today's date, so peak/off-peak hours each carry their own rate. `None` (the
+/// `—` dash) until a table loads; the `+` floor marks models with tokens but
+/// no matching rate.
+fn today_cost(prices: Option<&PriceTable>, t: &DaySummary) -> Option<(f64, bool)> {
+    let p = prices?;
+    Some(priced_total(t.model_hours.iter().map(|m| {
+        (
+            p.cost_day(&m.model, &t.date, &m.hours),
+            m.hours.iter().map(hour_total).sum(),
+        )
+    })))
+}
+
+/// Lifetime TOTAL card cost: each model's aggregate priced at today's hour-0
+/// rate — an at-latest-rates approximation, since the card spans all days
+/// (per-day exactness lives in the day/period views). `None` (the `—` dash)
+/// until a table loads.
+fn lifetime_cost(prices: Option<&PriceTable>, models: &[ModelTokens]) -> Option<(f64, bool)> {
+    let p = prices?;
+    let today = today_date();
+    Some(priced_total(
+        models.iter().map(|m| (p.cost_at(m, &today, 0), m.total())),
+    ))
+}
+
+/// Per-bucket USD cost of one model-day. Hour-bearing days price each hour at
+/// its own `(date, hour)` rate; a day with no hours (v1-ledger / stats-cache
+/// rows) prices its flat split at the day's hour-0 (default-tier) rate — the
+/// documented un-houred-day approximation. Mirrors `PriceTable::cost_day`'s
+/// math per bucket, which the pricing module's total-only API cannot return.
+fn day_cost_split(p: &PriceTable, day: &PeriodDay) -> Option<CostSplit> {
+    let model = &day.split.model;
+    match &day.hours {
+        Some(hours) => {
+            let mut s = CostSplit::default();
+            for (hour, h) in hours.iter().enumerate() {
+                let r = p.rate_at(model, &day.date, hour as u8)?;
+                s.input += h.input as f64 * r.input;
+                s.output += h.output as f64 * r.output;
+                s.cache +=
+                    h.cache_read as f64 * r.cache_read + h.cache_create as f64 * r.cache_write;
+            }
+            Some(s)
+        }
+        None => {
+            let r = p.rate_at(model, &day.date, 0)?;
+            Some(CostSplit {
+                input: day.split.input as f64 * r.input,
+                output: day.split.output as f64 * r.output,
+                cache: day.split.cache_read as f64 * r.cache_read
+                    + day.split.cache_create as f64 * r.cache_write,
+            })
+        }
+    }
+}
+
+/// One model's cost across its period days. `None` (the unpriced dash) when no
+/// token-bearing day has a rate; `unpriced` counts token-bearing days priced
+/// nowhere, marking the figure as a floor.
+fn period_cost(p: &PriceTable, m: &PeriodModel) -> Option<PeriodCost> {
+    if m.days.is_empty() {
+        // Lifetime rows carry no dates (`PeriodModel::from_full`): priced at
+        // the latest rate — an at-latest-rates approximation (per-day
+        // exactness lives in the day/period views).
+        return p
+            .cost_at(&m.split, &today_date(), 0)
+            .map(|usd| PeriodCost { usd, unpriced: 0 });
+    }
+    let mut usd = 0.0;
+    let mut unpriced = 0usize;
+    let mut priced = false;
+    for d in &m.days {
+        match day_cost_split(p, d) {
+            Some(s) => {
+                usd += s.total();
+                priced = true;
+            }
+            None if day_tokens(d) > 0 => unpriced += 1,
+            None => {}
+        }
+    }
+    priced.then_some(PeriodCost { usd, unpriced })
+}
+
+/// The scoped-window card's cost: per-model per-day sums. The `+` floor marks
+/// an incomplete split window or any token-bearing day priced nowhere.
+fn window_cost(
+    prices: Option<&PriceTable>,
+    rows: &[PeriodModel],
+    incomplete: bool,
+) -> Option<(f64, bool)> {
+    let p = prices?;
+    let mut usd = 0.0;
+    let mut floor = incomplete;
+    for m in rows {
+        match period_cost(p, m) {
+            Some(c) => {
+                usd += c.usd;
+                floor |= c.unpriced > 0;
+            }
+            None => {
+                floor |= m.days.iter().any(|d| day_tokens(d) > 0)
+                    || (m.days.is_empty() && m.split.total() > 0);
+            }
+        }
+    }
+    Some((usd, floor))
+}
+
+/// The detail card's per-bucket cost: per-day sums at each day's dated rate,
+/// or the aggregate at today's hour-0 rate for date-less `from_full` rows
+/// (the lifetime card is an at-latest-rates approximation). `unpriced` counts
+/// token-bearing days priced nowhere (the total renders as a `+` floor).
+fn model_detail_cost(p: &PriceTable, m: &PeriodModel) -> Option<(CostSplit, usize)> {
+    if m.days.is_empty() {
+        let r = p.rate_at(&m.model, &today_date(), 0)?;
+        return Some((
+            CostSplit {
+                input: m.split.input as f64 * r.input,
+                output: m.split.output as f64 * r.output,
+                cache: m.split.cache_read as f64 * r.cache_read
+                    + m.split.cache_create as f64 * r.cache_write,
+            },
+            0,
+        ));
+    }
+    let mut split = CostSplit::default();
+    let mut unpriced = 0usize;
+    let mut priced = false;
+    for d in &m.days {
+        match day_cost_split(p, d) {
+            Some(s) => {
+                split.add(s);
+                priced = true;
+            }
+            None if day_tokens(d) > 0 => unpriced += 1,
+            None => {}
+        }
+    }
+    priced.then_some((split, unpriced))
 }
 
 const MONTHS: [&str; 12] = [
@@ -795,7 +998,7 @@ fn today_lines(
     let tokens = if count_cache { t.total() } else { t.in_out() };
     vec![
         kv_accent("tokens", fmt_count(tokens)),
-        cost_line("cost", prices, &t.models, false),
+        cost_line("cost", today_cost(prices, t)),
         Line::from(vec![
             key("msgs"),
             Span::styled(group_thousands(t.messages as f64, 0), theme::body()),
@@ -848,7 +1051,7 @@ fn total_lines(
             )],
             w,
         ),
-        cost_line("cost", prices, &stats.models, false),
+        cost_line("cost", lifetime_cost(prices, &stats.models)),
         Line::from(vec![
             key("sessions"),
             Span::styled(
@@ -908,7 +1111,7 @@ fn period_lines(
         .sum();
     vec![
         kv_accent("tokens", fmt_count(tokens)),
-        cost_line("cost", prices, &splits, !complete),
+        cost_line("cost", window_cost(prices, &rows, !complete)),
         Line::from(vec![
             key("msgs"),
             Span::styled(group_thousands(msgs as f64, 0), theme::body()),
@@ -994,7 +1197,8 @@ fn model_lines(
         .collect();
     let count_w = counts.iter().map(|s| s.chars().count()).max().unwrap_or(3);
     // Per-model API-equivalent cost suffix (empty when unpriced / not loaded),
-    // right-aligned to its own shared column; a partial split reads as a floor.
+    // right-aligned to its own shared column; a partial split or an unpriced
+    // token-bearing day reads as a floor.
     let costs: Vec<String> = rows
         .iter()
         .take(n)
@@ -1002,16 +1206,16 @@ fn model_lines(
             // No price table at all → no column; a loaded table with an
             // unpriced model (unknown third-party id) shows the no-value dash.
             None => String::new(),
-            Some(p) => p
-                .cost(&m.split)
-                .map(|c| {
-                    let mut s = fmt_money(c);
-                    if !m.split_complete {
+            Some(p) => match period_cost(p, m) {
+                Some(c) => {
+                    let mut s = fmt_money(c.usd);
+                    if c.unpriced > 0 || !m.split_complete {
                         s.push('+');
                     }
                     s
-                })
-                .unwrap_or_else(|| "—".to_string()),
+                }
+                None => "—".to_string(),
+            },
         })
         .collect();
     let cost_w = costs.iter().map(|s| s.chars().count()).max().unwrap_or(0);
@@ -1264,6 +1468,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
             None,
             0,
             app.price_table.as_ref(),
+            app.price_failed,
             app.token_period,
         );
         return;
@@ -1289,6 +1494,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         grouped.get(sel),
         period_grand(app),
         app.price_table.as_ref(),
+        app.price_failed,
         app.token_period,
     );
 }
@@ -1321,6 +1527,7 @@ fn draw_model_detail(
     model: Option<&PeriodModel>,
     grand: u64,
     prices: Option<&PriceTable>,
+    rates_failed: bool,
     period: TokenPeriod,
 ) {
     let title = model
@@ -1394,35 +1601,38 @@ fn draw_model_detail(
         Line::from(vec![key(label), Span::styled(value, money_style())])
     };
     match prices {
-        None => lines.push(Line::from(Span::styled("rates loading", theme::faint()))),
-        Some(p) => match p.rate(&m.model) {
+        None => {
+            let label = if rates_failed {
+                "rates unavailable"
+            } else {
+                "rates loading"
+            };
+            lines.push(Line::from(Span::styled(label, theme::faint())));
+        }
+        Some(p) => match model_detail_cost(p, m) {
             None => lines.push(Line::from(Span::styled(
                 "no rate for this model",
                 theme::faint(),
             ))),
-            Some(r) if m.split_complete => {
-                let c_in = s.input as f64 * r.input;
-                let c_out = s.output as f64 * r.output;
-                let c_cache =
-                    s.cache_read as f64 * r.cache_read + s.cache_create as f64 * r.cache_write;
-                lines.push(cost_kv("input", fmt_money(c_in)));
-                lines.push(cost_kv("output", fmt_money(c_out)));
-                lines.push(cost_kv("cache", fmt_money(c_cache)));
+            Some((split, unpriced)) if m.split_complete => {
+                lines.push(cost_kv("input", fmt_money(split.input)));
+                lines.push(cost_kv("output", fmt_money(split.output)));
+                lines.push(cost_kv("cache", fmt_money(split.cache)));
+                let mut total = fmt_money(split.total());
+                if unpriced > 0 {
+                    total.push('+');
+                }
                 lines.push(Line::from(vec![
                     key("total"),
-                    Span::styled(
-                        fmt_money(c_in + c_out + c_cache),
-                        money_style().add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(total, money_style().add_modifier(Modifier::BOLD)),
                 ]));
             }
-            Some(_) => {
+            Some((split, _)) => {
                 // Floor over the split-bearing days only.
-                let floor = p.cost(s).unwrap_or(0.0);
                 lines.push(Line::from(vec![
                     key("total"),
                     Span::styled(
-                        format!("{}+", fmt_money(floor)),
+                        format!("{}+", fmt_money(split.total())),
                         money_style().add_modifier(Modifier::BOLD),
                     ),
                 ]));

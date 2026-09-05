@@ -33,6 +33,12 @@ pub(crate) trait Reconcile {
     fn credentials(&self);
     /// Pick up a daemon-requested member swap.
     fn swap_poll(&self);
+    /// A tick — the fallback cadence or the polling fallback — just drove a
+    /// reconcile where a filesystem event was supposed to. Test-only hook:
+    /// impls that pin the event leg count these, everything else keeps the
+    /// no-op default. Compiled out of production builds.
+    #[cfg(test)]
+    fn tick_driven(&self) {}
 }
 
 /// Every interval the watchdog loop runs on. A struct rather than consts so a
@@ -361,9 +367,14 @@ impl DeadFilter {
 /// the staging half costs a reconcile per publish and can only ever observe a
 /// path that is about to move anyway.
 ///
-/// Also the fake-mode tree mirror's skip rule (`runtime::union_children`): a
-/// walk that treats one as tree content either fails when the source is renamed
-/// away mid-copy, or lands an orphan the mirror can never delete.
+/// Also the skip rule for every walk over a shared fake-mode tree: the mirror's
+/// (`runtime::union_children`) and the acquire-time build's, which is both the
+/// top-level walk in `runtime::build_runtime_dir_with_active_env` and
+/// `runtime::copy_tree`'s recursion under it. A walk that treats one as tree
+/// content either fails when the source is renamed away mid-copy, or lands an
+/// orphan the mirror can never delete. On Windows it fails a third way, which is
+/// how this surfaced: share modes are per-handle, so a source another THREAD of
+/// this same process holds open for writing refuses the copy outright.
 pub(crate) fn is_staging(name: &OsStr) -> bool {
     name.to_str()
         .is_some_and(|n| n.starts_with('.') && n.contains(".tmp."))
@@ -673,6 +684,8 @@ pub(crate) fn run_events(
                 pending = true;
             }
             recv(fallback) -> _ => {
+                #[cfg(test)]
+                r.tick_driven();
                 pending = true;
                 if let Some(health) = health
                     && let Some((kind, counts)) = dead.fires(health)
@@ -727,6 +740,8 @@ pub(crate) fn run_poll(shutdown: &Receiver<()>, t: &Timings, r: &dyn Reconcile) 
         crossbeam_channel::select! {
             recv(shutdown) -> _ => return,
             recv(ticker) -> _ => {
+                #[cfg(test)]
+                r.tick_driven();
                 r.config();
                 until_cred -= 1;
                 if until_cred == 0 {

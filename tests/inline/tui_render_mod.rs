@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
@@ -19,11 +21,13 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             plan: None,
@@ -239,6 +243,76 @@ fn all_tabs_render() {
     assert!(detail.contains("components"), "components row renders");
     assert!(detail.contains('→'), "a transition arrow renders");
     app.status.focus = StatusFocus::List;
+}
+
+/// The status tab's incident stamps render LOCAL wall clock in the 2026-08-22
+/// ruling's `YYYY-MM-DD HH:MM:SS` shape — the `started` row and every timeline
+/// row. Both used to slice the UTC ISO (`jun 6, 10:14`), and a bare stamp in
+/// prose reads as local, so the unmarked rows were false off UTC. The expected
+/// strings derive through chrono's own `format` rather than the crate's
+/// formatter, so the pin is a second derivation of the same claim, not a copy
+/// of the code's arithmetic; it holds in any zone, UTC included (local equals
+/// UTC there, and the contract is satisfied by either).
+#[test]
+fn status_tab_incident_stamps_render_local_wall_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let incidents = demo_incidents();
+    let started_ms = incidents[0].started_ms;
+    let update_ms: Vec<u64> = incidents[0].updates.iter().map(|u| u.at_ms).collect();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.status.incidents = incidents;
+    app.tab = Tab::Status;
+    app.status.focus = StatusFocus::Detail;
+    let out = dump(&app, 90, 24);
+
+    let local_shape = |epoch_ms: u64| {
+        chrono::DateTime::from_timestamp((epoch_ms / 1000) as i64, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    };
+
+    let started = local_shape(started_ms);
+    assert!(
+        out.contains(&started),
+        "started row renders the local stamp {started:?}:\n{out}"
+    );
+    for at_ms in update_ms {
+        let row = local_shape(at_ms);
+        assert!(
+            out.contains(&row),
+            "timeline row renders the local stamp {row:?}:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains(" utc"),
+        "no stamp carries a utc marker after the local conversion:\n{out}"
+    );
+
+    // Where the zone spells the fixture instant differently from UTC, the
+    // UTC digits must be ABSENT: a stamp that regressed to UTC in the 19-char
+    // shape would still satisfy a contains() on a UTC box. Compared
+    // spelling-on-spelling, never via a run-instant offset read: a DST zone
+    // whose offset differs between the fixture instant and the run instant
+    // would fire the guard over two identical spellings. On a UTC runner the
+    // two spellings coincide, so there is no second spelling to ban.
+    let utc_started = chrono::DateTime::from_timestamp((started_ms / 1000) as i64, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if started != utc_started {
+        assert!(
+            !out.contains(&utc_started),
+            "the started stamp renders UTC digits, not local wall clock:\n{out}"
+        );
+    }
 }
 
 #[test]
@@ -624,7 +698,7 @@ fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mk_app = |seven_day: f64| {
-        let mut p = crate::testutil::blank_profile("a");
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         p.weekly_threshold = Some(90.0);
         // 5h spent (past its rotate threshold, live reset) so the `spent`
         // pill — the teach's gate — renders at all.
@@ -756,6 +830,58 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
     assert!(
         row.contains("/ 100%"),
         "3-digit threshold wrapped off the row at 45 cols:\n{out}"
+    );
+}
+
+/// The footer advertises `a` only where the menu has something in it. Both
+/// directions on one screen: the Setup tab's three actions all work on the
+/// focused account, and the `+ new` form carries only `apply preset` (no source
+/// account to duplicate or save) — so the hint stays up in both positions.
+#[test]
+fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("acct")],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    });
+    app.tab = Tab::Setup;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let menu = crate::tui::app::build_action_menu(&app);
+    assert_eq!(menu.items.len(), 3);
+    assert_eq!(
+        menu.context.as_deref(),
+        Some("acct"),
+        "a scoped group names the account it scopes to"
+    );
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("a actions"),
+        "an account carries three whole-account actions no key reaches:\n{out}"
+    );
+
+    // The create form sits past the roster: only `apply preset` is offered
+    // (no source account to duplicate or save), but that still means the menu
+    // has an item, so the footer keeps advertising `a`.
+    app.profile_cursor = app.profile_count();
+    app.config_draft = None;
+    let menu = crate::tui::app::build_action_menu(&app);
+    assert_eq!(menu.items.len(), 1);
+    assert_eq!(
+        menu.context, None,
+        "no draft is mounted yet, so the group title is bare"
+    );
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("a actions"),
+        "the create form's menu carries apply preset, so the key stays advertised:\n{out}"
     );
 }
 
@@ -948,11 +1074,13 @@ fn bare(name: &str) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -1438,7 +1566,9 @@ fn live_column_present(app: &App, width: u16) -> bool {
 }
 
 /// Where the `live` column exists, exactly, as a function of name length and
-/// terminal width — the presence map `docs/tui-design.md` publishes.
+/// terminal width. The column is monotone in width: once it is present at some
+/// width it is present at every wider width, so each map is one `(floor, 200)`
+/// range and the column never disappears as the terminal widens.
 ///
 /// The fit gate's own comparison had no pin: `<= total` → `< total` shifts every
 /// arrival by one column and the whole suite stayed green, because the only test
@@ -1446,34 +1576,48 @@ fn live_column_present(app: &App, width: u16) -> bool {
 /// it, which is true however the gate is written. This asserts the map instead,
 /// so the boundary is a fact rather than a self-consistency check.
 ///
-/// Presence is NOT monotonic and there is no single cutoff: the column takes what
-/// the name clamp and the kind / 5h / 7d tiers leave, so every tier bump reclaims
-/// its cells and widening the terminal can REMOVE it. That is why the expectation
-/// is a set of ranges and not a threshold.
+/// The column is decided before the wall-clock stamp bonus, so it outranks the
+/// stamp's clock cells rather than the other way round: the map is identical
+/// whether `reset_display` shows a clock or not, and only the stamp's wall-clock
+/// half may lose cells to it.
+///
+/// The floors are TERMINAL widths. The width math itself runs in the list-area
+/// inner width, 4 cells narrower — the accounts panel's rounded border plus a
+/// 1-cell horizontal padding on each side — so the pure-function floors read
+/// 4 lower than these.
 #[test]
-fn the_live_column_exists_exactly_where_the_other_columns_left_room() {
+fn the_live_column_appears_monotonically_in_width() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::Tab;
 
-    // (name length, inclusive terminal-width ranges carrying the column)
-    const PRESENCE: &[(usize, &[(u16, u16)])] = &[
-        (8, &[(48, 200)]),
-        (11, &[(51, 200)]),
-        (16, &[(56, 61), (63, 69), (74, 96), (99, 105), (109, 200)]),
-    ];
+    // (name length, terminal width at which the column first appears)
+    const FLOORS: &[(usize, u16)] = &[(8, 48), (12, 52), (13, 71), (14, 107), (16, 109), (22, 115)];
 
-    for (name_len, ranges) in PRESENCE {
+    for (name_len, floor) in FLOORS {
         let name = "n".repeat(*name_len);
-        let mut app = App::new(AppConfig {
-            state: AppState::default(),
-            profiles: vec![oauth(&name, 40.0, 60.0, false)],
-        });
-        app.tab = Tab::Overview;
+        for clock in [false, true] {
+            let state = AppState {
+                reset_display: if clock {
+                    Some(crate::profile::ResetDisplay::Both)
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            let mut app = App::new(AppConfig {
+                state,
+                profiles: vec![oauth(&name, 40.0, 60.0, false)],
+            });
+            app.tab = Tab::Overview;
 
-        let present: Vec<u16> = (34u16..=200)
-            .filter(|w| live_column_present(&app, *w))
-            .collect();
-        let expected: Vec<u16> = ranges.iter().flat_map(|(lo, hi)| *lo..=*hi).collect();
-        assert_eq!(present, expected, "the {name_len}-char presence map moved");
+            let present: Vec<u16> = (34u16..=200)
+                .filter(|w| live_column_present(&app, *w))
+                .collect();
+            let expected: Vec<u16> = (*floor..=200).collect();
+            assert_eq!(
+                present, expected,
+                "the {name_len}-char presence map moved (clock {clock})",
+            );
+        }
     }
 }

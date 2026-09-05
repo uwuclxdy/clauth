@@ -20,30 +20,83 @@
 //! # Boundaries
 //!
 //! - The ledger only ever records days strictly before "today" (a running day is
-//!   incomplete). Recording takes the max per field so a mid-write re-read never
-//!   lowers a stored day.
+//!   incomplete). Recording inserts the first-seen split for each finalized
+//!   day; the monotonic watermark makes each day record exactly once, so a
+//!   later re-read can never lower or double-count a stored day.
 //! - [`Ledger::apply_to_base`] folds only days strictly after the base's
 //!   `lastComputedDate`, so if CC's own aggregation later catches up past a ledger
 //!   day, the ledger never double-counts against the base.
+//!
+//! # Schema
+//!
+//! v2 adds per-hour buckets ([`WireModel::hours`]), optional on the wire: a v1
+//! file (no `hours` key) loads with `None` and keeps `None` on save. A one-shot
+//! backfill ([`Ledger::backfill_hours`], driven from the tokens worker) fills
+//! those buckets from the transcript corpus where the stored flat totals still
+//! match exactly; the `backfill_done` flag (absent → `false` in pre-backfill
+//! files) makes that sweep run at most once per ledger. Days the corpus no
+//! longer fully covers keep their v1 shape forever and price at the default
+//! tier.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::tokens::{DayModelTokens, DayTokens, ModelTokens, TokenStats};
+use crate::pricing::HourTokens;
+use crate::tokens::{DayModelTokens, DayTokens, ModelDayAcc, ModelTokens, TokenStats};
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs};
 
 const LEDGER_FILE: &str = "token_ledger.json";
 
 /// One model's stored split for one day (mirrors [`ModelTokens`] without the
-/// redundant `model` name, which is the map key).
+/// redundant `model` name, which is the map key). `hours` is the schema-v2
+/// hourly axis.
 #[derive(Serialize, Deserialize, Default)]
 struct WireModel {
     input: u64,
     output: u64,
     cache_read: u64,
     cache_create: u64,
+    /// Per-hour buckets, index = hour 0..23. A v1 file (no `hours` key) loads
+    /// with `None` — serde leaves an absent `Option` field `None`; the explicit
+    /// `default` is belt-and-braces per the schema contract. `skip_serializing_if`
+    /// keeps a v1 day's wire shape byte-for-byte v1 on save, so the file only
+    /// gains `hours` entries as new days are recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hours: Option<[WireHour; 24]>,
+}
+
+/// One hour's token buckets on the wire — the serde twin of [`HourTokens`]
+/// (which deliberately carries no serde derives).
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct WireHour {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_create: u64,
+}
+
+impl From<HourTokens> for WireHour {
+    fn from(h: HourTokens) -> Self {
+        Self {
+            input: h.input,
+            output: h.output,
+            cache_read: h.cache_read,
+            cache_create: h.cache_create,
+        }
+    }
+}
+
+impl From<WireHour> for HourTokens {
+    fn from(w: WireHour) -> Self {
+        Self {
+            input: w.input,
+            output: w.output,
+            cache_read: w.cache_read,
+            cache_create: w.cache_create,
+        }
+    }
 }
 
 /// Durable per-day token totals, persisted across processes.
@@ -55,6 +108,13 @@ pub(crate) struct Ledger {
     recorded_through: Option<String>,
     /// `date -> model -> split`.
     days: HashMap<String, HashMap<String, WireModel>>,
+    /// Set once the one-shot v1→v2 hourly backfill pass has run (whether it
+    /// filled anything or not), so the transcript corpus is swept at most
+    /// once per ledger. Absent in files written before the backfill;
+    /// `serde(default)` reads it `false`, which is what makes every
+    /// pre-upgrade ledger owe exactly one pass.
+    #[serde(default)]
+    backfill_done: bool,
 }
 
 impl Ledger {
@@ -83,19 +143,20 @@ impl Ledger {
     /// `lastComputedDate` and the ledger's `recorded_through`. Days at or before
     /// it are already durable (base or ledger), so the sweep can skip them.
     pub(crate) fn effective_cutoff(&self, last_computed_date: Option<&str>) -> Option<String> {
-        match (last_computed_date, self.recorded_through.as_deref()) {
-            (Some(a), Some(b)) => Some(if a >= b { a } else { b }.to_owned()),
-            (Some(a), None) => Some(a.to_owned()),
-            (None, Some(b)) => Some(b.to_owned()),
-            (None, None) => None,
-        }
+        last_computed_date
+            .into_iter()
+            .chain(self.recorded_through.as_deref())
+            .max()
+            .map(str::to_owned)
     }
 
     /// Fold the ledger's recorded days into `base` (already holding stats-cache
     /// data), extending `daily`, `daily_models`, `models`, and the totals — the
     /// same shape the top-up produces, so the Tokens views need no ledger
-    /// awareness. Only days strictly after `last_computed_date` are folded, so a
-    /// base that later advances past a ledger day never double-counts.
+    /// awareness. Each pushed row also carries the stored per-hour buckets when
+    /// the ledger day has them. Only days strictly after `last_computed_date`
+    /// are folded, so a base that later advances past a ledger day never
+    /// double-counts.
     pub(crate) fn apply_to_base(&self, base: &mut TokenStats, last_computed_date: Option<&str>) {
         let floor = last_computed_date.unwrap_or("");
         let mut model_map: HashMap<String, ModelTokens> = base
@@ -124,6 +185,7 @@ impl Ledger {
                     model: model.clone(),
                     in_out: split.in_out(),
                     split: Some(split.clone()),
+                    hours: w.hours.as_ref().map(|hs| hs.map(HourTokens::from)),
                 });
                 let e = model_map
                     .entry(model.clone())
@@ -177,6 +239,7 @@ impl Ledger {
                     output: split.output,
                     cache_read: split.cache_read,
                     cache_create: split.cache_create,
+                    hours: d.hours.map(|hs| hs.map(WireHour::from)),
                 },
             );
             changed = true;
@@ -194,6 +257,55 @@ impl Ledger {
             changed = true;
         }
         changed
+    }
+
+    /// The watermark date the one-shot hourly backfill may sweep up to, when
+    /// that pass still has work: the flag unset AND at least one day strictly
+    /// before `today` holding `hours: None` rows (every row a pre-v2 ledger
+    /// recorded qualifies, so an upgraded ledger owes exactly one pass; after
+    /// the pass the flag makes this `None` even when rows did not fill, since
+    /// transcripts only ever shrink and a re-sweep could never fill more).
+    /// Also `None` when there is no watermark to derive a cutoff from.
+    pub(crate) fn backfill_through(&self, today: &str) -> Option<String> {
+        if self.backfill_done {
+            return None;
+        }
+        let owed = self.days.iter().any(|(date, models)| {
+            date.as_str() < today && models.values().any(|w| w.hours.is_none())
+        });
+        owed.then(|| self.recorded_through.clone()).flatten()
+    }
+
+    /// Fill hour buckets on the ledger's v1 rows from a re-derived transcript
+    /// corpus ([`crate::tokens::backfill_corpus`]), exact-or-absent: a row's
+    /// `hours` is set ONLY when the corpus totals equal the stored flat totals
+    /// on all four fields. Any mismatch means the transcripts no longer fully
+    /// cover the day (pruned), and the row is left untouched — stored v1 flat
+    /// data is never lowered or rewritten (the equal case is equal by
+    /// construction), so a day whose rows do not all fill keeps its v1 shape
+    /// forever. Marks [`Ledger::backfill_done`] either way: the sweep runs at
+    /// most once per ledger, and a re-sweep could never fill what the first
+    /// one left unmatched.
+    pub(crate) fn backfill_hours(&mut self, derived: &HashMap<(String, String), ModelDayAcc>) {
+        for ((date, model), acc) in derived {
+            let Some(day) = self.days.get_mut(date) else {
+                continue;
+            };
+            let Some(w) = day.get_mut(model) else {
+                continue;
+            };
+            if w.hours.is_some() {
+                continue; // already on the hourly axis — never rewritten
+            }
+            if acc.flat.input == w.input
+                && acc.flat.output == w.output
+                && acc.flat.cache_read == w.cache_read
+                && acc.flat.cache_create == w.cache_create
+            {
+                w.hours = Some(acc.hours.map(WireHour::from));
+            }
+        }
+        self.backfill_done = true;
     }
 }
 

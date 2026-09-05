@@ -47,6 +47,14 @@ pub(crate) fn render(stamped: bool, now_secs: i64, msg: &str) -> String {
 /// Where a rendered line goes. The daemon always writes stderr (its redirected
 /// log); an interactive stderr that IS a terminal diverts to the log file so a
 /// background thread's line can never paint over the TUI's alternate screen.
+///
+/// **A diagnostic reached once per CALL from a hook or an MCP process must take
+/// [`to_logfile`], never [`line`].** [`route`] sends a process whose stderr is
+/// not a terminal and which has not enabled stamping — exactly a hook, exactly
+/// `clauth mcp` — to [`Sink::Stderr`], where nothing bounds the total. A
+/// per-EVENT line there is fine and every current caller is one; a per-CALL one
+/// floods the channel Claude Code surfaces to the user, which took a review to
+/// catch once already. [`Sink::LogFile`] is size-rotated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Sink {
     Stderr,
@@ -76,6 +84,23 @@ pub(crate) fn line(args: std::fmt::Arguments<'_>) {
         // forensics this exists for.
         Sink::LogFile => append_logfile(&render(true, now, &raw)),
     }
+}
+
+/// Always the log FILE, never stderr, whatever [`route`] would pick.
+///
+/// For a caller that runs once per tool call in a hook process. A hook's stderr
+/// is a pipe rather than a terminal and `STAMP` is off, which is precisely the
+/// `Sink::Stderr` arm — so a per-fire diagnostic through [`line`] is an
+/// unbounded write onto the channel Claude Code surfaces to the user, and a
+/// persistent failure floods it exactly like the bug it was reporting. The file
+/// is bounded by `rotate_log_if_large`; stderr is not.
+pub(crate) fn to_logfile(args: std::fmt::Arguments<'_>) {
+    let raw = args.to_string();
+    #[cfg(test)]
+    if captured(&raw) {
+        return;
+    }
+    append_logfile(&render(true, crate::usage::now_epoch_secs(), &raw));
 }
 
 /// Best-effort, on the same terms as [`write_log_line`]: the caller is usually

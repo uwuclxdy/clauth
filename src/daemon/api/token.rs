@@ -137,7 +137,7 @@ fn write(token: &str) -> Result<()> {
 /// cannot each generate a token and leave the loser's copy — already handed to
 /// a client — silently invalid.
 pub(crate) fn load_or_create() -> Result<String> {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         if let Some(token) = read_valid() {
             return Ok(token);
         }
@@ -150,7 +150,7 @@ pub(crate) fn load_or_create() -> Result<String> {
 /// Replace the stored token with a fresh one. Every client holding the old one
 /// starts getting 401s, which is the point.
 pub(crate) fn rotate() -> Result<String> {
-    with_state_lock(|| {
+    with_state_lock(|_| {
         let token = generate()?;
         write(&token)?;
         Ok(token)

@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
-use crate::profile::AccountId;
+use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
     ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache, remove_profile_cache,
     write_profile_cache,
@@ -457,6 +457,14 @@ pub(crate) struct UsageInfo {
     pub(crate) extra_usage: Option<ExtraUsage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spend: Option<SpendInfo>,
+    /// The authoritative 5h-window open instant, in epoch seconds. Present only
+    /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
+    /// `mark_window_open`): a history line carrying it is clauth's own durable
+    /// record of that kick, and the auto-start queue confirms the window on it.
+    /// Every API-read sample carries `None`, so the field stays absent from
+    /// those lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) open_at: Option<i64>,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -930,7 +938,7 @@ pub(crate) fn cli_user_agent() -> &'static str {
 /// Which of Claude Code's two `api.anthropic.com` clients to imitate. CC polls
 /// `/usage` with its `claude-cli` client but reads `/profile` through a plain
 /// axios instance — different UA, and `/profile` carries `Cache-Control: no-cache`
-/// with no `anthropic-beta`. See `docs/wire-parity.md`.
+/// with no `anthropic-beta`.
 #[derive(Clone, Copy)]
 enum AuthClient {
     /// `/usage`: `claude-cli/<ver> (external, cli)` UA + `anthropic-beta`.
@@ -943,7 +951,7 @@ fn get_json(
     url: &str,
     access_token: &str,
     activity: Option<&ActivityStore>,
-    name: &str,
+    name: &ProfileName,
     client: AuthClient,
 ) -> std::result::Result<String, FetchError> {
     await_request_slot(ANTHROPIC_ORIGIN);
@@ -996,9 +1004,9 @@ fn get_json(
 /// BOTH halves of the clock: dropping only the map entry would leave the durable
 /// stamp to be read straight back in as fresh, silently reducing the manual
 /// refresh to a no-op for `/profile`.
-pub(crate) fn expire_profile_ttl(name: &str) {
+pub(crate) fn expire_profile_ttl(name: &ProfileName) {
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name);
+        m.remove(name.as_str());
     }
     remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
 }
@@ -1007,16 +1015,16 @@ pub(crate) fn expire_profile_ttl(name: &str) {
 /// a process restart looks like to [`take_profile_fetch`], which is the whole
 /// point of the durable half and can't otherwise be exercised in one process.
 #[cfg(test)]
-fn forget_profile_memo(name: &str) {
+fn forget_profile_memo(name: &ProfileName) {
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name);
+        m.remove(name.as_str());
     }
 }
 
 /// The profile has a usable identity anchor. A blank/whitespace uuid is shape
 /// drift, never an identity — same contract as [`seed_identity_anchor`] and
 /// [`fetch_account_uuid`].
-fn has_identity_anchor(name: &str) -> bool {
+fn has_identity_anchor(name: &ProfileName) -> bool {
     load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE)
         .is_some_and(|u| !u.as_str().trim().is_empty())
 }
@@ -1028,11 +1036,11 @@ fn has_identity_anchor(name: &str) -> bool {
 /// unanchored profile that needs it, since without an anchor a dead stored pair
 /// wedges the profile in `auth_broken`. Unanchored profiles therefore pay one
 /// `/profile` per launch until the first backfill lands, then join everyone else.
-fn last_profile_attempt(name: &str) -> Option<u64> {
+fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
     if let Some(t) = PROFILE_FETCHED
         .lock()
         .ok()
-        .and_then(|m| m.get(name).copied())
+        .and_then(|m| m.get(name.as_str()).copied())
     {
         return Some(t);
     }
@@ -1063,7 +1071,7 @@ fn last_profile_attempt(name: &str) -> Option<u64> {
 /// also re-stamps the bogus clock back to sanity. Saturating the age to `0` here
 /// would instead mute `/profile` until wall-clock caught up, and — now that the
 /// stamp outlives the process — it would stay muted across every restart.
-pub(crate) fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
+pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
     let fresh = last_profile_attempt(name)
         .and_then(|t| now.checked_sub(t))
         .is_some_and(|age| age < PROFILE_TTL_MS);
@@ -1102,7 +1110,7 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
 /// Never bypasses the hourly cap unless `force_profile` (the rotation retry
 /// holding no plan yet).
 fn fetch_profile_plan(
-    name: &str,
+    name: &ProfileName,
     access_token: &str,
     force_profile: bool,
     activity: Option<&ActivityStore>,
@@ -1149,6 +1157,7 @@ fn assemble_usage(
                 window_dollars: windows.window_dollars,
                 extra_usage: raw.extra_usage,
                 spend,
+                open_at: None,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
@@ -1167,7 +1176,7 @@ fn assemble_usage(
 /// its plan rides the error, so a canceled (`claude_free`) account — observed to
 /// 429 `/usage` on every tick so far — is finally observed.
 pub(super) fn fetch_raw(
-    name: &str,
+    name: &ProfileName,
     access_token: &str,
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
@@ -1200,7 +1209,7 @@ pub(super) fn fetch_raw(
 /// anchor in that microsecond gap, then being overwritten by this ride-along)
 /// fails SAFE — a wrong anchor only makes adoption refuse and self-heals on
 /// the next login/adopt, so a cross-process lock isn't worth its weight here.
-fn seed_identity_anchor(name: &str, profile: &RawProfile) {
+fn seed_identity_anchor(name: &ProfileName, profile: &RawProfile) {
     let Some(uuid) = profile
         .account
         .as_ref()
@@ -1270,7 +1279,7 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
         profile_endpoint().as_ref(),
         access_token,
         None,
-        "login",
+        &ProfileName::from("login"),
         AuthClient::Profile,
     )
     .map_err(|e| match e {
@@ -1290,7 +1299,7 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
 /// onto the name must replace the old anchor rather than keep proving the old
 /// identity. Best-effort and silent on an absent/blank uuid (a failed probe or
 /// shape drift) — a login is never failed over its anchor.
-pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&AccountId>) {
+pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&AccountId>) {
     let Some(uuid) = account_uuid.map(|u| u.trim()).filter(|u| !u.is_empty()) else {
         return;
     };
@@ -1311,7 +1320,7 @@ pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<AccountId> {
         profile_endpoint().as_ref(),
         access_token,
         None,
-        "identity",
+        &ProfileName::from("identity"),
         AuthClient::Profile,
     )
     .ok()?;

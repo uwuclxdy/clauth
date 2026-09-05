@@ -3,11 +3,15 @@
 
 use super::{
     INDET_BLOCK, activity_lines, bar_chart, bar_chart_sqrt, bucket_layout, comp_rows,
-    determinate_bar, hour_lines, indeterminate_bar, model_lines, trend_lines,
+    determinate_bar, hour_lines, indeterminate_bar, model_detail_cost, model_lines, today_cost,
+    today_lines, total_lines, trend_lines, window_cost,
 };
-use crate::pricing::{ModelRate, PriceTable};
+use crate::pricing::{Constraint, HourTokens, PriceEntry, PriceTable, PricedModel, RateSnapshot};
 use crate::profile::{AppConfig, AppState};
-use crate::tokens::{DayActivity, DayTokens, ModelTokens, PeriodModel, TokenStats};
+use crate::tokens::{
+    DayActivity, DaySummary, DayTokens, HourlyModel, ModelTokens, PeriodDay, PeriodModel,
+    TokenStats,
+};
 use crate::tui::app::{App, Tab, TokenPeriod};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -17,6 +21,173 @@ use ratatui::text::Line;
 /// Flatten a `Line`'s spans back into one string (pad spans included).
 fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+// ── price-table builders ─────────────────────────────────────────────────────
+
+/// One exact-match model from its price entries (ids resolve
+/// case-insensitively).
+fn priced_model(id: &str, entries: Vec<PriceEntry>) -> PricedModel {
+    PricedModel {
+        id: id.to_owned(),
+        prices: entries,
+        effective_at: None,
+    }
+}
+
+/// One unconstrained price entry at the given per-token rates.
+fn flat_entry(input: f64, output: f64, cache_read: f64, cache_write: f64) -> PriceEntry {
+    PriceEntry {
+        input,
+        output,
+        cache_read,
+        cache_write,
+        constraint: None,
+    }
+}
+
+/// A flat (one unconstrained entry) model at the given per-token rates.
+fn flat_model(id: &str, input: f64, output: f64, cache_read: f64, cache_write: f64) -> PricedModel {
+    priced_model(id, vec![flat_entry(input, output, cache_read, cache_write)])
+}
+
+/// deepseek-chat-shaped pricing: an off-peak fallback entry plus a peak
+/// `00:30–16:30Z` time-window entry, which reversed-entry selection prefers
+/// while it is active. Per the settled hour-granularity formula hour 0 prices
+/// off-peak and hour 16 peak.
+fn windowed_model(id: &str, peak: (f64, f64), off_peak: (f64, f64)) -> PricedModel {
+    priced_model(
+        id,
+        vec![
+            flat_entry(off_peak.0, off_peak.1, 0.0, 0.0),
+            PriceEntry {
+                input: peak.0,
+                output: peak.1,
+                cache_read: 0.0,
+                cache_write: 0.0,
+                constraint: Some(Constraint::TimeWindow {
+                    start: "00:30:00Z".to_owned(),
+                    end: "16:30:00Z".to_owned(),
+                }),
+            },
+        ],
+    )
+}
+
+/// A table from `models`, captured today with no history.
+fn table_of(models: Vec<PricedModel>) -> PriceTable {
+    PriceTable::capture(
+        models,
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
+}
+
+/// A table whose newest snapshot is `models` and whose older snapshots are
+/// given explicitly (`capture` appends nothing — the last history entry must
+/// equal `models`).
+fn table_with_history(models: Vec<PricedModel>, history: Vec<RateSnapshot>) -> PriceTable {
+    PriceTable::capture(
+        models,
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        history,
+    )
+}
+
+// ── period-row builders ──────────────────────────────────────────────────────
+
+/// A one-model period row summing `days`.
+fn period_row(model: &str, days: Vec<PeriodDay>) -> PeriodModel {
+    let split = days.iter().fold(
+        ModelTokens {
+            model: model.to_owned(),
+            ..Default::default()
+        },
+        |mut acc, d| {
+            acc.input += d.split.input;
+            acc.output += d.split.output;
+            acc.cache_read += d.split.cache_read;
+            acc.cache_create += d.split.cache_create;
+            acc
+        },
+    );
+    PeriodModel {
+        model: model.to_owned(),
+        in_out: split.in_out(),
+        split,
+        split_complete: true,
+        days,
+    }
+}
+
+/// An unhoured day row (the v1-ledger / stats-cache shape).
+fn unhoured_day(date: &str, model: &str, input: u64, output: u64) -> PeriodDay {
+    let split = ModelTokens {
+        model: model.to_owned(),
+        input,
+        output,
+        ..Default::default()
+    };
+    PeriodDay {
+        date: date.to_owned(),
+        split,
+        hours: None,
+    }
+}
+
+/// An hour-bearing day row with input/output tokens in the named hours.
+fn hourly_day(date: &str, model: &str, buckets: &[(usize, u64, u64)]) -> PeriodDay {
+    let mut hours = [HourTokens::default(); 24];
+    let mut input = 0;
+    let mut output = 0;
+    for &(hour, i, o) in buckets {
+        hours[hour] = HourTokens {
+            input: i,
+            output: o,
+            ..Default::default()
+        };
+        input += i;
+        output += o;
+    }
+    let split = ModelTokens {
+        model: model.to_owned(),
+        input,
+        output,
+        ..Default::default()
+    };
+    PeriodDay {
+        date: date.to_owned(),
+        split,
+        hours: Some(hours),
+    }
+}
+
+/// A `TokenStats` whose today card carries one model's hourly buckets.
+fn day_with_model_hours(model: &str, hours: [HourTokens; 24]) -> DaySummary {
+    DaySummary {
+        date: crate::tokens::today_date(),
+        model_hours: vec![HourlyModel {
+            model: model.to_owned(),
+            hours,
+        }],
+        ..Default::default()
+    }
+}
+
+/// A `TokenStats` whose today card carries one model's hourly buckets.
+fn stats_with_today(model: &str, hours: [HourTokens; 24]) -> TokenStats {
+    TokenStats {
+        today: Some(day_with_model_hours(model, hours)),
+        ..Default::default()
+    }
 }
 
 /// Flatten a rendered `TestBackend` buffer to one string of cell symbols.
@@ -261,17 +432,7 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
             })
         })
         .collect();
-    let mut rates = std::collections::HashMap::new();
-    rates.insert(
-        "claude-opus-4-8".to_string(),
-        ModelRate {
-            input: 5e-6,
-            output: 25e-6,
-            cache_read: 5e-7,
-            cache_write: 6e-6,
-        },
-    );
-    let prices = PriceTable::from_rates(rates);
+    let prices = table_of(vec![flat_model("claude-opus-4-8", 5e-6, 25e-6, 5e-7, 6e-6)]);
 
     let lines = model_lines(&rows, 60, 5, true, Some(&prices), "no model usage yet");
     let texts: Vec<String> = lines.iter().map(line_text).collect();
@@ -291,6 +452,597 @@ fn model_lines_dash_unpriced_models_when_a_table_is_loaded() {
     assert!(
         bare.iter().map(line_text).all(|t| !t.contains('—')),
         "no table → no dash column"
+    );
+}
+
+// ── cost lens: hourly + dated resolution ─────────────────────────────────────
+
+#[test]
+fn today_card_prices_peak_and_off_peak_hours_at_their_tiers() {
+    let table = table_of(vec![windowed_model(
+        "deepseek-chat",
+        (2e-6, 4e-6),
+        (1e-6, 2e-6),
+    )]);
+    // 1000 input tokens in hour 0 (off-peak) and hour 16 (peak): $0.001 +
+    // $0.002 = $0.003 — neither the all-off-peak ($0.002) nor the all-peak
+    // ($0.004) flat total.
+    let mut hours = [HourTokens::default(); 24];
+    hours[0] = HourTokens {
+        input: 1000,
+        ..Default::default()
+    };
+    hours[16] = HourTokens {
+        input: 1000,
+        ..Default::default()
+    };
+    let stats = stats_with_today("deepseek-chat", hours);
+    let lines = today_lines(&stats, 60, false, Some(&table));
+    let cost = line_text(&lines[1]);
+    assert!(
+        cost.contains("$0.003"),
+        "mixed-hour day prices per hour, got {cost:?}"
+    );
+    assert!(
+        !cost.contains('+'),
+        "both hours priced ⇒ no floor mark, got {cost:?}"
+    );
+
+    // No table → the dash.
+    let bare = today_lines(&stats, 60, false, None);
+    assert!(line_text(&bare[1]).contains('—'), "no table → dash");
+}
+
+#[test]
+fn peak_window_boundary_hour_16_prices_peak() {
+    let table = table_of(vec![windowed_model(
+        "deepseek-chat",
+        (2e-6, 4e-6),
+        (1e-6, 2e-6),
+    )]);
+    // The settled hour-granularity formula samples the window at the hour's
+    // start: 16:00 is inside 00:30–16:30, 0:00 is not.
+    let mut peak = [HourTokens::default(); 24];
+    peak[16] = HourTokens {
+        input: 1000,
+        ..Default::default()
+    };
+    let peak_lines = today_lines(
+        &stats_with_today("deepseek-chat", peak),
+        60,
+        false,
+        Some(&table),
+    );
+    assert!(
+        line_text(&peak_lines[1]).contains("$0.002"),
+        "hour 16 prices peak (2e-6), got {:?}",
+        line_text(&peak_lines[1])
+    );
+
+    let mut off = [HourTokens::default(); 24];
+    off[0] = HourTokens {
+        input: 1000,
+        ..Default::default()
+    };
+    let off_lines = today_lines(
+        &stats_with_today("deepseek-chat", off),
+        60,
+        false,
+        Some(&table),
+    );
+    assert!(
+        line_text(&off_lines[1]).contains("$0.001"),
+        "hour 0 prices off-peak (1e-6), got {:?}",
+        line_text(&off_lines[1])
+    );
+}
+
+#[test]
+fn today_card_floors_unpriced_models_and_dashes_without_a_table() {
+    let table = table_of(vec![flat_model("claude-opus-4-8", 1e-6, 2e-6, 0.0, 0.0)]);
+    // Each bucket term alone must floor the day: glm-5.2 has no matching rate,
+    // so whichever single term carries its tokens marks the figure as a floor.
+    let buckets = [
+        HourTokens {
+            input: 1000,
+            ..Default::default()
+        },
+        HourTokens {
+            output: 1000,
+            ..Default::default()
+        },
+        HourTokens {
+            cache_read: 1000,
+            ..Default::default()
+        },
+        HourTokens {
+            cache_create: 1000,
+            ..Default::default()
+        },
+    ];
+    for b in buckets {
+        let mut hours = [HourTokens::default(); 24];
+        hours[10] = b;
+        let (usd, floor) = today_cost(Some(&table), &day_with_model_hours("glm-5.2", hours))
+            .expect("table present");
+        assert_eq!(usd, 0.0);
+        assert!(
+            floor,
+            "an unpriced model with only {b:?} tokens floors the day"
+        );
+    }
+    // Rendered: the day total is a `+` floor; no table renders the dash.
+    let mut hours = [HourTokens::default(); 24];
+    hours[10] = HourTokens {
+        input: 1000,
+        ..Default::default()
+    };
+    let lines = today_lines(&stats_with_today("glm-5.2", hours), 60, false, Some(&table));
+    assert!(
+        line_text(&lines[1]).contains("$0+"),
+        "unpriced token-bearing model floors the day, got {:?}",
+        line_text(&lines[1])
+    );
+}
+
+#[test]
+fn period_cost_sums_each_day_at_its_dated_rate() {
+    let cheap = flat_model("m", 1e-6, 0.0, 0.0, 0.0);
+    let dear = flat_model("m", 2e-6, 0.0, 0.0, 0.0);
+    let table = table_with_history(
+        vec![dear.clone()],
+        vec![
+            RateSnapshot {
+                captured: "2026-08-01".to_owned(),
+                models: vec![cheap],
+            },
+            RateSnapshot {
+                captured: "2026-08-10".to_owned(),
+                models: vec![dear],
+            },
+        ],
+    );
+    // Two unhoured days straddling the 08-10 price change: each prices at the
+    // snapshot live on its own date — $0.01 + $0.02 = $0.03, not $0.04 at the
+    // newest rate for both.
+    let row = period_row(
+        "m",
+        vec![
+            unhoured_day("2026-08-05", "m", 10_000, 0),
+            unhoured_day("2026-08-12", "m", 10_000, 0),
+        ],
+    );
+    let lines = model_lines(&[row], 60, 5, true, Some(&table), "no model usage yet");
+    let text = line_text(&lines[0]);
+    assert!(
+        text.contains("$0.03"),
+        "each day prices at its dated snapshot, got {text:?}"
+    );
+    assert!(
+        !text.trim_end().ends_with('+'),
+        "fully priced ⇒ no floor mark, got {text:?}"
+    );
+}
+
+#[test]
+fn unhoured_day_prices_flat_at_default_tier_without_floor_mark() {
+    let table = table_of(vec![windowed_model(
+        "deepseek-chat",
+        (2e-6, 4e-6),
+        (1e-6, 2e-6),
+    )]);
+    // hours: None ⇒ the day's flat split prices at hour 0 (off-peak) on the
+    // day's dated rate — the documented un-houred-day approximation. The
+    // missing hours are NOT flagged with `+`: that mark keeps its existing
+    // meanings only (split incomplete / unpriced with tokens).
+    let row = period_row(
+        "deepseek-chat",
+        vec![unhoured_day("2026-08-15", "deepseek-chat", 10_000, 0)],
+    );
+    let lines = model_lines(&[row], 60, 5, true, Some(&table), "no model usage yet");
+    let text = line_text(&lines[0]);
+    assert!(
+        text.contains("$0.01"),
+        "flat at the hour-0 (off-peak) tier, got {text:?}"
+    );
+    assert!(
+        !text.trim_end().ends_with('+'),
+        "no per-row flag for missing hours, got {text:?}"
+    );
+}
+
+#[test]
+fn period_cost_floors_on_unpriced_days() {
+    // One priced and one unpriced day for the SAME model: the priced day sums,
+    // the unpriced token-bearing day marks the figure as a floor.
+    let table = table_of(vec![flat_model("m", 1e-6, 0.0, 0.0, 0.0)]);
+    let row = period_row(
+        "m",
+        vec![
+            unhoured_day("2026-08-15", "m", 10_000, 0),
+            unhoured_day("2026-08-16", "unknown", 10_000, 0),
+        ],
+    );
+    let lines = model_lines(&[row], 60, 5, true, Some(&table), "no model usage yet");
+    let text = line_text(&lines[0]);
+    assert!(
+        text.contains("$0.010+"),
+        "an unpriced token-bearing day floors the row, got {text:?}"
+    );
+}
+
+#[test]
+fn window_cost_sums_rows_and_floors_unpriced_days() {
+    let table = table_of(vec![flat_model("m", 1e-6, 0.0, 0.0, 0.0)]);
+    let priced = period_row("m", vec![unhoured_day("2026-08-15", "m", 10_000, 0)]);
+    let unpriced = period_row(
+        "unknown",
+        vec![unhoured_day("2026-08-15", "unknown", 10_000, 0)],
+    );
+    // Only the priced row contributes; the unpriced token-bearing row floors
+    // the window figure.
+    let (usd, floor) =
+        window_cost(Some(&table), &[priced.clone(), unpriced], false).expect("table present");
+    assert!((usd - 0.01).abs() < 1e-9, "got {usd}");
+    assert!(floor, "unpriced token-bearing rows floor the window");
+    // An incomplete split window floors even when every day is priced.
+    let (usd, floor) =
+        window_cost(Some(&table), std::slice::from_ref(&priced), true).expect("table present");
+    assert!((usd - 0.01).abs() < 1e-9);
+    assert!(floor, "incomplete splits floor the window");
+    // No table → the dash.
+    assert!(window_cost(None, &[priced], false).is_none());
+}
+
+#[test]
+fn today_card_hourly_sum_matches_the_flat_model_totals() {
+    // A flat (hour-independent) rate: the card's per-hour walk over
+    // `model_hours` must price exactly what the flat `models` totals would —
+    // pinning that the buckets sum to the flat split and that the walk covers
+    // every model in `models`.
+    let table = table_of(vec![flat_model("m", 1e-6, 2e-6, 1e-7, 1.25e-6)]);
+    let mut hours = [HourTokens::default(); 24];
+    hours[3] = HourTokens {
+        input: 500_000,
+        output: 250_000,
+        cache_read: 100,
+        cache_create: 200,
+    };
+    hours[20] = HourTokens {
+        input: 500_000,
+        output: 750_000,
+        cache_read: 900,
+        cache_create: 800,
+    };
+    let t = DaySummary {
+        date: crate::tokens::today_date(),
+        model_hours: vec![HourlyModel {
+            model: "m".to_owned(),
+            hours,
+        }],
+        models: vec![ModelTokens {
+            model: "m".to_owned(),
+            input: 1_000_000,
+            output: 1_000_000,
+            cache_read: 1_000,
+            cache_create: 1_000,
+        }],
+        ..Default::default()
+    };
+    let (usd, floor) = today_cost(Some(&table), &t).expect("table present");
+    assert!(!floor, "the single priced model is not a floor");
+    // 1.0 (in) + 2.0 (out) + 0.0001 (read) + 0.00125 (create) = 3.00135 —
+    // the same figure pricing the flat totals at hour 0 would produce.
+    assert!((usd - 3.00135).abs() < 1e-9, "got {usd}");
+}
+
+#[test]
+fn today_card_prices_each_model_in_model_hours() {
+    let table = table_of(vec![flat_model("m", 1e-6, 0.0, 0.0, 0.0)]);
+    // model_hours carries one entry per model in `models`: the priced model
+    // sums, the unpriced token-bearing model floors the day figure.
+    let mut priced_hours = [HourTokens::default(); 24];
+    priced_hours[10] = HourTokens {
+        input: 1_000_000,
+        ..Default::default()
+    };
+    let mut unpriced_hours = [HourTokens::default(); 24];
+    unpriced_hours[10] = HourTokens {
+        input: 500_000,
+        ..Default::default()
+    };
+    let t = DaySummary {
+        date: crate::tokens::today_date(),
+        model_hours: vec![
+            HourlyModel {
+                model: "m".to_owned(),
+                hours: priced_hours,
+            },
+            HourlyModel {
+                model: "unknown".to_owned(),
+                hours: unpriced_hours,
+            },
+        ],
+        models: vec![],
+        ..Default::default()
+    };
+    let (usd, floor) = today_cost(Some(&table), &t).expect("table present");
+    assert!((usd - 1.0).abs() < 1e-9, "got {usd}");
+    assert!(floor, "the unpriced model's tokens floor the day");
+}
+
+#[test]
+fn model_detail_total_floors_mixed_priced_days() {
+    let table = table_of(vec![flat_model("m", 1e-6, 0.0, 0.0, 0.0)]);
+    // The same model priced on one day and unpriced on another: the split
+    // carries both days' tokens, the cost prices only the priced day, and the
+    // total renders as a `+` floor.
+    let row = period_row(
+        "m",
+        vec![
+            unhoured_day("2026-08-15", "m", 10_000, 0),
+            unhoured_day("2026-08-16", "unknown", 10_000, 0),
+        ],
+    );
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&row),
+            20_000,
+            Some(&table),
+            false,
+            TokenPeriod::Weekly,
+        );
+    })
+    .unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        out.contains("$0.010+"),
+        "the total renders as a floor over the priced day, got: {out}"
+    );
+}
+
+#[test]
+fn cost_lens_reads_rates_unavailable_after_a_failed_fetch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    app.token_view = crate::tui::app::TokenView::Models;
+    // The fetch failed before any table landed: the flag is set, the table
+    // absent, so the cost lens must not claim it is still loading.
+    app.price_failed = true;
+    let out = render_dashboard(&app, 100, 44);
+    assert!(out.contains("rates unavailable"), "got: {out}");
+}
+
+#[test]
+fn cost_lens_reads_rates_loading_before_any_pricing_result() {
+    let row = period_row("m", vec![unhoured_day("2026-08-15", "m", 10_000, 0)]);
+    let mut term = Terminal::new(TestBackend::new(60, 24)).unwrap();
+    term.draw(|f| {
+        super::draw_model_detail(
+            f,
+            f.area(),
+            Some(&row),
+            10_000,
+            None,
+            false,
+            TokenPeriod::Weekly,
+        );
+    })
+    .unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(out.contains("rates loading"), "got: {out}");
+}
+
+#[test]
+fn price_failed_clears_on_loaded() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    // Nothing must spawn a bootstrap thread out of this tick.
+    app.bootstrap_started = true;
+    app.price_failed = true;
+    // The test build drops the pricing worker's sender, so wire a live channel
+    // in for the `Loaded` to reach the tick drain.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pricing_events = rx;
+    tx.send(crate::pricing::PricingEvent::Loaded(Box::new(table_of(
+        vec![],
+    ))))
+    .unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(!app.price_failed, "any Loaded clears the failure flag");
+    assert!(app.price_table.is_some(), "the table lands");
+}
+
+#[test]
+fn price_failed_sets_on_failed_without_a_table() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.bootstrap_started = true;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pricing_events = rx;
+    tx.send(crate::pricing::PricingEvent::Failed).unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        app.price_failed,
+        "a failed fetch with no table sets the flag"
+    );
+}
+
+#[test]
+fn price_failed_keeps_the_last_good_table_on_a_transient_failure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.bootstrap_started = true;
+    app.price_table = Some(table_of(vec![]));
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.pricing_events = rx;
+    tx.send(crate::pricing::PricingEvent::Failed).unwrap();
+    crate::tui::app::on_tick(&mut app);
+    assert!(
+        !app.price_failed,
+        "a transient failure mid-session never blanks the cached table's flag"
+    );
+}
+
+#[test]
+fn total_cost_counts_unpriced_with_tokens() {
+    let table = table_of(vec![flat_model("m", 1e-6, 2e-6, 0.0, 0.0)]);
+    let stats = TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "m".to_owned(),
+                input: 1_000_000,
+                ..Default::default()
+            }, // $1.00, priced
+            ModelTokens {
+                model: "unknown".to_owned(),
+                input: 500_000,
+                ..Default::default()
+            }, // unpriced, has tokens → floor
+            ModelTokens {
+                model: "empty-unknown".to_owned(),
+                ..Default::default()
+            }, // unpriced, no tokens → ignored
+        ],
+        ..Default::default()
+    };
+    let (lines, _meta) = total_lines(&stats, 60, false, Some(&table));
+    assert!(
+        line_text(&lines[1]).contains("$1.00+"),
+        "unpriced token-bearing models floor the lifetime figure, got {:?}",
+        line_text(&lines[1])
+    );
+    let (bare, _meta) = total_lines(&stats, 60, false, None);
+    assert!(line_text(&bare[1]).contains('—'), "no table → dash");
+
+    // A zero-token unpriced model does NOT floor the figure: the count is
+    // token-gated, never rate-gated.
+    let zero_only = TokenStats {
+        models: vec![
+            ModelTokens {
+                model: "m".to_owned(),
+                input: 1_000_000,
+                ..Default::default()
+            },
+            ModelTokens {
+                model: "empty-unknown".to_owned(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let (zero_lines, _meta) = total_lines(&zero_only, 60, false, Some(&table));
+    let zero_cost = line_text(&zero_lines[1]);
+    assert!(
+        zero_cost.contains("$1.00") && !zero_cost.contains('+'),
+        "zero-token unpriced models do not floor, got {zero_cost:?}"
+    );
+}
+
+#[test]
+fn daily_lens_rows_carry_todays_hourly_buckets() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // The daily-lens model rows must price today's models at their hourly
+    // tiers (the today card's figures), not at the lifetime fallback's flat
+    // hour-0 rate: windowed deepseek-chat at hour 10 (peak) reads $0.002
+    // through the daily rows, not the $0.001 hour-0 flat price.
+    let table = table_of(vec![windowed_model(
+        "deepseek-chat",
+        (2e-6, 4e-6),
+        (1e-6, 2e-6),
+    )]);
+    let mut hours = [HourTokens::default(); 24];
+    hours[10] = HourTokens {
+        input: 1000,
+        ..Default::default()
+    };
+    let stats = TokenStats {
+        today: Some(DaySummary {
+            date: crate::tokens::today_date(),
+            model_hours: vec![HourlyModel {
+                model: "deepseek-chat".to_owned(),
+                hours,
+            }],
+            models: vec![ModelTokens {
+                model: "deepseek-chat".to_owned(),
+                input: 1000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Tokens;
+    app.token_period = TokenPeriod::Daily;
+    app.token_stats = Some(stats);
+    let rows = crate::tui::app::token_period_models(&app);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].days.len(),
+        1,
+        "the daily row carries today as a day"
+    );
+    assert!(
+        rows[0].days[0].hours.is_some(),
+        "and that day carries its hour buckets"
+    );
+    let lines = model_lines(&rows, 60, 5, true, Some(&table), "no model usage yet");
+    assert!(
+        line_text(&lines[0]).contains("$0.002"),
+        "the row prices the hourly tier, got {:?}",
+        line_text(&lines[0])
+    );
+}
+
+#[test]
+fn model_detail_cost_sums_buckets_across_hourly_days() {
+    let table = table_of(vec![windowed_model(
+        "deepseek-chat",
+        (2e-6, 4e-6),
+        (1e-6, 2e-6),
+    )]);
+    // One hourly day: 1000 input at peak hour 16, 500 output at off-peak hour 0.
+    let row = period_row(
+        "deepseek-chat",
+        vec![hourly_day(
+            "2026-08-15",
+            "deepseek-chat",
+            &[(16, 1000, 0), (0, 0, 500)],
+        )],
+    );
+    let (split, unpriced) = model_detail_cost(&table, &row).expect("priced");
+    assert_eq!(unpriced, 0);
+    assert!(
+        (split.input - 0.002).abs() < 1e-9,
+        "peak input rate, got {}",
+        split.input
+    );
+    assert!(
+        (split.output - 0.001).abs() < 1e-9,
+        "off-peak output rate, got {}",
+        split.output
+    );
+    assert!((split.cache - 0.0).abs() < 1e-9);
+    assert!(
+        (split.total() - 0.003).abs() < 1e-9,
+        "got {}",
+        split.total()
     );
 }
 

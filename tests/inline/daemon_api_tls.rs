@@ -218,7 +218,10 @@ fn tls_config_is_written_with_the_platform_default_on_first_use() {
         default_cert_dir().expect("default"),
         "first use takes the default"
     );
-    assert!(path.exists(), "the default should be persisted, not just returned");
+    assert!(
+        path.exists(),
+        "the default should be persisted, not just returned"
+    );
 
     let body = std::fs::read_to_string(&path).expect("read back");
     assert!(
@@ -233,11 +236,7 @@ fn an_edited_cert_dir_is_honored_across_restarts() {
     let path = clauth_dir().expect("clauth dir").join("tls.json");
     cert_dir().expect("create the default");
 
-    std::fs::write(
-        &path,
-        r#"{"schema":1,"cert_dir":"/opt/certs/lego"}"#,
-    )
-    .expect("edit");
+    std::fs::write(&path, r#"{"schema":1,"cert_dir":"/opt/certs/lego"}"#).expect("edit");
     assert_eq!(
         cert_dir().expect("read edited"),
         Path::new("/opt/certs/lego"),

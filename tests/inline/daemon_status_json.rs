@@ -69,6 +69,10 @@ fn build_status_top_level_shape_and_active() {
             "active",
             "auth_status",
             "auto_start",
+            // Additive under schema 1 (interleaved auto-start queue): the
+            // profile's queue slot and the queue's shared next-open estimate,
+            // `null` for a profile that holds no slot.
+            "auto_start_queue",
             "base_url",
             "bell_threshold",
             "fallback",
@@ -78,6 +82,7 @@ fn build_status_top_level_shape_and_active() {
             "name",
             "next_refresh_at",
             "provider",
+            "rolling_token",
             "stale",
             "third_party",
             "tier",
@@ -233,7 +238,7 @@ fn build_status_auth_status_ok_expiring_broken() {
         state: AppState::default(),
         profiles: vec![ok, expiring, broken],
     };
-    config.set_auth_broken("broken", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
 
     let v = build_status(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
@@ -306,9 +311,12 @@ fn build_status_pending_switch_reflects_live_signal() {
 
     let live = LiveSignals {
         status: &empty_status,
+        third_party_status: &Default::default(),
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: Some("home"),
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(v["pending_switch"], "home");
@@ -316,6 +324,90 @@ fn build_status_pending_switch_reflects_live_signal() {
         v["schema"], SCHEMA_VERSION,
         "pending_switch is part of schema 1 — no bump"
     );
+}
+
+/// The queue object is pinned by VALUE, not key presence: `position` is the
+/// member's 1-based slot in the shared order, `next_open_at` round-trips to
+/// anchor + gap, and every null shape is spelled out — toggle off, not a
+/// member, and member-with-no-anchor. Publishing `null` for every position
+/// would otherwise survive the key-list test.
+#[test]
+fn build_status_auto_start_queue_positions_and_null_cases() {
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let mut config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), oauth_profile("c")],
+    };
+
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &[],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(queue_of(&v, "b")["position"], 2);
+    // Round-trip rather than a formatted literal, so the pin is on the
+    // arithmetic (anchor + gap) and not on the ISO renderer.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+    );
+    assert_eq!(
+        queue_of(&v, "a")["next_open_at"],
+        queue_of(&v, "b")["next_open_at"],
+        "the estimate is the queue's, shared by every member"
+    );
+    // Null case 1: an OAuth profile that never opted into auto_start.
+    assert!(queue_of(&v, "c").is_null());
+
+    // Null case 2: a member with no anchor yet — the slot publishes, the
+    // stamp is null (reads as "due now").
+    let cold = LiveSignals {
+        queue_anchor: None,
+        ..live
+    };
+    let v = build_status(&config, 300_000, Some(&cold), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert!(queue_of(&v, "a")["next_open_at"].is_null());
+
+    // Null case 3: the toggle off is a real off switch on the feed too.
+    config.state.auto_start_queue = false;
+    let v = build_status(&config, 300_000, Some(&live), false);
+    for name in ["a", "b", "c"] {
+        assert!(queue_of(&v, name).is_null());
+    }
 }
 
 /// An api-key profile's freshness derives from ITS cache
@@ -337,8 +429,9 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     };
 
     // Warm third-party cache, no OAuth cache: the profile is fetched.
+    crate::testutil::register_names(&["zai"]);
     crate::profile_cache::write_profile_cache(
-        "zai",
+        &crate::profile::ProfileName::from("zai"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &crate::providers::ThirdPartyStats {
             is_available: true,
@@ -365,9 +458,12 @@ fn build_status_third_party_freshness_from_its_own_cache() {
     let empty_streaks = std::collections::HashMap::new();
     let live = LiveSignals {
         status: &empty_status,
+        third_party_status: &Default::default(),
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     let p = &v["profiles"].as_array().unwrap()[0];
@@ -394,8 +490,9 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
         profiles: vec![oauth_profile("maxed")],
     };
     // Warm the OAuth usage cache with a live 100%-capped 5h window.
+    crate::testutil::register_names(&["maxed"]);
     crate::profile_cache::write_profile_cache(
-        "maxed",
+        &crate::profile::ProfileName::from("maxed"),
         crate::profile_cache::USAGE_CACHE_FILE,
         &crate::usage::UsageInfo {
             five_hour: Some(crate::usage::UsageWindow {
@@ -420,6 +517,96 @@ fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
     assert!(
         !p["next_refresh_at"].is_null(),
         "polling a spent account still schedules a refresh: {p}"
+    );
+}
+
+/// The half a spent-skip gate keyed on `is_third_party` gets wrong: a GENERIC
+/// api-key endpoint (`provider` is `None`, so that predicate says false) is
+/// fetched on the cadence by the third-party leg, and `drop_spent_oauth` blanks
+/// the OAuth leg's countdown map alone — so a spent account is skipped on one
+/// leg while the other still has a refresh pending, and the feed published
+/// `null` over it.
+///
+/// The fixture is the HYBRID, which is the reachable shape: one Setup endpoint
+/// edit on a spent OAuth account (`edit_profile_endpoint`) keeps the pair, the
+/// key and the maxed `usage_cache.json`, so that reading is CURRENT rather than
+/// leftover and the OAuth leg is genuinely mid-skip.
+#[test]
+fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
+    let _home = HomeSandbox::new();
+    let mut api = oauth_profile("litellm");
+    api.base_url = Some("http://127.0.0.1:4000".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    assert!(
+        !api.is_third_party() && api.usage_cache_is_third_party(),
+        "fixture must be the case the two predicates disagree on",
+    );
+    let config = AppConfig {
+        state: AppState {
+            refresh_spent_accounts: false,
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    };
+    crate::testutil::register_names(&["litellm"]);
+    // Current, not stale: the OAuth leg still polls this pair, and this is the
+    // reading `drop_spent_oauth` skips on.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    // The cache this account's own leg writes.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    // Single-shot: derived off the third-party cache's mtime, not suppressed.
+    let single = build_status(&config, 300_000, None, false);
+    let p = &single["profiles"].as_array().unwrap()[0];
+    assert!(
+        !p["next_refresh_at"].is_null(),
+        "the third-party leg refreshes this account on the cadence: {p}"
+    );
+
+    // Live daemon: the countdown that leg published must reach the feed
+    // verbatim — a stamp the mtime derivation could not have produced, so this
+    // fails on suppression rather than on the two paths agreeing by accident.
+    let next: std::collections::HashMap<String, u64> = [("litellm".to_string(), 4_102_444_800_000)]
+        .into_iter()
+        .collect();
+    let empty_status = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        p["next_refresh_at"], "2100-01-01T00:00:00+00:00",
+        "the live third-party countdown must reach the feed: {p}"
     );
 }
 
@@ -476,9 +663,12 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
     let live = LiveSignals {
         status: &status,
+        third_party_status: &Default::default(),
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
@@ -498,14 +688,469 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
     let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
     let live = LiveSignals {
         status: &status,
+        third_party_status: &Default::default(),
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
     };
     let v = build_status(&config, 300_000, Some(&live), false);
     assert_eq!(
         stale_of("work", &v),
         false,
         "a shallow RateLimited reading is not stale"
+    );
+}
+
+/// The third-party leg writes its outcomes to `third_party_status`, not the
+/// OAuth `status` store the feed used to read alone. A name missing from that
+/// one fell through to the mtime derivation — and an `AuthExpired` fetch writes
+/// no cache, so the field came out `null`: a dead console session was
+/// indistinguishable from a profile that had never been fetched. That is the
+/// exact dishonesty "detect it, stop fetching, say why" was chosen to avoid.
+#[test]
+fn build_status_publishes_the_third_party_legs_own_status() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(base.to_string()), None);
+    qwen.provider = crate::providers::Provider::from_base_url(base);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["qwen".into()],
+            ..AppState::default()
+        },
+        profiles: vec![qwen],
+    };
+    let empty: HashMap<String, FetchStatus> = HashMap::new();
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+
+    // No cache on disk (an AuthExpired fetch writes none), so the mtime
+    // derivation has nothing — the live third-party store is the only source.
+    let tp = HashMap::from([("qwen".to_string(), FetchStatus::AuthExpired)]);
+    let live = LiveSignals {
+        status: &empty,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "AuthExpired",
+        "a dead console session must not read as never-fetched",
+    );
+    // `stale` is contracted as a stuck 429 off the OAuth store and must not
+    // start following the third-party leg.
+    assert_eq!(v["profiles"][0]["stale"], false);
+
+    // A third-party 429 reaches the feed too — pre-fix it published whatever the
+    // cache mtime said, which is a freshness claim about a rejected poll.
+    let tp = HashMap::from([("qwen".to_string(), FetchStatus::RateLimited)]);
+    let live = LiveSignals {
+        status: &empty,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
+}
+
+/// The OAuth leg keeps precedence, exactly as the TUI's own merge does: a
+/// hybrid profile carrying both must not have its OAuth verdict overwritten.
+#[test]
+fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["both".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("both".to_string(), None, None)],
+    };
+    let status = HashMap::from([("both".to_string(), FetchStatus::Fresh)]);
+    let tp = HashMap::from([("both".to_string(), FetchStatus::AuthExpired)]);
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+    let live = LiveSignals {
+        status: &status,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
+}
+
+/// The daemonless surfaces (`clauth status --json`, `clauth list`) derive
+/// freshness from the usage cache's mtime, so a warm cache behind a DEAD
+/// console session published `fetch_status: "Fresh"` — a live measurement over
+/// a credential that can never self-heal, which is the exact failure this
+/// design was chosen over "keep last-known values" to avoid. The durable
+/// verdict is keyed by credential fingerprint, so it can only ever say
+/// "the last fetch under the credential you still hold died".
+#[test]
+fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let session = |token: &str| crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+    let profile = |token: &str| {
+        let mut p = Profile::new("qwen".to_string(), Some(base.to_string()), None);
+        p.provider = crate::providers::Provider::from_base_url(base);
+        p.console = Some(session(token));
+        p
+    };
+    let config_of = |p: Profile| AppConfig {
+        state: AppState {
+            profiles: vec!["qwen".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+
+    // A cache written just now: the mtime derivation calls this "Fresh".
+    crate::testutil::register_names(&["qwen"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("qwen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: Vec::new(),
+            plan: Some("lite".to_string()),
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let dead = config_of(profile("dead-token"));
+    let v = build_status(&dead, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "Fresh",
+        "precondition: the mtime derivation alone calls a warm cache Fresh",
+    );
+
+    // Record the verdict against the credential the profile holds.
+    let fp = crate::usage::profile_credential_fingerprint(&dead.profiles[0])
+        .expect("a console-credentialed profile has a fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
+
+    let v = build_status(&dead, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "AuthExpired",
+        "no daemon, warm cache, dead session — must not read as a live measurement",
+    );
+
+    // A re-login changes the credential, so the record stops applying on its
+    // own. THIS is what makes persisting it safe.
+    let relogged = config_of(profile("fresh-token"));
+    let v = build_status(&relogged, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "Fresh",
+        "a record for a credential the profile no longer holds is inert",
+    );
+}
+
+/// The record must never invent a reading for a profile nothing has fetched.
+#[test]
+fn build_status_leaves_a_never_fetched_profile_unknown() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = Profile::new("cold".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["cold".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let v = build_status(&config, 300_000, None, false);
+    assert!(
+        v["profiles"][0]["fetch_status"].is_null(),
+        "no cache and no verdict is unknown, not a status",
+    );
+}
+
+/// The published `rolling_token` is what the sidecar HOLDS — the same content
+/// classification the TUI renders — never the config flag. status.json is the
+/// one surface where a reader has no second source to check against, so a
+/// flag-driven value would tell external readers a degraded mint is routine
+/// hours-scale maintenance (or hide a rolling bearer behind a mint's 30-day
+/// warning ramp).
+#[test]
+fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
+    let _home = HomeSandbox::new();
+    let name = "roll-truth";
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config_with_flag = |rolling_token: bool| {
+        let mut p = oauth_profile(name);
+        p.rolling_token = rolling_token;
+        AppConfig {
+            state: AppState::default(),
+            profiles: vec![p],
+        }
+    };
+    let sidecar = |scopes: Vec<&str>, plan: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-status-fixture".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(scopes.into_iter().map(String::from).collect()),
+            subscription_type: plan.map(String::from),
+        }),
+    };
+
+    // Flag ON, sidecar degraded onto the mint: publish the mint.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:sessions:claude_code"],
+            None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config_with_flag(true), 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], false,
+        "a degraded profile must publish the mint it is actually on"
+    );
+
+    // Flag OFF, sidecar holding a rolling bearer: publish the bearer.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:profile"],
+            Some("max"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config_with_flag(false), 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], true,
+        "what sessions actually hold outranks the flag in both directions"
+    );
+}
+
+/// A mis-fill (rotating pair) publishes `rolling_token: false` even though its
+/// chain-shaped scopes would scope-classify as rolling — the classifier's
+/// refresh-token arm pre-empts the inference. Without it, status.json told
+/// external readers "routine hours-scale maintenance" over the exact state the
+/// TUI renders `[ mis-filled ]` for, on the same file, same frame.
+#[test]
+fn build_status_rolling_token_is_false_for_a_misfill() {
+    let _home = HomeSandbox::new();
+    let name = "roll-misfill";
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut p = oauth_profile(name);
+    p.rolling_token = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![p],
+    };
+    // What a mis-fill IS: a copy of credentials.json — refresh token, chain
+    // scopes, plan stamp and all.
+    let misfill = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-misfill".to_string(),
+            refresh_token: Some("rt-misfill".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".to_string()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&misfill).unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], false,
+        "a mis-fill is the state the split exists to detect, not a rolling token"
+    );
+}
+
+/// The published `profiles[]` entries deserialize into [`ProfileEntry`] — the
+/// typed spelling the reader (`clauth list`) derives its fields from. A field
+/// the writer drops or renames reds here instead of in a reader's typed access.
+#[test]
+fn published_entries_deserialize_into_the_typed_contract() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    // Warm the cache so the entry carries real window rows.
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.4,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let v = build_status(&config, 300_000, None, false);
+    let entries: Vec<ProfileEntry> = serde_json::from_value(v["profiles"].clone()).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.name.as_str(), "work");
+    assert!(entry.active);
+    assert_eq!(entry.windows.len(), 1);
+    assert_eq!(entry.windows[0].label, "5h");
+    assert_eq!(entry.windows[0].utilization_pct, 42.4);
+    // The window row's published key set, pinned like the entry's above: both
+    // sides derive from one struct, so a rename compiles clean and would
+    // silently change the wire shape for every external reader.
+    let mut win_keys: Vec<&str> = v["profiles"][0]["windows"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    win_keys.sort_unstable();
+    assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
+}
+
+/// The feed must publish the queue the ELECTION is running, not a wider one.
+/// `auto_start_queue_members` drops switch-grade kick-blocked profiles, and the
+/// scheduler and the TUI both supply that set — the feed used to pass an empty
+/// one, so a blocked account kept a position and inflated `N` for as long as
+/// the limiter's advertised ceiling stood (hours, not the "one poll" the code
+/// claimed). Every OTHER member's `next_open_at` is then computed off the wrong
+/// `5h / N` and reads earlier than the gap actually applied (review round 4).
+///
+/// Both legs, because the two surfaces read the set from different places: a
+/// live daemon passes its in-memory blocks through `LiveSignals`, and the
+/// daemonless `status --json` re-derives them from the same `kick_block.json`
+/// caches the scheduler writes through — on the same `kick_block_switch_grade`
+/// predicate, which the third profile below pins by NOT being excluded.
+#[test]
+fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, write_profile_cache};
+    use crate::usage::KickBlock;
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("c")],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    // Live leg: the scheduler's own blocked set, handed over.
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let blocked = [crate::profile::ProfileName::from("b")];
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &blocked,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "a kick-blocked member holds no published slot, as it holds none in the election"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "the members behind it close up rather than leaving a hole"
+    );
+    // The N the estimate is sized from, which is the half of this that a
+    // position assertion alone would miss.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+        "the gap is 5h/2, not the 5h/3 an un-excluded member would publish"
+    );
+
+    // Daemonless leg: the same verdict re-derived from disk. `c` gets a block
+    // that is NOT switch-grade (one 429, no `rejected`), so the predicate is
+    // pinned in both directions by the same run.
+    crate::testutil::register_names(&["a", "b", "c"]);
+    let far_ahead = crate::usage::now_epoch_secs() + 3600;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("b"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("c"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 1,
+            rejected: false,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    let v = build_status(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "`status --json` reads the same block off `kick_block.json`"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "a burst 429 is not switch-grade and never costs a queue slot"
     );
 }

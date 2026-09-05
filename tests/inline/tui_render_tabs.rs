@@ -50,6 +50,7 @@ fn render_tabs(app: &App, width: u16) -> String {
 #[test]
 fn tokens_dashboard_uses_alignment_not_middot() {
     let _home = crate::testutil::HomeSandbox::new();
+    use crate::pricing::HourTokens;
     use crate::tokens::{DayActivity, DaySummary, DayTokens, ModelTokens, TokenStats};
     let mut app = empty_app(Tab::Tokens);
     let daily: Vec<DayTokens> = (0..30)
@@ -99,6 +100,8 @@ fn tokens_dashboard_uses_alignment_not_middot() {
             cache_create: 5_200_000,
             messages: 342,
             hours: [0; 24],
+            token_hours: [HourTokens::default(); 24],
+            model_hours: vec![],
             models: vec![],
         }),
     });
@@ -135,6 +138,7 @@ fn tokens_dashboard_uses_alignment_not_middot() {
 #[test]
 fn count_cache_toggle_switches_token_basis() {
     let _home = crate::testutil::HomeSandbox::new();
+    use crate::pricing::HourTokens;
     use crate::tokens::{DaySummary, TokenStats};
     let mut app = empty_app(Tab::Tokens);
     app.token_stats = Some(TokenStats {
@@ -160,6 +164,8 @@ fn count_cache_toggle_switches_token_basis() {
             cache_create: 0,
             messages: 1,
             hours: [0; 24],
+            token_hours: [HourTokens::default(); 24],
+            model_hours: vec![],
             models: vec![],
         }),
     });

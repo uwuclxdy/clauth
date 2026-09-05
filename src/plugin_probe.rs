@@ -320,8 +320,19 @@ fn clauth_mcp_entry() -> Value {
     serde_json::json!({ "type": "stdio", "command": "clauth", "args": ["mcp"] })
 }
 
+/// CC's user-scope plugin registry. `claude` resolves its config dir as
+/// `$CLAUDE_CONFIG_DIR` when set and non-empty, else `~/.claude`, and the
+/// registry lives under it — so the probe reads the same resolution the CLI
+/// writes. That is what makes the install fix converge: agentgear drives the
+/// real CLI, which honors the override, and the recomputed row must read the
+/// registry the CLI just wrote. `profile::claude_dir()` stays the `~/.claude`
+/// view the credentials link uses; the registry is not the link.
 fn plugins_dir() -> Option<PathBuf> {
-    Some(claude_dir().ok()?.join("plugins"))
+    let base = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => claude_dir().ok()?,
+    };
+    Some(base.join("plugins"))
 }
 
 /// Parse a JSON file into a `Value`, returning `None` on any missing/unreadable/

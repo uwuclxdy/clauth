@@ -131,13 +131,29 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     let seven = seven.expect("7d bar synthesizes a window");
 
     assert!(
-        app.active_burn_rate("tp", &UsageInfo::default()).is_none(),
+        app.active_burn_rate(
+            &crate::profile::ProfileName::from("tp"),
+            &UsageInfo::default()
+        )
+        .is_none(),
         "no burn history exists for an api-key profile — avg pace is the only source",
     );
-    let five_rate = drain_rate(&app, "tp", profile, LABEL_5H, &five)
-        .expect("a half-elapsed 5h window yields an avg pace");
-    let seven_rate = drain_rate(&app, "tp", profile, LABEL_7D, &seven)
-        .expect("a half-elapsed 7d window yields an avg pace");
+    let five_rate = drain_rate(
+        &app,
+        &crate::profile::ProfileName::from("tp"),
+        profile,
+        LABEL_5H,
+        &five,
+    )
+    .expect("a half-elapsed 5h window yields an avg pace");
+    let seven_rate = drain_rate(
+        &app,
+        &crate::profile::ProfileName::from("tp"),
+        profile,
+        LABEL_7D,
+        &seven,
+    )
+    .expect("a half-elapsed 7d window yields an avg pace");
     assert!(five_rate > 0.0 && seven_rate > 0.0);
 
     // 60% over the 2.5h elapsed half of a 5h window is past its 50% ideal line,
@@ -173,7 +189,14 @@ fn drain_rate_oauth_five_hour_uses_recent_burn() {
     let p = &app.config().profiles[0];
     let w = p.usage.as_ref().unwrap().five_hour.clone().unwrap();
     assert!(
-        drain_rate(&app, "a", p, LABEL_5H, &w).is_none(),
+        drain_rate(
+            &app,
+            &crate::profile::ProfileName::from("a"),
+            p,
+            LABEL_5H,
+            &w
+        )
+        .is_none(),
         "no recorded history → no rate, rather than an avg-pace fallback",
     );
 }
@@ -200,11 +223,13 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -238,7 +263,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
             });
         }
         rows.push(crate::providers::StatRow {
-            label: "total".into(),
+            label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
             value: (*t).to_string(),
             kind: crate::providers::StatRowKind::Body,
         });
@@ -254,11 +279,13 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -271,6 +298,37 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
             endpoint: None,
             best_effort: false,
         }),
+    }
+}
+
+/// A DeepSeek profile whose cached rows come from a captured
+/// `third_party_cache.json` (see the `CAPTURED_*_DS_CACHE` constants in
+/// [`crate::testutil`]): the bytes go through the production cache writer and
+/// reader into the field a live app's `apply_usage` fills, so the render path
+/// is driven by captured bytes rather than a hand-built `ThirdPartyStats`.
+fn deepseek_profile_from_cache(name: &str, captured: &str) -> Profile {
+    let base = deepseek_profile(name, &[]);
+    // The cache writer skips names the on-disk record doesn't carry, so the
+    // profile and the state list must exist before the captured bytes land.
+    crate::profile::save_profile(&base).expect("save profile");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(name, captured);
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("captured cache written and readable");
+    Profile {
+        name: name.into(),
+        base_url: Some("https://api.deepseek.com/anthropic".into()),
+        api_key: Some("k".into()),
+        provider: Some(crate::providers::Provider::DeepSeek),
+        third_party_usage: Some(stats),
+        ..deepseek_profile(name, &[])
     }
 }
 
@@ -288,11 +346,13 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -496,26 +556,20 @@ fn broken_login_outranks_token_danger_marker() {
     assert!(!text.contains('⊘'), "token marker yields to ×: {text}");
 }
 
-/// A live long-lived token tags the type column (·token) and raises no marker;
-/// an expired one raises the ⊘ danger marker.
+/// A live long-lived token raises no marker; an expired one raises the ⊘ danger marker.
 #[test]
-fn long_lived_token_tags_type_column_and_expired_marks() {
+fn long_lived_token_expired_marks() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
-    // Wide terminal so the type column isn't clamped narrow enough to drop the tag.
     let widths = OverviewWidths::new(120, &app);
 
     app.session_tokens
         .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
     let live = line_text(&render_overview_row(&app, 0, &widths, false, true));
-    assert!(
-        live.contains("·token"),
-        "type column tags token mode: {live}"
-    );
     assert!(
         !live.contains('⊘'),
         "a live token raises no danger marker: {live}"
@@ -701,11 +755,13 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "tok".into(),
@@ -1026,9 +1082,9 @@ fn no_tier_type_cell_does_not_pulse() {
 }
 
 /// The dash joins the other no-data cells at `faint`, but only when it is the
-/// whole cell: a `·token` tag beside it is real data, a disabled row still
-/// flattens to `dim` the way it outranks every other cell state, and a row whose
-/// label is a REAL one keeps `dim` however it reached the un-pulsed branch.
+/// whole cell: a disabled row flattens to `dim` the way it outranks every other
+/// cell state, and a row whose label is a REAL one keeps `dim` however it
+/// reached the un-pulsed branch.
 ///
 /// That last leg is the one the `no_tier &&` conjunct exists for. An api-key row
 /// has a genuine `API` label AND no credentials, so it lands in the same branch
@@ -1042,7 +1098,6 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let config = config_with(
         vec![
             credentialed_profile("a", "something_new"),
-            credentialed_profile("b", "something_new"),
             disabled,
             Profile::new(
                 "d".to_string(),
@@ -1055,20 +1110,15 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
         vec![],
     );
 
-    let cell = |idx: usize, token_mode: bool| -> (String, Option<ratatui::style::Color>) {
+    let cell = |idx: usize| -> (String, Option<ratatui::style::Color>) {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(0);
-        if token_mode {
-            let name = app.config().profiles[idx].name.to_string();
-            app.session_tokens
-                .insert(name, crate::claude::SessionTokenStatus::LongLived(None));
-        }
         let widths = OverviewWidths::new(110, &app);
         let span = render_overview_row(&app, idx, &widths, false, true).spans[KIND_SPAN].clone();
         (span.content.to_string(), span.style.fg)
     };
 
-    let (bare, bare_fg) = cell(0, false);
+    let (bare, bare_fg) = cell(0);
     assert_eq!(
         bare.trim_end(),
         "—",
@@ -1076,26 +1126,14 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     );
     assert_eq!(bare_fg, theme::faint().fg, "a bare dash is a no-data cell");
 
-    let (tagged, tagged_fg) = cell(1, true);
-    assert_eq!(
-        tagged.trim_end(),
-        "— ·token",
-        "fixture control: the tag shares the cell"
-    );
-    assert_eq!(
-        tagged_fg,
-        theme::dim().fg,
-        "`·token` is real data, so fading the cell would claim otherwise"
-    );
-
-    let (_, disabled_fg) = cell(2, false);
+    let (_, disabled_fg) = cell(1);
     assert_eq!(
         disabled_fg,
         theme::dim().fg,
         "a disabled row flattens to dim, outranking no-data as it does stale"
     );
 
-    let (api, api_fg) = cell(3, false);
+    let (api, api_fg) = cell(2);
     assert_eq!(
         api.trim_end(),
         "API",
@@ -1111,7 +1149,7 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     // (no credentials rather than no tier), and it fades too — the cell is empty
     // for the same reason, so it reads the same way. This one changed with the
     // no-data dash and had no leg of its own.
-    let (uncredentialed, uncredentialed_fg) = cell(4, false);
+    let (uncredentialed, uncredentialed_fg) = cell(3);
     assert_eq!(
         uncredentialed.trim_end(),
         "—",
@@ -1305,7 +1343,19 @@ fn chain_row_switch_hint_rides_the_target_row() {
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
-    let row = chain_row(&cfg, "a", 0, 0, 8, GAUGE_W, 3, None, Some(7200));
+    let row = chain_row(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        ChainRowCtx {
+            index: 0,
+            last: 0,
+            name_w: 8,
+            gauge_w: GAUGE_W,
+            thr_w: 3,
+            reason: None,
+            switch_eta: Some(7200),
+        },
+    );
     let base = row.base_width();
     let line = row.into_line(base + TRAILER_GAP, 60);
     let text = line_text(&line);
@@ -1337,7 +1387,19 @@ fn chain_row_marks_a_homecoming_onto_preferred_with_the_house_glyph() {
     let cfg = app.config();
 
     let hint = |name: &str| {
-        let row = chain_row(&cfg, name, 0, 0, 8, GAUGE_W, 3, None, Some(7200));
+        let row = chain_row(
+            &cfg,
+            &crate::profile::ProfileName::from(name),
+            ChainRowCtx {
+                index: 0,
+                last: 0,
+                name_w: 8,
+                gauge_w: GAUGE_W,
+                thr_w: 3,
+                reason: None,
+                switch_eta: Some(7200),
+            },
+        );
         let base = row.base_width();
         line_text(&row.into_line(base + TRAILER_GAP, 60))
     };
@@ -1439,14 +1501,16 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
     let cfg = app.config();
     let row = chain_row(
         &cfg,
-        "a",
-        0,
-        0,
-        8,
-        GAUGE_W,
-        3,
-        Some(BlockedReason::AuthBroken),
-        Some(7200),
+        &crate::profile::ProfileName::from("a"),
+        ChainRowCtx {
+            index: 0,
+            last: 0,
+            name_w: 8,
+            gauge_w: GAUGE_W,
+            thr_w: 3,
+            reason: Some(BlockedReason::AuthBroken),
+            switch_eta: Some(7200),
+        },
     );
     let col = row.base_width() + TRAILER_GAP;
     let text = line_text(&row.into_line(col, 60));
@@ -1470,14 +1534,16 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
     let build = || {
         chain_row(
             &cfg,
-            "a",
-            0,
-            0,
-            8,
-            GAUGE_W,
-            3,
-            Some(BlockedReason::AuthBroken),
-            Some(7200),
+            &crate::profile::ProfileName::from("a"),
+            ChainRowCtx {
+                index: 0,
+                last: 0,
+                name_w: 8,
+                gauge_w: GAUGE_W,
+                thr_w: 3,
+                reason: Some(BlockedReason::AuthBroken),
+                switch_eta: Some(7200),
+            },
         )
     };
     let col = build().base_width() + TRAILER_GAP;
@@ -1530,17 +1596,8 @@ fn live_row(
     follows_chain: bool,
 ) -> crate::live_sessions::LiveSession {
     crate::live_sessions::LiveSession {
-        session_id: session_id.to_string(),
-        start_profile: member.to_string(),
-        pid: 4242,
-        started_at: 1_700_000_000_000,
-        cwd: None,
-        isolated: false,
         follows_chain,
-        intended_member: None,
-        chain_cursor: None,
-        current_member: None,
-        last_swap_at: None,
+        ..crate::testutil::live_row(session_id, member)
     }
 }
 
@@ -1710,6 +1767,36 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
     }
 }
 
+/// The live column must be monotone in the list-area inner width (`total`):
+/// once it is present at some width it is present at every wider width, and it
+/// never disappears as the terminal narrows. The tier ladders jump several
+/// cells at a time, so the raw fit predicate alone would blink the column on
+/// and off while resizing.
+///
+/// This inner width is 4 cells narrower than the terminal width the render
+/// smoke test sweeps: the accounts panel takes 2 border cells + 2 horizontal
+/// padding cells. Floors here therefore read 4 lower than that test's.
+#[test]
+fn live_column_width_is_monotone_in_inner_width() {
+    for max_name in 8..=22 {
+        let mut prev = None;
+        for total in 30..=200 {
+            let width = live_column_width(max_name, total);
+            if let Some(prev_w) = prev
+                && width != prev_w
+            {
+                assert_eq!(
+                    (prev_w, width),
+                    (0, LIVE_W),
+                    "live column must only appear (0 -> LIVE_W), never drop or \
+                     flip, at name {max_name}, total {total} ({prev_w} -> {width})",
+                );
+            }
+            prev = Some(width);
+        }
+    }
+}
+
 // ── DeepSeek balance in the 5h column ──────────────────────────────────────
 
 /// The cell sitting under the `5h` header on `row`, padding included. Finds the
@@ -1796,6 +1883,37 @@ fn deepseek_row_shows_total_balance_in_5h_column() {
         cell.chars().count(),
         widths.five_hour,
         "the cell is exactly the column width so the next column does not shift"
+    );
+}
+
+/// The cache on disk outlives the label clauth writes into it. Every DeepSeek
+/// account carries a `third_party_cache.json` an older binary wrote, `profile.rs`
+/// seeds it into `third_party_usage` on every start, and two populations never
+/// get a rewrite at all: a disabled profile is dropped by
+/// `collect_third_party_entries`, and a failing fetch never reaches the arm that
+/// writes. A cell keyed on the current label alone blanks those accounts
+/// permanently, which is why this reads the CAPTURED legacy bytes through the
+/// production reader rather than a row built in Rust.
+#[test]
+fn a_deepseek_cache_written_before_the_rename_still_shows_its_balance() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::THIRD_PARTY_CACHE_BYTES)
+            .expect("the captured legacy cache parses");
+    let mut ds = deepseek_profile("ds", &[]);
+    ds.third_party_usage = Some(stats);
+    let app = App::new(config_with(vec![ds], Some("ds"), vec![]));
+
+    let widths = OverviewWidths::new(120, &app);
+    assert_eq!(
+        widths.deepseek_amount_w, 5,
+        "the legacy row still sizes the amount column (from `31.45`), not 0",
+    );
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.starts_with("[31.45 CNY"),
+        "a cache written before the rename still renders its balance: {cell:?}"
     );
 }
 
@@ -1900,6 +2018,58 @@ fn deepseek_multi_currency_only_shows_above_zero() {
     );
 }
 
+/// The two-wallet ruling (owner 2026-08-28) on the overview column: a profile
+/// whose captured cache carries the empty USD wallet first renders the funded
+/// CNY wallet only, through the same shared selector the MCP roster ranks on.
+#[test]
+fn deepseek_two_wallet_renders_only_the_funded_wallet() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile_from_cache(
+            "tw",
+            crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+        )],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("498.18 CNY"),
+        "the funded wallet is the rendered figure: {cell:?}",
+    );
+    // The currency token, not the amount string: the cell's alignment pads the
+    // amount, so an asserted `0.00 USD` substring is one the renderer can never
+    // produce for a dropped wallet and the absence leg would pin nothing.
+    assert!(
+        !cell.contains("USD"),
+        "the empty wallet must not render: {cell:?}",
+    );
+}
+
+/// One-wallet control for the ruling: a profile whose captured cache carries a
+/// single funded wallet renders exactly as it did before the rule.
+#[test]
+fn deepseek_single_wallet_renders_unchanged() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile_from_cache(
+            "one",
+            crate::testutil::CAPTURED_ONE_WALLET_DS_CACHE,
+        )],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app);
+    let row = render_overview_row(&app, 0, &widths, false, false);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("3640.55 CNY"),
+        "the single wallet is the rendered figure, as before: {cell:?}",
+    );
+}
+
 /// When every currency is 0, the highest one still renders — an account with
 /// no funds is still a real account, and a blank cell would read as no-data.
 #[test]
@@ -1954,5 +2124,94 @@ fn deepseek_amount_w_spans_all_currencies() {
         multi_cell.find("CNY"),
         single_cell.find("USD"),
         "first currencies in both cells start at the same column:\n  {multi_cell:?}\n  {single_cell:?}"
+    );
+}
+
+/// The 7d cell text, padding included, under the `7d` header; empty when the
+/// column is dropped. Mirrors `five_hour_cell_text` so the pin proves the cell
+/// sits under its own header, not just that a stamp exists somewhere on the row.
+fn seven_day_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    if widths.seven_day == 0 {
+        return String::new();
+    }
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("7d")
+        .expect("the accounts table carries a `7d` header");
+    line_text(row)
+        .chars()
+        .skip(col)
+        .take(widths.seven_day)
+        .collect()
+}
+
+/// A 12-char account row under `reset_display = both` must never lose its 5h
+/// wall-clock stamp (`· HH:MM`) while the 7d column still paints only the bare
+/// `XX%`. The 7d tier at inner totals 93..101 reserved 17 cells for a bar but
+/// painted 4 (the bar gate is `widths.seven_day >= 18`), so the 5h clock bonus
+/// starved and the stamp dropped between 96 and 97 terminal cols with nothing
+/// gained.
+///
+/// Sweeps TERMINAL widths 40..=170; each render runs in the list-area inner
+/// width 4 cells narrower (the accounts panel's 2 border cells + 1 padding cell
+/// per side, same offset the render smoke test pins). Asserts the 7d stamp map
+/// stays monotone and every 5h-stamp loss is paid for by a newly appeared 7d
+/// bar, then pins the 96/97 boundary in both directions.
+#[test]
+fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = profile("aaaaaaaaaaaa", 40.0, 60.0, 3 * 3600 + 1800);
+    if let Some(ref mut usage) = p.usage {
+        usage.seven_day = Some(UsageWindow {
+            utilization: 60.0,
+            resets_at: Some(reset_in(4 * 86400 + 43200)),
+        });
+    }
+    let mut config = config_with(vec![p], None, vec![]);
+    config.state.reset_display = Some(crate::profile::ResetDisplay::Both);
+    let app = App::new(config);
+
+    let mut five_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_bar = Vec::with_capacity((170 - 40 + 1) as usize);
+
+    for terminal in 40u16..=170 {
+        let widths = OverviewWidths::new(terminal - 4, &app);
+        let row = render_overview_row(&app, 0, &widths, false, false);
+        let five = five_hour_cell_text(&widths, false, &row);
+        let seven = seven_day_cell_text(&widths, &row);
+        five_stamp.push(five.contains('·'));
+        seven_stamp.push(seven.contains('·'));
+        seven_bar.push(seven.contains('['));
+    }
+
+    // The 7d stamp never blinks: once it appears at some width it stays at
+    // every wider width, like the live column.
+    for i in 1..seven_stamp.len() {
+        assert!(
+            !seven_stamp[i - 1] || seven_stamp[i],
+            "7d stamp disappears at terminal width {}",
+            40 + i
+        );
+    }
+
+    // A width that drops the 5h stamp must newly show the 7d bar at that same
+    // width, so the loss is a real trade, never a bare gutter.
+    for i in 1..five_stamp.len() {
+        if five_stamp[i - 1] && !five_stamp[i] {
+            assert!(
+                seven_bar[i] && !seven_bar[i - 1],
+                "5h stamp lost with no new 7d bar at terminal width {}",
+                40 + i
+            );
+        }
+    }
+
+    // The measured boundary, pinned in both directions: 96 and 97 cols both
+    // keep the stamp. Before the fix 97 dropped it while 96 kept it.
+    assert!(five_stamp[96 - 40], "5h stamp present at 96 cols");
+    assert!(
+        five_stamp[97 - 40],
+        "5h stamp present at 97 cols (the defect width)"
     );
 }

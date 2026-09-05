@@ -274,7 +274,11 @@ fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
             ("↵", "open settings · edit field · flip toggle"),
             ("↵ on a field", "edit inline; ↵ again saves"),
             ("space", "cycle the model preset (model row)"),
-            ("env", "+ add env · ↵ edits a value · a removes"),
+            ("env", "+ add env · ↵ edits a value"),
+            (
+                "a",
+                "duplicate the account · save it as a preset · apply one",
+            ),
             (
                 "disable / enable",
                 "↵ arms disable, again confirms · enable is one press · inert while active or a live session is open",
@@ -385,6 +389,155 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());
+}
+
+// ── action menu ─────────────────────────────────────────────────────────────
+
+/// Draw the menu the current context builds and return the screen rows plus the
+/// modal's own left/right border columns, so a test can slice it out.
+fn render_action_menu(app: &App, width: u16, height: u16) -> (Vec<String>, usize, usize) {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let state = crate::tui::app::build_action_menu(app);
+    let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+    term.draw(|f| draw_action_menu(f, f.area(), &state))
+        .unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let (left, right) = rows
+        .iter()
+        .find_map(|row| {
+            let chars: Vec<char> = row.chars().collect();
+            Some((
+                chars.iter().position(|c| *c == '\u{256d}')?,
+                chars.iter().position(|c| *c == '\u{256e}')?,
+            ))
+        })
+        .unwrap_or_else(|| panic!("the action menu's top border:\n{}", rows.join("\n")));
+    (rows, left, right)
+}
+
+fn app_on(tab: Tab, profiles: Vec<crate::profile::Profile>) -> App {
+    let names = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = tab;
+    app
+}
+
+/// The account-scoped half of the menu names its account in the title bar, and
+/// a rule holds it off the tab-global half below. Pinned whole: the name in the
+/// right border break, the rule's own row, and which items land on each side.
+#[test]
+fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let app = app_on(
+        Tab::Overview,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    );
+    let (rows, left, right) = render_action_menu(&app, 60, 20);
+    let slice =
+        |row: &String| -> String { row.chars().skip(left).take(right - left + 1).collect() };
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .expect("the top border");
+
+    assert_eq!(
+        rows[top..top + 9].iter().map(slice).collect::<Vec<_>>(),
+        vec![
+            "╭ ACTIONS ─────────────── acct ╮".to_string(),
+            "│                              │".to_string(),
+            "│  ❯ refresh usage          r  │".to_string(),
+            "│    rotate access token    t  │".to_string(),
+            "│    disable account        d  │".to_string(),
+            "│  ──────────────────────────  │".to_string(),
+            "│    refresh all accounts   f  │".to_string(),
+            "│    new account            n  │".to_string(),
+            "│                              │".to_string(),
+        ],
+    );
+}
+
+/// A one-group menu has nothing to separate and no account to name: no rule
+/// row, and the title bar stays bare rather than claiming a scope the items
+/// don't have.
+#[test]
+fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let (rows, left, right) = render_action_menu(&app_on(Tab::Overview, Vec::new()), 60, 20);
+    let slice =
+        |row: &String| -> String { row.chars().skip(left).take(right - left + 1).collect() };
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .expect("the top border");
+
+    assert_eq!(
+        rows[top..top + 6].iter().map(slice).collect::<Vec<_>>(),
+        vec![
+            "╭ ACTIONS ─────────────────────╮".to_string(),
+            "│                              │".to_string(),
+            "│  ❯ refresh all accounts   f  │".to_string(),
+            "│    new account            n  │".to_string(),
+            "│                              │".to_string(),
+            "╰──────────────────────────────╯".to_string(),
+        ],
+    );
+}
+
+/// A menu that is scoped end to end (the Setup tab, whose three actions all
+/// work on the account being configured) still names that account, and still
+/// draws no rule — there is no second group to hold off.
+#[test]
+fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
+    use crate::tui::app::{ConfigFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let mut app = app_on(
+        Tab::Setup,
+        vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    );
+    app.profile_cursor = 0;
+    // ⏎ on the account list is what seeds the draft the menu titles itself with.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.config_focus, ConfigFocus::Actions);
+
+    let (rows, left, right) = render_action_menu(&app, 60, 20);
+    let slice =
+        |row: &String| -> String { row.chars().skip(left).take(right - left + 1).collect() };
+    let top = rows
+        .iter()
+        .position(|r| r.contains('\u{256d}'))
+        .expect("the top border");
+
+    assert_eq!(
+        rows[top..top + 7].iter().map(slice).collect::<Vec<_>>(),
+        vec![
+            "╭ ACTIONS ──────────── acct ╮".to_string(),
+            "│                           │".to_string(),
+            "│  ❯ duplicate account   d  │".to_string(),
+            "│    save as preset      s  │".to_string(),
+            "│    apply preset        p  │".to_string(),
+            "│                           │".to_string(),
+            "╰───────────────────────────╯".to_string(),
+        ],
+    );
 }
 
 // ── AddChainCandidate confirm modal ─────────────────────────────────────────

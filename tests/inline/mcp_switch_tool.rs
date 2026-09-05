@@ -1,8 +1,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(unix)]
 
-//! Guard coverage for the MCP `switch` tool itself (the `ClauthServer::switch`
-//! seam, not the `switch_profile_noninteractive` action it wraps). An unknown or
+//! Guard coverage for the MCP `switch_profile` tool itself (the
+//! `ClauthServer::switch_profile` seam, not the `switch_profile_noninteractive`
+//! action it wraps). An unknown or
 //! wrong-case profile name must be rejected BEFORE any credential mutation:
 //! without the canonical-name guard the raw arg reaches `link_profile_credentials`,
 //! which removes the live `~/.claude/.credentials.json` symlink and creates no
@@ -32,7 +33,8 @@ fn seed_active_linked() {
         }),
     });
     save_profile(&p).expect("save profile");
-    force_link_profile_credentials("active").expect("link active");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("active"))
+        .expect("link active");
 
     let state = AppState {
         active_profile: Some("active".into()),
@@ -42,7 +44,7 @@ fn seed_active_linked() {
     save_app_state(&state).expect("save state");
 }
 
-/// Drive the async `switch` tool on a current-thread runtime.
+/// Drive the async `switch_profile` tool on a current-thread runtime.
 fn call_switch(name: &str) -> CallToolResult {
     let server = ClauthServer::new();
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -50,12 +52,12 @@ fn call_switch(name: &str) -> CallToolResult {
         .expect("runtime");
     rt.block_on(async {
         server
-            .switch(Parameters(SwitchArgs {
+            .switch_profile(Parameters(SwitchArgs {
                 name: name.to_string(),
             }))
             .await
     })
-    .expect("switch returns a tool result, never a transport error")
+    .expect("switch_profile returns a tool result, never a transport error")
 }
 
 #[test]
@@ -127,5 +129,20 @@ fn valid_switch_repoints_active_through_the_blocking_task() {
         live.refresh_token(),
         Some("target-r"),
         "the switch ends with the active link pointing at target's stored creds",
+    );
+
+    // The description promises "the reply says which case this session is in":
+    // the session-effect note rides the success arm through the same renderer
+    // the init block uses. Only the lead is pinned — which variant this
+    // process earns depends on the runner's own `CLAUDE_CONFIG_DIR`.
+    let text = result
+        .content
+        .first()
+        .and_then(|c| c.as_text())
+        .map(|t| t.text.clone())
+        .expect("switch reply text");
+    assert!(
+        text.contains("\n\nswitch_profile & this session: "),
+        "a successful switch names what it does to THIS session: {text}",
     );
 }

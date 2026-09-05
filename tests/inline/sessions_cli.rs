@@ -7,7 +7,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::*;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -25,7 +24,7 @@ fn user_line(sid: &str, cwd: &str, text: &str) -> String {
     json!({"sessionId": sid, "cwd": cwd, "message": {"role": "user", "content": text}}).to_string()
 }
 
-/// An assistant usage line — the token-bearing row `file_model_tokens` reads.
+/// An assistant usage line — the token-bearing row `file_hourly_model_tokens` reads.
 fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, output: u64) -> String {
     json!({
         "sessionId": sid, "cwd": cwd, "timestamp": "2026-06-11T10:30:00+00:00",
@@ -42,19 +41,27 @@ fn usage_line(sid: &str, cwd: &str, msg_id: &str, model: &str, input: u64, outpu
 
 /// A `PriceTable` from `(model_id, input_rate, output_rate)` rows; cache rates 0.
 fn price_table(rows: &[(&str, f64, f64)]) -> crate::pricing::PriceTable {
-    let mut rates = HashMap::new();
-    for &(id, input, output) in rows {
-        rates.insert(
-            id.to_owned(),
-            crate::pricing::ModelRate {
-                input,
-                output,
-                cache_read: 0.0,
-                cache_write: 0.0,
-            },
-        );
-    }
-    crate::pricing::PriceTable::from_rates(rates)
+    crate::pricing::PriceTable::capture(
+        rows.iter()
+            .map(|&(id, input, output)| crate::pricing::PricedModel {
+                id: id.to_owned(),
+                prices: vec![crate::pricing::PriceEntry {
+                    input,
+                    output,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                    constraint: None,
+                }],
+                effective_at: None,
+            })
+            .collect(),
+        Vec::new(),
+        Vec::new(),
+        crate::pricing::CanonicalMap::default(),
+        crate::tokens::today_date(),
+        0,
+        Vec::new(),
+    )
 }
 
 // ── clauth sessions --json ──
@@ -198,25 +205,170 @@ fn the_table_carries_the_token_columns_only_under_tokens() {
 
     // Annotated through the same call the flag makes, so the row has real
     // figures to print and a missing column is the flag's doing, not an empty
-    // fixture rendering blank either way.
+    // fixture rendering blank either way. The rates put the cost at $1.05 —
+    // above the row's two-decimal rounding floor, so the assertion pins the
+    // VALUE, not just a dollar-shaped cell (a zeroed cost also renders "$0.00").
     let mut groups = build_listing(false);
     crate::sessions::annotate_all(
         &mut groups,
-        Some(&price_table(&[("claude-sonnet-4", 0.000003, 0.000015)])),
+        Some(&price_table(&[("claude-sonnet-4", 0.003, 0.015)])),
     );
     let session = &groups[0].sessions[0];
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000 + 3_600);
 
-    let plain = session_row(session, false);
+    let plain = session_row(session, false, now);
     assert!(
         !plain.contains("150") && !plain.contains('$'),
         "the default row carries neither figure: {plain}"
     );
     assert!(plain.contains("hello"), "it still carries the preview");
 
-    let annotated = session_row(session, true);
+    let annotated = session_row(session, true, now);
     assert!(
-        annotated.contains("150") && annotated.contains("$0."),
+        annotated.contains("150") && annotated.contains("$1.05"),
         "--tokens adds both cells: {annotated}"
+    );
+}
+
+// ── the stamp cell: local wall clock + age ──
+
+/// The human row renders `updated` as LOCAL wall clock paired with its
+/// relative age (the 2026-08-22 ruling) — never the ISO machine stamp the
+/// JSON row keeps. The expected stamp derives through chrono's own `format`
+/// rather than the crate's formatter, so the pin is a second derivation of
+/// the same claim and holds in any zone; where the fixture instant's local
+/// spelling differs from its UTC one, the UTC digits must be ABSENT (when
+/// the two spellings coincide there is no second spelling to ban).
+#[test]
+fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    // 2026-06-21T00:00:00Z, with a `now` exactly 3h 12m later — the age cell
+    // is deterministic by construction.
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    let now = updated + Duration::from_secs(11_520);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+    let row = session_row(session, false, now);
+
+    let local = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert!(
+        row.contains(&format!("{local} · 3h 12m ago")),
+        "the row renders the local stamp paired with its age: {row}"
+    );
+    assert!(
+        !row.contains("+00:00"),
+        "no machine offset marker survives in the human row: {row}"
+    );
+    // Compared spelling-on-spelling, never via a run-instant offset read: a
+    // DST zone (Atlantic/Azores) reads +00 at the fixture instant, and the
+    // run instant reads -01 only inside the winter standard-time window
+    // (each year, roughly the last Sunday of October to the last Sunday of
+    // March); that read would fire the guard over two identical spellings.
+    let utc = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if local != utc {
+        assert!(
+            !row.contains(&utc),
+            "the stamp renders UTC digits, not local wall clock: {row}"
+        );
+    }
+}
+
+/// The age half of the pairing: a zero or negative age renders `· now`, never
+/// `now ago` — `humanize_duration` spells ≤0 `now`, so the generic ` ago`
+/// pairing would stutter over a sub-second-fresh file or a future mtime, both
+/// routine rows. A positive age keeps the full `· 3h 12m ago` pairing.
+#[test]
+fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+
+    // Zero age: `now` sits exactly on the mtime, the same whole-second a
+    // sub-second-fresh file truncates to.
+    let zero = session_row(session, false, updated);
+    assert!(zero.contains("· now"), "zero age renders `now`: {zero}");
+    assert!(!zero.contains("now ago"), "zero age never stutters: {zero}");
+
+    // Negative age: a future mtime (the clock behind the file) is the same
+    // ≤0 branch, not `now ago`.
+    let behind = updated - Duration::from_secs(60);
+    let future = session_row(session, false, behind);
+    assert!(
+        future.contains("· now"),
+        "a future mtime renders `now`: {future}"
+    );
+    assert!(
+        !future.contains("now ago"),
+        "a future mtime never stutters: {future}"
+    );
+
+    // Positive age: the full pairing survives the ≤0 branch.
+    let ahead = updated + Duration::from_secs(11_520);
+    let positive = session_row(session, false, ahead);
+    assert!(
+        positive.contains("· 3h 12m ago"),
+        "a positive age keeps the full pairing: {positive}"
+    );
+}
+
+/// The human row and the JSON `updated` field disagree on shape BY DESIGN
+/// (owner ruling 2026-08-22: `--json` keeps the documented ISO-8601 UTC).
+/// Pinned BOTH directions — the ISO spelling must not reach the human row,
+/// the local spelling must not reach the JSON field — so an edit that
+/// "aligns" either surface reds this test.
+#[test]
+fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
+    let sb = HomeSandbox::new();
+    let a = sb.home().join(".claude/projects/-w-a/aaaa-1111.jsonl");
+    write_jsonl(&a, &[user_line("aaaa-1111", "/ws/a", "hello")]);
+    let updated = SystemTime::UNIX_EPOCH + Duration::from_secs(1_782_000_000);
+    let now = updated + Duration::from_secs(11_520);
+    set_mtime(&a, updated);
+
+    let groups = build_listing(false);
+    let session = &groups[0].sessions[0];
+    let human = session_row(session, false, now);
+    let json_updated = session_json_row(session)["updated"]
+        .as_str()
+        .expect("updated is a string")
+        .to_string();
+
+    assert!(
+        json_updated.contains('T') && json_updated.ends_with("+00:00"),
+        "the json field keeps the documented ISO-8601 UTC shape: {json_updated}"
+    );
+    let local = chrono::DateTime::from_timestamp(1_782_000_000, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert!(
+        human.contains(&format!("{local} · 3h 12m ago")),
+        "the human row renders the local stamp and its age: {human}"
+    );
+    assert!(
+        !human.contains(&json_updated),
+        "the ISO spelling must not reach the human row: {human}"
+    );
+    assert!(
+        !json_updated.contains(&local),
+        "the local spelling must not reach the json field: {json_updated}"
     );
 }
 
@@ -380,8 +532,12 @@ fn resume_refuses_an_isolated_held_session_without_calling_it_missing() {
         "a listed session is not missing: {msg}"
     );
     assert!(
-        msg.contains("--rescue"),
-        "and must say what makes it reachable: {msg}"
+        msg.contains("it moves into the shared store when that run ends"),
+        "and must say what makes it reachable — waiting, with nothing to turn on: {msg}"
+    );
+    assert!(
+        !msg.contains("rescue") && !msg.contains("auto_rescue"),
+        "the rescue is unconditional, so the refusal names no switch: {msg}"
     );
     assert_eq!(crate::exit_code(Err(err)), 1);
 }
@@ -590,7 +746,8 @@ fn seed_profiles(enabled: &[&str], disabled: &[&str]) {
             .expect("create profile");
     }
     for name in disabled {
-        crate::actions::disable_profile(&mut config, name).expect("disable profile");
+        crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from(*name))
+            .expect("disable profile");
     }
 }
 

@@ -16,11 +16,12 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
-use super::format::{clock_label, relative_age, spinner_frame};
+use super::format::{NO_DATA, relative_age, spinner_frame};
 use super::panes::{draw_scrollbar, empty_state, key_cell, master_detail, section_box, wrap_words};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
-/// Detail-pane key column width (matches the usage tab's `KEY_W`).
+/// Detail-pane key column width (the house 11: chain/config's `KEY_W` and the
+/// usage tab's `TP_KEY_W`).
 const KEY_W: usize = 11;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
@@ -352,10 +353,9 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
         )));
     }
 
-    // started row (the one place the `utc` suffix appears).
     lines.push(Line::from(vec![
         key_span("started"),
-        Span::styled(clock_label(incident.started_ms, true), theme::body()),
+        Span::styled(stamp(incident.started_ms), theme::body()),
     ]));
 
     if !incident.components.is_empty() {
@@ -374,14 +374,9 @@ fn detail_lines(incident: &Incident, inner_w: usize) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::styled("TIMELINE", theme::dim())));
 
     // Per update (newest first). Columns: time | phase word | wrapped body.
-    let time_col = incident
-        .updates
-        .iter()
-        .map(|u| clock_label(u.at_ms, false).chars().count())
-        .max()
-        .unwrap_or(0)
-        .max("jun 6, 10:14".chars().count())
-        .min(18);
+    // Every stamp renders the fixed-width local shape (see `stamp`), so the
+    // column is that shape's own width rather than the widest rendered row.
+    let time_col = 19; // `YYYY-MM-DD HH:MM:SS`
     let phase_col = 13; // widest phase word ("investigating") + gap
     let indent = time_col + 1 + phase_col + 1;
     let body_w = inner_w.saturating_sub(indent).max(8);
@@ -402,7 +397,7 @@ fn update_lines(
     body_w: usize,
     indent: usize,
 ) -> Vec<Line<'static>> {
-    let time = pad_right(&clock_label(update.at_ms, false), time_col);
+    let time = pad_right(&stamp(update.at_ms), time_col);
     let phase = pad_right(&update.phase.word(), phase_col);
     let phase_color = phase_text_color(&update.phase);
 
@@ -609,7 +604,15 @@ fn key_span(key: &str) -> Span<'static> {
 
 // ── Small text helpers ──────────────────────────────────────────────────────
 
-use crate::format::truncate;
+use crate::format::{local_stamp, truncate};
+
+/// The incident stamps (`started` row + timeline rows): local wall clock in
+/// the 2026-08-22 ruling's `YYYY-MM-DD HH:MM:SS` shape, through the one
+/// prose-stamp formatter. A bare stamp reads as local, so the fallback for an
+/// instant chrono cannot represent is the no-data glyph, never a UTC reading.
+fn stamp(epoch_ms: u64) -> String {
+    local_stamp((epoch_ms / 1000) as i64).unwrap_or_else(|| NO_DATA.to_string())
+}
 
 /// Middle-ellipsis truncation (for URLs / IDs — both ends carry meaning).
 fn middle_truncate(s: &str, max: usize) -> String {

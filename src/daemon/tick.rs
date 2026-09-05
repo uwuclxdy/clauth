@@ -32,6 +32,13 @@ impl super::Daemon {
         self.drain_pending_switch();
         self.drain_pending_switch_off();
         self.write_status();
+        // Converge a broken plugin registration in the background. The gate is two
+        // registry reads inline and a needed heal runs detached (throttled inside
+        // `heal_detached`), so this never blocks the run loop.
+        crate::plugin_host::heal_detached();
+        // Same shape for the herdr plugin: update a stale install in the
+        // background, throttled inside its own `heal_detached`.
+        crate::herdr::heal_detached();
     }
 
     /// Rebuild the scheduler's token snapshots from the current config (after a
@@ -96,18 +103,18 @@ impl super::Daemon {
         let Some(target) = target else {
             return;
         };
+        let target = crate::profile::ProfileName::from(target);
         let now = now_ms();
 
         // A vanished target (deleted out-of-process after the enqueue — the
         // queue holds a raw name this process alone owns) is DROPPED, not
         // retried: no re-login can resurrect a profile that no longer exists,
         // and attempting it would run `switch_profile`'s side effects against
-        // a ghost. The logline keeps the drop observable.
-        let target_exists = self
-            .config
-            .lock()
-            .map(|c| c.find(&target).is_some())
-            .unwrap_or(false);
+        // a ghost. Read off DISK, not the in-memory config: the reload that
+        // would have seen the delete runs only at the top of this tick, so a
+        // delete landing after it leaves the in-memory list stale here. The
+        // logline keeps the drop observable.
+        let target_exists = crate::profile::is_configured(&target).unwrap_or(false);
         if !target_exists {
             logline!(
                 "clauth daemon: dropping queued switch to '{target}': profile no longer exists (deleted?)"
@@ -115,7 +122,7 @@ impl super::Daemon {
             if self
                 .switch_backoff
                 .as_ref()
-                .is_some_and(|b| b.target == target)
+                .is_some_and(|b| b.target == target.as_str())
             {
                 self.switch_backoff = None;
             }
@@ -129,7 +136,7 @@ impl super::Daemon {
         // step can reach past it, and gating on `not_before` alone would keep
         // requeueing a target whose window has already closed.
         if let Some(b) = &self.switch_backoff
-            && b.target == target
+            && b.target == target.as_str()
         {
             if now >= b.retry_until {
                 logline!(
@@ -140,7 +147,7 @@ impl super::Daemon {
                 return;
             }
             if now < b.not_before {
-                self.requeue_quiet(target);
+                self.requeue_quiet(&target);
                 return;
             }
         }
@@ -148,7 +155,7 @@ impl super::Daemon {
         // Still mid-fetch/rotation — switching now would race the worker on the
         // single-use token/TokenList. Defer, keep retrying.
         if !is_idle(&self.activity, &target) {
-            self.fail_switch(target, now, "target is mid-fetch");
+            self.fail_switch(&target, now, "target is mid-fetch");
             return;
         }
 
@@ -158,13 +165,13 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.as_deref().map(str::to_string));
-        if let Some(active) = &outgoing
-            && active != &target
-            && active_diverged_unsaved(active)
+            .and_then(|c| c.state.active_profile.as_ref().cloned());
+        if let Some(active) = outgoing
+            && active != target
+            && active_diverged_unsaved(&active)
         {
             self.fail_switch(
-                target,
+                &target,
                 now,
                 &format!(
                     "active '{active}' has unsaved credentials; {}",
@@ -197,7 +204,7 @@ impl super::Daemon {
                 // The daemon log is an operator surface with no companion log of
                 // its own, so it names the status like CLI stderr does.
                 self.fail_switch(
-                    target,
+                    &target,
                     now,
                     &format!("refresh failed transiently ({})", e.text_with_status()),
                 );
@@ -222,7 +229,10 @@ impl super::Daemon {
             // log names the two apart without threading the cause through the
             // switch action.
             let returning = cfg.find(&target).is_some_and(|p| p.preferred);
-            crate::lock::with_state_lock(|| {
+            // A delete landing between the early drop above and this hold is
+            // caught by `switch_profile`'s own fresh membership gate
+            // (`ensure_switch_target_ok`), which runs inside this same flock.
+            crate::lock::with_state_lock(|_held| {
                 switch_profile(&mut cfg, &target)?;
                 Ok((reload_fingerprint(), returning))
             })
@@ -239,7 +249,7 @@ impl super::Daemon {
                 }
             }
             Err(e) => {
-                self.fail_switch(target, now, &format!("switch failed: {e}"));
+                self.fail_switch(&target, now, &format!("switch failed: {e}"));
             }
         }
     }
@@ -249,23 +259,23 @@ impl super::Daemon {
     /// log (emits only when the target or reason changes — a stuck switch never
     /// logs 1/tick), and re-queues the target until its retry window closes.
     /// A change of target resets the backoff.
-    fn fail_switch(&mut self, target: String, now: u64, reason: &str) {
+    fn fail_switch(&mut self, target: &crate::profile::ProfileName, now: u64, reason: &str) {
         let (attempts, retry_until) = match &self.switch_backoff {
-            Some(b) if b.target == target => (b.attempts + 1, b.retry_until),
+            Some(b) if b.target == target.as_str() => (b.attempts + 1, b.retry_until),
             _ => (1, now.saturating_add(SWITCH_RETRY_TTL_MS)),
         };
         // Dedup: only log when the (target, reason) pair changed since last time.
         let changed = self
             .switch_backoff
             .as_ref()
-            .is_none_or(|b| b.target != target || b.reason != reason);
+            .is_none_or(|b| b.target != target.as_str() || b.reason != reason);
         if changed {
             logline!("clauth daemon: deferring switch to '{target}': {reason}");
             self.switch_failure_logs += 1;
         }
         if now < retry_until {
             self.switch_backoff = Some(SwitchBackoff {
-                target: target.clone(),
+                target: target.to_string(),
                 attempts,
                 not_before: now.saturating_add(switch_backoff_ms(attempts)),
                 reason: reason.to_string(),
@@ -282,11 +292,11 @@ impl super::Daemon {
     /// Re-queue a retry target. A NEWER target that arrived since the drain
     /// supersedes it — the scheduler's later decision wins. No logging — the
     /// backoff/dedup path owns the observability.
-    fn requeue_quiet(&mut self, target: String) {
+    fn requeue_quiet(&mut self, target: &crate::profile::ProfileName) {
         if let Ok(mut q) = self.pending_switch.lock()
             && q.is_empty()
         {
-            q.insert(target);
+            q.insert(target.to_string());
         }
     }
 
@@ -304,7 +314,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.as_deref().map(str::to_string));
+            .and_then(|c| c.state.active_profile.as_ref().cloned());
         let Some(active) = active else {
             return; // already off
         };
@@ -321,7 +331,7 @@ impl super::Daemon {
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|| {
+            crate::lock::with_state_lock(|_held| {
                 switch_off(&mut cfg)?;
                 Ok(reload_fingerprint())
             })

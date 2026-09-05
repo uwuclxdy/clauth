@@ -201,7 +201,7 @@ fn tp_bar(
 
 #[test]
 fn empty_msg_credless_profile_is_terminal() {
-    let profile = crate::testutil::blank_profile("a");
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     assert_eq!(
         oauth_empty_msg(&profile),
         "not logged in, use + login on the setup tab"
@@ -210,7 +210,7 @@ fn empty_msg_credless_profile_is_terminal() {
 
 #[test]
 fn empty_msg_failed_fetch_is_terminal() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -226,7 +226,7 @@ fn empty_msg_failed_fetch_is_terminal() {
 
 #[test]
 fn empty_msg_pending_fetch_loads() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -245,7 +245,7 @@ fn empty_msg_pending_fetch_loads() {
 /// enabled → "loading") proves it's the `disabled` flag that flips the outcome.
 #[test]
 fn empty_msg_disabled_profile_is_terminal() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -264,7 +264,7 @@ fn empty_msg_disabled_profile_is_terminal() {
 /// must read "no usage available" instead of spinning "loading" forever.
 #[test]
 fn tp_rows_disabled_profile_is_terminal() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.disabled = true;
     // No `third_party_usage`, no fetch_status → the un-fixed path returns "loading".
     let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
@@ -281,12 +281,212 @@ fn tp_rows_disabled_profile_is_terminal() {
     );
 }
 
+/// The Usage tab is where an operator decides whether an account can still
+/// serve, so a provider's refusal renders BESIDE the figures it qualifies
+/// rather than in place of them. Discarding the wallets left the tab saying
+/// only that something was wrong, with no way to see how short the account was.
+#[test]
+fn tp_rows_render_a_refusal_under_the_figures_it_qualifies() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    profile.third_party_usage = Some(
+        serde_json::from_str(crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES)
+            .expect("the unfunded balance cache parses"),
+    );
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        rendered.iter().any(|l| l.contains("0.00 CNY")),
+        "the wallet figure must survive the refusal, got {rendered:?}"
+    );
+    assert!(
+        rendered
+            .iter()
+            .any(|l| l.contains(crate::providers::LOW_BALANCE)),
+        "the refusal must render, got {rendered:?}"
+    );
+}
+
+/// A recognised-provider profile with NO credential its provider can use is
+/// never scheduled either, so it has the same hole. Reachable from the shipped
+/// TUI: a blank Setup key field stores `None`.
+#[test]
+fn tp_rows_uncredentialed_profile_is_terminal() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    profile.api_key = None;
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        !rendered.iter().any(|l| l.contains("loading")),
+        "a profile no leg will fetch must not spin loading, got {rendered:?}"
+    );
+    assert!(
+        rendered.iter().any(|l| l.contains("no api key")),
+        "and it must name the fix, got {rendered:?}"
+    );
+}
+
+/// An EMPTY or whitespace-only api key is the same never-scheduled state: the
+/// render layer must read it through the shared credential test and say so
+/// instead of spinning "loading" for a fetch no leg will run.
+#[test]
+fn tp_rows_empty_key_profile_is_terminal() {
+    for key in [String::new(), "  \t ".to_string()] {
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+        profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+        profile.provider =
+            crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+        profile.api_key = Some(key);
+        let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+            .collect();
+        assert!(
+            !rendered.iter().any(|l| l.contains("loading")),
+            "a profile no leg will fetch must not spin loading, got {rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("no api key")),
+            "and it must name the fix, got {rendered:?}"
+        );
+    }
+}
+
+/// The three dead-credential causes read as three messages: a lapsed Alibaba
+/// session, a never-captured one, and a rejected api key. A non-Alibaba
+/// profile has no session, so its verdict can only ever mean the third.
+#[test]
+fn tp_rows_auth_expired_copy_splits_by_credential() {
+    let body = |profile: &super::Profile| -> String {
+        build_tp_rows(profile, 52, false, false, ResetFmt::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    // A dead key on a typed api-key provider.
+    let mut ds = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    ds.api_key = Some("sk-dead".to_string());
+    ds.fetch_status = Some(FetchStatus::AuthExpired);
+    let msg = body(&ds);
+    assert!(msg.contains("api key rejected"), "got {msg}");
+
+    // A dead key on an unrecognised endpoint reaches the same verdict.
+    let mut generic = crate::testutil::blank_profile(&crate::profile::ProfileName::from("generic"));
+    generic.base_url = Some("https://proxy.example/v1".to_string());
+    generic.api_key = Some("sk-dead".to_string());
+    generic.fetch_status = Some(FetchStatus::AuthExpired);
+    let msg = body(&generic);
+    assert!(msg.contains("api key rejected"), "got {msg}");
+    assert!(
+        !msg.contains("console"),
+        "no session exists to name, got {msg}"
+    );
+
+    // An Alibaba profile with a stored session: the session lapsed.
+    let mut qwen = crate::testutil::blank_profile(&crate::profile::ProfileName::from("qwen"));
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = crate::providers::Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    qwen.fetch_status = Some(FetchStatus::AuthExpired);
+    let msg = body(&qwen);
+    assert!(msg.contains("console login expired"), "got {msg}");
+
+    // The same account before any session was captured: it needs one.
+    qwen.console = None;
+    let msg = body(&qwen);
+    assert!(msg.contains("console login needed"), "got {msg}");
+    assert!(!msg.contains("expired"), "nothing lapsed, got {msg}");
+}
+
+/// `TP_KEY_W` exists so every value in a stat block starts at one column.
+/// `key_cell` widens rather than truncates, so a label longer than the constant
+/// does not clip — it pushes that one row's value right of all its siblings, and
+/// the misalignment reads as a render bug rather than as a too-narrow constant.
+/// The block that catches it is the one with the longest label, DeepSeek's.
+#[test]
+fn tp_body_rows_share_one_value_column() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("ds"));
+    profile.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    profile.provider =
+        crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    profile.third_party_usage = Some(
+        serde_json::from_str(crate::testutil::DEEPSEEK_CACHE_BYTES)
+            .expect("the captured balance cache parses"),
+    );
+
+    // A body row is `["  " + key_cell, value]`, so the value's start column is
+    // the width of everything before it.
+    let starts: Vec<(String, usize)> =
+        build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+            .iter()
+            .filter(|l| l.spans.len() == 2)
+            .map(|l| {
+                (
+                    l.spans[0].content.trim().to_string(),
+                    l.spans[0].content.chars().count(),
+                )
+            })
+            .collect();
+
+    assert!(starts.len() >= 3, "the balance block renders: {starts:?}");
+    let first = starts[0].1;
+    assert!(
+        starts.iter().all(|(_, w)| *w == first),
+        "every value starts at the same column: {starts:?}",
+    );
+}
+
+/// An Alibaba profile with a console session but NO api key is the inverse: it
+/// IS scheduled (its quota runs on the console session), so it must keep
+/// loading rather than claim a missing key.
+#[test]
+fn tp_rows_console_only_alibaba_still_loads() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("qwen"));
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    profile.base_url = Some(base.to_string());
+    profile.provider = crate::providers::Provider::from_base_url(base);
+    profile.api_key = None;
+    profile.console = Some(crate::profile::ConsoleCredential {
+        token: "t".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    let rendered: Vec<String> = build_tp_rows(&profile, 52, false, false, ResetFmt::default())
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .collect();
+    assert!(
+        rendered.iter().any(|l| l.contains("loading")),
+        "a scheduled profile is still loading, got {rendered:?}"
+    );
+}
+
 /// With no fetched plan, the Usage `plan` row must match the Overview's tier
 /// label (`account_tier`) instead of a bare "oauth"/"api", so the two surfaces
 /// never disagree. A `subscription_type` claim renders as its tier.
 #[test]
 fn header_lines_plan_falls_back_to_account_tier() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -303,6 +503,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let plan_row: String = header_lines(&profile, &header, 52)
@@ -326,8 +527,8 @@ fn header_lines_plan_falls_back_to_account_tier() {
 /// A HYBRID profile — an OAuth pair AND a custom `base_url`, no api key, no
 /// recognised provider — renders its FETCHED tier, not the bare "api" literal.
 /// `is_oauth()` keys on `base_url`, so a hybrid reads false there while the body
-/// this header heads still draws its live OAuth window bars (the `api_key ||
-/// is_third_party` fork this file uses for the body). Reading `api` directly
+/// this header heads still draws its live OAuth window bars (the shared
+/// cache-selector fork this file uses for the body). Reading `api` directly
 /// above Anthropic 5h/7d bars sourced from the very `UsageInfo` whose tier was
 /// discarded is the disagreement; the header and the body must share one fork.
 ///
@@ -338,7 +539,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
 /// because `collect_tokens` keys on `claude_ai_oauth.is_some()`, not `is_oauth()`.
 #[test]
 fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
-    let mut profile = crate::testutil::blank_profile("hybrid");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("hybrid"));
     profile.base_url = Some("https://proxy.example/anthropic".to_string());
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
@@ -366,6 +567,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let plan_row: String = header_lines(&profile, &header, 52)
@@ -390,7 +592,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     // Credentialed, so the row is a live OAuth account rather than an empty
     // shell — but the token claims nothing clauth can classify.
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -406,6 +608,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let lines = header_lines(&profile, &header, 52);
@@ -421,6 +624,227 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
     assert!(
         !plan_row.contains("Claude"),
         "an unfetched plan must not name a tier, got {plan_row:?}"
+    );
+}
+
+/// The `usage auto-start in …` countdown on the `plan` row, flush right: gray,
+/// shown for ANY account with `auto_start` on, queue toggle on or off (owner
+/// 2026-09-01 — the text moved off the Fallback card, then right onto the plan
+/// row). The value is THIS account's next kick: with a queue slot, the LATER of
+/// the queue's next-opening estimate and the account's own 5h window reset —
+/// the kick fires once the queue gate has cleared AND this window has lapsed,
+/// so either can delay it. Without a slot (toggle off, or the profile is
+/// excluded from the queue) it is the account's own reset alone. A kick due on
+/// both clocks reads `usage auto-start due now`.
+#[test]
+fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
+    let lines_of = |auto_start: bool, reset_in: Option<i64>, slot: Option<QueueSlot>| {
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+        profile.auto_start = auto_start;
+        profile.usage = reset_in.map(|secs| crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(crate::usage::epoch_secs_to_iso(
+                    crate::usage::now_epoch_secs() + secs,
+                )),
+            }),
+            ..Default::default()
+        });
+        let header = HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: slot,
+            diag: DiagFlags::default(),
+        };
+        header_lines(&profile, &header, 52)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.clone())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+    };
+    let slot = |next_in: Option<i64>| {
+        Some(QueueSlot {
+            position: 1,
+            total: 2,
+            next_in,
+        })
+    };
+    // `plan` + no-data dash measure 11 cells; a 52-cell row pads the kick text
+    // flush right with the house 3-cell minimum gap.
+    let row = |kick: &str| {
+        format!(
+            "plan      —{}{}",
+            " ".repeat(52 - 11 - kick.chars().count()),
+            kick
+        )
+    };
+
+    // Gate and own reset tie: either estimate reads the same value.
+    assert_eq!(
+        lines_of(true, Some(8880), slot(Some(8880)))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Own reset LATER than the gate: the window is live past the gate, so the
+    // kick waits for the reset — the gate value alone would name an instant no
+    // kick fires at.
+    assert_eq!(
+        lines_of(true, Some(8880), slot(Some(3600)))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Gate LATER than the own reset: the window lapsed (or lapses) inside the
+    // gap, so the queue gate holds the kick.
+    assert_eq!(
+        lines_of(true, Some(3600), slot(Some(8880)))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Own window already lapsed with the gate still closed: the gate is the
+    // estimate.
+    assert_eq!(
+        lines_of(true, Some(-60), slot(Some(8880)))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Gate cleared, window still live: the reset is the estimate.
+    assert_eq!(
+        lines_of(true, Some(8880), slot(None))[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Both clocks due: due now.
+    assert_eq!(
+        lines_of(true, None, slot(None))[0],
+        row("usage auto-start due now")
+    );
+
+    // No slot — toggle off, or the account is excluded from the queue: the
+    // account's own reset is the moment its lapsed-leg kick fires.
+    assert_eq!(
+        lines_of(true, Some(8880), None)[0],
+        row("usage auto-start in 2h 28m")
+    );
+
+    // Own window already lapsed: due now.
+    assert_eq!(
+        lines_of(true, Some(-60), None)[0],
+        row("usage auto-start due now")
+    );
+
+    // Not opted in: no kick text at all.
+    let lines = lines_of(false, Some(8880), None);
+    assert!(
+        !lines.iter().any(|l| l.contains("kick")),
+        "an account without auto_start gets no kick text, got {lines:?}"
+    );
+}
+
+/// Tight rows: the kick text truncates with a trailing ellipsis, keeping the
+/// 3-cell gap, and drops whole when not even a hint fits.
+#[test]
+fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.auto_start = true;
+    profile.usage = Some(crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 0.0,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 8880,
+            )),
+        }),
+        ..Default::default()
+    });
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: Some(QueueSlot {
+            position: 1,
+            total: 2,
+            next_in: Some(8880),
+        }),
+        diag: DiagFlags::default(),
+    };
+    let row = |w: u16| {
+        header_lines(&profile, &header, w)[0]
+            .spans
+            .iter()
+            .map(|s| s.content.clone())
+            .collect::<String>()
+    };
+
+    // 26 cells: 11 left + 3 gap leaves 12, so "usage auto-start in 2h 28m"
+    // becomes "usage auto-…" and the 3-cell gap holds.
+    assert_eq!(row(26), "plan      —   usage auto-…");
+
+    // 15 cells: the gap alone eats what remains, so the kick text drops whole.
+    assert_eq!(row(15), "plan      —");
+}
+
+/// A stored key with NO base_url — reachable from a captured `~/.claude`
+/// settings.json that carried a key but no endpoint (the pre-helper env
+/// residual `read_claude_endpoint_config` still reads), or from a hand-edited
+/// config.toml — renders through the OAUTH arm: its figures would live in the
+/// OAuth cache, the same answer the shared cache selector gives and the one
+/// the profile load seeds `third_party_usage` with. The old site-local
+/// spelling (`api_key.is_some() || is_third_party`) rendered the third-party
+/// arm over a `third_party_usage` load had seeded `None`, the disagreement
+/// this fork keys out.
+#[test]
+fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
+    use crate::profile::{AppConfig, AppState};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyonly"));
+    profile.api_key = Some("sk-orphan".to_string());
+    assert!(
+        profile.api_key.is_some() && !profile.usage_cache_is_third_party(),
+        "fixture must be the state the two spellings disagree on",
+    );
+
+    let header = HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+    };
+    let plan_row: String = header_lines(&profile, &header, 52)
+        .first()
+        .map(|l| l.spans.iter().map(|s| s.content.clone()).collect())
+        .unwrap_or_default();
+    assert!(
+        !plan_row.contains("api"),
+        "a key with no endpoint has no third-party arm to head: {plan_row:?}"
+    );
+
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![profile.name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile.clone()],
+    });
+    let body: String =
+        build_usage_lines(&profile, 52, &header, &app, true, true, ResetFmt::default())
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect();
+    assert!(
+        body.contains("not logged in"),
+        "the body takes the OAuth arm's empty message, got {body:?}"
     );
 }
 
@@ -441,6 +865,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let plan_row: String = header_lines(&profile, &header, 52)
@@ -466,7 +891,7 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
 fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
     use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.usage = Some(UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -480,6 +905,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -519,7 +945,7 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
 fn status_lines_no_canceled_pill_when_subscription_is_active() {
     use crate::usage::{PlanInfo, PlanTier, UsageInfo};
 
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.usage = Some(UsageInfo {
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
@@ -533,6 +959,7 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -567,6 +994,7 @@ fn disabled_rung_header(kick: bool) -> HeaderState {
             until: Some(now_epoch_secs() + 3600),
             next_retry: now_epoch_secs() + 30,
         }),
+        queue_slot: None,
         diag: DiagFlags::default(),
     }
 }
@@ -589,8 +1017,9 @@ fn status_text(ls: &[Line<'_>]) -> String {
 #[test]
 fn status_lines_stacks_the_health_rungs_under_disabled() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
-    let mut profile = crate::testutil::blank_profile("gamma");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("gamma"));
     let header = HeaderState {
+        queue_slot: None,
         diag: DiagFlags {
             auth_broken: true,
             ..DiagFlags::default()
@@ -638,7 +1067,7 @@ fn status_lines_stacks_the_health_rungs_under_disabled() {
 /// A kick block in the same frame still renders — that one stays true.
 #[test]
 fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Cached);
     let header = disabled_rung_header(true);
 
@@ -671,7 +1100,7 @@ fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
     // Disabled with nothing else wrong is a single row and a lone `└`.
     let clean = crate::profile::Profile {
         disabled: true,
-        ..crate::testutil::blank_profile("a")
+        ..crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"))
     };
     assert_eq!(
         status_text(&status_lines(&clean, &disabled_rung_header(false), 120)),
@@ -688,7 +1117,7 @@ fn status_lines_suppresses_only_the_fetch_and_refresh_rungs_when_disabled() {
 fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     use crate::usage::KickBlock;
 
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
         activity: ProfileActivity::Idle,
@@ -696,6 +1125,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -764,7 +1194,7 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
 fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     use crate::usage::KickBlock;
 
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let now = now_epoch_secs();
     // 52 inner cells is the narrowest pane the layout builds (an 80-col terminal
@@ -786,6 +1216,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
                 until: Some(now + 4 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags::default(),
         },
         52,
@@ -846,7 +1277,7 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
 fn status_lines_connects_two_plus_hints_into_one_rail() {
     use crate::usage::KickBlock;
 
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Cached);
     let now = now_epoch_secs();
     let lines: Vec<String> = status_lines(
@@ -865,6 +1296,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
                 until: Some(now + 3 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 auto_start: false,
                 budget_spent: true,
@@ -916,7 +1348,7 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
 /// for panes whose row opens past col 0.
 #[test]
 fn status_lines_single_hint_has_no_rail() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Failed);
     let header = HeaderState {
         activity: ProfileActivity::Idle,
@@ -924,6 +1356,7 @@ fn status_lines_single_hint_has_no_rail() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags {
             auth_broken: true,
             ..DiagFlags::default()
@@ -954,7 +1387,7 @@ fn status_lines_single_hint_has_no_rail() {
 fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
     use crate::usage::KickBlock;
     let now = now_epoch_secs();
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     // Kick (a long hint) + a cached fetch: two hints, so the kick hint is
     // non-last. At 30 cells the kick hint wraps; the fetch's shorter hint does not.
     profile.fetch_status = Some(FetchStatus::Cached);
@@ -971,6 +1404,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
                 until: Some(now + 3 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 auto_start: true,
                 ..DiagFlags::default()
@@ -1003,7 +1437,7 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
 fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
     use crate::usage::KickBlock;
     let now = now_epoch_secs();
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     // Fetch FAILED carries no fix hint and renders last, so with kick +
     // budget-spent hints above it the rail closes on the spend `└` and the
     // failed row sits below the closed rail.
@@ -1021,6 +1455,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
                 until: Some(now + 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 budget_spent: true,
                 ..DiagFlags::default()
@@ -1047,7 +1482,7 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
 /// a zero streak keeps the bare `retry in` suffix.
 #[test]
 fn rate_limited_suffix_counts_the_retry() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
         activity: ProfileActivity::Idle,
@@ -1058,6 +1493,7 @@ fn rate_limited_suffix_counts_the_retry() {
             refresh_fail: 0,
         },
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -1088,7 +1524,7 @@ fn rate_limited_suffix_counts_the_retry() {
 /// pill must never appear for one.
 #[test]
 fn a_failing_refresh_names_itself_on_the_cached_row() {
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
         activity: ProfileActivity::Idle,
@@ -1099,6 +1535,7 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
             refresh_fail,
         },
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let text = |ls: Vec<Line<'_>>| -> String {
@@ -1155,6 +1592,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
         tick: 0,
         streaks,
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
 
@@ -1171,7 +1609,7 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             refresh_fail: n,
         }),
     ] {
-        let mut profile = crate::testutil::blank_profile("a");
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.fetch_status = Some(status);
 
         // At the cap the reading is still trusted — amber, same as `cached`.
@@ -1217,10 +1655,11 @@ fn spent_skipped_account_pill_is_bare() {
         tick: 0,
         streaks: StreakCounts::default(),
         kick_block: None,
+        queue_slot: None,
         diag: DiagFlags::default(),
     };
     let with_window = |util: f64| {
-        let mut p = crate::testutil::blank_profile("a");
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         p.fetch_status = None;
         p.usage = Some(crate::usage::UsageInfo {
             five_hour: Some(crate::usage::UsageWindow {
@@ -1284,7 +1723,7 @@ fn ordinal_covers_teens_and_edge_digits() {
 #[test]
 fn extra_bar_dedups_against_spend_and_scales_cents() {
     let with = |extra: Option<crate::usage::ExtraUsage>, spend: Option<crate::usage::SpendInfo>| {
-        let mut profile = crate::testutil::blank_profile("a");
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.usage = Some(crate::usage::UsageInfo {
             plan: None,
             five_hour: None,
@@ -1293,6 +1732,7 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
+            open_at: None,
         });
         collect_stats(&profile, ResetFmt::default())
     };
@@ -1376,7 +1816,7 @@ fn status_lines_renders_the_auto_start_divergence() {
             .join("")
     };
     let render = |auto_start: bool| {
-        let mut profile = crate::testutil::blank_profile("a");
+        let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.fetch_status = Some(FetchStatus::Fresh);
         joined(status_lines(
             &profile,
@@ -1391,6 +1831,7 @@ fn status_lines_renders_the_auto_start_divergence() {
                     until: Some(now + 4 * 60 * 60),
                     next_retry: now + 30,
                 }),
+                queue_slot: None,
                 diag: DiagFlags {
                     auto_start,
                     ..DiagFlags::default()
@@ -1414,7 +1855,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
             .collect::<Vec<_>>()
             .join("")
     };
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Fresh);
     let out = joined(status_lines(
         &profile,
@@ -1424,6 +1865,7 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
             tick: 0,
             streaks: StreakCounts::default(),
             kick_block: None,
+            queue_slot: None,
             diag: DiagFlags {
                 spend_uncapped: true,
                 budget_spent: true,
@@ -1452,7 +1894,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
             .collect::<Vec<_>>()
             .join("")
     };
-    let mut profile = crate::testutil::blank_profile("a");
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Cached);
     let out = joined(status_lines(
         &profile,
@@ -1470,6 +1912,7 @@ fn auth_broken_suppresses_the_lesser_pills() {
                 until: Some(now + 4 * 60 * 60),
                 next_retry: now + 30,
             }),
+            queue_slot: None,
             diag: DiagFlags {
                 auth_broken: true,
                 spend_uncapped: true,
@@ -1508,7 +1951,8 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
             .collect::<Vec<_>>()
             .join("")
     };
-    let mut profile = crate::testutil::blank_profile("OmniRoute");
+    let mut profile =
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("OmniRoute"));
     profile.fetch_status = None;
     let out = joined(status_lines(
         &profile,
@@ -1518,6 +1962,7 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
             tick: 0,
             streaks: StreakCounts::default(),
             kick_block: None,
+            queue_slot: None,
             diag: DiagFlags {
                 auth_broken: true,
                 ..DiagFlags::default()

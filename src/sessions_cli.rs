@@ -129,17 +129,15 @@ pub(crate) fn run_resume(target: &str, profile_flag: Option<&str>) -> Result<()>
 
     let resume_args = vec!["--resume".to_string(), session.id];
     // Shared isolation: a resume adopts the chosen account against the shared
-    // store, the same lifecycle a bare `clauth start <name>` uses. Rescue is
-    // isolated-only, so `None` (no per-run override) never rescues here, and a
-    // resume never opts into the fallback chain — there is no `--with-fallback`
-    // on this surface to ask for it.
+    // store, the same lifecycle a bare `clauth start <name>` uses. A resume never
+    // opts into the fallback chain — there is no `--with-fallback` on this
+    // surface to ask for it.
     crate::start::run(
         &config,
         &canonical,
         &resume_args,
         Isolation::Shared,
         Some(&workspace),
-        None,
         false,
     )
 }
@@ -206,11 +204,14 @@ fn resume_profile_choice(
 
 /// Resolve a chosen profile name to its canonical spelling, or an error listing
 /// the available names — mirrors `main::resolve_or_bail`.
-fn resolve_profile_name(config: &AppConfig, chosen: &str) -> Result<String> {
-    config.canonical_name(chosen).ok_or_else(|| {
-        let available = config.names().join(", ");
-        anyhow::anyhow!("profile '{chosen}' not found\navailable: {available}")
-    })
+fn resolve_profile_name(config: &AppConfig, chosen: &str) -> Result<crate::profile::ProfileName> {
+    config
+        .canonical_name(chosen)
+        .map(crate::profile::ProfileName::from)
+        .ok_or_else(|| {
+            let available = config.names().join(", ");
+            anyhow::anyhow!("profile '{chosen}' not found\navailable: {available}")
+        })
 }
 
 /// The candidate list [`prompt_profile`] offers, plus the resolved default:
@@ -335,7 +336,7 @@ fn shadowing_hold(target: &str, found: Option<&SessionRef>) -> Option<IsolatedHo
 
 /// The refusal for a target a live isolated run holds. Names the run's profile
 /// and how the session becomes reachable, since "wait for it" is only actionable
-/// if the operator knows the rescue is what moves it.
+/// if the operator knows the run ending is what moves it.
 fn held_refusal(target: &str, hold: &IsolatedHold) -> anyhow::Error {
     let what = if target == "latest" {
         format!("the newest session ('{}')", hold.session.id)
@@ -345,9 +346,7 @@ fn held_refusal(target: &str, hold: &IsolatedHold) -> anyhow::Error {
     anyhow::anyhow!(
         "can't resume '{target}': {what} belongs to a live isolated run under profile '{}', \
          whose store a resume can't read\n\
-         it moves into the shared store when that run ends with rescue on \
-         (`clauth start {} --isolated --rescue`, or the auto_rescue setting)",
-        hold.profile,
+         it moves into the shared store when that run ends",
         hold.profile,
     )
 }
@@ -357,7 +356,10 @@ fn held_refusal(target: &str, hold: &IsolatedHold) -> anyhow::Error {
 /// `last_message`, `tokens`, `cost`. Absent `tokens`/`cost` serialize to JSON
 /// `null` (never `0`) — and without `--tokens` nothing asked for them, so every
 /// row's pair is `null`. `updated` is ISO-8601 UTC
-/// (`YYYY-MM-DDTHH:MM:SS+00:00`), matching the rest of clauth's timestamps.
+/// (`YYYY-MM-DDTHH:MM:SS+00:00`), matching the rest of clauth's timestamps —
+/// and deliberately NOT the human table's shape, which renders the same
+/// instant in local wall clock with a relative age (the 2026-08-22
+/// prose-stamp ruling).
 fn sessions_json(sessions: &[&SessionInfo]) -> serde_json::Value {
     serde_json::Value::Array(sessions.iter().map(|s| session_json_row(s)).collect())
 }
@@ -380,6 +382,10 @@ fn session_json_row(s: &SessionInfo) -> serde_json::Value {
 /// cost columns appear only under `--tokens`; two permanently blank columns
 /// would otherwise eat the width the previews want.
 fn emit_sessions_table(groups: &[WorkspaceGroup], tokens: bool) {
+    // One clock read for the whole table: every row's age is relative to the
+    // same instant, and `session_row` stays pure (its `now` is a parameter,
+    // never a read hidden inside).
+    let now = SystemTime::now();
     for group in groups {
         let ws = if group.workspace.is_empty() {
             "(unknown workspace)"
@@ -388,16 +394,21 @@ fn emit_sessions_table(groups: &[WorkspaceGroup], tokens: bool) {
         };
         outln!("{ws}");
         for s in &group.sessions {
-            outln!("{}", session_row(s, tokens));
+            outln!("{}", session_row(s, tokens, now));
         }
     }
 }
 
 /// One session's table row. Pure, so which columns a flag puts in it is
-/// assertable without capturing stdout. The token total and its cost are blank
-/// when the annotation found none — never `0`, which would read as a real
-/// figure — and absent entirely when `tokens` never asked for them.
-fn session_row(s: &SessionInfo, tokens: bool) -> String {
+/// assertable without capturing stdout: `now` arrives from the caller, never
+/// a clock read hidden inside. The `updated` cell is the 2026-08-22
+/// prose-stamp ruling's shape — LOCAL wall clock (`YYYY-MM-DD HH:MM:SS`)
+/// paired with its relative age, `2026-08-28 14:03:11 · 3h 12m ago`; the
+/// machine ISO shape lives on in the `--json` row only. The token total and
+/// its cost are blank when the annotation found none — never `0`, which
+/// would read as a real figure — and absent entirely when `tokens` never
+/// asked for them.
+fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime) -> String {
     let usage = if tokens {
         format!(
             "  {tokens:>10}  {cost:>8}",
@@ -407,11 +418,31 @@ fn session_row(s: &SessionInfo, tokens: bool) -> String {
     } else {
         String::new()
     };
+    let secs = s
+        .updated
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // The None arm is unreachable for a filesystem mtime (chrono's range
+    // dwarfs any OS's); the dash is the table's no-data glyph, never a UTC
+    // fallback — a bare stamp reads as local.
+    let updated = crate::format::local_stamp(secs).unwrap_or_else(|| "-".to_string());
+    let age_secs = now
+        .duration_since(s.updated)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // `humanize_duration` spells ≤0 `now`, so the ` ago` pairing must skip
+    // the non-positive ages: a sub-second-fresh file or a future mtime would
+    // render `now ago`.
+    let age = if age_secs <= 0 {
+        "now".to_string()
+    } else {
+        format!("{} ago", crate::usage::humanize_duration(age_secs))
+    };
     format!(
-        "  {id:<8}  {profile:<12}  {updated}{usage}  {preview}",
+        "  {id:<8}  {profile:<12}  {updated} · {age}{usage}  {preview}",
         id = short_id(&s.id),
         profile = s.last_ran_profile.as_deref().unwrap_or("-"),
-        updated = updated_iso(s.updated),
         preview = preview_pair(s),
     )
 }
@@ -435,8 +466,10 @@ fn preview_pair(s: &SessionInfo) -> String {
     }
 }
 
-/// A file mtime as ISO-8601 UTC, reusing clauth's shared formatter so every
-/// emitted timestamp reads the same. A pre-epoch time clamps to epoch 0.
+/// The `--json` row's `updated` cell: a file mtime as ISO-8601 UTC, reusing
+/// clauth's shared formatter. Deliberately the machine shape — the human
+/// table renders the same instant in local wall clock with a relative age.
+/// A pre-epoch time clamps to epoch 0.
 fn updated_iso(t: SystemTime) -> String {
     let secs = t
         .duration_since(UNIX_EPOCH)

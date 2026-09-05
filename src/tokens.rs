@@ -30,7 +30,12 @@
 //! ledger closes that: each finalized day's split is written once to
 //! `~/.clauth/token_ledger.json` and folded back on load, and its watermark
 //! becomes the sweep's effective cutoff — so a frozen base can't keep the
-//! cold-start read growing either.
+//! cold-start read growing either. Days recorded before the hourly axis carry
+//! no per-hour buckets; on the first run after an upgrade, a one-shot backfill
+//! ([`backfill_corpus`] + [`crate::token_ledger::Ledger::backfill_hours`])
+//! re-derives them from the pre-watermark corpus and fills the rows whose flat
+//! totals still match, so past days price peak/off-peak exactly where the
+//! transcripts still cover them.
 //!
 //! # Caveat
 //!
@@ -51,6 +56,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Deserialize;
 
 use crate::poll::run_polling_loop;
+use crate::pricing::HourTokens;
 use crate::usage::{epoch_secs_to_iso, iso_to_epoch_secs, now_epoch_secs};
 
 // ── Refresh cadence ─────────────────────────────────────────────────────────
@@ -101,6 +107,21 @@ pub(crate) struct DayModelTokens {
     pub(crate) in_out: u64,
     /// Full split when known; `split.model` mirrors `model`.
     pub(crate) split: Option<ModelTokens>,
+    /// Per-hour buckets (index = hour 0..23) when the source carried
+    /// timestamps: transcript-derived rows and v2-ledger rows. `None` for
+    /// stats-cache (pre-cutoff) rows and v1-ledger rows — approximation:
+    /// those days price at the default tier on their dated rate.
+    pub(crate) hours: Option<[HourTokens; 24]>,
+}
+
+/// One day's contribution to a [`PeriodModel`]: the full split plus its
+/// per-hour buckets when the source carried them (`None` for v1-ledger days,
+/// which price at the default tier).
+#[derive(Debug, Clone)]
+pub(crate) struct PeriodDay {
+    pub(crate) date: String, // "YYYY-MM-DD"
+    pub(crate) split: ModelTokens,
+    pub(crate) hours: Option<[HourTokens; 24]>,
 }
 
 /// One model's aggregate over a date range ([`period_models`]). `split` sums
@@ -112,6 +133,12 @@ pub(crate) struct PeriodModel {
     pub(crate) in_out: u64,
     pub(crate) split: ModelTokens,
     pub(crate) split_complete: bool,
+    /// The split-bearing days that make up `split`, in date order — so a
+    /// period cost can price each day at its dated rate and each hour at its
+    /// own rate. Stats-cache days contribute in+out and the
+    /// incomplete flag but no row; `from_full` rows carry none (they hold no
+    /// dates).
+    pub(crate) days: Vec<PeriodDay>,
 }
 
 impl PeriodModel {
@@ -123,6 +150,7 @@ impl PeriodModel {
             in_out: m.in_out(),
             split: m.clone(),
             split_complete: true,
+            days: Vec::new(),
         }
     }
 
@@ -154,6 +182,24 @@ pub(crate) struct DayActivity {
     pub(crate) tool_calls: u64,
 }
 
+/// Per-hour token buckets for one model on one day — the per-model twin of
+/// [`DaySummary::token_hours`]. Index = hour of day 0..23.
+#[derive(Debug, Clone)]
+pub(crate) struct HourlyModel {
+    pub(crate) model: String,
+    pub(crate) hours: [HourTokens; 24],
+}
+
+/// One (model, day) pair's per-hour buckets, aggregated over a single
+/// transcript file by [`file_hourly_model_tokens`] — the sessions surface's
+/// dated-cost view. Index = hour of day 0..23.
+#[derive(Debug, Clone)]
+pub(crate) struct HourlyDayModel {
+    pub(crate) model: String,
+    pub(crate) day: String, // "YYYY-MM-DD"
+    pub(crate) hours: [HourTokens; 24],
+}
+
 /// Single-day token + message rollup, built live from today's transcripts during
 /// the top-up pass (so it carries the full in/out/cache split, unlike `DayTokens`).
 #[derive(Debug, Clone, Default)]
@@ -168,6 +214,13 @@ pub(crate) struct DaySummary {
     /// Message count per hour of day for the day, index = hour 0..23 — the
     /// daily-period twin of `TokenStats::hour_counts`.
     pub(crate) hours: [u64; 24],
+    /// Token buckets per hour of day for the day, index = hour 0..23 — the
+    /// per-hour twin of the flat totals above, so cost can price each hour at
+    /// its own rate (peak/off-peak). Exact: every top-up rec carries its hour.
+    pub(crate) token_hours: [HourTokens; 24],
+    /// Per-hour buckets per model, one entry per model in `models` (same
+    /// DESC-by-total order). Carried so cost can be priced per model per hour.
+    pub(crate) model_hours: Vec<HourlyModel>,
     /// Per-model breakdown of the day's tokens. Carried so cost can be priced
     /// per model (rates differ by family) — the day's lifetime totals can't be
     /// isolated from `TokenStats::models`. Empty until the top-up populates it.
@@ -457,6 +510,7 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
                     model: model.clone(),
                     in_out,
                     split: None,
+                    hours: None,
                 })
         })
         .collect();
@@ -485,18 +539,18 @@ pub(crate) fn load_base(claude_dir: &Path) -> Option<TokenStats> {
         }
     }
 
-    let total_input: u64 = wire.model_usage.values().map(|u| u.input_tokens).sum();
-    let total_output: u64 = wire.model_usage.values().map(|u| u.output_tokens).sum();
-    let total_cache_read: u64 = wire
-        .model_usage
-        .values()
-        .map(|u| u.cache_read_input_tokens)
-        .sum();
-    let total_cache_create: u64 = wire
-        .model_usage
-        .values()
-        .map(|u| u.cache_creation_input_tokens)
-        .sum();
+    // Off `models`, which already carries every `model_usage` row.
+    let (total_input, total_output, total_cache_read, total_cache_create) = models.iter().fold(
+        (0u64, 0u64, 0u64, 0u64),
+        |(input, output, read, create), m| {
+            (
+                input + m.input,
+                output + m.output,
+                read + m.cache_read,
+                create + m.cache_create,
+            )
+        },
+    );
 
     let stats = TokenStats {
         models,
@@ -630,6 +684,7 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
                 ..Default::default()
             },
             split_complete: true,
+            days: Vec::new(),
         });
         e.in_out = e.in_out.saturating_add(d.in_out);
         match &d.split {
@@ -638,11 +693,22 @@ pub(crate) fn period_models(days: &[DayModelTokens], from: &str, to: &str) -> Ve
                 e.split.output = e.split.output.saturating_add(s.output);
                 e.split.cache_read = e.split.cache_read.saturating_add(s.cache_read);
                 e.split.cache_create = e.split.cache_create.saturating_add(s.cache_create);
+                e.days.push(PeriodDay {
+                    date: d.date.clone(),
+                    split: s.clone(),
+                    hours: d.hours,
+                });
             }
             None => e.split_complete = false,
         }
     }
     let mut out: Vec<PeriodModel> = map.into_values().collect();
+    // Input order is the caller's; `daily_models` is sorted ASC by
+    // (date, model), but a hand-built slice may not be — pin date order per
+    // model regardless, so the per-day cost walks a chronological list.
+    for m in &mut out {
+        m.days.sort_unstable_by(|a, b| a.date.cmp(&b.date));
+    }
     out.sort_unstable_by_key(|m| std::cmp::Reverse(m.in_out));
     out
 }
@@ -706,6 +772,39 @@ struct LineRec {
     cache_read: u64,
     cache_create: u64,
     tool_calls: u64,
+}
+
+impl LineRec {
+    /// Full token footprint of one line. This is the discriminator that picks a
+    /// turn's completed streaming delta: input/cache are constant across the
+    /// deltas, only output grows, so the max-total delta is the final one.
+    fn total(&self) -> u64 {
+        self.input
+            .saturating_add(self.output)
+            .saturating_add(self.cache_read)
+            .saturating_add(self.cache_create)
+    }
+}
+
+/// Add one line's token counts into an hour bucket. The hour is safe to index
+/// directly: `parse_file` bounds `LineRec::hour` to 0..=23.
+fn add_to_hour(bucket: &mut HourTokens, r: &LineRec) {
+    bucket.input = bucket.input.saturating_add(r.input);
+    bucket.output = bucket.output.saturating_add(r.output);
+    bucket.cache_read = bucket.cache_read.saturating_add(r.cache_read);
+    bucket.cache_create = bucket.cache_create.saturating_add(r.cache_create);
+}
+
+/// One model's accumulation on one day during [`merge_topup`]: the flat split
+/// plus per-hour buckets, so a pushed [`DayModelTokens`] row and today's
+/// rollup both carry the hourly axis. The backfill sweep ([`backfill_corpus`])
+/// accumulates into the same shape, so a day it fully covers re-derives
+/// exactly the split the top-up would have recorded — the equality
+/// [`crate::token_ledger::Ledger::backfill_hours`] fills on is against the
+/// top-up's own counting rules, not a parallel approximation.
+pub(crate) struct ModelDayAcc {
+    pub(crate) flat: ModelTokens,
+    pub(crate) hours: [HourTokens; 24],
 }
 
 struct FileContrib {
@@ -811,8 +910,9 @@ fn merge_topup(
         .map(|m| (m.model.clone(), m))
         .collect();
 
-    // Per-day per-model splits for post-cutoff days (weekly/monthly lens).
-    let mut day_models: HashMap<(String, String), ModelTokens> = HashMap::new();
+    // Per-day per-model splits for post-cutoff days (weekly/monthly lens),
+    // flat plus per-hour buckets.
+    let mut day_models: HashMap<(String, String), ModelDayAcc> = HashMap::new();
     // Per-day activity for post-cutoff days + lifetime deltas.
     let mut day_msgs: HashMap<String, u64> = HashMap::new();
     let mut day_sessions: HashMap<String, HashSet<String>> = HashMap::new();
@@ -824,13 +924,20 @@ fn merge_topup(
         date: today_date.to_owned(),
         ..Default::default()
     };
-    let mut today_models: HashMap<String, ModelTokens> = HashMap::new();
+    let mut today_models: HashMap<String, ModelDayAcc> = HashMap::new();
 
     let mut seen_tok: HashSet<&str> = HashSet::new();
     let mut seen_uuid: HashSet<&str> = HashSet::new();
     let mut max_date: Option<String> = None;
 
-    for fc in cache.files.values() {
+    // Merge files in path-sorted order: the cross-file dedup winner is
+    // first-seen, and `cache.files` is a HashMap whose iteration order is
+    // random per process — with per-hour buckets the winner's hour is
+    // observable (peak/off-peak), so an unseeded winner would price one
+    // response in two different buckets across runs.
+    let mut files: Vec<_> = cache.files.iter().collect();
+    files.sort_unstable_by_key(|(a, _)| *a);
+    for (_, fc) in files {
         for r in &fc.recs {
             // Message / hour / session counting (user+assistant), deduped by uuid.
             // An empty uuid can't be keyed, so it counts as-is.
@@ -859,36 +966,54 @@ fn merge_topup(
             }
 
             // Token / model accumulation (assistant usage lines), deduped by key.
+            // The hour buckets ride the same deduped branch, so a skipped
+            // duplicate line contributes nothing to them either, and the
+            // winning line's own hour carries its whole turn (within a file
+            // that is the earliest max-total delta, so a turn spanning an hour
+            // boundary lands in its final delta's hour; across files the
+            // path-sorted first copy wins — the file order is pinned above, so
+            // the winner and its hour are deterministic) — the same first-wins
+            // rule the flat fields apply, so buckets and flat totals always
+            // agree whichever copy won.
             if r.has_usage && (r.tok_key.is_empty() || seen_tok.insert(r.tok_key.as_str())) {
                 if r.date == today_date {
                     today_acc.input = today_acc.input.saturating_add(r.input);
                     today_acc.output = today_acc.output.saturating_add(r.output);
                     today_acc.cache_read = today_acc.cache_read.saturating_add(r.cache_read);
                     today_acc.cache_create = today_acc.cache_create.saturating_add(r.cache_create);
+                    add_to_hour(&mut today_acc.token_hours[r.hour as usize], r);
                     let tm = today_models
                         .entry(r.model.clone())
-                        .or_insert_with(|| ModelTokens {
-                            model: r.model.clone(),
-                            ..Default::default()
+                        .or_insert_with(|| ModelDayAcc {
+                            flat: ModelTokens {
+                                model: r.model.clone(),
+                                ..Default::default()
+                            },
+                            hours: [HourTokens::default(); 24],
                         });
-                    tm.input = tm.input.saturating_add(r.input);
-                    tm.output = tm.output.saturating_add(r.output);
-                    tm.cache_read = tm.cache_read.saturating_add(r.cache_read);
-                    tm.cache_create = tm.cache_create.saturating_add(r.cache_create);
+                    tm.flat.input = tm.flat.input.saturating_add(r.input);
+                    tm.flat.output = tm.flat.output.saturating_add(r.output);
+                    tm.flat.cache_read = tm.flat.cache_read.saturating_add(r.cache_read);
+                    tm.flat.cache_create = tm.flat.cache_create.saturating_add(r.cache_create);
+                    add_to_hour(&mut tm.hours[r.hour as usize], r);
                 }
                 if r.date.as_str() > cutoff_date {
                     *daily_map.entry(r.date.clone()).or_insert(0) +=
                         r.input.saturating_add(r.output);
                     let dm = day_models
                         .entry((r.date.clone(), r.model.clone()))
-                        .or_insert_with(|| ModelTokens {
-                            model: r.model.clone(),
-                            ..Default::default()
+                        .or_insert_with(|| ModelDayAcc {
+                            flat: ModelTokens {
+                                model: r.model.clone(),
+                                ..Default::default()
+                            },
+                            hours: [HourTokens::default(); 24],
                         });
-                    dm.input = dm.input.saturating_add(r.input);
-                    dm.output = dm.output.saturating_add(r.output);
-                    dm.cache_read = dm.cache_read.saturating_add(r.cache_read);
-                    dm.cache_create = dm.cache_create.saturating_add(r.cache_create);
+                    dm.flat.input = dm.flat.input.saturating_add(r.input);
+                    dm.flat.output = dm.flat.output.saturating_add(r.output);
+                    dm.flat.cache_read = dm.flat.cache_read.saturating_add(r.cache_read);
+                    dm.flat.cache_create = dm.flat.cache_create.saturating_add(r.cache_create);
+                    add_to_hour(&mut dm.hours[r.hour as usize], r);
                     let e = model_map
                         .entry(r.model.clone())
                         .or_insert_with(|| ModelTokens {
@@ -913,10 +1038,16 @@ fn merge_topup(
     // Publish today's rollup (independent of the cutoff, so even a no-new-history
     // pass can still carry today's data).
     if today_acc.messages > 0 || today_acc.total() > 0 {
-        today_acc.models = today_models.into_values().collect();
-        today_acc
-            .models
-            .sort_unstable_by_key(|m| std::cmp::Reverse(m.total()));
+        let mut accs: Vec<ModelDayAcc> = today_models.into_values().collect();
+        accs.sort_unstable_by_key(|a| std::cmp::Reverse(a.flat.total()));
+        today_acc.models = accs.iter().map(|a| a.flat.clone()).collect();
+        today_acc.model_hours = accs
+            .into_iter()
+            .map(|a| HourlyModel {
+                model: a.flat.model,
+                hours: a.hours,
+            })
+            .collect();
         base.today = Some(today_acc);
     }
 
@@ -939,14 +1070,15 @@ fn merge_topup(
 
     // Post-cutoff per-day per-model rows are transcript-authoritative: drop any
     // base rows past the cutoff (normally none — stats-cache stops there) and
-    // append the reconstructed split-bearing ones.
+    // append the reconstructed split-bearing ones, hour buckets included.
     base.daily_models.retain(|d| d.date.as_str() <= cutoff_date);
-    for ((date, _), tokens) in day_models {
+    for ((date, _), acc) in day_models {
         base.daily_models.push(DayModelTokens {
             date,
-            model: tokens.model.clone(),
-            in_out: tokens.in_out(),
-            split: Some(tokens),
+            model: acc.flat.model.clone(),
+            in_out: acc.flat.in_out(),
+            split: Some(acc.flat),
+            hours: Some(acc.hours),
         });
     }
     base.daily_models.sort_unstable_by(|a, b| {
@@ -997,9 +1129,11 @@ fn merge_topup(
     base.topped_up_through = max_date;
 }
 
-/// Parse one JSONL transcript into per-line contribution records. Pure read —
-/// the cutoff/today split happens later in [`merge_topup`], so an advancing
-/// `last_computed_date` never forces a re-read. Silently skips parse errors.
+/// Parse one JSONL transcript into per-line contribution records, collapsing
+/// each turn's streaming deltas into its completed line (see
+/// [`collapse_streamed_turns`]). The cutoff/today split happens later in
+/// [`merge_topup`], so an advancing `last_computed_date` never forces a re-read.
+/// Silently skips parse errors.
 fn parse_file(path: &Path) -> Vec<LineRec> {
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1095,41 +1229,217 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
             tool_calls,
         });
     }
-    out
+    collapse_streamed_turns(out)
 }
 
-/// Fold one transcript file into per-model token sums for a per-session annotation
-/// (see [`crate::sessions`]). Deduped WITHIN the file by each usage line's
-/// `tok_key` (`message.id`, or the content composite `parse_file` derives when it
-/// is absent): a resumed or branched session copies its parent's history forward
-/// into the new file, so the same response can appear twice in one transcript —
-/// without this dedup a per-session total double-counts every carried-forward
-/// line. Same token-dedup discipline as [`merge_topup`], scoped to a single file
-/// instead of across the whole sweep. Fail-soft: an unreadable file yields `[]`.
-pub(crate) fn file_model_tokens(path: &Path) -> Vec<ModelTokens> {
+/// Collapse one assistant turn's streaming deltas into its completed line.
+///
+/// CC writes a turn several times as output streams in: the lines share
+/// `message.id` (the `tok_key`) and carry the same input/cache counts, but
+/// output grows from 0 to the final value on distinct line uuids. Deduping on
+/// the id at merge time would keep the first (output=0) partial, so collapse
+/// here to the occurrence with the largest total footprint. This also makes the
+/// message/session/hour counters see one turn instead of every delta.
+fn collapse_streamed_turns(recs: Vec<LineRec>) -> Vec<LineRec> {
+    let mut best: HashMap<String, LineRec> = HashMap::new();
+    let mut plain: Vec<LineRec> = Vec::new();
+    for rec in recs {
+        if !rec.has_usage {
+            plain.push(rec);
+            continue;
+        }
+        let key = rec.tok_key.clone();
+        let keep = best
+            .get(&key)
+            .is_some_and(|prev| prev.total() >= rec.total());
+        if !keep {
+            best.insert(key, rec);
+        }
+    }
+    plain.extend(best.into_values());
+    plain
+}
+
+/// Fold one transcript file into per-(model, day) per-hour buckets for the
+/// sessions surface's dated cost view. `parse_file` collapses each turn's
+/// streaming deltas to its completed line and dedupes a carried-forward
+/// response within the file, so each token-bearing line here is one distinct
+/// response and can be summed directly. Fail-soft: an unreadable file yields
+/// `[]`.
+pub(crate) fn file_hourly_model_tokens(path: &Path) -> Vec<HourlyDayModel> {
     let recs = parse_file(path);
-    let mut seen_tok: HashSet<&str> = HashSet::new();
-    let mut by_model: HashMap<&str, ModelTokens> = HashMap::new();
+    let mut by_key: HashMap<(&str, &str), HourlyDayModel> = HashMap::new();
     for r in &recs {
         if !r.has_usage {
             continue;
         }
-        // An empty tok_key can't be keyed, so it counts as-is (matches merge_topup).
-        if !r.tok_key.is_empty() && !seen_tok.insert(r.tok_key.as_str()) {
-            continue;
-        }
-        let e = by_model
-            .entry(r.model.as_str())
-            .or_insert_with(|| ModelTokens {
+        let e = by_key
+            .entry((r.model.as_str(), r.date.as_str()))
+            .or_insert_with(|| HourlyDayModel {
                 model: r.model.clone(),
-                ..Default::default()
+                day: r.date.clone(),
+                hours: [HourTokens::default(); 24],
             });
-        e.input = e.input.saturating_add(r.input);
-        e.output = e.output.saturating_add(r.output);
-        e.cache_read = e.cache_read.saturating_add(r.cache_read);
-        e.cache_create = e.cache_create.saturating_add(r.cache_create);
+        add_to_hour(&mut e.hours[r.hour as usize], r);
     }
-    by_model.into_values().collect()
+    by_key.into_values().collect()
+}
+
+// ── One-shot ledger backfill (v1 days → hourly axis) ──────────────────────────
+
+/// One backfill sweep's output: the per-(day, model) re-derived totals plus
+/// how many transcript files were actually parsed. The worker ignores the
+/// count; tests use it to pin that a second run re-reads nothing.
+struct BackfillSweep {
+    derived: HashMap<(String, String), ModelDayAcc>,
+    /// Test-only: how many files the sweep actually parsed, so a test can
+    /// pin that a second run re-reads nothing. Not compiled into the
+    /// binary — production never reads the count.
+    #[cfg(test)]
+    files_parsed: usize,
+}
+
+/// One-shot transcript sweep behind the ledger backfill: re-derive the
+/// pre-watermark per-(day, model) totals and hour buckets from the
+/// `projects/` corpus for [`crate::token_ledger::Ledger::backfill_hours`].
+///
+/// Mirrors [`merge_topup`]'s aggregation rules exactly — the same recursive
+/// walk, `parse_file`'s streaming-delta collapse, and a path-sorted
+/// first-seen `tok_key` winner — so a day this corpus fully covers re-derives
+/// the split the top-up would have recorded for it. Files crossing the
+/// cutoff contribute by LINE date; lines dated after `recorded_through` are
+/// dropped because the regular top-up owns them. It never feeds the top-up's
+/// totals: the top-up merges only lines dated strictly after its own cutoff,
+/// so even a file both sweeps read cannot double-count.
+///
+/// Streams one file at a time — `parse_file`'s records die with each file,
+/// never accumulated the way [`TopUpCache`] persists per-file records (this
+/// pass is one-shot, so there is no second sweep to reuse them for). The
+/// operator corpus measures 19,673 files / 8.1 GB (migration-seam review,
+/// 2026-08-20), so per-file streaming plus owned dedup keys bounds peak
+/// memory at one transcript.
+///
+/// `None` when `recorded_through` yields no instant — never in practice (the
+/// watermark is clauth-written); the caller then skips the pass without
+/// marking it done, so a fixed file still gets its backfill.
+fn backfill_corpus(
+    claude_dir: &Path,
+    recorded_through: &str,
+    mut progress: impl FnMut(usize, usize),
+) -> Option<BackfillSweep> {
+    // End-of-watermark-day bound, not the 00:00 instant the top-up uses:
+    // files touched ON the watermark day still carry the pre-watermark lines
+    // the stored v1 totals include, so excluding them would leave those days
+    // failing the equality gate and v1 forever — lossless but
+    // over-conservative. Widening admits them; the exact-or-absent fill gate
+    // still protects correctness either way.
+    let cutoff = date_to_cutoff(recorded_through)? + Duration::from_secs(86_400);
+    let projects_dir = claude_dir.join("projects");
+    let mut paths: Vec<PathBuf> = Vec::new();
+    collect_jsonl(&projects_dir, 8, &mut paths);
+    // Path-sorted so the cross-file dedup winner is deterministic — the same
+    // pin merge_topup needs, because the winner's hour is observable (on the
+    // operator's corpus, 0/200 sampled duplicate ids differed in timestamp
+    // hour, so the winning copy's hour is faithful to the turn's own).
+    paths.sort_unstable();
+
+    let total = paths.len();
+    // Owned keys only: the dedup set spans the WHOLE pass (cross-file
+    // first-seen wins, matching merge_topup) and must not borrow from
+    // per-file records that drop immediately after their file. With 78% of
+    // usage ids appearing in 2+ files on the operator's corpus, this set is
+    // the pass's one corpus-wide allocation — everything else is per file.
+    let mut seen_tok: HashSet<String> = HashSet::new();
+    let mut derived: HashMap<(String, String), ModelDayAcc> = HashMap::new();
+    #[cfg(test)]
+    let mut files_parsed = 0usize;
+    for (done, path) in paths.into_iter().enumerate() {
+        progress(done + 1, total);
+        let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        if mtime > cutoff {
+            continue; // the live top-up owns this file
+        }
+        for r in parse_file(&path) {
+            if !r.has_usage || r.date.as_str() > recorded_through {
+                continue; // post-watermark lines belong to the top-up
+            }
+            if r.tok_key.is_empty() || seen_tok.insert(r.tok_key.clone()) {
+                let acc = derived
+                    .entry((r.date.clone(), r.model.clone()))
+                    .or_insert_with(|| ModelDayAcc {
+                        flat: ModelTokens {
+                            model: r.model.clone(),
+                            ..Default::default()
+                        },
+                        hours: [HourTokens::default(); 24],
+                    });
+                acc.flat.input = acc.flat.input.saturating_add(r.input);
+                acc.flat.output = acc.flat.output.saturating_add(r.output);
+                acc.flat.cache_read = acc.flat.cache_read.saturating_add(r.cache_read);
+                acc.flat.cache_create = acc.flat.cache_create.saturating_add(r.cache_create);
+                add_to_hour(&mut acc.hours[r.hour as usize], &r);
+            }
+        }
+        #[cfg(test)]
+        {
+            files_parsed += 1;
+        }
+    }
+    Some(BackfillSweep {
+        derived,
+        #[cfg(test)]
+        files_parsed,
+    })
+}
+
+/// Run the one-shot v1→v2 hourly backfill when the ledger still owes it:
+/// sweep the pre-watermark corpus and hand it to
+/// [`crate::token_ledger::Ledger::backfill_hours`] (exact-or-absent fill),
+/// which also marks the pass done. Returns whether the pass ran — i.e.
+/// whether a save should follow. Called by the tokens worker after
+/// `record`, so the watermark is already at yesterday and the sweep's
+/// cutoff is the finalized-day boundary. Runs synchronously inside the
+/// worker's single tick, so the pass never overlaps the next 90s cycle —
+/// the polling loop serializes ticks by construction. The filled hours
+/// reach the UI on the NEXT tick: the current run's merged base was built
+/// before this pass, so a backfilled day's cost flips one 90s cycle later,
+/// unlabeled. Accepted for a one-shot.
+fn run_backfill(
+    claude_dir: &Path,
+    ledger: &mut crate::token_ledger::Ledger,
+    today: &str,
+    progress: impl FnMut(usize, usize),
+) -> bool {
+    let Some(through) = ledger.backfill_through(today) else {
+        return false;
+    };
+    let Some(sweep) = backfill_corpus(claude_dir, &through, progress) else {
+        return false;
+    };
+    ledger.backfill_hours(&sweep.derived);
+    true
+}
+
+/// Persist the ledger after a merge: record newly-finalized days, then run
+/// the one-shot backfill. The backfill's save is independent of whether
+/// `record` changed anything — the done flag must persist even on an idle
+/// cycle, or the corpus re-sweeps every 90s until a day records.
+fn persist_ledger(
+    claude_dir: &Path,
+    ledger: &mut crate::token_ledger::Ledger,
+    dir: &Path,
+    base: &TokenStats,
+    today: &str,
+    progress: impl FnMut(usize, usize),
+) {
+    if ledger.record(base, today) {
+        ledger.save(dir);
+    }
+    if run_backfill(claude_dir, ledger, today, progress) {
+        ledger.save(dir);
+    }
 }
 
 // ── Background thread ─────────────────────────────────────────────────────────
@@ -1204,11 +1514,17 @@ pub(crate) fn spawn(
                 }
             });
             merge_topup(&mut base, cache, cutoff.as_deref(), &today);
-            // Persist any newly-finalized days before the transcripts can age out.
-            if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref())
-                && l.record(&base, &today)
-            {
-                l.save(dir);
+            // Persist: newly-finalized days first, then the one-shot v1→v2
+            // backfill (which only ever adds hour buckets to v1 rows). Both
+            // legs run inside this one tick, so neither sweep overlaps the
+            // other or the next 90s cycle's. The backfill's save is
+            // independent of whether `record` had anything to write.
+            if let (Some(l), Some(dir)) = (ledger.as_mut(), clauth_dir.as_deref()) {
+                persist_ledger(&claude_dir, l, dir, &base, &today, |done, total| {
+                    if done % 25 == 0 || done == total {
+                        let _ = tx.send(TokensEvent::Progress { done, total });
+                    }
+                });
             }
             let _ = tx.send(TokensEvent::Loaded(Box::new(base)));
         };

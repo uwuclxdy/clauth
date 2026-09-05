@@ -80,8 +80,8 @@ const PER_PROFILE_TOP_FIELDS: &[&str] = &[
     "model",
 ];
 
-/// Newest mtime from the last [`sync_once`] that did work. Short-circuits ticks
-/// where no file is newer — no reads, parses, or writes.
+/// Newest mtime from the last [`sync_once`] that did work; the key for
+/// [`crate::jsonsync::run_with_cache`]'s fast path.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
 
 /// Latch for [`warn_paused`], so the pause is reported once rather than on every
@@ -134,27 +134,13 @@ fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
 }
 
 /// Every `settings.json` clauth reconciles: the operator's own
-/// `~/.claude/settings.json` plus each SHARED per-session runtime copy. The
-/// members are enumerated through [`crate::runtime::shared_runtime_dirs`], since
-/// every session owns its own `runtime-<sid>` — a fixed `<profile>/runtime` path
-/// would find nothing while every session ran, and reconcile nothing.
-///
-/// An isolated runtime's copy is deliberately absent. It is built from an EMPTY
-/// base (`runtime::write_merged_settings`), so it carries none of the operator's
-/// hooks, permissions, or statusline; letting it win a newest-wins race would
-/// delete all of them from the base and from every shared copy, and letting it
-/// receive would defeat the isolation it exists for. The flavors are separated by
-/// a dir-name rule, not a substring guess: a shared dir is `runtime` or
-/// `runtime-<sid>` with `<sid>` digits and one `-`, which no
-/// `runtime-isolated…` name can satisfy.
+/// `~/.claude/settings.json` plus each SHARED per-session runtime copy, via
+/// [`crate::jsonsync::runtime_files_under`].
 fn known_paths() -> Result<Vec<PathBuf>> {
-    let mut paths = vec![claude_dir()?.join("settings.json")];
-    paths.extend(
-        crate::runtime::shared_runtime_dirs()
-            .into_iter()
-            .map(|dir| dir.join("settings.json")),
-    );
-    Ok(paths)
+    Ok(crate::jsonsync::runtime_files_under(
+        &claude_dir()?,
+        "settings.json",
+    ))
 }
 
 /// Just the `[env]` table of a profile's `config.toml`. A dedicated minimal
@@ -216,27 +202,11 @@ fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     None
 }
 
-/// Reconcile every known `settings.json` once. Stat-only fast path: skips reads
-/// when no file is newer than `LAST_SYNCED`. Advances `LAST_SYNCED` only when
-/// the merge actually ran, so a paused or failed tick retries.
+/// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` mtime
+/// fast path in [`crate::jsonsync::run_with_cache`].
 pub(crate) fn sync_once() -> Result<()> {
     let paths = known_paths()?;
-    let Some(newest) = crate::jsonsync::newest_mtime(&paths) else {
-        return Ok(());
-    };
-    {
-        let last = LAST_SYNCED.lock().unwrap_or_else(|p| p.into_inner());
-        if last.is_some_and(|l| newest <= l) {
-            return Ok(());
-        }
-    }
-    if !sync_members(&paths)? {
-        return Ok(());
-    }
-    // `newest` was stated before the lock, so it can only lag what the merge
-    // actually saw — costing at most one redundant tick, never a skipped one.
-    *LAST_SYNCED.lock().unwrap_or_else(|p| p.into_inner()) = Some(newest);
-    Ok(())
+    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || sync_members(&paths))
 }
 
 /// Merge the members under the cross-process state flock. Returns whether the
@@ -264,7 +234,7 @@ pub(crate) fn sync_once() -> Result<()> {
 /// `settings.json` reads, parses, and writes.
 fn sync_members(paths: &[PathBuf]) -> Result<bool> {
     let operator_file = claude_dir()?.join("settings.json");
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let Some(custom_env) = per_profile_env_keys() else {
             return Ok(false);
         };

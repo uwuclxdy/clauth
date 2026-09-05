@@ -56,8 +56,8 @@ use crate::usage::{
 use status_json::LiveSignals;
 // `clauth list` (src/list.rs) renders a human table over the same body, so the
 // two surfaces read one code path and cannot drift.
-pub(crate) use status_json::build_status;
-// The feed's schema number, published by `GET /v1/health` so a remote reader
+pub(crate) use status_json::{ProfileEntry, build_profile_entries, build_status};
+// The feed's schema number, published by `GET /api/v1/health` so a remote reader
 // can refuse a daemon newer than it knows (wiki/Daemon.md's evolution rule).
 pub(crate) use status_json::SCHEMA_VERSION;
 
@@ -94,16 +94,23 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
 /// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
 /// dies — 30s frees the lease about as fast as the retired TUI freshness re-arm
-/// did. TENSION: a legit switch's keychain shell-out can block up to its own 20s
-/// kill deadline inside the `StateLock`, leaving only ~10s of slack. If that ever
-/// false-aborts, bound the keychain shell-out (the real fix), do NOT loosen this
-/// deadline — the lease's wedged-daemon recovery depends on it.
+/// did. TENSION: a legit switch's keychain shell-outs can block inside the
+/// `StateLock`, leaving only ~10s of slack. Twice now the count of those
+/// shell-outs grew under this deadline (a read-modify-write made one mirror two
+/// calls; a first-login adopt makes one switch two mirrors), so the bound is no
+/// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
+/// hold spends in `security` at 20s in aggregate. If it ever false-aborts,
+/// shrink THAT (the real fix), do NOT loosen this deadline — the lease's
+/// wedged-daemon recovery depends on it. Known residual:
+/// the budget is per HOLD, and `tick.rs` drains `pending_switch` then
+/// `pending_switch_off` under two separate holds, so one tick doing both can
+/// still spend 2 × 20s here.
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
 /// keeps the main loop ticking and the feed fresh, so it trips nothing and the
 /// lease is never freed — pre-existing (the retired probe keyed on the same
-/// main-loop freshness), tracked in `docs/todo.md`. Do not read this deadline as
+/// main-loop freshness). Do not read this deadline as
 /// covering the fetch path itself.
 const WATCHDOG_DEADLINE: Duration = Duration::from_secs(30);
 /// How often the watchdog re-checks the tick heartbeat.
@@ -362,7 +369,7 @@ pub(crate) fn status_oneshot(include_disabled: bool) -> Result<()> {
 /// The shell / first-login / clauth-symlink exemptions all live in
 /// [`crate::claude::live_diverged_and_unsaved`]; a read that errors outright
 /// maps to `false` (proceed) here.
-fn active_diverged_unsaved(active: &str) -> bool {
+fn active_diverged_unsaved(active: &crate::profile::ProfileName) -> bool {
     crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
@@ -379,6 +386,19 @@ struct Daemon {
     activity: ActivityStore,
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
+    /// Per-profile kick-429 blocks. The daemon renders no pills, so this backs
+    /// only the scheduler's own gate and its write-through cache files — but it
+    /// lives on `self` rather than inside `spawn_scheduler` for the same reason
+    /// `auto_start_queue` does: the status publisher snapshots its switch-grade
+    /// subset on every write, because that subset is what the auto-start
+    /// queue's membership rule excludes on and a feed deriving membership
+    /// without it publishes a queue the election is not running.
+    kick_blocks: KickBlocks,
+    /// Interleaved auto-start queue (`usage::auto_start_queue`). On `self`, like
+    /// `kick_blocks` above, because the status publisher snapshots the anchor on
+    /// every write so `status.json`'s `next_open_at` matches the value the
+    /// election gates on.
+    auto_start_queue: crate::usage::AutoStartQueueState,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -421,6 +441,8 @@ impl Daemon {
             activity: Arc::new(RankedMutex::new(HashMap::new())),
             last_fetched: Arc::new(RankedMutex::new(HashMap::new())),
             poll_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+            kick_blocks: Arc::new(RankedMutex::new(HashMap::new())),
+            auto_start_queue: crate::usage::new_auto_start_queue_state(),
             pending_switch: Arc::new(RankedMutex::new(HashSet::new())),
             pending_switch_off: Arc::new(RankedMutex::new(false)),
             refetch_queue: Arc::new(RankedMutex::new(HashSet::new())),
@@ -453,8 +475,8 @@ impl Daemon {
             .expect("config mutex poisoned")
             .state
             .active_profile
-            .as_deref()
-            .map(str::to_string);
+            .as_ref()
+            .cloned();
         if let Some(active) = active {
             let _ = link_profile_credentials(&active);
         }
@@ -491,11 +513,7 @@ impl Daemon {
     /// Bundle scheduler `Arc`s and launch the background refresher (same call the
     /// TUI's `start_scheduler` makes). The suppressed-generic set is daemon-local.
     fn spawn_scheduler(&self) {
-        let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
-        // Daemon-local like `suppressed`: the daemon never renders pills, so the
-        // block map only backs the scheduler's own gate + its write-through
-        // cache files (which a standdown TUI mirrors).
-        let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+        let suppressed: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             Arc::clone(&self.config),
             Arc::clone(&self.usage_tokens),
@@ -506,7 +524,8 @@ impl Daemon {
             Arc::clone(&self.activity),
             Arc::clone(&self.last_fetched),
             Arc::clone(&self.poll_streaks),
-            kick_blocks,
+            Arc::clone(&self.kick_blocks),
+            Arc::clone(&self.auto_start_queue),
             Arc::clone(&self.pending_switch),
             Arc::clone(&self.pending_switch_off),
             Arc::clone(&self.refetch_queue),
@@ -614,6 +633,16 @@ impl Daemon {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        // The third-party leg writes its outcomes to a store of its own, so
+        // without this snapshot every api-key/provider profile fell through to
+        // the mtime derivation — and an `AuthExpired` session, which writes no
+        // cache, published `fetch_status: null`, indistinguishable from a cold
+        // start.
+        let tp_status_snap: HashMap<String, FetchStatus> = self
+            .third_party_status
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         let next_snap: HashMap<String, u64> = self
             .next_refresh_per_profile
             .lock()
@@ -639,11 +668,25 @@ impl Daemon {
             .lock()
             .ok()
             .and_then(|q| q.iter().min().cloned());
+        // The auto-start queue's in-memory anchor and the blocks its membership
+        // rule excludes on — both leaf rank, snapshot + release before the config
+        // lock like every store above. `switch_grade_kick_lifts` keys ARE the
+        // blocked set: it and the scheduler's own `kick_rejected_names` share one
+        // predicate, which is how the TUI's queue chips read it too.
+        let queue_anchor = crate::usage::queue_anchor_cached(&self.auto_start_queue);
+        let queue_blocked: Vec<crate::profile::ProfileName> =
+            crate::usage::switch_grade_kick_lifts(&self.kick_blocks)
+                .keys()
+                .map(|k| k.as_str().into())
+                .collect();
         let live = LiveSignals {
             status: &status_snap,
+            third_party_status: &tp_status_snap,
             next_refresh: &next_snap,
             streaks: &streaks_snap,
             pending_switch: pending_snap.as_deref(),
+            queue_anchor,
+            queue_blocked: &queue_blocked,
         };
         let cfg_snap = {
             #[allow(

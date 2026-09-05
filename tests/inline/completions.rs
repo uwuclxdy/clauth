@@ -19,14 +19,14 @@ fn every_shell_completes_start_isolated_flag() {
     // (script body, the flag token as each shell spells its `start` branch)
     let cases = [
         (
-            BASH,
+            &BASH,
             "\"${COMP_WORDS[1]}\" = \"start\" ] && [ \"${cur:0:2}\" = \"--\"",
         ),
         (
-            ZSH,
+            &ZSH,
             "\"${words[2]}\" == start ]] && _values 'flag' '--isolated",
         ),
-        (FISH, "__fish_seen_subcommand_from start\" -a --isolated"),
+        (&FISH, "__fish_seen_subcommand_from start\" -a --isolated"),
     ];
     for (script, branch) in cases {
         assert!(
@@ -49,18 +49,18 @@ fn every_shell_completes_start_isolated_flag() {
 #[test]
 fn every_shell_completes_start_with_fallback_flag() {
     let cases = [
-        (BASH, "--isolated --rescue --no-rescue --with-fallback"),
+        (&BASH, "--isolated --with-fallback"),
         // Anchored on the preceding sibling INSIDE the backslash-continued
         // block. zsh's describe entry is position-free on its own, so a needle
         // made only of it stays green while the line is moved under another
         // subcommand's branch and the flag stops being offered under `start`.
         (
-            ZSH,
-            "'--no-rescue[isolated only: discard the isolated store]' \\\n            \
+            &ZSH,
+            "'--isolated[clean isolated runtime; drops operator config]' \\\n            \
              '--with-fallback[follow the fallback chain",
         ),
         (
-            FISH,
+            &FISH,
             "__fish_seen_subcommand_from start\" -a --with-fallback",
         ),
     ];
@@ -76,11 +76,28 @@ fn every_shell_completes_start_with_fallback_flag() {
     }
 }
 
+/// The flag pair that used to decide the isolated rescue is gone from the
+/// grammar, so a script still offering it completes a spelling clap refuses —
+/// the one shell surface where a removal is silent, since nothing here parses.
+/// Whole-word, so a hit is a completion entry rather than these letters sitting
+/// inside some longer token — the two spellings cannot hide inside each other,
+/// which is a property of this pair and not of the check.
+#[test]
+fn no_shell_offers_the_removed_rescue_flags() {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
+        for flag in ["--rescue", "--no-rescue"] {
+            assert!(
+                !offers_token(script, flag),
+                "{shell} must not complete the removed {flag}",
+            );
+        }
+    }
+}
+
 /// `clauth start --with-fallback <TAB>` is the canonical shape — clap only sees
 /// the flag before the profile name — so the profile list has to follow it in the
-/// two position-sensitive shells. `--rescue`/`--no-rescue` set no precedent here:
-/// both `requires = "isolated"`, so neither is ever the only flag before the name.
-/// fish matches on the subcommand alone and is unaffected.
+/// two position-sensitive shells. fish matches on the subcommand alone and is
+/// unaffected.
 #[test]
 fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
     assert!(
@@ -101,9 +118,12 @@ fn bash_and_zsh_complete_a_profile_after_start_with_fallback() {
 #[test]
 fn every_shell_completes_login_setup_token_flag() {
     let cases = [
-        (BASH, "--base-url --api-key --setup-token"),
-        (ZSH, "'--setup-token[capture a claude setup-token"),
-        (FISH, "__fish_seen_subcommand_from login\" -a --setup-token"),
+        (&BASH, "--base-url --api-key --setup-token"),
+        (&ZSH, "'--setup-token[capture a claude setup-token"),
+        (
+            &FISH,
+            "__fish_seen_subcommand_from login\" -a --setup-token",
+        ),
     ];
     for (script, gated) in cases {
         assert!(
@@ -115,6 +135,139 @@ fn every_shell_completes_login_setup_token_flag() {
             "the --setup-token completion must be gated to `login`, missing {gated:?}",
         );
     }
+}
+
+/// The scripts no longer spell the login flags themselves — the built statics
+/// splice `crate::cli::LOGIN_FLAGS` over the marker. A script still carrying
+/// it got an empty splice: every login completion missing, which the grammar
+/// walk below also reds, but one report per flag.
+#[test]
+fn no_script_carries_the_login_flags_marker() {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
+        assert!(
+            !script.contains(LOGIN_FLAGS_MARKER),
+            "{shell} still carries the raw {LOGIN_FLAGS_MARKER} marker",
+        );
+    }
+}
+
+/// The splice must drop no entry: every `LOGIN_FLAGS` flag is offered by every
+/// dialect. (That it is gated to `login` is the grammar walk's job below.)
+#[test]
+fn every_login_flag_is_offered_by_all_three_scripts() {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
+        for flag in crate::cli::LOGIN_FLAGS {
+            assert!(script.contains(flag), "{shell} must offer {flag}");
+        }
+    }
+}
+
+/// `LOGIN_FLAGS` is spliced into every script, so a stale entry would complete
+/// a spelling clap refuses — the rescue-flags class, on a list only this test
+/// reads. The grammar walk pins the other direction (a new clap flag missing
+/// from the scripts); this pins the list to clap's own `login` args.
+#[test]
+fn login_flags_matches_claps_login_args() {
+    use clap::CommandFactory as _;
+
+    let command = crate::cli::Cli::command();
+    let login = command.find_subcommand("login").expect("login subcommand");
+    // Both spellings of one clap arg (`--yes` and `-y`) are separate
+    // completion entries, so collect long and short each rather than one
+    // spelling per argument.
+    let mut clap_flags: Vec<String> = login
+        .get_arguments()
+        .flat_map(|a| {
+            a.get_long()
+                .map(|l| format!("--{l}"))
+                .into_iter()
+                .chain(a.get_short().map(|s| format!("-{s}")))
+        })
+        .collect();
+    clap_flags.sort_unstable();
+    let mut ours: Vec<String> = crate::cli::LOGIN_FLAGS
+        .iter()
+        .map(|f| (*f).to_string())
+        .collect();
+    ours.sort_unstable();
+    assert_eq!(
+        ours, clap_flags,
+        "LOGIN_FLAGS must be exactly clap's login flags"
+    );
+}
+
+/// `clauth herdr install` and `clauth herdr uninstall` are the only herdr
+/// subcommands whose flags the scripts offer, so the flag branches must track
+/// them: after `clauth herdr config get <key>` clap refuses `--key
+/// --no-config --yes`, and the scripts must not complete what clap rejects.
+#[test]
+fn herdr_flags_are_offered_only_under_install_and_uninstall() {
+    let cases = [
+        (
+            &BASH,
+            r#""${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "install" ]"#,
+        ),
+        (
+            &ZSH,
+            r#""${words[2]}" == herdr && "${words[3]}" == install"#,
+        ),
+        (
+            &FISH,
+            "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from install\" -a --key",
+        ),
+    ];
+    for (script, branch) in cases {
+        for flag in ["--key", "--no-config", "--yes"] {
+            assert!(script.contains(flag), "script must offer {flag}");
+        }
+        assert!(
+            script.contains(branch),
+            "the install flag offer must be gated to `install`, missing {branch:?}",
+        );
+    }
+    // `uninstall` offers the same flags minus `--key`, and each shell gates
+    // that arm on the subcommand too.
+    for (script, branch) in [
+        (
+            &BASH,
+            r#""${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "uninstall" ]"#,
+        ),
+        (
+            &ZSH,
+            r#""${words[2]}" == herdr && "${words[3]}" == uninstall"#,
+        ),
+        (
+            &FISH,
+            "__fish_seen_subcommand_from herdr; and __fish_seen_subcommand_from uninstall\" -a --no-config",
+        ),
+    ] {
+        assert!(
+            script.contains(branch),
+            "the uninstall flag offer must be gated to `uninstall`, missing {branch:?}",
+        );
+    }
+    // The arm that follows `config get` completes knob names, never the
+    // install flags above.
+    assert!(
+        BASH.contains(
+            r#"compgen -W "popup_width pane_tag tag_watch_secs border_label delegate_dot delegate_row_text""#
+        ),
+        "bash's `config get` arm offers the knobs and nothing else"
+    );
+    // The subcommand offer itself stays gated on `herdr` alone: the flag
+    // offer below it is the only one the `install` clause may gate.
+    assert!(
+        FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a install"#),
+        "fish must still offer `install` right after `clauth herdr`"
+    );
+    assert!(
+        FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a uninstall"#),
+        "fish must still offer `uninstall` right after `clauth herdr`"
+    );
+    assert!(
+        FISH.contains(r#"-n "__fish_seen_subcommand_from herdr" -a config"#),
+        "fish must still offer `config` right after `clauth herdr`"
+    );
 }
 
 /// The scripts are hand-written (clap_complete's stable generator can't
@@ -181,7 +334,7 @@ fn every_visible_subcommand_and_long_flag_is_offered_by_all_three_scripts() {
     );
 
     let mut missing: Vec<String> = Vec::new();
-    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         for (owner, token) in &expected {
             // A subcommand's own name is offered by the first-word branch; only
             // its flags live under the branch named after it.
@@ -324,7 +477,7 @@ trailing --after-chain
 /// whole-script fallback.
 #[test]
 fn subcommand_branch_isolates_one_subcommand_or_reports_none() {
-    for (shell, script) in [("bash", BASH), ("zsh", ZSH), ("fish", FISH)] {
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
         let list = subcommand_branch(shell, script, "list")
             .unwrap_or_else(|| panic!("{shell} must have a `list` branch"));
         assert!(offers_token(&list, "--all"), "{shell}: list offers --all");
@@ -340,8 +493,10 @@ fn subcommand_branch_isolates_one_subcommand_or_reports_none() {
     }
 }
 
-/// Whether `script` offers `token` as a whole word. `--rescue` must not match on
-/// `--no-rescue`, nor `start` on `--setup-token`.
+/// Whether `script` offers `token` as a whole word: a hyphen, letter, digit or
+/// underscore on either side disqualifies the hit, so `standby` does not match
+/// inside `--no-standby` nor `--standby` inside `--standby-mode`, while `start`
+/// still matches inside `-W "start login"`.
 fn offers_token(script: &str, token: &str) -> bool {
     let boundary = |c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_');
     script.match_indices(token).any(|(i, _)| {
@@ -354,10 +509,24 @@ fn offers_token(script: &str, token: &str) -> bool {
     })
 }
 
+/// Both boundary sides, each fed an input the predicate is what rejects.
+///
+/// The two flag-pair cases below them are kept for the shapes they document, but
+/// neither can fail on its own: `--no-standby` does not CONTAIN `--standby` (one
+/// hyphen, not two) and `'--setup-token[x]'` does not contain `start`, so a
+/// plain `str::contains` answers them identically. Measured — reducing
+/// `boundary` to `|_| true` left the whole gate green until the first two lines
+/// existed.
 #[test]
 fn offers_token_does_not_match_inside_a_longer_flag() {
-    assert!(offers_token("a --rescue b", "--rescue"));
-    assert!(!offers_token("a --no-rescue b", "--rescue"));
+    // `standby` IS inside `--no-standby`, preceded by a hyphen: the left
+    // boundary is the only thing that can reject it.
+    assert!(!offers_token("a --no-standby b", "standby"));
+    // `--standby` IS inside `--standby-mode`, followed by a hyphen: likewise on
+    // the right, which no other case here exercises.
+    assert!(!offers_token("a --standby-mode b", "--standby"));
+    assert!(offers_token("a --standby b", "--standby"));
+    assert!(!offers_token("a --no-standby b", "--standby"));
     assert!(!offers_token("'--setup-token[x]'", "start"));
     assert!(offers_token("-W \"start login\"", "start"));
 }
@@ -476,4 +645,181 @@ fn answer_is_yes_declines_on_n_or_other_input() {
     for a in ["n", "N", "no", "nope", "q", "x"] {
         assert!(!answer_is_yes(a), "{a:?} must decline");
     }
+}
+
+// ── the scripts must parse in the shells that source them ────────────────────
+//
+// The grammar walk above compares clap's command tree against the script TEXT
+// with `str::contains`. It models no shell lexical state at all, so a quoting
+// break is invisible to it — and worse, it DEMANDS the offending line be
+// present, so the assertion that should have caught the CLA-ROLL apostrophe
+// (`'feed[feed a profile's …]'`, which terminated the zsh single-quoted spec
+// and left the whole `_clauth` function unparseable) is the one that certified
+// it. `clauth completions install zsh` writes that file and sources it from the
+// user's rc, so the blast radius was completion for the ENTIRE `clauth`
+// command, plus a parse error on every new shell.
+//
+// The only thing that can see that class is the shell itself.
+
+/// Run one dialect's own parser over a script. `Ok(None)` = that shell is not
+/// installed here.
+#[cfg(unix)]
+fn parse_check(bin: &str, args: &[&str], script: &str, ext: &str) -> Option<std::process::Output> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(format!("clauth{ext}"));
+    std::fs::write(&path, script).expect("write script");
+    match std::process::Command::new(bin)
+        .args(args)
+        .arg(&path)
+        .output()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => panic!("could not run `{bin}`: {e}"),
+        Ok(out) => Some(out),
+    }
+}
+
+/// The parser reports where it ran out of input, not where the quote opened —
+/// on the real regression it said line 65 (the closing `}`) for a fault on
+/// line 13. So the message does the localizing the parser refuses to.
+#[cfg(unix)]
+fn lint_failure(shell: &str, bin: &str, script: &str, out: &std::process::Output) -> String {
+    let mut msg = format!(
+        "the {shell} completion script does not parse: `{bin}` exited {}.\n\
+         This ships verbatim — `clauth completions install {shell}` writes it and sources it \
+         from the user's rc, so a parse error here kills completion for the ENTIRE clauth \
+         command, not just the new verb.\n{bin} said:\n{}\n",
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    if shell == "zsh" {
+        for (i, line) in script.lines().enumerate() {
+            if line.matches('\'').count() % 2 == 1 {
+                msg.push_str(&format!(
+                    "\nLIKELY CAUSE — odd number of single quotes on script line {}:\n  {line}\n\
+                     Every _values/_describe spec in the zsh script is SINGLE-quoted, so an \
+                     apostrophe inside a description (a possessive like `profile's`) ends the \
+                     string. Reword to drop the apostrophe; do NOT backslash-escape it, since \
+                     a backslash is literal inside zsh single quotes.\n",
+                    i + 1,
+                ));
+            }
+        }
+    }
+    msg
+}
+
+#[cfg(unix)]
+#[test]
+fn every_completion_script_parses_in_its_own_shell() {
+    // A skip must not be able to masquerade as a pass. nextest (what CI runs)
+    // discards a passing test's output, so the eprintln alone would be silent:
+    // CI sets CLAUTH_REQUIRE_SHELL_LINT=1 and a missing shell becomes a
+    // failure there, while a dev box without fish still gets a useful run.
+    let strict = std::env::var("CLAUTH_REQUIRE_SHELL_LINT").as_deref() == Ok("1");
+    let mut parsed: Vec<&str> = Vec::new();
+    for (shell, bin, args, script, ext) in [
+        ("bash", "bash", &["-n"][..], &BASH, ".bash"),
+        ("zsh", "zsh", &["-n"][..], &ZSH, ".zsh"),
+        ("fish", "fish", &["--no-execute"][..], &FISH, ".fish"),
+    ] {
+        match parse_check(bin, args, script, ext) {
+            None => {
+                assert!(
+                    !strict,
+                    "{bin} is not installed, but CLAUTH_REQUIRE_SHELL_LINT=1 demands it"
+                );
+                eprintln!("SKIP: {bin} not installed; the {shell} script was NOT parsed");
+            }
+            Some(out) => {
+                parsed.push(shell);
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    lint_failure(shell, bin, script, &out)
+                );
+            }
+        }
+    }
+    // Floor: on a host with no shell at all this test would otherwise pass
+    // three times over having parsed nothing.
+    assert!(
+        parsed.contains(&"bash"),
+        "no shell parsed anything — this leg proved nothing"
+    );
+}
+
+/// Proof the leg can actually fail. Without this, a refactor that swallows the
+/// exit status turns it into a permanently green no-op and the class silently
+/// reopens — which is exactly how the first one shipped.
+#[cfg(unix)]
+#[test]
+fn the_zsh_leg_would_catch_an_apostrophe_in_a_description() {
+    let broken = concat!(
+        "_clauth() {\n",
+        "    _values 'subcommand' 'feed[feed a profile's session token]'\n",
+        "}\n"
+    );
+    match parse_check("zsh", &["-n"], broken, ".zsh") {
+        None => eprintln!("SKIP: zsh not installed; the mutation guard did not run"),
+        Some(out) => assert!(
+            !out.status.success(),
+            "`zsh -n` accepted an apostrophe inside a single-quoted _values spec, so the real \
+             leg would not have caught the CLA-ROLL regression either"
+        ),
+    }
+}
+
+/// Portable backstop: runs even on the Windows leg and on a shell-less host.
+/// Scoped to ZSH deliberately — the same parity scan over FISH false-positives
+/// on `-d "Launch claude with that profile's runtime"`, where the apostrophe is
+/// legitimately inside DOUBLE quotes.
+///
+/// `'"'"'` is the one way to get an apostrophe INTO a single-quoted zsh word
+/// and it is balanced by construction — close the string, emit a double-quoted
+/// `'`, reopen — so it is elided before counting rather than counted as the
+/// three quotes it spells. Without that the scan reds on correct zsh, which is
+/// what a merge proved: this guard and the `herdr` rows that use the idiom
+/// landed from two branches, each green alone. `zsh -n` above is the leg that
+/// judges everything this parity check cannot.
+#[test]
+fn no_zsh_spec_line_has_an_unbalanced_single_quote() {
+    for (i, line) in ZSH.lines().enumerate() {
+        assert!(
+            zsh_quote_parity_holds(line),
+            "odd number of single quotes on ZSH line {}: {line}",
+            i + 1
+        );
+    }
+}
+
+/// One spelling, so the negative leg below pins what the scan above runs rather
+/// than a copy of it.
+fn zsh_quote_parity_holds(line: &str) -> bool {
+    line.replace("'\"'\"'", "")
+        .matches('\'')
+        .count()
+        .is_multiple_of(2)
+}
+
+/// The elision must not become a hole the original class hides in: an
+/// apostrophe pasted straight into a `_values` spec still reds, on a line
+/// carrying the idiom as much as on one that does not. Without this leg the
+/// scan passes for the two reasons that read alike, and only one of them is
+/// the guard working.
+#[test]
+fn the_parity_scan_still_catches_a_bare_apostrophe_beside_the_escape_idiom() {
+    assert!(
+        !zsh_quote_parity_holds(
+            "    _values 'subcommand' 'install[wire it into herdr'\"'\"'s config]' \
+             'feed[feed a profile's session token]'"
+        ),
+        "the elision swallowed a real unbalanced quote, so the backstop proves nothing"
+    );
+    assert!(
+        zsh_quote_parity_holds(
+            "    _values 'subcommand' 'install[wire it into herdr'\"'\"'s config]'"
+        ),
+        "the idiom alone is balanced zsh and must not red"
+    );
 }

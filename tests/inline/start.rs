@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
 use std::fs;
 use std::process::Command;
@@ -71,104 +72,96 @@ fn apply_spawn_cwd_none_inherits_process_cwd() {
     assert_eq!(resolved, std::env::current_dir().ok());
 }
 
-// ── auto-rescue: the effective-decision + isolated-store teardown ──
+// ── rescue: the isolated-store teardown every isolated run gets ──
 
-/// The pure effective-decision: a per-run `--rescue`/`--no-rescue` override
-/// (`Some`) beats the persisted `auto_rescue` toggle; with no override the
-/// toggle decides. This is the whole gate `run` composes with `isolation ==
-/// Isolated` at teardown.
+/// A bare `clauth start --isolated`, with no flag and no config key asked for,
+/// lifts both legs into the global store: the transcript becomes resumable
+/// (mirrored `<slug>/<id>.jsonl`) and the session sidecars follow it, each moved
+/// rather than copied — the isolated tree is discarded right after.
 #[test]
-fn rescue_effective_override_beats_toggle() {
-    // No per-run flag → the persisted toggle decides.
-    assert!(
-        !rescue_effective(None, false),
-        "default OFF stays off (discard)"
-    );
-    assert!(rescue_effective(None, true), "toggle ON rescues");
-    // A per-run flag overrides the toggle either way.
-    assert!(
-        !rescue_effective(Some(false), true),
-        "--no-rescue beats a true toggle"
-    );
-    assert!(
-        rescue_effective(Some(true), false),
-        "--rescue beats a false toggle"
-    );
-}
-
-/// Bit-identical guard: with rescue OFF (default toggle, no flag) the teardown
-/// gate never invokes the store move, so the isolated transcript is left for the
-/// runtime GC to discard and the global store stays empty.
-#[test]
-fn rescue_off_leaves_isolated_store_to_discard() {
+fn an_isolated_teardown_moves_the_session_into_the_global_store() {
     let sb = HomeSandbox::new();
-    let iso = sb
-        .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects");
-    let global = sb.home().join(".claude/projects");
-    let src = iso.join("-w-iso/s1.jsonl");
+    let iso = sb.home().join(".clauth/profiles/iso/runtime-isolated");
+    let claude_home = sb.home().join(".claude");
+    let src = iso.join("projects/-w-iso/s1.jsonl");
     fs::create_dir_all(src.parent().unwrap()).unwrap();
     fs::write(&src, "transcript").unwrap();
+    let snap = iso.join("shell-snapshots/snap.sh");
+    fs::create_dir_all(snap.parent().unwrap()).unwrap();
+    fs::write(&snap, "iso shell").unwrap();
 
-    // Mirror teardown exactly: decide via the real fn, only move when true.
-    let moved = if rescue_effective(None, false) {
-        crate::sessions::rescue_isolated_store(&iso, &global)
-    } else {
-        0
-    };
-
-    assert_eq!(moved, 0, "default OFF must not rescue");
-    assert!(
-        src.exists(),
-        "the isolated transcript is left to be discarded"
+    assert_eq!(
+        teardown(&iso, &claude_home),
+        (1, 1),
+        "an isolated run rescues both legs with nothing asked for"
     );
-    assert!(
-        !global.join("-w-iso/s1.jsonl").exists(),
-        "the global store stays empty — stock discard behavior"
-    );
-}
 
-/// Rescue ON (via the toggle) lifts the isolated transcript into the global
-/// store: it becomes resumable (mirrored `<slug>/<id>.jsonl`) and the source is
-/// moved, not copied.
-#[test]
-fn rescue_on_moves_isolated_transcript_into_global_store() {
-    let sb = HomeSandbox::new();
-    let iso = sb
-        .home()
-        .join(".clauth/profiles/iso/runtime-isolated/projects");
-    let global = sb.home().join(".claude/projects");
-    let src = iso.join("-w-iso/s1.jsonl");
-    fs::create_dir_all(src.parent().unwrap()).unwrap();
-    fs::write(&src, "transcript").unwrap();
-
-    let moved = if rescue_effective(None, true) {
-        crate::sessions::rescue_isolated_store(&iso, &global)
-    } else {
-        0
-    };
-
-    assert_eq!(moved, 1, "toggle ON rescues the one transcript");
-    let landed = global.join("-w-iso/s1.jsonl");
-    assert!(
-        landed.exists(),
+    let landed = claude_home.join("projects/-w-iso/s1.jsonl");
+    assert_eq!(
+        fs::read(&landed).unwrap(),
+        b"transcript",
         "the transcript lands in the resumable global store"
     );
-    assert_eq!(fs::read(&landed).unwrap(), b"transcript");
     assert!(!src.exists(), "source moved, not copied");
+    assert_eq!(
+        fs::read_to_string(claude_home.join("shell-snapshots/snap.sh")).unwrap(),
+        "iso shell",
+        "the sidecar state a resumed session needs follows it"
+    );
+    assert!(!snap.exists(), "the sidecar moved too");
 }
 
-/// The gate `run` applies plus the production teardown, so a change to either
+/// `run`'s rescue leg cannot be driven without a real `claude` child, which this
+/// crate never fakes, so it is pinned over the source: the teardown tests own
+/// whether the move works, and this owns what stands between the stamp leg and
+/// the end of the teardown region.
+///
+/// An EQUALITY rather than a `contains`, because a needle that only looks for the
+/// condition is blind to every spelling that leaves the condition's own bytes
+/// intact — a shadowing `let isolated = isolated && <key>;` hoisted above it, an
+/// outer `if` wrapping the leg, an early return between the two. Each disables
+/// the rescue for a stock user. Measured over the real source text: the
+/// `contains` form this replaced caught 2 of 5 mutation spellings, the equality
+/// catches 5 of 5 and does not red the code as it stands.
+///
+/// What it cannot decide, stated because a scan reads stronger than it is: an
+/// early `return` or `?` placed BEFORE the stamp leg, i.e. above this window. A
+/// window pin never sees above its own window, and nothing else here covers it.
+#[test]
+fn the_start_teardown_tail_is_the_rescue_leg_gated_on_isolation_alone() {
+    let src = include_str!("../../src/start.rs");
+    let body = src
+        .split_once("pub(crate) fn run(")
+        .expect("run is defined")
+        .1;
+    // Bounded at the drop that discards the tree, i.e. the end of the teardown
+    // legs: past it lies the exit-code tail this test has no business reading.
+    let legs = body
+        .split_once("drop(runtime);")
+        .expect("the runtime is dropped after the teardown legs")
+        .0;
+    let dense: String = legs
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .flat_map(str::chars)
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let tail = dense
+        .rsplit_once("run_start);}")
+        .expect("the stamp leg precedes the rescue leg")
+        .1;
+    assert_eq!(
+        tail,
+        "ifisolated&&letOk(claude_home)=crate::profile::claude_dir(){\
+         rescue_teardown(runtime.config_dir(),runtime.sessions_dir(),&claude_home);}",
+        "between the stamp leg and the end of the teardown region there must be \
+         the rescue leg and nothing else, gated on the isolation alone"
+    );
+}
+
+/// The production teardown plus the sessions dir it reads, so a change to either
 /// shows up here. A fresh sessions dir holds one live marker: this session's.
-fn teardown(
-    rescue_override: Option<bool>,
-    auto_rescue: bool,
-    iso_root: &std::path::Path,
-    claude_home: &std::path::Path,
-) -> (usize, usize) {
-    if !rescue_effective(rescue_override, auto_rescue) {
-        return (0, 0);
-    }
+fn teardown(iso_root: &std::path::Path, claude_home: &std::path::Path) -> (usize, usize) {
     let sessions = iso_root.with_file_name("sessions-isolated");
     fs::create_dir_all(&sessions).unwrap();
     let _self_marker = live_marker(&sessions.join("1234-0"));
@@ -191,11 +184,12 @@ fn live_marker(path: &std::path::Path) -> fs::File {
     file
 }
 
-/// The refcount gate: the isolated runtime tree is SHARED by every session of
-/// that profile+flavor (overlapping `delegate`s hold several), and only the last
-/// one out sees it discarded. An exit while a sibling is still live must move
-/// nothing — rescuing `shell-snapshots/` out from under a running Claude Code
-/// would break its Bash tool mid-session.
+/// The guard's `> 1` arm as defence in depth: a same-sid collision or a legacy
+/// shared dir leaves a sibling's live marker in the sessions dir, and an exit
+/// while a sibling is still live must move nothing. Rescuing `shell-snapshots/`
+/// out from under a running Claude Code would break its Bash tool mid-session.
+/// A normal isolated session owns its dir, so the `None` arm is the other path
+/// to the refusal: it fires when the marker dir could not be read.
 #[test]
 fn rescue_moves_nothing_while_a_sibling_session_is_live() {
     let sb = HomeSandbox::new();
@@ -230,31 +224,6 @@ fn rescue_moves_nothing_while_a_sibling_session_is_live() {
     assert_eq!(rescue_teardown(&iso, &sessions, &claude_home), (1, 1));
 }
 
-/// Bit-identical guard, sidecar half: with rescue OFF nothing at all leaves the
-/// isolated tree — the sidecars are left for the runtime GC alongside the
-/// transcripts.
-#[test]
-fn rescue_off_leaves_sidecars_to_discard() {
-    let sb = HomeSandbox::new();
-    let iso = sb.home().join(".clauth/profiles/iso/runtime-isolated");
-    let claude_home = sb.home().join(".claude");
-    fs::create_dir_all(iso.join("shell-snapshots")).unwrap();
-    fs::write(iso.join("shell-snapshots/snap.sh"), "iso shell").unwrap();
-    fs::create_dir_all(iso.join("projects/-w-iso")).unwrap();
-    fs::write(iso.join("projects/-w-iso/s1.jsonl"), "transcript").unwrap();
-
-    assert_eq!(
-        teardown(None, false, &iso, &claude_home),
-        (0, 0),
-        "default OFF rescues neither leg"
-    );
-    assert!(iso.join("shell-snapshots/snap.sh").exists());
-    assert!(
-        !claude_home.join("shell-snapshots").exists(),
-        "the global store stays untouched — stock discard behavior"
-    );
-}
-
 /// A sidecar entry that cannot move (its global parent is occupied by a FILE)
 /// is logged and skipped: teardown still completes, the rest of the sidecars
 /// move, and the transcript leg's result is untouched.
@@ -273,7 +242,7 @@ fn sidecar_failure_leaves_teardown_and_transcript_rescue_intact() {
     fs::create_dir_all(claude_home.join("file-history")).unwrap();
     fs::write(claude_home.join("file-history/sess-a"), "in the way").unwrap();
 
-    let (transcripts, sidecars) = teardown(None, true, &iso, &claude_home);
+    let (transcripts, sidecars) = teardown(&iso, &claude_home);
 
     assert_eq!(
         (transcripts, sidecars),
@@ -328,7 +297,39 @@ fn chain_ready_config(name: &str) -> AppConfig {
 /// Nothing else in these tests creates it, so its absence is what proves the probe
 /// never ran.
 fn profile_dir_of(name: &str) -> std::path::PathBuf {
-    crate::profile::profile_dir(name).expect("profile dir")
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("profile dir")
+}
+
+/// Assert the eligible twin cleared every gate under test — the twin each refusal
+/// below keeps to prove it refused for the reason it names and not for a broken
+/// setup.
+///
+/// On a host that shares one runtime tree across a profile's sessions (Windows
+/// outside Developer Mode, which probes into `LinkMode::Fake`) the twin is refused
+/// anyway, by the transport probe. That probe runs LAST, after every gate these
+/// tests break one at a time, so reaching it concedes exactly what `Ok` concedes
+/// about the gates above — and demanding `Ok` there asserts the right thing about
+/// the wrong host. Nothing is weakened where the swap is supported: the probe
+/// answers `None` and this is the `expect` it replaced.
+///
+/// Call it only on the twin, never on a refusal under test: it reads the transport
+/// probe, which materializes the profile dir.
+#[track_caller]
+fn the_eligible_twin_clears_every_gate(verdict: Result<()>, name: &str) {
+    match crate::runtime::unsupported_swap_transport(&crate::profile::ProfileName::from(name))
+        .expect("probe the transport")
+    {
+        None => {
+            verdict.expect("the eligible twin must clear every gate");
+        }
+        Some(why) => assert_eq!(
+            verdict
+                .expect_err("a shared-tree host refuses the twin at the transport probe")
+                .to_string(),
+            unsupported_host_refusal(&crate::profile::ProfileName::from(name), why),
+            "the twin must reach the transport probe and be refused only there"
+        ),
+    }
 }
 
 /// Both unsupported-host arms' copy, as literals. `cfg!(target_os = "macos")`
@@ -337,12 +338,18 @@ fn profile_dir_of(name: &str) -> std::path::PathBuf {
 #[test]
 fn the_unsupported_host_refusal_names_each_cause() {
     assert_eq!(
-        unsupported_host_refusal("acme", SwapUnsupported::KeychainFirst),
+        unsupported_host_refusal(
+            &crate::profile::ProfileName::from("acme"),
+            SwapUnsupported::KeychainFirst
+        ),
         "'acme': --with-fallback needs a per-session credential swap, but this host \
          resolves credentials keychain-first; start without it"
     );
     assert_eq!(
-        unsupported_host_refusal("acme", SwapUnsupported::SharedRuntimeTree),
+        unsupported_host_refusal(
+            &crate::profile::ProfileName::from("acme"),
+            SwapUnsupported::SharedRuntimeTree
+        ),
         "'acme': --with-fallback needs a per-session credential swap, but this host \
          shares one runtime tree across the profile's sessions; start without it"
     );
@@ -357,7 +364,9 @@ fn with_fallback_refuses_a_keychain_first_host() {
     let _sb = HomeSandbox::new();
     let _daemon = crate::daemon::hold_daemon_lock();
     let config = chain_ready_config("macish");
-    let profile = config.find("macish").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("macish"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
         .expect_err("a keychain-first host must refuse");
@@ -367,8 +376,10 @@ fn with_fallback_refuses_a_keychain_first_host() {
          resolves credentials keychain-first; start without it"
     );
 
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("the same profile off a keychain-first host is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "macish",
+    );
 }
 
 /// The freshness gate the decision leg runs reads only the OAuth store, which is
@@ -381,7 +392,9 @@ fn with_fallback_refuses_a_non_oauth_profile() {
     let _daemon = crate::daemon::hold_daemon_lock();
     let mut third_party = chain_ready_config("thirdparty");
     third_party.profiles[0].base_url = Some("https://api.example.com".to_string());
-    let profile = third_party.find("thirdparty").expect("fixture profile");
+    let profile = third_party
+        .find(&crate::profile::ProfileName::from("thirdparty"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&third_party, profile, Isolation::Shared, false)
         .expect_err("a custom endpoint must refuse");
@@ -392,9 +405,13 @@ fn with_fallback_refuses_a_non_oauth_profile() {
     );
 
     let oauth = chain_ready_config("thirdparty");
-    let profile = oauth.find("thirdparty").expect("fixture profile");
-    refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false)
-        .expect("the same profile without an endpoint is eligible");
+    let profile = oauth
+        .find(&crate::profile::ProfileName::from("thirdparty"))
+        .expect("fixture profile");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false),
+        "thirdparty",
+    );
 }
 
 /// A session's chain snapshot returns `None` for a member outside the chain, so
@@ -406,7 +423,9 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
     let _daemon = crate::daemon::hold_daemon_lock();
     let mut loner = chain_ready_config("loner");
     loner.state.fallback_chain.clear();
-    let profile = loner.find("loner").expect("fixture profile");
+    let profile = loner
+        .find(&crate::profile::ProfileName::from("loner"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&loner, profile, Isolation::Shared, false)
         .expect_err("a non-member must refuse");
@@ -417,9 +436,13 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
     );
 
     let member = chain_ready_config("loner");
-    let profile = member.find("loner").expect("fixture profile");
-    refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false)
-        .expect("the same profile inside the chain is eligible");
+    let profile = member
+        .find(&crate::profile::ProfileName::from("loner"))
+        .expect("fixture profile");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false),
+        "loner",
+    );
 }
 
 /// Nothing writes a session's `intended_member` but the daemon's decision leg, so
@@ -430,7 +453,9 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
 fn with_fallback_refuses_when_no_daemon_is_running() {
     let _sb = HomeSandbox::new();
     let config = chain_ready_config("undaemoned");
-    let profile = config.find("undaemoned").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("undaemoned"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
         .expect_err("no daemon must refuse");
@@ -441,8 +466,10 @@ fn with_fallback_refuses_when_no_daemon_is_running() {
     );
 
     let _daemon = crate::daemon::hold_daemon_lock();
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("a held singleton is the whole requirement");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "undaemoned",
+    );
 }
 
 /// `singleton_held` separates "nobody there" from "can't tell" precisely so a
@@ -457,7 +484,9 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
     let lock_path = crate::daemon::daemon_lock_path();
     fs::create_dir_all(&lock_path).expect("mkdir over the lock path");
     let config = chain_ready_config("unreadable");
-    let profile = config.find("unreadable").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("unreadable"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
         .expect_err("an unreadable daemon lock must refuse");
@@ -469,8 +498,10 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
 
     fs::remove_dir(&lock_path).expect("clear the lock path");
     let _daemon = crate::daemon::hold_daemon_lock();
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("a readable, held lock is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "unreadable",
+    );
 }
 
 /// A chain whose only member is this profile is accepted by a bare membership
@@ -485,7 +516,9 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
     lone.state
         .fallback_chain
         .retain(|n| n.as_str() == "onlyone");
-    let profile = lone.find("onlyone").expect("fixture profile");
+    let profile = lone
+        .find(&crate::profile::ProfileName::from("onlyone"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&lone, profile, Isolation::Shared, false)
         .expect_err("a chain of one must refuse");
@@ -496,9 +529,13 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
     );
 
     let paired = chain_ready_config("onlyone");
-    let profile = paired.find("onlyone").expect("fixture profile");
-    refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false)
-        .expect("the same profile in a chain with a second member is eligible");
+    let profile = paired
+        .find(&crate::profile::ProfileName::from("onlyone"))
+        .expect("fixture profile");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false),
+        "onlyone",
+    );
 }
 
 /// `--isolated` is refused by clap, which is where the user meets it. But `run` is
@@ -510,7 +547,9 @@ fn with_fallback_refuses_an_isolated_session() {
     let _sb = HomeSandbox::new();
     let _daemon = crate::daemon::hold_daemon_lock();
     let config = chain_ready_config("throwaway");
-    let profile = config.find("throwaway").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("throwaway"))
+        .expect("fixture profile");
 
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Isolated, false)
         .expect_err("an isolated session must refuse");
@@ -520,8 +559,10 @@ fn with_fallback_refuses_an_isolated_session() {
          isolated session follows no chain"
     );
 
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("the same profile as a shared session is eligible");
+    the_eligible_twin_clears_every_gate(
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        "throwaway",
+    );
 }
 
 /// Every gate that can answer without the disk runs BEFORE the transport probe,
@@ -534,7 +575,9 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     let _sb = HomeSandbox::new();
     // No daemon held: the last pure gate refuses.
     let config = chain_ready_config("untouched");
-    let profile = config.find("untouched").expect("fixture profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("untouched"))
+        .expect("fixture profile");
     let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
         .expect_err("no daemon must refuse");
     // WHICH gate refused is the whole subject here: a fixture that drifted into
@@ -565,9 +608,23 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     );
 
     // The eligible path DOES probe — otherwise the assertions above pass for a
-    // gate that simply never runs the probe at all.
-    refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
-        .expect("the eligible setup passes");
+    // gate that simply never runs the probe at all. Read off
+    // `refuse_unless_chain_eligible` alone: `the_eligible_twin_clears_every_gate`
+    // reads the transport probe itself, which materializes the dir, so routing
+    // this control through it would assert against the helper's own side effect.
+    // Past every pure gate the only refusal left is the probe's own, and it
+    // materializes the dir before it refuses, so the dir is there either way.
+    match refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false) {
+        Ok(()) => {}
+        Err(e) => assert_eq!(
+            e.to_string(),
+            unsupported_host_refusal(
+                &crate::profile::ProfileName::from("untouched"),
+                SwapUnsupported::SharedRuntimeTree
+            ),
+            "a host that cleared every pure gate can only be refused by the probe"
+        ),
+    }
     assert!(
         profile_dir_of("untouched").is_dir(),
         "the transport probe runs once everything else has cleared"
@@ -587,8 +644,15 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
     let mut loner = chain_ready_config("wired");
     loner.state.fallback_chain.clear();
 
-    let err = run(&loner, "wired", &[], Isolation::Shared, None, None, true)
-        .expect_err("an opted-in start must be gated");
+    let err = run(
+        &loner,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        true,
+    )
+    .expect_err("an opted-in start must be gated");
     // WHICH gate answers is platform-decided, since `run` passes
     // `cfg!(target_os = "macos")` in and the unsupported-host arm precedes the
     // membership one. Each build sees one arm, so it is the ubuntu and macOS CI
@@ -605,11 +669,208 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         }
     );
 
-    let err = run(&loner, "wired", &[], Isolation::Shared, None, None, false)
-        .expect_err("the sandbox has no ~/.claude to launch against");
+    let err = run(
+        &loner,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+    )
+    .expect_err("the sandbox has no ~/.claude to launch against");
     assert_eq!(
         err.to_string(),
         "~/.claude not found; install Claude Code first",
         "a bare start must skip the gate entirely"
+    );
+}
+
+// ── the plugin pre-flight ─────────────────────────────────────────────────
+
+/// The migration trigger's own pin: a `clauth start` heals a broken plugin
+/// registration before `claude` launches, and a healthy one costs no `claude
+/// plugin` spawn at all. Both halves drive the real `run` chokepoint against
+/// the fake-`claude` harness, so the shim's call log is the evidence.
+#[cfg(unix)]
+#[test]
+fn start_heals_the_plugin_registry_only_when_it_is_broken() {
+    use crate::testutil::{ConfigDirSandbox, FakeClaude, HomeSandbox};
+
+    let sb = HomeSandbox::new();
+    let claude = sb.home().join(".claude");
+    std::fs::create_dir_all(&claude).expect("~/.claude");
+    let _config = ConfigDirSandbox::new(&sb, &claude);
+    let fake = FakeClaude::new(&sb);
+    // `acquire` re-reads the account record from disk under the state flock, so
+    // the sandbox needs the profile the run starts under persisted the way
+    // `load_config` walks it.
+    let clauth_dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&clauth_dir).expect("clauth dir");
+    std::fs::write(
+        clauth_dir.join("profiles.toml"),
+        "profiles = [\"wired\", \"spare\"]\n",
+    )
+    .expect("profiles.toml");
+    let config = chain_ready_config("wired");
+
+    // Healthy: the gate reads the seeded registry, sees the materialized
+    // pointer with its manifest, and the heal stays out of the launch.
+    let expected = crate::plugin_host::expected_pointer().expect("pointer");
+    std::fs::create_dir_all(expected.join(".claude-plugin")).expect("pointer tree");
+    std::fs::write(
+        expected.join(".claude-plugin").join("marketplace.json"),
+        "{}",
+    )
+    .expect("manifest");
+    let path = expected.to_string_lossy().into_owned();
+    let marketplaces = serde_json::json!({
+        "clauth": {"source": {"source": "directory", "path": path}, "installLocation": path, "lastUpdated": "2026-08-26T00:00:00.000Z"}
+    });
+    let plugins = serde_json::json!({
+        "version": 2,
+        "plugins": {"clauth@clauth": [{"scope": "user", "installPath": path, "version": "0.14.1"}]}
+    });
+    let plugins_dir = claude.join("plugins");
+    std::fs::create_dir_all(&plugins_dir).expect("plugins dir");
+    for (name, value) in [
+        ("known_marketplaces.json", &marketplaces),
+        ("installed_plugins.json", &plugins),
+    ] {
+        std::fs::write(
+            plugins_dir.join(name),
+            serde_json::to_vec_pretty(value).expect("seed json"),
+        )
+        .expect("seed registry");
+    }
+
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+    )
+    .expect("healthy start");
+    assert!(
+        !fake.log().contains("plugin"),
+        "a healthy start must spawn no claude plugin calls, got:\n{}",
+        fake.log()
+    );
+
+    // Broken: the marketplace registration vanishes, and the next start heals
+    // it through the lifecycle before claude launches.
+    std::fs::remove_file(plugins_dir.join("known_marketplaces.json")).expect("remove registry");
+    run(
+        &config,
+        &crate::profile::ProfileName::from("wired"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+    )
+    .expect("broken start");
+    assert!(
+        fake.log().contains("plugin list --json"),
+        "a broken registration must heal at start, got:\n{}",
+        fake.log()
+    );
+}
+
+// ── the runtime settings merge's strip list ──────────────────────────────
+
+/// The runtime settings merge at session start strips the OUTGOING
+/// activation's custom env from the shared base — `actions::outgoing_env_keys`,
+/// which with no marker to read answers every configured profile's keys.
+/// Passing an empty list there (what the site did before) leaves the departed
+/// account's `[env]` entries in the base untouched, and the merge then pairs
+/// them with the started account's endpoint in the runtime settings.
+/// Reach: `switch_off` (clears the marker, never the file), then
+/// `clauth start <other>`.
+///
+/// Drives the real `run` against a slow shim, so the list under test is the
+/// one `run` itself computes, and reads the runtime settings.json MID-run:
+/// the drop removes the tree once the child exits, leaving nothing to assert.
+#[cfg(unix)]
+#[test]
+#[cfg(unix)]
+fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_endpoint() {
+    use crate::testutil::HomeSandbox;
+
+    let sb = HomeSandbox::new();
+    let claude_home = sb.home().join(".claude");
+    fs::create_dir_all(&claude_home).expect("~/.claude");
+
+    let mut departing = Profile::new("departing".to_string(), None, None);
+    departing.env.insert(
+        "ANTHROPIC_API_KEY".to_string(),
+        "departing-token".to_string(),
+    );
+    departing.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-departing".to_string(),
+            refresh_token: Some("rt-departing".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    });
+    let target = Profile::new(
+        "target".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-target".to_string()),
+    );
+    crate::profile::save_profile(&departing).expect("save departing");
+    crate::profile::save_profile(&target).expect("save target");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["departing".into(), "target".into()],
+            active_profile: Some("departing".into()),
+            ..AppState::default()
+        },
+        profiles: vec![departing, target],
+    };
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let departing_ref = config
+        .find(&crate::profile::ProfileName::from("departing"))
+        .expect("profile");
+    crate::claude::apply_profile_to_claude_settings(departing_ref, &[])
+        .expect("seed the departing account's env into the live settings");
+
+    crate::actions::switch_off(&mut config).expect("switch off");
+    assert_eq!(
+        config.state.active_profile, None,
+        "fixture: the marker must be cleared, which is what the start then reads"
+    );
+
+    let shim = crate::testutil::SlowClaude::new(&sb);
+    let target_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("target"))
+        .expect("profile dir");
+    let observer = std::thread::spawn(move || crate::testutil::runtime_settings_until(&target_dir));
+    run(
+        &config,
+        &crate::profile::ProfileName::from("target"),
+        &[],
+        Isolation::Shared,
+        None,
+        false,
+    )
+    .expect("start");
+    let settings = observer
+        .join()
+        .expect("observer thread")
+        .expect("the runtime settings never appeared");
+    drop(shim);
+
+    let json: serde_json::Value = serde_json::from_str(&settings).expect("parse settings");
+    assert_eq!(
+        json["env"]["ANTHROPIC_BASE_URL"],
+        serde_json::json!("https://api.deepseek.com/anthropic"),
+        "fixture: the merge ran, pointing the runtime at the started endpoint"
+    );
+    assert!(
+        json["env"].get("ANTHROPIC_API_KEY").is_none(),
+        "a departed account's env key must not survive in front of the started \
+         account's endpoint: {settings}"
     );
 }

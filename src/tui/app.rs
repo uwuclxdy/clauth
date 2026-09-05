@@ -23,9 +23,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crate::actions::{
     CaptureSnapshot, EnvKeyCollision, capture_into_profile, capture_snapshot, classify_env_key,
     clear_profile_api_key, clear_profile_credentials, create_blank_profile,
-    create_profile_from_login, delete_profile, edit_profile_endpoint, edit_profile_env,
-    edit_profile_model, find_matching_oauth_profile, overwrite_captured_profile, rename_profile,
-    reorder_profile, switch_off, switch_profile, validate_profile_name,
+    create_profile_from_login, delete_profile, duplicate_profile, edit_profile_endpoint,
+    edit_profile_env, edit_profile_model, edit_profile_preset, find_matching_oauth_profile,
+    overwrite_captured_profile, rename_profile, reorder_profile, rotation_guard_for_mutation,
+    switch_off, switch_profile, validate_profile_name,
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
@@ -39,10 +40,10 @@ use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
 use crate::oauth;
 use crate::profile::{
-    AppConfig, ClockFormat, ConfigHandle, DivergenceChoice, MAX_REFRESH_INTERVAL_MS,
-    MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings, Profile,
-    ReloadFingerprint, ResetDisplay, ThemeName, load_config, reload_fingerprint, save_app_state,
-    save_profile,
+    AppConfig, ClockFormat, ConfigHandle, ConsoleSite, DivergenceChoice, HerdrSettings,
+    MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT,
+    ModelSettings, PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName,
+    load_config, reload_fingerprint, save_app_state, save_profile,
 };
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::theme;
@@ -218,13 +219,17 @@ pub(crate) enum ConfigRow {
     SonnetModel,
     /// `ANTHROPIC_DEFAULT_HAIKU_MODEL` — full id, free text.
     HaikuModel,
+    /// `ANTHROPIC_DEFAULT_FABLE_MODEL` — full id, free text.
+    FableModel,
     /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
     SubagentModel,
     /// The `+ model override` reveal row. Shown only while the unset alias
-    /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/subagent inline.
+    /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/fable/subagent inline.
     ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
-    /// snapshot. ⏎ edits the value inline; `a` → `remove field` deletes it.
+    /// snapshot. ⏎ edits its VALUE. There is no removal action: an emptied value
+    /// saves as an empty string, so the key stays in `settings.json` until the
+    /// account's `config.toml` is edited by hand.
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
@@ -233,8 +238,18 @@ pub(crate) enum ConfigRow {
     Login,
     /// Drop this account's stored OAuth credentials, keeping the profile shell.
     DeleteCreds,
-    /// User-disabled account-action row (`Profile::disabled`, see
-    /// `docs/fallback.md`), same class as `Delete`: enabling fires the shared
+    /// CLA-SPLIT escape hatch: delete this account's `session-token.json`, so
+    /// switches go back to installing its own `credentials.json`. Shown only
+    /// while a sidecar exists (`claude::session_token_status`, so a MIS-FILLED
+    /// one gets the row too — that state needs an exit as much as a live mint),
+    /// and dimmed + inert when the account stores no other login, since
+    /// clearing would leave it with no credentials at all. Arms on the first
+    /// Space/⏎ and confirms on the second, like `Disabled`'s disable direction:
+    /// it changes what every future switch installs and, on the active account,
+    /// moves a running session's credentials.
+    ClearSessionToken,
+    /// User-disabled account-action row (`Profile::disabled`), same class as
+    /// `Delete`: enabling fires the shared
     /// `actions::enable_profile` immediately (harmless), disabling arms on the
     /// first Space/⏎ and confirms on the second, via `actions::disable_profile`.
     /// Dimmed and inert while the account is active or holds a live `clauth
@@ -258,6 +273,7 @@ impl ConfigRow {
                 | ConfigRow::OpusModel
                 | ConfigRow::SonnetModel
                 | ConfigRow::HaikuModel
+                | ConfigRow::FableModel
                 | ConfigRow::SubagentModel
         )
     }
@@ -342,6 +358,11 @@ pub(crate) enum GlobalConfigRow {
     /// spent account until its window resets — a fetch-leg optimization only,
     /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
     RefreshSpentAccounts,
+    /// Whether the `auto_start` auto-start kick is interleaved across accounts, so
+    /// their 5h windows open `5h / N` apart instead of all at once
+    /// (`AppState.auto_start_queue`, default OFF — for one account the queue is
+    /// a no-op, so the operator opts in). ENUMERATED on/off, ⏎ mirrors space.
+    AutoStartQueue,
 }
 
 /// Inline editor state for the Config detail pane. Built on entry, torn down
@@ -358,18 +379,24 @@ pub(crate) struct ConfigDraft {
     pub(crate) opus_model: InputState,
     pub(crate) sonnet_model: InputState,
     pub(crate) haiku_model: InputState,
+    pub(crate) fable_model: InputState,
     pub(crate) subagent_model: InputState,
     /// Value buffer for the env entry currently being edited (seeded on entry).
     /// Shared across `EnvEntry` rows since only one is active at a time.
     pub(crate) env_value: InputState,
     /// Key buffer for the `+ add env` row's key editor.
     pub(crate) env_new_key: InputState,
+    /// Key of an env entry added this draft whose value has had no commit
+    /// since the add. Escape on that entry's editor removes the row (cancel
+    /// semantics) instead of keeping the empty placeholder; any value commit
+    /// on the key clears it.
+    pub(crate) env_just_added: Option<String>,
     /// `Some(row)` while a text row (or the `model` custom field) owns the keyboard.
     pub(crate) active: Option<ConfigRow>,
-    /// The account-action row (`Delete`, or `Disabled` in the disable
-    /// direction only — enabling is immediate, never armed) currently armed by
-    /// a first ⏎; a second ⏎ on that same row confirms. Any cursor move, or
-    /// the confirm itself, disarms back to `None`.
+    /// The account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
+    /// the disable direction only — enabling is immediate, never armed)
+    /// currently armed by a first ⏎; a second ⏎ on that same row confirms. Any
+    /// cursor move, or the confirm itself, disarms back to `None`.
     pub(crate) armed_action: Option<ConfigRow>,
     /// API-account re-login is in flight: committing the base-url field advances
     /// to the api-key field (re-enter both, mirroring `login --base-url --api-key`)
@@ -399,6 +426,7 @@ impl ConfigDraft {
             ConfigRow::OpusModel => &self.opus_model,
             ConfigRow::SonnetModel => &self.sonnet_model,
             ConfigRow::HaikuModel => &self.haiku_model,
+            ConfigRow::FableModel => &self.fable_model,
             ConfigRow::SubagentModel => &self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
@@ -408,6 +436,7 @@ impl ConfigDraft {
             | ConfigRow::EnvAdd
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
+            | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -423,6 +452,7 @@ impl ConfigDraft {
             ConfigRow::OpusModel => &mut self.opus_model,
             ConfigRow::SonnetModel => &mut self.sonnet_model,
             ConfigRow::HaikuModel => &mut self.haiku_model,
+            ConfigRow::FableModel => &mut self.fable_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
@@ -432,6 +462,7 @@ impl ConfigDraft {
             | ConfigRow::EnvAdd
             | ConfigRow::Login
             | ConfigRow::DeleteCreds
+            | ConfigRow::ClearSessionToken
             | ConfigRow::Disabled
             | ConfigRow::Delete
             | ConfigRow::Create => return None,
@@ -471,6 +502,9 @@ pub(crate) enum ConfirmAction {
     /// Force-rotate one account's refresh token (action-menu "rotate access
     /// token" on the focused account).
     RotateOne(String),
+    /// Disable one account (action-menu "disable account" off the Setup pane,
+    /// standing in for the row's arm-then-confirm).
+    DisableOne(String),
     /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
     WireMcpServers,
@@ -492,11 +526,80 @@ pub(crate) enum ConfirmAction {
     /// in the chain. Confirm carries the add through; cancel returns to the
     /// picker. Non-destructive — the member can be removed after adding.
     AddChainCandidate(String),
+    /// Setup menu `save as preset`: a custom preset already holds the typed
+    /// name. `(preset name, source account)` — confirming re-saves over it.
+    OverwritePreset(String, String),
+    /// Setup menu `apply preset`: the target account already carries a base url
+    /// or model settings the preset would replace. `(account, preset name)` —
+    /// the preset is re-read at apply, so what lands is what is on disk now.
+    ApplyPresetOver(String, String),
+    /// Preset picker `d`: drop a custom preset from disk.
+    DeletePreset(String),
     /// Info-only modal: an action the user asked for is refused for a reason
     /// they should read (rotating a macOS profile whose running session holds
     /// its login in a Keychain entry clauth cannot write). Confirming just
     /// dismisses; `run_confirm_action` does nothing.
     Acknowledge,
+    /// Plugin tab: run `crate::herdr::heal` on the named config file.
+    HealHerdrConfig(std::path::PathBuf),
+    /// Plugin tab herdr options: flip the `delegate row text` knob, persist it,
+    /// then heal herdr's config so the sidebar row matches the new knob. The
+    /// heal is what the confirm gates — it rewrites herdr's own file.
+    HerdrDelegateRowText(std::path::PathBuf),
+    /// Plugin tab: install the clauth plugin through agentgear at user scope.
+    /// A write into CC's plugin registry (driven via the `claude` CLI), so it
+    /// keeps the confirm modal like every other mutating fix.
+    InstallPlugin,
+}
+
+/// One-field name prompt shared by the Setup menu's two naming actions. The
+/// variant carries what the typed name is FOR, so the modal itself stays a plain
+/// input and every validation rule lives in the handler that consumes it.
+#[derive(Debug, Clone)]
+pub(crate) struct NamePromptForm {
+    pub(crate) input: InputState,
+    pub(crate) action: NamePromptAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NamePromptAction {
+    /// Copy this account onto a new one under the typed name.
+    DuplicateProfile(String),
+    /// Save this account's base url + models as a preset under the typed name.
+    SavePreset(String),
+}
+
+impl NamePromptAction {
+    /// Modal title, and the blurb under it — both read off the same variant so a
+    /// new action can't ship with the other one's copy.
+    pub(crate) fn title(&self) -> &'static str {
+        match self {
+            Self::DuplicateProfile(_) => "DUPLICATE",
+            Self::SavePreset(_) => "SAVE PRESET",
+        }
+    }
+
+    pub(crate) fn blurb(&self) -> String {
+        match self {
+            Self::DuplicateProfile(source) => {
+                format!("copies every setting of '{source}' except its login.")
+            }
+            Self::SavePreset(source) => {
+                format!("stores '{source}'s base url and model settings under this name.")
+            }
+        }
+    }
+}
+
+/// Preset picker for `apply preset`. Built-ins lead the list (see
+/// [`crate::presets::list_presets`]), so the cursor's index is the list's index
+/// and nothing has to track the split.
+#[derive(Debug, Clone)]
+pub(crate) struct PresetPickerForm {
+    /// The account the pick is stamped onto.
+    pub(crate) target: String,
+    pub(crate) presets: Vec<crate::presets::Preset>,
+    pub(crate) cursor: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -521,7 +624,7 @@ pub(crate) struct DivergenceForm {
     /// that profile is NOT the active one. Surfaces a first-class "switch to
     /// it" action — the near-always-right resolution for a CC re-login into a
     /// known account, which the generic three options all get wrong.
-    pub(crate) sibling: Option<String>,
+    pub(crate) sibling: Option<ProfileName>,
     pub(crate) cursor: usize,
 }
 
@@ -533,7 +636,7 @@ pub(crate) struct DivergenceNotice {
     pub(crate) active: String,
     /// Locally identified owner of the live login when it is a NON-active
     /// profile (see [`DivergenceForm::sibling`]); drives the banner wording.
-    pub(crate) sibling: Option<String>,
+    pub(crate) sibling: Option<ProfileName>,
     /// SipHash of the live access token at identification time — the memo that
     /// keeps the 1Hz poll from re-running the owner lookup while the live login
     /// is unchanged.
@@ -572,7 +675,7 @@ impl DivergenceForm {
     pub(crate) fn actions(&self) -> Vec<DivergenceAction> {
         let mut v = Vec::with_capacity(4);
         if let Some(owner) = &self.sibling {
-            v.push(DivergenceAction::SwitchToOwner(owner.clone()));
+            v.push(DivergenceAction::SwitchToOwner(owner.to_string()));
         }
         v.extend([
             DivergenceAction::Choice(DivergenceChoice::Overwrite),
@@ -647,35 +750,29 @@ pub(crate) enum ActionMenuAction {
     // Global
     NewAccount,
     RefreshUsage,
+    /// Force-refresh every account — what the global `r` does off the Usage and
+    /// Tokens tabs, and the only way to reach it from Usage (where `r` is the
+    /// focused account's own refresh).
+    RefreshAll,
     RotateTokens,
-    // Overview
-    SwitchToSelected,
-    // Config
-    ConfigureSelected,
-    // Fallback chain
-    OpenChainMember,
-    ReorderUp,
-    ReorderDown,
-    // Fallback detail
-    EditThreshold,
-    EditWeeklyAt,
-    ToggleCheckWeekly,
-    ToggleCheckScoped,
-    ToggleLastResort,
-    TogglePreferred,
-    EditMaxSpend,
-    RemoveMember,
-    // Config detail actions (proxied through run_config_row)
+    /// The focused account's disabled flag, off the Setup pane (Overview and
+    /// Usage, which carry no row for it).
     DisableProfile,
     EnableProfile,
-    ToggleAutoStart,
-    DeleteProfile,
-    CreateProfile,
-    LoginAccount,
-    ClearCredentials,
-    EditField,
-    /// Remove the focused custom env entry from the account.
-    RemoveEnvField,
+    /// Open the focused account's provider console — where its api key is
+    /// minted. Offered only for a recognised third-party endpoint, since that
+    /// is the only case clauth knows a page for.
+    OpenProviderConsole,
+    // Setup tab — all three act on the focused account and none has a key.
+    /// Copy every setting of the focused account onto a new one, credentials
+    /// excluded. Prompts for the new name.
+    Duplicate,
+    /// Store the focused account's base url + model settings as a named
+    /// [`crate::presets::Preset`]. Prompts for the name.
+    SaveAsPreset,
+    /// Stamp a preset's base url + model settings onto the focused account.
+    /// Opens the picker.
+    ApplyPreset,
     // Status tab
     RefreshStatus,
     OpenIncidentLink,
@@ -697,18 +794,34 @@ pub(crate) enum ActionMenuAction {
 /// State for the action-menu modal.
 #[derive(Debug, Clone)]
 pub(crate) struct ActionMenuState {
+    /// Account-scoped items first, then the tab-global ones. One flat list so
+    /// the cursor and the hotkey scan stay index-free of the split; the render
+    /// draws the group rule at `scoped_len`.
     pub(crate) items: Vec<ActionItem>,
+    /// How many leading `items` act on [`ActionMenuState::context`].
+    pub(crate) scoped_len: usize,
+    /// The focused account, named in the title bar so the scoped items don't
+    /// each need a suffix. `None` whenever the scoped group is empty — a name
+    /// on a menu of tab-global actions would claim a scope that isn't there.
+    pub(crate) context: Option<String>,
     pub(crate) cursor: usize,
 }
 
 impl ActionMenuState {
     /// Build and assign hotkeys in source order per the SKILL.md algorithm.
     /// Reserved keys: `a` `x` `?` `q`.
-    pub(crate) fn new(actions: Vec<ActionMenuAction>) -> Self {
+    pub(crate) fn new(
+        scoped: Vec<ActionMenuAction>,
+        global: Vec<ActionMenuAction>,
+        context: Option<String>,
+    ) -> Self {
         const RESERVED: &[char] = &['a', 'x', '?', 'q'];
+        let scoped_len = scoped.len();
+        let context = (scoped_len > 0).then_some(context).flatten();
         let mut claimed: Vec<char> = Vec::new();
-        let items = actions
+        let items = scoped
             .into_iter()
+            .chain(global)
             .map(|action| {
                 let label = action.label();
                 // An explicit override wins when free; else scan the first 3 alpha
@@ -732,7 +845,12 @@ impl ActionMenuState {
                 }
             })
             .collect();
-        Self { items, cursor: 0 }
+        Self {
+            items,
+            scoped_len,
+            context,
+            cursor: 0,
+        }
     }
 }
 
@@ -745,6 +863,14 @@ impl ActionMenuAction {
             Self::RotateTokens => Some('t'),
             Self::ToggleEstimates => Some('e'),
             Self::TogglePace => Some('p'),
+            // `r` belongs to the focused account's own refresh, and `e`/`p` to
+            // the Usage page keys above, so refresh-all takes the third letter
+            // of its label — pinned rather than scanned so it doesn't move with
+            // the tab. (Uppercase `R` is out: hotkeys are case-insensitive.)
+            Self::RefreshAll => Some('f'),
+            // One letter across both halves of the disable/enable pair, so the
+            // key doesn't move when the account's state flips.
+            Self::DisableProfile | Self::EnableProfile => Some('d'),
             // Mirror the Tokens tab's page keys so the menu teaches them.
             Self::ToggleCountCache => Some('c'),
             Self::ReloadTokenStats => Some('r'),
@@ -762,29 +888,14 @@ impl ActionMenuAction {
         match self {
             Self::NewAccount => "new account",
             Self::RefreshUsage => "refresh usage",
+            Self::RefreshAll => "refresh all accounts",
             Self::RotateTokens => "rotate access token",
-            Self::SwitchToSelected => "switch to selected",
-            Self::ConfigureSelected => "configure",
-            Self::OpenChainMember => "open",
-            Self::ReorderUp => "reorder up",
-            Self::ReorderDown => "reorder down",
-            Self::EditThreshold => "edit threshold",
-            Self::EditWeeklyAt => "edit weekly at",
-            Self::ToggleCheckWeekly => "toggle weekly gate",
-            Self::ToggleCheckScoped => "toggle scoped gate",
-            Self::ToggleLastResort => "toggle last resort",
-            Self::TogglePreferred => "toggle preferred",
-            Self::EditMaxSpend => "edit max auto-spend",
-            Self::RemoveMember => "remove member",
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
-            Self::ToggleAutoStart => "toggle auto-start",
-            Self::DeleteProfile => "delete account",
-            Self::CreateProfile => "create account",
-            Self::LoginAccount => "log in",
-            Self::ClearCredentials => "log out",
-            Self::EditField => "edit field",
-            Self::RemoveEnvField => "remove field",
+            Self::OpenProviderConsole => "open provider console",
+            Self::Duplicate => "duplicate account",
+            Self::SaveAsPreset => "save as preset",
+            Self::ApplyPreset => "apply preset",
             Self::RefreshStatus => "refresh status",
             Self::OpenIncidentLink => "open in browser",
             Self::ToggleEstimates => "toggle estimates",
@@ -808,6 +919,11 @@ pub(crate) enum Modal {
     /// Credential divergence prompt.
     Divergence(DivergenceForm),
     CaptureName(CaptureNameForm),
+    /// One-field name prompt behind the Setup menu's `duplicate account` and
+    /// `save as preset`.
+    NamePrompt(NamePromptForm),
+    /// Setup menu `apply preset`: pick which preset stamps the account.
+    PresetPicker(PresetPickerForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
     DivergenceTarget(DivergenceTargetForm),
     Help,
@@ -856,6 +972,11 @@ const ROTATE_LIVE_SESSION_MSG: &str = "has a live clauth start session";
 const ROTATE_LIVE_SESSION_DETAIL: &str = "macos keeps its login in a keychain entry clauth can't write, so rotating would sign the \
      session out.";
 const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can't rotate it";
+
+/// What disabling costs, for the action menu's confirm. The Setup row states the
+/// same thing in its own hint (`config::row_hint`) before arming.
+const DISABLE_DETAIL: &str =
+    "it drops out of auto-switch, usage polling, and status until re-enabled.";
 const TOAST_CAPACITY: usize = 3;
 const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
@@ -1142,6 +1263,12 @@ pub(crate) enum PluginFix {
     RepairDivergence(String),
     /// Relink a `missing` active-profile credential link to its own stored creds.
     RelinkCredentials(String),
+    /// Append the keybinding + sidebar row to herdr's config (the config half of
+    /// `clauth herdr install`). `PathBuf` = the resolved config file.
+    HealHerdrConfig(std::path::PathBuf),
+    /// Install the clauth plugin through agentgear (user scope, embedded tree).
+    /// Replaces the copy-paste `/plugin` hint the row used to show.
+    InstallPlugin,
 }
 
 /// A computed integration-check row (global, profile-independent).
@@ -1174,14 +1301,61 @@ pub(crate) struct PluginState {
     pub(crate) error: Option<String>,
     pub(crate) checks: Vec<Check>,
     /// Cached `claude --version`: `None` = unprobed, `Some(None)` = probed and
-    /// missing/unparseable, `Some(Some(v))` = the version string. Re-probed only
-    /// on an explicit `r` so a tab switch never re-spawns the subprocess.
+    /// missing/unparseable, `Some(Some(v))` = the version string. Probed only
+    /// on an explicit `r` — construction and a tab switch never spawn the
+    /// subprocess, so the first paint never blocks on it.
     pub(crate) cc_version: Option<Option<String>>,
     /// Cached `clauth mcp` discovery handshake: `None` = unprobed. Re-probed only
     /// on `r` (heavier than the others — it boots the real server), never on a tab
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
+    /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
+    /// resolve (no row), `Some(Some(p))` = the probe. Probed at construction in
+    /// herdr mode (`HERDR_ENV=1` proves herdr is present) and re-probed on `r`;
+    /// it spawns three subprocesses, so a tab switch and the per-tick refresh
+    /// reuse the cached value.
+    pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
+    /// The `clauth mcp` job store as of the last refresh, newest first: what the
+    /// delegates pane draws. Re-read on the same cadence as the checks, because
+    /// the server writing it is a DIFFERENT process, so there is nothing to
+    /// subscribe to and no event to wait for. Read-only: the TUI never writes
+    /// this store, and never sweeps it.
+    ///
+    /// The cost is one readdir plus a parse per file. No count cap bounds that
+    /// from here: retention is the two TTLs (`jobs::DONE_TTL_MS` /
+    /// `jobs::RUNNING_TTL_MS`), applied only by the startup sweep inside a
+    /// `clauth mcp` process, which the TUI neither runs nor depends on having
+    /// run, and the count spans both record spellings. What the directory
+    /// really holds is whatever the last such startup expired, plus every job
+    /// written since. Measured against the 1 s tick with 256 records over
+    /// ~5 MB of envelopes, best of 5 warm: **~3 ms release, ~20 ms debug**.
+    /// Written as a bound rather than to two figures on purpose — two
+    /// independent runs on this box landed 2.2 ms and 3.2 ms release, neither on
+    /// a quiet machine, so a point figure would read as stale to the next person
+    /// who re-derives it and misses by half. What binds is the order: single-
+    /// digit ms in release, roughly ten times that in debug.
+    pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
+    /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
+    /// herdr detail is the one detail pane that takes per-row focus: while it
+    /// is descended, ↑↓ walks these rows instead of scrolling the prose.
+    pub(crate) herdr_options_cursor: usize,
+    /// Typed editor for the `tag refresh` stepper — the Config-tab
+    /// refresh-interval editor's shape. `None` = not editing.
+    pub(crate) herdr_tag_draft: Option<InputState>,
+    /// The herdr config verdict from the last recompute (a cheap file re-read
+    /// that rides the per-tick refresh), cached so the render and the key
+    /// handler never re-read the file per frame. `None` = unreadable or no
+    /// config path. The options section reads it to decide whether the
+    /// `delegate row text` row can write.
+    pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
 }
+
+/// Selector index the `herdr` check occupies once it renders: `about`,
+/// `mcp servers`, `plugin`, `herdr`, `runtime`. The landing row in herdr mode;
+/// when the construction probe does not resolve herdr, the same index rests
+/// on `runtime`, the last row — the cursor clamp in
+/// `recompute_plugin_checks` keeps it valid either way.
+const HERDR_SELECTOR_ROW: usize = 3;
 
 impl Default for PluginState {
     fn default() -> Self {
@@ -1195,6 +1369,11 @@ impl Default for PluginState {
             checks: Vec::new(),
             cc_version: None,
             mcp_boot: None,
+            herdr: None,
+            delegates: Vec::new(),
+            herdr_options_cursor: 0,
+            herdr_tag_draft: None,
+            herdr_config: None,
         }
     }
 }
@@ -1213,6 +1392,43 @@ impl PluginState {
     /// The fix offered by the row under the cursor, if any.
     pub(crate) fn selected_fix(&self) -> Option<&PluginFix> {
         self.selected_check().and_then(|check| check.fix.as_ref())
+    }
+}
+
+/// One editable row in the herdr detail's options section, in tab order. The
+/// values live in `AppState.herdr` (profiles.toml) and persist immediately on
+/// every change — there is no separate save step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HerdrOption {
+    PopupWidth,
+    PaneTag,
+    TagRefresh,
+    BorderLabel,
+    DelegateDot,
+    DelegateRowText,
+}
+
+/// The options section's row order — also the ↑↓ walk order.
+pub(crate) const HERDR_OPTIONS: [HerdrOption; 6] = [
+    HerdrOption::PopupWidth,
+    HerdrOption::PaneTag,
+    HerdrOption::TagRefresh,
+    HerdrOption::BorderLabel,
+    HerdrOption::DelegateDot,
+    HerdrOption::DelegateRowText,
+];
+
+impl HerdrOption {
+    /// The form-row label, lowercase per the contract.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PopupWidth => "popup width",
+            Self::PaneTag => "pane tag",
+            Self::TagRefresh => "tag refresh",
+            Self::BorderLabel => "border label",
+            Self::DelegateDot => "delegate dot",
+            Self::DelegateRowText => "delegate row text",
+        }
     }
 }
 
@@ -1290,6 +1506,20 @@ pub(crate) enum LoginEvent {
     Stage(LoginStage),
 }
 
+/// What a finished login worker produced. Both flows are a browser round-trip
+/// announced through the same [`LoginEvent`] channel and drawn by the same
+/// modal, and they diverge only at apply time: an Anthropic login replaces the
+/// profile's credentials, an Alibaba console login replaces its usage session
+/// and touches nothing else.
+///
+/// The drain routes on this payload rather than on anything recorded in
+/// [`LoginSession`], so a session and its result cannot disagree about which
+/// flow ran.
+pub(crate) enum LoginResult {
+    Oauth(Box<crate::oauth_login::LoginOutcome>),
+    Console(Box<crate::alibaba_login::ConsoleLoginOutcome>),
+}
+
 // ── App ───────────────────────────────────────────────────────────────────────
 
 pub(crate) struct App {
@@ -1324,6 +1554,13 @@ pub(crate) struct App {
     /// Per-profile kick-429 blocks (the messages endpoint rejecting the 5h
     /// auto-start kick) — feeds the usage tab's blocked pill.
     pub(crate) kick_blocks: KickBlocks,
+    /// Interleaved auto-start queue (`usage::auto_start_queue`): the anchor the 5h-window
+    /// queue spaces against, plus per-profile election health. Held here for
+    /// the same reason as `kick_blocks` — the Fallback card's detail render
+    /// reads it every frame, and a per-frame history replay is not an option.
+    /// Shared with the refresher this TUI spawns, so what the queue chip shows
+    /// is what the gate is actually using.
+    pub(crate) auto_start_queue: crate::usage::AutoStartQueueState,
     /// Scheduler-posted auto-switch decisions; drained in `on_tick`.
     pub(crate) pending_switch: PendingSwitch,
     /// Set by the scheduler when the whole chain is spent; `on_tick` drains it
@@ -1335,6 +1572,10 @@ pub(crate) struct App {
     pub(crate) third_party_usage_store: ThirdPartyUsageStore,
     pub(crate) third_party_status: ThirdPartyStatusStore,
     pub(crate) tab: Tab,
+    /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
+    /// carries a `[ herdr ]` tag and the TUI lands on the Plugin tab's herdr
+    /// row. Read-only after construction — the mode is decided once at launch.
+    pub(crate) herdr_mode: bool,
     pub(crate) modals: Vec<Modal>,
     /// First help-modal row on screen (↑↓ scrolls). Reset when the modal opens.
     pub(crate) help_scroll: u16,
@@ -1395,14 +1636,10 @@ pub(crate) struct App {
     pub(crate) login_generation: u64,
     pub(crate) login_event_rx: std::sync::mpsc::Receiver<(u64, LoginEvent)>,
     pub(crate) login_event_tx: std::sync::mpsc::Sender<(u64, LoginEvent)>,
-    pub(crate) login_result_rx: std::sync::mpsc::Receiver<(
-        u64,
-        std::result::Result<crate::oauth_login::LoginOutcome, String>,
-    )>,
-    pub(crate) login_result_tx: std::sync::mpsc::Sender<(
-        u64,
-        std::result::Result<crate::oauth_login::LoginOutcome, String>,
-    )>,
+    pub(crate) login_result_rx:
+        std::sync::mpsc::Receiver<(u64, std::result::Result<LoginResult, String>)>,
+    pub(crate) login_result_tx:
+        std::sync::mpsc::Sender<(u64, std::result::Result<LoginResult, String>)>,
 
     /// Claude status feed state; UI-thread-only (no shared lock).
     pub(crate) status: StatusState,
@@ -1456,6 +1693,10 @@ pub(crate) struct App {
     /// Model price table for the Tokens tab's API-equivalent cost lens; `None`
     /// until the pricing loader posts a result (and `—` is shown meanwhile).
     pub(crate) price_table: Option<crate::pricing::PriceTable>,
+    /// Set when the pricing loader reported a failure and no table is cached —
+    /// the cost lens reads `rates unavailable` instead of a perpetual
+    /// `rates loading`.
+    pub(crate) price_failed: bool,
     /// Pricing load results from the background loader; drained in `on_tick`.
     pub(crate) pricing_events: std::sync::mpsc::Receiver<crate::pricing::PricingEvent>,
     /// Manual-refresh signal to the pricing loader; a `()` triggers a refetch.
@@ -1525,10 +1766,10 @@ pub(crate) struct App {
 
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
-    /// marker + the type tag, so it needn't stat each `session-token.json` per
-    /// frame. Seeded at construct and refreshed on config reload; the expiry
-    /// stamp it carries is compared to live `now_ms` at render time, so the
-    /// clock ticking past expiry never needs a re-read — only an add / delete /
+    /// marker, so it needn't stat each `session-token.json` per frame. Seeded
+    /// at construct and refreshed on config reload; the expiry stamp it
+    /// carries is compared to live `now_ms` at render time, so the clock
+    /// ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
     pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
     /// Live `clauth start` sessions per account, for the Overview `active`
@@ -1552,12 +1793,26 @@ pub(crate) struct App {
 fn collect_session_tokens(names: &[String]) -> HashMap<String, crate::claude::SessionTokenStatus> {
     names
         .iter()
-        .filter_map(|n| crate::claude::session_token_status(n).map(|s| (n.clone(), s)))
+        .filter_map(|n| {
+            // ONE sidecar read per profile, the same derivation `build_snap`
+            // uses: Misfilled ⇔ NotLongLived, everything readable else is
+            // LongLived. (The cache held the `SidecarKind` too while the
+            // Overview wore a type tag; upstream 5dde024 removed the tag, and
+            // the kind went with it.)
+            let (kind, oauth) = crate::claude::sidecar_summary(&ProfileName::from(n.clone()))?;
+            let status = match kind {
+                crate::claude::SidecarKind::Misfilled => {
+                    crate::claude::SessionTokenStatus::NotLongLived
+                }
+                _ => crate::claude::SessionTokenStatus::LongLived(oauth.expires_at),
+            };
+            Some((n.clone(), status))
+        })
         .collect()
 }
 
-/// Cloned `Arc`s bundled for [`spawn_refresher`]; carries no lock rank and is
-/// safe to construct while holding any lock.
+/// Cloned `Arc`s bundled for [`spawn_refresher`] and the bootstrap worker;
+/// carries no lock rank and is safe to construct while holding any lock.
 struct WorkerHandles {
     config: ConfigHandle,
     usage_tokens: TokenList,
@@ -1569,6 +1824,7 @@ struct WorkerHandles {
     last_fetched: LastFetchedAt,
     poll_streaks: PollStreaks,
     kick_blocks: KickBlocks,
+    auto_start_queue: crate::usage::AutoStartQueueState,
     pending_switch: PendingSwitch,
     pending_switch_off: PendingSwitchOff,
     refetch_queue: RefetchQueue,
@@ -1577,9 +1833,13 @@ struct WorkerHandles {
     third_party_status: ThirdPartyStatusStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
+    bootstrap_active: Arc<AtomicBool>,
+    startup_sender: StartupSender,
 }
 
 impl WorkerHandles {
+    /// Clone every `Arc` the background workers share with the UI thread out of
+    /// `app`.
     fn from_app(app: &App) -> Self {
         Self {
             config: Arc::clone(&app.config),
@@ -1592,6 +1852,7 @@ impl WorkerHandles {
             last_fetched: Arc::clone(&app.last_fetched),
             poll_streaks: Arc::clone(&app.poll_streaks),
             kick_blocks: Arc::clone(&app.kick_blocks),
+            auto_start_queue: Arc::clone(&app.auto_start_queue),
             pending_switch: Arc::clone(&app.pending_switch),
             pending_switch_off: Arc::clone(&app.pending_switch_off),
             refetch_queue: Arc::clone(&app.refetch_queue),
@@ -1600,6 +1861,8 @@ impl WorkerHandles {
             third_party_status: Arc::clone(&app.third_party_status),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
+            bootstrap_active: Arc::clone(&app.bootstrap_active),
+            startup_sender: app.startup_sender.clone(),
         }
     }
 }
@@ -1618,6 +1881,7 @@ impl App {
         let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
         let poll_streaks: PollStreaks = Arc::new(RankedMutex::new(HashMap::new()));
         let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+        let auto_start_queue = crate::usage::new_auto_start_queue_state();
         let pending_switch: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
         let pending_switch_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
         let refetch_queue: RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
@@ -1632,7 +1896,7 @@ impl App {
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
         let mut history_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
         for profile in &config.profiles {
-            let name = profile.name.as_str();
+            let name = &profile.name;
             let data = crate::profile::load_usage_history(name);
             if !data.is_empty() {
                 if let Ok(path) = crate::profile::profile_history_path(name)
@@ -1681,10 +1945,10 @@ impl App {
             drop((tokens_sender, tokens_refresh_rx));
         }
 
-        // Pricing loader: fetches per-token model rates (LiteLLM JSON) for the
-        // Tokens tab's cost lens, disk-cached under `~/.clauth`. Same test-skip
-        // rationale as the status/token workers — a detached thread could outlive
-        // a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
+        // Pricing loader: fetches the ai-pricelog index rates for the Tokens
+        // tab's cost lens, disk-cached under `~/.clauth`. Same test-skip
+        // rationale as the status/token workers — a detached thread could
+        // outlive a test's `HOME_OVERRIDE` and write the real `~/.clauth`.
         let (pricing_sender, pricing_events) =
             std::sync::mpsc::channel::<crate::pricing::PricingEvent>();
         let (pricing_refresh, pricing_refresh_rx) = std::sync::mpsc::channel::<()>();
@@ -1724,6 +1988,7 @@ impl App {
             last_fetched,
             poll_streaks,
             kick_blocks,
+            auto_start_queue,
             pending_switch,
             pending_switch_off,
             refetch_queue,
@@ -1731,6 +1996,7 @@ impl App {
             third_party_usage_store,
             third_party_status,
             tab: Tab::Overview,
+            herdr_mode: false,
             modals: Vec::new(),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
@@ -1776,6 +2042,7 @@ impl App {
             tokens_events,
             tokens_refresh,
             price_table: None,
+            price_failed: false,
             pricing_events,
             pricing_refresh,
             last_reload_fp: reload_fingerprint(),
@@ -1805,6 +2072,33 @@ impl App {
         }
     }
 
+    /// herdr-mode landing, applied at construction (before the first paint):
+    /// the Plugin tab with the herdr selector row under the cursor. The herdr
+    /// probe runs here too — `HERDR_ENV=1` proves herdr is present, and each
+    /// of its three subprocesses is bounded at `herdr::PROBE_TIMEOUT` (2 s,
+    /// worst case 6 s total) — so the landing row is real at first paint
+    /// instead of waiting for `r`; the cursor clamp inside the recompute
+    /// below keeps the landing row valid when herdr does not resolve. The
+    /// `claude --version` probe stays `r`-gated: construction must not block
+    /// the first paint on a spawn. Nothing else changes — no key handling, no
+    /// focus stealing after construction.
+    pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
+        self.herdr_mode = herdr_mode;
+        if herdr_mode {
+            self.tab = Tab::Plugin;
+            self.plugin.cursor = HERDR_SELECTOR_ROW;
+            // Skipped under test (a spawned probe would read the real
+            // registry); the landing test injects the probe instead.
+            self.plugin.herdr = Some(if cfg!(test) {
+                None
+            } else {
+                crate::herdr::probe()
+            });
+            recompute_plugin_checks(&mut self, false);
+        }
+        self
+    }
+
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
     /// opened, wrapped by each effect's own period.
     pub(crate) fn anim_ms(&self) -> u64 {
@@ -1817,8 +2111,14 @@ impl App {
 
     /// Lock the shared AppConfig. Order: AppConfig outer, `with_state_lock` inner.
     pub(crate) fn config(&self) -> RankedGuard<'_, AppConfig> {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        self.config.lock().expect("config mutex poisoned")
+        Self::lock_config(&self.config)
+    }
+
+    /// The `config` lock for a worker holding only the cloned [`ConfigHandle`]
+    /// — same lock and poison policy, without an `&App`.
+    pub(crate) fn lock_config(config: &ConfigHandle) -> RankedGuard<'_, AppConfig> {
+        #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        config.lock().expect("config mutex poisoned")
     }
 
     /// Spawn the bootstrap on a background thread (never blocks first paint).
@@ -1833,17 +2133,10 @@ impl App {
     /// token snapshot, starts the scheduler, applies usage, and runs the startup
     /// auto-switch.
     pub(crate) fn spawn_bootstrap(&self) {
-        let config = Arc::clone(&self.config);
-        let usage_store = Arc::clone(&self.usage_store);
-        let usage_status = Arc::clone(&self.usage_status);
-        let third_party_usage_store = Arc::clone(&self.third_party_usage_store);
-        let third_party_status = Arc::clone(&self.third_party_status);
-        let last_fetched = Arc::clone(&self.last_fetched);
-        let refresh_interval = Arc::clone(&self.refresh_interval);
-        let activity = Arc::clone(&self.activity);
+        let h = WorkerHandles::from_app(self);
         let done = BootstrapDoneGuard {
-            bootstrap_active: Arc::clone(&self.bootstrap_active),
-            startup_sender: self.startup_sender.clone(),
+            bootstrap_active: h.bootstrap_active,
+            startup_sender: h.startup_sender,
         };
 
         spawn_worker(move || {
@@ -1851,13 +2144,11 @@ impl App {
 
             // Re-establish the credentials symlink (shutdown replaced it with
             // a plain file); without this, CC refreshes bypass the profile.
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-            let active = config
-                .lock()
-                .expect("config mutex poisoned")
+            let active = Self::lock_config(&h.config)
                 .state
                 .active_profile
-                .clone();
+                .as_ref()
+                .cloned();
             if let Some(active) = active {
                 let _ = link_profile_credentials(&active);
             }
@@ -1867,26 +2158,25 @@ impl App {
             // the `Queued` marking below — a disabled profile is seeded but never
             // queued for a fetch it will never get.
             let (seed_names, snapshot, third_party) = {
-                #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-                let cfg = config.lock().expect("config mutex poisoned");
+                let cfg = Self::lock_config(&h.config);
                 (
                     collect_oauth_seed_names(&cfg),
                     collect_tokens(&cfg),
                     collect_third_party_entries(&cfg.profiles),
                 )
             };
-            let interval_ms = refresh_interval.load(Ordering::Relaxed);
+            let interval_ms = h.refresh_interval.load(Ordering::Relaxed);
             bootstrap_fetch(
-                &usage_store,
-                &usage_status,
-                &last_fetched,
+                &h.usage_store,
+                &h.usage_status,
+                &h.last_fetched,
                 &seed_names,
                 interval_ms,
             );
             bootstrap_third_party(
-                &third_party_usage_store,
-                &third_party_status,
-                &last_fetched,
+                &h.third_party_usage_store,
+                &h.third_party_status,
+                &h.last_fetched,
                 &third_party,
                 interval_ms,
             );
@@ -1904,11 +2194,11 @@ impl App {
             // past). The first tick re-marks (idempotent); each worker flips itself
             // to Fetching when its request fires and clears on landing.
             let now = now_ms();
-            let due_now: Vec<String> = match last_fetched.lock() {
+            let due_now: Vec<String> = match h.last_fetched.lock() {
                 Ok(lf) => snapshot
                     .iter()
-                    .map(|e| e.name.clone())
-                    .chain(third_party.iter().map(|e| e.name.clone()))
+                    .map(|e| e.name.to_string())
+                    .chain(third_party.iter().map(|e| e.name.to_string()))
                     .filter(|n| {
                         lf.get(n)
                             .is_none_or(|t| t.as_millis().saturating_add(interval_ms) <= now)
@@ -1917,7 +2207,11 @@ impl App {
                 Err(_) => Vec::new(),
             };
             for name in &due_now {
-                mark_activity(&activity, name, ProfileActivity::Queued);
+                mark_activity(
+                    &h.activity,
+                    &ProfileName::from(name.clone()),
+                    ProfileActivity::Queued,
+                );
             }
         });
     }
@@ -1929,11 +2223,15 @@ impl App {
     /// reads `usage_history.jsonl` while holding the config guard;
     /// `fallback::burn_rate_for_profile` is the disk-reading twin used off the
     /// render/UI thread (the scheduler tick, after locks are dropped).
-    pub(crate) fn active_burn_rate(&self, name: &str, usage_info: &UsageInfo) -> Option<f64> {
+    pub(crate) fn active_burn_rate(
+        &self,
+        name: &ProfileName,
+        usage_info: &UsageInfo,
+    ) -> Option<f64> {
         let five_h = usage_info.five_hour.as_ref().map(|w| ("5h", w))?;
         crate::usage::compute_burn_rates_from_history(
             self.history_cache
-                .get(name)
+                .get(name.as_str())
                 .map(|v| v.as_slice())
                 .unwrap_or(&[]),
             std::slice::from_ref(&five_h),
@@ -1967,11 +2265,7 @@ impl App {
             // risks acting on a window the account no longer has. Stale profiles
             // are due on the scheduler's first tick, which fetches then
             // auto-switches off the corrected numbers.
-            let active_profile = cfg
-                .state
-                .active_profile
-                .as_deref()
-                .and_then(|n| cfg.find(n));
+            let active_profile = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n));
             let active_fresh =
                 active_profile.is_some_and(|p| p.fetch_status == Some(FetchStatus::Fresh));
             if active_fresh {
@@ -1979,7 +2273,7 @@ impl App {
                 // while the config guard is held; see `active_burn_rate`.
                 let rate = active_profile.and_then(|p| {
                     let usage = p.usage.as_ref()?;
-                    self.active_burn_rate(p.name.as_str(), usage)
+                    self.active_burn_rate(&p.name, usage)
                 });
                 auto_switch_if_needed(&mut cfg, rate).ok().flatten()
             } else {
@@ -1991,7 +2285,10 @@ impl App {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
-                let returned = self.config().find(&target).is_some_and(|p| p.preferred);
+                let returned = self
+                    .config()
+                    .find(&ProfileName::from(target.clone()))
+                    .is_some_and(|p| p.preferred);
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
@@ -2016,7 +2313,7 @@ impl App {
         // Session-scoped suppressed-generic set: rebuilt fresh each TUI launch,
         // dropped on exit. Purely scheduler-internal — the App never touches it
         // (manual refresh clears suppression via the shared forced queue).
-        let suppressed_generic: SuppressedGenericStore = Arc::new(RankedMutex::new(HashSet::new()));
+        let suppressed_generic: SuppressedGenericStore = Arc::new(RankedMutex::new(HashMap::new()));
         spawn_refresher(
             h.config,
             h.usage_tokens,
@@ -2028,6 +2325,7 @@ impl App {
             h.last_fetched,
             h.poll_streaks,
             h.kick_blocks,
+            h.auto_start_queue,
             h.pending_switch,
             h.pending_switch_off,
             h.refetch_queue,
@@ -2125,12 +2423,14 @@ impl App {
         // whichever process holds the fetch lease — this one or a headless
         // daemon — so an mtime bump is the only signal that new samples landed.
         for name in &history_names {
-            if let Ok(path) = crate::profile::profile_history_path(name)
+            if let Ok(path) = crate::profile::profile_history_path(&ProfileName::from(name.clone()))
                 && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
                 && self.history_mtimes.get(name) != Some(&mtime)
             {
-                self.history_cache
-                    .insert(name.clone(), crate::profile::load_usage_history(name));
+                self.history_cache.insert(
+                    name.clone(),
+                    crate::profile::load_usage_history(&ProfileName::from(name.clone())),
+                );
                 self.history_mtimes.insert(name.clone(), mtime);
             }
         }
@@ -2156,7 +2456,7 @@ impl App {
                 let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
                 (tokens, third_party, names)
             };
-            #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+            #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
                 *self
                     .usage_tokens
@@ -2179,7 +2479,7 @@ impl App {
         // invert lock order (TOKENS is outer of CONFIG).
         let tokens = collect_tokens(&self.config());
         let third_party = collect_third_party_entries(&self.config().profiles);
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
         {
             *self
                 .usage_tokens
@@ -2196,8 +2496,8 @@ impl App {
     /// profile's cached plan/tier — only the single-profile refresh re-pulls
     /// `/profile`, keeping the global refresh light on the rate-limited host.
     pub(crate) fn manual_refresh(&self) {
-        #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
-        let names: Vec<String> = self
+        #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
+        let names: Vec<ProfileName> = self
             .usage_tokens
             .lock()
             .expect("usage_tokens mutex poisoned")
@@ -2211,14 +2511,14 @@ impl App {
 
     /// Queue a single profile for an immediate re-fetch (Usage `r` / action
     /// menu), also re-pulling its `/profile` (plan / tier).
-    pub(crate) fn manual_refresh_one(&self, name: &str) {
+    pub(crate) fn manual_refresh_one(&self, name: &ProfileName) {
         self.enqueue_refetch(name, true);
     }
 
     /// Mark a profile for an immediate re-fetch. `refresh_plan` expires the
     /// `/profile` TTL so the next fetch re-pulls plan/tier — set for an explicit
     /// single-profile refresh, cleared for the bulk refresh-all.
-    fn enqueue_refetch(&self, name: &str, refresh_plan: bool) {
+    fn enqueue_refetch(&self, name: &ProfileName, refresh_plan: bool) {
         // Light a pending spinner immediately so the UI reflects the keypress.
         // Only when idle — don't clobber an in-flight switch/refresh marker. The
         // next tick's worker flips Queued→Fetching when its request fires; a name
@@ -2308,8 +2608,8 @@ impl App {
         self.config().profiles.len()
     }
 
-    pub(crate) fn profile_name_at(&self, idx: usize) -> Option<String> {
-        self.config().profiles.get(idx).map(|p| p.name.to_string())
+    pub(crate) fn profile_name_at(&self, idx: usize) -> Option<ProfileName> {
+        self.config().profiles.get(idx).map(|p| p.name.clone())
     }
 
     /// Clamp `profile_cursor` to `0..profile_count`.
@@ -2338,13 +2638,13 @@ impl App {
 /// takes live creds, NewProfile captures them, Discard relinks as-is); a stale
 /// access token is refreshed lazily on the next fetch.
 pub(super) fn reconcile_startup(app: &mut App) {
-    let Some(active) = app.config().state.active_profile.clone() else {
+    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
         return;
     };
 
     // Read live credentials under the state lock to avoid torn snapshots.
-    let live = with_state_lock(|| Ok(read_claude_credentials().ok().flatten()))
+    let live = with_state_lock(|_held| Ok(read_claude_credentials().ok().flatten()))
         .ok()
         .flatten();
     let diverged = {
@@ -2452,6 +2752,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // And the Plugin-tab herdr tag-refresh editor (same capture shape: typing
+    // owns the keyboard so digits can't trip global shortcuts).
+    if app.tab == Tab::Plugin && app.plugin.herdr_tag_draft.is_some() {
+        handle_herdr_tag_edit_key(app, key);
+        return;
+    }
+
     // Esc/q abandon an in-flight login (the detached worker's result is
     // discarded by the generation guard). Catching q here keeps it symmetric
     // with esc — otherwise q would ascend out of the Setup form (orphaning the
@@ -2515,25 +2822,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             if app.tab == Tab::Usage {
-                let selected = {
-                    let cfg = app.config();
-                    cfg.profiles
-                        .get(app.profile_cursor)
-                        .map(|p| (p.name.clone(), p.login_is_oauth(), p.is_third_party()))
-                };
-                match selected {
-                    Some((name, true, _)) | Some((name, _, true)) => {
-                        app.manual_refresh_one(&name);
-                        app.toast(ToastKind::Info, format!("refreshing '{name}'"));
-                    }
-                    Some((name, false, false)) => {
-                        app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
-                    }
-                    None => {}
-                }
+                queue_focused_usage_refresh(app);
             } else {
                 app.manual_refresh();
-                app.toast(ToastKind::Info, "refreshing usage");
+                app.toast(ToastKind::Info, "refreshing every account");
             }
             return;
         }
@@ -2647,7 +2939,32 @@ pub(crate) fn token_period_models(app: &App) -> Vec<crate::tokens::PeriodModel> 
         stats
             .today
             .as_ref()
-            .map(|t| t.models.iter().map(PeriodModel::from_full).collect())
+            .map(|t| {
+                // Daily-lens rows carry today's per-hour buckets (unlike
+                // lifetime rows, whose aggregate holds no dates), so the
+                // top-models and detail views price the same hourly rates
+                // the today card does.
+                use crate::pricing::HourTokens;
+                let mut hours: HashMap<&str, [HourTokens; 24]> = t
+                    .model_hours
+                    .iter()
+                    .map(|m| (m.model.as_str(), m.hours))
+                    .collect();
+                t.models
+                    .iter()
+                    .map(|m| PeriodModel {
+                        model: m.model.clone(),
+                        in_out: m.in_out(),
+                        split: m.clone(),
+                        split_complete: true,
+                        days: vec![crate::tokens::PeriodDay {
+                            date: t.date.clone(),
+                            split: m.clone(),
+                            hours: hours.remove(m.model.as_str()),
+                        }],
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     } else {
         crate::tokens::group_models(&stats.models)
@@ -2750,6 +3067,10 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.plugin.focus = PluginFocus::List;
             app.plugin.cursor = 0;
             app.plugin.detail_scroll = 0;
+            // Entering the tab clears an open tag editor the same way the
+            // Config tab clears its drafts; `switch_tab` matches the
+            // destination, so the clear runs on entry, not on exit.
+            app.plugin.herdr_tag_draft = None;
             // Recompute on focus; the cached `claude --version` is not re-probed.
             recompute_plugin_checks(app, false);
         }
@@ -2841,7 +3162,8 @@ fn trigger_status_refresh(app: &mut App) {
 
 /// Plugin tab keymap. List focus: ↑↓ moves the cursor (wrapping over both
 /// groups), ⏎ descends to the detail pane, `f` applies the selected row's fix.
-/// Detail focus: ↑↓ scrolls (clamped by the render pass); `f` still fixes.
+/// Detail focus: the herdr detail walks its focusable options rows, every
+/// other detail scrolls (clamped by the render pass); `f` still fixes.
 fn handle_plugin_key(app: &mut App, key: KeyEvent) {
     match app.plugin.focus {
         PluginFocus::List => {
@@ -2863,19 +3185,31 @@ fn handle_plugin_key(app: &mut App, key: KeyEvent) {
                 _ => {}
             }
         }
-        PluginFocus::Detail => match key.code {
-            KeyCode::Up => {
-                // Clamp before stepping — see the Status detail pane's ↑ arm.
-                let max = app.plugin.detail_max_scroll.get();
-                app.plugin.detail_scroll = app.plugin.detail_scroll.min(max).saturating_sub(1);
+        PluginFocus::Detail => {
+            if app
+                .plugin
+                .selected_check()
+                .is_some_and(|c| c.label == "herdr")
+            {
+                handle_herdr_options_key(app, key);
+            } else {
+                match key.code {
+                    KeyCode::Up => {
+                        // Clamp before stepping — see the Status detail pane's ↑ arm.
+                        let max = app.plugin.detail_max_scroll.get();
+                        app.plugin.detail_scroll =
+                            app.plugin.detail_scroll.min(max).saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        let max = app.plugin.detail_max_scroll.get();
+                        app.plugin.detail_scroll =
+                            app.plugin.detail_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::Char('f') => apply_plugin_fix(app),
+                    _ => {}
+                }
             }
-            KeyCode::Down => {
-                let max = app.plugin.detail_max_scroll.get();
-                app.plugin.detail_scroll = app.plugin.detail_scroll.saturating_add(1).min(max);
-            }
-            KeyCode::Char('f') => apply_plugin_fix(app),
-            _ => {}
-        },
+        }
     }
 }
 
@@ -2913,6 +3247,417 @@ fn apply_plugin_fix(app: &mut App) {
                 on_confirm: ConfirmAction::RelinkCredentials(name),
             }));
         }
+        PluginFix::HealHerdrConfig(path) => {
+            app.disarm_quit();
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: "add the keybinding and sidebar row to herdr's config?".to_string(),
+                detail: Some(
+                    "writes them into herdr's config.toml and validates the result with `herdr config check`.".to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::HealHerdrConfig(path),
+            }));
+        }
+        PluginFix::InstallPlugin => {
+            app.disarm_quit();
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: "install the clauth plugin into claude code?".to_string(),
+                detail: Some(
+                    "runs claude's own plugin installer at user scope; your other plugins and settings are untouched."
+                        .to_string(),
+                ),
+                choice: false,
+                on_confirm: ConfirmAction::InstallPlugin,
+            }));
+        }
+    }
+}
+
+/// The herdr detail's options keymap: ↑↓ walks the six rows (wrapping), space
+/// and ⏎ activate the focused row, `+`/`-` step the tag-refresh stepper, `f`
+/// still applies the check's fix. Only the herdr detail routes here — every
+/// other detail keeps the scroll-only keymap.
+fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
+    let cursor = app.plugin.herdr_options_cursor;
+    let rows = HERDR_OPTIONS.len();
+    match key.code {
+        KeyCode::Up => app.plugin.herdr_options_cursor = (cursor + rows - 1) % rows,
+        KeyCode::Down => app.plugin.herdr_options_cursor = (cursor + 1) % rows,
+        KeyCode::Char('f') => apply_plugin_fix(app),
+        KeyCode::Enter | KeyCode::Char(' ') => activate_herdr_option(app, HERDR_OPTIONS[cursor]),
+        KeyCode::Char('+') => step_herdr_tag_refresh(app, 1),
+        KeyCode::Char('-') => step_herdr_tag_refresh(app, -1),
+        _ => {}
+    }
+}
+
+/// Apply space/⏎ to the focused options row: cycle, toggle, open the tag
+/// editor, or confirm the delegate-row rewrite. Every change persists
+/// immediately through `save_app_state` (the `cycle_theme` shape).
+fn activate_herdr_option(app: &mut App, row: HerdrOption) {
+    match row {
+        HerdrOption::PopupWidth => cycle_herdr_popup_width(app),
+        HerdrOption::PaneTag => {
+            toggle_herdr_bool(app, |h| h.pane_tag = !h.pane_tag);
+            push_herdr_knob_change();
+        }
+        HerdrOption::TagRefresh => begin_herdr_tag_edit(app),
+        HerdrOption::BorderLabel => {
+            toggle_herdr_bool(app, |h| h.border_label = !h.border_label);
+            push_herdr_knob_change();
+        }
+        HerdrOption::DelegateDot => toggle_herdr_bool(app, |h| h.delegate_dot = !h.delegate_dot),
+        // Inert while herdr's config does not read+parse: the write this row
+        // triggers goes through the parse, so offering it there is a promise
+        // the heal cannot keep. The render draws the row faint with the reason.
+        HerdrOption::DelegateRowText => {
+            if herdr_config_writable(app) {
+                open_herdr_row_text_confirm(app);
+            }
+        }
+    }
+}
+
+/// True while the herdr config behind the options section reads AND parses —
+/// the states where `heal` can actually rewrite the file. `None` (unreadable /
+/// no config path) and `parsed == false` both read as not writable. Shared by
+/// the key handler and the render so the inert row and the no-op key agree.
+pub(crate) fn herdr_config_writable(app: &App) -> bool {
+    app.plugin.herdr_config.as_ref().is_some_and(|c| c.parsed)
+}
+
+/// `+`/`-` on the tag-refresh stepper: ±1 second, floored at 1. A no-op on
+/// every other row.
+fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
+    if HERDR_OPTIONS[app.plugin.herdr_options_cursor] != HerdrOption::TagRefresh {
+        return;
+    }
+    {
+        let mut cfg = app.config();
+        let cur = cfg.state.herdr.tag_watch_secs;
+        cfg.state.herdr.tag_watch_secs = if delta > 0 {
+            cur.saturating_add(1)
+        } else {
+            cur.saturating_sub(1).max(1)
+        };
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip one herdr bool knob and persist immediately (the `cycle_theme` save
+/// shape — no separate save step).
+fn toggle_herdr_bool(app: &mut App, flip: impl FnOnce(&mut HerdrSettings)) {
+    {
+        let mut cfg = app.config();
+        flip(&mut cfg.state.herdr);
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Push a `pane_tag`/`border_label` change onto the live herdr panes right
+/// now, instead of letting it sit until the next watcher tick
+/// (`tag_watch_secs` away, 5 s by default): re-run `report-profile.sh` once
+/// per pane, the way `watch-profile.sh` re-runs it. The off direction clears
+/// its artifact through the same re-run, so it no longer waits for the tick
+/// either. Only the two knobs that script reads trigger this —
+/// `delegate_dot`'s gate lives in the MCP server process (a separate binary a
+/// TUI cannot hot-patch), and `tag_refresh` belongs to watchers that already
+/// hold their own interval, so both keep their current behavior.
+///
+/// Gated on the plugin-pane environment (`HERDR_ENV=1` plus the injected
+/// binary and plugin-root paths): no herdr command exposes the plugin root,
+/// so this gate is the only channel, and a bare `clauth` TUI inside a herdr
+/// pane silently skips the push too. Best-effort — a failure anywhere is
+/// silent, and the change still lands with the next report (a watcher tick,
+/// or the next agent-event hook for panes without one).
+fn push_herdr_knob_change() {
+    if std::env::var("HERDR_ENV").as_deref() != Ok("1") {
+        return;
+    }
+    let Ok(bin) = std::env::var("HERDR_BIN_PATH") else {
+        return;
+    };
+    let Ok(root) = std::env::var("HERDR_PLUGIN_ROOT") else {
+        return;
+    };
+    let script = std::path::PathBuf::from(&root)
+        .join("report-profile.sh")
+        .to_string_lossy()
+        .into_owned();
+    spawn_worker(move || {
+        let Some(panes) = herdr_pane_ids(&bin) else {
+            return;
+        };
+        for pane in panes {
+            rerun_pane_report(&script, &pane);
+        }
+    });
+}
+
+/// `bin pane list` → pane ids, parsed leniently: an unknown payload shape (a
+/// herdr release moving a field) reads as no panes rather than a wrong one.
+/// Bounded at `crate::herdr::PROBE_TIMEOUT` — a hung herdr delays the push
+/// worker, never the key handling.
+fn herdr_pane_ids(bin: &str) -> Option<Vec<String>> {
+    let out = crate::herdr::bounded_output(bin, &["pane", "list"], &[])?;
+    if !out.status.success() {
+        return None;
+    }
+    let root: serde_json::Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).ok()?;
+    let panes = root.get("result")?.get("panes")?.as_array()?;
+    Some(
+        panes
+            .iter()
+            .filter_map(|pane| pane.get("pane_id")?.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// Re-run `report-profile.sh` for one pane with the pane id set and the
+/// event/context JSON cleared — the exact `watch-profile.sh` invocation. The
+/// script's pidfile gate skips the watcher spawn while a live watch exists,
+/// so re-running it alongside the live watchers is safe.
+fn rerun_pane_report(script: &str, pane: &str) {
+    let _ = crate::herdr::bounded_output(
+        script,
+        &[],
+        &[
+            ("HERDR_PANE_ID", std::ffi::OsStr::new(pane)),
+            ("HERDR_PLUGIN_EVENT_JSON", std::ffi::OsStr::new("")),
+            ("HERDR_PLUGIN_CONTEXT_JSON", std::ffi::OsStr::new("")),
+        ],
+    );
+}
+
+/// Advance the popup-width knob to the next shape, wrapping past `split-top`
+/// back to `fit` — space always cycles forward, never clamps.
+fn cycle_herdr_popup_width(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.herdr.popup_width = match cfg.state.herdr.popup_width {
+            PopupWidth::Fit => PopupWidth::Half,
+            PopupWidth::Half => PopupWidth::SplitRight,
+            PopupWidth::SplitRight => PopupWidth::SplitTop,
+            PopupWidth::SplitTop => PopupWidth::Fit,
+        };
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Open the inline typed editor for the tag-refresh stepper, seeded with the
+/// current value in whole seconds. ⏎ commits, ⎋ discards — the Config-tab
+/// refresh-interval editor's mechanism.
+fn begin_herdr_tag_edit(app: &mut App) {
+    let secs = app.config().state.herdr.tag_watch_secs;
+    app.plugin.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
+}
+
+/// Keystrokes while the herdr tag-refresh editor is open: ⏎ saves, ⎋ discards.
+fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.plugin.herdr_tag_draft = None,
+        KeyCode::Enter => commit_herdr_tag_edit(app),
+        _ => {
+            if let Some(input) = app.plugin.herdr_tag_draft.as_mut() {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// Parse and persist the typed tag-refresh seconds. A value under 1s keeps the
+/// draft open so the inline Invalid-input treatment stays on screen — no toast.
+fn commit_herdr_tag_edit(app: &mut App) {
+    let Some(raw) = app.plugin.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
+        return;
+    };
+    let Some(secs) = parse_herdr_tag_secs(raw) else {
+        return;
+    };
+    {
+        let mut cfg = app.config();
+        cfg.state.herdr.tag_watch_secs = secs;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+    app.plugin.herdr_tag_draft = None;
+}
+
+/// A typed tag-refresh value is valid only as a whole number of seconds, at
+/// least 1 — shared by the commit path and the render's inline check.
+pub(crate) fn parse_herdr_tag_secs(raw: &str) -> Option<u64> {
+    let secs = raw.parse::<u64>().ok()?;
+    (secs >= 1).then_some(secs)
+}
+
+/// Open the confirm before flipping `delegate row text`: the flip rewrites
+/// herdr's own config (the row `clauth herdr install` appended), so it carries
+/// the same confirm gate as the `[f]` heal. The copy names the delegate token
+/// so the confirm says what it will write; cancel is the default choice.
+fn open_herdr_row_text_confirm(app: &mut App) {
+    let Some(path) = app
+        .plugin
+        .herdr
+        .as_ref()
+        .and_then(|probe| probe.as_ref())
+        .and_then(|probe| probe.config_path.clone())
+    else {
+        return;
+    };
+    let turning_on = !app.config().state.herdr.delegate_row_text;
+    app.disarm_quit();
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: if turning_on {
+            "add the delegate token to herdr's sidebar row?".to_string()
+        } else {
+            "drop the delegate token from herdr's sidebar row?".to_string()
+        },
+        detail: Some(if turning_on {
+            "writes $clauth_delegate into the row clauth added in herdr's config.toml, validated by `herdr config check`; a hand-owned row is left alone with a note."
+                .to_string()
+        } else {
+            "rewrites the row clauth added in herdr's config.toml without $clauth_delegate, validated by `herdr config check`; a hand-owned row is left alone with a note."
+                .to_string()
+        }),
+        choice: false,
+        on_confirm: ConfirmAction::HerdrDelegateRowText(path),
+    }));
+}
+
+/// Componentwise numeric comparison of two dotted version strings. `None` when
+/// either side is not a dotted run of numbers — an unrecognisable version is
+/// unknown, not stale, so a caller stays quiet rather than warning on a shape it
+/// has never seen.
+fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    let parts = |s: &str| -> Option<Vec<u64>> {
+        s.split('.').map(|part| part.parse::<u64>().ok()).collect()
+    };
+    Some(parts(a)?.cmp(&parts(b)?))
+}
+
+/// `probed >= min` componentwise. Either side absent or unparseable reads as
+/// satisfied: a false warn on an unrecognisable version is worse than staying
+/// quiet.
+fn version_satisfies(probed: Option<&str>, min: Option<&str>) -> bool {
+    let (Some(probed), Some(min)) = (probed, min) else {
+        return true;
+    };
+    match compare_versions(probed, min) {
+        Some(ord) => ord != std::cmp::Ordering::Less,
+        None => true,
+    }
+}
+
+/// The Plugin tab's `herdr` row: the installed herdr's clauth plugin plus the
+/// keybinding/sidebar config `clauth herdr install` adds. Pure so the verdict
+/// logic unit-tests without an `App`; the caller supplies the probe and the
+/// config readout (`None` when the config file could not be read at all).
+pub(crate) fn herdr_check(
+    probe: &crate::herdr::HerdrProbe,
+    config: Option<&crate::herdr::ConfigStatus>,
+) -> Check {
+    let mut detail = Vec::new();
+    detail.push(match &probe.version {
+        Some(version) => format!("herdr: {version}"),
+        None => "herdr: unknown".to_string(),
+    });
+
+    let mut danger = false;
+    let mut warn = false;
+    let mut fix = None;
+
+    // Indented, because herdr's own prose carries colons ("manifest unavailable: No such file or directory") and `detail_line` splits the first `": "` into a key column: left flush, a warning renders as a field named after its first clause and widens that column for every real field above it.
+    if let Some(error) = &probe.error {
+        danger = true;
+        detail.push(format!("  {error}"));
+    }
+
+    if let Some(entry) = &probe.entry {
+        // `herdr plugin list --json` spells a linked plugin's source `local`, measured against 0.8.0; `link` is the verb that creates one, not the kind it reports.
+        let local = entry.source_kind.as_deref() == Some("local");
+
+        if !entry.warnings.is_empty() {
+            danger = true;
+        }
+        if !entry.enabled {
+            warn = true;
+            detail.push("plugin: disabled".to_string());
+        } else if local {
+            detail.push("plugin: linked (local)".to_string());
+        } else {
+            detail.push("plugin: installed (github)".to_string());
+        }
+        if local && let Some(root) = &entry.plugin_root {
+            detail.push(format!("root: {root}"));
+        }
+        for warning in &entry.warnings {
+            detail.push(format!("  {warning}"));
+        }
+        if !version_satisfies(probe.version.as_deref(), entry.min_herdr_version.as_deref()) {
+            warn = true;
+            detail.push(format!(
+                "plugin needs herdr {} or newer",
+                entry.min_herdr_version.as_deref().unwrap_or("unknown")
+            ));
+        }
+
+        let parsed = config.is_some_and(|c| c.parsed);
+        let templated = config.is_some_and(|c| c.sidebar == crate::herdr::SidebarState::Templated);
+        match config {
+            Some(c) if !c.parsed => {
+                warn = true;
+                detail.push("herdr's config doesn't parse".to_string());
+            }
+            Some(c) => {
+                match &c.bound_key {
+                    Some(key) => detail.push(format!("key: {key}")),
+                    None => {
+                        warn = true;
+                        detail.push("key: not bound".to_string());
+                    }
+                }
+                if c.sidebar == crate::herdr::SidebarState::Templated {
+                    detail.push("sidebar: templated".to_string());
+                } else {
+                    warn = true;
+                    detail.push("sidebar: not templated".to_string());
+                }
+            }
+            None => {
+                warn = true;
+                detail.push("herdr's config can't be read".to_string());
+            }
+        }
+
+        if parsed && (config.and_then(|c| c.bound_key.as_deref()).is_none() || !templated) {
+            detail.push(String::new());
+            detail.push("[f] add the keybinding and sidebar row to herdr's config".to_string());
+            fix = probe.config_path.clone().map(PluginFix::HealHerdrConfig);
+        }
+    } else if probe.error.is_none() {
+        warn = true;
+        detail.push("plugin: not installed".to_string());
+        detail.push(String::new());
+        detail.push("  clauth herdr install".to_string());
+    }
+
+    let health = if danger {
+        Health::Danger
+    } else if warn {
+        Health::Warn
+    } else {
+        Health::Ok
+    };
+
+    Check {
+        label: "herdr",
+        health,
+        detail,
+        fix,
     }
 }
 
@@ -2925,9 +3670,11 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
 
     app.plugin.error = None;
 
-    // CC version is cached; a tab switch reuses it, only `r` re-probes. Skipped
-    // under test so the suite never spawns the real `claude` binary.
-    if refresh_version || app.plugin.cc_version.is_none() {
+    // CC version is cached; only `r` probes. Construction and a tab switch
+    // leave it unprobed rather than spawning `claude --version` synchronously
+    // — construction must not block the first paint. Skipped under test so
+    // the suite never spawns the real `claude` binary.
+    if refresh_version {
         app.plugin.fetching = true;
         app.plugin.cc_version = Some(if cfg!(test) {
             None
@@ -2936,7 +3683,6 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         });
         app.plugin.fetching = false;
     }
-    let cc_version = app.plugin.cc_version.clone().flatten();
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
 
@@ -2960,19 +3706,25 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             about_detail.push("install clauth so its bin directory is on PATH".to_string());
         }
     }
-    match &cc_version {
-        Some(version) => about_detail.push(format!("claude: {version}")),
-        None => {
+    match &app.plugin.cc_version {
+        Some(Some(version)) => about_detail.push(format!("claude: {version}")),
+        Some(None) => {
             about_detail.push("claude: not found".to_string());
             about_detail.push("claude --version failed or claude is not on PATH".to_string());
             about_detail.push("install claude code so the claude binary resolves".to_string());
         }
+        // Unprobed is not missing: the probe is `r`-gated, so before the first
+        // `r` the row names the key that fills the line in instead of claiming
+        // a binary is absent.
+        None => about_detail.push("claude: press r to probe".to_string()),
     }
     checks.push(Check {
         label: "about",
         health: if clauth_path.is_none() {
             Health::Danger
-        } else if cc_version.is_none() {
+        } else if matches!(app.plugin.cc_version, Some(None)) {
+            // Probed and missing is the only version verdict that warns; an
+            // unprobed version is not evidence of anything.
             Health::Warn
         } else {
             Health::Ok
@@ -2998,6 +3750,13 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         app.plugin.fetching = false;
     }
     let mcp_boot = app.plugin.mcp_boot.clone();
+
+    // herdr probe — three subprocesses, so it is `r`-gated like `mcp_boot`.
+    // Skipped under test rather than set to a fixed value, so a test that
+    // injected a probe keeps it.
+    if refresh_version && !cfg!(test) {
+        app.plugin.herdr = Some(crate::herdr::probe());
+    }
 
     // "global" == active in every project: a CC `user`-scope plugin install. A
     // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
@@ -3068,7 +3827,14 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     // plugin install record — installed-only verdict (CC exposes no clean per-scope
     // "enabled" boolean, so v1 reports presence + scope, not enabled/disabled).
     let marketplace = probe::marketplace_known();
-    let plugin_check = if let Some(record) = records.first() {
+    // The operative record is the `user`-scope install when one exists; a stale
+    // project/local row that sorts first must not name the install beside a
+    // verdict computed off the user row (`plugin_global` above).
+    let record_for_check = records
+        .iter()
+        .find(|r| r.scope.as_deref() == Some("user"))
+        .or_else(|| records.first());
+    let plugin_check = if let Some(record) = record_for_check {
         let scope = record.scope.as_deref();
         let mut detail = vec![format!("installed: yes ({})", scope.unwrap_or("?"))];
         if let Some(version) = &record.version {
@@ -3102,22 +3868,12 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         } else {
             detail.push(String::new());
             detail.push("installed for this project only, not global".to_string());
-            detail.push("make it global (run in shell):".to_string());
-            if let Some(scope) = scope {
-                detail.push(format!(
-                    "  claude plugin uninstall {} --scope {scope}",
-                    probe::PLUGIN_ID
-                ));
-            }
-            detail.push(format!(
-                "  claude plugin install {} --scope user",
-                probe::PLUGIN_ID
-            ));
+            detail.push("[f] install globally (user scope)".to_string());
             Check {
                 label: "plugin",
                 health: Health::Warn,
                 detail,
-                fix: None,
+                fix: Some(PluginFix::InstallPlugin),
             }
         }
     } else {
@@ -3134,24 +3890,45 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             detail.push(format!("marketplace: {repo}"));
         }
         detail.push(String::new());
-        detail.push("install (run in claude code):".to_string());
-        detail.push("  /plugin marketplace add uwuclxdy/clauth".to_string());
-        detail.push("  /plugin install clauth@clauth".to_string());
+        detail.push("[f] install the clauth plugin".to_string());
         Check {
             label: "plugin",
             health: Health::Warn,
             detail,
-            fix: None,
+            fix: Some(PluginFix::InstallPlugin),
         }
     };
     checks.push(plugin_check);
 
+    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
+    // The probe is cached (`r`-gated, three subprocesses); the config read is a
+    // cheap `fs::read_to_string` that rides the tick, using the path the probe
+    // already resolved. No row when herdr does not resolve or was never probed.
+    if let Some(Some(probe)) = &app.plugin.herdr {
+        let config = probe
+            .config_path
+            .as_deref()
+            .map(crate::herdr::read_config)
+            .and_then(Result::ok)
+            .map(|text| crate::herdr::config_status(&text));
+        checks.push(herdr_check(probe, config.as_ref()));
+        // The options section reads this verdict (writable vs inert) off the
+        // cache — recompute already paid for the file read, so neither the
+        // render nor the key handler re-reads per frame.
+        app.plugin.herdr_config = config;
+    } else {
+        // No herdr row renders without a probe, so its verdict must not
+        // outlive the probe (a stale writable verdict would arm the
+        // delegate-row confirm against a file that no longer resolves).
+        app.plugin.herdr_config = None;
+    }
+
     // runtime — fold every profile's live sessions / credential link / token
     // freshness into one summary row. Snapshot the names under the config lock,
-    // then drop it before the FS reads (the live tally,
-    // `classify_credentials_link`) so no lock is held across I/O.
+    // then drop it before the FS reads (`classify_credentials_link`) so no lock
+    // is held across I/O.
     struct Snap {
-        name: String,
+        name: ProfileName,
         active: bool,
         expires_at: Option<i64>,
     }
@@ -3160,8 +3937,8 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         cfg.profiles
             .iter()
             .map(|p| Snap {
-                name: p.name.as_str().to_string(),
-                active: cfg.is_active(p.name.as_str()),
+                name: p.name.clone(),
+                active: cfg.is_active(&p.name),
                 expires_at: p.access_token_expires_at(),
             })
             .collect()
@@ -3183,14 +3960,19 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let mut active_fix: Option<PluginFix> = None;
     let mut active_bad = false; // diverged / missing / unknown link
 
-    // One registry read for the whole fleet. `runtime::live_session_count`
-    // cannot answer this: it dedupes markers by name WITHIN a profile but not
-    // across them, so a session that swapped A→B is counted under both and named
-    // twice — and A is a wrong answer, not a changed one, since nothing
-    // authenticates as it (`docs/plan/multi-session-fallback.md` §14). Its other
-    // consumers ask "does a session own this account's chain", which stays true
-    // under both markers.
-    let tally = crate::live_sessions::LiveTally::collect(&app.config());
+    // `r` means re-probe everything, so it re-collects rather than rendering the
+    // age the tick left. Sited next to the read, not at the top: the version
+    // probe above spawns `claude`, and a tally taken before that is already as
+    // stale as the subprocess is slow.
+    if refresh_version {
+        app.last_live_sessions_refresh = None;
+        poll_live_sessions(app);
+    }
+
+    // Otherwise the tick's fleet tally, never a second sweep: this row and the
+    // Overview's `live` column answer one question, and two independent reads of
+    // it can disagree inside a frame.
+    let tally = &app.live_sessions;
     for snap in snaps {
         let instances = tally.member(&snap.name).sessions;
         live_sessions += instances;
@@ -3199,20 +3981,20 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             live_names.push(if instances > 1 {
                 format!("{} · {instances}", snap.name)
             } else {
-                snap.name.clone()
+                snap.name.to_string()
             });
         }
         // Observed delegate throughput (MCP `delegate`); a recent rate-limit on any
         // exercised model warns even when the credential link is healthy.
         let throughput = crate::throughput::summary(&snap.name, now_secs);
         if throughput.iter().any(|t| t.rate_limited_recent) {
-            rate_limited_names.push(snap.name.clone());
+            rate_limited_names.push(snap.name.to_string());
         }
 
         if !snap.active {
             continue;
         }
-        active_name = Some(snap.name.clone());
+        active_name = Some(snap.name.to_string());
 
         // A classify error (broken symlink mid-read, perms) must not read as
         // healthy: surface it as a warn with an `unknown` link label rather than
@@ -3240,9 +4022,9 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         };
         active_bad = link_err || diverged || missing;
         active_fix = if diverged {
-            Some(PluginFix::RepairDivergence(snap.name.clone()))
+            Some(PluginFix::RepairDivergence(snap.name.to_string()))
         } else if missing && stored_creds {
-            Some(PluginFix::RelinkCredentials(snap.name.clone()))
+            Some(PluginFix::RelinkCredentials(snap.name.to_string()))
         } else {
             None
         };
@@ -3318,7 +4100,14 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             runtime_detail.push(String::new());
             runtime_detail.push("[f] relink credentials".to_string());
         }
-        _ => {}
+        // The other fixes are produced on their own check rows (wire / herdr /
+        // install), never on this one; `None` is a healthy or inactive link.
+        // Named, so a new `PluginFix` variant fails the build instead of a
+        // silent no-op.
+        Some(
+            PluginFix::WireMcpServers | PluginFix::HealHerdrConfig(_) | PluginFix::InstallPlugin,
+        ) => {}
+        None => {}
     }
     checks.push(Check {
         label: "runtime",
@@ -3328,6 +4117,16 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     });
 
     app.plugin.checks = checks;
+
+    // The delegates pane's data. Read here rather than on its own timer so it
+    // rides the cadence this tab already documents (tab focus, `r`, and the 1 s
+    // tick while focused) — a `clauth mcp` run is a different process, so a
+    // watcher would buy freshness this tab has never promised.
+    //
+    // `list_banded`, the same call `clauth jobs` and `monitor`'s listing make,
+    // so the pane's row order is not a second derivation of one. It arrives
+    // banded and the renderer sorts nothing.
+    app.plugin.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
 
     // Keep the cursor in range after the check set changes.
     let max = app.plugin.row_count().saturating_sub(1);
@@ -3357,7 +4156,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
     let Some(profile) = cfg.profiles.get(idx) else {
         return;
     };
-    let name = profile.name.to_string();
+    let name = profile.name.clone();
     // `switch_profile` already refuses a disabled target (shared guard), but a
     // disabled row must never even offer the confirm — never selectable, not
     // just never landed.
@@ -3369,7 +4168,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
-        on_confirm: ConfirmAction::Switch(name),
+        on_confirm: ConfirmAction::Switch(name.to_string()),
     }));
 }
 
@@ -3409,7 +4208,7 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
 /// worker and drained by `drain_switch_gates`.
 pub(crate) struct SwitchGateResult {
-    name: String,
+    name: ProfileName,
     gate: oauth::AuthGate,
 }
 
@@ -3420,13 +4219,13 @@ pub(crate) struct SwitchGateResult {
 /// (`switch_profile` no-ops on `is_active`), and gating it races a live
 /// `claude` refreshing through the symlink — the same exemption as the
 /// CLI/MCP paths.
-fn perform_switch(app: &mut App, name: &str) {
-    let active = app.config().state.active_profile.clone();
+fn perform_switch(app: &mut App, name: &ProfileName) {
+    let active = app.config().state.active_profile.as_ref().cloned();
     if active.as_deref() == Some(name) {
         finalize_switch(app, name);
         return;
     }
-    spawn_switch_gate(app, name.to_string(), oauth::refresh_result);
+    spawn_switch_gate(app, name.clone(), oauth::refresh_result);
 }
 
 /// Run `ensure_installable` for `name` off the UI thread and post the answer
@@ -3435,7 +4234,7 @@ fn perform_switch(app: &mut App, name: &str) {
 /// clears it. `refresher` is injected so tests gate offline; under `cfg(test)`
 /// the gate runs synchronously — a detached worker would race the test's
 /// `HomeSandbox` (the gate persists `auth_broken` transitions to home paths).
-fn spawn_switch_gate<F>(app: &mut App, name: String, refresher: F)
+fn spawn_switch_gate<F>(app: &mut App, name: ProfileName, refresher: F)
 where
     F: Fn(&str, Option<&str>) -> std::result::Result<oauth::TokenResponse, oauth::RefreshError>
         + Send
@@ -3458,7 +4257,7 @@ where
 /// True when the live credentials diverge from the stored chain and it's not a
 /// first-login adoption (must be reconciled before clearing/relinking). A
 /// logged-out shell is exempt — an empty login needs no reconciling.
-fn active_diverged_unsaved(active: &str) -> bool {
+fn active_diverged_unsaved(active: &ProfileName) -> bool {
     crate::claude::live_diverged_and_unsaved(active).unwrap_or(false)
 }
 
@@ -3491,14 +4290,14 @@ fn open_divergence_modal(app: &mut App, active: &str) {
 /// `switch_profile`, token-snapshot refresh. No HTTP — the AUTH-1 gate has
 /// already answered (or the target is the already-active exemption) by the
 /// time this runs.
-fn finalize_switch(app: &mut App, name: &str) {
+fn finalize_switch(app: &mut App, name: &ProfileName) {
     // Guard a diverged outgoing active: `switch_profile` would no-op the
     // snapshot and then `link_profile_credentials` would bail on the regular
     // file, stranding the fresh `/login` chain. Raise the Divergence modal so
     // the user cleans up first; first-login adoption stays a clean switch.
-    let outgoing = app.config().state.active_profile.clone();
+    let outgoing = app.config().state.active_profile.as_ref().cloned();
     if let Some(active) = outgoing
-        && active != name
+        && active != *name
         && active_diverged_unsaved(&active)
     {
         clear_activity(&app.activity, name);
@@ -3524,7 +4323,7 @@ fn finalize_switch(app: &mut App, name: &str) {
 /// divergence guard: an unsaved `/login` must be resolved before clearing live
 /// credentials. No HTTP.
 fn perform_switch_off(app: &mut App) {
-    let Some(active) = app.config().state.active_profile.clone() else {
+    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         return;
     };
     if active_diverged_unsaved(&active) {
@@ -3584,7 +4383,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
     };
     let existing_match = {
         let cfg = app.config();
-        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref()).map(str::to_string)
+        find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
     };
     if let Some(existing) = existing_match {
         app.modals.push(Modal::Confirm(ConfirmState {
@@ -3648,13 +4447,14 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 14] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 15] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
+    GlobalConfigRow::AutoStartQueue,
     GlobalConfigRow::PreemptiveRotation,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
@@ -3678,6 +4478,7 @@ impl GlobalConfigRow {
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
+            | GlobalConfigRow::AutoStartQueue
             | GlobalConfigRow::PreemptiveRotation => "scheduler",
             GlobalConfigRow::WeeklyThreshold
             | GlobalConfigRow::BurnAware
@@ -3772,6 +4573,14 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
+        // Inert while no account has `auto_start` on (rendered dimmed): a
+        // queue with no possible member spaces nothing, so it stays a true
+        // disabled row — the key is a no-op.
+        GlobalConfigRow::AutoStartQueue => {
+            if app.config().profiles.iter().any(|p| p.auto_start) {
+                toggle_auto_start_queue(app);
+            }
+        }
     }
 }
 
@@ -4092,6 +4901,17 @@ fn toggle_refresh_spent_accounts(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
+/// Interleave the auto-start kick across accounts, or let every window reopen the
+/// instant it lapses (`usage::auto_start_queue`).
+fn toggle_auto_start_queue(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.auto_start_queue = !cfg.state.auto_start_queue;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
 fn toggle_show_estimates(app: &mut App) {
     {
         let mut cfg = app.config();
@@ -4331,7 +5151,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            let name = candidates[app.fallback_detail_cursor].clone();
+            let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
             let would_mix = {
                 let cfg = app.config();
                 chain_would_mix(&cfg, &name)
@@ -4343,7 +5163,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
                     choice: false,
-                    on_confirm: ConfirmAction::AddChainCandidate(name),
+                    on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
                 }));
             } else {
                 commit_chain_add(app, &name);
@@ -4355,7 +5175,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
 
 /// Add `name` to the chain, toast, and re-home focus. Shared by the direct
 /// add path and the `AddChainCandidate` confirm callback.
-fn commit_chain_add(app: &mut App, name: &str) {
+fn commit_chain_add(app: &mut App, name: &ProfileName) {
     add_chain_candidate(app, name);
     app.toast(ToastKind::Success, format!("added '{name}' to chain"));
     // When the picker empties, `+ add` disappears — land on the new member.
@@ -4390,12 +5210,12 @@ pub(crate) fn chain_candidates(app: &App) -> Vec<String> {
 }
 
 /// Whether adding `name` to the fallback chain would mix api-key and oauth
-/// accounts. CC's env-var handling breaks the api-key → oauth switch direction
-/// (see docs/domain-knowledge.md), so a mixed chain can leave a running bare
+/// accounts. CC's env-var handling breaks the api-key → oauth switch direction,
+/// so a mixed chain can leave a running bare
 /// `claude` session stuck on the api-key account until restart. Fires only
 /// when a homogeneous chain would gain its other kind — silent on empty,
 /// already-mixed, and same-kind adds.
-pub(crate) fn chain_would_mix(cfg: &AppConfig, name: &str) -> bool {
+pub(crate) fn chain_would_mix(cfg: &AppConfig, name: &ProfileName) -> bool {
     let Some(candidate) = cfg.find(name) else {
         return false;
     };
@@ -4925,7 +5745,7 @@ fn toggle_preferred(app: &mut App) {
 }
 
 /// Add a profile to the chain (seeding default threshold if unset) and persist.
-fn add_chain_candidate(app: &mut App, name: &str) {
+fn add_chain_candidate(app: &mut App, name: &ProfileName) {
     let mut cfg = app.config();
     if let Some(profile) = cfg.find_mut(name)
         && profile.fallback_threshold.is_none()
@@ -4933,7 +5753,7 @@ fn add_chain_candidate(app: &mut App, name: &str) {
         profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
         let _ = save_profile(profile);
     }
-    cfg.state.fallback_chain.push(name.into());
+    cfg.state.fallback_chain.push(name.clone());
     let _ = save_app_state(&cfg.state);
 }
 
@@ -4990,6 +5810,8 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
         Modal::Confirm(_) => handle_confirm_key(app, key),
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
+        Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
+        Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
@@ -5015,34 +5837,23 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Build the action menu for the current screen/focus context.
-fn build_action_menu(app: &App) -> ActionMenuState {
+/// Build the action menu for the current screen/focus context: what acts on the
+/// focused account, then what acts on the tab.
+pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
     use ActionMenuAction::*;
+    let mut scoped: Vec<ActionMenuAction> = Vec::new();
     let mut actions: Vec<ActionMenuAction> = Vec::new();
+    let mut context: Option<String> = None;
 
     match app.tab {
         Tab::Overview => {
-            let can_switch = app
-                .current_main_item()
-                .map(|item| match item {
-                    MainItemKind::Profile(idx) => {
-                        let cfg = app.config();
-                        cfg.profiles
-                            .get(idx)
-                            .map(|p| !cfg.is_active(&p.name) && !p.is_disabled())
-                            .unwrap_or(false)
-                    }
-                })
-                .unwrap_or(false);
-            if can_switch {
-                actions.push(SwitchToSelected);
-            }
+            context = push_account_scope(app, &mut scoped);
+            actions.push(RefreshAll);
             actions.push(NewAccount);
-            actions.push(RefreshUsage);
-            actions.push(RotateTokens);
         }
         Tab::Usage => {
-            actions.push(RefreshUsage);
+            context = push_account_scope(app, &mut scoped);
+            actions.push(RefreshAll);
             actions.push(ToggleEstimates);
             actions.push(TogglePace);
         }
@@ -5072,74 +5883,35 @@ fn build_action_menu(app: &App) -> ActionMenuState {
             actions.push(ToggleCountCache);
             actions.push(ReloadTokenStats);
         }
-        Tab::Setup => match app.config_focus {
-            ConfigFocus::Profiles => {
-                if app.profile_cursor < app.profile_count() {
-                    actions.push(ConfigureSelected);
+        // Both halves of the Setup tab configure the SAME focused account, so
+        // they carry the same three items. Every per-row action already has a
+        // key (the detail pane is a list of actions and ⏎ runs the row); what
+        // is left is the whole-account work no row states: copy it, save its
+        // endpoint + models as a template, stamp one back onto it. On `+ new`
+        // there is no source account to duplicate or save, but a preset can
+        // still stamp the draft's endpoint + model fields.
+        Tab::Setup => {
+            if let Some((name, _, _)) = focused_account(app) {
+                context = Some(name.to_string());
+                scoped.push(Duplicate);
+                scoped.push(SaveAsPreset);
+                scoped.push(ApplyPreset);
+                // The api-key row is on this tab, so the page that key comes
+                // from belongs next to it.
+                if focused_provider_console(app).is_some() {
+                    scoped.push(OpenProviderConsole);
                 }
-                actions.push(NewAccount);
+            } else if app.profile_cursor >= app.profile_count() {
+                context = app
+                    .config_draft
+                    .as_ref()
+                    .and_then(|d| d.name.trimmed_some());
+                scoped.push(ApplyPreset);
             }
-            ConfigFocus::Actions => {
-                let rows = config_rows(app);
-                if let Some(&row) = rows.get(app.config_action_cursor) {
-                    match row {
-                        ConfigRow::Disabled => {
-                            let currently_disabled = app
-                                .config()
-                                .profiles
-                                .get(app.profile_cursor)
-                                .is_some_and(Profile::is_disabled);
-                            actions.push(if currently_disabled {
-                                ActionMenuAction::EnableProfile
-                            } else {
-                                ActionMenuAction::DisableProfile
-                            });
-                        }
-                        ConfigRow::AutoStart => actions.push(ActionMenuAction::ToggleAutoStart),
-                        ConfigRow::Login => actions.push(ActionMenuAction::LoginAccount),
-                        ConfigRow::DeleteCreds => actions.push(ActionMenuAction::ClearCredentials),
-                        ConfigRow::Delete => actions.push(ActionMenuAction::DeleteProfile),
-                        ConfigRow::Create => actions.push(ActionMenuAction::CreateProfile),
-                        ConfigRow::EnvEntry(_) => {
-                            actions.push(ActionMenuAction::EditField);
-                            actions.push(ActionMenuAction::RemoveEnvField);
-                        }
-                        // The reveal chip has no field to edit — `a` offers nothing.
-                        ConfigRow::ModelOverrideAdd => {}
-                        _ => actions.push(ActionMenuAction::EditField),
-                    }
-                }
-            }
-        },
-        Tab::Fallback => match app.fallback_focus {
-            FallbackFocus::Chain => {
-                let items = chain_items(app);
-                if let Some(item) = items.get(app.chain_cursor) {
-                    match item {
-                        ChainItemKind::Member(_) => {
-                            actions.push(OpenChainMember);
-                            actions.push(ReorderUp);
-                            actions.push(ReorderDown);
-                        }
-                        ChainItemKind::Add => {}
-                    }
-                }
-            }
-            FallbackFocus::Detail => {
-                if let Some(&row) = FALLBACK_ROWS.get(app.fallback_detail_cursor) {
-                    match row {
-                        FallbackRow::Threshold => actions.push(EditThreshold),
-                        FallbackRow::WeeklyAt => actions.push(EditWeeklyAt),
-                        FallbackRow::CheckWeekly => actions.push(ToggleCheckWeekly),
-                        FallbackRow::CheckScoped => actions.push(ToggleCheckScoped),
-                        FallbackRow::LastResort => actions.push(ToggleLastResort),
-                        FallbackRow::Preferred => actions.push(TogglePreferred),
-                        FallbackRow::MaxSpend => actions.push(EditMaxSpend),
-                        FallbackRow::Remove => actions.push(RemoveMember),
-                    }
-                }
-            }
-        },
+        }
+        // Fallback: every action the chain and its detail rows carry is bound to
+        // a key of its own (⏎, ⇧↑↓, space, +/-), so `a` offers nothing.
+        Tab::Fallback => {}
         Tab::Config => {}
         Tab::Status => {
             actions.push(RefreshStatus);
@@ -5151,7 +5923,57 @@ fn build_action_menu(app: &App) -> ActionMenuState {
         Tab::Plugin => {}
     }
 
-    ActionMenuState::new(actions)
+    ActionMenuState::new(scoped, actions, context)
+}
+
+/// Push what the account under the cursor can be told to do, returning the name
+/// the menu titles that group with. Nothing to push when the cursor sits past
+/// the accounts (an empty Overview), which is also what leaves the title bare.
+fn push_account_scope(app: &App, scoped: &mut Vec<ActionMenuAction>) -> Option<String> {
+    let (name, _, _) = focused_account(app)?;
+    scoped.push(ActionMenuAction::RefreshUsage);
+    scoped.push(ActionMenuAction::RotateTokens);
+    scoped.push(disabled_toggle_action(app));
+    if focused_provider_console(app).is_some() {
+        scoped.push(ActionMenuAction::OpenProviderConsole);
+    }
+    Some(name.to_string())
+}
+
+/// The console page the focused account's endpoint mints its api key on.
+/// `None` past the accounts, on an OAuth account, and on an endpoint no
+/// provider claims. Both the menu's gate and the handler resolve through this
+/// one function, so what is offered and what opens cannot drift apart.
+fn focused_provider_console(app: &App) -> Option<&'static str> {
+    app.config().profiles.get(app.profile_cursor)?.console_url()
+}
+
+/// Open the focused account's provider console in the default browser
+/// (detached), mirroring [`open_incident_link`].
+fn open_provider_console(app: &mut App) {
+    let Some(url) = focused_provider_console(app) else {
+        app.toast(ToastKind::Info, "no console page for this endpoint");
+        return;
+    };
+    match crate::platform::open_url(url) {
+        Ok(()) => app.toast(ToastKind::Info, "opening in browser"),
+        Err(_) => app.toast(ToastKind::Danger, "failed to open browser"),
+    }
+}
+
+/// The focused account's disable-row action, labeled by the state it would
+/// leave behind — the same flip the Setup row's own label carries.
+fn disabled_toggle_action(app: &App) -> ActionMenuAction {
+    let currently_disabled = app
+        .config()
+        .profiles
+        .get(app.profile_cursor)
+        .is_some_and(Profile::is_disabled);
+    if currently_disabled {
+        ActionMenuAction::EnableProfile
+    } else {
+        ActionMenuAction::DisableProfile
+    }
 }
 
 fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
@@ -5211,36 +6033,55 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The account under the cursor as `(name, has_oauth_login, is_third_party)`.
-/// `profile_cursor` is shared across Overview, Usage, and Setup, so this resolves
-/// the focused account on any of them. `None` when the cursor sits past the
-/// profile list (e.g. `+ new`).
+/// The account under the cursor as `(name, has_oauth_login,
+/// usage_cache_is_third_party)`. `profile_cursor` is shared across Overview,
+/// Usage, and Setup, so this resolves the focused account on any of them.
+/// `None` when the cursor sits past the profile list (e.g. `+ new`).
 ///
 /// The OAuth bool is credential typing ([`Profile::login_is_oauth`]), not endpoint
 /// routing: the actions it gates (rotate, refresh) act on the stored token chain,
 /// so a hybrid holding a real pair behind a `base_url` can rotate it, and an
 /// endpoint-only profile cannot.
-fn focused_account(app: &App) -> Option<(String, bool, bool)> {
+///
+/// The third bool is the shared cache selector, not `is_third_party`: the
+/// refresh gate asks whether the account has a usage fetch leg, and the
+/// third-party leg fetches generic api-key endpoints too — `is_third_party`
+/// would refuse a litellm row the scheduler refreshes every cadence.
+fn focused_account(app: &App) -> Option<(ProfileName, bool, bool)> {
     let cfg = app.config();
-    cfg.profiles
-        .get(app.profile_cursor)
-        .map(|p| (p.name.to_string(), p.login_is_oauth(), p.is_third_party()))
+    cfg.profiles.get(app.profile_cursor).map(|p| {
+        (
+            p.name.clone(),
+            p.login_is_oauth(),
+            p.usage_cache_is_third_party(),
+        )
+    })
+}
+
+/// Queue a usage refetch for the account under the cursor, or toast why not.
+/// One shape for both entry points (Usage `r`, the action menu's refresh
+/// entry): the OAuth arm and the third-party-cache arm both queue
+/// [`App::manual_refresh_one`] — the same refetch the cadence legs would run —
+/// and only an endpoint-only account with no credential either leg can use
+/// falls through to the nothing-to-refresh toast.
+fn queue_focused_usage_refresh(app: &mut App) {
+    match focused_account(app) {
+        Some((name, true, _)) | Some((name, _, true)) => {
+            app.manual_refresh_one(&name);
+            app.toast(ToastKind::Info, format!("refreshing '{name}'"));
+        }
+        Some((name, false, false)) => {
+            app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
+        }
+        None => {}
+    }
 }
 
 /// Dispatch a selected action menu item to its handler.
 fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
     match action {
         ActionMenuAction::NewAccount => start_new_account(app),
-        ActionMenuAction::RefreshUsage => match focused_account(app) {
-            Some((name, _, true)) | Some((name, true, _)) => {
-                app.manual_refresh_one(&name);
-                app.toast(ToastKind::Info, format!("refreshing '{name}'"));
-            }
-            Some((name, false, false)) => {
-                app.toast(ToastKind::Info, format!("'{name}' has no usage to refresh"));
-            }
-            None => {}
-        },
+        ActionMenuAction::RefreshUsage => queue_focused_usage_refresh(app),
         ActionMenuAction::RotateTokens => match focused_account(app) {
             // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
             // say why up front instead of arming a confirm that no-ops.
@@ -5257,7 +6098,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
-                    on_confirm: ConfirmAction::RotateOne(name),
+                    on_confirm: ConfirmAction::RotateOne(name.to_string()),
                 }));
             }
             Some((name, _, _)) => {
@@ -5265,78 +6106,17 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             }
             None => {}
         },
-        ActionMenuAction::SwitchToSelected => activate_main_item(app),
-        ActionMenuAction::ConfigureSelected => enter_config_detail(app),
-        ActionMenuAction::OpenChainMember => enter_fallback_detail(app),
-        ActionMenuAction::ReorderUp => reorder_chain_member(app, -1),
-        ActionMenuAction::ReorderDown => reorder_chain_member(app, 1),
-        ActionMenuAction::EditThreshold => {
-            run_fallback_row(app, FallbackRow::Threshold);
-        }
-        ActionMenuAction::EditWeeklyAt => {
-            run_fallback_row(app, FallbackRow::WeeklyAt);
-        }
-        ActionMenuAction::ToggleCheckWeekly => {
-            run_fallback_row(app, FallbackRow::CheckWeekly);
-        }
-        ActionMenuAction::ToggleCheckScoped => {
-            run_fallback_row(app, FallbackRow::CheckScoped);
-        }
-        ActionMenuAction::ToggleLastResort => {
-            run_fallback_row(app, FallbackRow::LastResort);
-        }
-        ActionMenuAction::TogglePreferred => {
-            run_fallback_row(app, FallbackRow::Preferred);
-        }
-        ActionMenuAction::EditMaxSpend => {
-            run_fallback_row(app, FallbackRow::MaxSpend);
-        }
-        ActionMenuAction::RemoveMember => {
-            run_fallback_row(app, FallbackRow::Remove);
+        ActionMenuAction::RefreshAll => {
+            app.manual_refresh();
+            app.toast(ToastKind::Info, "refreshing every account");
         }
         ActionMenuAction::DisableProfile | ActionMenuAction::EnableProfile => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
+            toggle_focused_account_disabled(app);
         }
-        ActionMenuAction::ToggleAutoStart => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::DeleteProfile => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::CreateProfile => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::LoginAccount => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::ClearCredentials => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::EditField => {
-            let rows = config_rows(app);
-            if let Some(&row) = rows.get(app.config_action_cursor) {
-                run_config_row(app, row);
-            }
-        }
-        ActionMenuAction::RemoveEnvField => remove_env_field(app),
+        ActionMenuAction::OpenProviderConsole => open_provider_console(app),
+        ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
+        ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
+        ActionMenuAction::ApplyPreset => open_preset_picker(app),
         ActionMenuAction::RefreshStatus => trigger_status_refresh(app),
         ActionMenuAction::OpenIncidentLink => open_incident_link(app),
         ActionMenuAction::ToggleEstimates => toggle_show_estimates(app),
@@ -5478,6 +6258,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
                 ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
                 ConfigRow::SonnetModel => profile.and_then(|p| p.models.sonnet.as_deref()),
                 ConfigRow::HaikuModel => profile.and_then(|p| p.models.haiku.as_deref()),
+                ConfigRow::FableModel => profile.and_then(|p| p.models.fable.as_deref()),
                 ConfigRow::SubagentModel => profile.and_then(|p| p.models.subagent.as_deref()),
                 _ => None,
             };
@@ -5489,6 +6270,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         ConfigRow::OpusModel,
         ConfigRow::SonnetModel,
         ConfigRow::HaikuModel,
+        ConfigRow::FableModel,
         ConfigRow::SubagentModel,
     ] {
         if expanded || override_set(row) {
@@ -5522,6 +6304,22 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     };
     if has_creds {
         rows.push(ConfigRow::DeleteCreds);
+    }
+    // CLA-SPLIT escape hatch, beside the log-out row because it drops the OTHER
+    // credential a split profile holds. Gated on ANY long-lived piece existing
+    // — the sidecar (`session_token_status`, so a mis-fill gets the same
+    // exit), the preserved mint backup, or a set `rolling_token` flag — never
+    // on the split being ENGAGED: a flag with no sidecar is exactly the state
+    // where hiding the row leaves the daemon to re-create what the operator
+    // has no surface left to remove (the CLI's widened nothing-to-clear gate,
+    // rendered). The no-other-login refusal is a dim, not a hide — see
+    // `run_config_row`.
+    if profile.is_some_and(|p| {
+        crate::claude::session_token_status(&p.name).is_some()
+            || p.rolling_token
+            || crate::claude::has_static_backup(&p.name)
+    }) {
+        rows.push(ConfigRow::ClearSessionToken);
     }
     // The account-actions group's tail: disable/enable (reversible) one severity
     // notch below delete (irreversible), which always stays the very last row.
@@ -5562,9 +6360,11 @@ fn build_draft_new() -> ConfigDraft {
         opus_model: InputState::new(""),
         sonnet_model: InputState::new(""),
         haiku_model: InputState::new(""),
+        fable_model: InputState::new(""),
         subagent_model: InputState::new(""),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
+        env_just_added: None,
         active: None,
         armed_action: None,
         relogin_chain: false,
@@ -5573,7 +6373,7 @@ fn build_draft_new() -> ConfigDraft {
     }
 }
 
-fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
+fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
     let cfg = app.config();
     let profile = cfg.find(name);
     let m = profile.map(|p| p.models.clone()).unwrap_or_default();
@@ -5586,9 +6386,11 @@ fn build_draft_existing(app: &App, name: &str) -> ConfigDraft {
         opus_model: InputState::new(m.opus.as_deref().unwrap_or("")),
         sonnet_model: InputState::new(m.sonnet.as_deref().unwrap_or("")),
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
+        fable_model: InputState::new(m.fable.as_deref().unwrap_or("")),
         subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
+        env_just_added: None,
         active: None,
         armed_action: None,
         relogin_chain: false,
@@ -5656,7 +6458,8 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
     let name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
     match row {
         ConfigRow::Disabled => {
             if let Some(name) = name {
@@ -5708,15 +6511,17 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 .config_draft
                 .as_ref()
                 .and_then(|d| d.editing_name.clone());
-            // An existing API account re-enters its base url + api key inline (no
-            // browser); only OAuth accounts run the token-minting flow below.
-            let is_api_account = editing.as_deref().is_some_and(|n| {
-                let cfg = app.config();
-                cfg.find(n).map(|p| !p.login_is_oauth()).unwrap_or(false)
-            });
-            if is_api_account {
-                start_api_relogin(app);
-                return;
+            match login_row_flow(app, editing.as_deref()) {
+                LoginRowFlow::Console { site, region } => {
+                    let name = editing.unwrap_or_default();
+                    start_console_login(app, name, site, region);
+                    return;
+                }
+                LoginRowFlow::ApiKey => {
+                    start_api_relogin(app);
+                    return;
+                }
+                LoginRowFlow::OauthMint => {}
             }
             let target = match editing {
                 Some(name) => Some((name, false)),
@@ -5776,12 +6581,237 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                     message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
-                    on_confirm: ConfirmAction::BlankCredentials(name),
+                    on_confirm: ConfirmAction::BlankCredentials(name.to_string()),
                 }));
+            }
+        }
+        ConfigRow::ClearSessionToken => {
+            if let Some(name) = name {
+                // Same refusal the CLI makes (`cmd_static_token_clear`), on the
+                // same condition: with no other login stored, clearing would
+                // strip the account's last credential — but only a stored PIECE
+                // (a sidecar or a preserved mint) is a credential to strip. A
+                // flag-only account disarms without touching one, so it clears
+                // here exactly as the CLI does, instead of a silent return
+                // behind a row the widening made visible.
+                let stores_other_login = {
+                    let cfg = app.config();
+                    cfg.find(&name)
+                        .is_some_and(|p| p.credentials.is_some() || p.api_key.is_some())
+                };
+                let holds_credential_piece = crate::claude::session_token_status(&name).is_some()
+                    || crate::claude::has_static_backup(&name);
+                if holds_credential_piece && !stores_other_login {
+                    return;
+                }
+                let armed = app
+                    .config_draft
+                    .as_ref()
+                    .is_some_and(|d| d.armed_action == Some(ConfigRow::ClearSessionToken));
+                // Arm/confirm rather than a modal: this is a row-level
+                // destructive action, and it retargets every future switch.
+                if armed {
+                    perform_clear_session_token(app, &name);
+                    disarm_armed_action(app);
+                } else {
+                    arm_action(app, ConfigRow::ClearSessionToken);
+                }
             }
         }
         _ => {}
     }
+}
+
+/// Confirmed `clear long-lived token`: drop the sidecar, then relink when the
+/// account is ACTIVE. The relink is not optional there — the live
+/// `~/.claude/.credentials.json` is a symlink INTO the profile store aimed at
+/// `session-token.json`, so removing the target alone leaves a dangling link
+/// and Claude Code reads no credentials at all. An idle account is left alone:
+/// force-linking it would repoint the live slot at a profile nobody switched to.
+///
+/// Same full-exit contract as the CLI's `static-token --clear`, or the two
+/// surfaces fight the daemon differently: the `rolling_token` flag goes FIRST
+/// (a set flag re-stamps a fresh bearer over the removal on the daemon's next
+/// scan), the preserved mint backup goes too (a "cleared" long-lived token
+/// with a year-scale mint still in `session-token.static.json` is not
+/// cleared), and a mis-filled sidecar is quarantined as evidence before the
+/// removal, exactly as every other repair path does.
+///
+/// The rotation guard is the same load-bearing piece it is on the CLI path —
+/// a rotation in flight that still saw the flag set would re-stamp the
+/// sidecar AFTER the removal — but a UI thread must never park behind a
+/// timeout-less flock, so this takes `try_acquire` and fails LOUDLY into a
+/// toast when a rotation holds the profile, instead of silently losing the
+/// race.
+///
+/// The relink has TWO outcomes and the toast names which one happened. The row
+/// is refused only when clearing would strip the account's LAST credential — a
+/// stored piece (sidecar or preserved mint) with neither a login nor an api key
+/// behind it; a flag-only account disarms regardless, touching no credential.
+/// An api-key account clears fine onto an ABSENT install source: the forcing
+/// relink then removes the live slot and, on macOS, signs the Keychain out
+/// rather than installing anything. Both were reported as "relinked its own
+/// login". The refusal is re-checked from DISK under the guard: the in-memory
+/// gate in `run_config_row` reads a snapshot `reload_fingerprint` can never
+/// invalidate (it does not stat `credentials.json`), so an out-of-band log-out
+/// would otherwise slip past it forever.
+///
+/// Deliberately does NOT stamp `last_reload_fp`: `reload_fingerprint` folds each
+/// sidecar's write time in, so leaving it stale is what makes the next tick
+/// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
+/// local `remove` below only spares that marker one tick of staleness.
+fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
+    let _guard = match crate::runtime::RotationGuard::try_acquire(name) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => {
+            // Rendered from the shared cause, not spelled here: one condition
+            // reaching an operator from a third surface in a third wording is
+            // what sends someone looking for three different problems.
+            app.toast(
+                ToastKind::Danger,
+                crate::format::Transient::new(
+                    crate::format::Cause::RotationLockHeld(name.to_string()),
+                    crate::format::Retry::Stated,
+                )
+                .text(),
+            );
+            return;
+        }
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+    };
+    // Everything the ACTIONS key off is re-read under the guard — the CLI's
+    // own rule, and stricter here: the TUI's config is a tick-stale snapshot,
+    // and `reload_fingerprint` does not stat `credentials.json` at all, so an
+    // out-of-band log-out leaves the snapshot claiming a stored login
+    // INDEFINITELY, not for one tick. `run_config_row`'s gate fed the row's
+    // rendering and nothing else.
+    let on_disk = match crate::profile::load_profile(name) {
+        Ok(p) => p,
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+    };
+    let holds_credential_piece = crate::claude::session_token_status(name).is_some()
+        || crate::claude::has_static_backup(name);
+    if holds_credential_piece && on_disk.credentials.is_none() && on_disk.api_key.is_none() {
+        app.toast(
+            ToastKind::Danger,
+            format!("'{name}' stores no other login anymore · log in first, then clear"),
+        );
+        return;
+    }
+    let rolling_armed = on_disk.rolling_token;
+    if rolling_armed {
+        // The PERSIST is written from the same under-guard disk read, never
+        // the in-memory snapshot — an external daemon's rotation may have
+        // landed since the last reload, and `save_profile` writes the whole
+        // profile back. The renderer's in-memory flag flips only AFTER that
+        // write lands: flipped first, a failed save leaves the config lying
+        // (`reload_fingerprint` never corrects it — config mtime did not move)
+        // until an unrelated save makes the lie durable, and the end state is
+        // a live rolling sidecar nothing re-stamps.
+        let mut disarmed = on_disk.clone();
+        disarmed.rolling_token = false;
+        if let Err(e) = save_profile(&disarmed) {
+            app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+            return;
+        }
+        let mut cfg = app.config();
+        if let Some(p) = cfg.find_mut(name) {
+            p.rolling_token = false;
+        }
+    }
+    if let Err(e) = crate::claude::quarantine_misfilled_sidecar(name)
+        .and_then(|_| crate::claude::clear_session_token(name))
+    {
+        app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
+        return;
+    }
+    app.session_tokens.remove(name.as_str());
+    // Read AFTER the clear, so it names the store the relink actually finds:
+    // `install_source_path` falls back to `credentials.json` only once the
+    // sidecar is gone. An api-key account has none, so it is signed out rather
+    // than relinked, and the toast used to claim the opposite.
+    let has_login = crate::claude::has_stored_oauth_login(name);
+    // `active` comes off DISK for the same reason every other fact here does.
+    // This process is not the only thing that switches: `daemon::tick` and
+    // `fallback` both reach `actions::switch_profile`, so the active account
+    // moves with no keypress at all, and the snapshot behind the row is a tick
+    // old at best. Acting on a stale one relinks the account the operator just
+    // switched AWAY from, or skips the relink on the one that IS active and
+    // leaves its live slot a dangling symlink into the file just removed. A
+    // config that will not parse is a larger failure than this decision, so
+    // that arm keeps the old in-memory read rather than inventing a verdict.
+    let active = crate::profile::load_config()
+        .map(|c| c.is_active(name))
+        .unwrap_or_else(|_| app.config().is_active(name));
+    if active && let Err(e) = force_link_profile_credentials(name) {
+        app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
+        return;
+    }
+    // No `refresh_tokens()`: `collect_tokens` reads `Profile::credentials`, which
+    // a sidecar clear never touches.
+    let tail = match (active, has_login) {
+        (true, true) => ", relinked its own login",
+        (true, false) if on_disk.api_key.is_some() => {
+            ", signed Claude Code out; it runs on its api key"
+        }
+        // Reachable only on the flag-only widening (a stored piece with no
+        // other login is refused above): nothing backs this account now, and
+        // claiming an api key it does not hold would be the toast's own lie.
+        (true, false) => ", signed Claude Code out; it stores no login at all",
+        (false, true) => "; the next switch installs its own login",
+        (false, false) if on_disk.api_key.is_some() => {
+            "; it stores no login, so it runs on its api key"
+        }
+        (false, false) => "; it stores no login at all · log in before switching to it",
+    };
+    let rolled = if rolling_armed {
+        " · re-stamping off"
+    } else {
+        ""
+    };
+    // The backup goes LAST, after the relink: failing between the sidecar
+    // removal and the relink would leave an active profile's live slot a
+    // dangling symlink under a toast reading "clear failed", a broken login
+    // reported as nothing-happened. From here the live slot is already sound,
+    // so a failed backup removal is exactly what its toast says and no more.
+    //
+    // `tail` and `rolled` are composed ABOVE so this arm can carry them: the
+    // sign-out and the disarm both already happened and are durable, and a
+    // failure message that reports neither is the same silence the postscripts
+    // exist to refuse. The CLI keeps them for free by printing before its own
+    // removal.
+    let backup_removed = match crate::claude::clear_static_backup(name) {
+        Ok(removed) => removed,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "cleared the long-lived token for '{name}'{tail}{rolled}, but the preserved \
+                     mint remains\n{e}"
+                ),
+            );
+            return;
+        }
+    };
+    // Unconditional on the removal, like the CLI's `clear_backup_postscript`:
+    // the pre-action disclosure lives in the row hint, but a hint is not a
+    // report, and a year-scale credential destroyed with nothing saying so is
+    // the silence the `rolled` suffix already refuses for the flag.
+    let swept = if backup_removed {
+        " · the preserved mint is gone"
+    } else {
+        ""
+    };
+    app.toast(
+        ToastKind::Success,
+        format!("cleared the long-lived token for '{name}'{tail}{rolled}{swept}"),
+    );
 }
 
 /// API-account "re-login": re-enter the base url + api key inline, mirroring the
@@ -5792,10 +6822,11 @@ fn start_api_relogin(app: &mut App) {
     let name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
     let (base, key) = {
         let cfg = app.config();
-        let p = name.as_deref().and_then(|n| cfg.find(n));
+        let p = name.as_ref().and_then(|n| cfg.find(n));
         (
             p.and_then(|p| p.base_url.clone()).unwrap_or_default(),
             p.and_then(|p| p.api_key.clone()).unwrap_or_default(),
@@ -5850,7 +6881,116 @@ fn start_login(app: &mut App, name: String, is_new: bool) {
         });
         // A toast, not stderr: the canned line without the HTTP status. The
         // status is in `~/.clauth/clauth.log` via the exchange's `logline!`.
-        let _ = result_tx.send((generation, res.map_err(|e| e.user_message())));
+        let _ = result_tx.send((
+            generation,
+            res.map(|o| LoginResult::Oauth(Box::new(o)))
+                .map_err(|e| e.user_message()),
+        ));
+    });
+    open_login_modal(app);
+}
+
+/// Which of the three flows the `log in` row runs. An account can satisfy more
+/// than one of these predicates, so the ORDER is the behaviour: a Model Studio
+/// account is api-typed by `login_is_oauth`, and reading the api-key arm first
+/// would route every one of them to the api-key re-entry with nothing else
+/// failing. Encoded here rather than as a chain of early returns in the row so
+/// the order is a thing a test can pin — driving the row itself binds a
+/// loopback listener and opens a browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginRowFlow {
+    /// Capture this account's Alibaba console session.
+    Console {
+        site: ConsoleSite,
+        region: &'static str,
+    },
+    /// Re-enter an existing api-key account's base url + key inline.
+    ApiKey,
+    /// Mint an Anthropic login in the browser. Also the `+ new` form's flow,
+    /// which has no account to read a type off yet.
+    OauthMint,
+}
+
+/// Resolve the `log in` row's flow for the draft's account (`None` on the
+/// `+ new` form, which can only mint).
+fn login_row_flow(app: &App, editing: Option<&str>) -> LoginRowFlow {
+    let Some(name) = editing else {
+        return LoginRowFlow::OauthMint;
+    };
+    let name = ProfileName::from(name);
+    if let Some((site, region)) = console_login_target(app, &name) {
+        return LoginRowFlow::Console { site, region };
+    }
+    let cfg = app.config();
+    match cfg.find(&name) {
+        Some(p) if !p.login_is_oauth() => LoginRowFlow::ApiKey,
+        _ => LoginRowFlow::OauthMint,
+    }
+}
+
+/// Which console the `log in` row would capture a session from for `name`, or
+/// `None` when that row runs one of its other two flows (an api-key re-entry or
+/// an Anthropic browser mint).
+///
+/// Split out of the row so the decision is readable without starting a browser
+/// round-trip: driving the row itself binds a loopback listener and opens a
+/// browser, which is not something a test may do.
+///
+/// The verdict itself is [`Profile::console_login_target`], shared with the row's
+/// hint and label so the copy cannot describe a different flow than the one ⏎
+/// runs.
+fn console_login_target(app: &App, name: &ProfileName) -> Option<(ConsoleSite, &'static str)> {
+    let cfg = app.config();
+    cfg.find(name)?.console_login_target()
+}
+
+/// Kick the Alibaba console login on a worker — the same browser round-trip and
+/// the same progress modal as [`start_login`], capturing that account's usage
+/// session instead of an Anthropic credential.
+///
+/// Never `is_new`: the console site and region are read off the profile's
+/// endpoint, so an account without one has no console to open, and the create
+/// form has no endpoint yet. That is why the CLI's own route is
+/// create-with-preset, then log in.
+fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &'static str) {
+    if let Some(session) = app.login.as_ref() {
+        // Same shape as `start_login`'s guard, `is_new` included: a `+ new`
+        // draft's login is a different session even when the typed name matches,
+        // so re-showing its modal without a word would read as this row's own
+        // login having started.
+        if session.name != name || session.is_new {
+            app.toast(
+                ToastKind::Warning,
+                format!("a login for '{}' is already in progress", session.name),
+            );
+        }
+        open_login_modal(app);
+        return;
+    }
+    app.login_generation += 1;
+    let generation = app.login_generation;
+    app.login = Some(LoginSession {
+        name,
+        is_new: false,
+        generation,
+        url: None,
+        stage: LoginStage::WaitingBrowser,
+    });
+    let event_tx = app.login_event_tx.clone();
+    let result_tx = app.login_result_tx.clone();
+    spawn_worker(move || {
+        let res = crate::alibaba_login::login_with(site, region, |url| {
+            let _ = event_tx.send((generation, LoginEvent::Url(url.to_string())));
+        });
+        let _ = result_tx.send((
+            generation,
+            res.map(|o| LoginResult::Console(Box::new(o)))
+                // `{e:#}` keeps the whole `anyhow` chain: the outermost context
+                // here is a bare "loopback accept failed" whose io cause is the
+                // only part that says what to do about it. No constructor in
+                // `alibaba_login` embeds the token or an upstream body.
+                .map_err(|e| format!("{e:#}")),
+        ));
     });
     open_login_modal(app);
 }
@@ -5867,8 +7007,8 @@ fn close_login_modal(app: &mut App) {
     app.modals.retain(|m| !matches!(m, Modal::Login));
 }
 
-/// Arm an account-action row (`Delete`, or `Disabled` in the disable
-/// direction) on its first ⏎.
+/// Arm an account-action row (`Delete`, `ClearSessionToken`, or `Disabled` in
+/// the disable direction) on its first ⏎.
 fn arm_action(app: &mut App, row: ConfigRow) {
     if let Some(d) = app.config_draft.as_mut() {
         d.armed_action = Some(row);
@@ -5895,11 +7035,34 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
 
 /// ⎋ inside a field: existing accounts revert from the live profile;
 /// new drafts keep the typed value. Either way, editing ends.
+///
+/// Escape on a just-added env entry removes the row instead: the add only
+/// persisted an empty placeholder, so backing out restores the pre-add state.
 fn cancel_config_edit(app: &mut App, field: ConfigRow) {
     let editing_name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
+    if let Some(name) = editing_name.clone() {
+        let just_added = app
+            .config_draft
+            .as_ref()
+            .and_then(|d| d.env_just_added.clone());
+        if let (Some(added), ConfigRow::EnvEntry(i)) = (just_added, field) {
+            let key = {
+                let cfg = app.config();
+                cfg.find(&name).and_then(|p| p.env.keys().nth(i).cloned())
+            };
+            // Keyed on the just-added state, never on an empty buffer: an
+            // existing entry the operator is merely editing empty must keep
+            // its saved value.
+            if key.as_deref() == Some(added.as_str()) {
+                cancel_just_added_env(app, &name, &added);
+                return;
+            }
+        }
+    }
     if let Some(name) = editing_name {
         let value = {
             let cfg = app.config();
@@ -5919,9 +7082,61 @@ fn cancel_config_edit(app: &mut App, field: ConfigRow) {
     }
 }
 
+/// Escape on a just-added env entry: drop the placeholder and persist through
+/// [`edit_profile_env`] — the same writer the value-commit unset uses — so the
+/// active profile's live settings lose the key too. On a failed persist the
+/// editor and the flag stay, so a retry still removes the row.
+fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
+    let new_env = {
+        let cfg = app.config();
+        cfg.find(name).map(|p| {
+            let mut env = p.env.clone();
+            env.remove(key);
+            env
+        })
+    };
+    let Some(new_env) = new_env else {
+        // The profile vanished from the in-memory config (an out-of-band
+        // delete/rename); disarm the cancel and end the edit instead of
+        // leaving the editor stuck open with a zombie flag.
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_just_added = None;
+            d.active = None;
+        }
+        return;
+    };
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_env(&mut cfg, name, new_env)
+    };
+    match result {
+        Ok(()) => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.env_just_added = None;
+                d.env_value = InputState::new("");
+                d.active = None;
+            }
+        }
+        Err(e) => {
+            // `edit_profile_env` mutates the in-memory profile BEFORE its
+            // disk writes, so a failed persist leaves memory without the key
+            // while the placeholder stays on disk — put it back so memory
+            // matches disk and a retry's index lookup finds the same row it
+            // cancelled.
+            {
+                let mut cfg = app.config();
+                if let Some(p) = cfg.find_mut(name) {
+                    p.env.insert(key.to_string(), String::new());
+                }
+            }
+            app.toast(ToastKind::Danger, format!("env update failed\n{e}"))
+        }
+    }
+}
+
 /// The persisted value behind a buffered row, used to revert on ⎋ and to reseed
 /// the buffer after a commit. Toggle/action rows have no buffer → empty string.
-fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) -> String {
+fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: ConfigRow) -> String {
     match row {
         ConfigRow::Name => name.to_string(),
         ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
@@ -5938,6 +7153,9 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         ConfigRow::HaikuModel => profile
             .and_then(|p| p.models.haiku.clone())
             .unwrap_or_default(),
+        ConfigRow::FableModel => profile
+            .and_then(|p| p.models.fable.clone())
+            .unwrap_or_default(),
         ConfigRow::SubagentModel => profile
             .and_then(|p| p.models.subagent.clone())
             .unwrap_or_default(),
@@ -5950,6 +7168,7 @@ fn row_committed_value(profile: Option<&Profile>, name: &str, row: ConfigRow) ->
         | ConfigRow::EnvAdd
         | ConfigRow::Login
         | ConfigRow::DeleteCreds
+        | ConfigRow::ClearSessionToken
         | ConfigRow::Disabled
         | ConfigRow::Delete
         | ConfigRow::Create => String::new(),
@@ -5976,6 +7195,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
         | ConfigRow::OpusModel
         | ConfigRow::SonnetModel
         | ConfigRow::HaikuModel
+        | ConfigRow::FableModel
         | ConfigRow::SubagentModel => commit_model_field(app, field),
         ConfigRow::EnvEntry(i) => commit_env_value(app, i),
         ConfigRow::EnvAdd => commit_env_new_key(app),
@@ -5994,6 +7214,7 @@ fn commit_model_field(app: &mut App, field: ConfigRow) {
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -6040,8 +7261,24 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         ConfigRow::OpusModel => models.opus = scalar,
         ConfigRow::SonnetModel => models.sonnet = scalar,
         ConfigRow::HaikuModel => models.haiku = scalar,
+        ConfigRow::FableModel => models.fable = scalar,
         ConfigRow::SubagentModel => models.subagent = scalar,
-        _ => {}
+        // The other rows carry no `ModelSettings` field and never route here
+        // (`commit_model_field` is the only caller). Named, so a new
+        // `ConfigRow` variant fails the build instead of a silent no-op.
+        ConfigRow::Name
+        | ConfigRow::AutoStart
+        | ConfigRow::BaseUrl
+        | ConfigRow::ApiKey
+        | ConfigRow::ModelOverrideAdd
+        | ConfigRow::EnvEntry(_)
+        | ConfigRow::EnvAdd
+        | ConfigRow::Login
+        | ConfigRow::DeleteCreds
+        | ConfigRow::ClearSessionToken
+        | ConfigRow::Disabled
+        | ConfigRow::Delete
+        | ConfigRow::Create => {}
     }
 }
 
@@ -6054,7 +7291,8 @@ fn cycle_model(app: &mut App) {
     let editing_name = app
         .config_draft
         .as_ref()
-        .and_then(|d| d.editing_name.clone());
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from);
     let Some(name) = editing_name else {
         if let Some(d) = app.config_draft.as_mut() {
             let next = next_model_preset(d.model.trimmed_some().as_deref()).unwrap_or_default();
@@ -6108,6 +7346,7 @@ fn enter_env_value_edit(app: &mut App, i: usize) {
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -6131,13 +7370,16 @@ fn enter_env_add_edit(app: &mut App) {
     }
 }
 
-/// ⏎ in an env value editor: fold the trimmed buffer into the entry (key
-/// unchanged), persist via [`edit_profile_env`], then reseed from the saved value.
+/// ⏎ in an env value editor: fold the trimmed buffer into the entry,
+/// persist via [`edit_profile_env`], then reseed from the saved value.
+/// An emptied value is an unset — the entry is dropped, so neither the
+/// profile's config.toml nor the live settings.json keeps `key = ""`.
 fn commit_env_value(app: &mut App, i: usize) {
     let Some(name) = app
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -6146,12 +7388,22 @@ fn commit_env_value(app: &mut App, i: usize) {
         .as_ref()
         .map(|d| d.env_value.trimmed().to_string())
         .unwrap_or_default();
+    let key = {
+        let cfg = app.config();
+        cfg.find(&name).and_then(|p| p.env.keys().nth(i).cloned())
+    };
     let new_env = {
         let cfg = app.config();
         cfg.find(&name).map(|p| {
             let mut env = p.env.clone();
-            if let Some(key) = p.env.keys().nth(i).cloned() {
-                env.insert(key, value.clone());
+            if let Some(key) = key.clone() {
+                if value.is_empty() {
+                    // Unset, not blank: `edit_profile_env` strips the dropped
+                    // key from the live settings on its own (prev-key removal).
+                    env.remove(&key);
+                } else {
+                    env.insert(key, value.clone());
+                }
             }
             env
         })
@@ -6168,13 +7420,23 @@ fn commit_env_value(app: &mut App, i: usize) {
     };
     match result {
         Ok(()) => {
-            let saved = {
+            let saved = if value.is_empty() {
+                // The entry is gone; `values().nth(i)` would now read the
+                // SIBLING that slid into its slot.
+                String::new()
+            } else {
                 let cfg = app.config();
                 cfg.find(&name)
                     .and_then(|p| p.env.values().nth(i).cloned())
                     .unwrap_or_default()
             };
             if let Some(d) = app.config_draft.as_mut() {
+                if d.env_just_added.as_deref() == key.as_deref() {
+                    // A value commit resolves the just-added state: the entry
+                    // is either kept with its value or dropped by the unset
+                    // gate above — either way the cancel arm disarms.
+                    d.env_just_added = None;
+                }
                 d.env_value = InputState::new(&saved);
                 d.active = None;
             }
@@ -6190,6 +7452,7 @@ fn commit_env_new_key(app: &mut App) {
         .config_draft
         .as_ref()
         .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
     else {
         return;
     };
@@ -6222,9 +7485,11 @@ fn commit_env_new_key(app: &mut App) {
         d.active = None;
     }
     match collision {
-        Some(c) => app
-            .modals
-            .push(Modal::EnvCollision(env_collision_form(name, key, c))),
+        Some(c) => app.modals.push(Modal::EnvCollision(env_collision_form(
+            name.to_string(),
+            key,
+            c,
+        ))),
         None => env_add_commit(app, &name, &key),
     }
 }
@@ -6232,7 +7497,7 @@ fn commit_env_new_key(app: &mut App) {
 /// Add (when new) the custom key with an empty value, then focus its row and open
 /// the value editor. An existing key (overwrite chosen on the prompt) is edited in
 /// place — never re-blanked.
-fn env_add_commit(app: &mut App, name: &str, key: &str) {
+fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
     let exists = {
         let cfg = app.config();
         cfg.find(name)
@@ -6258,6 +7523,11 @@ fn env_add_commit(app: &mut App, name: &str, key: &str) {
             app.toast(ToastKind::Danger, format!("env update failed\n{e}"));
             return;
         }
+        // The add persisted an empty placeholder; arm the cancel so an escape
+        // in the value editor removes the row instead of keeping `key = ""`.
+        if let Some(d) = app.config_draft.as_mut() {
+            d.env_just_added = Some(key.to_string());
+        }
     }
     let idx = {
         let cfg = app.config();
@@ -6271,50 +7541,6 @@ fn env_add_commit(app: &mut App, name: &str, key: &str) {
         app.config_action_cursor = row_pos;
     }
     enter_env_value_edit(app, idx);
-}
-
-/// Remove the focused custom env entry and persist; clamps the cursor afterwards.
-fn remove_env_field(app: &mut App) {
-    let rows = config_rows(app);
-    let Some(ConfigRow::EnvEntry(i)) = rows.get(app.config_action_cursor).copied() else {
-        return;
-    };
-    let Some(name) = app
-        .config_draft
-        .as_ref()
-        .and_then(|d| d.editing_name.clone())
-    else {
-        return;
-    };
-    let (removed, new_env) = {
-        let cfg = app.config();
-        match cfg.find(&name) {
-            Some(p) => {
-                let Some(removed) = p.env.keys().nth(i).cloned() else {
-                    return;
-                };
-                let mut env = p.env.clone();
-                env.remove(&removed);
-                (removed, env)
-            }
-            None => return,
-        }
-    };
-    let result = {
-        let mut cfg = app.config();
-        edit_profile_env(&mut cfg, &name, new_env)
-    };
-    match result {
-        Ok(()) => {
-            if let Some(d) = app.config_draft.as_mut() {
-                d.active = None;
-            }
-            let last = config_rows(app).len().saturating_sub(1);
-            app.config_action_cursor = app.config_action_cursor.min(last);
-            app.toast(ToastKind::Success, format!("removed env '{removed}'"));
-        }
-        Err(e) => app.toast(ToastKind::Danger, format!("env remove failed\n{e}")),
-    }
 }
 
 /// Position of `EnvEntry(sorted_idx)` in the current detail-row list, if present.
@@ -6375,7 +7601,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let choice = EnvCollisionForm::options()[state.cursor.min(last)];
-            let name = state.profile.clone();
+            let name = ProfileName::from(state.profile.clone());
             let pending = state.key.clone();
             let existing_idx = state.existing_idx;
             app.modals.pop();
@@ -6387,7 +7613,7 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
 
 fn run_env_collision_choice(
     app: &mut App,
-    name: &str,
+    name: &ProfileName,
     key: &str,
     existing_idx: Option<usize>,
     choice: EnvCollisionChoice,
@@ -6428,10 +7654,15 @@ fn commit_rename(app: &mut App) {
         app.toast(ToastKind::Danger, format!("{e}"));
         return;
     }
-    let result = {
+    // The rotation guard is taken BEFORE `app.config()`: ROTATION ranks outside
+    // `Config`, so acquiring it under the config guard is the inversion
+    // `lockorder` asserts on.
+    let old_pn = ProfileName::from(old.clone());
+    let new_pn = ProfileName::from(new.clone());
+    let result = rotation_guard_for_mutation(&old_pn).and_then(|rotation| {
         let mut cfg = app.config();
-        rename_profile(&mut cfg, &old, &new)
-    };
+        rename_profile(&mut cfg, &old_pn, &new_pn, &rotation)
+    });
     match result {
         Ok(()) => {
             app.refresh_tokens();
@@ -6451,7 +7682,7 @@ fn commit_endpoint(app: &mut App) {
     let Some(d) = app.config_draft.as_ref() else {
         return;
     };
-    let Some(name) = d.editing_name.clone() else {
+    let Some(name) = d.editing_name.clone().map(ProfileName::from) else {
         return;
     };
     let active_field = d.active;
@@ -6561,7 +7792,7 @@ fn commit_new_account(app: &mut App) {
     }
 }
 
-fn perform_delete(app: &mut App, name: &str) {
+fn perform_delete(app: &mut App, name: &ProfileName) {
     // The unforced guard in `delete_profile` refuses a live-session profile,
     // which would otherwise dead-end the TUI on a danger toast with no way
     // forward. Confirm the deauth risk instead of attempting (and failing)
@@ -6582,11 +7813,12 @@ fn perform_delete(app: &mut App, name: &str) {
     finish_delete(app, name, false);
 }
 
-fn finish_delete(app: &mut App, name: &str, force: bool) {
-    let result = {
+fn finish_delete(app: &mut App, name: &ProfileName, force: bool) {
+    // Before `app.config()`, for the reason the rename path states.
+    let result = rotation_guard_for_mutation(name).and_then(|rotation| {
         let mut cfg = app.config();
-        delete_profile(&mut cfg, name, force)
-    };
+        delete_profile(&mut cfg, name, force, &rotation)
+    });
     match result {
         Ok(()) => {
             app.refresh_tokens();
@@ -6597,6 +7829,392 @@ fn finish_delete(app: &mut App, name: &str, force: bool) {
             app.toast(ToastKind::Success, format!("deleted '{name}'"));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("delete failed\n{e}")),
+    }
+}
+
+/// The action menu's `disable account` / `enable account` off the Setup pane,
+/// where there is no row to arm. Disabling routes through the confirm modal
+/// instead (the row's own arm-then-confirm, in the shape a modal can carry);
+/// enabling is harmless, so it fires straight away, exactly as the row does.
+///
+/// The two gates the row renders inert speak up here: a menu carries no dimmed
+/// item, so a silent no-op would read as a broken pick.
+fn toggle_focused_account_disabled(app: &mut App) {
+    let Some((name, _, _)) = focused_account(app) else {
+        return;
+    };
+    if app.config().is_active(&name) {
+        app.toast(
+            ToastKind::Warning,
+            format!("'{name}' is the active account\nswitch away before disabling it"),
+        );
+        return;
+    }
+    if crate::runtime::has_live_session(&name) {
+        app.toast(
+            ToastKind::Warning,
+            format!("'{name}' has a live session\nclose it before disabling"),
+        );
+        return;
+    }
+    if app.config().find(&name).is_some_and(Profile::is_disabled) {
+        toggle_profile_disabled(app, &name);
+        return;
+    }
+    app.modals.push(Modal::Confirm(ConfirmState {
+        message: format!("disable '{name}'?"),
+        detail: Some(DISABLE_DETAIL.to_string()),
+        choice: false,
+        on_confirm: ConfirmAction::DisableOne(name.to_string()),
+    }));
+}
+
+// ── Setup menu: duplicate + presets ───────────────────────────────────────────
+
+/// `duplicate account`: ask for the new name. The copy itself runs on ⏎, so
+/// esc costs nothing.
+fn prompt_duplicate_profile(app: &mut App) {
+    let Some((name, _, _)) = focused_account(app) else {
+        return;
+    };
+    app.modals.push(Modal::NamePrompt(NamePromptForm {
+        input: InputState::new(""),
+        action: NamePromptAction::DuplicateProfile(name.to_string()),
+    }));
+}
+
+/// `save as preset`: ask for the preset name.
+fn prompt_save_preset(app: &mut App) {
+    let Some((name, _, _)) = focused_account(app) else {
+        return;
+    };
+    app.modals.push(Modal::NamePrompt(NamePromptForm {
+        input: InputState::new(""),
+        action: NamePromptAction::SavePreset(name.to_string()),
+    }));
+}
+
+/// `apply preset`: open the picker. The list always holds the built-ins, so
+/// it is never empty and needs no empty state. On `+ new` the target is the
+/// draft's name buffer (empty until the user types one); the preset's fields
+/// are stamped into the draft, not a saved profile.
+fn open_preset_picker(app: &mut App) {
+    let target = if let Some((name, _, _)) = focused_account(app) {
+        name.to_string()
+    } else if app.profile_cursor >= app.profile_count() {
+        if app.config_draft.is_none() {
+            app.config_draft = Some(build_draft_new());
+        }
+        app.config_draft
+            .as_ref()
+            .map(|d| d.name.trimmed().to_string())
+            .unwrap_or_default()
+    } else {
+        return;
+    };
+    app.modals.push(Modal::PresetPicker(PresetPickerForm {
+        target,
+        presets: crate::presets::list_presets(),
+        cursor: 0,
+    }));
+}
+
+/// ⏎ on the name prompt. The name is validated for the action it carries —
+/// a duplicate against the profile roster, a preset against the preset store —
+/// and a failure toasts with the modal still open so the name can be fixed.
+fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::NamePrompt(form)) = app.modals.last_mut() else {
+        return;
+    };
+    match key.code {
+        // Esc closes; `q` is a valid name character and falls through to the
+        // input editor. (The other modals' `q` shortcut doesn't apply to a
+        // text field.)
+        KeyCode::Esc => {
+            app.modals.pop();
+        }
+        KeyCode::Enter => {
+            let name = form.input.trimmed().to_string();
+            let action = form.action.clone();
+            match action {
+                NamePromptAction::DuplicateProfile(source) => {
+                    let validation = {
+                        let cfg = app.config();
+                        validate_profile_name(&name, &cfg.names(), None)
+                    };
+                    if let Err(e) = validation {
+                        app.toast(ToastKind::Danger, format!("{e}"));
+                        return;
+                    }
+                    app.modals.pop();
+                    duplicate_profile_into(
+                        app,
+                        &ProfileName::from(source),
+                        &ProfileName::from(name),
+                    );
+                }
+                NamePromptAction::SavePreset(source) => {
+                    // The preset store is its own namespace, so the roster is
+                    // empty here; only the charset + built-in rules apply.
+                    if let Err(e) = validate_profile_name(&name, &[], None) {
+                        app.toast(ToastKind::Danger, format!("{e}"));
+                        return;
+                    }
+                    if crate::presets::is_builtin(&name) {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("'{name}' is a built-in preset\npick another name"),
+                        );
+                        return;
+                    }
+                    app.modals.pop();
+                    if crate::presets::preset_exists(&name) {
+                        app.modals.push(Modal::Confirm(ConfirmState {
+                            message: format!("preset '{name}' already exists."),
+                            detail: Some(
+                                "overwrite it with this account's base url and model settings?"
+                                    .to_string(),
+                            ),
+                            choice: false,
+                            on_confirm: ConfirmAction::OverwritePreset(name, source),
+                        }));
+                        return;
+                    }
+                    save_preset_from(app, &source, &name);
+                }
+            }
+        }
+        _ => apply_input_edit(&mut form.input, key),
+    }
+}
+
+fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::PresetPicker(state)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = state.presets.len().saturating_sub(1);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Up => {
+            state.cursor = if state.cursor == 0 {
+                last
+            } else {
+                state.cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            state.cursor = if state.cursor >= last {
+                0
+            } else {
+                state.cursor + 1
+            };
+        }
+        // Drop a custom preset. Built-ins have no file to drop, so the pick says
+        // so rather than no-opping: a list carries no dimmed row here. The toast
+        // fires with the picker still mounted so the user can pick another.
+        KeyCode::Char('d') => {
+            let Some(preset) = state.presets.get(state.cursor.min(last)).cloned() else {
+                return;
+            };
+            if preset.builtin {
+                app.toast(
+                    ToastKind::Info,
+                    format!("'{}' is built in and always available", preset.name),
+                );
+                return;
+            }
+            app.modals.pop();
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("delete preset '{}'?", preset.name),
+                detail: Some("accounts already stamped from it are untouched.".to_string()),
+                choice: false,
+                on_confirm: ConfirmAction::DeletePreset(preset.name),
+            }));
+        }
+        KeyCode::Enter => {
+            let picked = state.presets.get(state.cursor.min(last)).cloned();
+            let target = state.target.clone();
+            app.modals.pop();
+            let Some(preset) = picked else {
+                return;
+            };
+            // Naming the fields that would change is the whole point of the
+            // warning: "this overwrites settings" says nothing a user can act on.
+            let clobbered = {
+                let cfg = app.config();
+                cfg.find(&ProfileName::from(target.clone()))
+                    .map(preset_clobbers)
+                    .unwrap_or_default()
+            };
+            if clobbered.is_empty() {
+                apply_preset_to(app, &target, &preset.name);
+                return;
+            }
+            app.modals.push(Modal::Confirm(ConfirmState {
+                message: format!("apply '{}' over '{target}'?", preset.name),
+                detail: Some(format!("replaces {}.", clobbered.join(", "))),
+                choice: false,
+                on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name),
+            }));
+        }
+        _ => {}
+    }
+}
+
+/// Which of the target's own fields an apply would land on, in row order and
+/// spelled the way the Setup rows are. Empty means the preset writes into a
+/// blank endpoint + model block and can go straight through. Every set field
+/// counts: the apply REPLACES both blocks wholesale, so a field the preset
+/// leaves unset is cleared rather than kept.
+fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if profile.base_url.is_some() {
+        out.push("base url");
+    }
+    let m = &profile.models;
+    for (label, set) in [
+        ("model", m.default.is_some()),
+        ("opus", m.opus.is_some()),
+        ("sonnet", m.sonnet.is_some()),
+        ("haiku", m.haiku.is_some()),
+        ("fable", m.fable.is_some()),
+        ("subagent", m.subagent.is_some()),
+    ] {
+        if set {
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// Stamp `preset` onto `target`. A saved account is written in a single locked
+/// transaction ([`edit_profile_preset`]) so a failure leaves the whole profile on
+/// its prior state. On `+ new` (cursor past the roster) the target names the
+/// unsaved draft, not a profile on disk — the preset's fields are written into
+/// the draft's input buffers directly and committed when the create form fires.
+/// Rebuilds the draft afterwards for a saved account, since every buffer it
+/// holds is stale.
+///
+/// The preset is re-read here rather than carried from the picker: a confirm can
+/// sit open across an edit to the store, and what the user confirmed was a NAME.
+/// The account's own api key is preserved — a template names an endpoint, never
+/// the credential for one.
+fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
+    let Some(preset) = crate::presets::load_preset(preset) else {
+        app.toast(ToastKind::Danger, format!("preset '{preset}' is gone"));
+        return;
+    };
+    // `+ new`: target names the draft. Stamp the input buffers and return —
+    // nothing is on disk until the create form commits.
+    if app.profile_cursor >= app.profile_count() {
+        stamp_draft_from_preset(app, &preset);
+        return;
+    }
+    let target = ProfileName::from(target);
+    let result = {
+        let mut cfg = app.config();
+        edit_profile_preset(
+            &mut cfg,
+            &target,
+            preset.base_url.clone(),
+            preset.models.clone(),
+        )
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_reload_fp = reload_fingerprint();
+            if app.config_draft.is_some() {
+                app.config_draft = Some(build_draft_existing(app, &target));
+            }
+            app.toast(
+                ToastKind::Success,
+                format!("applied '{}' to '{target}'", preset.name),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("apply preset failed\n{e}")),
+    }
+}
+
+/// Write `preset`'s fields into the `+ new` draft's input buffers. Only fields
+/// the preset carries are touched — a draft is a work in progress, so clearing
+/// a buffer the user had typed (because the preset left that field unset) would
+/// lose their work for no reason. The model-override fields the preset does
+/// carry land in the corresponding tier row.
+fn stamp_draft_from_preset(app: &mut App, preset: &crate::presets::Preset) {
+    let Some(draft) = app.config_draft.as_mut() else {
+        return;
+    };
+    if let Some(url) = preset.base_url.as_deref() {
+        draft.base_url = InputState::new(url);
+    }
+    if let Some(m) = preset.models.default.as_deref() {
+        draft.model = InputState::new(m);
+    }
+    for (value, field) in [
+        (preset.models.opus.as_deref(), &mut draft.opus_model),
+        (preset.models.sonnet.as_deref(), &mut draft.sonnet_model),
+        (preset.models.haiku.as_deref(), &mut draft.haiku_model),
+        (preset.models.fable.as_deref(), &mut draft.fable_model),
+        (preset.models.subagent.as_deref(), &mut draft.subagent_model),
+    ] {
+        if let Some(m) = value {
+            *field = InputState::new(m);
+        }
+    }
+    let name = preset.name.clone();
+    app.toast(
+        ToastKind::Success,
+        format!("stamped '{name}' onto the new account"),
+    );
+}
+
+/// Save `source`'s base url + models under `preset`.
+fn save_preset_from(app: &mut App, source: &str, preset: &str) {
+    let fields = {
+        let cfg = app.config();
+        cfg.find(&ProfileName::from(source))
+            .map(|p| (p.base_url.clone(), p.models.clone()))
+    };
+    let Some((base_url, models)) = fields else {
+        app.toast(ToastKind::Danger, format!("'{source}' is gone"));
+        return;
+    };
+    match crate::presets::save_preset(preset, &base_url, &models) {
+        Ok(()) => app.toast(ToastKind::Success, format!("saved preset '{preset}'")),
+        Err(e) => app.toast(ToastKind::Danger, format!("save preset failed\n{e}")),
+    }
+}
+
+/// Copy `source` onto a new account named `new_name` and select it.
+fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &ProfileName) {
+    let result = {
+        let mut cfg = app.config();
+        duplicate_profile(&mut cfg, source, new_name.to_string())
+    };
+    match result {
+        Ok(()) => {
+            app.refresh_tokens();
+            app.last_reload_fp = reload_fingerprint();
+            let idx = app
+                .config()
+                .profiles
+                .iter()
+                .position(|p| p.name == *new_name)
+                .unwrap_or(0);
+            app.profile_cursor = idx;
+            app.config_action_cursor = 0;
+            if app.config_focus == ConfigFocus::Actions {
+                app.config_draft = Some(build_draft_existing(app, new_name));
+            }
+            app.toast(
+                ToastKind::Success,
+                format!("duplicated '{source}' as '{new_name}'"),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("duplicate failed\n{e}")),
     }
 }
 
@@ -6613,7 +8231,7 @@ fn finish_delete(app: &mut App, name: &str, force: bool) {
 /// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
 /// `is_disabled`) the same way `toggle_auto_start` does, since a per-profile
 /// `config.toml` write doesn't bump the mtime the periodic reload watches.
-fn toggle_profile_disabled(app: &mut App, name: &str) {
+fn toggle_profile_disabled(app: &mut App, name: &ProfileName) {
     let currently_disabled = app.config().find(name).is_some_and(Profile::is_disabled);
     let gated = app.config().is_active(name) || crate::runtime::has_live_session(name);
     if gated {
@@ -6642,7 +8260,7 @@ fn toggle_profile_disabled(app: &mut App, name: &str) {
     }
 }
 
-fn toggle_auto_start(app: &mut App, name: &str) {
+fn toggle_auto_start(app: &mut App, name: &ProfileName) {
     enum Outcome {
         NotOAuth,
         Saved(bool),
@@ -6715,6 +8333,47 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// Run `crate::herdr::heal` with the knob the state now holds and surface the
+/// outcome: success, non-empty refusal notes (warning), or failure (danger).
+/// Shared by the `[f]` fix and the `delegate row text` options row — the knob
+/// rides the heal the way `install` reads it, so the row written matches the
+/// `delegate_row_text` set in the TUI.
+fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
+    let delegate_row_text = app.config().state.herdr.delegate_row_text;
+    match crate::herdr::heal(
+        path,
+        crate::herdr::DEFAULT_KEY,
+        &crate::herdr::herdr_bin(),
+        delegate_row_text,
+    ) {
+        Ok(notes) if notes.is_empty() => {
+            // Name the knob state the write landed: the confirm copy for the
+            // off direction says "drop the delegate token", so a success toast
+            // reading "added the keybinding and sidebar row" would claim the
+            // opposite of what the user confirmed.
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "wrote herdr's config: keybinding + sidebar row (delegate token {})",
+                    if delegate_row_text { "on" } else { "off" }
+                ),
+            );
+            recompute_plugin_checks(app, false);
+        }
+        Ok(notes) => {
+            // Non-empty notes = pieces clauth refused to touch (a table it
+            // cannot extend by appending). Reporting success over those is a
+            // lie, so the notes surface verbatim.
+            app.toast(
+                ToastKind::Warning,
+                format!("herdr's config needs attention\n{}", notes.join("\n")),
+            );
+            recompute_plugin_checks(app, false);
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
+    }
+}
+
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
@@ -6732,9 +8391,12 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             if from_divergence {
                 let _ = detach_credentials_link();
                 let mut cfg = app.config();
-                cfg.state.active_profile = None;
-                let _ = save_app_state(&cfg.state);
+                let _ = with_state_lock(|held| {
+                    cfg.state.set_active(None, held);
+                    save_app_state(&cfg.state)
+                });
             }
+            let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
                 overwrite_captured_profile(&mut cfg, &name, *snapshot)
@@ -6756,14 +8418,35 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // so `overwrite_captured_profile` just rewrites its stored creds and
             // skips its own guarded relink. Then force the live link onto it and
             // make it active — the divergence is resolved onto the target.
+            let name = ProfileName::from(name);
+            // Captured before the activation replaces the marker, through the
+            // one helper that also answers for a CLEARED marker — this arm can
+            // run after a `switch_off` left the departed account's `[env]` in
+            // the live file.
+            let outgoing_env_keys = crate::actions::outgoing_env_keys(&app.config());
             let result = {
                 let mut cfg = app.config();
                 overwrite_captured_profile(&mut cfg, &name, *snapshot).and_then(|()| {
-                    cfg.state.active_profile = Some(name.as_str().into());
-                    save_app_state(&cfg.state)
+                    with_state_lock(|held| {
+                        cfg.state.set_active(Some(name.clone()), held);
+                        save_app_state(&cfg.state)
+                    })
                 })
             };
-            let result = result.and_then(|()| force_link_profile_credentials(&name));
+            let result = result
+                .and_then(|()| force_link_profile_credentials(&name))
+                .and_then(|()| {
+                    // This arm activates OUTSIDE `overwrite_captured_profile`,
+                    // so the settings write its own activate arms make has to
+                    // happen here too: an endpoint that never reaches
+                    // `settings.json` routes the live session at Anthropic
+                    // under a profile that says otherwise.
+                    let cfg = app.config();
+                    let Some(profile) = cfg.find(&name) else {
+                        return Ok(());
+                    };
+                    crate::claude::apply_profile_to_claude_settings(profile, &outgoing_env_keys)
+                });
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
@@ -6777,6 +8460,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::Switch(name) => {
+            let name = ProfileName::from(name);
             if switch_gate_in_flight(&app.activity) {
                 app.toast(
                     ToastKind::Warning,
@@ -6818,6 +8502,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             // Backstop for a session that started between arming the confirm and
             // running it: on macOS `rotate_one_inner` refuses, and an unguarded
             // "rotating 'X'" toast would be a success-shaped message for a no-op.
+            let name = ProfileName::from(name);
             if crate::runtime::rotation_blocked_for(&name) {
                 app.toast(
                     ToastKind::Warning,
@@ -6839,6 +8524,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             });
             app.toast(ToastKind::Info, format!("rotating '{name}'"));
         }
+        // Re-checked inside `toggle_profile_disabled`: an account can go active
+        // or open a session between arming this confirm and running it.
+        ConfirmAction::DisableOne(name) => toggle_profile_disabled(app, &ProfileName::from(name)),
         ConfirmAction::WireMcpServers => {
             match crate::plugin_probe::wire_mcp_server() {
                 Ok(()) => {
@@ -6849,18 +8537,59 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
             }
         }
-        ConfirmAction::RelinkCredentials(name) => match force_link_profile_credentials(&name) {
-            Ok(()) => {
-                app.refresh_tokens();
+        ConfirmAction::RelinkCredentials(name) => {
+            let name = ProfileName::from(name);
+            match force_link_profile_credentials(&name) {
+                Ok(()) => {
+                    app.refresh_tokens();
+                    app.toast(
+                        ToastKind::Success,
+                        format!("relinked credentials to '{name}'"),
+                    );
+                    recompute_plugin_checks(app, false);
+                }
+                Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
+            }
+        }
+        ConfirmAction::HealHerdrConfig(path) => run_herdr_heal(app, &path),
+        ConfirmAction::HerdrDelegateRowText(path) => {
+            // Persist the flipped knob FIRST: `run_herdr_heal` reads it back off
+            // the state (the way `install` reads it), so heal writes the row the
+            // user just asked for. Cancel never reaches here — the modal pops
+            // without running the action.
+            {
+                let mut cfg = app.config();
+                cfg.state.herdr.delegate_row_text = !cfg.state.herdr.delegate_row_text;
+                let _ = save_app_state(&cfg.state);
+            }
+            app.last_reload_fp = reload_fingerprint();
+            run_herdr_heal(app, &path);
+        }
+        ConfirmAction::InstallPlugin => match crate::plugin_host::install() {
+            // A no-op from a row that read "not installed" means the backend
+            // never ran — `claude` not on PATH is the reachable case (agentgear
+            // skips an undetected backend). A green success toast over a
+            // skipped install is a lie, so the warning names it instead.
+            Ok(agentgear::Outcome::NoOp) => {
                 app.toast(
-                    ToastKind::Success,
-                    format!("relinked credentials to '{name}'"),
+                    ToastKind::Warning,
+                    "plugin install made no changes\ninstall claude code first, then try again",
                 );
                 recompute_plugin_checks(app, false);
             }
-            Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
+            // Installed / Repaired / Adopted / Updated, or anything agentgear
+            // adds later: a real change happened, so the success toast is
+            // earned. (`Outcome` is #[non_exhaustive], so the wildcard is the
+            // contract, not a shortcut.)
+            Ok(outcome) => {
+                app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
+                // Reflect the fresh install in the rows without a version probe.
+                recompute_plugin_checks(app, false);
+            }
+            Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
         },
         ConfirmAction::BlankCredentials(name) => {
+            let name = ProfileName::from(name);
             let result = {
                 let mut cfg = app.config();
                 // OAuth accounts drop the token via the shared clearer; API
@@ -6882,8 +8611,16 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             }
         }
         ConfirmAction::RestartLogin(name, is_new) => start_login(app, name, is_new),
-        ConfirmAction::DeleteLiveSession(name) => finish_delete(app, &name, true),
-        ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &name),
+        ConfirmAction::DeleteLiveSession(name) => {
+            finish_delete(app, &ProfileName::from(name), true)
+        }
+        ConfirmAction::AddChainCandidate(name) => commit_chain_add(app, &ProfileName::from(name)),
+        ConfirmAction::OverwritePreset(preset, source) => save_preset_from(app, &source, &preset),
+        ConfirmAction::ApplyPresetOver(target, preset) => apply_preset_to(app, &target, &preset),
+        ConfirmAction::DeletePreset(preset) => match crate::presets::delete_preset(&preset) {
+            Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
+            Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
+        },
         ConfirmAction::Acknowledge => {}
     }
 }
@@ -6954,7 +8691,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
                 return;
             }
-            if let Err(e) = force_link_profile_credentials(active) {
+            if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
                 app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
                 return;
             }
@@ -6979,7 +8716,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
 }
 
 fn run_discard_divergence(app: &mut App, active: &str) {
-    if let Err(e) = force_link_profile_credentials(active) {
+    if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
         app.toast(ToastKind::Danger, format!("discard failed\n{e}"));
         return;
     }
@@ -7005,7 +8742,7 @@ fn open_divergence_target_picker(app: &mut App) {
             .collect();
         let live = read_claude_credentials().ok().flatten();
         let preselect = find_matching_oauth_profile(&cfg, live.as_ref())
-            .and_then(|m| targets.iter().position(|n| n == m))
+            .and_then(|m| targets.iter().position(|n| n.as_str() == m.as_str()))
             .map_or(0, |i| i + 1);
         (targets, preselect)
     };
@@ -7062,6 +8799,14 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             let Some(snapshot) = capture_live_or_toast(app) else {
                 return;
             };
+            // Names no surviving endpoint, unlike the browser-login confirm:
+            // this snapshot is a LIVE read (`capture_snapshot` reads the live
+            // settings' endpoint), so what it carries describes the OUTGOING
+            // active profile, not this target. An endpoint-carrying active
+            // profile fills both fields and the target's pair is replaced by
+            // it; an OAuth-active one fills neither and the preserve arm keeps
+            // the target's. The outcome turns on an account this prompt is not
+            // about, so it promises nothing about either field.
             app.modals.push(Modal::Confirm(ConfirmState {
                 message: format!("save the live login into '{target}'?"),
                 detail: Some(format!(
@@ -7129,8 +8874,10 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
             if from_divergence {
                 let _ = detach_credentials_link();
                 let mut cfg = app.config();
-                cfg.state.active_profile = None;
-                let _ = save_app_state(&cfg.state);
+                let _ = with_state_lock(|held| {
+                    cfg.state.set_active(None, held);
+                    save_app_state(&cfg.state)
+                });
             }
             let result = {
                 let mut cfg = app.config();
@@ -7315,8 +9062,15 @@ fn drain_pricing_events(app: &mut App) {
         match ev {
             crate::pricing::PricingEvent::Loaded(table) => {
                 app.price_table = Some(*table);
+                app.price_failed = false;
             }
-            crate::pricing::PricingEvent::Failed => {}
+            // Surface failure only when there is nothing to show — a transient
+            // fetch error mid-session keeps the last good table.
+            crate::pricing::PricingEvent::Failed => {
+                if app.price_table.is_none() {
+                    app.price_failed = true;
+                }
+            }
         }
     }
 }
@@ -7343,7 +9097,8 @@ fn drain_login_events(app: &mut App) {
         };
         close_login_modal(app);
         match result {
-            Ok(creds) => apply_login(app, session, creds),
+            Ok(LoginResult::Oauth(creds)) => apply_login(app, session, *creds),
+            Ok(LoginResult::Console(outcome)) => apply_console_login(app, session, *outcome),
             Err(e) => app.toast(
                 ToastKind::Danger,
                 format!("login for '{}' failed\n{e}", session.name),
@@ -7395,7 +9150,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
 
     let (exists, has_creds) = {
         let cfg = app.config();
-        let profile = cfg.find(&session.name);
+        let profile = cfg.find(&ProfileName::from(session.name.clone()));
         (
             profile.is_some(),
             profile.and_then(|p| p.credentials.as_ref()).is_some(),
@@ -7424,11 +9179,23 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             Some(DivergenceChoice::Overwrite)
         );
     if !apply_now {
+        // Names the endpoint only where the preserve arm will actually keep it
+        // — the same rule `reauth_confirm_object` enforces on the CLI prompt,
+        // asked of the same predicate. This snapshot is credential-only, so
+        // the arm turns on the stored profile alone.
+        let keeps_endpoint = app
+            .config()
+            .find(&ProfileName::from(session.name.clone()))
+            .is_some_and(crate::claude::has_own_inference_endpoint);
         app.modals.push(Modal::Confirm(ConfirmState {
             message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
-                "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
-                    .to_string(),
+                if keeps_endpoint {
+                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, model settings, and its endpoint and api key stay."
+                } else {
+                    "a fresh browser login finished for this account. the old tokens are dropped; chain slot, env, and model settings stay."
+                }
+                .to_string(),
             ),
             choice: false,
             on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
@@ -7437,7 +9204,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
     }
     let result = {
         let mut cfg = app.config();
-        overwrite_captured_profile(&mut cfg, &session.name, snapshot)
+        overwrite_captured_profile(&mut cfg, &ProfileName::from(session.name.clone()), snapshot)
     };
     match result {
         Ok(()) => {
@@ -7446,6 +9213,77 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
         }
         Err(e) => app.toast(ToastKind::Danger, format!("login failed\n{e}")),
+    }
+}
+
+/// Fold a captured Alibaba console session into its profile. Replaces the usage
+/// session and NOTHING else — not the api key, which the callback also returns
+/// scoped to a workspace rather than to this plan (`alibaba_login`'s module doc
+/// has the reason it is dropped).
+///
+/// Re-checks the account at apply time the way [`apply_login`] does, and on the
+/// same reasoning: a browser round-trip is long enough for the profile to be
+/// deleted or repointed at a different endpoint underneath it, and a session is
+/// only meaningful on the console its endpoint is administered from. There is no
+/// divergence gate, because a lapsed session cannot be refreshed and re-running
+/// this login is the routine repair rather than an overwrite to guard.
+fn apply_console_login(
+    app: &mut App,
+    session: LoginSession,
+    outcome: crate::alibaba_login::ConsoleLoginOutcome,
+) {
+    let name = ProfileName::from(session.name);
+    let (exists, target) = {
+        let cfg = app.config();
+        let profile = cfg.find(&name);
+        (
+            profile.is_some(),
+            profile.and_then(Profile::console_login_target),
+        )
+    };
+    if !exists {
+        app.toast(
+            ToastKind::Danger,
+            format!("console login failed\nprofile '{name}' no longer exists"),
+        );
+        return;
+    }
+    // The SITE, not just "still Alibaba". A session is minted on one console
+    // front and is meaningless on the other, and the usage fetch keys on the
+    // credential's OWN site rather than on `base_url` — so an endpoint moved
+    // between two Model Studio hosts mid-round-trip would not degrade to a dead
+    // session, it would quietly report the other plan's quota under this name.
+    // Compared against what the console ANSWERED with, which is what got
+    // stored, rather than against what the login opened.
+    if target.map(|(site, _)| site) != Some(outcome.console.site) {
+        app.toast(
+            ToastKind::Danger,
+            format!("console login failed\n'{name}' no longer points at the console this session came from"),
+        );
+        return;
+    }
+    let result = {
+        let mut cfg = app.config();
+        crate::actions::store_console_login(&mut cfg, &name, outcome.console)
+    };
+    match result {
+        Ok(()) => {
+            // The stored session is what the usage leg fetches with, and
+            // `store_console_login` drops the cache the old one filled, so ask
+            // for the figures the new one can actually read.
+            app.refresh_tokens();
+            app.manual_refresh_one(&name);
+            // The window is the surprising part and the CLI's own summary leads
+            // with it: the 48h runs from the aliyun browser sign-in, so a login
+            // inherits what is left of it and can be worth minutes.
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "console session captured for '{name}'\nit expires 48h after your aliyun sign-in, not after this login"
+                ),
+            );
+        }
+        Err(e) => app.toast(ToastKind::Danger, format!("console login failed\n{e}")),
     }
 }
 
@@ -7488,6 +9326,7 @@ pub(crate) fn on_tick(app: &mut App) {
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
     for name in auto_switch_targets {
+        let name = ProfileName::from(name);
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
         }
@@ -7514,8 +9353,10 @@ pub(crate) fn on_tick(app: &mut App) {
     maybe_spawn_bootstrap(app);
 
     poll_credentials_divergence(app);
-    poll_plugin_refresh(app);
+    // Before the plugin refresh, which folds the tally into its runtime row and
+    // would otherwise render this tick against the previous one's fleet.
     poll_live_sessions(app);
+    poll_plugin_refresh(app);
     poll_daemon_health(app);
 
     update_banner(app);
@@ -7534,11 +9375,12 @@ fn poll_daemon_health(app: &mut App) {
     app.daemon_health = crate::daemon::daemon_health();
 }
 
-/// Re-tally the live-session registry for the Overview `active` column and the
-/// Fallback tab, at most once a second — a readdir plus an `open` + `try_lock`
-/// per row is cheap but not per-frame cheap, and a session starting or exiting
-/// is a human-timescale event. Ungated by tab: two tabs read it, and a snapshot
-/// a second stale on arrival would show the wrong fleet for that second.
+/// Re-tally the live-session registry for the Overview `live` column, the
+/// Fallback member card and the Plugin tab's `runtime` row, at most once a
+/// second — a readdir plus an `open` + `try_lock` per row is cheap but not
+/// per-frame cheap, and a session starting or exiting is a human-timescale
+/// event. Ungated by tab: all three read it, and a snapshot a second stale on
+/// arrival would show the wrong fleet for that second.
 fn poll_live_sessions(app: &mut App) {
     const LIVE_SESSIONS_INTERVAL: Duration = Duration::from_secs(1);
     if app
@@ -7748,13 +9590,7 @@ fn poll_credentials_divergence(app: &mut App) {
     if !app.modals.is_empty() {
         return;
     }
-    let Some(active) = app
-        .config()
-        .state
-        .active_profile
-        .as_deref()
-        .map(str::to_string)
-    else {
+    let Some(active) = app.config().state.active_profile.as_ref().cloned() else {
         app.divergence_pending = None;
         return;
     };
@@ -7797,7 +9633,7 @@ fn poll_credentials_divergence(app: &mut App) {
         app.divergence_pending = None;
         return;
     }
-    resolve_or_note_divergence(app, &active);
+    resolve_or_note_divergence(app, active.as_ref());
 }
 
 /// Apply the configured `default_divergence`, or flag the non-blocking banner

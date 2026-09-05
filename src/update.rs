@@ -51,7 +51,8 @@ struct Asset {
     browser_download_url: String,
 }
 
-const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version this binary is, read off the manifest at build time.
+pub(crate) const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Returns `true` when the update system is active (env var unset or not `"1"`).
 pub(crate) fn updates_enabled() -> bool {
@@ -283,7 +284,10 @@ fn is_cargo_installed() -> bool {
     let Ok(exe) = env::current_exe() else {
         return false;
     };
-    let Some(home) = dirs::home_dir() else {
+    // Through `profile::home_dir` rather than `dirs` directly: that resolver is
+    // the one a test can redirect, so this stays inside the sandbox with every
+    // other home-derived path.
+    let Ok(home) = crate::profile::home_dir() else {
         return false;
     };
     exe.starts_with(home.join(".cargo").join("bin"))
@@ -313,7 +317,7 @@ fn parse_version(v: &str) -> Option<(u32, u32, u32)> {
     ))
 }
 
-fn is_newer(tag: &str, current: &str) -> bool {
+pub(crate) fn is_newer(tag: &str, current: &str) -> bool {
     match (parse_version(tag), parse_version(current)) {
         (Some(latest), Some(cur)) => latest > cur,
         _ => false,

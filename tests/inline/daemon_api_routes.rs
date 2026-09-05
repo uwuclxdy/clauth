@@ -14,7 +14,8 @@
 use super::*;
 
 use crate::profile::{
-    AppConfig, AppState, ClaudeCredentials, ConfigHandle, OAuthToken, Profile, save_profile,
+    AppConfig, AppState, ClaudeCredentials, ConfigHandle, OAuthToken, Profile, save_app_state,
+    save_profile,
 };
 use crate::testutil::HomeSandbox;
 
@@ -47,6 +48,11 @@ fn seeded_config() -> ConfigHandle {
         profiles: vec!["alpha".into(), "beta".into()],
         ..Default::default()
     };
+    // Persisted, not just built in memory: `ensure_installable` gates on
+    // `profile::is_configured`, which reads the roster back off disk so a target
+    // deleted by a concurrent CLI bounces before any relink tears the live slot
+    // down. A fixture that only holds the roster in memory reads as "not found".
+    save_app_state(&state).expect("save app state");
     std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
         state,
         profiles,
@@ -191,7 +197,9 @@ fn all_reveals_disabled_accounts_that_the_plain_feed_hides() {
     let config = seeded_config();
     {
         let mut cfg = config.lock().expect("config");
-        let beta = cfg.find_mut("beta").expect("beta");
+        let beta = cfg
+            .find_mut(&crate::profile::ProfileName::from("beta"))
+            .expect("beta");
         beta.disabled = true;
         save_profile(beta).expect("save");
     }
@@ -292,7 +300,9 @@ fn switch_to_a_disabled_profile_is_refused() {
     let config = seeded_config();
     {
         let mut cfg = config.lock().expect("config");
-        let beta = cfg.find_mut("beta").expect("beta");
+        let beta = cfg
+            .find_mut(&crate::profile::ProfileName::from("beta"))
+            .expect("beta");
         beta.disabled = true;
         save_profile(beta).expect("save");
     }

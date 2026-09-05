@@ -1,7 +1,5 @@
 //! The rank check is the mechanism every other lock-discipline claim leans on.
 //!
-//! `docs/concurrency.md` states the global lock order as an executable check
-//! rather than prose ("what used to be prose is now an executable check"), and
 //! `the_ttl_clock_is_reachable_under_the_config_guard` is written on the premise
 //! that a misorder panics there. But the whole enforcement is one
 //! `debug_assert!` inside `RankGuard::enter`, and nothing asserted that it

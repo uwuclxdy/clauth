@@ -7,7 +7,7 @@
 //! `switch mode` = burn-aware, the burn-aware `burn floor`/`burn horizon`
 //! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
 //! extra usage (`allow extra usage` opt-in + its own `extra usage spent` halt
-//! default — real money, see `docs/fallback.md`).
+//! default — real money).
 //! ↑↓ walks the rows; space cycles a row's value in place; ⏎ opens the
 //! refresh-interval and weekly-threshold custom-value editors and otherwise
 //! mirrors space. No left selector, no popups — settings are global.
@@ -29,7 +29,7 @@ use super::super::app::{
 use super::super::theme::{self, Tier};
 use super::panes::{
     cycle_option, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, section_box,
+    invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -46,7 +46,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     let rows = {
-        let state = &app.config().state;
+        let cfg = app.config();
+        let state = &cfg.state;
         RowState {
             switch_off_when_spent: state.switch_off_when_spent,
             burn_aware: state.burn_aware_switching,
@@ -54,17 +55,24 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
             refresh_spent: state.refresh_spent_accounts,
+            auto_start_queue: state.auto_start_queue,
+            any_auto_start: cfg.profiles.iter().any(|p| p.auto_start),
             reset_display: state.reset_display(),
             clock_format: state.clock_format(),
         }
     };
-    let refresh_interval_ms = app
-        .refresh_interval
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let weekly_pct = app.config().state.weekly_switch_threshold_pct();
-    let burn_floor_pct = app.config().state.burn_switch_floor_pct();
-    let burn_horizon_ms = app.config().state.burn_horizon_cap_ms();
-    let default_divergence = app.config().state.default_divergence;
+    let tunables = {
+        let state = &app.config().state;
+        RowTunables {
+            refresh_interval_ms: app
+                .refresh_interval
+                .load(std::sync::atomic::Ordering::Relaxed),
+            weekly_pct: state.weekly_switch_threshold_pct(),
+            burn_floor_pct: state.burn_switch_floor_pct(),
+            burn_horizon_ms: state.burn_horizon_cap_ms(),
+            default_divergence: state.default_divergence,
+        }
+    };
     let cursor = app
         .global_config_cursor
         .min(GLOBAL_CONFIG_ROWS.len().saturating_sub(1));
@@ -98,17 +106,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             GlobalConfigRow::WeeklyThreshold => weekly_editing,
             _ => None,
         };
-        let line = detail_row(
-            *row,
-            selected,
-            rows,
-            refresh_interval_ms,
-            weekly_pct,
-            burn_floor_pct,
-            burn_horizon_ms,
-            default_divergence,
-            row_editing,
-        );
+        let line = detail_row(*row, selected, rows, tunables, row_editing);
         match row_editing {
             Some(input) => {
                 // The native terminal cursor owns the caret; the row renders plain
@@ -131,17 +129,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 } else {
                     line
                 });
-                if selected
-                    && let Some(tip) = row_hint(
-                        *row,
-                        default_divergence,
-                        rows,
-                        refresh_interval_ms,
-                        weekly_pct,
-                        burn_floor_pct,
-                        burn_horizon_ms,
-                    )
-                {
+                if selected && let Some(tip) = row_hint(*row, rows, tunables) {
                     lines.extend(help_tooltip_lines(&tip, inner.width as usize));
                 }
             }
@@ -185,19 +173,35 @@ struct RowState {
     switch_off_when_budget_spent: bool,
     preemptive: bool,
     refresh_spent: bool,
+    auto_start_queue: bool,
+    /// Whether ANY account has opted into `auto_start` — the queue toggle is
+    /// inert without one (there is nothing to space), so the row dims and its
+    /// key no-ops, like every other row another setting makes inert.
+    any_auto_start: bool,
     reset_display: ResetDisplay,
     clock_format: ClockFormat,
 }
 
-fn row_hint(
-    row: GlobalConfigRow,
-    default_divergence: Option<DivergenceChoice>,
-    rows: RowState,
+/// The numeric tunables the Config tab's rows render, gathered once per draw.
+/// Bundled for the same argument-budget reason as [`RowState`]; [`row_hint`]
+/// reads the same bundle, so the two stay in sync as rows accumulate.
+#[derive(Clone, Copy)]
+struct RowTunables {
     refresh_interval_ms: u64,
     weekly_pct: f64,
     burn_floor_pct: f64,
     burn_horizon_ms: u64,
-) -> Option<String> {
+    default_divergence: Option<DivergenceChoice>,
+}
+
+fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Option<String> {
+    let RowTunables {
+        refresh_interval_ms,
+        weekly_pct,
+        burn_floor_pct,
+        burn_horizon_ms,
+        default_divergence,
+    } = tunables;
     // The default + units live on the row as a faint span (only when the value
     // is off its default), so the hint states behavior alone, interpolating the
     // live value. Rows another toggle makes inert render dimmed and keep their
@@ -275,22 +279,29 @@ fn row_hint(
         } else {
             "skip refreshing a spent account until its window resets"
         }),
+        GlobalConfigRow::AutoStartQueue => String::from(if rows.auto_start_queue {
+            "space auto-start windows evenly, so one resets every 5h / accounts"
+        } else {
+            "auto-start usage windows as soon as possible"
+        }),
     };
     Some(tip)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn detail_row(
     row: GlobalConfigRow,
     selected: bool,
     rows: RowState,
-    refresh_interval_ms: u64,
-    weekly_pct: f64,
-    burn_floor_pct: f64,
-    burn_horizon_ms: u64,
-    default_divergence: Option<DivergenceChoice>,
+    tunables: RowTunables,
     editing: Option<&InputState>,
 ) -> Line<'static> {
+    let RowTunables {
+        refresh_interval_ms,
+        weekly_pct,
+        burn_floor_pct,
+        burn_horizon_ms,
+        default_divergence,
+    } = tunables;
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
@@ -416,6 +427,17 @@ fn detail_row(
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
         }
+        // Inert until some account opts into `auto_start` (rendered dimmed):
+        // a queue with no possible member spaces nothing, so it stays a true
+        // disabled row — the key is a no-op, and `faint` never decouples from
+        // "not editable" (the `extra usage spent` contract above).
+        GlobalConfigRow::AutoStartQueue => {
+            if rows.any_auto_start {
+                toggle_row(arrow, "auto-start queue", rows.auto_start_queue, selected)
+            } else {
+                dimmed_toggle_row("auto-start queue", rows.auto_start_queue, selected)
+            }
+        }
     }
 }
 
@@ -489,19 +511,6 @@ fn refresh_edit_line(arrow: Span<'static>, input: &InputState) -> Line<'static> 
     };
     spans.push(Span::styled(" s", unit_style));
     Line::from(spans)
-}
-
-/// Render the typed buffer with uniform `BG_SUNKEN` styling (DANGER fg when
-/// invalid). The terminal cursor — set via `frame.set_cursor_position` — owns
-/// the caret glyph, matching the chain threshold editor.
-fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
-    let body = if invalid {
-        theme::danger()
-    } else {
-        theme::body()
-    }
-    .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
 }
 
 /// Sub-line under the refresh field while typing: the valid range, in DANGER
@@ -700,6 +709,28 @@ fn dimmed_cycle_row(key: &str, options: &[(&str, bool)], selected: bool) -> Line
         arrow,
         Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
         Span::styled(value.to_string(), theme::faint()),
+    ])
+}
+
+/// [`dimmed_cycle_row`]'s toggle sibling: the whole row — caret, key, knob —
+/// renders `TEXT_FAINT`, keeping the current value visible with no accent even
+/// while on. Focusable but inert (the key handler no-ops it), so `TEXT_FAINT`
+/// keeps meaning "can't touch this".
+fn dimmed_toggle_row(key: &str, on: bool, selected: bool) -> Line<'static> {
+    let arrow = if selected {
+        Span::styled("❯ ", theme::faint())
+    } else {
+        Span::raw("  ")
+    };
+    let glyph = if on {
+        theme::toggle_on()
+    } else {
+        theme::toggle_off()
+    };
+    Line::from(vec![
+        arrow,
+        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::faint()),
+        Span::styled(glyph, theme::faint()),
     ])
 }
 

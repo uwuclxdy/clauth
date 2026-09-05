@@ -383,9 +383,9 @@ fn disabled_account_only_dims_its_name_in_the_setup_list() {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
-    let mut disabled = crate::testutil::blank_profile("xqzoff");
+    let mut disabled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("xqzoff"));
     disabled.disabled = true;
-    let enabled = crate::testutil::blank_profile("xqzon");
+    let enabled = crate::testutil::blank_profile(&crate::profile::ProfileName::from("xqzon"));
     let names: Vec<ProfileName> = vec!["xqzoff".into(), "xqzon".into()];
     let app = App::new(AppConfig {
         state: AppState {
@@ -506,7 +506,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     };
 
     // Comfortable horizon: a plain accent value, no pill, one line.
-    let comfy = session_token_lines(&S::LongLived(Some(now + 340 * day)), now, w);
+    let comfy = session_token_lines(&S::LongLived(Some(now + 340 * day)), false, "acct", now, w);
     assert_eq!(comfy.len(), 1);
     let comfy_t = text(&comfy);
     assert!(comfy_t.contains("token"), "{comfy_t}");
@@ -518,7 +518,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&comfy, theme::accent()));
 
     // Last 30 days: a WARNING pill, still one line, no fix.
-    let soon = session_token_lines(&S::LongLived(Some(now + 12 * day)), now, w);
+    let soon = session_token_lines(&S::LongLived(Some(now + 12 * day)), false, "acct", now, w);
     assert_eq!(soon.len(), 1);
     assert!(
         text(&soon).contains("[ expires in ~12d ]"),
@@ -528,7 +528,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(has_color(&soon, theme::warning()), "last 30 days warn");
 
     // Expired: DANGER pill + a `└` re-mint fix line.
-    let dead = session_token_lines(&S::LongLived(Some(now - day)), now, w);
+    let dead = session_token_lines(&S::LongLived(Some(now - day)), false, "acct", now, w);
     assert_eq!(dead.len(), 2, "expired = pill + fix line");
     let dead_t = text(&dead);
     assert!(dead_t.contains("[ expired ]"), "{dead_t}");
@@ -540,7 +540,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
 
     // Expired within the last 24h: truncating division gives 0 days; it must
     // read as expired, not "~0d / warning".
-    let just_dead = session_token_lines(&S::LongLived(Some(now - day / 2)), now, w);
+    let just_dead = session_token_lines(&S::LongLived(Some(now - day / 2)), false, "acct", now, w);
     let just_dead_t = text(&just_dead);
     assert!(
         just_dead_t.contains("[ expired ]"),
@@ -552,7 +552,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Unstamped long-lived: a plain accent value.
-    let unstamped = session_token_lines(&S::LongLived(None), now, w);
+    let unstamped = session_token_lines(&S::LongLived(None), false, "acct", now, w);
     assert_eq!(unstamped.len(), 1);
     assert!(
         text(&unstamped).contains("no recorded expiry"),
@@ -561,7 +561,7 @@ fn long_lived_token_row_counts_down_and_escalates() {
     );
 
     // Mis-filled (rotating pair): DANGER pill + fix, split disengaged.
-    let misfilled = session_token_lines(&S::NotLongLived, now, w);
+    let misfilled = session_token_lines(&S::NotLongLived, false, "acct", now, w);
     assert_eq!(misfilled.len(), 2, "mis-filled = pill + fix line");
     let mis_t = text(&misfilled);
     assert!(mis_t.contains("[ mis-filled ]"), "{mis_t}");
@@ -572,5 +572,446 @@ fn long_lived_token_row_counts_down_and_escalates() {
     assert!(
         has_color(&misfilled, theme::danger()),
         "a disengaged sidecar is DANGER"
+    );
+}
+
+/// The action next to that status row. Same button class as `Delete` /
+/// `Disabled`: one label span, DANGER + bold whether or not the row is focused,
+/// flipping to the `press again to <verb>` copy once `armed_action` names it —
+/// clearing changes what EVERY future switch installs and can move a running
+/// session's credentials, so it is never a one-press action.
+#[test]
+fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut snap = Snap::blank("a");
+    snap.has_other_login = true; // ungated: the profile has an OAuth login too
+    let input = InputState::new("");
+
+    for selected in [false, true] {
+        let arrow = if selected { "❯ " } else { "  " };
+        let unarmed = detail_row(
+            ConfigRow::ClearSessionToken,
+            selected,
+            false,
+            None,
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&unarmed),
+            format!("{arrow}clear long-lived token"),
+            "unarmed label is fixed regardless of focus (selected={selected})"
+        );
+        assert_eq!(unarmed.spans[1].style.fg, theme::danger().fg);
+        assert!(
+            unarmed.spans[1].style.add_modifier.contains(Modifier::BOLD),
+            "always bold, like `delete account` (selected={selected})"
+        );
+
+        let armed = detail_row(
+            ConfigRow::ClearSessionToken,
+            selected,
+            false,
+            Some(ConfigRow::ClearSessionToken),
+            &snap,
+            &input,
+        );
+        assert_eq!(
+            line_text(&armed),
+            format!("{arrow}press again to clear"),
+            "arming swaps to the confirm copy"
+        );
+        assert_eq!(armed.spans[1].style.fg, theme::danger().fg);
+        assert!(armed.spans[1].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    // Another row's arm must not bleed into this row's confirm copy.
+    let cross_armed = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        Some(ConfigRow::Delete),
+        &snap,
+        &input,
+    );
+    assert_eq!(line_text(&cross_armed), "❯ clear long-lived token");
+}
+
+/// Dimmed + inert when the profile stores no other login — clearing there
+/// would strip its only credential, so the row takes the same faint treatment
+/// as a gated `disabled` row (arrow included) and ignores a stale arm. The
+/// differential leg proves the faint is a real style branch rather than a
+/// coincidence with an ungated row's color.
+#[test]
+fn clear_session_token_button_dims_without_another_stored_login() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let snap = Snap::blank("a"); // has_other_login: false
+    let input = InputState::new("");
+
+    let gated = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        Some(ConfigRow::ClearSessionToken),
+        &snap,
+        &input,
+    );
+    assert_eq!(
+        line_text(&gated),
+        "❯ clear long-lived token",
+        "gated ignores the stale arm, showing the plain label"
+    );
+    assert_eq!(gated.spans[1].style.fg, theme::faint().fg);
+    assert_eq!(
+        gated.spans[0].style.fg,
+        theme::faint().fg,
+        "the arrow dims too while gated and selected"
+    );
+
+    let mut ungated_snap = Snap::blank("a");
+    ungated_snap.has_other_login = true;
+    let ungated = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        None,
+        &ungated_snap,
+        &input,
+    );
+    assert_ne!(
+        gated.spans[1].style.fg, ungated.spans[1].style.fg,
+        "a gated row must render distinctly from the same row ungated"
+    );
+
+    // The FLAG-ONLY state is never gated, even with no other login: the press
+    // disarms without touching a credential (`run_config_row`'s widened gate),
+    // and a row that dims while its press acts would be the renderer's own
+    // lie. `Snap::clear_gated` is the one spelling all three surfaces share.
+    let mut flag_only = Snap::blank("a");
+    flag_only.rolling_armed = true;
+    let acting = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        None,
+        &flag_only,
+        &input,
+    );
+    assert_eq!(
+        acting.spans[1].style.fg,
+        theme::danger().fg,
+        "a flag-only account renders the acting button, not the dim"
+    );
+    let armed = detail_row(
+        ConfigRow::ClearSessionToken,
+        true,
+        false,
+        Some(ConfigRow::ClearSessionToken),
+        &flag_only,
+        &input,
+    );
+    assert_eq!(
+        line_text(&armed),
+        "❯ press again to clear",
+        "the first press arms VISIBLY on a flag-only account"
+    );
+}
+
+/// The `└` hint is value-aware like every other Setup hint: the gate's reason
+/// first, then what the clear actually does — and the ACTIVE account's wording
+/// names the relink, since that is the half a running session feels.
+///
+/// Both halves split again on what the clear falls back TO. The gate passes on
+/// EITHER credential, so an api-key account with a sidecar clears fine onto an
+/// absent install source and is signed out rather than relinked; the hint
+/// promised a relink in both states until 2026-08-12. The two api-key legs are
+/// what make `clear_falls_back_to_oauth` load-bearing rather than a restatement
+/// of `has_other_login`.
+#[test]
+fn clear_session_token_hint_names_the_gate_then_what_the_clear_falls_back_to() {
+    let mut snap = Snap::blank("a");
+
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("no other login stored, log in first"),
+    );
+
+    // An api key alone opens the gate, and there is no login behind it.
+    snap.has_other_login = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("the next switch runs this account on its api key"),
+    );
+
+    snap.is_active = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("signs Claude Code out now · this account runs on its api key"),
+    );
+
+    // A stored OAuth pair is what the clear actually falls back to.
+    snap.clear_falls_back_to_oauth = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("relinks this account's own login now · running sessions follow"),
+    );
+
+    snap.is_active = false;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("the next switch installs this account's own login again"),
+    );
+
+    snap.is_active = true;
+    // The full-scope disclosure: this hint is the TUI's ONLY statement that a
+    // clear on a rolling profile stops the re-stamping and destroys the
+    // preserved mint — the CLI prints two explicit lines for the same act,
+    // and a two-press arm is not a disclosure. (The gate-vs-flag-only split
+    // has its own test below.)
+    snap.rolling_armed = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
+    );
+    snap.has_static_backup = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some(
+            "relinks this account's own login now · running sessions follow · re-stamping \
+             stops · the preserved mint goes too"
+        ),
+    );
+    // The disarm half also fires off the sidecar CONTENT alone (a rolling
+    // bearer with the flag raced off), so neither signal can silently stop
+    // carrying the disclosure.
+    snap.rolling_armed = false;
+    snap.rolling_token = true;
+    snap.has_static_backup = false;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("relinks this account's own login now · running sessions follow · re-stamping stops"),
+    );
+}
+
+/// The gate arm reads the SAME condition as `run_config_row`'s refusal
+/// (`Snap::clear_gated`): a flag-only account (armed, nothing stamped, no
+/// preserved mint) disarms without stripping a credential, so its hint must
+/// describe the act — with its OWN copy, since the 4-way base's api-key arms
+/// would promise a credential this account does not hold. The moment a stored
+/// piece exists, the gate line is back — clearing THAT would strip the last
+/// credential.
+#[test]
+fn clear_session_token_hint_lets_a_flag_only_account_past_the_gate() {
+    let mut snap = Snap::blank("a");
+    snap.rolling_armed = true;
+
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("stops the daemon re-stamping this account · nothing else is stored"),
+    );
+
+    // Active, the relink onto an absent install source signs Claude Code out,
+    // and the hint says so instead of hiding it behind the disarm.
+    snap.is_active = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some(
+            "stops the daemon re-stamping this account · signs Claude Code out · nothing is \
+             stored behind it"
+        ),
+    );
+    snap.is_active = false;
+
+    snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(None));
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("no other login stored, log in first"),
+    );
+
+    snap.session_token = None;
+    snap.has_static_backup = true;
+    assert_eq!(
+        row_hint(ConfigRow::ClearSessionToken, &snap).as_deref(),
+        Some("no other login stored, log in first"),
+    );
+}
+
+/// `build_snap` derives the token row from what the sidecar HOLDS, never from
+/// the config flag. The two part ways exactly when honesty matters: a dead
+/// chain degrades the sidecar onto its static mint while the flag stays on,
+/// and a flag-driven row would promise a re-stamp in ~8760h for a mint nobody
+/// is going to re-stamp — the same comfortable-looking lie the honest
+/// countdown exists to prevent, from the other direction.
+#[test]
+fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
+    use crate::profile::{AppConfig, AppState, ClaudeCredentials, OAuthToken};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "cfg-snap-roll";
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let app_with_flag = |rolling_token: bool| {
+        let mut p = crate::profile::Profile::new(name.to_string(), None, None);
+        p.rolling_token = rolling_token;
+        App::new(AppConfig {
+            state: AppState {
+                profiles: vec![p.name.clone()],
+                ..AppState::default()
+            },
+            profiles: vec![p],
+        })
+    };
+    let sidecar = |scopes: Vec<&str>, plan: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-snap-fixture".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(scopes.into_iter().map(String::from).collect()),
+            subscription_type: plan.map(String::from),
+        }),
+    };
+
+    // Flag ON, sidecar degraded onto the mint: the row must say mint.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:sessions:claude_code"],
+            None,
+        ))
+        .expect("ser"),
+    )
+    .expect("write mint");
+    assert!(
+        !build_snap(&app_with_flag(true), true).rolling_token,
+        "a degraded profile must render the mint it is actually on"
+    );
+
+    // Flag OFF, sidecar holding a rolling bearer (`clauth static-token` flips
+    // the flag before the restore lands): the row must say rolling.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:profile"],
+            Some("max"),
+        ))
+        .expect("ser"),
+    )
+    .expect("write rolling");
+    assert!(
+        build_snap(&app_with_flag(false), true).rolling_token,
+        "what sessions actually hold outranks the flag in both directions"
+    );
+}
+
+/// The ROLLING half of the token row, previously untested end to end: the
+/// countdown counts to the RE-STAMP (expiry minus `ROLLING_RESTAMP_HORIZON_MS`),
+/// never to the expiry — the leg renews 2h ahead, so an expiry-based label
+/// read 2h high everywhere except zero — and the stalled state names the
+/// re-arm command with the live profile name, house `·` form.
+#[test]
+fn rolling_token_row_counts_to_the_restamp_and_escalates() {
+    use crate::claude::SessionTokenStatus as S;
+    let now = crate::usage::now_ms() as i64;
+    let hour = 3_600_000i64;
+    let w = 60usize;
+    let text = |ls: &[Line<'static>]| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect()
+    };
+
+    // 5h of bearer life = 3h until the 2h-ahead re-stamp fires.
+    let fresh = session_token_lines(&S::LongLived(Some(now + 5 * hour)), true, "acct", now, w);
+    assert_eq!(fresh.len(), 1);
+    assert!(
+        text(&fresh).contains("rolling · re-stamps in ~3h"),
+        "{}",
+        text(&fresh)
+    );
+
+    // Inside the horizon: the re-stamp is due NOW, and saying "~0h" would
+    // read as a countdown that stopped.
+    let due = session_token_lines(&S::LongLived(Some(now + hour)), true, "acct", now, w);
+    assert!(
+        text(&due).contains("rolling · re-stamp due"),
+        "{}",
+        text(&due)
+    );
+
+    // 2.5h of life = 30 minutes until the re-stamp: STRICTLY inside the
+    // sub-hour band, not on its zero boundary. The boundary cases alone let
+    // the band predicate collapse to `== 0` unnoticed — measured — and this
+    // fixture is what a collapsed predicate renders as a stopped-looking
+    // "~0h" countdown.
+    let inside = session_token_lines(
+        &S::LongLived(Some(now + 2 * hour + hour / 2)),
+        true,
+        "acct",
+        now,
+        w,
+    );
+    assert!(
+        text(&inside).contains("rolling · re-stamp due"),
+        "{}",
+        text(&inside)
+    );
+
+    // Expired: the stalled DANGER state, with the fix line naming the live
+    // profile and the re-arm verb.
+    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, "acct", now, w);
+    // Whitespace-normalized: the tooltip wraps, padding line breaks with
+    // spaces mid-sentence.
+    let stalled_t = text(&stalled)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(stalled_t.contains("rolling token stalled"), "{stalled_t}");
+    assert!(
+        stalled_t.contains("clauth rolling-token acct"),
+        "the fix line interpolates the profile, never a <p> placeholder: {stalled_t}"
+    );
+
+    // No recorded expiry: named as rolling, not as the mint.
+    let unstamped = session_token_lines(&S::LongLived(None), true, "acct", now, w);
+    assert!(
+        text(&unstamped).contains("rolling · no recorded expiry"),
+        "{}",
+        text(&unstamped)
+    );
+}
+
+/// The stalled-rolling fix line interpolates `snap.title`, never `snap.name`:
+/// `build_snap(app, draft.is_none())` blanks `name` whenever a draft is open,
+/// so a name-fed line renders `clauth rolling-token  re-arms` — a fix command
+/// with a hole where the profile belongs — exactly while the operator is
+/// editing the profile it names. Driven through `draw_settings_rows` with the
+/// draft-open Snap shape (`title` carries the profile, `name` blank), which is
+/// the shape the direct `session_token_lines` tests above never exercise.
+#[test]
+fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut snap = Snap::blank("acct");
+    snap.rolling_token = true;
+    snap.session_token = Some(crate::claude::SessionTokenStatus::LongLived(Some(
+        crate::usage::now_ms() as i64 - 3_600_000,
+    )));
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    term.draw(|f| draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false))
+        .unwrap();
+    let joined = crate::testutil::buffer_rows(term.backend().buffer())
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        joined.contains("clauth rolling-token acct re-arms"),
+        "the fix line reads the title, which a draft never blanks: {joined}"
     );
 }

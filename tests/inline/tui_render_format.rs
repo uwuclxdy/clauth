@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! `fixed_split` truncation contract: content + pad always total `width`, and
 //! ANY dropped character is signalled with a trailing `…` — including the
 //! boundary case where the value is exactly one char over the window, which
@@ -70,11 +72,13 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: status,
@@ -166,10 +170,10 @@ fn no_data_dash_stays_faint() {
 fn account_type_label_dashes_an_unfetched_plan() {
     assert_eq!(NO_DATA, "—", "the house no-data glyph");
 
-    let unfetched = crate::testutil::blank_profile("a");
+    let unfetched = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     assert_eq!(account_type_label(&unfetched), NO_DATA);
 
-    let mut unclassified = crate::testutil::blank_profile("b");
+    let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     unclassified.credentials = Some(crate::profile::ClaudeCredentials {
         claude_ai_oauth: Some(crate::profile::OAuthToken {
             access_token: "at".into(),
@@ -196,15 +200,15 @@ fn account_type_label_keeps_every_known_tier() {
         })
     };
 
-    let mut max = crate::testutil::blank_profile("a");
+    let mut max = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     max.usage = plan(crate::usage::PlanTier::Max(Some(20)));
     assert_eq!(account_type_label(&max), "Max 20x");
 
-    let mut free = crate::testutil::blank_profile("b");
+    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
     free.usage = plan(crate::usage::PlanTier::Free);
     assert_eq!(account_type_label(&free), "Free");
 
-    let mut api = crate::testutil::blank_profile("c");
+    let mut api = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
     api.base_url = Some("https://api.deepseek.com/anthropic".into());
     assert_eq!(account_type_label(&api), "API");
 }
@@ -569,17 +573,20 @@ fn stale_window_fades_only_fill_and_percent() {
 ///
 /// Both fixtures sit HALF A DAY off the boundary, so the wall clock cannot walk
 /// either across it between building the fixture and rendering it. The date
-/// arm is asserted by SHAPE rather than by a recomputed ISO string — deriving
-/// the expected date through the same `epoch_secs_to_iso` the code calls would
-/// only confirm the copy is faithful. The literal ISO output is already pinned
-/// against a fixed epoch by `the_last_swap_age_renders_one_unit_and_a_date_past_
-/// thirty_days`; what this owns is the branch.
+/// arm renders the 2026-08-22 ruling's local prose stamp through
+/// `crate::format::local_stamp`; the expected string derives through chrono's own
+/// `format` rather than the crate's formatter, so the pin is a second
+/// derivation of the same claim, not a copy of the code's arithmetic — it
+/// holds in any zone, UTC included (local equals UTC there, and the contract
+/// is satisfied by either). The literal stamp is also pinned against a fixed
+/// epoch through the chain surface by
+/// `the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days`; what this
+/// owns is the branch.
 ///
-/// `relative_age` also feeds the status tab's incident ages
-/// (`status.rs` `started` row + the detail timeline), so the arm protects three
-/// surfaces, not one.
+/// `relative_age` also feeds the status tab's incident ages (the list row and
+/// the detail header), so the arm protects three surfaces, not one.
 #[test]
-fn relative_age_switches_to_a_date_at_thirty_days() {
+fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
     const DAY_MS: u64 = 86_400_000;
     const HALF_DAY_MS: u64 = 43_200_000;
     let ago = |ms: u64| crate::usage::now_ms().saturating_sub(ms);
@@ -588,14 +595,31 @@ fn relative_age_switches_to_a_date_at_thirty_days() {
     assert_eq!(relative_age(ago(29 * DAY_MS + HALF_DAY_MS)), "4w ago");
 
     // 30d12h — the first age past it. `days < 31` renders `4w ago` here.
-    let dated = relative_age(ago(30 * DAY_MS + HALF_DAY_MS));
-    let bytes = dated.as_bytes();
-    assert!(
-        !dated.ends_with(" ago")
-            && bytes.len() == 10
-            && bytes[4] == b'-'
-            && bytes[7] == b'-'
-            && bytes.iter().filter(|b| b.is_ascii_digit()).count() == 8,
-        "30d12h must take the ISO date arm, got {dated:?}"
-    );
+    let at_ms = ago(30 * DAY_MS + HALF_DAY_MS);
+    let dated = relative_age(at_ms);
+    let local = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert_eq!(dated, local, "30d12h must take the local stamp arm");
+
+    // Where the fixture instant's local spelling differs from its UTC one,
+    // the UTC spelling must NOT be the answer: a stamp that regressed to UTC
+    // digits in the 19-char shape would still equal the local one on a UTC
+    // box, and where the two spellings coincide there is no second spelling
+    // to ban. The condition compares spellings, never the run-instant offset:
+    // a DST zone can read +00 at the fixture instant and nonzero now (the
+    // trap `sessions_cli`'s stamp pin records), and the offset read would
+    // fire the guard over two identical spellings.
+    let utc = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if local != utc {
+        assert_ne!(
+            dated, utc,
+            "the arm rendered UTC digits, not local wall clock: {dated:?}"
+        );
+    }
 }

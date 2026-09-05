@@ -170,9 +170,10 @@ fn weighted_rate_per_hour(entries: &[(u64, f64)], half_life_ms: f64) -> Option<f
 
 /// Projects a window's utilization over a look-ahead: current value plus the
 /// recent burn rate (%/h, from [`compute_burn_rates_from_history`]) times
-/// `interval_ms`. The caller (`fallback::is_exhausted_projected`) passes the
-/// capped horizon `min(refresh_interval, horizon_cap)`, not the raw interval, so
-/// this helper keeps its single job. Burn is floored at 0 — an idle or negative rate
+/// `interval_ms`. The helper takes the interval it is given; callers cap the
+/// horizon themselves where they want one — `fallback::projected_exhausted`
+/// folds in `min(interval_ms, horizon_cap_ms)`, and the headroom nudge passes
+/// the raw window remainder uncapped. Burn is floored at 0 — an idle or negative rate
 /// can't project a utilization *drop* mid-window, so an idle account simply
 /// projects flat at its current value ("run to ~100" only via real
 /// accumulation). The result is clamped finite so a corrupt or extreme rate

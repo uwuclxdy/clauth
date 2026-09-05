@@ -150,7 +150,7 @@ fn switch(ctx: &ApiContext, req: &Request) -> Response {
 
     match switch_profile_noninteractive(
         &ctx.config,
-        &canonical,
+        &crate::profile::ProfileName::from(canonical.as_str()),
         on_divergence,
         oauth::refresh_result,
     ) {

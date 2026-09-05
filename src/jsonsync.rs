@@ -7,12 +7,14 @@
 //! preference while every copy keeps the fields that name its own account; and
 //! both are rewritten in place by a Claude Code that can be caught mid-write.
 //!
-//! Only three things differ between them: the file name, the member list, and
-//! which keys are per-profile. So the read/parse/skip, newest-wins, merge, and
-//! atomic-write-only-on-change machinery lives here once, and each caller
-//! supplies the paths plus one [`KeyRule`] function.
+//! Only two things differ between them: the file name, and which keys are
+//! per-profile. So the read/parse/skip, newest-wins, merge, member
+//! enumeration, mtime-cache fast path, and atomic-write-only-on-change
+//! machinery lives here once, and each caller supplies its base file plus one
+//! [`KeyRule`] function.
 
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result};
@@ -51,6 +53,51 @@ pub(crate) fn newest_mtime(paths: &[PathBuf]) -> Option<SystemTime> {
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
         .max()
+}
+
+/// Every file clauth reconciles for one synced document: the operator's own
+/// copy under `base` plus each SHARED per-session runtime copy of `file`.
+/// Enumerated through [`crate::runtime::shared_runtime_dirs`] rather than a
+/// fixed `<profile>/runtime` path — every session owns its own `runtime-<sid>`,
+/// so a fixed path would reconcile nothing while every session ran. Isolated
+/// copies stay out: an isolated runtime is built from an empty base, so it must
+/// neither win (its empty copy would delete the operator's own fields) nor
+/// receive (that would defeat the isolation it exists for).
+pub(crate) fn runtime_files_under(base: &Path, file: &str) -> Vec<PathBuf> {
+    let mut paths = vec![base.join(file)];
+    paths.extend(
+        crate::runtime::shared_runtime_dirs()
+            .into_iter()
+            .map(|dir| dir.join(file)),
+    );
+    paths
+}
+
+/// Stat-only mtime-cache fast path around `body`: skip the tick when no file in
+/// `paths` is newer than what `cache` records from the last sync that did work
+/// (no reads, parses, or writes), and advance `cache` only when `body` reports
+/// it ran — so a paused (`Ok(false)`) or failed tick retries next time.
+pub(crate) fn run_with_cache(
+    cache: &Mutex<Option<SystemTime>>,
+    paths: &[PathBuf],
+    body: impl FnOnce() -> Result<bool>,
+) -> Result<()> {
+    let Some(newest) = newest_mtime(paths) else {
+        return Ok(());
+    };
+    {
+        let last = cache.lock().unwrap_or_else(|p| p.into_inner());
+        if last.is_some_and(|l| newest <= l) {
+            return Ok(());
+        }
+    }
+    if !body()? {
+        return Ok(());
+    }
+    // `newest` was stated before the body, so it can only lag what the body
+    // actually saw — costing at most one redundant tick, never a skipped one.
+    *cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(newest);
+    Ok(())
 }
 
 struct Member {

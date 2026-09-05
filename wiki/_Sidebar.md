@@ -14,6 +14,7 @@
 **Headless**
 - [Daemon](Daemon)
 - [Claude Code plugin](Claude-Code-Plugin)
+- [herdr plugin](Herdr-Plugin)
 
 **Help**
 - [FAQ](FAQ)

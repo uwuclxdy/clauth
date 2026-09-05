@@ -28,8 +28,11 @@ fn oauth(name: &str) -> Profile {
 /// Warm `name`'s OAuth usage cache: a `Max 5x` plan and fixed 5h/7d utilization
 /// so the rounding and the plan label are pinned, not incidental.
 fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
+    // The cache write is gated on the on-disk record; the row this warms is the
+    // test's pin, so the name has to exist in the record for the write to land.
+    crate::testutil::register_names(&[name]);
     write_profile_cache(
-        name,
+        &crate::profile::ProfileName::from(name),
         USAGE_CACHE_FILE,
         &UsageInfo {
             plan: Some(PlanInfo {
@@ -49,9 +52,9 @@ fn warm_usage(name: &str, five_h: f64, seven_d: f64) {
     );
 }
 
-const HEADER: &str = "  PROFILE  PLAN       5H     7D  ENDPOINT";
+const HEADER: &str = "  PROFILE  PLAN    5H USED  7D USED  ENDPOINT";
 // 42.4 → 42.4%, 17.6 → 17.6%: format_pct drops only trailing `.0`.
-const WORK_ROW: &str = "* work     Max 5x  42.4%  17.6%  -";
+const WORK_ROW: &str = "* work     Max 5x    42.4%    17.6%  -";
 
 #[test]
 fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
@@ -65,8 +68,8 @@ fn list_table_hides_disabled_by_default_and_marks_the_active_profile() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let body = build_status(&config, config.state.refresh_interval_ms, None, false);
-    let table = render_table(&config, &body);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -92,8 +95,8 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4, 17.6);
 
-    let body = build_status(&config, config.state.refresh_interval_ms, None, true);
-    let table = render_table(&config, &body);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
+    let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -101,7 +104,7 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
         [
             HEADER,
             WORK_ROW,
-            "  off      Max         -      -  - (disabled)",
+            "  off      Max           -        -  - (disabled)",
         ],
         "the disabled row keeps its columns aligned and carries the (disabled) marker"
     );
@@ -110,8 +113,9 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
 /// Warm `name`'s cache as a CANCELED account: the org has already dropped to
 /// `claude_free`, which is what makes the tier alone unable to carry the fact.
 fn warm_canceled(name: &str) {
+    crate::testutil::register_names(&[name]);
     write_profile_cache(
-        name,
+        &crate::profile::ProfileName::from(name),
         USAGE_CACHE_FILE,
         &UsageInfo {
             plan: Some(PlanInfo {
@@ -140,7 +144,7 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
 
     let table = render_table(
         &config,
-        &build_status(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -148,7 +152,7 @@ fn list_table_marks_a_canceled_account_and_keeps_its_real_tier() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free        -      -  - (canceled)",
+            "  dead     Free          -        -  - (canceled)",
         ],
         "the canceled row keeps its tier in PLAN and carries the marker"
     );
@@ -168,7 +172,7 @@ fn list_table_leaves_a_live_account_unmarked() {
 
     let table = render_table(
         &config,
-        &build_status(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
     );
     assert_eq!(table.lines().collect::<Vec<_>>(), [HEADER, WORK_ROW]);
     assert!(
@@ -195,7 +199,7 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
 
     let table = render_table(
         &config,
-        &build_status(&config, config.state.refresh_interval_ms, None, true),
+        &build_profile_entries(&config, config.state.refresh_interval_ms, None, true),
     );
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
@@ -203,7 +207,7 @@ fn list_table_stacks_disabled_and_canceled_rather_than_letting_one_win() {
         [
             HEADER,
             WORK_ROW,
-            "  dead     Free        -      -  - (disabled, canceled)",
+            "  dead     Free          -        -  - (disabled, canceled)",
         ],
         "neither state may hide the other"
     );
@@ -227,17 +231,88 @@ fn list_table_shows_provider_as_plan_and_the_base_url_endpoint_for_a_third_party
         profiles: vec![zai],
     };
 
-    let body = build_status(&config, config.state.refresh_interval_ms, None, false);
-    let table = render_table(&config, &body);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
 
     let lines: Vec<&str> = table.lines().collect();
     assert_eq!(
         lines,
         [
-            "  PROFILE  PLAN  5H  7D  ENDPOINT",
-            "  z.ai     Z.ai   -   -  https://api.z.ai/api/anthropic",
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai        -        -  https://api.z.ai/api/anthropic",
         ],
         "a third-party account shows its provider as the plan and its base url as the endpoint"
+    );
+}
+
+/// A third-party profile with no inference auth source reads as viable —
+/// indistinguishable from a keyed one — unless the row names the state. The
+/// word is the MCP roster's own `keyless` flag, so the two surfaces cannot
+/// spell one state two ways.
+#[test]
+fn list_table_marks_a_keyless_third_party_profile() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let zai = Profile::new("z.ai".to_string(), Some(url.to_string()), None);
+    assert!(
+        zai.is_third_party(),
+        "fixture must be a third-party account"
+    );
+    assert!(
+        !crate::claude::has_inference_auth(&zai),
+        "fixture must have no inference auth source"
+    );
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai        -        -  https://api.z.ai/api/anthropic (keyless)",
+        ],
+        "a keyless third-party row names the state"
+    );
+}
+
+/// An env token is an inference auth source too: the predicate is the delegate
+/// guard's own (`has_inference_auth`), not `api_key.is_some()`, so an
+/// env-keyed third-party row must read exactly like an api-keyed one.
+#[test]
+fn list_table_leaves_an_env_keyed_third_party_profile_unmarked() {
+    let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z.ai".to_string(), Some(url.to_string()), None);
+    zai.env.insert(
+        "ANTHROPIC_AUTH_TOKEN".to_string(),
+        "sk-env-token".to_string(),
+    );
+    assert!(
+        crate::claude::has_inference_auth(&zai),
+        "fixture must have an inference auth source via env"
+    );
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![zai],
+    };
+
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, false);
+    let table = render_table(&config, &entries);
+
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            "  PROFILE  PLAN  5H USED  7D USED  ENDPOINT",
+            "  z.ai     Z.ai        -        -  https://api.z.ai/api/anthropic",
+        ],
+        "an env token keys the row, so it carries no marker"
     );
 }
 
@@ -248,9 +323,115 @@ fn list_table_reports_no_accounts_when_empty() {
         state: AppState::default(),
         profiles: vec![],
     };
-    let body = build_status(&config, config.state.refresh_interval_ms, None, true);
+    let entries = build_profile_entries(&config, config.state.refresh_interval_ms, None, true);
     assert_eq!(
-        render_table(&config, &body),
+        render_table(&config, &entries),
         "no accounts yet. add one with `clauth login <name>`.\n"
+    );
+}
+
+/// The table shows window percentages with no freshness column, so a dead
+/// console session behind a warm cache rendered as ordinary live numbers. The
+/// state suffix — already the place for facts the columns can't hold — is where
+/// that has to surface.
+#[test]
+fn a_dead_credential_is_named_in_the_state_suffix() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = crate::profile::Profile::new("qwen".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["qwen".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["qwen"]);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
+
+    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("login expired"),
+        "the table must name a credential that will never self-heal, got:\n{table}"
+    );
+}
+
+/// The same dead-credential state has two causes wanting opposite actions, and
+/// the api-key-only account is the common one: its key works for inference and
+/// authenticates nothing on the usage gateway, so it lands here having never
+/// stored a session. "expired" would send that operator looking for something to
+/// renew.
+#[test]
+fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = crate::profile::Profile::new(
+        "qwen".to_string(),
+        Some(base.to_string()),
+        Some("sk-sp-a-perfectly-good-inference-key".to_string()),
+    );
+    p.provider = crate::providers::Provider::from_base_url(base);
+    assert!(p.console.is_none(), "the account has only its api key");
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["qwen".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["qwen"]);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
+
+    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("login needed"),
+        "an account that never had a session is not expired, got:\n{table}"
+    );
+    assert!(
+        !table.contains("login expired"),
+        "nothing lapsed here, so nothing may say it did, got:\n{table}"
+    );
+}
+
+/// A non-Alibaba profile has no session to lapse, so its `AuthExpired` can only
+/// mean the api key was rejected — the suffix must say so, or the operator goes
+/// hunting for a login that does not exist.
+#[test]
+fn a_dead_api_key_is_told_the_key_was_rejected() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let base = "https://api.deepseek.com/anthropic";
+    let mut p = crate::profile::Profile::new("deepseek".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    p.api_key = Some("sk-revoked".to_string());
+    let config = AppConfig {
+        state: crate::profile::AppState {
+            profiles: vec!["deepseek".into()],
+            ..crate::profile::AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let fp = crate::usage::profile_credential_fingerprint(&config.profiles[0]).unwrap();
+    crate::testutil::register_names(&["deepseek"]);
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("deepseek"), fp);
+
+    let entries = crate::daemon::build_profile_entries(&config, 300_000, None, false);
+    let table = render_table(&config, &entries);
+    assert!(
+        table.contains("key rejected"),
+        "a dead api key is not a login problem, got:\n{table}"
+    );
+    assert!(
+        !table.contains("login"),
+        "no session exists to name, got:\n{table}"
     );
 }

@@ -64,6 +64,25 @@ pub(crate) struct LiveSession {
     /// Session-owned: when this session last executed a swap.
     #[serde(default)]
     pub(crate) last_swap_at: Option<u64>,
+    /// The credential source this session LAUNCHED on, as an absolute path.
+    /// Set once at registration from the same value the runtime tree was built
+    /// from, never mutated.
+    ///
+    /// A path rather than a decoded verdict, deliberately. What the rotation
+    /// gate needs to know is whether this session is holding something
+    /// rotatable, and the CONTENT at this path can change under a running
+    /// session — `claude::heal_misfilled_sidecar` exists precisely because a
+    /// rotating pair can land in a `session-token.json`. Freezing a boolean
+    /// here would keep answering "refresh-less" while the file the session
+    /// actually reads holds a live chain, so the test is made at rotation time
+    /// against this path (`runtime::live_session_holds_rotatable`).
+    ///
+    /// `serde(default)` is the upgrade gate and the fail-closed direction at
+    /// once: a row written by a clauth that predates the field reads `None`,
+    /// which every consumer must treat as "assume rotatable", so the macOS
+    /// rotation refusal keeps applying to it exactly as it does today.
+    #[serde(default)]
+    pub(crate) launch_store: Option<PathBuf>,
 }
 
 impl LiveSession {
@@ -74,6 +93,7 @@ impl LiveSession {
         start_profile: &str,
         isolated: bool,
         follows_chain: bool,
+        launch_store: Option<PathBuf>,
     ) -> Self {
         Self {
             session_id: session_id.as_str().to_string(),
@@ -87,6 +107,7 @@ impl LiveSession {
             chain_cursor: None,
             current_member: None,
             last_swap_at: None,
+            launch_store,
         }
     }
 }
@@ -117,6 +138,15 @@ impl SessionFields<'_> {
     pub(crate) fn set_last_swap_at(&mut self, at: u64) {
         self.0.last_swap_at = Some(at);
     }
+
+    /// Re-key the row onto the process that IS the session. A delegate's row is
+    /// registered by the `clauth mcp` that spawns it — `std::process::id()` at
+    /// register time reads the mcp, not the delegate child — and the herdr
+    /// pane-tag walk joins rows to processes by pid, so a row keyed on the mcp
+    /// names a delegate's account for the pane hosting its parent session.
+    pub(crate) fn set_pid(&mut self, pid: u32) {
+        self.0.pid = pid;
+    }
 }
 
 /// Live sessions tallied by the account each one is CURRENTLY running as.
@@ -135,8 +165,7 @@ pub(crate) struct MemberSessions {
     /// How many of `sessions` the fallback chain is allowed to move.
     pub(crate) following: usize,
     /// The newest swap ONTO this account. `None` when no session here has ever
-    /// swapped, which is also what says no `current_member` pickup lag applies
-    /// (`docs/plan/multi-session-fallback.md` §12).
+    /// swapped, which is also what says no `current_member` pickup lag applies.
     pub(crate) last_swap_at: Option<u64>,
 }
 
@@ -148,8 +177,10 @@ impl LiveTally {
     /// and dead for the other.
     pub(crate) fn collect(config: &AppConfig) -> Self {
         let mut tally = Self::from_live_rows(list().into_iter().filter(|row| {
-            let probe = row.current_member.as_deref().unwrap_or(&row.start_profile);
-            crate::runtime::session_row_is_live(probe, row.isolated, &row.session_id)
+            let probe = crate::profile::ProfileName::from(
+                row.current_member.as_deref().unwrap_or(&row.start_profile),
+            );
+            crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
         }));
         tally.add_bare_sessions(config);
         tally
@@ -173,8 +204,9 @@ impl LiveTally {
     /// a global auto-switch repoints the link and Claude Code re-reads it.
     ///
     /// An unreadable marker dir counts as ZERO — the OPPOSITE direction to
-    /// [`crate::runtime::has_live_session`], which gates delete, disable and
-    /// rotation and so must read an unknown as live. This tally only renders, so
+    /// [`crate::runtime::has_live_session`], which gates delete, disable,
+    /// rename and rotation and so must read an unknown as live. This tally
+    /// only renders, so
     /// folding an unknown in as live would put a session on screen that nothing
     /// produced.
     fn add_bare_sessions(&mut self, config: &AppConfig) {
@@ -216,8 +248,8 @@ impl LiveTally {
     }
 
     /// One account's sessions.
-    pub(crate) fn member(&self, name: &str) -> MemberSessions {
-        self.0.get(name).copied().unwrap_or_default()
+    pub(crate) fn member(&self, name: &crate::profile::ProfileName) -> MemberSessions {
+        self.0.get(name.as_str()).copied().unwrap_or_default()
     }
 }
 
@@ -250,7 +282,7 @@ fn write_row(row: &LiveSession) -> Result<()> {
 /// File a starting session's row. Called once the session's liveness marker is
 /// flock-held, so a row never exists without something for GC to test it by.
 pub(crate) fn register(row: &LiveSession) -> Result<()> {
-    with_state_lock(|| write_row(row))
+    with_state_lock(|_held| write_row(row))
 }
 
 /// Drop a session's row. Idempotent — a row already reaped by GC is not an
@@ -258,7 +290,7 @@ pub(crate) fn register(row: &LiveSession) -> Result<()> {
 /// its store and leave the row resurrected.
 pub(crate) fn unregister(session_id: &str) -> Result<()> {
     let path = row_path(session_id)?;
-    with_state_lock(|| match std::fs::remove_file(&path) {
+    with_state_lock(|_held| match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
@@ -300,7 +332,7 @@ pub(crate) fn get(session_id: &str) -> Option<LiveSession> {
 /// missing row is an error naming the id, never a silent no-op.
 fn update(session_id: &str, edit: impl FnOnce(&mut LiveSession)) -> Result<()> {
     let path = row_path(session_id)?;
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let bytes = std::fs::read(&path)
             .with_context(|| format!("no live-session row for {session_id}"))?;
         let mut row: LiveSession = serde_json::from_slice(&bytes)

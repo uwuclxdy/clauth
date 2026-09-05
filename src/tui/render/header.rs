@@ -58,7 +58,7 @@ struct ActiveGauge {
 
 fn active_gauge(app: &App) -> Option<ActiveGauge> {
     let cfg = app.config();
-    let name = cfg.state.active_profile.as_deref()?;
+    let name = cfg.state.active_profile.as_ref()?;
     let profile = cfg.find(name)?;
     let pct = if profile.is_oauth() {
         profile
@@ -221,7 +221,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row0.push(Span::styled("● ", Style::default().fg(color)));
         row0.push(Span::styled("daemon", theme::dim()));
     }
-    let used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
+    let mut used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
+    // `[ herdr ]` context tag, between the brand and the daemon dot. The tag is
+    // the one span this row can shed: it renders only while brand + tag +
+    // daemon + version all fit, so the version stays right-aligned and nothing
+    // new clips at narrow widths (without the tag the row is byte-identical to
+    // a non-herdr launch at every width).
+    if app.herdr_mode {
+        let tag = "  [ herdr ]";
+        if used + tag.chars().count() + ver.chars().count() <= info_width {
+            row0.insert(1, Span::styled(tag, theme::dim()));
+            used += tag.chars().count();
+        }
+    }
     let gap = info_width.saturating_sub(used + ver.chars().count());
     row0.push(Span::styled(" ".repeat(gap), theme::base()));
     row0.push(Span::styled(ver, theme::dim()));
@@ -329,3 +341,9 @@ fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
 #[cfg(test)]
 #[path = "../../../tests/inline/tui_render_header.rs"]
 mod gauge_tests;
+
+// Herdr-mode row-0 pins: the `[ herdr ]` tag, its shed order at narrow
+// widths, and the byte-identical plain launch.
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_header_herdr.rs"]
+mod herdr_mode_tests;

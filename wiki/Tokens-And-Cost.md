@@ -12,7 +12,7 @@ The Tokens tab is a dashboard over Claude Code's own token history on this machi
 
 Claude Code prunes old transcripts and its rollup freezes at a date, so clauth keeps its own ledger of finalized days. That ledger is what lets the dashboard keep advancing once the transcripts behind it are gone. Days already pruned before the ledger existed are unrecoverable.
 
-The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `clauth start --isolated` session writes into its own throwaway store and is not counted.
+The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `clauth start --isolated` session writes into its own throwaway store, so its usage arrives here only once the run ends and its transcripts are lifted into the global store.
 
 ## Period lens
 
@@ -26,7 +26,9 @@ The cost figure is what your recorded usage **would cost on the pay-as-you-go AP
 
 It is computed per model, never off a blended rate, and it prices the four token classes separately: input, output, cache reads, cache writes. The <kbd>c</kbd> toggle changes whether cache tokens count toward the token *totals*; cost always counts them.
 
-Prices come from LiteLLM's public price table, fetched daily and cached at `~/.clauth/price_cache.json`. clauth loads the cache first so the tab paints instantly and works offline. A model with no matching rate contributes nothing to cost, renders as a faint dash, and puts the surrounding totals on a `$X+` floor.
+Prices come from the ai-pricelog public index, fetched daily. clauth keeps a distilled copy of it at `~/.clauth/ai_pricelog_v4_price_cache.json` and loads that before fetching, so the tab paints instantly and works offline. A model with no matching rate contributes nothing to cost: it renders as a faint dash, and the surrounding totals get a `$X+` floor. A first launch whose fetch fails before any rates are cached reads `rates unavailable` on the cost figure.
+
+Rates are dated snapshots, and a feed-carried peak/off-peak window prices each recorded hour at the rate live at that date and hour. Hours only exist from the hourly ledger onward, so past days recorded before it price flat at their day's hour-0 tier. The days from Claude Code's own rollup keep that flat rate permanently; ledger days get their hours backfilled once from the stored transcripts (visible one refresh later; a day the transcripts no longer fully cover keeps the flat rate). The lifetime card prices everything at today's rate.
 
 ## Model grouping
 
