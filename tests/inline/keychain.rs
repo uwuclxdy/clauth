@@ -10,8 +10,9 @@
 //! touches the Keychain.
 
 use super::{
-    Keep, delete_at, keychain_service_for_config_dir, merge_and_put_at, merge_write, merged_blob,
-    put_blob_at, read_blob_at, run_with_deadline, security_quote,
+    Keep, PutTransport, SECURITY_ARGV_VALUE_MAX, SECURITY_STDIN_LINE_MAX, delete_at,
+    keychain_service_for_config_dir, merge_and_put_at, merge_write, merged_blob, put_blob_at,
+    put_transport, read_blob_at, run_with_deadline, security_quote,
 };
 use crate::profile::{ClaudeCredentials, OAuthToken};
 use std::path::Path;
@@ -488,4 +489,64 @@ fn keychain_service_canonicalization_resolves_dot_dot() {
         via_dotdot, direct,
         "`sub/..` must canonicalize to the parent directory"
     );
+}
+
+// ── the transport ceilings: `security` truncates instead of refusing ──────────
+//
+// `security -i` reads ONE command per line into a bounded buffer. Past it the
+// value is silently cut and the tail parsed as another command, leaving the item
+// holding truncated JSON -- a destroyed login AND destroyed `mcpOAuth`. Harmless
+// while the mirror wrote a 1-2 KB login-only blob; reachable now that the blob
+// carries Claude Code's sibling keys.
+
+#[test]
+fn stdin_carries_a_line_up_to_the_ceiling() {
+    assert_eq!(
+        put_transport(SECURITY_STDIN_LINE_MAX, 100).expect("at the ceiling"),
+        PutTransport::Stdin,
+    );
+    assert_eq!(
+        put_transport(SECURITY_STDIN_LINE_MAX + 1, 100).expect("one past it"),
+        PutTransport::Argv,
+        "one byte past the ceiling must leave the stdin transport, not truncate",
+    );
+}
+
+#[test]
+fn argv_takes_over_up_to_its_own_ceiling() {
+    assert_eq!(
+        put_transport(1_000_000, SECURITY_ARGV_VALUE_MAX).expect("at the argv ceiling"),
+        PutTransport::Argv,
+    );
+    // Past BOTH ceilings there is no intact transport left, so refuse. Writing
+    // anyway is what destroys the item.
+    assert!(put_transport(1_000_000, SECURITY_ARGV_VALUE_MAX + 1).is_err());
+}
+
+// KC-3 -- the ceiling through the REAL `security`, on a throwaway service. Sized
+// like an operator carrying a dozen-plus OAuth MCP servers beside the login: the
+// case that used to come back truncated.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn a_blob_past_the_stdin_ceiling_round_trips_intact() {
+    use serde_json::json;
+
+    let service = format!("clauth-ceiling-test-{}", std::process::id());
+    let account = "clauth-test-account";
+    delete_at(&service, account).expect("pre-clean");
+
+    for value_len in [SECURITY_STDIN_LINE_MAX - 200, SECURITY_STDIN_LINE_MAX + 200, 32 * 1024] {
+        let blob = json!({
+            "claudeAiOauth": { "accessToken": "a".repeat(200) },
+            "mcpOAuth": { "srv": { "accessToken": "m".repeat(value_len) } },
+        });
+        put_blob_at(&service, account, &blob).expect("write");
+        assert_eq!(
+            read_blob_at(&service, account).expect("read").as_ref(),
+            Some(&blob),
+            "a {value_len}-byte blob came back changed -- the transport truncated it",
+        );
+    }
+
+    delete_at(&service, account).expect("cleanup");
 }
