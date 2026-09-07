@@ -1687,6 +1687,31 @@ pub(crate) fn claude_settings_env_keys() -> Result<Vec<String>> {
         .unwrap_or_default())
 }
 
+/// The model strings the live `~/.claude/settings.json` puts in effect: the
+/// top-level `model` and the subagent override in its `env` block.
+///
+/// Read rather than resolved — [`crate::selection`] wants every family the next
+/// session MAY run, and both of these are separately reachable inside one
+/// session. Absent file, absent keys and unreadable JSON all answer empty: a
+/// launcher must never fail over a settings file it only wanted a hint from.
+pub(crate) fn claude_settings_models() -> Result<Vec<String>> {
+    let path = claude_settings_path()?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let Ok(settings) = read_json_file::<serde_json::Value>(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    if let Some(m) = settings["model"].as_str() {
+        out.push(m.to_owned());
+    }
+    if let Some(m) = settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"].as_str() {
+        out.push(m.to_owned());
+    }
+    Ok(out)
+}
+
 /// Patch `settings.json` `env` with profile's endpoint keys and env map;
 /// strip `prev_env_keys` the new profile doesn't carry to clear stale entries.
 pub(crate) fn apply_profile_to_claude_settings(

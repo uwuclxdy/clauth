@@ -218,7 +218,11 @@ fn spend_armed(usage: Option<&crate::usage::UsageInfo>, budget_on: bool, ceiling
 /// limits (e.g. "7d fable") gate separately, per-account and never as full
 /// exhaustion (see [`scoped_weekly_blocked_info`]). Store-side twin logic
 /// inlines this same shape (see `is_exhausted_from_usage`).
-fn weekly_blocked_info(info: &crate::usage::UsageInfo, now_secs: i64, weekly_pct: f64) -> bool {
+pub(crate) fn weekly_blocked_info(
+    info: &crate::usage::UsageInfo,
+    now_secs: i64,
+    weekly_pct: f64,
+) -> bool {
     seven_day_live(info, now_secs)
         && info
             .seven_day
@@ -277,7 +281,7 @@ pub(crate) fn weekly_hard_blocked(profile: &Profile) -> bool {
 /// Whether one window carries a parseable reset still in the future — the
 /// per-window liveness primitive [`scoped_weekly_blocked_info`] applies to
 /// each `weekly_scoped` entry (mirroring `seven_day_live` for the aggregate).
-fn window_live(w: &UsageWindow, now_secs: i64) -> bool {
+pub(crate) fn window_live(w: &UsageWindow, now_secs: i64) -> bool {
     w.resets_at
         .as_deref()
         .and_then(iso_to_epoch_secs)
@@ -313,8 +317,34 @@ pub(crate) fn worst_scoped_window(
     now_secs: i64,
     weekly_pct: f64,
 ) -> Option<&crate::usage::ScopedWindow> {
+    worst_scoped_window_for(info, now_secs, weekly_pct, None)
+}
+
+/// [`worst_scoped_window`] narrowed to the model families a caller actually
+/// cares about.
+///
+/// `None` weighs every per-model window, which is the chain walk's case and its
+/// only correct one: it cannot know which model the next session runs, so any
+/// capped window is disqualifying. A caller that DOES know — start-time
+/// selection, which reads the models a launch will run — passes them, and a
+/// member capped only on a family this session never touches stays a candidate.
+///
+/// Liveness and the comparison live here rather than at either call site, so
+/// the narrowed judgment cannot drift from the blanket one.
+pub(crate) fn worst_scoped_window_for<'a>(
+    info: &'a crate::usage::UsageInfo,
+    now_secs: i64,
+    weekly_pct: f64,
+    families: Option<&[String]>,
+) -> Option<&'a crate::usage::ScopedWindow> {
     info.weekly_scoped
         .iter()
+        .filter(|s| {
+            families.is_none_or(|fams| {
+                fams.iter()
+                    .any(|f| crate::selection::scoped_label_is(&s.label, f))
+            })
+        })
         .filter(|s| window_live(&s.window, now_secs) && s.window.utilization >= weekly_pct)
         .max_by(|a, b| a.window.utilization.total_cmp(&b.window.utilization))
 }

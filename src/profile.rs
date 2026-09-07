@@ -823,6 +823,25 @@ pub(crate) struct AppState {
     /// through [`AppState::burn_horizon_cap_ms`]. Inert unless burn-aware is on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) burn_horizon_cap_ms: Option<u64>,
+    /// Start-time selection floor: the fewest minutes of runway
+    /// (`clauth start --auto`) a chain member may have and still count as a
+    /// feasible place to launch. `None` = [`crate::selection::DEFAULT_MIN_RUNWAY_MINS`].
+    /// Inert unless a start asks for selection — this never moves a running
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_min_runway_mins: Option<f64>,
+    /// Start-time selection grace: a member whose binding window resets within
+    /// this many minutes is feasible however little runway is left, because a
+    /// stall until the reset is not a strand. `None` =
+    /// [`crate::selection::DEFAULT_RESET_GRACE_MINS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selection_reset_grace_mins: Option<f64>,
+    /// Let a `delegate` call that names no `profiles` pick one by the model it
+    /// asked for, instead of refusing. Off by default: a delegate spends a real
+    /// usage window, so choosing the account it spends stays an explicit act
+    /// until the operator says otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) delegate_auto_select: bool,
     /// herdr-mode knobs (popup width, pane tag, the delegate dot). Omitted from
     /// the file while every knob is at its default, so an untouched
     /// profiles.toml gains no `[herdr]` block on the next save.
@@ -883,6 +902,24 @@ impl AppState {
         self.weekly_switch_threshold
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v))
             .unwrap_or(DEFAULT_WEEKLY_SWITCH_PCT)
+    }
+
+    /// The effective start-time selection limits, resetting a non-finite or
+    /// negative hand-edit to the default rather than honoring it. Zero IS
+    /// honored on both: a zero floor makes every member feasible and a zero
+    /// grace removes the reset rescue, and turning a guard off deliberately is
+    /// the operator's call — what gets reset is nonsense, not a low setting.
+    pub(crate) fn selection_limits(&self) -> crate::selection::Limits {
+        crate::selection::Limits {
+            min_runway_mins: self
+                .selection_min_runway_mins
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(crate::selection::DEFAULT_MIN_RUNWAY_MINS),
+            reset_grace_mins: self
+                .selection_reset_grace_mins
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(crate::selection::DEFAULT_RESET_GRACE_MINS),
+        }
     }
 
     /// The effective burn-aware floor, resetting an out-of-band hand-edit to the
@@ -1008,6 +1045,9 @@ impl Default for AppState {
             weekly_switch_threshold: None,
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
+            selection_min_runway_mins: None,
+            selection_reset_grace_mins: None,
+            delegate_auto_select: false,
             herdr: HerdrSettings::default(),
         }
     }

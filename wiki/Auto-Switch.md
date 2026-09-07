@@ -29,12 +29,12 @@ An account is exhausted when either window is past its line.
 
 The weekly lines are deliberately below 100. Topping out a week bricks an account for days rather than hours, so clauth moves off while there is still room to land the hop. The 100% hard cap blocks an account regardless of every toggle below.
 
-Per-model weekly windows (a "7d fable" window, say) gate the same way: an account whose scoped week is past the line stays out of rotation, since a session of the capped model landed there would strand, and the walk cannot know which model your next session runs.
+Per-model weekly windows (a "7d fable" window, say) gate the same way: an account whose scoped week is past the line stays out of rotation, since a session of the capped model landed there would strand, and the walk cannot know which model your next session runs. A session that has not started yet is the one case where the model *is* knowable, which is what [`start --auto`](Auto-Switch#choosing-where-a-session-starts) uses.
 
 Two per-account toggles relax this:
 
 - **`weekly gate`** off: ignore the soft weekly line for this account. The hard cap still blocks.
-- **`scoped gate`** off: keep rotating to this account for other models, ignoring its capped per-model weeks.
+- **`scoped gate`** off: keep rotating to this account for other models, ignoring its capped per-model weeks. Blunt by nature — it drops the gate for every model, so a session of the capped model can then land here too. `start --auto` narrows the same judgment to the models a session will actually run, and needs no toggle.
 
 ## Excluded members
 
@@ -103,6 +103,24 @@ An account's 5h window opens on its first real request, so a chain member you ha
 The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` with the TUI closed ([Daemon](Daemon)). Only one of them decides at a time.
 
 `clauth start <profile> --with-fallback` gives a single session its own chain, so that session hops accounts while your global one stays put. It needs a running daemon and an OAuth account inside a chain that holds a second member to move to, and it does not work on macOS or alongside `--isolated` ([Quickstart](Quickstart#rules-worth-knowing)).
+
+## Choosing where a session starts
+
+The chain decides where a session *moves*. `clauth start --auto` decides where one **starts**, and it is the only place in clauth that knows which models a session is about to run.
+
+It weighs the chain and launches on the best member that can serve every model family the session may run, printing the choice and the numbers behind it. `--explain` prints that and exits without launching.
+
+**It is the union of families, never the headline model.** A `Task` subagent runs inside the parent's process and spends the parent's account on whatever model it runs, so choosing for the main thread alone would strand the session the moment a subagent used a capped family. The union comes from your `settings.json` model, `CLAUDE_CODE_SUBAGENT_MODEL`, and any `--model` you pass. When none of those resolves, the demand is empty and the blanket `scoped gate` above applies unchanged — precision only where there is information.
+
+**Feasibility is runway, not utilization.** A member with minutes left strands one turn in and the chain then swaps it, which costs the whole context re-read: cache entries do not cross accounts. So headroom is divided by the same burn rate [burn-aware switching](Auto-Switch#burn-aware-switching) fits, and the result is minutes. No burn samples means unbounded, never zero — an idle account has none *because* it is idle. A member whose binding window resets within the grace is feasible however thin, since a stall until the reset is not a strand.
+
+**Ranking.** Feasible first, then the `last_resort` member last, then a member clauth has numbers for over one it does not, then fewest live sessions, then most runway, then `preferred`. Live sessions outrank runway deliberately: launching several sessions at once would otherwise send them all to the same member, and usage polling cannot see the launches until its next refresh.
+
+When nothing is feasible it launches on the best of a bad set and says so, rather than refusing. The candidate set is the fallback chain — the accounts you have already said may be entered unattended — so an empty chain refuses and names the fix.
+
+This never moves a running session. `--with-fallback` remains the only thing that does, and the two compose: pick the entry point, then let the chain rescue it if that account runs out.
+
+The floor and the grace are `selection_min_runway_mins` and `selection_reset_grace_mins` ([Configuration](Configuration#profilestoml)).
 
 ## Mixing account types
 

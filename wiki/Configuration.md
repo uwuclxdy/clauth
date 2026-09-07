@@ -137,6 +137,9 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
+| `selection_min_runway_mins` | float | `20.0` | `start --auto`: fewest minutes of runway a member may have and still count as a feasible place to launch; `0` turns the floor off |
+| `selection_reset_grace_mins` | float | `10.0` | `start --auto`: a member whose binding window resets within this is feasible however thin |
+| `delegate_auto_select` | bool | `false` | let a `delegate` naming no `profiles` pick one by the model it asked for |
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
