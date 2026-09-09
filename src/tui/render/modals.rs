@@ -11,17 +11,25 @@ use crate::profile::DivergenceChoice;
 
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
-    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal, Tab,
+    DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginStage, Modal,
+    NamePromptForm, PresetPickerForm, Tab,
 };
 use super::super::theme;
+use super::chain::reason_marker;
 use super::format::spinner_frame;
-use super::panes::{bold_when, head_cols, key_cell};
+use super::panes::{
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines, head_cols, key_cell,
+};
+use crate::fallback::BlockedReason;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
     match modal {
         Modal::Confirm(state) => draw_confirm(frame, area, state),
         Modal::Divergence(form) => draw_divergence(frame, area, form),
         Modal::CaptureName(form) => draw_capture_name(frame, area, &form.input),
+        Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
+        Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
@@ -101,6 +109,27 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// tail. On any terminal wide enough for the content nothing splits and the
 /// modal renders exactly as before.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
+    draw_modal_scrolled(frame, area, title, lines, 0);
+}
+
+/// [`draw_modal`] with the content scrolled to start at row `scroll`, returning
+/// the largest offset the content allows so a caller holding the offset in state
+/// can clamp its key handler against it (the render pass owns the viewport).
+///
+/// A terminal too short for the whole modal used to drop the tail with nothing
+/// on screen saying so. The rows now go through the shared scrolled-lines
+/// helper, which draws the overflow scrollbar the cloudy-tui contract makes the
+/// only legal overflow signal. The focus block handed to it is the viewport
+/// window itself — "keep rows `scroll..scroll + viewport` on screen" — which
+/// resolves to exactly `scroll` once clamped. A modal that fits scrolls by 0 and
+/// draws no bar, so it renders as before.
+fn draw_modal_scrolled(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'_>>,
+    scroll: u16,
+) -> u16 {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let w = (content_w + 6)
         .max(title.chars().count() as u16 + 4)
@@ -117,7 +146,18 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_
     let block = modal_block(title);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+
+    let viewport = inner.height as usize;
+    // A terminal short enough to leave no inner rows at all draws nothing, and
+    // `total - 0` would publish the whole content as a reachable offset.
+    let max_scroll = if viewport == 0 {
+        0
+    } else {
+        lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16
+    };
+    let scroll = scroll.min(max_scroll) as usize;
+    draw_scrolled_lines(frame, inner, lines, (scroll, scroll + viewport));
+    max_scroll
 }
 
 /// Split one styled line into `w`-column rows by character, preserving span
@@ -188,6 +228,20 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
         .padding(Padding::new(2, 2, 1, 1))
 }
 
+/// [`modal_block`] plus the contract's title-right meta slot, for a modal whose
+/// contents are scoped to one named thing. The name keeps its own case (it is a
+/// proper noun, not a structural label) and stays `TEXT_DIM` — it is data about
+/// the modal, so it takes neither the title's italic nor any bold.
+fn modal_block_with_meta(title: &str, meta: Option<&str>) -> Block<'static> {
+    let block = modal_block(title);
+    match meta {
+        Some(meta) => block.title(
+            Line::from(Span::styled(format!(" {meta} "), theme::dim())).alignment(Alignment::Right),
+        ),
+        None => block,
+    }
+}
+
 fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let title = match state.on_confirm {
         // The one non-confirm modal: an in-use account can't be acted on.
@@ -203,11 +257,19 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         ConfirmAction::Switch(_)
             | ConfirmAction::RotateAll
             | ConfirmAction::RotateOne(_)
+            | ConfirmAction::DisableOne(_)
             | ConfirmAction::CaptureOverwrite(..)
             | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)
             | ConfirmAction::DeleteLiveSession(_)
     );
+
+    // `AddChainCandidate` names the candidate in its confirm button so the
+    // operator sees the exact add they are agreeing to, not a generic label.
+    let confirm_label = match &state.on_confirm {
+        ConfirmAction::AddChainCandidate(name) => format!("add '{name}'"),
+        _ => "confirm".to_string(),
+    };
 
     let mut lines: Vec<Line<'_>> = vec![Line::from(Span::styled(
         state.message.clone(),
@@ -221,21 +283,22 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
         Line::from(modal_button(" ok ", true))
     } else {
-        choice_buttons(state.choice, destructive)
+        choice_buttons(state.choice, destructive, &confirm_label)
     };
     lines.push(buttons.alignment(Alignment::Right));
 
     draw_modal(frame, area, title, lines);
 }
 
-fn choice_buttons(choice: bool, destructive_confirm: bool) -> Line<'static> {
+fn choice_buttons(choice: bool, destructive_confirm: bool, confirm_label: &str) -> Line<'static> {
+    let label = format!(" {confirm_label} ");
     Line::from(vec![
         modal_button(" cancel ", !choice),
         Span::raw("   "),
         if destructive_confirm {
-            danger_button(" confirm ", choice)
+            danger_button(&label, choice)
         } else {
-            modal_button(" confirm ", choice)
+            modal_button(&label, choice)
         },
     ])
 }
@@ -440,6 +503,64 @@ fn draw_capture_name(frame: &mut Frame<'_>, area: Rect, input: &InputState) {
     frame.set_cursor_position((cx, cy));
 }
 
+/// The Setup menu's shared name prompt. Same geometry trick as
+/// [`draw_capture_name`] — the input is line index 2, so the native cursor can
+/// be placed without re-measuring what `draw_modal` already sized.
+fn draw_name_prompt(frame: &mut Frame<'_>, area: Rect, form: &NamePromptForm) {
+    let lines = vec![
+        Line::from(Span::styled(form.action.blurb(), theme::dim())),
+        Line::from(""),
+        labelled_input("name", &form.input, true),
+    ];
+
+    let title = form.action.title();
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let w = (content_w + 6)
+        .max(title.chars().count() as u16 + 4)
+        .min(area.width.saturating_sub(4));
+    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let rect = centered(area, w, h);
+    let inner_x = rect.x.saturating_add(3);
+    let inner_y = rect.y.saturating_add(2);
+
+    draw_modal(frame, area, title, lines);
+
+    // x = edit gutter "✎ " (2) + label "name" (4) + " " (1) + cols before caret
+    let cx = inner_x.saturating_add(2 + 4 + 1 + head_cols(&form.input) as u16);
+    let cy = inner_y.saturating_add(2);
+    frame.set_cursor_position((cx, cy));
+}
+
+/// `apply preset` picker. Built-ins lead the list and carry a dim `built-in`
+/// tail so the two groups read apart without a second rule.
+fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm) {
+    let last = form.presets.len().saturating_sub(1);
+    let cursor = form.cursor.min(last);
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled(
+            format!("sets the base url and models on '{}'.", form.target),
+            theme::dim(),
+        )),
+        Line::from(""),
+    ];
+    for (i, preset) in form.presets.iter().enumerate() {
+        let mut line = option_line(i == cursor, preset.name.clone());
+        if preset.builtin {
+            line.push_span(Span::styled("  built-in", theme::dim()));
+        }
+        lines.push(line);
+    }
+    // `d` reaches nothing else from here, so the picker has to teach it.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "d deletes a saved preset",
+        theme::dim(),
+    )));
+
+    draw_modal(frame, area, "PRESET", lines);
+}
+
 /// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
@@ -484,10 +605,14 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("\u{21b5}", "open settings · edit field · flip toggle"),
                 ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
                 ("space", "cycle the model preset (model row)"),
-                ("env", "+ add env · \u{21b5} edits a value · a removes"),
+                ("env", "+ add env · \u{21b5} edits a value"),
+                (
+                    "a",
+                    "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
+                ),
                 (
                     "disable / enable",
-                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a session is open",
+                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
                 ),
                 ("delete", "\u{21b5} once to arm, again to confirm"),
                 ("esc", "stop editing / back to account list"),
@@ -516,11 +641,16 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Plugin => vec![(
             "plugin",
             &[
-                ("\u{2191}\u{2193}", "pick check · scroll detail"),
-                ("\u{21b5}", "open the selected row's detail"),
+                (
+                    "\u{2191}\u{2193}",
+                    "pick check · scroll detail · walk herdr options",
+                ),
+                ("\u{21b5}", "open detail · activate an option"),
+                ("space", "activate the focused herdr option"),
+                ("+ / -", "step the tag refresh"),
                 ("f", "apply the selected row's fix"),
                 ("r", "re-run all checks"),
-                ("esc", "back to the list"),
+                ("esc", "back to the list · close the editor"),
             ][..],
         )],
         Tab::Fallback => vec![(
@@ -534,10 +664,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ),
                 ("+ / -", "step rotate at / weekly at by 5"),
                 ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
-                (
-                    "\u{21b5} on weekly at",
-                    "type a %, empty follows the chain default",
-                ),
+                ("\u{21b5} on weekly at", "type a %, empty clears"),
                 ("esc", "back / cancel edit"),
             ][..],
         )],
@@ -553,6 +680,19 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "\u{2190} \u{2192} \u{00b7} tab",
         "previous / next tab (shift tab: previous)",
     )];
+
+    // The modal's own keys, in their own section. Not folded into `global`
+    // below: every tab binds ↑↓ for its own list, so the shadow filter there
+    // would drop this row on all eight — and hanging it off another section
+    // would put two ↑↓ rows with different senses a few lines apart, the exact
+    // contradiction that filter exists to prevent.
+    // The close keys were documented only at app level, where `q` reads
+    // "back / quit" and `esc` reads "back within a sub-view" — neither tells a
+    // reader how to dismiss what they are looking at.
+    let modal_keys: &[(&str, &str)] = &[
+        ("\u{2191}\u{2193}", "scroll"),
+        ("esc \u{00b7} q \u{00b7} ?", "close"),
+    ];
 
     let global_all: &[(&str, &str)] = &[
         ("n", "new account"),
@@ -581,22 +721,74 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut lines: Vec<Line<'_>> = Vec::new();
     lines.extend(key_section("tabs", nav));
+    lines.extend(key_section("this modal", modal_keys));
     for (section, entries) in &tab_specific {
         lines.extend(key_section(section, entries));
     }
     lines.extend(key_section("global", &global));
+    // Last: the keys are what a reader came for, so they stay in view on a
+    // terminal too short for the whole modal. ↑↓ reaches the legend from there.
+    lines.extend(glyph_section("glyphs", glyph_rows()));
     lines.pop(); // trim trailing blank from last section
-    draw_modal(frame, area, title, lines);
+    app.help_max_scroll.set(draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        app.help_scroll,
+    ));
+}
+
+/// Legend for the 1-cell marks the account surfaces carry, with no key of their
+/// own to document them: the Overview row's leading `●` and `⇄`, and every
+/// blocked-reason marker on the Fallback chain.
+///
+/// Each blocked-reason row takes its glyph AND its hue from [`reason_marker`]
+/// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
+/// each appear twice because they split their two senses on hue alone (see
+/// `chain::reason_marker` for why), and a legend naming one sense per glyph
+/// would be worse than none.
+fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
+    let reason = |r: BlockedReason, desc| (reason_marker(&r), desc);
+    vec![
+        (
+            Span::styled("\u{25cf}", Style::default().fg(theme::accent_2_color())),
+            "the active account",
+        ),
+        (
+            Span::styled("\u{21c4}", theme::dim()),
+            "a live session here follows the fallback chain",
+        ),
+        reason(BlockedReason::Disabled, DIAG_DISABLED),
+        reason(BlockedReason::Canceled, DIAG_CANCELED),
+        reason(BlockedReason::AuthBroken, DIAG_AUTH_BROKEN),
+        reason(
+            BlockedReason::WeeklySpent { resets_in: None },
+            DIAG_WEEKLY_SPENT,
+        ),
+        reason(BlockedReason::KickRejected { lifts_in: 0 }, DIAG_KICK),
+        reason(BlockedReason::BudgetSpent, DIAG_BUDGET_SPENT),
+        reason(
+            BlockedReason::FiveHour {
+                pct: 0.0,
+                resets_in: None,
+            },
+            "5h window spent",
+        ),
+        reason(
+            BlockedReason::ScopedSpent {
+                label: String::new(),
+                pct: 0.0,
+            },
+            "one model's week spent, other models ok",
+        ),
+        reason(BlockedReason::WeeklySoft { pct: 0.0 }, DIAG_WEEKLY_SOFT),
+        reason(BlockedReason::Stale, DIAG_STALE),
+    ]
 }
 
 fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(Span::styled(
-            title.to_uppercase(),
-            Style::default().fg(theme::text_dim_color()),
-        )),
-        Line::from(""),
-    ];
+    let mut lines = section_head(title);
     for (key, desc) in pairs {
         lines.push(help_row(key, desc));
     }
@@ -604,14 +796,45 @@ fn key_section(title: &str, pairs: &[(&str, &str)]) -> Vec<Line<'static>> {
     lines
 }
 
+fn glyph_section(title: &str, rows: Vec<(Span<'static>, &'static str)>) -> Vec<Line<'static>> {
+    let mut lines = section_head(title);
+    lines.extend(rows.into_iter().map(|(mark, desc)| glyph_row(mark, desc)));
+    lines.push(Line::from(""));
+    lines
+}
+
+fn section_head(title: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(
+            title.to_uppercase(),
+            Style::default().fg(theme::text_dim_color()),
+        )),
+        Line::from(""),
+    ]
+}
+
+const HELP_KEY_W: usize = 18;
+const HELP_KEY_GUTTER: usize = 2;
+
 fn help_row(key: &str, desc: &str) -> Line<'static> {
-    const KEY_W: usize = 18;
-    const KEY_GUTTER: usize = 2;
     Line::from(vec![
         Span::styled(
-            format!("  {}", key_cell(key, KEY_W, KEY_GUTTER)),
+            format!("  {}", key_cell(key, HELP_KEY_W, HELP_KEY_GUTTER)),
             Style::default().fg(theme::accent_color()).bold(),
         ),
+        Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
+    ])
+}
+
+/// A legend row, aligned to the same description column the key rows open at.
+/// The mark keeps the style its renderer gave it — a hue-split glyph read in
+/// the accent every other key row wears would document the wrong thing.
+fn glyph_row(mark: Span<'static>, desc: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("  "),
+        mark,
+        // The mark already spent one of the key cell's columns.
+        Span::raw(key_cell("", HELP_KEY_W - 1, HELP_KEY_GUTTER)),
         Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
     ])
 }
@@ -645,6 +868,11 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     const HOTKEY_W: u16 = 1; // 1 char for hotkey letter, or 1 space if none
     const GUTTER: u16 = 2; // "❯ " or "  "
 
+    // The rule between the account-scoped items and the tab-global ones. Only
+    // when both groups exist — a one-group menu needs nothing separated.
+    let rule_at = (state.scoped_len > 0 && state.scoped_len < state.items.len())
+        .then_some(state.scoped_len as u16);
+
     // Render rows with right-aligned hotkeys — can't use draw_modal because that
     // wraps all lines in one Paragraph, preventing per-row background tinting.
     // Custom draw: measure → size → clear → border → per-row widgets.
@@ -656,22 +884,51 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         .unwrap_or(0) as u16;
     let content_w = GUTTER + max_label_w + 3 + HOTKEY_W;
     let title = "actions";
+    // Both border breaks have to fit: ` ACTIONS ` on the left, ` <account> ` on
+    // the right, 2 corners and at least one dash of chrome between them.
+    let title_w = title.chars().count() as u16
+        + 2
+        + state
+            .context
+            .as_ref()
+            .map_or(0, |c| c.chars().count() as u16 + 2);
     let w = (content_w + 6)
-        .max(title.chars().count() as u16 + 4)
+        .max(title_w + 3)
         .min(area.width.saturating_sub(4));
-    // items rows + 4 chrome (border + padding)
-    let h = (state.items.len() as u16 + 4).min(area.height.saturating_sub(4));
+    // items rows + the rule + 4 chrome (border + padding)
+    let h = (state.items.len() as u16 + u16::from(rule_at.is_some()) + 4)
+        .min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
-    let block = modal_block(title);
+    let block = modal_block_with_meta(title, state.context.as_deref());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
+
+    if let Some(at) = rule_at {
+        let y = inner.y + at;
+        if y < inner.y + inner.height {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "─".repeat(inner.width as usize),
+                    theme::line(),
+                )))
+                .style(theme::base()),
+                Rect {
+                    y,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+    }
 
     let inner_w = inner.width;
     for (i, item) in state.items.iter().enumerate() {
         let focused = i == state.cursor;
-        let y = inner.y + i as u16;
+        // Rows below the rule sit one further down; the cursor never lands on
+        // it, so `items` stays the only index anything else needs.
+        let y = inner.y + i as u16 + u16::from(rule_at.is_some_and(|at| i as u16 >= at));
         if y >= inner.y + inner.height {
             break;
         }

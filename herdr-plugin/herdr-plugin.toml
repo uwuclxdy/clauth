@@ -1,0 +1,39 @@
+id = "clauth"
+name = "clauth"
+version = "0.15.1"
+min_herdr_version = "0.8.0"
+description = "Claude Code account switcher and usage dashboard, in a herdr popup"
+platforms = ["linux", "macos"]
+
+[[panes]]
+id = "tui"
+title = "clauth"
+description = "Accounts, usage windows, and the auto-switch chain"
+# A popup at the default half size renders the full desktop layout on any host
+# 152 columns or wider, and clauth's own narrow rules take over below that.
+placement = "popup"
+command = ["clauth"]
+
+[[actions]]
+id = "open"
+title = "Open clauth"
+description = "Open the clauth dashboard in a popup"
+contexts = ["global", "workspace"]
+command = ["sh", "open-pane.sh", "tui"]
+
+[[actions]]
+id = "which"
+title = "Show this pane's clauth account"
+description = "Publish the account the focused pane burns as pane metadata"
+contexts = ["global", "workspace", "pane"]
+command = ["sh", "report-profile.sh"]
+
+# A --with-fallback session moves onto another account mid-run, so the tag is
+# refreshed on every status change and not only when the agent first appears.
+[[events]]
+on = "pane.agent_detected"
+command = ["sh", "report-profile.sh"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["sh", "report-profile.sh"]

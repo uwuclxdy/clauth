@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! `fixed_split` truncation contract: content + pad always total `width`, and
 //! ANY dropped character is signalled with a trailing `…` — including the
 //! boundary case where the value is exactly one char over the window, which
@@ -61,7 +63,6 @@ fn cell_is_always_exactly_width() {
 fn cue_profile(status: Option<FetchStatus>) -> Profile {
     Profile {
         harness: crate::profile::Harness::Claude,
-        session_feed: false,
         name: "p".into(),
         base_url: None,
         api_key: None,
@@ -71,11 +72,14 @@ fn cue_profile(status: Option<FetchStatus>) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: status,
@@ -151,6 +155,63 @@ fn no_data_dash_stays_faint() {
     let spans = window_summary_spans_bracketed(None, 17, true, None, ResetFmt::default(), false);
     assert_eq!(spans[0].content, "—");
     assert_eq!(spans[0].style.fg, theme::faint().fg);
+}
+
+// ── Overview tier chip ──────────────────────────────────────────────────────
+
+/// The Overview kind column takes the same `—` every other no-data cell uses
+/// once no tier is known. The bare "Claude" it used to print sat in a column
+/// read side by side against real tiers, so it scanned as a plan of its own.
+///
+/// Asserted against `NO_DATA`, not a second copy of the literal, because
+/// `overview.rs` decides whether to animate the cell by comparing this return
+/// value to that const. A glyph change that moved only one of the two would stop
+/// the no-animation branch firing with nothing else red.
+#[test]
+fn account_type_label_dashes_an_unfetched_plan() {
+    assert_eq!(NO_DATA, "—", "the house no-data glyph");
+
+    let unfetched = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    assert_eq!(account_type_label(&unfetched), NO_DATA);
+
+    let mut unclassified = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    unclassified.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("something_new".into()),
+        }),
+    });
+    assert_eq!(account_type_label(&unclassified), NO_DATA);
+}
+
+/// The other direction: a fetched tier still loses only its `Claude ` prefix,
+/// `Free` is untouched, and an api-key profile still reads `API`.
+#[test]
+fn account_type_label_keeps_every_known_tier() {
+    let plan = |tier| {
+        Some(crate::usage::UsageInfo {
+            plan: Some(crate::usage::PlanInfo {
+                tier,
+                subscription_status: None,
+            }),
+            ..Default::default()
+        })
+    };
+
+    let mut max = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    max.usage = plan(crate::usage::PlanTier::Max(Some(20)));
+    assert_eq!(account_type_label(&max), "Max 20x");
+
+    let mut free = crate::testutil::blank_profile(&crate::profile::ProfileName::from("b"));
+    free.usage = plan(crate::usage::PlanTier::Free);
+    assert_eq!(account_type_label(&free), "Free");
+
+    let mut api = crate::testutil::blank_profile(&crate::profile::ProfileName::from("c"));
+    api.base_url = Some("https://api.deepseek.com/anthropic".into());
+    assert_eq!(account_type_label(&api), "API");
 }
 
 // ── Reset display (issue #39) ───────────────────────────────────────────────
@@ -363,24 +424,28 @@ fn the_widest_column_text_still_fits_the_wide_overview_tier() {
 #[test]
 fn overview_reset_middle_dot_stays_uncolored_in_both_mode() {
     use ratatui::style::Color;
+    // One pinned clock feeds both the fixture and the render, so the span
+    // assertions below can never race a wall-clock tick (the old fixture and
+    // `reset_in_secs` each read `now_epoch_secs()` independently, and a second
+    // landing between them pushed the countdown to `39m` under load).
+    let now = crate::usage::now_epoch_secs();
     let w = UsageWindow {
         utilization: 40.0,
-        resets_at: Some(crate::usage::epoch_secs_to_iso(
-            crate::usage::now_epoch_secs() + 40 * 60,
-        )),
+        resets_at: Some(crate::usage::epoch_secs_to_iso(now + 40 * 60)),
     };
     let fmt = ResetFmt {
         display: ResetDisplay::Both,
         clock: ClockFormat::H24,
     };
     let drain = Color::Yellow;
-    let spans = window_summary_spans_bracketed(
+    let spans = window_summary_spans_bracketed_at(
         Some(&w),
         160,
         true,
         Some(Style::default().fg(drain)),
         fmt,
         false,
+        now,
     );
     let dot = spans
         .iter()
@@ -502,18 +567,70 @@ fn stale_window_fades_only_fill_and_percent() {
     );
 }
 
-// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
+/// The 30-day arm edge of `relative_age`, which the ladder pin in
+/// `tui_render_chain.rs` walks straight past: it steps 30s / 5m30 / 2h30 /
+/// 3d12h / 12d and then jumps to a fixed 2023 epoch, so nothing sits near the
+/// cutover and `days < 30` is free to become `days < 31`.
+///
+/// Both fixtures sit HALF A DAY off the boundary, so the wall clock cannot walk
+/// either across it between building the fixture and rendering it. The date
+/// arm renders the 2026-08-22 ruling's local prose stamp through
+/// `crate::format::local_stamp`; the expected string derives through chrono's own
+/// `format` rather than the crate's formatter, so the pin is a second
+/// derivation of the same claim, not a copy of the code's arithmetic — it
+/// holds in any zone, UTC included (local equals UTC there, and the contract
+/// is satisfied by either). The literal stamp is also pinned against a fixed
+/// epoch through the chain surface by
+/// `the_last_swap_age_renders_one_unit_and_a_date_past_thirty_days`; what this
+/// owns is the branch.
+///
+/// `relative_age` also feeds the status tab's incident ages (the list row and
+/// the detail header), so the arm protects three surfaces, not one.
+#[test]
+fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
+    const DAY_MS: u64 = 86_400_000;
+    const HALF_DAY_MS: u64 = 43_200_000;
+    let ago = |ms: u64| crate::usage::now_ms().saturating_sub(ms);
+
+    // 29d12h — the last age still inside the relative arm, floored to 4 weeks.
+    assert_eq!(relative_age(ago(29 * DAY_MS + HALF_DAY_MS)), "4w ago");
+
+    // 30d12h — the first age past it. `days < 31` renders `4w ago` here.
+    let at_ms = ago(30 * DAY_MS + HALF_DAY_MS);
+    let dated = relative_age(at_ms);
+    let local = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
+        .unwrap()
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    assert_eq!(dated, local, "30d12h must take the local stamp arm");
+
+    // Where the fixture instant's local spelling differs from its UTC one,
+    // the UTC spelling must NOT be the answer: a stamp that regressed to UTC
+    // digits in the 19-char shape would still equal the local one on a UTC
+    // box, and where the two spellings coincide there is no second spelling
+    // to ban. The condition compares spellings, never the run-instant offset:
+    // a DST zone can read +00 at the fixture instant and nonzero now (the
+    // trap `sessions_cli`'s stamp pin records), and the offset read would
+    // fire the guard over two identical spellings.
+    let utc = chrono::DateTime::from_timestamp((at_ms / 1000) as i64, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if local != utc {
+        assert_ne!(
+            dated, utc,
+            "the arm rendered UTC digits, not local wall clock: {dated:?}"
+        );
+    }
+}
+
+// ── Fork-only tests (codex harness) ─────────────────────────────────────────
 
 // CDX-1 T8: the kind column is the harness tag for codex profiles.
 #[test]
 fn account_type_label_tags_codex_profiles() {
-    let mut p = crate::testutil::blank_profile("cdx");
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("cdx"));
     p.harness = crate::profile::Harness::Codex;
     assert_eq!(account_type_label(&p), "Codex");
 }
-
-// ── Reset display (issue #39) ───────────────────────────────────────────────
-//
-// `clock_text` and the three compositions are pure, so these pin exact strings
-// without depending on the box's timezone. The zone lookup itself
-// (`local_clock`) is a single chrono call over them.

@@ -6,7 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
-use crate::format::endpoint_label;
+use crate::format::account_tier;
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
     FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
@@ -67,6 +67,14 @@ pub(super) fn cue_style(cue: Option<Color>, resting: Style) -> Style {
     cue.map(|c| Style::default().fg(c)).unwrap_or(resting)
 }
 
+/// The house no-data glyph. A caller that has to branch on "is this cell empty"
+/// compares against this rather than a second copy of the literal.
+pub(super) const NO_DATA: &str = "—";
+
+/// The Overview kind column's tier chip. An account whose plan is not known yet
+/// gets [`NO_DATA`]: the old bare "Claude" read as a real plan, and this column
+/// is the one place a reader compares tiers side by side. The caller styles the
+/// cell, so it is the caller that keeps a no-data dash out of the identity pulse.
 pub(super) fn account_type_label(profile: &Profile) -> String {
     // The harness tag: a codex profile's kind column names its CLI, so the
     // accounts list reads at a glance which rows switch which tool (CDX-1 T8).
@@ -76,11 +84,9 @@ pub(super) fn account_type_label(profile: &Profile) -> String {
     if !profile.is_oauth() {
         return "API".to_string();
     }
-    let label = endpoint_label(profile);
-    label
-        .strip_prefix("Claude ")
-        .unwrap_or(label.as_str())
-        .to_string()
+    account_tier(profile)
+        .and_then(|t| t.short_label())
+        .unwrap_or_else(|| NO_DATA.to_string())
 }
 
 pub(super) fn bar_string_with_cells(pct: f64, cells: usize) -> String {
@@ -112,8 +118,30 @@ pub(super) fn window_summary_spans_bracketed(
     fmt: ResetFmt,
     stale: bool,
 ) -> Vec<Span<'static>> {
+    window_summary_spans_bracketed_at(
+        window,
+        width,
+        include_bar,
+        reset_style,
+        fmt,
+        stale,
+        now_epoch_secs(),
+    )
+}
+
+/// [`window_summary_spans_bracketed`] against a caller-supplied clock so a
+/// test can pin the fixture and the render to one instant.
+pub(crate) fn window_summary_spans_bracketed_at(
+    window: Option<&UsageWindow>,
+    width: usize,
+    include_bar: bool,
+    reset_style: Option<Style>,
+    fmt: ResetFmt,
+    stale: bool,
+    now: i64,
+) -> Vec<Span<'static>> {
     let Some(window) = window else {
-        return vec![Span::styled("—".to_string(), theme::faint())];
+        return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
     };
     let bracket = theme::dim();
     let pct = window.utilization.clamp(0.0, 100.0);
@@ -131,7 +159,7 @@ pub(super) fn window_summary_spans_bracketed(
             Span::styled("]", bracket),
             Span::styled(format!(" {:>3.0}%", pct), fill_style),
         ];
-        if let Some(secs) = reset_in_secs(window) {
+        if let Some(secs) = reset_in_secs_at(window, now) {
             let style = reset_style.unwrap_or_else(theme::faint);
             spans.extend(reset_suffix_spans(secs, fmt, width, style));
         }
@@ -167,9 +195,15 @@ pub(super) fn is_past_reset(window: &UsageWindow) -> bool {
 
 /// Seconds until the window resets (may be negative if the stamp is overdue).
 pub(super) fn reset_in_secs(window: &UsageWindow) -> Option<i64> {
+    reset_in_secs_at(window, now_epoch_secs())
+}
+
+/// [`reset_in_secs`] against a caller-supplied clock so a test can pin both
+/// reads to one instant instead of racing the wall clock.
+pub(crate) fn reset_in_secs_at(window: &UsageWindow, now: i64) -> Option<i64> {
     let resets_at = window.resets_at.as_deref()?;
     let target = iso_to_epoch_secs(resets_at)?;
-    Some(target - now_epoch_secs())
+    Some(target - now)
 }
 
 /// The operator's reset-rendering choice, snapshotted so a render pass reads the
@@ -401,8 +435,8 @@ fn month_label(month: u32) -> &'static str {
 
 /// Relative age of an epoch-ms timestamp per the cloudy-tui Time-formatting
 /// contract: single largest unit under 30 days (`4m ago`, `2h ago`, `3d ago`,
-/// `2w ago`); the absolute ISO date (`2026-04-12`) at 30 days and beyond.
-/// `< 1 minute` reads `just now`.
+/// `2w ago`); the local prose stamp (`2026-04-12 14:03:07`) at 30 days and
+/// beyond. `< 1 minute` reads `just now`.
 pub(super) fn relative_age(epoch_ms: u64) -> String {
     let now = crate::usage::now_ms();
     let age_secs = (now.saturating_sub(epoch_ms) / 1000) as i64;
@@ -425,28 +459,11 @@ pub(super) fn relative_age(epoch_ms: u64) -> String {
             format!("{weeks}w ago")
         }
     } else {
-        let iso = crate::usage::epoch_secs_to_iso((epoch_ms / 1000) as i64);
-        iso.split('T').next().unwrap_or(&iso).to_string()
+        // Local wall clock per the 2026-08-22 ruling: the bare UTC date read
+        // as local off UTC. Same formatter as the status tab's incident
+        // stamps; an instant chrono cannot represent renders no-data, never UTC.
+        crate::format::local_stamp((epoch_ms / 1000) as i64).unwrap_or_else(|| NO_DATA.to_string())
     }
-}
-
-/// Lowercase clock label for an epoch-ms timestamp: `jun 5, 18:27`. A comma sits
-/// directly after the day, no space before it. With `utc = true` appends ` utc`
-/// (used only on the detail `started` row). All times are UTC.
-pub(super) fn clock_label(epoch_ms: u64, utc: bool) -> String {
-    // `epoch_secs_to_iso` → `YYYY-MM-DDTHH:MM:SS+00:00`.
-    let iso = crate::usage::epoch_secs_to_iso((epoch_ms / 1000) as i64);
-    let bytes = iso.as_bytes();
-    // Defensive: a malformed ISO string degrades to the raw value.
-    if bytes.len() < 16 || bytes[10] != b'T' {
-        return iso;
-    }
-    let mon = month_label(iso[5..7].parse().unwrap_or(1));
-    // Day without a leading zero.
-    let day: u32 = iso[8..10].parse().unwrap_or(0);
-    let hm = &iso[11..16];
-    let suffix = if utc { " utc" } else { "" };
-    format!("{mon} {day}, {hm}{suffix}")
 }
 
 use crate::spinner::SPINNER_FRAMES;

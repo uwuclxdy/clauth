@@ -9,7 +9,22 @@
 //!    and `fetch` (mirror [`deepseek`] for balances, [`zai`] for limit bars +
 //!    per-model token rows).
 //! 2. Add a variant to [`Provider`] and wire it into `from_base_url`,
-//!    `display_name`, and [`fetch_third_party_usage`]'s match arms.
+//!    `display_name`, `console_url` (the page an operator mints the key on —
+//!    cite where the vendor publishes it, since a wrong one sends someone to
+//!    another product), [`ThirdPartyTarget::throttle_key`], and
+//!    [`Provider::fetch`].
+//! 3. Decide what the fetch AUTHENTICATES with before writing it. The api key is
+//!    not a given: Alibaba's reads inference only and every quota surface
+//!    ignores it, so [`alibaba`] runs on a separate per-profile console session
+//!    and its entries are collected even when the api key is absent
+//!    ([`crate::usage::third_party_credentialed`] is the shared test, and the
+//!    render layer reads the same one). A provider whose usage credential can
+//!    die with no refresh path returns [`ThirdPartyError::AuthExpired`] rather
+//!    than a generic failure, which is what stops the cadence and tells the
+//!    operator to re-authenticate instead of waiting. The shared `get_json`
+//!    already maps a 401 to it — a dead api key has no refresh path either — so
+//!    a provider only needs to produce the verdict itself when its credential
+//!    is session-shaped (Alibaba) and the death arrives in an HTTP 200 body.
 //!
 //! No render-layer changes needed — [`ThirdPartyStats`] carries provider-agnostic
 //! [`UsageBar`]s (percentage windows) and [`StatRow`]s (text), which
@@ -17,11 +32,91 @@
 //! through [`generic`]'s best-effort scanner, which sets `best_effort` so the UI
 //! invites a bug report.
 
+pub(crate) mod alibaba;
 mod deepseek;
 mod generic;
+mod openrouter;
 mod zai;
 
+pub(crate) use deepseek::BALANCE_ROW_LABEL as DEEPSEEK_BALANCE_ROW_LABEL;
+
+/// Whether a `StatRow` label names the account's spendable balance, in either
+/// spelling a cache on disk can carry: the current [`DEEPSEEK_BALANCE_ROW_LABEL`],
+/// or the legacy `total` an older clauth wrote and the generic scanner still
+/// passes an endpoint's own key through as. Every reader that singles the
+/// wallet row out — the overview balance column, the MCP roster's rank and its
+/// rendered figure — asks this, so a rename lives in one place.
+pub(crate) fn is_balance_row(label: &str) -> bool {
+    label == DEEPSEEK_BALANCE_ROW_LABEL || label == "total"
+}
+
+/// One wallet parsed off a cached balance row: `"1132.60 CNY"` → currency
+/// `CNY`, amount `1132.6`. The row's own `label` and `value` ride along for
+/// the surfaces that render the row rather than the figure.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Wallet {
+    pub(crate) label: String,
+    pub(crate) value: String,
+    pub(crate) currency: String,
+    pub(crate) amount: f64,
+}
+
+/// Parse one balance row's value: `"31.45 USD"` → `("USD", 31.45)`: one finite
+/// amount plus one 2-5 letter ASCII currency code. The narrowness is the
+/// point: a balance row carrying anything else (z.ai's `123.4M  (1.2k calls)`,
+/// a second word, `nan`/`inf`) describes no wallet. A loose parse would invent
+/// one to rank on.
+pub(crate) fn parse_balance(value: &str) -> Option<(String, f64)> {
+    let mut parts = value.split_whitespace();
+    let amount: f64 = parts.next()?.parse().ok()?;
+    if !amount.is_finite() {
+        return None;
+    }
+    let currency = parts.next()?;
+    if parts.next().is_some()
+        || !(2..=5).contains(&currency.len())
+        || !currency.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return None;
+    }
+    Some((currency.to_string(), amount))
+}
+
+/// Every balance row parsed into a [`Wallet`], in row order — zero-amount
+/// wallets included, so a surface can still render an all-empty account's
+/// figure. [`funded_wallets`] is this minus the wallets that carry no headroom.
+pub(crate) fn balance_wallets(rows: &[StatRow]) -> Vec<Wallet> {
+    rows.iter()
+        .filter(|r| is_balance_row(&r.label))
+        .filter_map(|r| {
+            let (currency, amount) = parse_balance(&r.value)?;
+            Some(Wallet {
+                label: r.label.clone(),
+                value: r.value.clone(),
+                currency,
+                amount,
+            })
+        })
+        .collect()
+}
+
+/// [`balance_wallets`] with the wallets that carry no headroom dropped: a
+/// wallet whose amount is not above zero names a pool nothing is left to
+/// spend from, and dropping it compares nothing across currencies (owner
+/// ruling 2026-08-28). The first element — ROW order, never amount, so two
+/// funded wallets of different currencies are never compared — is the wallet
+/// the MCP roster ranks the account on and its rendered figure reports; the
+/// overview balance column shows the whole list.
+pub(crate) fn funded_wallets(rows: &[StatRow]) -> Vec<Wallet> {
+    balance_wallets(rows)
+        .into_iter()
+        .filter(|w| w.amount > 0.0)
+        .collect()
+}
+
 use serde::{Deserialize, Serialize};
+
+use crate::profile::ConsoleCredential;
 
 // ── Provider ────────────────────────────────────────────────────────────────────
 
@@ -30,6 +125,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) enum Provider {
     DeepSeek,
     Zai,
+    Alibaba,
+    OpenRouter,
 }
 
 impl Provider {
@@ -39,6 +136,10 @@ impl Provider {
             Some(Self::DeepSeek)
         } else if zai::matches_base_url(url) {
             Some(Self::Zai)
+        } else if alibaba::matches_base_url(url) {
+            Some(Self::Alibaba)
+        } else if openrouter::matches_base_url(url) {
+            Some(Self::OpenRouter)
         } else {
             None
         }
@@ -48,29 +149,76 @@ impl Provider {
         match self {
             Self::DeepSeek => deepseek::DISPLAY_NAME,
             Self::Zai => zai::DISPLAY_NAME,
+            Self::Alibaba => alibaba::DISPLAY_NAME,
+            Self::OpenRouter => openrouter::DISPLAY_NAME,
         }
     }
 
-    /// Canonical `scheme://host` this provider's requests target — the per-host
-    /// request-pacing key (see [`ThirdPartyTarget::throttle_key`]).
-    fn origin(self) -> &'static str {
+    /// Whether this provider publishes usage windows of its own (percentage
+    /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai` and
+    /// `Alibaba` do; `DeepSeek` and `OpenRouter` publish a wallet. The MCP
+    /// headroom clause denies a 5h/7d limit only where it knows the provider
+    /// has none: a windows-publishing provider HAS the limits even when one
+    /// cached response carried no bars.
+    pub(crate) fn publishes_windows(self) -> bool {
+        matches!(self, Self::Zai | Self::Alibaba)
+    }
+
+    /// The vendor page where this endpoint's api key is minted, for a surface
+    /// that offers to open it. [`alibaba`] answers with four different pages,
+    /// since its four endpoints are two products across two consoles; the other
+    /// three have one page each.
+    ///
+    /// `None` means the `base_url` doesn't belong to `self`, which is why every
+    /// arm re-checks it rather than only the arm that has to. Returning a page
+    /// for a mismatched pair would open some other account's console, and a
+    /// single-page provider is exactly where that reads as harmless.
+    pub(crate) fn console_url(self, base_url: &str) -> Option<&'static str> {
         match self {
-            Self::DeepSeek => deepseek::ORIGIN,
-            Self::Zai => zai::ORIGIN,
+            Self::DeepSeek => deepseek::matches_base_url(base_url).then_some(deepseek::CONSOLE_URL),
+            Self::Zai => zai::matches_base_url(base_url).then_some(zai::CONSOLE_URL),
+            Self::Alibaba => alibaba::console_url(base_url),
+            Self::OpenRouter => {
+                openrouter::matches_base_url(base_url).then_some(openrouter::CONSOLE_URL)
+            }
+        }
+    }
+
+    /// Fetch this provider's usage. `api_key` authorises every provider except
+    /// Alibaba: its quota lives behind the per-profile console session
+    /// (`console`), and its api key reads inference only.
+    fn fetch(
+        self,
+        api_key: &str,
+        console: Option<&ConsoleCredential>,
+    ) -> Result<ThirdPartyStats, ThirdPartyError> {
+        match self {
+            Self::DeepSeek => deepseek::fetch(api_key),
+            Self::Zai => zai::fetch(api_key),
+            // The api key is not a quota credential here — the console session is.
+            Self::Alibaba => alibaba::fetch(console),
+            Self::OpenRouter => openrouter::fetch(api_key),
         }
     }
 }
 
 /// What a third-party scheduler entry fetches against: a recognised provider
 /// (typed fetch) or an unrecognised api-key endpoint (generic discovery + scan).
+///
+/// `Known` carries the profile's console credential because one provider's usage
+/// surface doesn't run on the api key at all: Alibaba's quota lives behind a
+/// console session, and its gateway host is picked from that session's
+/// region + site rather than being a constant. Every other provider leaves it
+/// `None` and is unaffected.
 #[derive(Debug, Clone)]
 pub(crate) enum ThirdPartyTarget {
-    Known(Provider),
+    Known {
+        provider: Provider,
+        console: Option<ConsoleCredential>,
+    },
     /// Generic api-key endpoint: usage is discovered + scanned at this base_url's
     /// API origin (same host the key already authorises for completions).
-    Generic {
-        base_url: String,
-    },
+    Generic { base_url: String },
 }
 
 impl ThirdPartyTarget {
@@ -80,7 +228,13 @@ impl ThirdPartyTarget {
     /// stable per-account key.
     pub(crate) fn throttle_key(&self) -> String {
         match self {
-            Self::Known(provider) => provider.origin().to_string(),
+            Self::Known { provider, console } => match provider {
+                Provider::DeepSeek => deepseek::ORIGIN.to_string(),
+                Provider::Zai => zai::ORIGIN.to_string(),
+                // One of four console gateways, chosen by region + site.
+                Provider::Alibaba => alibaba::gateway_origin(console.as_ref()).to_string(),
+                Provider::OpenRouter => openrouter::ORIGIN.to_string(),
+            },
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
         }
     }
@@ -92,15 +246,29 @@ impl ThirdPartyTarget {
 /// (`https://api.deepseek.com.evil.tld`) — a bare `starts_with` would claim
 /// those and send the profile's API key to the real provider endpoint.
 ///
+/// A `:` is only a port when what follows it is digits: per RFC 3986 everything
+/// before an `@` is USERINFO, so `https://api.deepseek.com:443@evil.tld` has
+/// host `evil.tld` and belongs to no provider here. Accepting it labelled that
+/// profile DeepSeek and pointed the typed usage fetch at the real
+/// `api.deepseek.com`, handing the account's api key to a host its own config
+/// never named. An empty port (`https://api.deepseek.com:/v1`) is valid and
+/// still the provider, so it matches.
+///
 /// The scheme + host are compared case-insensitively (hosts are
 /// case-insensitive per RFC 3986). `url` is lowercased; `base` is lowercased
 /// defensively so a future caller passing mixed-case still matches.
-fn url_matches_host(url: &str, base: &str) -> bool {
+pub(crate) fn url_matches_host(url: &str, base: &str) -> bool {
     let url = url.to_ascii_lowercase();
     let base = base.to_ascii_lowercase();
     match url.strip_prefix(&base) {
         Some("") => true,
-        Some(rest) => rest.starts_with(['/', ':', '?', '#']),
+        Some(rest) => match rest.strip_prefix(':') {
+            Some(after) => {
+                let port_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+                after[..port_end].bytes().all(|b| b.is_ascii_digit())
+            }
+            None => rest.starts_with(['/', '?', '#']),
+        },
         None => false,
     }
 }
@@ -129,10 +297,7 @@ pub(crate) fn fetch_third_party_usage(
     hint: Option<&str>,
 ) -> Result<ThirdPartyStats, ThirdPartyError> {
     match target {
-        ThirdPartyTarget::Known(provider) => match provider {
-            Provider::DeepSeek => deepseek::fetch(api_key),
-            Provider::Zai => zai::fetch(api_key),
-        },
+        ThirdPartyTarget::Known { provider, console } => provider.fetch(api_key, console.as_ref()),
         ThirdPartyTarget::Generic { base_url } => generic::fetch(base_url, api_key, hint),
     }
 }
@@ -199,14 +364,21 @@ impl ThirdPartyStats {
         }
     }
 
-    fn unavailable(reason: &str) -> Self {
+    /// The provider's own verdict that the account cannot fund a call, carrying
+    /// whatever figures it still reported. The verdict rides as a trailing
+    /// `Danger` row instead of replacing the rows: a reader picking a target
+    /// needs both how short the account is and that it will refuse, and the
+    /// providers that set this flag (DeepSeek's `is_available`, OpenRouter's
+    /// overdrawn wallet) both still send the figures.
+    fn unfunded(mut rows: Vec<StatRow>) -> Self {
+        rows.push(StatRow {
+            label: String::new(),
+            value: LOW_BALANCE.to_string(),
+            kind: StatRowKind::Danger,
+        });
         Self {
             is_available: false,
-            rows: vec![StatRow {
-                label: String::new(),
-                value: reason.to_string(),
-                kind: StatRowKind::Danger,
-            }],
+            rows,
             bars: Vec::new(),
             plan: None,
             endpoint: None,
@@ -224,6 +396,13 @@ pub(crate) struct StatRow {
     pub(crate) kind: StatRowKind,
 }
 
+/// What every surface says when a provider reports the account cannot fund a
+/// call. One spelling, because the roster line, the Usage tab and the MCP
+/// headline all render it and a reader meets more than one of them. It is a
+/// verdict the PROVIDER reached, never clauth failing to read a figure, which
+/// is what the old `balance unavailable` wording claimed.
+pub(crate) const LOW_BALANCE: &str = "balance too low";
+
 /// Visual weight of a row in the Usage tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -232,7 +411,7 @@ pub(crate) enum StatRowKind {
     Heading,
     /// Normal key:value.
     Body,
-    /// Danger-coloured (e.g. "balance unavailable").
+    /// Danger-coloured (e.g. [`LOW_BALANCE`]).
     Danger,
     /// Dim / faint text.
     Faint,
@@ -242,9 +421,11 @@ pub(crate) enum StatRowKind {
 
 #[derive(Debug)]
 pub(crate) enum ThirdPartyError {
-    /// Provider returned a non-429 >=400 status (e.g. 401 bad key). The caller
-    /// doesn't branch on the code — third-party profiles have no chain to
-    /// rotate — so it collapses to a cache-fallback like `Network`/`Parse`.
+    /// Provider returned a non-429, non-401 >=400 status. The caller doesn't
+    /// branch on the code — third-party profiles have no chain to rotate — so
+    /// it collapses to a cache-fallback like `Network`/`Parse`. A 401 never
+    /// reaches this variant: the shared `get_json` maps it to [`AuthExpired`],
+    /// since a dead api key can never succeed on retry.
     Status,
     /// HTTP 429. `retry_after` is the server's `retry-after` header in
     /// delta-seconds form (the HTTP-date form is treated as absent), used to
@@ -254,6 +435,14 @@ pub(crate) enum ThirdPartyError {
     },
     Network,
     Parse,
+    /// The provider's usage credential is dead or was never captured, and no
+    /// refresh path exists — only an operator re-login clears it. Distinct from
+    /// `Status` because retrying on the cadence can never succeed: the scheduler
+    /// session-suppresses this profile and the UI names the login instead of a
+    /// network fault. Two producers: a 401 from the shared `get_json` (a dead
+    /// api key), and Alibaba's 48-hour console session (the verdict rides an
+    /// HTTP 200 body).
+    AuthExpired,
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────────
@@ -272,6 +461,14 @@ fn get_json(url: &str, api_key: &str) -> Result<String, ThirdPartyError> {
             .and_then(|v| v.to_str().ok())
             .and_then(crate::usage::parse_retry_after);
         return Err(ThirdPartyError::RateLimited { retry_after });
+    }
+    if status == 401 {
+        // The api key is dead for this host and no refresh path exists, so
+        // retrying on the cadence can never succeed — `AuthExpired` is what
+        // stops the poll and names a key re-entry instead of a network fault.
+        // Shared by every api-key fetch: the typed providers and the generic
+        // prober alike.
+        return Err(ThirdPartyError::AuthExpired);
     }
     if status >= 400 {
         return Err(ThirdPartyError::Status);

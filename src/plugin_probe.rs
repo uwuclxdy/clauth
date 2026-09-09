@@ -146,29 +146,33 @@ pub(crate) fn global_entry_drifted() -> Option<bool> {
     Some(!same)
 }
 
-/// Verdict of a live `clauth mcp` initialize handshake.
+/// Verdict of a live `clauth mcp` discovery handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum McpProbe {
-    /// Server answered `initialize` with a result.
+    /// Server answered `server/discover` with a result advertising its tools.
     Ok,
     /// Server couldn't be spawned or didn't answer a valid result (reason).
     Failed(String),
 }
 
-/// Spawn `clauth mcp`, send one JSON-RPC `initialize`, and confirm the reply is a
-/// success result. Client-faithful: catches a `clauth` that resolves on PATH but is
-/// too old to serve (no `mcp` subcommand) or boots then dies. Heavier than the
+/// Spawn `clauth mcp`, send one JSON-RPC `server/discover`, and confirm the reply
+/// advertises tools. Client-faithful: catches a `clauth` that resolves on PATH but is
+/// too old to serve (no `mcp` subcommand, or no stateless protocol) or boots then dies. Heavier than the
 /// other probes — the server runs `gc_stale_runtimes()` at startup — so the tab
 /// gates it behind `r` only. Drains stdout on a thread so a chatty server can't
 /// deadlock the pipe; 3s budget, then kill.
-pub(crate) fn mcp_boots() -> McpProbe {
-    let mut child = match Command::new("clauth")
-        .arg("mcp")
+fn probe_command() -> Command {
+    let mut cmd = Command::new("clauth");
+    cmd.arg("mcp")
+        .env(crate::mcp::MCP_PROBE_ENV, "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
+        .stderr(Stdio::null());
+    cmd
+}
+
+pub(crate) fn mcp_boots() -> McpProbe {
+    let mut child = match probe_command().spawn() {
         Ok(child) => child,
         Err(e) => return McpProbe::Failed(format!("spawn failed: {e}")),
     };
@@ -178,16 +182,7 @@ pub(crate) fn mcp_boots() -> McpProbe {
         return McpProbe::Failed("no stdio pipes".to_string());
     };
 
-    // Conservative protocol version so a healthy server never errors on a too-new
-    // value — the probe only needs to prove it boots and speaks MCP.
-    let req = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "clauth-probe", "version": env!("CARGO_PKG_VERSION") }
-        }
-    });
+    let req = discover_frame();
     if writeln!(stdin, "{req}")
         .and_then(|()| stdin.flush())
         .is_err()
@@ -205,7 +200,7 @@ pub(crate) fn mcp_boots() -> McpProbe {
     });
 
     let verdict = match rx.recv_timeout(Duration::from_secs(3)) {
-        Ok(Ok(line)) => parse_initialize_reply(&line),
+        Ok(Ok(line)) => parse_discover_reply(&line),
         Ok(Err(e)) => McpProbe::Failed(format!("read failed: {e}")),
         Err(_) => McpProbe::Failed("no reply within 3s".to_string()),
     };
@@ -217,20 +212,56 @@ pub(crate) fn mcp_boots() -> McpProbe {
     verdict
 }
 
-/// Classify the first stdout line of an `initialize` handshake. A parseable result
-/// proves the server booted; an `error` reply or unparseable line is a failure.
-fn parse_initialize_reply(line: &str) -> McpProbe {
+/// The stateless opener the probe sends. An `initialize` frame would keep
+/// passing against a server no modern client can talk to, since rmcp answers
+/// both eras; there is no handshake left, so the version and the client's
+/// capabilities ride in `_meta` on the request itself.
+fn discover_frame() -> Value {
+    serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "server/discover",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "clauth-probe", "version": env!("CARGO_PKG_VERSION")
+                },
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    })
+}
+
+/// JSON-RPC "method not found", which is what a `clauth` predating the stateless
+/// protocol answers `server/discover` with.
+const METHOD_NOT_FOUND: i64 = -32601;
+
+/// Classify the first stdout line of a `server/discover` handshake. A result
+/// proves the server booted, and the `tools` capability inside it is what
+/// decides whether a real client exposes any tools at all — a forced
+/// `tools/list` answers either way, so it cannot stand in for this.
+fn parse_discover_reply(line: &str) -> McpProbe {
     let Ok(value) = serde_json::from_str::<Value>(line.trim()) else {
         return McpProbe::Failed("unparseable reply".to_string());
     };
-    if value.get("error").is_some() {
-        return McpProbe::Failed("server returned an error".to_string());
+    if let Some(error) = value.get("error") {
+        let code = error.get("code").and_then(Value::as_i64);
+        return McpProbe::Failed(if code == Some(METHOD_NOT_FOUND) {
+            "no `server/discover`: the clauth on PATH predates the stateless protocol".to_string()
+        } else {
+            let message = error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("no message");
+            format!("server rejected `server/discover`: {message}")
+        });
     }
-    if value.get("result").is_some() {
-        McpProbe::Ok
-    } else {
-        McpProbe::Failed("no result in reply".to_string())
+    let Some(result) = value.get("result") else {
+        return McpProbe::Failed("no result in reply".to_string());
+    };
+    if result.pointer("/capabilities/tools").is_none() {
+        return McpProbe::Failed("server advertises no tools capability".to_string());
     }
+    McpProbe::Ok
 }
 
 /// `claude --version`, trimmed to its first line. `None` when the binary is
@@ -289,8 +320,19 @@ fn clauth_mcp_entry() -> Value {
     serde_json::json!({ "type": "stdio", "command": "clauth", "args": ["mcp"] })
 }
 
+/// CC's user-scope plugin registry. `claude` resolves its config dir as
+/// `$CLAUDE_CONFIG_DIR` when set and non-empty, else `~/.claude`, and the
+/// registry lives under it — so the probe reads the same resolution the CLI
+/// writes. That is what makes the install fix converge: agentgear drives the
+/// real CLI, which honors the override, and the recomputed row must read the
+/// registry the CLI just wrote. `profile::claude_dir()` stays the `~/.claude`
+/// view the credentials link uses; the registry is not the link.
 fn plugins_dir() -> Option<PathBuf> {
-    Some(claude_dir().ok()?.join("plugins"))
+    let base = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => claude_dir().ok()?,
+    };
+    Some(base.join("plugins"))
 }
 
 /// Parse a JSON file into a `Value`, returning `None` on any missing/unreadable/

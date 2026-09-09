@@ -55,9 +55,11 @@ fn store_mode_reports_non_file_modes() {
 fn profile_and_live_writes_round_trip_bytes_exactly() {
     let _sandbox = HomeSandbox::new();
     let bytes = auth_bytes("at-alpha", "acct-alpha");
-    write_profile_auth("alpha", &bytes).expect("store");
+    write_profile_auth(&crate::profile::ProfileName::from("alpha"), &bytes).expect("store");
     assert_eq!(
-        read_profile_auth("alpha").unwrap().as_deref(),
+        read_profile_auth(&crate::profile::ProfileName::from("alpha"))
+            .unwrap()
+            .as_deref(),
         Some(&bytes[..])
     );
 
@@ -68,7 +70,7 @@ fn profile_and_live_writes_round_trip_bytes_exactly() {
     {
         use std::os::unix::fs::PermissionsExt;
         for path in [
-            profile_auth_path("alpha").unwrap(),
+            profile_auth_path(&crate::profile::ProfileName::from("alpha")).unwrap(),
             live_auth_path().unwrap(),
         ] {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -81,7 +83,11 @@ fn profile_and_live_writes_round_trip_bytes_exactly() {
 fn read_helpers_return_none_when_absent() {
     let _sandbox = HomeSandbox::new();
     assert!(read_live().unwrap().is_none());
-    assert!(read_profile_auth("ghost").unwrap().is_none());
+    assert!(
+        read_profile_auth(&crate::profile::ProfileName::from("ghost"))
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]

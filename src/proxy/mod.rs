@@ -32,6 +32,7 @@ use crate::usage::{UsageInfo, now_ms};
 
 use self::http::{RequestError, RequestHead, read_body, read_request_head};
 use self::pool::{Cooldowns, PoolMember, Selection, next_after_failure, select_account};
+use crate::out::outln;
 
 /// Default loopback port (unclaimed; overridable). Named in the printed config.
 pub(crate) const DEFAULT_PROXY_PORT: u16 = 4517;
@@ -71,7 +72,7 @@ pub(crate) fn proxy_active(interval_ms: u64) -> bool {
 /// Print the `config.toml` block a user pastes to point codex at the proxy
 /// (proxy-design §1.3 — clauth NEVER writes the live config).
 pub(crate) fn print_config(port: u16) {
-    println!(
+    outln!(
         "# Paste into ~/.codex/config.toml to route codex through clauth's proxy.\n\
          # (clauth never edits this file for you — proxy off = delete this block.)\n\
          model_provider = \"clauth\"\n\n\
@@ -106,9 +107,9 @@ pub(crate) fn run(port: u16) -> Result<()> {
         upstream_base: UPSTREAM_BASE.to_string(),
     });
 
-    println!("clauth proxy listening on http://127.0.0.1:{port}{EXPECTED_PREFIX}");
-    println!("  point codex at it with:  clauth proxy --print-config --port {port}");
-    println!("  (loopback only, no client auth — any local process can use the pool)");
+    outln!("clauth proxy listening on http://127.0.0.1:{port}{EXPECTED_PREFIX}");
+    outln!("  point codex at it with:  clauth proxy --print-config --port {port}");
+    outln!("  (loopback only, no client auth — any local process can use the pool)");
     // Stamp log lines like the daemon does: the proxy is a supervised process
     // whose stderr lands in `proxy.log`, and the 2026-07-18 incident had to be
     // reconstructed from an unstamped error flood.
@@ -498,7 +499,9 @@ fn account_identity(state: &ProxyState, account: &str) -> Option<Identity> {
     } else {
         // Parked chain: refresh through CDX-3 if near expiry, then read store.
         ensure_fresh_parked(state, account);
-        crate::codex::read_profile_auth(account).ok().flatten()?
+        crate::codex::read_profile_auth(&crate::profile::ProfileName::from(account))
+            .ok()
+            .flatten()?
     };
     let auth = crate::codex::CodexAuthFile::parse(&bytes).ok()?;
     Some(Identity {
@@ -508,7 +511,9 @@ fn account_identity(state: &ProxyState, account: &str) -> Option<Identity> {
 }
 
 fn stored_account_id(account: &str) -> Option<String> {
-    let bytes = crate::codex::read_profile_auth(account).ok().flatten()?;
+    let bytes = crate::codex::read_profile_auth(&crate::profile::ProfileName::from(account))
+        .ok()
+        .flatten()?;
     crate::codex::CodexAuthFile::parse(&bytes)
         .ok()?
         .account_id()
@@ -524,7 +529,7 @@ fn stored_account_id(account: &str) -> Option<String> {
 fn ensure_fresh_parked(state: &ProxyState, account: &str) {
     // Cheap pre-gate outside the guard (re-checked authoritatively inside):
     // skip the guard entirely when the store already holds a fresh token.
-    let due = crate::codex::read_profile_auth(account)
+    let due = crate::codex::read_profile_auth(&crate::profile::ProfileName::from(account))
         .ok()
         .flatten()
         .and_then(|b| crate::codex::CodexAuthFile::parse(&b).ok())
@@ -534,7 +539,7 @@ fn ensure_fresh_parked(state: &ProxyState, account: &str) {
     }
     if let crate::usage::CodexStandbyOutcome::Transient(e) = crate::usage::codex_refresh_parked(
         &state.config,
-        account,
+        &crate::profile::ProfileName::from(account),
         None,
         &crate::codex::oauth::refresh,
         false,
@@ -584,7 +589,11 @@ fn capture_usage_headers(account: &str, response: &ureq::http::Response<ureq::Bo
         codex_rate_limit_reached,
         ..UsageInfo::default()
     };
-    write_profile_cache(account, USAGE_CACHE_FILE, &info);
+    write_profile_cache(
+        &crate::profile::ProfileName::from(account),
+        USAGE_CACHE_FILE,
+        &info,
+    );
 }
 
 /// The advertised reset (epoch-ms) from the primary window's reset header, for
@@ -609,18 +618,18 @@ fn pool_snapshot(state: &ProxyState) -> Vec<PoolMember> {
     let Ok(cfg) = state.config.lock() else {
         return Vec::new();
     };
-    let names: Vec<String> = if !cfg.state.codex_fallback_chain.is_empty() {
+    let names: Vec<crate::profile::ProfileName> = if !cfg.state.codex_fallback_chain.is_empty() {
         cfg.state
             .codex_fallback_chain
             .iter()
-            .map(|n| n.as_str().to_string())
             .filter(|n| cfg.find(n).is_some_and(|p| p.is_codex()))
+            .cloned()
             .collect()
     } else {
         cfg.profiles
             .iter()
             .filter(|p| p.is_codex())
-            .map(|p| p.name.to_string())
+            .map(|p| p.name.clone())
             .collect()
     };
     let cooldowns = state.cooldowns.lock().ok();
@@ -629,12 +638,15 @@ fn pool_snapshot(state: &ProxyState) -> Vec<PoolMember> {
         .into_iter()
         .filter(|n| matches!(crate::codex::read_profile_auth(n), Ok(Some(_))))
         .map(|name| {
-            let cooldown_until_ms = cooldowns.as_ref().map(|c| c.get(&name)).unwrap_or(0);
+            let cooldown_until_ms = cooldowns
+                .as_ref()
+                .map(|c| c.get(name.as_str()))
+                .unwrap_or(0);
             let unavailable =
                 cfg.is_auth_broken(&name) || crate::runtime::has_live_codex_session(&name);
             let cached_spent = cached_exhausted(&name, now, &cfg);
             PoolMember {
-                name,
+                name: name.to_string(),
                 cooldown_until_ms,
                 unavailable,
                 cached_spent,
@@ -645,7 +657,7 @@ fn pool_snapshot(state: &ProxyState) -> Vec<PoolMember> {
 
 /// Whether `name`'s cached usage says it is spent (the CDX-4 exhaustion shape
 /// against its own cache). Best-effort — no cache = not exhausted.
-fn cached_exhausted(name: &str, now_ms: u64, cfg: &AppConfig) -> bool {
+fn cached_exhausted(name: &crate::profile::ProfileName, now_ms: u64, cfg: &AppConfig) -> bool {
     let now_secs = (now_ms / 1000) as i64;
     let weekly_pct = cfg.state.weekly_switch_threshold_pct();
     crate::profile_cache::load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)

@@ -32,8 +32,8 @@ use crate::profile::clauth_dir;
 
 /// How stale `status.json` may be before the `● daemon` dot flips green→amber.
 /// The daemon stamps it every ~1s loop tick, but a single tick can legitimately
-/// block up to the keychain shell-out's 20s kill deadline, so the window rides
-/// just above that. It also lands at the daemon's tightened
+/// block up to the keychain shell-outs' 20s total kill deadline (a
+/// read-modify-write at 10s each), so the window rides just above that. It also lands at the daemon's tightened
 /// [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE), so amber reads as "wedging,
 /// about to be aborted + restarted" rather than a transient slow tick.
 const DAEMON_STALE_MS: u64 = 30_000;
@@ -172,11 +172,12 @@ impl StandbySlot {
 }
 
 /// How many times a non-[`Claim::Active`] outcome is re-tried before it stands.
-/// **All three presence probes TAKE the flock they test** — [`daemon_health`]
-/// (TUI header, 1 Hz), [`singleton_held`] (`clauth daemon --status`, at whatever
-/// rate a supervisor polls) and [`standby_waiting`] (the slot file) try-lock a
-/// free file and release it microseconds later — so a single lost try-lock does
-/// not prove a daemon is there. A real holder keeps its lock for the process
+/// **Every presence probe TAKES the flock it tests** — [`daemon_health`] (TUI
+/// header, 1 Hz), [`singleton_held`] (`clauth daemon --status` at whatever rate a
+/// supervisor polls, plus once per `clauth start --with-fallback`, which refuses
+/// when no daemon is there to decide its switches) and [`standby_waiting`] (the
+/// slot file) try-lock a free file and release it microseconds later — so a single
+/// lost try-lock does not prove a daemon is there. A real holder keeps its lock for the process
 /// lifetime, so anything that clears on the next attempt was a reader. Without
 /// this, a µs-long probe could push a starting daemon into `Redundant`, and
 /// under launchd `KeepAlive{SuccessfulExit=false}` that clean exit is never
@@ -234,6 +235,25 @@ pub(crate) fn claim_singleton_with(
     Ok(claim)
 }
 
+/// Test-only: claim attempts each directory has seen, keyed by directory because
+/// tests run in parallel over distinct sandboxes. Lets a test pin "the retry leg
+/// did not run" by counting attempts instead of by a wall-clock bound.
+#[cfg(test)]
+static CLAIM_ATTEMPTS_BY_DIR: std::sync::LazyLock<
+    Mutex<std::collections::HashMap<std::path::PathBuf, u64>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+/// Claim attempts `dir` has seen so far (test builds only).
+#[cfg(test)]
+fn claim_attempts(dir: &Path) -> u64 {
+    CLAIM_ATTEMPTS_BY_DIR
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(dir)
+        .copied()
+        .unwrap_or(0)
+}
+
 /// One claim attempt. `standby` false (`--no-standby`) turns a lost race straight
 /// into [`Claim::Redundant`] without so much as creating the slot file.
 ///
@@ -242,6 +262,14 @@ pub(crate) fn claim_singleton_with(
 /// instance would otherwise announce a daemon that isn't there and exit 0. A
 /// hard failure exits non-zero, which a supervisor retries and an operator sees.
 fn claim_once(dir: &Path, standby: bool) -> Result<Claim> {
+    #[cfg(test)]
+    {
+        *CLAIM_ATTEMPTS_BY_DIR
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(dir.to_path_buf())
+            .or_insert(0) += 1;
+    }
     let active = crate::profile::open_state_file(&dir.join(super::LOCK_FILE))
         .context("failed to open the clauth daemon lock file")?;
     match active.try_lock() {
@@ -288,13 +316,37 @@ pub(crate) fn claim_by_replacing(dir: &Path) -> Result<Claim> {
 /// Always yields [`Claim::Active`] on success; every failure mode is an `Err`,
 /// never a silent [`Claim::Redundant`] that would log-and-exit-0 on the caller.
 pub(crate) fn claim_by_replacing_with(dir: &Path, wait: Duration, poll: Duration) -> Result<Claim> {
-    // Fast path: no daemon → a normal start. If a daemon wins the lock in the
-    // instant between the presence check and the claim, fall through and replace
-    // it rather than returning a silent `Redundant` (which `serve` would log and
-    // exit 0 on, leaving the operator's upgrade un-started).
-    if !singleton_held()?
-        && let Claim::Active(lock) = claim_once(dir, false)?
-    {
+    claim_by_replacing_retry_with(dir, wait, poll, CLAIM_ATTEMPTS, CLAIM_RETRY)
+}
+
+/// [`claim_by_replacing_with`] with the retry schedule injected, so a test can
+/// pin the probe-collision recovery without sleeping for it.
+pub(crate) fn claim_by_replacing_retry_with(
+    dir: &Path,
+    wait: Duration,
+    poll: Duration,
+    attempts: u32,
+    retry: Duration,
+) -> Result<Claim> {
+    // Fast path: no daemon → a normal start. Retry past transient probe holds
+    // (TUI header at 1 Hz, clauth daemon --status) that take the flock and
+    // release it microseconds later — a real holder keeps its lock for the
+    // process lifetime, so anything that clears on retry was a reader.
+    let mut held = true;
+    for attempt in 0..attempts.max(1) {
+        held = singleton_held()?;
+        if !held {
+            break;
+        }
+        if attempt + 1 < attempts.max(1) {
+            std::thread::sleep(retry);
+        }
+    }
+    // If the retry cleared the transient, try a normal claim. If a daemon wins
+    // the lock in the instant between the presence check and the claim, fall
+    // through and replace it rather than returning a silent `Redundant` (which
+    // `serve` would log and exit 0 on, leaving the operator's upgrade un-started).
+    if !held && let Claim::Active(lock) = claim_once(dir, false)? {
         return Ok(Claim::Active(lock));
     }
     let Some(pid) = holder_pid() else {
@@ -351,8 +403,8 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 /// Send SIGTERM (`hard` false) or SIGKILL (`hard` true) to `pid`, returning
 /// whether the signal command actually ran (`false` = it could not even be
 /// spawned, e.g. `kill` off PATH — which the caller distinguishes from "signalled
-/// but the process survived"). Shelling out keeps `unsafe_code = "forbid"` intact
-/// (`libc::kill` would need `unsafe`, and `signal_hook` only *receives*), matching
+/// but the process survived"). Shelling out spends no `unsafe` here
+/// (`libc::kill` would need it, and `signal_hook` only *receives*), matching
 /// the `/usr/bin/security` shell-out pattern already in the crate. A non-zero exit
 /// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
 /// way. Long-form flags so the call site documents itself.
@@ -596,6 +648,29 @@ impl FetchLease {
             Err(std::fs::TryLockError::Error(_)) => false,
         }
     }
+}
+
+/// Where the daemon singleton's flock lives. Test-only, so a module outside
+/// `daemon` can pose a held or unreadable lock without [`super::LOCK_FILE`]
+/// leaving the subsystem that owns it.
+#[cfg(test)]
+pub(crate) fn daemon_lock_path() -> std::path::PathBuf {
+    clauth_dir().expect("clauth dir").join(super::LOCK_FILE)
+}
+
+/// Open + exclusively lock the daemon singleton, standing in for a live daemon.
+/// Test-only, and shared by every module that needs one: it goes through
+/// [`crate::profile::open_state_file`] exactly as [`claim_once`] does, so a
+/// fixture cannot drift from the file mode production creates. The handle must
+/// stay in scope — the flock releases when it drops.
+#[cfg(test)]
+pub(crate) fn hold_daemon_lock() -> File {
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let file =
+        crate::profile::open_state_file(&dir.join(super::LOCK_FILE)).expect("open the daemon lock");
+    file.try_lock().expect("acquire the free daemon lock");
+    file
 }
 
 #[cfg(test)]

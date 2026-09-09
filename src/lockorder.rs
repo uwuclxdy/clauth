@@ -24,6 +24,7 @@
 //! - rotation/save sites: `config` → state flock → `activity`.
 //! - `/profile` TTL clock: `rotation` → `profile_ttl` (post-401 retry) and
 //!   `config` → `profile_ttl` (the account-swap actions that expire it).
+//! - per-session swap: `rotation` → state flock → `swap_cell`.
 //!
 //! Standalone leaves (`refetch_queue`, the `pending_*` sets) are never nested
 //! with another tracked lock; they are ranked above the rest so that a future
@@ -112,6 +113,18 @@ pub(crate) mod rank {
         /// `PollStreak` — read/copied alone, released before any other lock,
         /// and its cache-file IO stays outside the guard.
         KickBlockState = 230;
+        /// Pending weekly-reset re-test marks
+        /// (`usage::scheduler::WeeklyResetKicks`): the set of profiles owed one
+        /// kick because their 7d window just rolled over from the hard cap.
+        /// Leaf like `KickBlockState` — inserted/removed alone, released
+        /// before any other lock.
+        WeeklyResetKicks = 235;
+        /// Interleaved auto-start queue state (`usage::auto_start_queue::AutoStartQueueState`): the
+        /// anchor the 5h-window queue spaces against, plus per-profile
+        /// election health. Leaf like `KickBlockState` — read/updated alone,
+        /// released before any other lock, and the anchor's disk IO stays
+        /// outside the guard.
+        AutoStartQueue = 240;
         Tokens = 250;
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;
@@ -139,20 +152,69 @@ pub(crate) mod rank {
         ProfileTtl = 450;
         /// `with_state_lock` (cross-process state flock). Inner of `config`.
         State = 500;
+        /// `hook_note::ScopeLock` (the per-scope record flock). A true leaf —
+        /// nothing is acquired while it is held — ranked INSIDE `State`, which is
+        /// outer to it: `note_for` drops it before the exact-owner stamp reaches
+        /// for the state flock, and the rank turns a future re-nesting into an
+        /// assertion instead of a deadlock.
+        Scope = 525;
+        /// `runtime::SessionSwap`'s cell: the member a live session's credential
+        /// link resolves to, plus the liveness markers of every member it has run
+        /// on. A true leaf — take-read/take-publish-release, with the file IO the
+        /// swap does outside it — ranked INSIDE `State` because both its writer
+        /// (the swap's publish step) and its reader (the watchdog tick's
+        /// credential leg) take it under `with_state_lock`, which is what makes
+        /// the marker move and the link repoint one atomic step.
+        SwapCell = 550;
         Activity = 600;
         // Standalone leaves — never nested with another tracked lock.
         NextRefresh = 1100;
         RefetchQueue = 1200;
+        /// Process-lifetime `access token digest → account uuid` memo behind the
+        /// adopt's identity gate (`usage::scheduler::memoized_identity`). A true
+        /// leaf: every acquisition is get-or-insert and releases before the
+        /// `/profile` probe runs, so nothing is acquired while it is held. Its
+        /// one holder is `Rotation`, and the probe it guards itself takes
+        /// `UsageThrottle` (150) — holding this across that probe inverts the
+        /// order and asserts here rather than deadlocking in production.
+        IdentityMemo = 1250;
         /// Session-scoped set of generic profiles suppressed from the timer until
         /// a manual refresh (`usage::scheduler`). Leaf — acquired standalone in
         /// `tick`/`fetch_third_party_due`, never under another lock.
         SuppressedGeneric = 1300;
+        /// CLA-ROLL re-stamp pacing (`usage::scheduler::ClaudeRollingPacing`).
+        /// A true leaf: every acquisition — the scan gate up front, the
+        /// departed-name retain sweep after candidates, the per-candidate hold
+        /// check (and its release-on-changed-credentials remove), and the
+        /// per-verdict bookkeeping inside the `match gate` arms — is
+        /// take-mutate-release with no other lock and no IO under it (the due
+        /// re-read before the Ready arm's insert and the credential
+        /// fingerprint reads both run OUTSIDE the lock, for exactly that
+        /// reason). A rankless `std::sync::Mutex` could not defend that
+        /// shape: the ordering `debug_assert` is blind to it, so a future
+        /// edit taking `Config` inside a pacing scope would sail past the one
+        /// check built to catch it. Ranked as a standalone leaf like its
+        /// neighbors.
+        RollingPacing = 1400;
         PendingSwitch = 1500;
         /// Fallback-config edits queued by the daemon control socket for the main
         /// loop to apply. Leaf — the socket pushes standalone; the main loop
         /// drains into a `Vec` and releases before taking `config`.
         PendingConfigOps = 1600;
         PendingSwitchOff = 1700;
+        /// MCP reply-digest snapshot (`mcp::digest::DigestTracker`): the
+        /// since-your-last-call baseline every clone of the stdio server shares.
+        /// A true leaf — each acquisition wraps one sample-compare-store step
+        /// over a handful of small local-disk reads (the active profile's name
+        /// and its stored endpoint, plus two stats), and `watch`'s poll loop
+        /// drops it before every sleep slice, so no RANKED lock, HTTP,
+        /// subprocess, or sleep runs under it. That endpoint read is why the
+        /// sample calls `profile::stored_usage_cache_is_third_party` and never
+        /// `load_profile`, whose staged-rotation recovery takes `State` (500)
+        /// and would invert this order. Under `cfg(test)` the sample does nest one
+        /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
+        /// takes and releases with nothing under it.
+        McpDigest = 1800;
     }
 }
 
@@ -197,6 +259,28 @@ impl RankGuard {
         {
             Self {}
         }
+    }
+}
+
+/// Whether the current thread holds rank `R`. Lets a function whose correctness
+/// depends on a lock its own signature cannot express assert that rather than say
+/// it in a comment — the state flock's holders are the case that needs it.
+/// Writers of shared state prefer the [`crate::lock::StateLockHeld`] witness
+/// `with_state_lock` hands its closure; this is the fallback for sites that only
+/// assert (e.g. a cache-consistency check), which have nothing to hand a witness
+/// to.
+///
+/// Always `true` in release: the rank stack is `cfg(debug_assertions)`-only, so a
+/// caller must use this inside a `debug_assert!` and never as real control flow.
+#[inline]
+pub(crate) fn holds<R: Rank>() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        HELD.with(|h| h.borrow().contains(&R::VALUE))
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        true
     }
 }
 

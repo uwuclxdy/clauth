@@ -1,0 +1,36 @@
+# Mirrors wiki/ into the GitHub wiki repo (<repo>.wiki.git).
+# The wiki is a read-only mirror: edit wiki/ in this repo. Direct
+# web-UI wiki edits are overwritten on the next sync.
+name: sync wiki
+
+on:
+  push:
+    branches: [mommy]
+    paths: ['wiki/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write # GITHUB_TOKEN write access extends to <repo>.wiki.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Mirror wiki/ into the wiki repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" /tmp/wiki
+          rsync -a --delete --exclude .git wiki/ /tmp/wiki/
+          cd /tmp/wiki
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "wiki already in sync"
+            exit 0
+          fi
+          git commit -m "docs: sync wiki from ${GITHUB_SHA::7}"
+          git push

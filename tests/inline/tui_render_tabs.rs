@@ -49,6 +49,8 @@ fn render_tabs(app: &App, width: u16) -> String {
 /// and must render the active span (earliest left, latest right).
 #[test]
 fn tokens_dashboard_uses_alignment_not_middot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::pricing::HourTokens;
     use crate::tokens::{DayActivity, DaySummary, DayTokens, ModelTokens, TokenStats};
     let mut app = empty_app(Tab::Tokens);
     let daily: Vec<DayTokens> = (0..30)
@@ -98,6 +100,8 @@ fn tokens_dashboard_uses_alignment_not_middot() {
             cache_create: 5_200_000,
             messages: 342,
             hours: [0; 24],
+            token_hours: [HourTokens::default(); 24],
+            model_hours: vec![],
             models: vec![],
         }),
     });
@@ -133,6 +137,8 @@ fn tokens_dashboard_uses_alignment_not_middot() {
 
 #[test]
 fn count_cache_toggle_switches_token_basis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::pricing::HourTokens;
     use crate::tokens::{DaySummary, TokenStats};
     let mut app = empty_app(Tab::Tokens);
     app.token_stats = Some(TokenStats {
@@ -158,6 +164,8 @@ fn count_cache_toggle_switches_token_basis() {
             cache_create: 0,
             messages: 1,
             hours: [0; 24],
+            token_hours: [HourTokens::default(); 24],
+            model_hours: vec![],
             models: vec![],
         }),
     });
@@ -187,6 +195,7 @@ fn count_cache_toggle_switches_token_basis() {
 
 #[test]
 fn normal_form_shows_all_tabs() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = empty_app(Tab::Overview);
     let s = render_tabs(&app, 75);
     assert!(s.contains("overview"), "active tab missing");
@@ -201,6 +210,7 @@ fn normal_form_shows_all_tabs() {
 
 #[test]
 fn normal_form_labels_untruncated_at_tight_boundary() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = empty_app(Tab::Overview);
     let s = render_tabs(&app, 71);
     assert!(
@@ -215,6 +225,7 @@ fn normal_form_labels_untruncated_at_tight_boundary() {
 
 #[test]
 fn overflow_form_shows_only_active() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = empty_app(Tab::Usage);
     let s = render_tabs(&app, 10);
     assert!(
@@ -233,6 +244,7 @@ fn overflow_form_shows_only_active() {
 
 #[test]
 fn overflow_chevrons_at_middle_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = empty_app(Tab::Usage);
     let s = render_tabs(&app, 15);
     assert!(
@@ -247,6 +259,7 @@ fn overflow_chevrons_at_middle_tab() {
 
 #[test]
 fn overflow_no_left_chevron_at_first_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = empty_app(Tab::Overview);
     let s = render_tabs(&app, 12);
     assert!(!s.contains('‹'), "no left chevron at first tab");
@@ -258,6 +271,7 @@ fn overflow_no_left_chevron_at_first_tab() {
 
 #[test]
 fn overflow_no_right_chevron_at_last_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
     let app = empty_app(Tab::Plugin);
     let s = render_tabs(&app, 12);
     assert!(

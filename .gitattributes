@@ -1,0 +1,3 @@
+# Force LF on checkout: git-for-windows otherwise writes CRLF and line-ending-
+# sensitive code (include_str!, source-pin tests) reds only the windows CI leg.
+* text=auto eol=lf

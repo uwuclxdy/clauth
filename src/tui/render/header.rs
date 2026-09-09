@@ -30,8 +30,6 @@ const GAUGE_BAR_MIN: usize = 3;
 const GAUGE_NAME_MAX: usize = 16;
 const GAUGE_NAME_MIN: usize = 3;
 const GAUGE_PCT_W: usize = 4;
-const GAUGE_DASH_W: usize = 1;
-
 // ── Account-name pulse ───────────────────────────────────────────────────
 
 const PULSE_SWEEP_MS: u64 = 900;
@@ -60,7 +58,7 @@ struct ActiveGauge {
 
 fn active_gauge(app: &App) -> Option<ActiveGauge> {
     let cfg = app.config();
-    let name = cfg.state.active_profile.as_deref()?;
+    let name = cfg.state.active_profile.as_ref()?;
     let profile = cfg.find(name)?;
     let pct = if profile.is_oauth() {
         profile
@@ -78,7 +76,7 @@ fn active_gauge(app: &App) -> Option<ActiveGauge> {
 }
 
 fn gauge_tail_w(has_pct: bool) -> usize {
-    if has_pct { GAUGE_PCT_W } else { GAUGE_DASH_W }
+    if has_pct { GAUGE_PCT_W } else { 0 }
 }
 
 fn gauge_total_w(name_w: usize, bar_cells: usize, has_pct: bool) -> usize {
@@ -116,6 +114,9 @@ fn gauge_fit(avail: usize, name_len: usize, has_pct: bool) -> GaugeFit {
     if gauge_total_w(name_w, bar_cells, has_pct) > avail {
         return GaugeFit::HIDDEN;
     }
+    if !has_pct && name_w == 0 {
+        return GaugeFit::HIDDEN;
+    }
     GaugeFit {
         name_w,
         bar_cells,
@@ -148,7 +149,7 @@ fn gauge_spans(fit: GaugeFit, name: &str, pct: Option<f64>, elapsed_ms: u64) -> 
                 Style::default().fg(theme::util_color(pct)),
             ));
         }
-        None => spans.push(Span::styled("—", theme::faint())),
+        None => {}
     }
     spans
 }
@@ -220,7 +221,19 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         row0.push(Span::styled("● ", Style::default().fg(color)));
         row0.push(Span::styled("daemon", theme::dim()));
     }
-    let used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
+    let mut used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
+    // `[ herdr ]` context tag, between the brand and the daemon dot. The tag is
+    // the one span this row can shed: it renders only while brand + tag +
+    // daemon + version all fit, so the version stays right-aligned and nothing
+    // new clips at narrow widths (without the tag the row is byte-identical to
+    // a non-herdr launch at every width).
+    if app.herdr_mode {
+        let tag = "  [ herdr ]";
+        if used + tag.chars().count() + ver.chars().count() <= info_width {
+            row0.insert(1, Span::styled(tag, theme::dim()));
+            used += tag.chars().count();
+        }
+    }
     let gap = info_width.saturating_sub(used + ver.chars().count());
     row0.push(Span::styled(" ".repeat(gap), theme::base()));
     row0.push(Span::styled(ver, theme::dim()));
@@ -233,7 +246,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The count + gauge are left-aligned together; the status dot is the
     // only thing right-aligned, with an elastic gap in between.
     let row1_width = rows[1].width as usize;
-    let prefix = format!("{n} account{}", plural(n));
+    let prefix = format!("{n} account{}", crate::format::plural(n));
     let feed = "status.claude.ai";
     let status_head = "● ";
     let status_w = status_head.chars().count() + feed.chars().count();
@@ -255,9 +268,8 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         );
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
-            let elapsed = app.started_at.elapsed().as_millis() as u64;
             left_spans.push(Span::styled(sep.to_string(), theme::faint()));
-            left_spans.extend(gauge_spans(fit, &g.name, g.pct, elapsed));
+            left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
     }
     let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
@@ -279,10 +291,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // ── Row 2: tabs ──────────────────────────────────────────────────────
     super::tabs::draw(frame, rows[2], app);
-}
-
-fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
 }
 
 fn status_dot_color(app: &App) -> ratatui::style::Color {
@@ -308,8 +316,7 @@ fn daemon_dot_color(app: &App) -> Option<ratatui::style::Color> {
 }
 
 fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let elapsed = app.started_at.elapsed().as_millis() as u64;
-    let blink = (elapsed % 6000) < 200;
+    let blink = (app.anim_ms() % 6000) < 200;
 
     let style = Style::default().fg(theme::accent_2_color());
 
@@ -334,3 +341,9 @@ fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
 #[cfg(test)]
 #[path = "../../../tests/inline/tui_render_header.rs"]
 mod gauge_tests;
+
+// Herdr-mode row-0 pins: the `[ herdr ]` tag, its shed order at narrow
+// widths, and the byte-identical plain launch.
+#[cfg(test)]
+#[path = "../../../tests/inline/tui_render_header_herdr.rs"]
+mod herdr_mode_tests;

@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::lockorder::{RankedMutex, rank};
+use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
     ACCOUNT_EMAIL_CACHE_FILE, ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE,
     load_profile_cache, remove_profile_cache, write_profile_cache,
@@ -14,6 +15,59 @@ use super::scheduler::{ActivityStore, ProfileActivity, mark_activity};
 
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
+
+/// Test-only [`USAGE_ENDPOINT`] override, the `/usage` half of the offline
+/// rotation-leg harness (`oauth::set_endpoint_overrides` owns the token and
+/// messages halves). `fetch_with_rotation` decides whether to rotate from what
+/// this endpoint answers, so its 401 leg is unreachable without it. Serialized by
+/// `profile::HOME_TEST_LOCK`. Never compiled into the binary.
+#[cfg(test)]
+static USAGE_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// `/profile` rides along on the retry after a rotation, so it needs redirecting
+/// too — otherwise the test's successful re-poll escapes to the real host.
+#[cfg(test)]
+static PROFILE_ENDPOINT_OVERRIDE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_usage_endpoint_override(usage: &str, profile: &str) {
+    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+        *guard = Some(usage.to_string());
+    }
+    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
+        *guard = Some(profile.to_string());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_usage_endpoint_override() {
+    if let Ok(mut guard) = USAGE_ENDPOINT_OVERRIDE.lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = PROFILE_ENDPOINT_OVERRIDE.lock() {
+        *guard = None;
+    }
+}
+
+fn usage_endpoint() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Some(url) = USAGE_ENDPOINT_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+        return std::borrow::Cow::Owned(url);
+    }
+    std::borrow::Cow::Borrowed(USAGE_ENDPOINT)
+}
+
+fn profile_endpoint() -> std::borrow::Cow<'static, str> {
+    #[cfg(test)]
+    if let Some(url) = PROFILE_ENDPOINT_OVERRIDE
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+    {
+        return std::borrow::Cow::Owned(url);
+    }
+    std::borrow::Cow::Borrowed(PROFILE_ENDPOINT)
+}
 
 /// Re-fetch `/profile` (plan / rate-limit tier) at most once per hour per
 /// profile. The tier rarely changes, so the steady usage poll reuses the cached
@@ -93,6 +147,18 @@ pub(crate) fn reset_request_slots() {
     if let Ok(mut slots) = NEXT_REQUEST_SLOT.lock() {
         slots.clear();
     }
+}
+
+/// The slot currently reserved for `host`, `None` when it holds none. Test-only
+/// companion to [`reset_request_slots`]: a leg that skips [`await_request_slot`]
+/// is otherwise only observable by timing a second same-host request through the
+/// full [`REQUEST_SPACING_MS`] sleep, which costs the suite 5 s per assertion.
+#[cfg(test)]
+pub(crate) fn reserved_request_slot(host: &str) -> Option<u64> {
+    NEXT_REQUEST_SLOT
+        .lock()
+        .ok()
+        .and_then(|slots| slots.get(host).copied())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,7 +310,7 @@ impl SpendInfo {
 }
 
 /// Canonical account tier, computed once at fetch time. The single source of
-/// truth that `plan_label` / `endpoint_label` render from — collapses the old
+/// truth that `format::account_tier` renders from — collapses the old
 /// four-field `PlanInfo` fan-out into one enum. `Serialize`/`Deserialize` keep it
 /// in the `usage_cache.json` shape; a field rename simply misses → refetches.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -259,8 +325,8 @@ pub(crate) enum PlanTier {
 }
 
 impl PlanTier {
-    /// Reproduce the old `plan_label` classification exactly from the raw
-    /// `/profile` fields. `rate_limit_tier` carries the Max multiplier when present.
+    /// Classify a tier from the raw `/profile` fields. `rate_limit_tier` carries
+    /// the Max multiplier when present.
     pub(crate) fn from_profile(
         org_type: Option<&str>,
         has_max: bool,
@@ -289,29 +355,35 @@ impl PlanTier {
     /// Map the OAuth token's `subscription_type` so a not-yet-fetched profile
     /// still shows a sane tier label. A missing claim (a credential-less or
     /// never-fetched profile) or an unrecognized value → `Unknown`, never a
-    /// fabricated paid tier: `Unknown` renders neutrally (`short_label` omits it,
-    /// `display` shows the bare "Claude") instead of a "Pro" out of thin air.
+    /// fabricated paid tier: `Unknown` renders neutrally (both `short_label` and
+    /// `display` omit it) instead of a "Pro" out of thin air.
     pub(crate) fn from_subscription_type(s: Option<&str>) -> Self {
         match s {
             Some("pro") => PlanTier::Pro,
             Some("max") => PlanTier::Max(None),
             Some("team") | Some("teams") => PlanTier::Team,
             Some("enterprise") => PlanTier::Enterprise,
+            // `login_profile_from_raw` mints this token for a `Free` account, so
+            // without the arm clauth fails to read back its own write.
+            Some("free") => PlanTier::Free,
             _ => PlanTier::Unknown,
         }
     }
 
-    /// Same strings the old `plan_label` emitted, for every tier.
-    pub(crate) fn display(&self) -> String {
-        match self {
+    /// The long `Claude <tier>` form, for every known tier. `None`
+    /// for `Unknown`, mirroring [`PlanTier::short_label`]: a bare "Claude" reads
+    /// as a real plan the account never claimed, so each surface renders its own
+    /// no-data form instead.
+    pub(crate) fn display(&self) -> Option<String> {
+        Some(match self {
             PlanTier::Max(Some(n)) => format!("Claude Max {n}x"),
             PlanTier::Max(None) => "Claude Max".to_string(),
             PlanTier::Pro => "Claude Pro".to_string(),
             PlanTier::Team => "Claude Team".to_string(),
             PlanTier::Enterprise => "Claude Enterprise".to_string(),
             PlanTier::Free => "Claude Free".to_string(),
-            PlanTier::Unknown => "Claude".to_string(),
-        }
+            PlanTier::Unknown => return None,
+        })
     }
 
     /// Compact tier label without the `Claude ` prefix, for contexts that
@@ -400,6 +472,14 @@ pub(crate) struct UsageInfo {
     /// spent window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_reset_credits: Option<i64>,
+    /// The authoritative 5h-window open instant, in epoch seconds. Present only
+    /// on the synthetic stamp a landed kick wrote ([`crate::usage::scheduler`]'s
+    /// `mark_window_open`): a history line carrying it is clauth's own durable
+    /// record of that kick, and the auto-start queue confirms the window on it.
+    /// Every API-read sample carries `None`, so the field stays absent from
+    /// those lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) open_at: Option<i64>,
 }
 
 /// Fixed labels for the two always-present windows. Per-model weekly labels are
@@ -451,12 +531,21 @@ pub(crate) fn window_duration_secs(label: &str) -> Option<i64> {
 
 /// Parse a `"<n>h"` / `"<n>d"` window label into a duration in seconds. `None`
 /// for any other shape.
+///
+/// The label is a third-party provider's free-form JSON string, so it is
+/// untrusted: the unit is taken as a whole character (a byte-index split lands
+/// mid-codepoint on a multi-byte tail) and the scale-up is checked (`9e15h`
+/// overflows an `i64`, and a wrapped negative duration would panic the
+/// `clamp(0, duration)` in every consumer).
 fn parse_nh_nd_label(label: &str) -> Option<i64> {
-    let (num, unit) = label.split_at(label.len().checked_sub(1)?);
-    let n = num.parse::<i64>().ok().filter(|&n| n > 0)?;
+    let unit = label.chars().next_back()?;
+    let n = label[..label.len() - unit.len_utf8()]
+        .parse::<i64>()
+        .ok()
+        .filter(|&n| n > 0)?;
     match unit {
-        "h" => Some(n * 3600),
-        "d" => Some(n * 86_400),
+        'h' => n.checked_mul(3600),
+        'd' => n.checked_mul(86_400),
         _ => None,
     }
 }
@@ -473,27 +562,56 @@ pub(crate) fn ideal_pace_pct(label: &str, window: &UsageWindow, now_secs: i64) -
     Some(elapsed as f64 / duration as f64 * 100.0)
 }
 
-/// Average burn pace in %/day for `window`: utilization spread evenly over the
-/// time elapsed since the window opened (`resets_at − duration`). Unlike the
-/// recency-weighted recent-burn rate, this is anchored to the fixed window, so
-/// it is unaffected by account rotation (which makes a per-profile history jump
-/// to another account's utilization). `None` until `min_elapsed_secs` have
-/// elapsed — a freshly opened window would otherwise divide by ~0 — or when the
-/// window has no reset time or no fixed duration.
+/// Weight of the on-pace pseudo-observation that caps [`window_avg_pace_per_day`],
+/// as a fraction of the window's own length. An over-pace window needs this much
+/// elapsed time before its measurement outweighs the cap (16.8 h into a week,
+/// 30 min into a 5h window). For a utilization inside the API's own 0..=100
+/// range that puts a ceiling of
+/// `100 × (1 + PACE_PRIOR_FRACTION) / (PACE_PRIOR_FRACTION × duration_days)`
+/// on the reported pace — 157 %/d for a week.
+const PACE_PRIOR_FRACTION: f64 = 0.1;
+
+/// Average burn pace in %/day for `window`: utilization over the time elapsed
+/// since the window opened (`resets_at − duration`), capped for a window running
+/// ahead of its own ideal pace.
+///
+/// The plain quotient divides by ~0 for as long as a window is young, so early
+/// activity reads as an enormous %/day and the ETA it feeds claims a week's
+/// budget runs dry within a day. Blending in a pseudo-observation worth
+/// [`PACE_PRIOR_FRACTION`] of the window at the ideal pace holds the denominator
+/// off zero, which bounds the result and decays out as real elapsed time
+/// accumulates.
+///
+/// The cap is ONE-SIDED, because only the high side is pathological: a small
+/// numerator over a small denominator stays small, while a large one explodes.
+/// The two forms cross exactly where utilization meets [`ideal_pace_pct`], so
+/// taking the lower never reports an at-or-under-pace window above its plain
+/// average (an idle window still paces at 0, never at the prior) and trims only
+/// the overshoot above the line. The run-dry projection the callers derive keeps
+/// the plain form's threshold either way: both warn iff utilization is past the
+/// ideal line.
+///
+/// Anchored to the window rather than to sample history, so which account served
+/// the traffic cannot move it. `None` when the window carries no reset time, has
+/// no fixed duration, or has not opened yet (`resets_at` a full duration out,
+/// which `/usage` reports for an idle 5h window).
 pub(crate) fn window_avg_pace_per_day(
     label: &str,
     window: &UsageWindow,
     now_secs: i64,
-    min_elapsed_secs: i64,
 ) -> Option<f64> {
     let duration = window_duration_secs(label)?;
     let reset = iso_to_epoch_secs(window.resets_at.as_deref()?)?;
     let remaining = (reset - now_secs).clamp(0, duration);
     let elapsed = duration - remaining;
-    if elapsed < min_elapsed_secs {
+    if elapsed <= 0 {
         return None;
     }
-    Some(window.utilization / (elapsed as f64 / 86_400.0))
+    let elapsed_days = elapsed as f64 / 86_400.0;
+    let prior_days = duration as f64 * PACE_PRIOR_FRACTION / 86_400.0;
+    let plain = window.utilization / elapsed_days;
+    let capped = (window.utilization + 100.0 * PACE_PRIOR_FRACTION) / (elapsed_days + prior_days);
+    Some(plain.min(capped))
 }
 
 #[derive(Deserialize)]
@@ -726,9 +844,9 @@ pub(super) enum FetchError {
     /// present (delta-seconds or an IMF HTTP-date); an unparseable value is
     /// absent, and a `0` / past date parses to `ZERO` ("retry now"). `plan`
     /// carries a `/profile` reading taken DESPITE the 429: a canceled account
-    /// 429s `/usage` forever, so the profile leg is the only place its
-    /// cancellation is ever observed. `None` from the low-level `get_json`
-    /// (no profile context there); populated by [`fetch_raw`].
+    /// has been observed to keep 429ing `/usage` (one sample), so the profile
+    /// leg is the only place its cancellation has been observed. `None` from the
+    /// low-level `get_json` (no profile context there); populated by [`fetch_raw`].
     RateLimited {
         retry_after: Option<Duration>,
         plan: Option<PlanInfo>,
@@ -839,7 +957,7 @@ pub(crate) fn cli_user_agent() -> &'static str {
 /// Which of Claude Code's two `api.anthropic.com` clients to imitate. CC polls
 /// `/usage` with its `claude-cli` client but reads `/profile` through a plain
 /// axios instance — different UA, and `/profile` carries `Cache-Control: no-cache`
-/// with no `anthropic-beta`. See `docs/wire-parity.md`.
+/// with no `anthropic-beta`.
 #[derive(Clone, Copy)]
 enum AuthClient {
     /// `/usage`: `claude-cli/<ver> (external, cli)` UA + `anthropic-beta`.
@@ -852,7 +970,7 @@ fn get_json(
     url: &str,
     access_token: &str,
     activity: Option<&ActivityStore>,
-    name: &str,
+    name: &ProfileName,
     client: AuthClient,
 ) -> std::result::Result<String, FetchError> {
     await_request_slot(ANTHROPIC_ORIGIN);
@@ -905,9 +1023,9 @@ fn get_json(
 /// BOTH halves of the clock: dropping only the map entry would leave the durable
 /// stamp to be read straight back in as fresh, silently reducing the manual
 /// refresh to a no-op for `/profile`.
-pub(crate) fn expire_profile_ttl(name: &str) {
+pub(crate) fn expire_profile_ttl(name: &ProfileName) {
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name);
+        m.remove(name.as_str());
     }
     remove_profile_cache(name, PROFILE_FETCHED_CACHE_FILE);
 }
@@ -916,17 +1034,18 @@ pub(crate) fn expire_profile_ttl(name: &str) {
 /// a process restart looks like to [`take_profile_fetch`], which is the whole
 /// point of the durable half and can't otherwise be exercised in one process.
 #[cfg(test)]
-fn forget_profile_memo(name: &str) {
+fn forget_profile_memo(name: &ProfileName) {
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.remove(name);
+        m.remove(name.as_str());
     }
 }
 
 /// The profile has a usable identity anchor. A blank/whitespace uuid is shape
 /// drift, never an identity — same contract as [`seed_identity_anchor`] and
 /// [`fetch_account_uuid`].
-fn has_identity_anchor(name: &str) -> bool {
-    load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE).is_some_and(|u| !u.trim().is_empty())
+fn has_identity_anchor(name: &ProfileName) -> bool {
+    load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE)
+        .is_some_and(|u| !u.as_str().trim().is_empty())
 }
 
 /// The last `/profile` attempt stamp for `name`, honouring the durable stamp only
@@ -936,11 +1055,11 @@ fn has_identity_anchor(name: &str) -> bool {
 /// unanchored profile that needs it, since without an anchor a dead stored pair
 /// wedges the profile in `auth_broken`. Unanchored profiles therefore pay one
 /// `/profile` per launch until the first backfill lands, then join everyone else.
-fn last_profile_attempt(name: &str) -> Option<u64> {
+fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
     if let Some(t) = PROFILE_FETCHED
         .lock()
         .ok()
-        .and_then(|m| m.get(name).copied())
+        .and_then(|m| m.get(name.as_str()).copied())
     {
         return Some(t);
     }
@@ -971,7 +1090,7 @@ fn last_profile_attempt(name: &str) -> Option<u64> {
 /// also re-stamps the bogus clock back to sanity. Saturating the age to `0` here
 /// would instead mute `/profile` until wall-clock caught up, and — now that the
 /// stamp outlives the process — it would stay muted across every restart.
-pub(crate) fn take_profile_fetch(name: &str, force: bool, now: u64) -> bool {
+pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> bool {
     let fresh = last_profile_attempt(name)
         .and_then(|t| now.checked_sub(t))
         .is_some_and(|age| age < PROFILE_TTL_MS);
@@ -1004,12 +1123,13 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
 /// The TTL-gated `/profile` leg on its own: `Some(plan)` only when
 /// [`take_profile_fetch`] elects to fetch AND the leg parses; `None` when it's
 /// skipped this round or the fetch/parse fails. Split out of [`fetch_raw`] so
-/// the `/usage` 429 bail can run the SAME leg — a canceled account never returns
-/// a 200 `/usage`, so this is the only path that ever sees its cancellation.
+/// the `/usage` 429 bail can run the SAME leg — a canceled account has not been
+/// observed to return a 200 `/usage`, so in practice this is the only path that
+/// surfaces its cancellation.
 /// Never bypasses the hourly cap unless `force_profile` (the rotation retry
 /// holding no plan yet).
 fn fetch_profile_plan(
-    name: &str,
+    name: &ProfileName,
     access_token: &str,
     force_profile: bool,
     activity: Option<&ActivityStore>,
@@ -1018,7 +1138,7 @@ fn fetch_profile_plan(
         return None;
     }
     let text = get_json(
-        PROFILE_ENDPOINT,
+        profile_endpoint().as_ref(),
         access_token,
         activity,
         name,
@@ -1059,6 +1179,7 @@ fn assemble_usage(
                 // Anthropic leg: the codex legs are the only writers.
                 codex_rate_limit_reached: None,
                 codex_reset_credits: None,
+                open_at: None,
             })
         }
         Err(FetchError::RateLimited { retry_after, .. }) => Err(FetchError::RateLimited {
@@ -1074,17 +1195,17 @@ fn assemble_usage(
 /// rotation retry sets it only when no plan is held yet, since a refresh mints a
 /// token for the same account and can't change what `/profile` would say. A
 /// `/usage` 429 no longer suppresses `/profile`: the profile leg still runs and
-/// its plan rides the error, so a canceled (`claude_free`) account — which 429s
-/// `/usage` on every tick — is finally observed.
+/// its plan rides the error, so a canceled (`claude_free`) account — observed to
+/// 429 `/usage` on every tick so far — is finally observed.
 pub(super) fn fetch_raw(
-    name: &str,
+    name: &ProfileName,
     access_token: &str,
     prev_plan: Option<PlanInfo>,
     force_profile: bool,
     activity: Option<&ActivityStore>,
 ) -> std::result::Result<UsageInfo, FetchError> {
     let usage = get_json(
-        USAGE_ENDPOINT,
+        usage_endpoint().as_ref(),
         access_token,
         activity,
         name,
@@ -1110,7 +1231,7 @@ pub(super) fn fetch_raw(
 /// anchor in that microsecond gap, then being overwritten by this ride-along)
 /// fails SAFE — a wrong anchor only makes adoption refuse and self-heals on
 /// the next login/adopt, so a cross-process lock isn't worth its weight here.
-fn seed_identity_anchor(name: &str, profile: &RawProfile) {
+fn seed_identity_anchor(name: &ProfileName, profile: &RawProfile) {
     let Some(uuid) = profile
         .account
         .as_ref()
@@ -1120,13 +1241,13 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
     else {
         return;
     };
-    let cached_uuid = load_profile_cache::<String>(name, ACCOUNT_ID_CACHE_FILE);
+    let cached_uuid = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
     if cached_uuid.is_none() {
         // An email surviving WITHOUT its uuid half predates this anchor (a
         // torn drop) and may describe the previous account — drop it before
         // seeding, so the pair is rebuilt whole from this one response.
-        crate::profile_cache::drop_cache_file(name, crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE);
-        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
+        remove_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE);
+        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &AccountId::from(uuid));
     }
     // The email half rides the same response, same write-if-missing rule —
     // but ONLY when the uuid half agrees with this response (absent = just
@@ -1134,7 +1255,7 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
     // still describes another account than the store (the CAP guard's
     // refuse-and-heal state); seeding a fresh email under it would split the
     // pair across two accounts.
-    let uuid_agrees = cached_uuid.as_deref().is_none_or(|c| c.trim() == uuid);
+    let uuid_agrees = cached_uuid.as_ref().is_none_or(|c| c.trim() == uuid);
     if uuid_agrees
         && let Some(email) = profile
             .account
@@ -1155,7 +1276,7 @@ fn seed_identity_anchor(name: &str, profile: &RawProfile) {
 /// other still yields what it has.
 pub(crate) struct LoginProfile {
     pub(crate) subscription_type: Option<String>,
-    pub(crate) account_uuid: Option<String>,
+    pub(crate) account_uuid: Option<AccountId>,
 }
 
 /// Pull both login values out of an already-parsed `/profile` response. Split
@@ -1184,7 +1305,8 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
         account_uuid: p
             .account
             .and_then(|a| a.uuid)
-            .filter(|u| !u.trim().is_empty()),
+            .filter(|u| !u.trim().is_empty())
+            .map(AccountId::from),
     }
 }
 
@@ -1199,10 +1321,10 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
 /// caller can surface it.
 pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginProfile> {
     let text = get_json(
-        PROFILE_ENDPOINT,
+        profile_endpoint().as_ref(),
         access_token,
         None,
-        "login",
+        &ProfileName::from("login"),
         AuthClient::Profile,
     )
     .map_err(|e| match e {
@@ -1222,11 +1344,15 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
 /// onto the name must replace the old anchor rather than keep proving the old
 /// identity. Best-effort and silent on an absent/blank uuid (a failed probe or
 /// shape drift) — a login is never failed over its anchor.
-pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&str>) {
-    let Some(uuid) = account_uuid.map(str::trim).filter(|u| !u.is_empty()) else {
+pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&AccountId>) {
+    let Some(uuid) = account_uuid.map(|u| u.trim()).filter(|u| !u.is_empty()) else {
         return;
     };
-    write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid.to_string());
+    write_profile_cache(
+        name,
+        ACCOUNT_ID_CACHE_FILE,
+        &AccountId::from(uuid.to_string()),
+    );
 }
 
 /// The account identity a freshly minted token authenticates as: the uuid
@@ -1235,7 +1361,7 @@ pub(crate) fn seed_login_anchor(name: &str, account_uuid: Option<&str>) {
 /// and error messages name).
 #[derive(Debug, Clone)]
 pub(crate) struct AccountIdentity {
-    pub(crate) uuid: String,
+    pub(crate) uuid: AccountId,
     pub(crate) email: Option<String>,
 }
 
@@ -1262,10 +1388,10 @@ pub(crate) enum IdentityProbe {
 /// `/api/oauth/profile`, preserving the rejected-vs-unproven split.
 pub(crate) fn probe_account_identity(access_token: &str) -> IdentityProbe {
     classify_identity_response(get_json(
-        PROFILE_ENDPOINT,
+        profile_endpoint().as_ref(),
         access_token,
         None,
-        "identity",
+        &ProfileName::from("identity"),
         AuthClient::Profile,
     ))
 }
@@ -1294,7 +1420,7 @@ fn classify_identity_response(response: std::result::Result<String, FetchError>)
         .as_deref()
         .map(str::trim)
         .filter(|u| !u.is_empty())
-        .map(str::to_string)
+        .map(AccountId::from)
     else {
         return IdentityProbe::Indeterminate;
     };
@@ -1319,7 +1445,7 @@ pub(crate) fn fetch_account_identity(access_token: &str) -> Option<AccountIdenti
 
 /// [`fetch_account_identity`] narrowed to the uuid — the adopt-gate callers'
 /// shape (`oauth::try_adopt_live_rotation` closures).
-pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<String> {
+pub(crate) fn fetch_account_uuid(access_token: &str) -> Option<AccountId> {
     fetch_account_identity(access_token).map(|id| id.uuid)
 }
 

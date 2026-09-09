@@ -16,6 +16,11 @@ use crate::usage::epoch_secs_to_iso;
 pub(super) const DISPLAY_NAME: &str = "Z.ai";
 
 pub(super) const ORIGIN: &str = "https://api.z.ai";
+
+/// Where an operator mints the api key this provider authenticates with, as
+/// published by <https://docs.z.ai/guides/overview/quick-start>.
+pub(super) const CONSOLE_URL: &str = "https://z.ai/manage-apikey/apikey-list";
+
 const QUOTA_PATH: &str = "/api/monitor/usage/quota/limit";
 const MODEL_USAGE_PATH: &str = "/api/monitor/usage/model-usage";
 /// Window for the model-usage breakdown, in seconds (7 days).

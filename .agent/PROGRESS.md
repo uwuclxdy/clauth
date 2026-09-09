@@ -2848,3 +2848,125 @@ last #[allow(dead_code)]) and **P6 published surface** (status.json/which
 --json/list_profiles additive codex fields, TUI c-codex/c-claude filter + header
 chip, daemon-version warning, MCP/plugin/tokens copy fixes). Then fleet+mutate
 each, PR to uwuclxdy/clauth per delivery series.
+
+## UPS-17 — the big sync: fork main ← upstream/mommy v0.15.1+ (2026-09-09)
+
+**Why now.** Fork main's last true merge was UPS-6 (v0.13.0+v0.13.1, 2026-07-23).
+Upstream had moved 646 commits past the merge-base `8c0840cf` — four releases
+(v0.14.0, v0.14.1, v0.15.0, v0.15.1) plus eight days of post-release fixes,
+head `435a859f`. AX's call: catch up, and **where upstream already did the same
+thing (and did it better), take upstream's** — divergence-reduction over
+preservation.
+
+**Shape of the merge.** 56 conflicted files / ~320 hunks: 27 src, 25 test files,
+README + SECURITY + .gitignore, and `wiki/daemon.md` (a case-only rename to
+`wiki/Daemon.md` upstream, then rewritten — the fork's 4-line pointer paragraph
+re-added under its Field notes). The dangerous part was NOT the markers: three
+upstream refactors changed the signature of nearly every helper the fork's 17
+fork-only modules call, so those files compile against nothing even though git
+reports them clean —
+
+  * `ProfileName` newtype for every profile name that flows anywhere;
+  * `with_state_lock(|held| …)` handing the closure a `&StateLockHeld` witness,
+    with `set_active(.., held)` / `set_credentials(.., held)` / `remove(.., held)`
+    taking it — the fork's `update_app_state(|s|)` survives as `|s, held|`;
+  * `TokenFailure` replacing the anyhow token errors, and deliberately carrying
+    NO `Display`, so every log site renders `log_detail()` / `text_with_status()`.
+
+**What was DROPPED as superseded** (upstream's form adopted wholesale):
+CLA-FEED in its entirety → upstream's merged rolling-token (our own PR #59 after
+seven review rounds of race fixes the fork's copy never got); the fork's
+Keychain-first relink ordering → `publish_credential_link` +
+`keychain_mirror_source(Leave|SignOut)`; `auto_rescue` / `--rescue` (upstream
+deleted the flag — isolated sessions always keep transcripts); `CaptureIdentity`
+→ `CaptureSnapshot { account_uuid: Option<AccountId>, account_email, live_login }`;
+`first_refusal_of` → upstream's on-disk `ADOPT_REFUSAL_FILE` memo;
+`drop_cache_file` → `remove_profile_cache`; the fork's TUI-side usage-history
+appender (upstream's scheduler owns `usage_history.jsonl` now); the fork's
+`route` column on the Overview → upstream's `live` column; the fork's
+`ACTIVE_ROTATE_LEAD_FLOOR_MS` → upstream's identical `ROTATE_LEAD_FLOOR_MS`;
+`proactive_rotation_due`'s five-flag fork signature → upstream's two.
+
+**What SURVIVED** (fork-only, retyped onto the new APIs): the whole codex engine
+(harness axis, `src/codex/*`, isolated CODEX_HOME runtime + watchdog, standby
+refresh, codex chain + walk, CDX-6 `wham/usage` poll, `codex_reset_credits`),
+`src/proxy/*` and `clauth proxy`, the daemon control socket, `clauth doctor`,
+`tokens.json`, `fallback_config`, the per-harness `VecDeque<PendingSwitchEntry>`
+switch queue with `Origin` precedence, SCW/RLS scheduler hardening, RESCUE-1/2c,
+the identity anchor's email half + CAP-1/CAP-3, `atomic_write_600_fast` (the
+non-durable 1/s `status.json` write) now built on upstream's per-writer
+`tmp_sibling` staging, the fork's `--new`/`--codex`/`--browser` login flags, and
+the status.json fork fields — now carried as typed members of upstream's
+`ProfileEntry` (`harness`, `account_email`, `codex_snapshot_at`,
+`codex_rate_limit_reached`, `codex_reset_credits`) rather than a hand-rolled
+`json!` literal.
+
+**Wire contract for the GUI clients** (ccsbar, Pulse): every key those two read
+still ships. The one rename is `session_feed` → `rolling_token`, which both
+readers already handle (ccsbar `0e128bc`, Pulse `ClauthStatus.swift`), and
+`ProfileConfig::rolling_token` carries `#[serde(alias = "session_feed")]` so a
+profile this fork armed under the old key stays armed across the upgrade.
+New additive keys upstream brought: per-profile `auto_start_queue`.
+`docs/ccsbar/DESIGN.md` documents both.
+
+**Verification so far:** `cargo check` clean, zero warnings, on the merged tree.
+Test files were resolved in parallel by four agents against a written
+resolution brief (`scratchpad/ups/RESOLUTION-BRIEF.md`); `cargo test` +
+`clippy` + `fmt` still owed, then deploy.
+
+### UPS-17 verification — the 18 failures, and what each one meant
+
+First full run after the merge: **3288 passed / 18 failed**. None was cosmetic;
+the triage is the interesting part, because three classes needed a decision
+rather than a fix.
+
+**A real merge bug the fork's own tests caught.**
+`snapshot_active_credentials` lost its divergence guard: I kept the fork's body
+shape (read live → check the store path → capture) and dropped the
+`LinkState::Diverged` gate with it, so the unattended snapshot would have
+captured a FOREIGN live login into the active profile's store — the exact
+2026-07-12 incident shape (a running claude mirrored a sibling's rotated pair;
+the capture copied it into the wrong account, and the two then double-polled
+one account into a rate-limit pin). Fixed by taking upstream's body verbatim,
+which guards it structurally: `Diverged` returns, and the only thing a diverged
+slot may still do is complete a FIRST login through `adopt_first_login`.
+
+**A behaviour the fork had to keep, restored.** Upstream's `known_paths` walks
+the runtime dirs that exist, which dropped the fork's codex gate from settings
+sync. Restored as a `retain` in `settings_sync.rs` (the fork's own file), and
+its test now creates both profiles' `runtime/` dirs so the assertion can fail
+for the right reason — as written it would have passed on a config-only fixture
+either way.
+
+**Fixtures that upstream's new rules made dishonest.** `write_profile_cache`
+now skips any name `profiles.toml` does not carry, so six fork tests were
+asserting against caches that were never written; they register their rosters
+now (`testutil::register_names`, or `save_app_state` in the fixture helper).
+Three TUI render tests reached the operator's real `~/.clauth` through the
+fork's email column and are sandboxed. Two daemon tests now disarm upstream's
+plugin/herdr self-heal the way upstream's own tick tests do.
+
+**Two deliberate divergences, written down rather than papered over.**
+- `the_pre_rename_session_feed_key_is_not_carried` is upstream's test asserting
+  that no `session_feed` alias exists. This fork is the one install where that
+  key DID ship — armed profiles on this machine still carry it — so the alias
+  stays and the test now pins the fork's rule and says why. Dropping the key
+  silently would disarm the split, and the operator would learn about it from a
+  Fable refusal rather than from clauth.
+- `reauth_of_the_active_account_force_relinks_the_stale_mirror` drove
+  `capture_into_profile`, which upstream narrowed to the new-profile path; the
+  was-active force-relink it protects now lives in `overwrite_captured_profile`
+  (where `LoginRoute::Reauth` lands). The test was re-pointed at that door, not
+  weakened.
+
+Also real: the fork's `println!` in `main.rs`/`proxy`/`doctor` violated
+upstream's `outln!` rule (which exists so `clauth sessions | head` cannot panic
+on a closed stdout) — 28 converted; and the fork's `fallback`/`proxy`/`doctor`
+verbs plus upstream's `status`/`completions` were missing from the shell
+completion scripts.
+
+**Final gate:** `cargo test` **3306 passed / 0 failed / 3 ignored** (352s),
+`cargo fmt --check` clean, `cargo clippy --all-targets` down to ONE warning —
+`src/tui/render/footer.rs:317`, byte-identical to upstream's own code, where
+this machine's clippy 1.96 is stricter than upstream's CI (the same red UPS-15
+recorded and declined to fix).

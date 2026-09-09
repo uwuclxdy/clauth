@@ -37,6 +37,39 @@ fn deepseek_rejects_host_extension() {
 }
 
 #[test]
+fn a_userinfo_authority_is_not_the_provider_it_is_prefixed_with() {
+    // `https://api.deepseek.com:443@evil.tld` has host `evil.tld` — everything
+    // before the `@` is userinfo. Claiming it as DeepSeek pointed the typed
+    // usage fetch at the real `api.deepseek.com` with this account's key, which
+    // is the same leak the host-extension case above exists to stop, reached
+    // through the port delimiter instead of the dot.
+    for url in [
+        "https://api.deepseek.com:443@evil.tld/v1",
+        "https://api.deepseek.com:x@evil.tld",
+        "https://api.deepseek.com:@evil.tld",
+        "https://api.z.ai:8443@evil.tld",
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com:1@evil.tld/apps/anthropic",
+    ] {
+        assert_eq!(Provider::from_base_url(url), None, "{url}");
+    }
+
+    // The positive leg: a real port, an empty port, and a port with a path all
+    // still resolve, so the guard rejects userinfo rather than rejecting `:`.
+    for url in [
+        "https://api.deepseek.com:443",
+        "https://api.deepseek.com:443/v1",
+        "https://api.deepseek.com:/v1",
+        "https://api.deepseek.com:?k=v",
+    ] {
+        assert_eq!(
+            Provider::from_base_url(url),
+            Some(Provider::DeepSeek),
+            "{url}"
+        );
+    }
+}
+
+#[test]
 fn deepseek_rejects_plain_http_and_unrelated_hosts() {
     assert_eq!(Provider::from_base_url("http://api.deepseek.com"), None);
     assert_eq!(Provider::from_base_url("https://api.anthropic.com"), None);
@@ -80,13 +113,14 @@ fn disk_cache_roundtrips_stats() {
         endpoint: None,
         best_effort: false,
     };
+    crate::testutil::register_names(&["tp-cache-test"]);
     crate::profile_cache::write_profile_cache(
-        "tp-cache-test",
+        &crate::profile::ProfileName::from("tp-cache-test"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
         &stats,
     );
     let loaded = crate::profile_cache::load_profile_cache::<ThirdPartyStats>(
-        "tp-cache-test",
+        &crate::profile::ProfileName::from("tp-cache-test"),
         crate::profile_cache::THIRD_PARTY_CACHE_FILE,
     )
     .expect("cache present");
@@ -100,10 +134,92 @@ fn disk_cache_missing_reads_as_none() {
     let _home = HomeSandbox::new();
     assert!(
         crate::profile_cache::load_profile_cache::<ThirdPartyStats>(
-            "tp-cache-absent",
-            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &crate::profile::ProfileName::from("tp-cache-absent"),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE
         )
         .is_none()
+    );
+}
+
+// ── balance-wallet selection ──────────────────────────────────────────────────
+
+/// The wallet parse is deliberately strict. It reads whichever row a provider
+/// singles out as its balance, and every one writes something into one — z.ai's
+/// counts tokens under the `total` spelling. Anything that is
+/// not exactly one finite amount and one currency code describes no wallet, and
+/// a loose parse would mint a rank out of it and order the roster on token counts.
+#[test]
+fn parse_balance_takes_an_amount_and_a_currency_and_nothing_else() {
+    assert_eq!(parse_balance("31.45 USD"), Some(("USD".to_string(), 31.45)));
+    assert_eq!(
+        parse_balance("1117.65 CNY"),
+        Some(("CNY".to_string(), 1117.65))
+    );
+    for junk in [
+        "123.4M  (1.2k calls)", // z.ai's token total
+        LOW_BALANCE,            // the refusal `unfunded` appends, which reaches this parser
+        "31.45",
+        "31.45 USD extra",
+        "USD 31.45",
+        "31.45 U",
+        "31.45 TOOLONG",
+        "31.45 US1",
+        // A non-finite amount must never rank: it outranks (inf) or sinks
+        // below (nan) every real wallet in its currency group.
+        "nan USD",
+        "inf USD",
+        "infinity CNY",
+        "-inf USD",
+        "",
+    ] {
+        assert_eq!(parse_balance(junk), None, "must not rank on `{junk}`");
+    }
+    // Exponent and explicit-sign forms parse as finite numbers, so they stay
+    // accepted: they order sanely, and refusing them would silently drop the
+    // wallet rank of an unknown provider that spelled its total that way.
+    assert_eq!(parse_balance("1e3 USD"), Some(("USD".to_string(), 1000.0)));
+    assert_eq!(parse_balance("+1.5 USD"), Some(("USD".to_string(), 1.5)));
+    // An overdrawn openrouter wallet: the sign parses and the negated-amount
+    // sort key puts it after every positive wallet in its currency group.
+    assert_eq!(parse_balance("-0.20 USD"), Some(("USD".to_string(), -0.2)));
+}
+
+/// The selector the ruling (2026-08-28) is built on, driven from the captured
+/// two-wallet cache: the empty USD wallet drops, the funded CNY one stays, and
+/// the row's own label and value ride along for the surfaces that render them.
+#[test]
+fn funded_wallets_drops_empty_wallets_and_keeps_row_order() {
+    let stats: ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let funded = funded_wallets(&stats.rows);
+    assert_eq!(
+        funded,
+        vec![Wallet {
+            label: "api balance".to_string(),
+            value: "498.18 CNY".to_string(),
+            currency: "CNY".to_string(),
+            amount: 498.18,
+        }],
+        "the 0.00 USD wallet carries no headroom and must not survive the selection",
+    );
+}
+
+/// [`balance_wallets`] keeps the zero-amount wallets [`funded_wallets`] drops:
+/// an all-empty account still renders its figure, so the raw list must stay
+/// available to the surface that draws it.
+#[test]
+fn balance_wallets_keeps_zero_amount_wallets_in_row_order() {
+    let stats: ThirdPartyStats =
+        serde_json::from_str(crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE)
+            .expect("captured cache parses");
+    let all = balance_wallets(&stats.rows);
+    assert_eq!(
+        all.iter()
+            .map(|w| (w.value.as_str(), w.amount))
+            .collect::<Vec<_>>(),
+        vec![("0.00 USD", 0.0), ("498.18 CNY", 498.18)],
+        "both wallets parse, in the cache's own row order",
     );
 }
 
@@ -140,12 +256,28 @@ fn api_origin_none_without_scheme_delimiter() {
 fn throttle_key_known_provider_uses_canonical_origin() {
     // Distinct providers key distinct hosts so they pace independently.
     assert_eq!(
-        ThirdPartyTarget::Known(Provider::DeepSeek).throttle_key(),
+        ThirdPartyTarget::Known {
+            provider: Provider::DeepSeek,
+            console: None,
+        }
+        .throttle_key(),
         "https://api.deepseek.com"
     );
     assert_eq!(
-        ThirdPartyTarget::Known(Provider::Zai).throttle_key(),
+        ThirdPartyTarget::Known {
+            provider: Provider::Zai,
+            console: None,
+        }
+        .throttle_key(),
         "https://api.z.ai"
+    );
+    assert_eq!(
+        ThirdPartyTarget::Known {
+            provider: Provider::OpenRouter,
+            console: None,
+        }
+        .throttle_key(),
+        "https://openrouter.ai"
     );
 }
 
@@ -172,4 +304,45 @@ fn throttle_key_generic_falls_back_to_raw_when_schemeless() {
         .throttle_key(),
         "localhost:1234"
     );
+}
+
+// ── Provider::console_url ─────────────────────────────────────────────────────
+
+#[test]
+fn console_url_is_the_vendor_page_per_provider() {
+    // Exact values: a typo here sends an operator to the wrong product's console.
+    assert_eq!(
+        Provider::DeepSeek.console_url("https://api.deepseek.com"),
+        Some("https://platform.deepseek.com/api_keys")
+    );
+    assert_eq!(
+        Provider::Zai.console_url("https://api.z.ai/api/anthropic"),
+        Some("https://z.ai/manage-apikey/apikey-list")
+    );
+    assert_eq!(
+        Provider::OpenRouter.console_url("https://openrouter.ai/api"),
+        Some("https://openrouter.ai/settings/keys")
+    );
+}
+
+#[test]
+fn console_url_answers_none_for_a_base_url_the_provider_does_not_own() {
+    // The mismatched pair a caller could build by hand. Opening some other
+    // account's console would be worse than offering nothing, and the
+    // single-page providers are exactly where a wrong page reads as harmless —
+    // so every arm re-checks, not just Alibaba's.
+    assert_eq!(
+        Provider::Alibaba.console_url("https://api.deepseek.com"),
+        None
+    );
+    assert_eq!(
+        Provider::OpenRouter.console_url("https://api.deepseek.com"),
+        None
+    );
+    assert_eq!(Provider::DeepSeek.console_url("https://api.z.ai"), None);
+    assert_eq!(
+        Provider::Zai.console_url("https://token-plan.ap-southeast-1.maas.aliyuncs.com"),
+        None
+    );
+    assert_eq!(Provider::DeepSeek.console_url(""), None);
 }

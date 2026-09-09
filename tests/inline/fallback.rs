@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+use crate::runtime::LaunchTransport;
 use crate::usage::{
     PlanInfo, PlanTier, SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso,
     now_epoch_secs,
@@ -61,7 +62,6 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
     use std::collections::BTreeMap;
     Profile {
         harness: crate::profile::Harness::Claude,
-        session_feed: false,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -71,11 +71,14 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         fallback_threshold: threshold,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage,
         fetch_status: None,
@@ -114,6 +117,15 @@ fn mark_disabled(mut p: Profile) -> Profile {
 /// The snapshot twin carries the same judgment on `ChainSnapshot::fresh`.
 fn mark_fresh(mut p: Profile) -> Profile {
     p.fetch_status = Some(FetchStatus::Fresh);
+    p
+}
+
+/// Marks a profile the chain's preferred (home) account (`Profile::preferred`).
+/// The snapshot twin carries it on `ChainMember::preferred`, derived under the
+/// config lock in `build_chain_snapshot`, so `snapshot_chain` alone suffices to
+/// exercise the return-to-preferred pass.
+fn mark_preferred(mut p: Profile) -> Profile {
+    p.preferred = true;
     p
 }
 
@@ -331,6 +343,144 @@ fn snapshot_chain_none_when_active_not_in_chain() {
     assert!(snapshot_chain(&config).is_none());
 }
 
+/// B1a. A session's decision cannot depend on the GLOBAL active: after a wrap-off
+/// switch-off-all there is none, and that is exactly the state where a session
+/// most needs to move. `snapshot_chain` returns `None` there, so the per-session
+/// builder has to be the one that does not.
+#[test]
+fn a_session_snapshot_needs_no_global_active_profile() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    config.state.active_profile = None;
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    assert!(
+        snapshot_chain(&config).is_none(),
+        "fixture: the global builder must be the one that gives up here"
+    );
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch)
+        .expect("a session snapshot");
+    assert_eq!(snap.active, "a", "the session's own member plays `active`");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b"]
+    );
+}
+
+/// B1b. The disabled filter has to spare the SESSION's member, not the global
+/// active: `next_auto_switch_target` locates the active by `position()` in this
+/// vec, so dropping it returns `None` every tick and wedges the session on the one
+/// member it must leave.
+#[test]
+fn a_session_snapshot_keeps_the_sessions_own_disabled_member_resolvable() {
+    let config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(50.0)),
+            mark_disabled(profile_with_util("b", Some(95.0), Some(10.0))),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("b"), &launch)
+        .expect("a session snapshot");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c"],
+        "the session's disabled member must stay resolvable"
+    );
+
+    // …and a disabled member the session is NOT on is still dropped as a
+    // candidate, exactly as the global builder drops it.
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch)
+        .expect("a session snapshot");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c"]
+    );
+}
+
+/// B5. A candidate the executor refuses on CONFIG grounds WEDGES the walk: the
+/// intent never changes, so the session never reaches the next viable member and
+/// the chain's recovery half dies on any mixed chain. The eligibility skip is a
+/// walk preference in the same sense `ChainSnapshot::fresh` is one.
+#[test]
+fn a_session_snapshot_drops_a_member_the_executor_would_refuse() {
+    let mut endpoint = profile_with_util("b", Some(95.0), Some(10.0));
+    endpoint.base_url = Some("https://api.example/anthropic".into());
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            endpoint,
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    // A chain entry with no profile behind it — a hand-edited `state.json`, or one
+    // whose profile failed to load. Same wedge, different cause: `precondition`'s
+    // `load_profile` refuses it `ProfileUnreadable` every tick, so naming it stops
+    // the session ever reaching the member past it.
+    config.state.fallback_chain.push("ghost".into());
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    let snap = snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch)
+        .expect("a session snapshot");
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c"],
+        "a member carrying an endpoint, and one with no profile at all, are both \
+         members the executor refuses"
+    );
+    // The global builder drops the unresolvable name (ghost) but keeps the
+    // endpoint-refused member — the latter is a per-session skip only.
+    let global = snapshot_chain(&config).expect("global snapshot");
+    assert_eq!(
+        global
+            .chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "b", "c"]
+    );
+}
+
+/// A member the session's own chain does not carry has no cursor to walk from, so
+/// there is nothing to decide.
+#[test]
+fn a_session_snapshot_is_none_for_a_member_outside_the_chain() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("b", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    config.state.fallback_chain = vec!["b".into()];
+    let launch = LaunchTransport::of(&profile_with_util("a", None, None));
+
+    assert!(
+        snapshot_session_chain(&config, &crate::profile::ProfileName::from("a"), &launch).is_none()
+    );
+}
+
 #[test]
 fn auto_switch_returns_none_when_active_below_threshold() {
     let config = config_with_chain(
@@ -431,6 +581,45 @@ fn auto_switch_missing_util_is_not_exhausted() {
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_utils(&[("b", 10.0)]); // active absent from store → not exhausted → no switch
     assert_eq!(next_auto_switch_target(&snap, &store), None);
+}
+
+/// An unresolvable name in the chain (no profile on disk, i.e. a hand-edited
+/// `state.json` or a profile that failed to load) must not be a switch candidate
+/// for the scheduler walk, lockstep with `next_target` which excludes it via
+/// `walk_excluded → p.is_none()`. The unresolvable non-active entry is dropped
+/// at snapshot build time, so it never reaches `next_auto_switch_target_with_usage`
+/// where the absence of a usage-store entry would misleadingly read as infinite
+/// headroom.
+#[test]
+fn auto_switch_skips_unresolvable_chain_entry() {
+    let mut config = config_with_chain(
+        vec![
+            profile_with_util("a", Some(95.0), Some(100.0)),
+            profile_with_util("c", Some(95.0), Some(10.0)),
+        ],
+        "a",
+    );
+    // Insert a ghost name between a and c — unresolvable, no profile on disk.
+    config.state.fallback_chain.insert(1, "ghost".into());
+
+    let snap = snapshot_chain(&config).expect("snapshot");
+    // The ghost is dropped at build time; the chain walk sees only resolvable members.
+    assert_eq!(
+        snap.chain
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["a", "c"],
+        "unresolvable non-active chain entry must not be in the snapshot"
+    );
+
+    let store = store_with_utils(&[("a", 100.0), ("c", 10.0)]);
+    // a is exhausted → walk should pick c (the viable member past the ghost).
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("c".to_string())),
+        "scheduler walk must pick the viable member, not the ghost"
+    );
 }
 
 // ── wrap-off mode ───────────────────────────────────────────────────────────
@@ -652,7 +841,7 @@ fn soonest_resume_skips_an_auth_broken_member_holding_an_idle_window() {
         ],
         "reachable",
     );
-    config.set_auth_broken("dead", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("dead"), true);
     let (name, eta) = soonest_resume(&config).expect("reachable member is hard-exhausted");
     assert_eq!(name, "reachable", "the auth-broken member must be skipped");
     assert!((1700..=1800).contains(&eta), "eta ~1800s, got {eta}");
@@ -733,6 +922,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -742,6 +932,7 @@ fn find_recovered_returns_first_member_below_threshold() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -754,7 +945,7 @@ fn find_recovered_returns_first_member_below_threshold() {
         Some("b".to_string()),
     );
     assert_eq!(
-        find_recovered_member(&members, &store, &["b".to_string()]),
+        find_recovered_member(&members, &store, &[ProfileName::from("b")]),
         None,
         "a kick-rejected member's idle usage is not recovery — its account \
          still refuses inference"
@@ -768,6 +959,7 @@ fn find_recovered_skips_exhausted_members() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -777,6 +969,7 @@ fn find_recovered_skips_exhausted_members() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -794,6 +987,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             name: "a".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -803,6 +997,7 @@ fn find_recovered_returns_none_when_no_member_has_data() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -820,6 +1015,7 @@ fn find_recovered_uses_threshold_per_member() {
             name: "a".into(),
             threshold: 90.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -829,6 +1025,7 @@ fn find_recovered_uses_threshold_per_member() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -851,6 +1048,7 @@ fn find_recovered_recovers_when_window_expired() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -874,6 +1072,7 @@ fn find_recovered_recovers_when_windowless() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -894,6 +1093,7 @@ fn find_recovered_treats_missing_resets_at_as_lapsed() {
         name: "a".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -979,7 +1179,7 @@ fn next_target_skips_broken_member_picks_next() {
         ],
         "a",
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
         next_target(&config, None),
         Some(SwitchAction::To("c".into()))
@@ -996,7 +1196,7 @@ fn next_target_returns_none_when_only_alternative_is_broken() {
         ],
         "a",
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(next_target(&config, None), None);
 }
 
@@ -1012,7 +1212,7 @@ fn auto_switch_skips_broken_member_picks_next() {
         ],
         "a",
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     let snap = snapshot_chain(&config).expect("snapshot");
     assert!(snap.broken.iter().any(|n| n == "b"));
     let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
@@ -1035,7 +1235,7 @@ fn next_target_broken_sink_wrap_off_switches_off() {
         "a",
     );
     config.state.switch_off_when_spent = true;
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(next_target(&config, None), Some(SwitchAction::Off));
 }
 
@@ -1243,7 +1443,9 @@ fn blocked_reason_reports_canceled_first() {
         vec![profile_with_usage("a", Some(95.0), Some(canceled_usage()))],
         "a",
     );
-    let profile = config.find("a").expect("profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("a"))
+        .expect("profile");
     assert_eq!(
         blocked_reason(&config, profile, None),
         Some(BlockedReason::Canceled),
@@ -1251,7 +1453,9 @@ fn blocked_reason_reports_canceled_first() {
 
     // A genuine free account (no canceled status) with headroom is NOT blocked.
     let config = config_with_chain(vec![profile_with_util("a", Some(95.0), Some(20.0))], "a");
-    let profile = config.find("a").expect("profile");
+    let profile = config
+        .find(&crate::profile::ProfileName::from("a"))
+        .expect("profile");
     assert_eq!(blocked_reason(&config, profile, None), None);
 }
 
@@ -1277,7 +1481,7 @@ fn auto_switch_broken_active_walks_away_despite_stale_headroom() {
         ],
         "a",
     );
-    config.set_auth_broken("a", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![
         // The active's last-ever read: maxed on a window that has since
@@ -1305,7 +1509,7 @@ fn auto_switch_kick_rejected_active_walks_away_despite_idle_usage() {
         "a",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.kick_rejected = vec!["a".to_string()];
+    snap.kick_rejected = vec![ProfileName::from("a")];
     let store = store_with_infos(vec![
         // The rejected active's live read: an idle, lapsed window — exactly the
         // shape the 2026-07-15 outage froze uwuclxdy in while healthy siblings
@@ -1332,7 +1536,7 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
     profiles[2].last_resort = true;
     let config = config_with_chain(profiles, "a");
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.kick_rejected = vec!["b".to_string()];
+    snap.kick_rejected = vec![ProfileName::from("b")];
     let store = store_with_infos(vec![
         // Exhausted active, idle-but-rejected b → the walk must land on c.
         ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
@@ -1346,7 +1550,7 @@ fn auto_switch_never_targets_a_kick_rejected_member() {
 
     // Same chain with the rejection also covering the last resort: nothing
     // viable remains and the active stays put (no Off — switch_off_when_spent is unset).
-    snap.kick_rejected = vec!["b".to_string(), "c".to_string()];
+    snap.kick_rejected = vec![ProfileName::from("b"), ProfileName::from("c")];
     assert_eq!(next_auto_switch_target(&snap, &store), None);
 }
 
@@ -1385,7 +1589,7 @@ fn auto_switch_prefers_fresh_member_over_earlier_stale_one() {
         "a",
     );
     let mut snap = snapshot_chain(&config).expect("snapshot");
-    snap.fresh = vec!["c".to_string()];
+    snap.fresh = vec![ProfileName::from("c")];
     let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 20.0)]);
     assert_eq!(
         next_auto_switch_target(&snap, &store),
@@ -1432,6 +1636,246 @@ fn auto_switch_still_picks_a_stale_member_when_no_fresh_one_has_headroom() {
         next_auto_switch_target(&snap, &store),
         Some(SwitchAction::To("b".to_string())),
         "freshness is a preference, not a gate: the stale escape must stay open"
+    );
+}
+
+// ── return-to-preferred ────────────────────────────────────────────────────
+// A healthy active that is not the operator's preferred (home) account walks
+// back the moment preferred reads clear AND fresh. 3-member chains throughout,
+// so the pass is actually selecting a target rather than accepting the only
+// candidate — a bug that returned "first clear member" instead of "preferred"
+// would pass on a 2-member chain and fail here.
+
+// The core: work has drifted to the tail while the head is the home account.
+// Preferred is clear and fresh, the active is healthy and fresh → come home.
+// The pick is "a" specifically, never merely "some clear member": "b" is
+// reached first in chain order from the active yet must be passed over.
+#[test]
+fn return_to_preferred_walks_a_drifted_active_home() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("a".to_string())),
+        "a healthy active that is not preferred returns to the clear, fresh home account"
+    );
+}
+
+// Self-limiting, no dwell timer: once the active IS preferred there is nothing
+// to return to, so the pass produces no move even with the whole chain clear
+// and fresh. This is what makes the return one-shot — the instant it fires the
+// active becomes preferred and this guard bars any re-fire, so it can never
+// ping-pong.
+#[test]
+fn return_to_preferred_is_a_no_op_once_already_home() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "already on the preferred account, there is nothing to return to"
+    );
+}
+
+// The other half of the self-limiting argument: when preferred is the SPENT
+// member (the only way the exhaustion walk could ever have left it), the return
+// pass does not fire — the exhausted preferred active drops out of the
+// healthy-active branch entirely and the exhaustion walk owns the move, leaving
+// for a clear sibling. Return only ever pulls work TOWARD a clear preferred,
+// never keeps it pinned to a spent one.
+#[test]
+fn a_spent_preferred_active_is_left_not_kept() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "a",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
+    // Preferred active spent; b and c clear.
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        Some(SwitchAction::To("b".to_string())),
+        "a spent preferred active is left for a clear sibling, not held on numbers it can't serve"
+    );
+}
+
+// Freshness is a HARD gate on the TARGET here, unlike the exhaustion walk where
+// a stale member is still an accepted escape. Preferred is clear but its read is
+// NOT fresh (a Cached window hydrated idle but possibly near-blocked). A healthy
+// active has no forced escape to preserve, so the return must NOT fire — moving
+// live work onto an untrusted account is worse than staying on a working one.
+#[test]
+fn return_to_preferred_gated_on_target_freshness() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    // Active is fresh; preferred "a" is deliberately absent from `fresh`.
+    snap.fresh = vec![ProfileName::from("b"), ProfileName::from("c")];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a clear but stale preferred must not pull a healthy active home on an untrusted read"
+    );
+}
+
+// The `clear` guard on the preferred TARGET: a fresh but exhausted preferred
+// (live 5h window at 100%) must NOT pull a healthy active home. Without this
+// guard the return fires on any fresh preferred regardless of headroom,
+// stranding the operator on an account that can't serve. 3-member chain so
+// "a" is genuinely selected past the other guards, not the only candidate.
+#[test]
+fn return_to_preferred_gated_on_target_clearance() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
+    let store = store_with_utils(&[("a", 100.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "an exhausted preferred must not pull a healthy active onto an account that can't serve"
+    );
+}
+
+// Freshness is also a hard gate on the ACTIVE. A stuck-RateLimited active is
+// frozen at an idle-looking read and is therefore never in `fresh`; its headroom
+// numbers are the ones the scheduler declared untrustworthy. Preferred is clear
+// AND fresh, yet the return must NOT fire, because moving off the active would
+// act on numbers the code refuses to trust (scheduler.rs stuck-RateLimited
+// invariant: real headroom stays put).
+#[test]
+fn return_to_preferred_gated_on_active_freshness() {
+    let config = config_with_chain(
+        vec![
+            mark_preferred(profile_with_util("a", Some(95.0), None)),
+            profile_with_util("b", Some(95.0), None),
+            profile_with_util("c", Some(95.0), None),
+        ],
+        "c",
+    );
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    // Preferred "a" is fresh; the active "c" is deliberately NOT (stuck).
+    snap.fresh = vec![ProfileName::from("a"), ProfileName::from("b")];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a stuck (non-fresh) active must not be moved even toward a clear, fresh preferred"
+    );
+}
+
+// A preferred that cannot actually serve is skipped, each exclusion in turn:
+// broken (dead token), kick-rejected (limiter refusing inference), and canceled
+// (subscription 403). Its idle-looking usage must never pull work home onto an
+// account that would reject every request.
+#[test]
+fn return_to_preferred_skips_a_broken_kick_rejected_or_canceled_preferred() {
+    let base = || {
+        config_with_chain(
+            vec![
+                mark_preferred(profile_with_util("a", Some(95.0), None)),
+                profile_with_util("b", Some(95.0), None),
+                profile_with_util("c", Some(95.0), None),
+            ],
+            "c",
+        )
+    };
+    let fresh_all = || {
+        vec![
+            ProfileName::from("a"),
+            ProfileName::from("b"),
+            ProfileName::from("c"),
+        ]
+    };
+
+    // Broken preferred.
+    let config = base();
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.broken = vec![ProfileName::from("a")];
+    snap.fresh = fresh_all();
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a broken preferred is unusable — no return"
+    );
+
+    // Kick-rejected preferred.
+    let config = base();
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.kick_rejected = vec![ProfileName::from("a")];
+    snap.fresh = fresh_all();
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "a kick-rejected preferred rejects inference — no return"
+    );
+
+    // Canceled preferred: sourced from usage, not a snapshot flag.
+    let config = base();
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    snap.fresh = fresh_all();
+    let store_canceled = store_with_infos(vec![
+        ("a", canceled_usage()),
+        ("b", usage_info(Some(window(10.0, Some(live_reset()))))),
+        ("c", usage_info(Some(window(10.0, Some(live_reset()))))),
+    ]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store_canceled),
+        None,
+        "a canceled preferred 403s every request — no return"
     );
 }
 
@@ -2229,8 +2673,8 @@ fn auto_switch_broken_active_without_viable_member_never_wraps_off() {
         "a",
     );
     config.state.switch_off_when_spent = true;
-    config.set_auth_broken("a", true);
-    config.set_auth_broken("b", true); // the only sibling is dead too
+    config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true); // the only sibling is dead too
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![
         ("a", usage_info(Some(window(100.0, Some(expired_reset()))))),
@@ -2251,8 +2695,8 @@ fn auto_switch_broken_and_exhausted_active_still_wraps_off() {
         "a",
     );
     config.state.switch_off_when_spent = true;
-    config.set_auth_broken("a", true);
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("a"), true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     let snap = snapshot_chain(&config).expect("snapshot");
     let store = store_with_infos(vec![
         ("a", usage_info(Some(window(100.0, Some(live_reset()))))),
@@ -2282,7 +2726,7 @@ fn next_target_skips_broken_last_resort_member() {
         Some(SwitchAction::To("b".into())),
         "base case: the last-resort pass migrates to the sink"
     );
-    config.set_auth_broken("b", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("b"), true);
     assert_eq!(
         next_target(&config, None),
         None,
@@ -2514,10 +2958,10 @@ fn next_target_burn_aware_none_rate_falls_back_to_static_threshold() {
 }
 
 /// Writes `entries` as `usage_history.jsonl` lines for `name` — the on-disk
-/// shape `crate::profile::load_usage_history` parses. Takes the sandbox so the
-/// write can only land in a sandboxed home, never the real one.
-fn write_history(_home: &crate::testutil::HomeSandbox, name: &str, entries: &[(u64, UsageInfo)]) {
-    let path = crate::profile::profile_history_path(name).expect("history path");
+/// shape `crate::profile::load_usage_history` parses.
+fn write_history(name: &str, entries: &[(u64, UsageInfo)]) {
+    let path = crate::profile::profile_history_path(&crate::profile::ProfileName::from(name))
+        .expect("history path");
     std::fs::create_dir_all(path.parent().expect("parent dir")).expect("mkdir");
     let mut body = String::new();
     for (ts, usage) in entries {
@@ -2547,7 +2991,6 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     let now = crate::usage::now_ms();
     // Perfectly linear climb, 36 → 96 over 6 minutes = 600 %/h.
     write_history(
-        &_home,
         "a",
         &[
             (
@@ -2586,7 +3029,8 @@ fn burn_aware_never_holds_the_active_where_static_switches_on_both_walks() {
     // standing in for the caller's in-memory `history_cache` lookup
     // (`App::active_burn_rate`) that feeds the real UI-thread call site.
     let active_window = window(96.0, Some(live_reset()));
-    let rate = burn_rate_for_profile("a", &active_window).expect("rate computed from history");
+    let rate = burn_rate_for_profile(&crate::profile::ProfileName::from("a"), &active_window)
+        .expect("rate computed from history");
     assert!((rate - 600.0).abs() < 1.0, "expected ~600 %/h, got {rate}");
 
     // Burn-aware: 96% is over the 95% threshold, so the static check inside the
@@ -2824,6 +3268,7 @@ fn weekly_dead_member_never_recovers() {
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -3101,7 +3546,9 @@ fn both_windows(five: f64, seven: f64) -> UsageInfo {
 #[test]
 fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     fn dead_first_chip(config: &AppConfig, name: &str) -> bool {
-        let cand = config.find(name).expect("candidate is resolvable");
+        let cand = config
+            .find(&crate::profile::ProfileName::from(name))
+            .expect("candidate is resolvable");
         matches!(
             blocked_reason(config, cand, None),
             Some(BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken)
@@ -3111,10 +3558,16 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     // dead-first verdict must agree for a resolvable non-active candidate.
     let assert_coupled = |config: &AppConfig, name: &str| {
         assert_eq!(
-            candidate_excluded(config, name),
+            candidate_excluded(config, &crate::profile::ProfileName::from(name)),
             dead_first_chip(config, name),
             "walk skip and dead-first chip disagree for {name}: {:?}",
-            blocked_reason(config, config.find(name).expect("resolvable"), None)
+            blocked_reason(
+                config,
+                config
+                    .find(&crate::profile::ProfileName::from(name))
+                    .expect("resolvable"),
+                None
+            )
         );
     };
     let keeper = || mark_fresh(profile_with_util("keep", Some(90.0), Some(10.0)));
@@ -3128,9 +3581,18 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
         "keep",
     );
     assert_coupled(&config, "cand");
-    assert!(candidate_excluded(&config, "cand"));
+    assert!(candidate_excluded(
+        &config,
+        &crate::profile::ProfileName::from("cand")
+    ));
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         Some(BlockedReason::Disabled)
     );
 
@@ -3142,7 +3604,13 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     config.state.auth_broken.push("cand".into());
     assert_coupled(&config, "cand");
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         Some(BlockedReason::AuthBroken)
     );
 
@@ -3156,7 +3624,13 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     );
     assert_coupled(&config, "cand");
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         Some(BlockedReason::Canceled)
     );
 
@@ -3169,9 +3643,18 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
         "keep",
     );
     assert_coupled(&config, "cand");
-    assert!(!candidate_excluded(&config, "cand"));
+    assert!(!candidate_excluded(
+        &config,
+        &crate::profile::ProfileName::from("cand")
+    ));
     assert_eq!(
-        blocked_reason(&config, config.find("cand").expect("cand"), None),
+        blocked_reason(
+            &config,
+            config
+                .find(&crate::profile::ProfileName::from("cand"))
+                .expect("cand"),
+            None
+        ),
         None
     );
 
@@ -3186,15 +3669,226 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
     );
     assert_coupled(&config, "cand");
     assert!(
-        !candidate_excluded(&config, "cand"),
+        !candidate_excluded(&config, &crate::profile::ProfileName::from("cand")),
         "a member blocked only by usage stays a walk candidate"
     );
     assert!(
         matches!(
-            blocked_reason(&config, config.find("cand").expect("cand"), None),
+            blocked_reason(
+                &config,
+                config
+                    .find(&crate::profile::ProfileName::from("cand"))
+                    .expect("cand"),
+                None
+            ),
             Some(BlockedReason::FiveHour { .. })
         ),
         "usage exhaustion is a non-dead-first chip"
+    );
+}
+
+// The test above admits its own gap: "a brand-new exclusion class needs its
+// own fixture added below to be covered" — until then, a fourth dead-first
+// variant can be added to `BlockedReason` and land Disabled/Canceled/AuthBroken
+// classification without ever touching `candidate_excluded`, and nothing reds.
+// `dead_first` below closes it structurally rather than by convention: it
+// matches every current `BlockedReason` variant with NO wildcard arm, so
+// adding a variant to the enum fails to compile here until a developer
+// classifies it dead-first or not. Each arm then gets a fixture proving both
+// which reason it triggers and whether the walk's skip agrees with that
+// classification — so a future variant that ships dead-first without also
+// widening `candidate_excluded`/`walk_excluded` reds the moment its fixture is
+// added, instead of drifting silently like the three above already do today.
+#[test]
+fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
+    fn dead_first(reason: &BlockedReason) -> bool {
+        match reason {
+            BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken => true,
+            BlockedReason::WeeklySpent { .. }
+            | BlockedReason::KickRejected { .. }
+            | BlockedReason::BudgetSpent
+            | BlockedReason::FiveHour { .. }
+            | BlockedReason::ScopedSpent { .. }
+            | BlockedReason::WeeklySoft { .. }
+            | BlockedReason::Stale => false,
+        }
+    }
+
+    // Confirms the fixture actually triggers `expected` AND that the walk's
+    // skip agrees with `dead_first` on it, for the resolvable non-active
+    // "cand" behind a healthy active "keep".
+    let assert_variant = |config: &AppConfig,
+                          kick_lift: Option<i64>,
+                          expected: &dyn Fn(&BlockedReason) -> bool,
+                          label: &str| {
+        let cand = config
+            .find(&crate::profile::ProfileName::from("cand"))
+            .expect("candidate is resolvable");
+        let reason = blocked_reason(config, cand, kick_lift)
+            .unwrap_or_else(|| panic!("{label}: blocked_reason returned None"));
+        assert!(expected(&reason), "{label}: got {reason:?}");
+        assert_eq!(
+            candidate_excluded(config, &crate::profile::ProfileName::from("cand")),
+            dead_first(&reason),
+            "{label}: walk skip and dead-first chip disagree, got {reason:?}"
+        );
+    };
+
+    let keeper = || mark_fresh(profile_with_util("keep", Some(90.0), Some(10.0)));
+
+    // Disabled — dead-first.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            mark_disabled(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::Disabled),
+        "Disabled",
+    );
+
+    // Canceled — dead-first.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(canceled_usage())),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::Canceled),
+        "Canceled",
+    );
+
+    // AuthBroken — dead-first.
+    let mut config = config_with_chain(
+        vec![keeper(), profile_with_util("cand", Some(90.0), Some(10.0))],
+        "keep",
+    );
+    config.state.auth_broken.push("cand".into());
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::AuthBroken),
+        "AuthBroken",
+    );
+
+    // WeeklySpent — 7d at the hard cap: usage-only, stays a walk candidate.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(weekly_usage(100.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::WeeklySpent { .. }),
+        "WeeklySpent",
+    );
+
+    // KickRejected — the messages limiter refuses the auto-start kick despite
+    // live headroom: usage/limiter-only, stays a walk candidate.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            mark_fresh(profile_with_util("cand", Some(90.0), Some(10.0))),
+        ],
+        "keep",
+    );
+    let until = now_epoch_secs() + 3600;
+    assert_variant(
+        &config,
+        Some(until),
+        &|r| matches!(r, BlockedReason::KickRejected { .. }),
+        "KickRejected",
+    );
+
+    // BudgetSpent — 5h spent, billing, over its auto-spend ceiling: usage-only.
+    let mut config = config_with_chain(
+        vec![keeper(), spend_member("cand", 10.0, 20.0, None)],
+        "keep",
+    );
+    config.state.spend_budget_switching = true;
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::BudgetSpent),
+        "BudgetSpent",
+    );
+
+    // FiveHour — over its own rotate threshold: usage-only.
+    let config = config_with_chain(
+        vec![keeper(), profile_with_util("cand", Some(90.0), Some(97.0))],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::FiveHour { .. }),
+        "FiveHour",
+    );
+
+    // ScopedSpent — a gated per-model weekly window over the line, aggregate
+    // windows clear: usage-only.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage(
+                "cand",
+                Some(90.0),
+                Some(usage_with_scoped(
+                    10.0,
+                    50.0,
+                    vec![scoped_window("7d fable", 99.0, Some(week_reset()))],
+                )),
+            ),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::ScopedSpent { .. }),
+        "ScopedSpent",
+    );
+
+    // WeeklySoft — 7d over the soft line, under the hard cap: usage-only.
+    let config = config_with_chain(
+        vec![
+            keeper(),
+            profile_with_usage("cand", Some(90.0), Some(both_windows(40.0, 99.0))),
+        ],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::WeeklySoft { .. }),
+        "WeeklySoft",
+    );
+
+    // Stale — the last read was cached, otherwise live and clear: usage-only.
+    let config = config_with_chain(
+        vec![keeper(), {
+            let mut p = profile_with_util("cand", Some(90.0), Some(40.0));
+            p.fetch_status = Some(FetchStatus::Cached);
+            p
+        }],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::Stale),
+        "Stale",
     );
 }
 
@@ -3476,6 +4170,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 name: "a".into(),
                 threshold: 95.0,
                 last_resort: false,
+                preferred: false,
                 max_spend: 0.0,
                 weekly_line: 98.0,
                 scoped_line: 98.0,
@@ -3485,6 +4180,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 name: "b".into(),
                 threshold: 95.0,
                 last_resort: false,
+                preferred: false,
                 max_spend: 0.0,
                 weekly_line: 98.0,
                 scoped_line: 98.0,
@@ -3494,6 +4190,7 @@ fn snapshot_for_lock_consolidation(spend_budget: bool) -> ChainSnapshot {
                 name: "c".into(),
                 threshold: 95.0,
                 last_resort: false,
+                preferred: false,
                 max_spend: 100.0,
                 weekly_line: 98.0,
                 scoped_line: 98.0,
@@ -3561,6 +4258,7 @@ fn snapshot_evaluation_isolates_predicate_reads_from_between_pass_mutation() {
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -4294,6 +4992,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             name: "b".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -4303,6 +5002,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
             name: "c".into(),
             threshold: 95.0,
             last_resort: false,
+            preferred: false,
             max_spend: 0.0,
             weekly_line: 98.0,
             scoped_line: 98.0,
@@ -4338,6 +5038,7 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
         name: "b".into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         weekly_line: 98.0,
         scoped_line: 98.0,
@@ -4346,6 +5047,64 @@ fn find_recovered_prefers_member_clear_of_scoped_windows() {
     assert_eq!(
         find_recovered_member(&chain_b, &store, &[]),
         Some("b".to_string()),
+    );
+}
+
+// Preferred-wins recovery: the same scoped-blocked-head / fully-clear-tail
+// shape as above, but with the head marked preferred (the home account). It is
+// aggregate-recovered (its per-model window still gates it), so the scoped-clear
+// pass would normally hand recovery to the fully-clear tail `c`. Preferred
+// overrides that: relink home rather than to a lower-priority member that merely
+// cleared its per-model windows first. The chain has 3 members so the pick is a
+// genuine selection — `b` is chosen over BOTH `a` (not recovered) and `c`.
+#[test]
+fn find_recovered_prefers_the_preferred_member_over_a_scoped_clear_one() {
+    let mkmember = |name: &str, preferred: bool| ChainMember {
+        name: name.into(),
+        threshold: 95.0,
+        last_resort: false,
+        preferred,
+        max_spend: 0.0,
+        weekly_line: 98.0,
+        scoped_line: 98.0,
+        check_scoped: true,
+    };
+    let chain = vec![
+        mkmember("a", false),
+        mkmember("b", true),
+        mkmember("c", false),
+    ];
+    let store = store_with_infos(vec![
+        // a: weekly-dead — never recovers.
+        ("a", usage_with_scoped(0.0, 100.0, vec![])),
+        // b (preferred): aggregate-clear but its 7d fable window still gates it.
+        (
+            "b",
+            usage_with_scoped(
+                0.0,
+                40.0,
+                vec![scoped_window("7d fable", 100.0, Some(week_reset()))],
+            ),
+        ),
+        // c: fully clear — the scoped-clear pass would take it absent preferred.
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member(&chain, &store, &[]),
+        Some("b".to_string()),
+        "an aggregate-recovered preferred wins over a lower-priority scoped-clear member"
+    );
+    // Guard: preferred wins only when it is ITSELF recovered. Drop b to
+    // weekly-dead and recovery falls through to the fully-clear c.
+    let store_b_dead = store_with_infos(vec![
+        ("a", usage_with_scoped(0.0, 100.0, vec![])),
+        ("b", usage_with_scoped(0.0, 100.0, vec![])),
+        ("c", usage_with_scoped(5.0, 30.0, vec![])),
+    ]);
+    assert_eq!(
+        find_recovered_member(&chain, &store_b_dead, &[]),
+        Some("c".to_string()),
+        "a preferred that has not recovered does not block a clear member from relinking"
     );
 }
 
@@ -4358,6 +5117,7 @@ fn recovery_respects_each_members_gates() {
         name: name.into(),
         threshold: 95.0,
         last_resort: false,
+        preferred: false,
         max_spend: 0.0,
         // Snapshot-folded shape: a gate-off weekly reads as the hard cap.
         weekly_line: if check_weekly { 98.0 } else { 100.0 },
@@ -4544,7 +5304,10 @@ fn snapshot_chain_skips_stray_codex_members() {
         ],
         "a",
     );
-    config.find_mut("cdx").unwrap().harness = crate::profile::Harness::Codex;
+    config
+        .find_mut(&crate::profile::ProfileName::from("cdx"))
+        .unwrap()
+        .harness = crate::profile::Harness::Codex;
     let snap = snapshot_chain(&config).expect("snapshot");
     let names: Vec<&str> = snap.chain.iter().map(|m| m.name.as_str()).collect();
     assert_eq!(
@@ -4560,9 +5323,10 @@ fn snapshot_chain_skips_stray_codex_members() {
 
 fn codex_member(name: &str) -> ChainMember {
     ChainMember {
-        name: name.to_string(),
+        name: crate::profile::ProfileName::from(name),
         threshold: DEFAULT_THRESHOLD,
         last_resort: false,
+        preferred: false,
         weekly_line: 98.0,
         scoped_line: 98.0,
         check_scoped: true,
@@ -4572,7 +5336,7 @@ fn codex_member(name: &str) -> ChainMember {
 
 fn codex_snapshot(active: &str, members: &[&str]) -> CodexChainSnapshot {
     CodexChainSnapshot {
-        active: active.to_string(),
+        active: crate::profile::ProfileName::from(active.to_string()),
         chain: members.iter().map(|n| codex_member(n)).collect(),
         broken: Vec::new(),
         weekly_pct: 98.0,
@@ -4591,7 +5355,7 @@ fn codex_walk_fires_only_on_an_exhausted_active() {
     let store = store_with_utils(&[("a", 100.0), ("b", 10.0)]);
     assert_eq!(
         next_codex_auto_switch_target(&snap, &store),
-        Some("b".to_string())
+        Some(crate::profile::ProfileName::from("b"))
     );
 }
 
@@ -4606,20 +5370,23 @@ fn codex_walk_treats_lapsed_windows_and_missing_data_as_viable() {
     ]);
     assert_eq!(
         next_codex_auto_switch_target(&snap, &store),
-        Some("b".to_string())
+        Some(crate::profile::ProfileName::from("b"))
     );
 }
 
 #[test]
 fn codex_walk_skips_broken_leased_and_loginless_members() {
     let mut snap = codex_snapshot("a", &["a", "b", "c", "d", "e"]);
-    snap.broken.push("b".to_string());
-    snap.leased.push("c".to_string());
-    snap.loginless.push("d".to_string());
+    snap.broken
+        .push(crate::profile::ProfileName::from("b".to_string()));
+    snap.leased
+        .push(crate::profile::ProfileName::from("c".to_string()));
+    snap.loginless
+        .push(crate::profile::ProfileName::from("d".to_string()));
     let store = store_with_utils(&[("a", 100.0)]);
     assert_eq!(
         next_codex_auto_switch_target(&snap, &store),
-        Some("e".to_string()),
+        Some(crate::profile::ProfileName::from("e")),
         "only the installable member is picked"
     );
 }
@@ -4634,7 +5401,7 @@ fn codex_limiter_verdict_drives_the_switch_and_clears_on_reset() {
     let store = store_with_infos(vec![("a", blocked), ("b", usage_info(None))]);
     assert_eq!(
         next_codex_auto_switch_target(&snap, &store),
-        Some("b".to_string())
+        Some(crate::profile::ProfileName::from("b"))
     );
 
     // Same verdict but the named window has lapsed → verdict expired.
@@ -4655,7 +5422,7 @@ fn codex_limiter_verdict_blocks_a_candidate_too() {
     ]);
     assert_eq!(
         next_codex_auto_switch_target(&snap, &store),
-        Some("c".to_string()),
+        Some(crate::profile::ProfileName::from("c")),
         "a limiter-blocked sibling is walked around"
     );
 }
@@ -4668,7 +5435,7 @@ fn codex_walk_last_resort_pass_and_one_migration_rule() {
     let store = store_with_utils(&[("a", 100.0), ("b", 100.0)]);
     assert_eq!(
         next_codex_auto_switch_target(&snap, &store),
-        Some("b".to_string())
+        Some(crate::profile::ProfileName::from("b"))
     );
     // …but never FROM a last-resort active (no sink ping-pong).
     let mut snap = codex_snapshot("b", &["a", "b"]);
@@ -4696,7 +5463,7 @@ fn snapshot_codex_chain_rejects_degenerate_markers() {
         let profiles = names
             .iter()
             .map(|(n, h)| {
-                let mut p = crate::testutil::blank_profile(n);
+                let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(*n));
                 p.harness = *h;
                 p
             })

@@ -12,10 +12,10 @@
 //! these primitives (so there is a single implementation) is a documented
 //! follow-up, not done here to keep this change scoped to the socket path.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
 use crate::fallback::DEFAULT_THRESHOLD;
-use crate::profile::{AppConfig, profile_dir, save_profile, update_app_state};
+use crate::profile::{AppConfig, save_profile, update_app_state};
 
 /// Direction for [`move_member`] within the ordered chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,10 +54,7 @@ pub(crate) fn add(config: &mut AppConfig, name: &str) -> Result<bool> {
     // `fallback_chain`. Homogeneity holds by construction: the harness picks
     // the chain, so neither chain can hold the other kind.
     let codex = config.find(&canonical).is_some_and(|p| p.is_codex());
-    if chain_of(config, codex)
-        .iter()
-        .any(|n| n.as_str() == canonical)
-    {
+    if chain_of(config, codex).contains(&canonical) {
         return Ok(false);
     }
     // Seed a default threshold if unset, persisting config.toml first; roll the
@@ -76,10 +73,10 @@ pub(crate) fn add(config: &mut AppConfig, name: &str) -> Result<bool> {
     // concurrent switch's `active_profile` (or a login's appended profile) is
     // preserved rather than clobbered by a blind rewrite.
     let canon = canonical.clone();
-    if let Err(e) = update_app_state(move |s| {
+    if let Err(e) = update_app_state(move |s, _held| {
         let chain = chain_of_mut(s, codex);
-        if !chain.iter().any(|n| n.as_str() == canon) {
-            chain.push(canon.as_str().into());
+        if !chain.contains(&canon) {
+            chain.push(canon.clone());
         }
     }) {
         chain_of_mut(&mut config.state, codex).pop();
@@ -121,64 +118,19 @@ fn chain_of_mut(
 /// or a failed directory rename.
 pub(crate) fn rename(config: &mut AppConfig, old: &str, new: &str) -> Result<bool> {
     let canonical = resolve(config, old)?;
-    let new = new.trim().to_string();
+    let new = crate::profile::ProfileName::from(new.trim());
     // Charset + collision (excluding the profile being renamed, so a case-only
     // self-rename is allowed). Belt-and-suspenders with the socket's own check.
-    crate::actions::validate_profile_name(&new, &config.names(), Some(canonical.as_str()))?;
+    crate::actions::validate_profile_name(new.as_str(), &config.names(), Some(canonical.as_str()))?;
     if new == canonical {
         return Ok(false);
     }
-
-    // Rename the directory first: if it fails, no state has changed yet.
-    let old_dir = profile_dir(&canonical)?;
-    if old_dir.exists() {
-        std::fs::rename(&old_dir, profile_dir(&new)?)
-            .with_context(|| format!("failed to rename profile directory to '{new}'"))?;
-    }
-
-    let was_active = config.is_active(&canonical);
-    config.rename_all_occurrences(&canonical, &new);
-
-    // Merge the same rename into the latest on-disk state (TECH-7 — never blind-write
-    // a concurrent switch's active_profile).
-    let (from, to) = (canonical.clone(), new.clone());
-    if let Err(e) = update_app_state(move |s| {
-        for slot in s
-            .profiles
-            .iter_mut()
-            .chain(s.fallback_chain.iter_mut())
-            .chain(s.codex_fallback_chain.iter_mut())
-            .chain(s.auth_broken.iter_mut())
-        {
-            if slot.as_str() == from {
-                *slot = to.as_str().into();
-            }
-        }
-        if s.active_profile
-            .as_ref()
-            .is_some_and(|n| n.as_str() == from)
-        {
-            s.active_profile = Some(to.as_str().into());
-        }
-        // CDX slots (wave-2 fix — the in-memory rename covered these, the
-        // disk merge didn't, stranding a stale name in profiles.toml).
-        if s.active_codex_profile
-            .as_ref()
-            .is_some_and(|n| n.as_str() == from)
-        {
-            s.active_codex_profile = Some(to.as_str().into());
-        }
-    }) {
-        // Roll back the directory rename + in-memory state so disk and memory agree.
-        let _ = std::fs::rename(profile_dir(&new)?, profile_dir(&canonical)?);
-        config.rename_all_occurrences(&new, &canonical);
-        return Err(e);
-    }
-
-    // Re-link the credential mirror to the renamed (active) profile's new dir.
-    if was_active {
-        crate::claude::link_profile_credentials(&new)?;
-    }
+    // Upstream owns the rename now: the directory move under the state flock,
+    // every in-memory + on-disk reference (both chains, the active markers,
+    // the auth-broken set), the credential relink when the renamed profile is
+    // active — all serialized against a token rotation on the same profile.
+    let guard = crate::actions::rotation_guard_for_mutation(&canonical)?;
+    crate::actions::rename_profile(config, &canonical, &new, &guard)?;
     Ok(true)
 }
 
@@ -187,17 +139,14 @@ pub(crate) fn rename(config: &mut AppConfig, old: &str, new: &str) -> Result<boo
 pub(crate) fn remove(config: &mut AppConfig, name: &str) -> Result<bool> {
     let canonical = resolve(config, name)?;
     let codex = config.find(&canonical).is_some_and(|p| p.is_codex());
-    let Some(pos) = chain_of(config, codex)
-        .iter()
-        .position(|n| n.as_str() == canonical)
-    else {
+    let Some(pos) = chain_of(config, codex).iter().position(|n| *n == canonical) else {
         return Ok(false);
     };
     let removed = chain_of_mut(&mut config.state, codex).remove(pos);
     // TECH-7: merge the removal delta into the latest on-disk state.
     let canon = canonical.clone();
-    if let Err(e) = update_app_state(move |s| {
-        chain_of_mut(s, codex).retain(|n| n.as_str() != canon);
+    if let Err(e) = update_app_state(move |s, _held| {
+        chain_of_mut(s, codex).retain(|n| *n != canon);
     }) {
         chain_of_mut(&mut config.state, codex).insert(pos, removed);
         return Err(e);
@@ -210,10 +159,7 @@ pub(crate) fn remove(config: &mut AppConfig, name: &str) -> Result<bool> {
 pub(crate) fn move_member(config: &mut AppConfig, name: &str, dir: MoveDir) -> Result<bool> {
     let canonical = resolve(config, name)?;
     let codex = config.find(&canonical).is_some_and(|p| p.is_codex());
-    let Some(pos) = chain_of(config, codex)
-        .iter()
-        .position(|n| n.as_str() == canonical)
-    else {
+    let Some(pos) = chain_of(config, codex).iter().position(|n| *n == canonical) else {
         return Ok(false);
     };
     let target = match dir {
@@ -228,9 +174,9 @@ pub(crate) fn move_member(config: &mut AppConfig, name: &str, dir: MoveDir) -> R
     // position on disk (its chain may differ from our snapshot) so we express the
     // intent "move `canonical` one slot in `dir`" rather than a stale positional swap.
     let canon = canonical.clone();
-    if let Err(e) = update_app_state(move |s| {
+    if let Err(e) = update_app_state(move |s, _held| {
         let chain = chain_of_mut(s, codex);
-        if let Some(p) = chain.iter().position(|n| n.as_str() == canon) {
+        if let Some(p) = chain.iter().position(|n| *n == canon) {
             let t = match dir {
                 MoveDir::Up => p.checked_sub(1),
                 MoveDir::Down => Some(p + 1).filter(|t| *t < chain.len()),
@@ -353,7 +299,7 @@ pub(crate) fn set_wrap_off(config: &mut AppConfig, on: bool) -> Result<bool> {
     let previous = config.state.switch_off_when_spent;
     config.state.switch_off_when_spent = on;
     // TECH-7: merge the wrap_off delta into the latest on-disk state.
-    if let Err(e) = update_app_state(move |s| s.switch_off_when_spent = on) {
+    if let Err(e) = update_app_state(move |s, _held| s.switch_off_when_spent = on) {
         config.state.switch_off_when_spent = previous;
         return Err(e);
     }
@@ -376,7 +322,7 @@ pub(crate) fn set_weekly_threshold(config: &mut AppConfig, value: f64) -> Result
     }
     config.state.weekly_switch_threshold = Some(value);
     // TECH-7: merge the delta into the latest on-disk state.
-    if let Err(e) = update_app_state(move |s| s.weekly_switch_threshold = Some(value)) {
+    if let Err(e) = update_app_state(move |s, _held| s.weekly_switch_threshold = Some(value)) {
         config.state.weekly_switch_threshold = previous;
         return Err(e);
     }
@@ -385,9 +331,10 @@ pub(crate) fn set_weekly_threshold(config: &mut AppConfig, value: f64) -> Result
 
 /// Resolve a raw/case-insensitive profile name to its canonical form, erroring
 /// when it names no known profile.
-fn resolve(config: &AppConfig, name: &str) -> Result<String> {
+fn resolve(config: &AppConfig, name: &str) -> Result<crate::profile::ProfileName> {
     config
         .canonical_name(name)
+        .map(|n| crate::profile::ProfileName::from(n.as_str()))
         .ok_or_else(|| anyhow::anyhow!("unknown profile '{name}'"))
 }
 

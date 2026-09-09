@@ -122,6 +122,7 @@ and a debugging/fallback surface.
     {
       "name": "kitty",
       "active": true,
+      "rolling_token": false,
       "provider": "anthropic",
       "base_url": null,
       "tier": "Max 5x",
@@ -133,6 +134,7 @@ and a debugging/fallback surface.
       "fetched_at": "2026-07-03T19:04:20+00:00",
       "next_refresh_at": "2026-07-03T19:09:20+00:00",
       "auto_start": true,
+      "auto_start_queue": null,
       "bell_threshold": 90,
       "fallback": { "position": 1, "threshold": 95, "armed": true, "last_resort": false },
       "windows": [
@@ -151,6 +153,22 @@ use `decodeIfPresent`; schema stays 1):
 
 - `clauth_version` — always present (daemon and single-shot) so CLI↔daemon
   skew is detectable.
+- per-profile `rolling_token` (upstream PR #59, merged; UPS-17 adopted the
+  merged form) — `true` when the profile's `session-token.json` currently
+  HOLDS a rolling bearer, content-classified rather than read off the config
+  flag: a dead chain degrades the sidecar onto its static mint while the flag
+  stays on, and a mis-filled sidecar (a rotating pair) publishes `false`
+  because it is not a rolling token. Readers MUST key their token-row
+  rendering off this: a rolling bearer drawn through the static mint's 30-day
+  ramp shows a healthy credential as dying, and a mint drawn through the
+  rolling countdown promises re-stamps nobody will make. **Replaces the
+  fork's pre-merge `session_feed` key** (same meaning, flag-shaped); readers
+  that still fall back to `session_feed` when `rolling_token` is absent stay
+  correct against an older daemon.
+- per-profile `auto_start_queue` (upstream v0.15.0) — `{position,
+  next_open_at}` when the interleaved auto-start queue holds a slot for this
+  profile, else `null`. Not consumed by either GUI client today; listed so a
+  reader knows it is additive, not a shape change.
 - `last_switch` — the hero event: last executed switch with `from`/`to`/`at`/
   `trigger` (`"user"` or `"scheduler"`); `null` until one lands. Daemon-only.
 - `last_error` — most recent switch skip/failure `{at, message}`, sticky until

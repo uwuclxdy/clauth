@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
@@ -19,12 +21,14 @@ fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
         fallback_threshold: Some(80.0),
         weekly_threshold: None,
         last_resort: false,
-        session_feed: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             plan: None,
@@ -127,6 +131,7 @@ fn dump(app: &App, w: u16, h: u16) -> String {
 
 #[test]
 fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::ToastKind;
     use ratatui::style::Modifier;
 
@@ -167,6 +172,7 @@ fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
 
 #[test]
 fn login_modal_drops_the_url_and_offers_a_retry() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{LoginSession, LoginStage, Modal, Tab};
     let mut app = App::new(AppConfig {
         state: AppState::default(),
@@ -195,6 +201,7 @@ fn login_modal_drops_the_url_and_offers_a_retry() {
 
 #[test]
 fn all_tabs_render() {
+    let _home = crate::testutil::HomeSandbox::new();
     let profiles = vec![
         oauth("uwuclxdy", 42.0, 18.0, true),
         oauth("work", 12.0, 3.0, false),
@@ -239,8 +246,79 @@ fn all_tabs_render() {
     app.status.focus = StatusFocus::List;
 }
 
+/// The status tab's incident stamps render LOCAL wall clock in the 2026-08-22
+/// ruling's `YYYY-MM-DD HH:MM:SS` shape — the `started` row and every timeline
+/// row. Both used to slice the UTC ISO (`jun 6, 10:14`), and a bare stamp in
+/// prose reads as local, so the unmarked rows were false off UTC. The expected
+/// strings derive through chrono's own `format` rather than the crate's
+/// formatter, so the pin is a second derivation of the same claim, not a copy
+/// of the code's arithmetic; it holds in any zone, UTC included (local equals
+/// UTC there, and the contract is satisfied by either).
+#[test]
+fn status_tab_incident_stamps_render_local_wall_clock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    let incidents = demo_incidents();
+    let started_ms = incidents[0].started_ms;
+    let update_ms: Vec<u64> = incidents[0].updates.iter().map(|u| u.at_ms).collect();
+
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.status.incidents = incidents;
+    app.tab = Tab::Status;
+    app.status.focus = StatusFocus::Detail;
+    let out = dump(&app, 90, 24);
+
+    let local_shape = |epoch_ms: u64| {
+        chrono::DateTime::from_timestamp((epoch_ms / 1000) as i64, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    };
+
+    let started = local_shape(started_ms);
+    assert!(
+        out.contains(&started),
+        "started row renders the local stamp {started:?}:\n{out}"
+    );
+    for at_ms in update_ms {
+        let row = local_shape(at_ms);
+        assert!(
+            out.contains(&row),
+            "timeline row renders the local stamp {row:?}:\n{out}"
+        );
+    }
+    assert!(
+        !out.contains(" utc"),
+        "no stamp carries a utc marker after the local conversion:\n{out}"
+    );
+
+    // Where the zone spells the fixture instant differently from UTC, the
+    // UTC digits must be ABSENT: a stamp that regressed to UTC in the 19-char
+    // shape would still satisfy a contains() on a UTC box. Compared
+    // spelling-on-spelling, never via a run-instant offset read: a DST zone
+    // whose offset differs between the fixture instant and the run instant
+    // would fire the guard over two identical spellings. On a UTC runner the
+    // two spellings coincide, so there is no second spelling to ban.
+    let utc_started = chrono::DateTime::from_timestamp((started_ms / 1000) as i64, 0)
+        .unwrap()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    if started != utc_started {
+        assert!(
+            !out.contains(&utc_started),
+            "the started stamp renders UTC digits, not local wall clock:\n{out}"
+        );
+    }
+}
+
 #[test]
 fn config_refresh_interval_custom_editor_renders() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, InputState, Tab};
     let mut app = App::new(AppConfig {
         state: AppState::default(),
@@ -278,6 +356,7 @@ fn config_refresh_interval_custom_editor_renders() {
 
 #[test]
 fn fallback_threshold_editor_shows_range_tooltip() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{FallbackFocus, InputState, Tab};
     let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
     let config = AppConfig {
@@ -314,6 +393,7 @@ fn fallback_threshold_editor_shows_range_tooltip() {
 
 #[test]
 fn setup_delete_row_hint_names_usage_history() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
     let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
     let config = AppConfig {
@@ -343,6 +423,7 @@ fn setup_delete_row_hint_names_usage_history() {
 
 #[test]
 fn setup_api_account_shows_relogin_and_logout_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
     let mut api = oauth("acme", 0.0, 0.0, false);
     api.base_url = Some("https://api.example.com".to_string());
@@ -374,8 +455,95 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
         "api account with a key shows a log-out row:\n{out}",
     );
     assert!(
-        out.contains("re-enter the base url"),
+        out.contains("re-enter the base URL"),
         "the login row's hint describes the API re-entry:\n{out}",
+    );
+}
+
+/// The Setup picker ends in exactly one trailing row (`+ new`), and the
+/// create form carries `+ capture current login` under `+ login` while the
+/// live login is unowned — flipping to its ✓ done state once stashed, and
+/// gone entirely when no live login is unsaved.
+#[test]
+fn new_form_renders_the_capture_row_and_its_done_state() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::actions::CaptureSnapshot;
+    use crate::tui::app::{ConfigRow, DraftLogin, Tab, build_draft_new, config_rows};
+
+    // A plain live credentials file, as `claude` itself leaves it.
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        serde_json::to_vec(&crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "live-access".to_string(),
+                refresh_token: Some("live-refresh".to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+            }),
+        })
+        .expect("serialize live login"),
+    )
+    .expect("write live login");
+
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    let mut app = App::new(config);
+    app.refresh_unsaved_live_login();
+    app.tab = Tab::Setup;
+    app.config_focus = ConfigFocus::Actions;
+    app.profile_cursor = 0; // the `+ new` form
+
+    // Park the cursor on the capture row so its hint renders too.
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::CaptureLogin)
+        .expect("the capture row renders for an unowned live login");
+
+    let out = dump(&app, 120, 30);
+    assert!(
+        !out.contains("+ new from"),
+        "the picker carries no second trailing row:\n{out}"
+    );
+    assert!(
+        out.contains("+ capture current login"),
+        "the form carries the capture row under `+ login`:\n{out}"
+    );
+    assert!(
+        out.contains("save the current global credentials into a new account"),
+        "the capture row's hint explains what ⏎ stashes:\n{out}"
+    );
+
+    // Stashed: the ✓ done state, same pattern as `✓ logged in`.
+    let mut draft = build_draft_new();
+    draft.captured_login = Some(DraftLogin::LiveLogin(Box::new(CaptureSnapshot {
+        credentials: None,
+        base_url: None,
+        api_key: None,
+        account_uuid: None,
+        account_email: None,
+        live_login: true,
+    })));
+    app.config_draft = Some(draft);
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("✓ captured current login"),
+        "a stashed snapshot renders the done state:\n{out}"
+    );
+
+    // No unsaved live login: no row at all.
+    app.config_draft = None;
+    app.unsaved_live_login = false;
+    let out = dump(&app, 120, 30);
+    assert!(
+        !out.contains("capture current login"),
+        "a saved or absent live login hides the row:\n{out}"
     );
 }
 
@@ -384,6 +552,7 @@ fn setup_api_account_shows_relogin_and_logout_rows() {
 /// over a live token.
 #[test]
 fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
     let mut hybrid = oauth("acme", 0.0, 0.0, false);
     hybrid.base_url = Some("http://127.0.0.1:1234".to_string());
@@ -424,6 +593,7 @@ fn setup_hybrid_account_reads_logged_in_on_its_oauth_pair() {
 /// key and an OAuth pair logs out of the pair, and the copy must say so.
 #[test]
 fn setup_hybrid_logout_hint_names_the_oauth_login() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigRow, Tab, config_rows};
     let mut hybrid = oauth("acme", 0.0, 0.0, false);
     hybrid.base_url = Some("https://api.example.com".to_string());
@@ -454,6 +624,7 @@ fn setup_hybrid_logout_hint_names_the_oauth_login() {
 
 #[test]
 fn capture_name_caret_follows_edit_position() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::actions::CaptureSnapshot;
     use crate::tui::app::{CaptureNameForm, InputState, Modal};
 
@@ -472,7 +643,9 @@ fn capture_name_caret_follows_edit_position() {
             credentials: None,
             base_url: None,
             api_key: None,
-            identity: crate::actions::CaptureIdentity::LiveLogin,
+            account_uuid: None,
+            account_email: None,
+            live_login: true,
         }),
         input,
         from_divergence: false,
@@ -501,6 +674,7 @@ fn capture_name_caret_follows_edit_position() {
 
 #[test]
 fn status_selected_row_tint_spans_both_lines() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = AppConfig {
         state: AppState::default(),
@@ -611,9 +785,10 @@ fn narrow_app() -> App {
 /// override the member line IS the cap, and a folding revision stays green.
 #[test]
 fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::usage::{FetchStatus, UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
     let mk_app = |seven_day: f64| {
-        let mut p = crate::testutil::blank_profile("a");
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         p.weekly_threshold = Some(90.0);
         // 5h spent (past its rotate threshold, live reset) so the `spent`
         // pill — the teach's gate — renders at all.
@@ -655,6 +830,7 @@ fn usage_weekly_teach_keys_on_the_hard_cap_not_the_member_line() {
 
 #[test]
 fn narrow_master_detail_stacks_wide_stays_side_by_side() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = narrow_app();
     for tab in [
         Tab::Usage,
@@ -680,6 +856,7 @@ fn narrow_master_detail_stacks_wide_stays_side_by_side() {
 
 #[test]
 fn narrow_tokens_dashboard_keeps_card_text_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = narrow_app();
     app.tab = Tab::Tokens;
     let out = dump(&app, 45, 44);
@@ -698,6 +875,7 @@ fn narrow_tokens_dashboard_keeps_card_text_whole() {
 
 #[test]
 fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = narrow_app();
     app.tab = Tab::Overview;
     let out = dump(&app, 45, 38);
@@ -745,8 +923,61 @@ fn narrow_overview_chain_row_keeps_its_figures_on_one_line() {
     );
 }
 
+/// The footer advertises `a` only where the menu has something in it. Both
+/// directions on one screen: the Setup tab's three actions all work on the
+/// focused account, and the `+ new` form carries only `apply preset` (no source
+/// account to duplicate or save) — so the hint stays up in both positions.
+#[test]
+fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("acct")],
+            ..AppState::default()
+        },
+        profiles: vec![crate::testutil::blank_profile(
+            &crate::profile::ProfileName::from("acct"),
+        )],
+    });
+    app.tab = Tab::Setup;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let menu = crate::tui::app::build_action_menu(&app);
+    assert_eq!(menu.items.len(), 3);
+    assert_eq!(
+        menu.context.as_deref(),
+        Some("acct"),
+        "a scoped group names the account it scopes to"
+    );
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("a actions"),
+        "an account carries three whole-account actions no key reaches:\n{out}"
+    );
+
+    // The create form sits past the roster: only `apply preset` is offered
+    // (no source account to duplicate or save), but that still means the menu
+    // has an item, so the footer keeps advertising `a`.
+    app.profile_cursor = app.profile_count();
+    app.config_draft = None;
+    let menu = crate::tui::app::build_action_menu(&app);
+    assert_eq!(menu.items.len(), 1);
+    assert_eq!(
+        menu.context, None,
+        "no draft is mounted yet, so the group title is bare"
+    );
+    let out = dump(&app, 120, 30);
+    assert!(
+        out.contains("a actions"),
+        "the create form's menu carries apply preset, so the key stays advertised:\n{out}"
+    );
+}
+
 #[test]
 fn narrow_footer_degrades_to_essential_hints() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = narrow_app();
     app.tab = Tab::Usage;
     let out = dump(&app, 45, 38);
@@ -769,6 +1000,7 @@ fn narrow_footer_degrades_to_essential_hints() {
 
 #[test]
 fn narrow_header_hides_the_gauge_without_a_dangling_separator() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = narrow_app();
     app.tab = Tab::Usage;
     let narrow = dump(&app, 45, 38);
@@ -793,6 +1025,7 @@ fn narrow_header_hides_the_gauge_without_a_dangling_separator() {
 
 #[test]
 fn narrow_status_detail_duration_drops_to_its_own_line() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut app = narrow_app();
     app.tab = Tab::Status;
     let out = dump(&app, 45, 38);
@@ -806,6 +1039,7 @@ fn narrow_status_detail_duration_drops_to_its_own_line() {
 
 #[test]
 fn narrow_modal_body_wraps_instead_of_clipping() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfirmAction, ConfirmState, Modal};
     let mut app = narrow_app();
     app.modals.push(Modal::Confirm(ConfirmState {
@@ -823,6 +1057,7 @@ fn narrow_modal_body_wraps_instead_of_clipping() {
 
 #[test]
 fn empty_state_renders() {
+    let _home = crate::testutil::HomeSandbox::new();
     let config = AppConfig {
         state: AppState::default(),
         profiles: Vec::new(),
@@ -836,6 +1071,7 @@ fn empty_state_renders() {
 
 #[test]
 fn banner_renders() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{Banner, BannerSeverity};
 
     let profiles = vec![oauth("alpha", 99.0, 50.0, true)];
@@ -874,6 +1110,7 @@ fn banner_renders() {
 // empty-state ("no accounts yet · n to create one").
 #[test]
 fn tokens_models_view_empty_filter_names_the_filter() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tokens::{ModelTokens, TokenStats};
     use crate::tui::app::{TokenFilter, TokenView};
 
@@ -927,12 +1164,14 @@ fn bare(name: &str) -> Profile {
         fallback_threshold: Some(95.0),
         weekly_threshold: None,
         last_resort: false,
-        session_feed: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -960,6 +1199,7 @@ fn fallback_config(auth_broken: &[&str]) -> AppConfig {
 // with nothing blocked carries none.
 #[test]
 fn fallback_selector_marks_a_blocked_member() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut blocked = App::new(fallback_config(&["b"]));
     blocked.tab = Tab::Fallback;
     let out = dump(&blocked, 90, 20);
@@ -984,6 +1224,7 @@ fn fallback_selector_marks_a_blocked_member() {
 // a delta test just re-derives the implementation's own arithmetic.
 #[test]
 fn fallback_edit_caret_follows_the_blocked_reason_pill() {
+    let _home = crate::testutil::HomeSandbox::new();
     let check = |auth_broken: &[&str], label: &str| {
         let mut app = App::new(fallback_config(auth_broken));
         app.tab = Tab::Fallback;
@@ -1016,6 +1257,7 @@ fn fallback_edit_caret_follows_the_blocked_reason_pill() {
 /// tooltip) on screen at the smallest size the app renders at.
 #[test]
 fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{ConfigFocus, GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
 
     let mut app = App::new(AppConfig {
@@ -1087,6 +1329,7 @@ fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
 /// pane, so it must not carry a leading spacer.
 #[test]
 fn config_bands_are_separated_by_one_blank_row() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::Tab;
 
     let mut app = App::new(AppConfig {
@@ -1125,6 +1368,7 @@ fn config_bands_are_separated_by_one_blank_row() {
 /// while the row it explains sits comfortably on screen.
 #[test]
 fn a_wrapped_hint_scrolls_into_view_with_its_row() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
 
     let mut app = App::new(AppConfig {
@@ -1194,6 +1438,7 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
 /// holds in any timezone.
 #[test]
 fn usage_tab_reset_follows_the_reset_display_setting() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::profile::ResetDisplay;
     use crate::tui::app::Tab;
 
@@ -1240,6 +1485,84 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
     );
 }
 
+/// The overview accounts table's width budget, pinned at the FRAME across every
+/// tier boundary the column algorithm has. Every new column plays by the reset
+/// column's rule — it may spend leftover slack and it may be dropped whole, but
+/// it may never cost a bar or a reset at any width — and the only way to catch a
+/// breach is to count what a real render puts on screen.
+///
+/// The expected counts are the behavior BEFORE the `live` column existed, so a
+/// column that pays for itself out of a tier instead of out of slack reds here
+/// rather than silently deleting a bar at some width nobody tests by hand (which
+/// is exactly what the 2026-07-19 reset-column cut did).
+#[test]
+fn the_overview_column_budget_never_pays_for_a_new_column_with_an_old_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    // A bar is 10 interior cells in brackets, always trailed by its percentage —
+    // specific enough that no pill or chip elsewhere in the frame can match it.
+    let bar = regex::Regex::new(r"\[[^\[\]]{10}\] +\d+%").expect("valid pattern");
+    let reset_cell = regex::Regex::new(r"% \([^)]+\)").expect("valid pattern");
+
+    // Pre-column behavior as a function of TERMINAL width, per NAME LENGTH. The
+    // name sweep is what makes this pin able to fail: `OverviewWidths` clamps
+    // `max_name` to 8 at the low end, so a one-profile-named-"a" fixture never
+    // enters the shrink loop's name arm and never reaches the width where the 7d
+    // column is what gives way. 16 and 22 do both.
+    //
+    // Boundaries are terminal widths, not the tiers spelled in `OverviewWidths`
+    // (the accounts area is narrower by the frame's own chrome). The 5h bar
+    // arrives, then its reset, then the 7d column brings its own pair — one
+    // column later for a 22-char name, which is the shrink loop trading.
+    const BUDGET: &[(usize, u16, u16, u16, u16)] = &[
+        // (name length, first bar, first reset, 7d bar, 7d reset)
+        (8, 68, 85, 106, 106),
+        (16, 68, 85, 106, 106),
+        (22, 68, 85, 106, 108),
+    ];
+
+    for (name_len, first_bar, first_reset, seven_bar, seven_reset) in BUDGET {
+        let name = "n".repeat(*name_len);
+        let mut profile = oauth(&name, 40.0, 60.0, false);
+        let now = crate::usage::now_epoch_secs();
+        if let Some(u) = profile.usage.as_mut() {
+            // Both resets sit MID-unit, deliberately. `humanize_duration` narrows
+            // by a cell the moment a countdown crosses a unit boundary (`3h 0m` →
+            // `2h 59m`, `4d 0h` → `3d 23h`), and `reset_suffix` fit-checks the
+            // stamp — so a fixture pinned exactly ON a boundary decides a column
+            // boundary by which second the render lands in. That shipped as a
+            // 28%-flaky pin at the 22-char row's 107th column.
+            if let Some(w) = u.five_hour.as_mut() {
+                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 3 * 3600 + 1800));
+            }
+            if let Some(w) = u.seven_day.as_mut() {
+                w.resets_at = Some(crate::usage::epoch_secs_to_iso(now + 4 * 86400 + 43200));
+            }
+        }
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![profile],
+        });
+        app.tab = Tab::Overview;
+
+        for width in 34u16..=200 {
+            let frame = dump(&app, width, 20);
+            let bars = usize::from(width >= *first_bar) + usize::from(width >= *seven_bar);
+            let resets = usize::from(width >= *first_reset) + usize::from(width >= *seven_reset);
+            assert_eq!(
+                (
+                    bar.find_iter(&frame).count(),
+                    reset_cell.find_iter(&frame).count()
+                ),
+                (bars, resets),
+                "a {name_len}-char name at {width} cols must still carry {bars} bars \
+                 and {resets} resets:\n{frame}"
+            );
+        }
+    }
+}
+
 /// The overview column is the one reset surface with a width budget, and no
 /// frame test covered it — which is how a first cut shipped that DELETED the
 /// countdown (and the 7d bar with it) at widths between the old and new tiers.
@@ -1247,6 +1570,7 @@ fn usage_tab_reset_follows_the_reset_display_setting() {
 /// width: worst case the stamp is dropped, never the countdown.
 #[test]
 fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::profile::ResetDisplay;
     use crate::tui::app::Tab;
 
@@ -1308,4 +1632,83 @@ fn overview_reset_column_never_loses_ground_to_the_clock_setting() {
         2,
         "a 160-col overview stamps both the 5h and 7d resets:\n{wide}"
     );
+}
+
+/// Whether a real frame carries the accounts table's live-session column, read
+/// off the table's own HEADER ROW rather than the whole frame.
+///
+/// A frame-wide `.contains("live")` would be vacuous: `live` is a four-character
+/// needle and the chain panel, the captions and the footer are all prose on the
+/// same screen, so any of them saying "live" would report the column present at
+/// every width, green. The header row is located by the two labels that always
+/// precede this one (`account` and `type`, both of which survive the narrowest
+/// tier), and a missing row PANICS rather than reading as absence — an absence
+/// claim from a probe that never ran is worth nothing.
+fn live_column_present(app: &App, width: u16) -> bool {
+    let frame = dump(app, width, 20);
+    let header = frame
+        .lines()
+        .find(|row| row.contains("account") && row.contains("type"))
+        .unwrap_or_else(|| panic!("no accounts-table header at {width} cols:\n{frame}"));
+    // Whole-token, so a column clipped mid-label ("liv") reads as absent — which
+    // is the point: the tail ratatui discards IS this column. Tokenizing also
+    // steps over the panel's own `│` border cells, which sit on the same row.
+    header.split_whitespace().any(|cell| cell == "live")
+}
+
+/// Where the `live` column exists, exactly, as a function of name length and
+/// terminal width. The column is monotone in width: once it is present at some
+/// width it is present at every wider width, so each map is one `(floor, 200)`
+/// range and the column never disappears as the terminal widens.
+///
+/// The fit gate's own comparison had no pin: `<= total` → `< total` shifts every
+/// arrival by one column and the whole suite stayed green, because the only test
+/// watching presence reads `widths.live` and then checks the render agrees with
+/// it, which is true however the gate is written. This asserts the map instead,
+/// so the boundary is a fact rather than a self-consistency check.
+///
+/// The column is decided before the wall-clock stamp bonus, so it outranks the
+/// stamp's clock cells rather than the other way round: the map is identical
+/// whether `reset_display` shows a clock or not, and only the stamp's wall-clock
+/// half may lose cells to it.
+///
+/// The floors are TERMINAL widths. The width math itself runs in the list-area
+/// inner width, 4 cells narrower — the accounts panel's rounded border plus a
+/// 1-cell horizontal padding on each side — so the pure-function floors read
+/// 4 lower than these.
+#[test]
+fn the_live_column_appears_monotonically_in_width() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::Tab;
+
+    // (name length, terminal width at which the column first appears)
+    const FLOORS: &[(usize, u16)] = &[(8, 48), (12, 52), (13, 71), (14, 107), (16, 109), (22, 115)];
+
+    for (name_len, floor) in FLOORS {
+        let name = "n".repeat(*name_len);
+        for clock in [false, true] {
+            let state = AppState {
+                reset_display: if clock {
+                    Some(crate::profile::ResetDisplay::Both)
+                } else {
+                    None
+                },
+                ..Default::default()
+            };
+            let mut app = App::new(AppConfig {
+                state,
+                profiles: vec![oauth(&name, 40.0, 60.0, false)],
+            });
+            app.tab = Tab::Overview;
+
+            let present: Vec<u16> = (34u16..=200)
+                .filter(|w| live_column_present(&app, *w))
+                .collect();
+            let expected: Vec<u16> = (*floor..=200).collect();
+            assert_eq!(
+                present, expected,
+                "the {name_len}-char presence map moved (clock {clock})",
+            );
+        }
+    }
 }

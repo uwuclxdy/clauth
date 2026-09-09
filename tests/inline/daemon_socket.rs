@@ -292,7 +292,10 @@ fn error_replies_carry_stable_error_code() {
 fn switch_to_auth_broken_profile_refused_with_code() {
     let _home = HomeSandbox::new();
     let h = handles(&["work", "home"]);
-    h.config.lock().unwrap().set_auth_broken("work", true);
+    h.config
+        .lock()
+        .unwrap()
+        .set_auth_broken(&crate::profile::ProfileName::from("work"), true);
 
     let resp = dispatch(r#"{"cmd":"switch","profile":"work"}"#, &no_status(), &h);
     assert!(resp.contains("\"ok\":false"), "got: {resp}");

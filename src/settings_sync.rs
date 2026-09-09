@@ -29,10 +29,10 @@
 //!   symmetric [`key_role`] rule gives for free.
 //!
 //! With no live `clauth start` session there is nothing to reconcile and nothing
-//! to lose: teardown removes `runtime/`, so the base is the only surviving
-//! member and the engine's `members.len() < 2` short-circuit makes a sync a
-//! no-op. That is why this runs on the session watchdog and needs no daemon
-//! tick — a headless box has no runtime copy that could diverge.
+//! to lose: teardown discards each session's runtime tree, so the base is the
+//! only surviving member and the engine's `members.len() < 2` short-circuit makes
+//! a sync a no-op. That is why this runs on the session watchdog and needs no
+//! daemon tick — a headless box has no runtime copy that could diverge.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -80,8 +80,8 @@ const PER_PROFILE_TOP_FIELDS: &[&str] = &[
     "model",
 ];
 
-/// Newest mtime from the last [`sync_once`] that did work. Short-circuits ticks
-/// where no file is newer — no reads, parses, or writes.
+/// Newest mtime from the last [`sync_once`] that did work; the key for
+/// [`crate::jsonsync::run_with_cache`]'s fast path.
 static LAST_SYNCED: Mutex<Option<SystemTime>> = Mutex::new(None);
 
 /// Latch for [`warn_paused`], so the pause is reported once rather than on every
@@ -134,25 +134,23 @@ fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
 }
 
 /// Every `settings.json` clauth reconciles: the operator's own
-/// `~/.claude/settings.json` plus each profile's SHARED runtime copy.
-///
-/// `runtime-isolated/settings.json` is deliberately absent. An isolated runtime
-/// is built from an EMPTY base (`runtime::write_merged_settings`), so it carries
-/// none of the operator's hooks, permissions, or statusline; letting it win a
-/// newest-wins race would delete all of them from the base and from every shared
-/// copy, and letting it receive would defeat the isolation it exists for. The
-/// two flavors live in separate directories (`runtime/` vs `runtime-isolated/`),
-/// so excluding it is an exact path check, not a heuristic.
+/// `~/.claude/settings.json` plus each SHARED per-session runtime copy, via
+/// [`crate::jsonsync::runtime_files_under`].
 fn known_paths() -> Result<Vec<PathBuf>> {
-    let mut paths = vec![claude_dir()?.join("settings.json")];
-    let profiles = clauth_dir()?.join("profiles");
-    if let Ok(entries) = std::fs::read_dir(&profiles) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|t| t.is_dir()) && !is_codex_profile_dir(&entry.path()) {
-                paths.push(entry.path().join("runtime").join("settings.json"));
-            }
-        }
-    }
+    let mut paths = crate::jsonsync::runtime_files_under(&claude_dir()?, "settings.json");
+    // Harness gate (fork): a codex profile's dir never becomes a sync target.
+    // Upstream's walk already cannot reach one by construction — a codex start
+    // builds `codex-home/`, never a `runtime*/` dir, and only the latter matches
+    // `is_shared_runtime_dir_name` — but the invariant is the fork's to keep,
+    // not a shape upstream promises, and a hand-made `runtime/` under a codex
+    // profile would otherwise take claude's managed key set into a tree the
+    // codex CLI reads. The operator's own `~/.claude/settings.json` (first
+    // entry) has no profile dir above it, so it can never match.
+    paths.retain(|path| {
+        path.parent()
+            .and_then(Path::parent)
+            .is_none_or(|profile_dir| !is_codex_profile_dir(profile_dir))
+    });
     Ok(paths)
 }
 
@@ -234,27 +232,11 @@ fn warn_paused(path: &Path, reason: &str) -> Option<BTreeSet<String>> {
     None
 }
 
-/// Reconcile every known `settings.json` once. Stat-only fast path: skips reads
-/// when no file is newer than `LAST_SYNCED`. Advances `LAST_SYNCED` only when
-/// the merge actually ran, so a paused or failed tick retries.
+/// Reconcile every known `settings.json` once, behind the `LAST_SYNCED` mtime
+/// fast path in [`crate::jsonsync::run_with_cache`].
 pub(crate) fn sync_once() -> Result<()> {
     let paths = known_paths()?;
-    let Some(newest) = crate::jsonsync::newest_mtime(&paths) else {
-        return Ok(());
-    };
-    {
-        let last = LAST_SYNCED.lock().unwrap_or_else(|p| p.into_inner());
-        if last.is_some_and(|l| newest <= l) {
-            return Ok(());
-        }
-    }
-    if !sync_members(&paths)? {
-        return Ok(());
-    }
-    // `newest` was stated before the lock, so it can only lag what the merge
-    // actually saw — costing at most one redundant tick, never a skipped one.
-    *LAST_SYNCED.lock().unwrap_or_else(|p| p.into_inner()) = Some(newest);
-    Ok(())
+    crate::jsonsync::run_with_cache(&LAST_SYNCED, &paths, || sync_members(&paths))
 }
 
 /// Merge the members under the cross-process state flock. Returns whether the
@@ -282,7 +264,7 @@ pub(crate) fn sync_once() -> Result<()> {
 /// `settings.json` reads, parses, and writes.
 fn sync_members(paths: &[PathBuf]) -> Result<bool> {
     let operator_file = claude_dir()?.join("settings.json");
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let Some(custom_env) = per_profile_env_keys() else {
             return Ok(false);
         };

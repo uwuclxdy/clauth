@@ -1,5 +1,36 @@
 {
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "clauth hook-profile-changed-note",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "clauth hook-profile-changed-note",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "clauth self-heal",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "mcp__plugin_clauth_clauth__delegate$",
@@ -10,6 +41,15 @@
             "asyncRewake": true,
             "timeout": 4260,
             "rewakeMessage": "A backgrounded clauth delegate finished; its result envelope follows."
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "clauth hook-profile-changed-note",
+            "timeout": 10
           }
         ]
       }

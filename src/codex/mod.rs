@@ -8,6 +8,8 @@
 //! `with_state_lock` itself (re-entrant, mirroring `claude.rs`), so callers
 //! may hold it around larger compound operations.
 
+use crate::profile::ProfileName;
+
 pub(crate) mod auth;
 pub(crate) mod login;
 pub(crate) mod oauth;
@@ -34,7 +36,7 @@ pub(crate) fn live_auth_path() -> Result<PathBuf> {
 
 /// A profile's stored codex chain. Distinct filename from the claude
 /// `credentials.json` so a directory listing tells the harness at a glance.
-pub(crate) fn profile_auth_path(name: &str) -> Result<PathBuf> {
+pub(crate) fn profile_auth_path(name: &ProfileName) -> Result<PathBuf> {
     profile_subpath(name, "codex-auth.json")
 }
 
@@ -49,7 +51,7 @@ pub(crate) fn read_live() -> Result<Option<Vec<u8>>> {
 }
 
 /// Raw stored bytes for `name`; `Ok(None)` when the profile has no codex login.
-pub(crate) fn read_profile_auth(name: &str) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_profile_auth(name: &ProfileName) -> Result<Option<Vec<u8>>> {
     let path = profile_auth_path(name)?;
     match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
@@ -63,14 +65,14 @@ pub(crate) fn read_profile_auth(name: &str) -> Result<Option<Vec<u8>>> {
 /// running session errors at its next refresh boundary rather than clobbering
 /// this (feasibility §2.3); the swap takes effect for NEW sessions.
 pub(crate) fn write_live(bytes: &[u8]) -> Result<()> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         atomic_write_600(&live_auth_path()?, bytes).context("failed to write ~/.codex/auth.json")
     })
 }
 
 /// Store `bytes` as `name`'s codex chain (atomic, 0600, whole-file).
-pub(crate) fn write_profile_auth(name: &str, bytes: &[u8]) -> Result<()> {
-    with_state_lock(|| {
+pub(crate) fn write_profile_auth(name: &ProfileName, bytes: &[u8]) -> Result<()> {
+    with_state_lock(|_held| {
         mkdir_700(&crate::profile::profile_dir(name)?)?;
         atomic_write_600(&profile_auth_path(name)?, bytes)
             .with_context(|| format!("failed to write {name}/codex-auth.json"))
@@ -135,7 +137,7 @@ pub(crate) fn codex_processes_running() -> bool {
 /// mirror `claude::archive_live_credentials`; the `.codex-auth.json` suffix
 /// keeps the two retentions independent.
 pub(crate) fn archive_live_auth(label: &str) -> Result<PathBuf> {
-    with_state_lock(|| {
+    with_state_lock(|_held| {
         let path = live_auth_path()?;
         let bytes = std::fs::read(&path).context("live auth.json vanished before archive")?;
         let dir = crate::profile::clauth_dir()?.join("quarantine");

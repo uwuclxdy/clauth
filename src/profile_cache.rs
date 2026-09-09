@@ -6,10 +6,13 @@
 //! module owns that shared IO once; the two layers only differ in their cache
 //! filename and the concrete type.
 
-use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use std::any::TypeId;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+use crate::profile::ProfileName;
 
 /// Filename of the OAuth usage cache, relative to the per-profile dir.
 pub(crate) const USAGE_CACHE_FILE: &str = "usage_cache.json";
@@ -27,6 +30,14 @@ pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
 /// `status.json`, and the daemon's same-account tripwire). Written/dropped
 /// wherever the uuid anchor moves; backfilled by the same `/profile` fetch.
 pub(crate) const ACCOUNT_EMAIL_CACHE_FILE: &str = "account_email.json";
+/// The last adopt refusal announced for this profile, as one of the reason
+/// keys `oauth::try_adopt_live_rotation` refuses with (a bare JSON string).
+/// The refusal is a STANDING state while the live slot stays unadoptable, and
+/// the rotation legs that reach it run in DIFFERENT processes (the daemon
+/// scheduler and the TUI's in-process scheduler), so the once-per-state
+/// announcement is recorded on disk where every process reads it instead of
+/// in either process's memory.
+pub(crate) const ADOPT_REFUSAL_FILE: &str = "adopt_refusal.json";
 
 /// Epoch-ms of this profile's last `/profile` fetch attempt (a bare JSON number).
 /// Derived data: the durable half of `usage::fetch`'s once-per-hour-per-profile
@@ -47,19 +58,182 @@ pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 /// interval (AX report 2026-07-22: ax-codex-cl upgraded plus→pro, label
 /// stuck on plus).
 pub(crate) const CODEX_PLAN_CACHE_FILE: &str = "codex_plan.json";
+/// The last third-party fetch for this profile died on a credential that can
+/// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
+/// against the fingerprint of the credential that produced it.
+///
+/// It exists for the surfaces with no scheduler in the process — `clauth list`
+/// and `clauth status --json` — which otherwise derive freshness from the usage
+/// cache's mtime alone and so report a warm cache behind a dead session as
+/// `Fresh`: a live measurement, over a credential that will never come back.
+/// The refusal splitter `oauth::third_party_dead_chain_copy` is a third reader:
+/// a matched verdict demotes the dead-chain sentence to the keyless one.
+///
+/// This is NOT a freshness claim and cannot go stale in the dangerous
+/// direction: it is a terminal verdict BOUND to one credential, so a re-login
+/// changes the fingerprint and the record stops applying on its own — the same
+/// invalidation rule the scheduler's in-memory suppression uses.
+pub(crate) const THIRD_PARTY_AUTH_FILE: &str = "third_party_auth.json";
+
+/// Body of [`THIRD_PARTY_AUTH_FILE`]. A struct rather than a bare number so a
+/// second field can join without a format break.
+#[derive(Debug, Serialize, Deserialize)]
+struct AuthVerdict {
+    /// `ThirdPartyEntry::credential_fingerprint` of the credential that failed.
+    credential: u64,
+}
+
+/// Record that `name`'s usage credential is dead. Best-effort like every other
+/// per-profile cache: a record that never lands leaves the reader on the
+/// mtime derivation, which is the pre-record answer rather than a worse one.
+pub(crate) fn write_auth_expired(name: &ProfileName, credential: u64) {
+    write_profile_cache(name, THIRD_PARTY_AUTH_FILE, &AuthVerdict { credential });
+}
+
+/// Drop the record — any outcome other than `AuthExpired` proves the verdict no
+/// longer holds. Cheap and unconditional: the file is usually absent.
+pub(crate) fn clear_auth_expired(name: &ProfileName) {
+    remove_profile_cache(name, THIRD_PARTY_AUTH_FILE);
+}
+
+/// Whether `name` carries a dead-credential verdict for the credential it holds
+/// RIGHT NOW. A record for any other fingerprint is inert — that is what makes
+/// this safe to persist.
+pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool {
+    load_profile_cache::<AuthVerdict>(name, THIRD_PARTY_AUTH_FILE)
+        .is_some_and(|v| v.credential == credential)
+}
+
+/// The one credential-store mtime bump clauth makes with NO bytes behind it
+/// ([`TouchReceipt`]). Sits beside the store it describes, so
+/// [`effective_write_time`] resolves it from the store's own path.
+/// Per-profile parked MCP-server logins (`claude::park_mcp_logins_from_store`),
+/// written only while a profile stores no credentials file of its own to hold
+/// them. Carries none of the account's own credential material: the blocks
+/// inside are minted per (MCP server, endpoint) and belong to no Claude account,
+/// which is why a profile that stops storing a login still has to keep them.
+pub(crate) const MCP_LOGINS_FILE: &str = "mcp-logins.json";
+
+pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";
+
+/// A store mtime clauth moved without writing the store.
+///
+/// The per-session swap executor must move the mtime of the store it repoints to
+/// — Claude Code re-reads credentials only when that value changes, so an
+/// mtime-preserving repoint is a silent no-op — but every OTHER reader of that
+/// mtime is asking when the bytes were last WRITTEN, and answers a bare stamp as
+/// "just now". This is what separates the two.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct TouchReceipt {
+    /// File name of the stamped store. A profile can hold both a
+    /// `credentials.json` and a `session-token.json` and only ever one of them
+    /// is stamped, so a receipt for one must not resolve the other.
+    store: String,
+    /// The mtime the stamp actually landed on, read back rather than predicted —
+    /// a coarse filesystem truncates the value asked for. A store whose mtime has
+    /// moved off this has been genuinely written since, which retires the
+    /// receipt.
+    stamped: SystemTime,
+    /// The mtime the stamp displaced: when the store's bytes were last written.
+    prev: Option<SystemTime>,
+}
+
+/// Record that `name`'s `store` carries a bare stamp. Best-effort like every
+/// other per-profile cache — a receipt that never lands leaves the readers on the
+/// raw mtime, which is the pre-receipt answer rather than a worse one.
+pub(crate) fn write_touch_receipt(
+    name: &ProfileName,
+    store: &Path,
+    stamped: SystemTime,
+    prev: Option<SystemTime>,
+) {
+    let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
+        return;
+    };
+    debug_assert!(
+        crate::profile::profile_dir(name).ok().as_deref() == store.parent(),
+        "the receipt is read back from the store's own directory, so it has to be written there",
+    );
+    write_profile_cache(
+        name,
+        TOUCH_RECEIPT_FILE,
+        &TouchReceipt {
+            store: file.to_string(),
+            stamped,
+            prev,
+        },
+    );
+}
+
+/// When `store`'s bytes were last written: its mtime, unless a [`TouchReceipt`]
+/// beside it identifies that exact mtime as a bare stamp — in which case the
+/// value that stamp displaced.
+///
+/// Every decision that compares store mtimes to answer "which side was written
+/// last" resolves through here. A receipt that is absent, unreadable,
+/// unparseable, for the other store, or retired by a later write yields the raw
+/// mtime, so a lost or stale receipt costs exactly the pre-receipt answer.
+pub(crate) fn effective_write_time(store: &Path) -> Option<SystemTime> {
+    // Returns before the receipt read when the store is absent: nothing can have
+    // displaced a write that never happened, and a profile with no sidecar is the
+    // common case on the reload fingerprint's per-profile walk.
+    let mtime = std::fs::metadata(store)
+        .ok()
+        .and_then(|m| m.modified().ok())?;
+    let Some(file) = store.file_name().and_then(|f| f.to_str()) else {
+        return Some(mtime);
+    };
+    std::fs::read_to_string(store.with_file_name(TOUCH_RECEIPT_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<TouchReceipt>(&text).ok())
+        .filter(|receipt| receipt.store == file && mtime == receipt.stamped)
+        .map_or(Some(mtime), |receipt| receipt.prev)
+}
 
 /// Resolve `<profile_dir>/<file>` for `name`. `None` only when the per-profile
 /// dir itself can't be resolved (matches the prior per-layer `cache_path`).
-pub(crate) fn profile_cache_path(name: &str, file: &str) -> Option<PathBuf> {
+pub(crate) fn profile_cache_path(name: &ProfileName, file: &str) -> Option<PathBuf> {
     // `profile_dir` (override-aware) rather than raw `dirs::home_dir`, so tests
     // never touch the real `~/.clauth`.
     crate::profile::profile_dir(name).ok().map(|p| p.join(file))
 }
 
+/// The cache file each usage-cache payload type is written to, so a call site
+/// pairing the wrong constant with the wrong type fails the read instead of
+/// deserializing a foreign file into an all-default value. An all-`serde(default)`
+/// payload (e.g. [`crate::usage::UsageInfo`]) parses ANY JSON object into a
+/// valid-looking all-default answer, so the constant↔type mismatch is invisible
+/// to a parse and no test can catch it — the defect a two-part fix once shipped
+/// half-swallowed by. Payloads with required fields fail a mismatched read on
+/// their own (`ThirdPartyStats`'s `is_available`/`rows`), and `u64` /
+/// `serde_json::Value` parse anything by design; neither needs an entry.
+///
+/// A `TypeId` table rather than a trait bound: a `CachePayload` trait could not
+/// be implemented here for the one payload private to another module
+/// (`throughput::ThroughputStore`), and the bound would force an edit in its
+/// home. The table keeps the guard beside the constants it protects.
+fn expected_cache_file<T: 'static>() -> Option<&'static str> {
+    match TypeId::of::<T>() {
+        t if t == TypeId::of::<crate::usage::UsageInfo>() => Some(USAGE_CACHE_FILE),
+        t if t == TypeId::of::<crate::providers::ThirdPartyStats>() => Some(THIRD_PARTY_CACHE_FILE),
+        _ => None,
+    }
+}
+
 /// Read + deserialize `<profile_dir>/<file>`. `None` on missing file or any
 /// read/parse error — the caller treats both as "no cache" (matches the prior
-/// per-layer loaders exactly).
-pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &str, file: &str) -> Option<T> {
+/// per-layer loaders exactly) — and `None` again when `file` is not the cache
+/// this payload type is written to, so a wrong constant cannot read an
+/// all-default value out of a foreign file (see [`expected_cache_file`]).
+pub(crate) fn load_profile_cache<T: DeserializeOwned + 'static>(
+    name: &ProfileName,
+    file: &str,
+) -> Option<T> {
+    if let Some(expected) = expected_cache_file::<T>()
+        && expected != file
+    {
+        return None;
+    }
     profile_cache_path(name, file).and_then(|p| {
         let text = std::fs::read_to_string(p).ok()?;
         serde_json::from_str::<T>(&text).ok()
@@ -70,7 +244,21 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned>(name: &str, file: &str) ->
 /// (cache is best-effort): a missing parent is created at 0o700, the file at
 /// 0o600, via a tmp + rename so a torn write reads as no cache rather than a
 /// parse failure.
-pub(crate) fn write_profile_cache<T: Serialize>(name: &str, file: &str, value: &T) {
+///
+/// Skips names the on-disk record no longer carries: the fetch legs hold a
+/// stale in-memory config for up to a tick, and the parent creation above
+/// would re-create a deleted profile's directory. Fail-closed — an unreadable
+/// record skips the write too. The tick-driven callers (usage fetch,
+/// scheduler) retry on the next tick; one-shot writers degrade to their
+/// documented safe answers instead (a lost touch receipt yields the raw
+/// mtime, an unseeded anchor reads as unanchored). Cost: one read + TOML
+/// parse of `profiles.toml` per write — the record is small, and the same
+/// read already backs the oauth adopt gate and the daemon's switch-target
+/// existence check.
+pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
+    if !crate::profile::is_configured(name).unwrap_or(false) {
+        return;
+    }
     let Some(path) = profile_cache_path(name, file) else {
         return;
     };
@@ -88,18 +276,22 @@ pub(crate) fn write_profile_cache<T: Serialize>(name: &str, file: &str, value: &
 /// paths (2026-07-12: a profile held a sibling's chain behind its own stale
 /// anchor), while a missing one makes them refuse until the hourly `/profile`
 /// fetch re-backfills it — refuse-and-heal beats trusting a lie.
-pub(crate) fn refresh_account_anchor(name: &str) {
+pub(crate) fn refresh_account_anchor(name: &ProfileName) {
     // ONE read of ~/.claude.json for both halves — two independent reads
     // could straddle a rewrite and pair one account's uuid with another's
     // email (the exact split this pair exists to prevent).
     match crate::claude_json::live_oauth_account_pair() {
         Some((uuid, email)) => {
-            write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &uuid);
+            write_profile_cache(
+                name,
+                ACCOUNT_ID_CACHE_FILE,
+                &crate::profile::AccountId::from(uuid),
+            );
             // The email moves (or drops) in lockstep with the uuid so the
             // anchor pair can never describe two different accounts.
             match email {
                 Some(email) => write_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE, &email),
-                None => drop_cache_file(name, ACCOUNT_EMAIL_CACHE_FILE),
+                None => remove_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE),
             }
         }
         None => drop_account_anchor(name),
@@ -110,28 +302,22 @@ pub(crate) fn refresh_account_anchor(name: &str) {
 /// Email FIRST: a torn drop (crash/unlink failure between the two) must leave
 /// uuid-present + email-absent — harmless, later re-seeded under an agreeing
 /// uuid — never a surviving email the backfill would pair with a NEW uuid.
-pub(crate) fn drop_account_anchor(name: &str) {
-    drop_cache_file(name, ACCOUNT_EMAIL_CACHE_FILE);
-    drop_cache_file(name, ACCOUNT_ID_CACHE_FILE);
+pub(crate) fn drop_account_anchor(name: &ProfileName) {
+    remove_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE);
+    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
 }
 
-pub(crate) fn drop_cache_file(name: &str, file: &str) {
+/// Delete `<profile_dir>/<file>`. Best-effort, same contract as the writer: an
+/// already-absent file and any removal error alike leave the caller with "no
+/// cache", which is the intended post-state either way.
+pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
     if let Some(path) = profile_cache_path(name, file) {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// Delete `<profile_dir>/<file>`. Best-effort, same contract as the writer: an
-/// already-absent file and any removal error alike leave the caller with "no
-/// cache", which is the intended post-state either way. Upstream's name for
-/// [`drop_cache_file`], kept as a delegating alias so upstream call sites merge
-/// without churn.
-pub(crate) fn remove_profile_cache(name: &str, file: &str) {
-    drop_cache_file(name, file);
-}
-
 /// Epoch-ms of `<profile_dir>/<file>`'s last write, or `None` when it's absent.
-pub(crate) fn profile_cache_mtime_ms(name: &str, file: &str) -> Option<u64> {
+pub(crate) fn profile_cache_mtime_ms(name: &ProfileName, file: &str) -> Option<u64> {
     let modified = std::fs::metadata(profile_cache_path(name, file)?)
         .ok()?
         .modified()
@@ -141,3 +327,7 @@ pub(crate) fn profile_cache_mtime_ms(name: &str, file: &str) -> Option<u64> {
         .ok()
         .map(|d| d.as_millis() as u64)
 }
+
+#[cfg(test)]
+#[path = "../tests/inline/profile_cache.rs"]
+mod tests;

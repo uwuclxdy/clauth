@@ -121,6 +121,7 @@ fn drain_reset_style_7d_runs_dry_first_is_warning() {
 /// the only source, and it needs only the window's utilization + `resets_at`.
 #[test]
 fn drain_rate_covers_third_party_windows_from_avg_pace() {
+    let _home = crate::testutil::HomeSandbox::new();
     let p = third_party_profile(60.0, 30.0);
     let config = config_with(vec![p], None, vec![]);
     let app = App::new(config);
@@ -130,21 +131,39 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
     let seven = seven.expect("7d bar synthesizes a window");
 
     assert!(
-        app.active_burn_rate("tp", &UsageInfo::default()).is_none(),
+        app.active_burn_rate(
+            &crate::profile::ProfileName::from("tp"),
+            &UsageInfo::default()
+        )
+        .is_none(),
         "no burn history exists for an api-key profile — avg pace is the only source",
     );
-    let five_rate = drain_rate(&app, "tp", profile, LABEL_5H, &five)
-        .expect("a half-elapsed 5h window yields an avg pace");
-    let seven_rate = drain_rate(&app, "tp", profile, LABEL_7D, &seven)
-        .expect("a half-elapsed 7d window yields an avg pace");
+    let five_rate = drain_rate(
+        &app,
+        &crate::profile::ProfileName::from("tp"),
+        profile,
+        LABEL_5H,
+        &five,
+    )
+    .expect("a half-elapsed 5h window yields an avg pace");
+    let seven_rate = drain_rate(
+        &app,
+        &crate::profile::ProfileName::from("tp"),
+        profile,
+        LABEL_7D,
+        &seven,
+    )
+    .expect("a half-elapsed 7d window yields an avg pace");
     assert!(five_rate > 0.0 && seven_rate > 0.0);
 
-    // 60% over the 2.5h elapsed half of a 5h window = 24 %/h.
+    // 60% over the 2.5h elapsed half of a 5h window is past its 50% ideal line,
+    // so the cap applies: 70 / 3h = 23.3 %/h rather than the plain 24.
     assert!(
-        (five_rate - 24.0).abs() < 0.5,
+        (five_rate - 23.333).abs() < 0.1,
         "5h rate in %/h: {five_rate}"
     );
-    // 30% over the 3.5d elapsed half of a 7d window ≈ 8.57 %/d.
+    // 30% at the 3.5d half of a 7d window is under the line, so it reads the
+    // plain 30 / 3.5d ≈ 8.57 %/d untouched.
     assert!(
         (seven_rate - 30.0 / 3.5).abs() < 0.2,
         "7d rate in %/d: {seven_rate}",
@@ -163,13 +182,21 @@ fn drain_rate_covers_third_party_windows_from_avg_pace() {
 /// with no history recorded, it stays uncolored rather than falling back.
 #[test]
 fn drain_rate_oauth_five_hour_uses_recent_burn() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 60.0, 9_000);
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
     let p = &app.config().profiles[0];
     let w = p.usage.as_ref().unwrap().five_hour.clone().unwrap();
     assert!(
-        drain_rate(&app, "a", p, LABEL_5H, &w).is_none(),
+        drain_rate(
+            &app,
+            &crate::profile::ProfileName::from("a"),
+            p,
+            LABEL_5H,
+            &w
+        )
+        .is_none(),
         "no recorded history → no rate, rather than an avg-pace fallback",
     );
 }
@@ -187,7 +214,6 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
     };
     Profile {
         harness: crate::profile::Harness::Claude,
-        session_feed: false,
         name: "tp".into(),
         base_url: Some("https://api.example.com".into()),
         api_key: Some("k".into()),
@@ -197,11 +223,14 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -220,13 +249,97 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
     }
 }
 
+/// A DeepSeek api-key profile with cached balance rows built from `totals`
+/// (e.g. `["1.71 USD", "100.00 CNY"]`). Each total is preceded by a heading row
+/// whose currency is extracted from the total value. An empty slice produces an
+/// empty-rows snapshot, matching an account whose balance fetch has not landed.
+fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
+    let mut rows = Vec::new();
+    for t in totals {
+        if let Some((_, currency)) = t.rsplit_once(' ') {
+            rows.push(crate::providers::StatRow {
+                label: format!("{currency} balance"),
+                value: String::new(),
+                kind: crate::providers::StatRowKind::Heading,
+            });
+        }
+        rows.push(crate::providers::StatRow {
+            label: crate::providers::DEEPSEEK_BALANCE_ROW_LABEL.into(),
+            value: (*t).to_string(),
+            kind: crate::providers::StatRowKind::Body,
+        });
+    }
+    Profile {
+        harness: Default::default(),
+        name: name.into(),
+        base_url: Some("https://api.deepseek.com/anthropic".into()),
+        api_key: Some("k".into()),
+        auto_start: false,
+        env: BTreeMap::new(),
+        models: Default::default(),
+        fallback_threshold: None,
+        weekly_threshold: None,
+        last_resort: false,
+        preferred: false,
+        rolling_token: false,
+        max_auto_spend: None,
+        check_weekly: true,
+        check_scoped: true,
+        bell_threshold: None,
+        disabled: false,
+        console: None,
+        credentials: None,
+        usage: None,
+        fetch_status: None,
+        provider: Some(crate::providers::Provider::DeepSeek),
+        third_party_usage: Some(crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows,
+            bars: Vec::new(),
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        }),
+    }
+}
+
+/// A DeepSeek profile whose cached rows come from a captured
+/// `third_party_cache.json` (see the `CAPTURED_*_DS_CACHE` constants in
+/// [`crate::testutil`]): the bytes go through the production cache writer and
+/// reader into the field a live app's `apply_usage` fills, so the render path
+/// is driven by captured bytes rather than a hand-built `ThirdPartyStats`.
+fn deepseek_profile_from_cache(name: &str, captured: &str) -> Profile {
+    let base = deepseek_profile(name, &[]);
+    // The cache writer skips names the on-disk record doesn't carry, so the
+    // profile and the state list must exist before the captured bytes land.
+    crate::profile::save_profile(&base).expect("save profile");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(name, captured);
+    let stats = crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("captured cache written and readable");
+    Profile {
+        name: name.into(),
+        base_url: Some("https://api.deepseek.com/anthropic".into()),
+        api_key: Some("k".into()),
+        provider: Some(crate::providers::Provider::DeepSeek),
+        third_party_usage: Some(stats),
+        ..deepseek_profile(name, &[])
+    }
+}
+
 /// A chain-eligible OAuth profile with a live 5h window at `util`%, resetting
 /// in `reset_secs`.
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
     Profile {
         name: name.into(),
         harness: crate::profile::Harness::Claude,
-        session_feed: false,
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -235,11 +348,14 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         fallback_threshold: Some(threshold),
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             five_hour: Some(UsageWindow {
@@ -280,6 +396,7 @@ fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
 // `next_target` returns `None`) — previously silent. b resets sooner than a.
 #[test]
 fn all_exhausted_wrap_mode_shows_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 100.0, 3600);
     let b = profile("b", 95.0, 100.0, 1800);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
@@ -297,6 +414,7 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
 // not depend on an active profile being set at all.
 #[test]
 fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 100.0, 900);
     let b = profile("b", 95.0, 100.0, 3600);
     let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
@@ -312,6 +430,7 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
 // stay hidden (recovery would relink b on the next tick regardless).
 #[test]
 fn partially_exhausted_chain_hides_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 100.0, 3600);
     let b = profile("b", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
@@ -326,6 +445,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
 // Nobody near their threshold at all — the ordinary healthy-chain case.
 #[test]
 fn healthy_chain_hides_resumes_hint() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let b = profile("b", 95.0, 5.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
@@ -340,6 +460,7 @@ fn healthy_chain_hides_resumes_hint() {
 /// active dot (●) — usage alerts are moot until re-login.
 #[test]
 fn broken_login_marker_outranks_bell_and_active() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 10.0, 3600);
     let mut config = config_with(vec![a], Some("a"), vec![]);
@@ -358,6 +479,7 @@ fn broken_login_marker_outranks_bell_and_active() {
 
 #[test]
 fn bell_marker_shows_when_login_is_fine() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
@@ -372,6 +494,7 @@ fn bell_marker_shows_when_login_is_fine() {
 /// the next switch would sign sessions out, so it beats a usage alert.
 #[test]
 fn token_danger_marker_outranks_bell_and_active() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec![]); // active
@@ -397,6 +520,7 @@ fn token_danger_marker_outranks_bell_and_active() {
 /// hue, so the danger assertion below is what pins the canceled arm.
 #[test]
 fn canceled_marker_is_dead_first() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     use crate::usage::{PlanInfo, PlanTier};
     let mut a = profile("a", 95.0, 10.0, 3600);
@@ -422,6 +546,7 @@ fn canceled_marker_is_dead_first() {
 /// But a broken login (×) still wins over a token-danger marker.
 #[test]
 fn broken_login_outranks_token_danger_marker() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let mut config = config_with(vec![a], Some("a"), vec![]);
     config.state.auth_broken.push("a".into());
@@ -434,10 +559,10 @@ fn broken_login_outranks_token_danger_marker() {
     assert!(!text.contains('⊘'), "token marker yields to ×: {text}");
 }
 
-/// A live long-lived token tags the type column (·token) and raises no marker;
-/// an expired one raises the ⊘ danger marker.
+/// A live long-lived token raises no marker; an expired one raises the ⊘ danger marker.
 #[test]
-fn long_lived_token_tags_type_column_and_expired_marks() {
+fn long_lived_token_expired_marks() {
+    let _home = crate::testutil::HomeSandbox::new();
     use crate::claude::SessionTokenStatus as S;
     let day = 86_400_000_i64;
     let a = profile("a", 95.0, 10.0, 3600);
@@ -449,10 +574,6 @@ fn long_lived_token_tags_type_column_and_expired_marks() {
     app.session_tokens
         .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
     let live = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
-    assert!(
-        live.contains("·token"),
-        "type column tags token mode: {live}"
-    );
     assert!(
         !live.contains('⊘'),
         "a live token raises no danger marker: {live}"
@@ -468,6 +589,7 @@ fn long_lived_token_tags_type_column_and_expired_marks() {
 /// would double-signal, and the bar brackets stay plain dim.
 #[test]
 fn cached_row_colors_countdown_amber_and_underlines_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.fetch_status = Some(FetchStatus::Cached);
@@ -501,6 +623,7 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
 
 #[test]
 fn failed_row_colors_countdown_red() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.fetch_status = Some(FetchStatus::Failed);
@@ -540,6 +663,7 @@ fn reset_suffixes(line: &Line<'static>) -> Vec<Span<'static>> {
 /// third-party row's countdowns stayed faint however fast the window drained.
 #[test]
 fn third_party_row_drain_colors_both_countdowns() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = config_with(vec![third_party_profile(60.0, 30.0)], None, vec![]);
     let app = App::new(config);
@@ -564,6 +688,7 @@ fn third_party_row_drain_colors_both_countdowns() {
 /// average pace, so it colors even though the 5h burn history is empty.
 #[test]
 fn oauth_row_drain_colors_the_seven_day_countdown() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 60.0, 9_000);
     a.usage.as_mut().unwrap().seven_day = Some(UsageWindow {
@@ -595,6 +720,7 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
 /// gap-widened layout must still fit.
 #[test]
 fn gap_widening_never_clips_the_row() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("ax-main", 95.0, 10.0, 3600);
     let b = profile("ax-backup", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("ax-main"), vec![]);
@@ -602,13 +728,13 @@ fn gap_widening_never_clips_the_row() {
     for width in 34u16..=200 {
         let w = OverviewWidths::new(width, &app, false);
         let min =
-            fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.route, 2) + TIMER_SLOT;
+            fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.live, 2) + TIMER_SLOT;
         if min > width as usize {
             // Below this the shrink loop has already bottomed out and the row
             // deliberately overflows-and-clips; gap widening isn't the cause.
             continue;
         }
-        let used = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.route, w.gap)
+        let used = fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.live, w.gap)
             + TIMER_SLOT;
         assert!(
             used <= width as usize,
@@ -624,7 +750,6 @@ fn gap_widening_never_clips_the_row() {
 fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
     Profile {
         harness: crate::profile::Harness::Claude,
-        session_feed: false,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -634,11 +759,14 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: Some(ClaudeCredentials {
             claude_ai_oauth: Some(OAuthToken {
                 access_token: "tok".into(),
@@ -661,6 +789,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
 /// column (6 chars) and bleed into the following gap/timer columns.
 #[test]
 fn credentialed_long_label_clamps_to_kind_width() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = credentialed_profile("acct", "enterprise");
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
@@ -698,6 +827,7 @@ fn credentialed_long_label_clamps_to_kind_width() {
 /// same config proves the dimming is per-profile, not global.
 #[test]
 fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
@@ -785,6 +915,7 @@ fn oauth_creds() -> ClaudeCredentials {
 /// every hue, which is what proves the flattening is per-row.
 #[test]
 fn disabled_row_flattens_every_semantic_hue_to_dim() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 90.0, 3600);
     a.disabled = true;
@@ -842,6 +973,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
 /// surviving pulse would differ between them.
 #[test]
 fn disabled_row_type_cell_does_not_pulse() {
+    let _home = crate::testutil::HomeSandbox::new();
     // The wave is a Full-tier effect: `pulse_name_spans` returns flat spans
     // below it. The tier auto-detects from `$COLORTERM`, which CI leaves unset,
     // so an unpinned tier renders every row flat. That makes the assertion
@@ -854,15 +986,14 @@ fn disabled_row_type_cell_does_not_pulse() {
     b.credentials = Some(oauth_creds());
     let config = config_with(vec![a, b], None, vec![]);
 
-    // `pulse_name_spans` keys off `app.started_at.elapsed()`, so two Apps
-    // constructed a real interval apart sample different phases of the wave.
-    // 450ms is the crest of the 900ms sweep, where the envelope peaks: the
-    // phase furthest from the flat 0ms frame, so a surviving pulse shows up at
-    // its widest rather than at some near-zero lean that rounds back to base.
+    // `pulse_name_spans` keys off `App::anim_ms`, so two Apps with different
+    // pinned phases sample different points of the wave. 450ms is the crest of
+    // the 900ms sweep, where the envelope peaks: the phase furthest from the
+    // flat 0ms frame, so a surviving pulse shows up at its widest rather than at
+    // some near-zero lean that rounds back to base.
     let snapshot = |idx: usize| -> Vec<(String, Option<ratatui::style::Color>)> {
         let mut app = App::new(config.clone());
-        app.started_at =
-            std::time::Instant::now() - std::time::Duration::from_millis(450 * idx as u64);
+        app.anim_phase_ms = Some(450 * idx as u64);
         let widths = OverviewWidths::new(110, &app, false);
         render_overview_row(&app, 0, &widths, false, true, None)
             .spans
@@ -879,7 +1010,7 @@ fn disabled_row_type_cell_does_not_pulse() {
     // Control: the ENABLED sibling does pulse, so the comparison above is real.
     let enabled_snapshot = |elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
         let mut app = App::new(config.clone());
-        app.started_at = std::time::Instant::now() - std::time::Duration::from_millis(elapsed_ms);
+        app.anim_phase_ms = Some(elapsed_ms);
         let widths = OverviewWidths::new(110, &app, false);
         render_overview_row(&app, 1, &widths, false, true, None)
             .spans
@@ -894,11 +1025,155 @@ fn disabled_row_type_cell_does_not_pulse() {
     );
 }
 
+/// The type cell's index in a row's span list: cursor, marker, name, name pad,
+/// gap, then the cell. Read positionally on purpose — identifying it by content
+/// would collide with the 5h/7d cells, which render the same `—` whenever a
+/// profile has no usage, which is exactly the fixture these tests use.
+const KIND_SPAN: usize = 5;
+
+/// A no-data dash is not a tier, so the identity wave must not carry it: a lone
+/// glyph color-cycling next to the row's static faint dashes reads as live data.
+/// Same two-phase shape as the disabled-row pin above, and the same reason it
+/// needs a control — without one, a harness that never animates anything passes
+/// this as "no pulse".
+#[test]
+fn no_tier_type_cell_does_not_pulse() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // The wave is Full-tier only; an unpinned tier renders every row flat and
+    // makes the equality below vacuous. Same guard the disabled-row pin carries.
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    // `something_new` is a claim clauth cannot classify, so the row has no tier
+    // at all; `max` is the same row WITH one.
+    let config = config_with(
+        vec![
+            credentialed_profile("a", "something_new"),
+            credentialed_profile("b", "max"),
+        ],
+        None,
+        vec![],
+    );
+
+    let snapshot = |idx: usize, phase_ms: u64| -> Vec<(String, Option<ratatui::style::Color>)> {
+        let mut app = App::new(config.clone());
+        app.anim_phase_ms = Some(phase_ms);
+        let widths = OverviewWidths::new(110, &app, false);
+        render_overview_row(&app, idx, &widths, false, true, None)
+            .spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.fg))
+            .collect()
+    };
+
+    // NOT 450ms, the crest the disabled-row pin above uses. That phase is the
+    // one value a ONE-CHARACTER label cannot express. `pulse_name_spans` weights
+    // char `i` by `crest = ((col − head).cos() · 0.5 + 0.5)²` — note the remap,
+    // which is what turns the cosine's −1 into a 0 rather than a trough. A lone
+    // char sits at `col = 0`, and at progress 0.5 `head` is half a turn, so
+    // `crest = ((−1) · 0.5 + 0.5)² = 0`: no tint, landing on the same base color
+    // as the flat 0ms frame, whose `envelope = sin(0)` is 0 for its own reason.
+    // A `—` cell would then compare equal at both phases whether or not it
+    // pulsed, and the mutation deleting the guard stays green. 135ms is near the
+    // peak `crest × envelope` for one char, where the tint is observable.
+    assert_eq!(
+        snapshot(0, 0),
+        snapshot(0, 135),
+        "a no-tier row must render identically at two wave phases (no pulse)"
+    );
+    assert_ne!(
+        snapshot(1, 0),
+        snapshot(1, 135),
+        "control: a row that HAS a tier really does animate, so the equality above is real"
+    );
+}
+
+/// The dash joins the other no-data cells at `faint`, but only when it is the
+/// whole cell: a disabled row flattens to `dim` the way it outranks every other
+/// cell state, and a row whose label is a REAL one keeps `dim` however it
+/// reached the un-pulsed branch.
+///
+/// That last leg is the one the `no_tier &&` conjunct exists for. An api-key row
+/// has a genuine `API` label AND no credentials, so it lands in the same branch
+/// a no-data dash does; without the conjunct every DeepSeek / Z.ai row fades.
+#[test]
+fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let mut disabled = credentialed_profile("c", "something_new");
+    disabled.disabled = true;
+    let config = config_with(
+        vec![
+            credentialed_profile("a", "something_new"),
+            disabled,
+            Profile::new(
+                "d".to_string(),
+                Some("https://api.deepseek.com/anthropic".to_string()),
+                Some("sk-fixture".to_string()),
+            ),
+            Profile::new("e".to_string(), None, None),
+        ],
+        None,
+        vec![],
+    );
+
+    let cell = |idx: usize| -> (String, Option<ratatui::style::Color>) {
+        let mut app = App::new(config.clone());
+        app.anim_phase_ms = Some(0);
+        let widths = OverviewWidths::new(110, &app, false);
+        let span =
+            render_overview_row(&app, idx, &widths, false, true, None).spans[KIND_SPAN].clone();
+        (span.content.to_string(), span.style.fg)
+    };
+
+    let (bare, bare_fg) = cell(0);
+    assert_eq!(
+        bare.trim_end(),
+        "—",
+        "fixture control: the cell is the dash"
+    );
+    assert_eq!(bare_fg, theme::faint().fg, "a bare dash is a no-data cell");
+
+    let (_, disabled_fg) = cell(1);
+    assert_eq!(
+        disabled_fg,
+        theme::dim().fg,
+        "a disabled row flattens to dim, outranking no-data as it does stale"
+    );
+
+    let (api, api_fg) = cell(2);
+    assert_eq!(
+        api.trim_end(),
+        "API",
+        "fixture control: an api-key row carries a real label, not the dash"
+    );
+    assert_eq!(
+        api_fg,
+        theme::dim().fg,
+        "a real label never fades, however it reached the un-pulsed branch"
+    );
+
+    // An UNCREDENTIALED account reaches the same branch by a different route
+    // (no credentials rather than no tier), and it fades too — the cell is empty
+    // for the same reason, so it reads the same way. This one changed with the
+    // no-data dash and had no leg of its own.
+    let (uncredentialed, uncredentialed_fg) = cell(3);
+    assert_eq!(
+        uncredentialed.trim_end(),
+        "—",
+        "fixture control: an uncredentialed oauth row has no tier to show"
+    );
+    assert_eq!(
+        uncredentialed_fg,
+        theme::faint().fg,
+        "a bare dash is a no-data cell whether or not credentials exist"
+    );
+}
+
 /// A disabled account is never polled, so its refresh countdown would tick to
 /// zero and then claim a refresh forever. The slot renders blank — at full
 /// width, so no column downstream shifts.
 #[test]
 fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut a = profile("a", 95.0, 10.0, 3600);
     a.disabled = true;
     let b = profile("b", 95.0, 10.0, 3600);
@@ -973,6 +1248,7 @@ fn bar_fade_spans(line: &Line<'static>) -> (Style, Style, Style) {
 /// control keeps a real (non-faint) util color to red against.
 #[test]
 fn stale_window_fades_bar_fill_and_percent() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let stale = profile("a", 95.0, 73.0, -60); // reset 60s in the past
     let live = profile("b", 95.0, 73.0, 3600); // reset in 1h
@@ -1016,6 +1292,7 @@ fn stale_window_fades_bar_fill_and_percent() {
 /// a half-faint/half-dim bar — every span flattens to the same dim hue.
 #[test]
 fn disabled_and_past_reset_row_stays_fully_dim() {
+    let _home = crate::testutil::HomeSandbox::new();
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let mut a = profile("a", 95.0, 73.0, -60); // disabled + past-reset
     a.disabled = true;
@@ -1067,11 +1344,24 @@ fn chain_panel_height_floors_at_three_without_panicking() {
 /// content — NOT flung out to the panel's right edge.
 #[test]
 fn chain_row_switch_hint_rides_the_target_row() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
-    let row = chain_row(&cfg, "a", 0, 0, 8, GAUGE_W, 3, None, Some(7200));
+    let row = chain_row(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        ChainRowCtx {
+            index: 0,
+            last: 0,
+            name_w: 8,
+            gauge_w: GAUGE_W,
+            thr_w: 3,
+            reason: None,
+            switch_eta: Some(7200),
+        },
+    );
     let base = row.base_width();
     let line = row.into_line(base + TRAILER_GAP, 60);
     let text = line_text(&line);
@@ -1088,12 +1378,57 @@ fn chain_row_switch_hint_rides_the_target_row() {
     );
 }
 
+/// A projected switch LANDING on the preferred (home) member carries the `⌂`
+/// homecoming glyph, while a switch onto any other member carries the plain `↩`.
+/// Pins the wording that distinguishes a return from an exhaustion hop (spec
+/// item 6) — an inverted glyph (⌂/↩ swapped) would otherwise ship green.
+#[test]
+fn chain_row_marks_a_homecoming_onto_preferred_with_the_house_glyph() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut home = profile("home", 95.0, 10.0, 3600);
+    home.preferred = true;
+    let plain = profile("plain", 95.0, 10.0, 3600);
+    let config = config_with(vec![home, plain], Some("plain"), vec!["home", "plain"]);
+    let app = App::new(config);
+    let cfg = app.config();
+
+    let hint = |name: &str| {
+        let row = chain_row(
+            &cfg,
+            &crate::profile::ProfileName::from(name),
+            ChainRowCtx {
+                index: 0,
+                last: 0,
+                name_w: 8,
+                gauge_w: GAUGE_W,
+                thr_w: 3,
+                reason: None,
+                switch_eta: Some(7200),
+            },
+        );
+        let base = row.base_width();
+        line_text(&row.into_line(base + TRAILER_GAP, 60))
+    };
+
+    let home_hint = hint("home");
+    assert!(
+        home_hint.contains('⌂') && !home_hint.contains('↩'),
+        "a switch onto the preferred member reads as a homecoming: {home_hint}",
+    );
+    let plain_hint = hint("plain");
+    assert!(
+        plain_hint.contains('↩') && !plain_hint.contains('⌂'),
+        "a switch onto a non-preferred member keeps the plain glyph: {plain_hint}",
+    );
+}
+
 /// Every trailer in the panel lands in ONE column, and that column tracks the
 /// widest row's content rather than the panel width. The regression this pins:
 /// padding each row out to `width` stranded the markers at the far right edge of
 /// a wide panel, cells away from the data they mark.
 #[test]
 fn fallback_panel_parks_trailers_next_to_the_content() {
+    let _home = crate::testutil::HomeSandbox::new();
     // `ghost` sits in the chain with no profile behind it, so its row renders
     // the short `missing` arm. Leading with it proves the column is measured off
     // the WIDEST row rather than whichever one happens to come first.
@@ -1139,6 +1474,7 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
 /// between a `95%` row and a `100%` row.
 #[test]
 fn chain_rows_align_the_threshold_percent_column() {
+    let _home = crate::testutil::HomeSandbox::new();
     let ninety_five = profile("a", 95.0, 10.0, 3600);
     let hundred = profile("b", 100.0, 10.0, 3600);
     let config = config_with(vec![ninety_five, hundred], Some("a"), vec!["a", "b"]);
@@ -1164,20 +1500,23 @@ fn chain_rows_align_the_threshold_percent_column() {
 /// imminent-switch projection.
 #[test]
 fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
     let cfg = app.config();
     let row = chain_row(
         &cfg,
-        "a",
-        0,
-        0,
-        8,
-        GAUGE_W,
-        3,
-        Some(BlockedReason::AuthBroken),
-        Some(7200),
+        &crate::profile::ProfileName::from("a"),
+        ChainRowCtx {
+            index: 0,
+            last: 0,
+            name_w: 8,
+            gauge_w: GAUGE_W,
+            thr_w: 3,
+            reason: Some(BlockedReason::AuthBroken),
+            switch_eta: Some(7200),
+        },
     );
     let col = row.base_width() + TRAILER_GAP;
     let text = line_text(&row.into_line(col, 60));
@@ -1192,6 +1531,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
 /// gauge/figure formatting changes.
 #[test]
 fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec!["a"]);
     let app = App::new(config);
@@ -1200,14 +1540,16 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
     let build = || {
         chain_row(
             &cfg,
-            "a",
-            0,
-            0,
-            8,
-            GAUGE_W,
-            3,
-            Some(BlockedReason::AuthBroken),
-            Some(7200),
+            &crate::profile::ProfileName::from("a"),
+            ChainRowCtx {
+                index: 0,
+                last: 0,
+                name_w: 8,
+                gauge_w: GAUGE_W,
+                thr_w: 3,
+                reason: Some(BlockedReason::AuthBroken),
+                switch_eta: Some(7200),
+            },
         )
     };
     let col = build().base_width() + TRAILER_GAP;
@@ -1233,6 +1575,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
 /// fallback panel — exercises the kick-lift read + `blocked_reason` wiring.
 #[test]
 fn fallback_panel_marks_a_blocked_member() {
+    let _home = crate::testutil::HomeSandbox::new();
     let a = profile("a", 95.0, 10.0, 3600);
     let mut config = config_with(vec![a], Some("a"), vec!["a"]);
     config.state.auth_broken.push("a".into());
@@ -1248,31 +1591,687 @@ fn fallback_panel_marks_a_blocked_member() {
     );
 }
 
-// ── Fork-only tests (codex engine, RESCUE, CLA-FEED, forecast, email column) ──
+// ── live-session `active` column ─────────────────────────────────────────────
 
-/// Two-profile roster used by every test in this section: an OAuth profile
-/// and an api-key profile (index 1), so placeholder gating is exercised on
-/// both row kinds.
-fn email_fixture() -> App {
+/// One live session's registry row. `start_profile` doubles as the account it is
+/// on: a session that never swapped runs where it launched, and the swap
+/// attribution itself is pinned in `live_sessions.rs`'s own tests.
+fn live_row(
+    session_id: &str,
+    member: &str,
+    follows_chain: bool,
+) -> crate::live_sessions::LiveSession {
+    crate::live_sessions::LiveSession {
+        follows_chain,
+        ..crate::testutil::live_row(session_id, member)
+    }
+}
+
+/// The cell sitting under the `live` header on `row`, padding included, so the
+/// pin is an exact value AND proves the cell is aligned under its own header.
+fn live_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("live")
+        .expect("the accounts table carries a `live` header");
+    line_text(row).chars().skip(col).collect()
+}
+
+/// The column answers "how many `clauth start` sessions are on this account",
+/// with `⇄` marking that at least one of them can be moved by the chain. It is
+/// DISTINCT from the leading `●`, which marks the one profile a bare `claude`
+/// authenticates as — an account can carry either, both, or neither. That split
+/// is why the header reads `live`: `active` is the `●` sense app-wide.
+#[test]
+fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![
+            profile("main", 95.0, 10.0, 3600),
+            profile("spare", 95.0, 20.0, 3600),
+        ],
+        Some("main"),
+        vec![],
+    ));
+    app.live_sessions = crate::live_sessions::LiveTally::of([
+        live_row("4242-0", "main", true),
+        live_row("4242-1", "main", false),
+        live_row("4242-2", "spare", false),
+    ]);
+
+    let widths = OverviewWidths::new(160, &app, false);
+    let main = render_overview_row(&app, 0, &widths, false, false, None);
+    let spare = render_overview_row(&app, 1, &widths, false, false, None);
+
+    assert_eq!(
+        live_cell_text(&widths, &main),
+        "2  ⇄",
+        "two sessions, one of them steerable"
+    );
+    assert_eq!(
+        live_cell_text(&widths, &spare),
+        "1   ",
+        "a pinned session still holds the account and burns its window, but no `⇄`"
+    );
+}
+
+/// `humanize_duration` goes 7 chars wide once the 7d reset lands in the 10h–23h
+/// band with double-digit minutes (`10h 20m`), and the 26-cell 7d tier was sized
+/// for the 6-char ceiling (`6d 23h`). The overflow leaks past the column's right
+/// edge and shoves every column after it — including `live` — one cell right, so
+/// the `live` header no longer lines up with its cell. Pinning the cell under the
+/// header catches both the overflow and any future change to the budget.
+#[test]
+fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = profile("main", 95.0, 10.0, 3600);
+    if let Some(ref mut usage) = p.usage {
+        // 37200s = 10h 20m → `humanize_duration` emits the 7-char form.
+        usage.seven_day = Some(UsageWindow {
+            utilization: 95.0,
+            resets_at: Some(reset_in(37_200)),
+        });
+    }
+    let mut app = App::new(config_with(vec![p], Some("main"), vec![]));
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
+
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+
+    assert_eq!(
+        live_cell_text(&widths, &row),
+        "1  ⇄",
+        "the 7d reset suffix must not push the live cell past its header"
+    );
+}
+
+/// Zero renders as nothing — cloudy-tui hides a zero count rather than printing
+/// it, and a table full of `0`s would drown the accounts that do host something.
+#[test]
+fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "other", true)]);
+
+    let widths = OverviewWidths::new(160, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+
+    assert_eq!(live_cell_text(&widths, &row), "    ");
+}
+
+/// The column is budgeted on WIDTH alone. Were it budgeted on whether anything
+/// is live, the whole table would reflow the moment someone ran `clauth start`
+/// and reflow back when that session exited — so an empty fleet must lay the
+/// table out exactly as a busy one does.
+#[test]
+fn the_live_column_holds_its_place_while_nothing_is_live() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+
+    let idle_widths = OverviewWidths::new(160, &app, false);
+    let idle_header = line_text(&overview_header(&idle_widths, false));
+    let idle_row = line_text(&render_overview_row(
+        &app,
+        0,
+        &idle_widths,
+        false,
+        false,
+        None,
+    ));
+
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
+    let busy_widths = OverviewWidths::new(160, &app, false);
+    let busy_header = line_text(&overview_header(&busy_widths, false));
+    let busy_row = line_text(&render_overview_row(
+        &app,
+        0,
+        &busy_widths,
+        false,
+        false,
+        None,
+    ));
+
+    assert_eq!(idle_header, busy_header, "the header must not move");
+    let col = idle_header.find("live").expect("a `live` header");
+    assert_eq!(
+        idle_row.chars().take(col).collect::<String>(),
+        busy_row.chars().take(col).collect::<String>(),
+        "no column left of `live` may shift when a session appears"
+    );
+}
+
+/// A column that overflows its row is not dropped, it is CLIPPED — and the
+/// clipping is invisible from a bar/reset count, because the tail ratatui throws
+/// away is this column itself. So the fit gate needs its own pin: below the
+/// width that pays for it the column must be absent, and above it the assembled
+/// row must still fit.
+#[test]
+fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+    app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
+
+    for width in 34u16..=200 {
+        let widths = OverviewWidths::new(width, &app, false);
+        let header = line_text(&overview_header(&widths, false));
+        if widths.live == 0 {
+            assert!(
+                !header.contains("live"),
+                "no column means no header at {width} cols: {header:?}"
+            );
+            continue;
+        }
+        let row = line_text(&render_overview_row(&app, 0, &widths, false, false, None));
+        assert!(
+            header.chars().count() <= width as usize,
+            "the header overflows at {width} cols ({} cells): {header:?}",
+            header.chars().count()
+        );
+        assert!(
+            row.chars().count() <= width as usize,
+            "the row overflows at {width} cols ({} cells): {row:?}",
+            row.chars().count()
+        );
+    }
+}
+
+/// The live column must be monotone in the list-area inner width (`total`):
+/// once it is present at some width it is present at every wider width, and it
+/// never disappears as the terminal narrows. The tier ladders jump several
+/// cells at a time, so the raw fit predicate alone would blink the column on
+/// and off while resizing.
+///
+/// This inner width is 4 cells narrower than the terminal width the render
+/// smoke test sweeps: the accounts panel takes 2 border cells + 2 horizontal
+/// padding cells. Floors here therefore read 4 lower than that test's.
+#[test]
+fn live_column_width_is_monotone_in_inner_width() {
+    for max_name in 8..=22 {
+        let mut prev = None;
+        for total in 30..=200 {
+            let width = live_column_width(max_name, total);
+            if let Some(prev_w) = prev
+                && width != prev_w
+            {
+                assert_eq!(
+                    (prev_w, width),
+                    (0, LIVE_W),
+                    "live column must only appear (0 -> LIVE_W), never drop or \
+                     flip, at name {max_name}, total {total} ({prev_w} -> {width})",
+                );
+            }
+            prev = Some(width);
+        }
+    }
+}
+
+// ── DeepSeek balance in the 5h column ──────────────────────────────────────
+
+/// The cell sitting under the `5h` header on `row`, padding included. Finds the
+/// column from its header so the pin proves alignment, not just presence.
+fn five_hour_cell_text(widths: &OverviewWidths, deepseek: bool, row: &Line<'static>) -> String {
+    let header = line_text(&overview_header(widths, deepseek));
+    let col = header
+        .find("5h")
+        .expect("the accounts table carries a `5h` header");
+    line_text(row)
+        .chars()
+        .skip(col)
+        .take(widths.five_hour)
+        .collect()
+}
+
+/// DeepSeek accounts carry a USD balance where OAuth profiles carry a 5h
+/// utilization window. When one is on the overview the column header names
+/// both roles so the balance cell below it does not read as a mislabeled `%`.
+#[test]
+fn header_reads_5h_balance_when_a_deepseek_profile_is_present() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            profile("main", 95.0, 10.0, 3600),
+            deepseek_profile("ds", &["1.71 USD"]),
+        ],
+        Some("main"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let header = line_text(&overview_header(&widths, any_deepseek(&app)));
+    assert!(
+        header.contains("5h / balance"),
+        "header should name both roles when a DeepSeek account is present: {header:?}"
+    );
+}
+
+/// Without a DeepSeek account the column is a pure 5h window readout, so the
+/// header keeps its original label and does not advertise a balance it has no
+/// cell for.
+#[test]
+fn header_keeps_plain_5h_when_no_deepseek_profile_is_present() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![profile("main", 95.0, 10.0, 3600)],
+        Some("main"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let header = line_text(&overview_header(&widths, any_deepseek(&app)));
+    assert!(
+        !header.contains("balance"),
+        "no DeepSeek account means no balance in the header: {header:?}"
+    );
+    assert!(
+        header.contains("5h"),
+        "the 5h label is still there: {header:?}"
+    );
+}
+
+/// A DeepSeek profile's total balance renders left-aligned and dim in the 5h
+/// column, replacing the bracketed bar an OAuth profile would show there.
+/// Pinned by header column so it also proves the cell sits under its header.
+#[test]
+fn deepseek_row_shows_total_balance_in_5h_column() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            profile("main", 95.0, 10.0, 3600),
+            deepseek_profile("ds", &["1.71 USD"]),
+        ],
+        Some("main"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 1, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.starts_with("[1.71 USD"),
+        "the balance is bracketed and left-aligned: {cell:?}"
+    );
+    assert_eq!(
+        cell.chars().count(),
+        widths.five_hour,
+        "the cell is exactly the column width so the next column does not shift"
+    );
+}
+
+/// The cache on disk outlives the label clauth writes into it. Every DeepSeek
+/// account carries a `third_party_cache.json` an older binary wrote, `profile.rs`
+/// seeds it into `third_party_usage` on every start, and two populations never
+/// get a rewrite at all: a disabled profile is dropped by
+/// `collect_third_party_entries`, and a failing fetch never reaches the arm that
+/// writes. A cell keyed on the current label alone blanks those accounts
+/// permanently, which is why this reads the CAPTURED legacy bytes through the
+/// production reader rather than a row built in Rust.
+#[test]
+fn a_deepseek_cache_written_before_the_rename_still_shows_its_balance() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(crate::testutil::THIRD_PARTY_CACHE_BYTES)
+            .expect("the captured legacy cache parses");
+    let mut ds = deepseek_profile("ds", &[]);
+    ds.third_party_usage = Some(stats);
+    let app = App::new(config_with(vec![ds], Some("ds"), vec![]));
+
+    let widths = OverviewWidths::new(120, &app, false);
+    assert_eq!(
+        widths.deepseek_amount_w, 5,
+        "the legacy row still sizes the amount column (from `31.45`), not 0",
+    );
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.starts_with("[31.45 CNY"),
+        "a cache written before the rename still renders its balance: {cell:?}"
+    );
+}
+
+/// A DeepSeek profile whose balance fetch has not landed (empty rows) renders
+/// the same no-data dash an OAuth profile with no window gets, so the column
+/// reads as "no data yet" rather than a blank cell.
+#[test]
+fn deepseek_row_without_balance_shows_no_data_dash() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &[])],
+        Some("ds"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert_eq!(
+        cell.trim(),
+        "—",
+        "no cached balance renders the no-data dash"
+    );
+}
+
+/// Currencies align across DeepSeek rows: amounts left-pad to the widest so
+/// every currency starts at the same column, with exactly one space after the
+/// longest amount. Without alignment a short amount would butt its currency
+/// against the column's left edge while a long one trails it.
+#[test]
+fn deepseek_balance_currencies_align_across_rows() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            deepseek_profile("short", &["1.71 USD"]),
+            deepseek_profile("long", &["197.50 CNY"]),
+        ],
+        Some("short"),
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let short_row = render_overview_row(&app, 0, &widths, false, false, None);
+    let long_row = render_overview_row(&app, 1, &widths, false, false, None);
+    let short_cell = five_hour_cell_text(&widths, true, &short_row);
+    let long_cell = five_hour_cell_text(&widths, true, &long_row);
+
+    let usd = short_cell.find("USD").expect("USD currency present");
+    let cny = long_cell.find("CNY").expect("CNY currency present");
+    assert_eq!(
+        usd, cny,
+        "currencies start at the same column:\n  {short_cell:?}\n  {long_cell:?}"
+    );
+    // The longest amount ("197.50") has exactly one space before its currency.
+    let before_cny = long_cell.chars().nth(cny.saturating_sub(1)).unwrap_or('!');
+    assert_eq!(
+        before_cny, ' ',
+        "the widest amount gets exactly one space gap: {long_cell:?}"
+    );
+}
+
+/// A DeepSeek profile with multiple currencies above 0 shows both in the 5h
+/// column, comma-joined and sorted by amount descending (highest first).
+#[test]
+fn deepseek_multi_currency_shows_all_above_zero() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["1.71 USD", "100.00 CNY"])],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("USD") && cell.contains("CNY"),
+        "both currencies render: {cell:?}"
+    );
+    // Higher amount first: 100.00 > 1.71, so CNY comes before USD.
+    let cny = cell.find("CNY").expect("CNY present");
+    let usd = cell.find("USD").expect("USD present");
+    assert!(
+        cny < usd,
+        "higher balance (100.00 CNY) renders before 1.71 USD: {cell:?}"
+    );
+}
+
+/// When only one currency is above 0, only that one shows — the zero-balance
+/// currency is dropped.
+#[test]
+fn deepseek_multi_currency_only_shows_above_zero() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["0.00 USD", "100.00 CNY"])],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("CNY") && !cell.contains("USD"),
+        "only the above-zero balance renders: {cell:?}"
+    );
+}
+
+/// The two-wallet ruling (owner 2026-08-28) on the overview column: a profile
+/// whose captured cache carries the empty USD wallet first renders the funded
+/// CNY wallet only, through the same shared selector the MCP roster ranks on.
+#[test]
+fn deepseek_two_wallet_renders_only_the_funded_wallet() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile_from_cache(
+            "tw",
+            crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+        )],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("498.18 CNY"),
+        "the funded wallet is the rendered figure: {cell:?}",
+    );
+    // The currency token, not the amount string: the cell's alignment pads the
+    // amount, so an asserted `0.00 USD` substring is one the renderer can never
+    // produce for a dropped wallet and the absence leg would pin nothing.
+    assert!(
+        !cell.contains("USD"),
+        "the empty wallet must not render: {cell:?}",
+    );
+}
+
+/// One-wallet control for the ruling: a profile whose captured cache carries a
+/// single funded wallet renders exactly as it did before the rule.
+#[test]
+fn deepseek_single_wallet_renders_unchanged() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile_from_cache(
+            "one",
+            crate::testutil::CAPTURED_ONE_WALLET_DS_CACHE,
+        )],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        cell.contains("3640.55 CNY"),
+        "the single wallet is the rendered figure, as before: {cell:?}",
+    );
+}
+
+/// When every currency is 0, the highest one still renders — an account with
+/// no funds is still a real account, and a blank cell would read as no-data.
+#[test]
+fn deepseek_all_zero_shows_the_highest() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![deepseek_profile("ds", &["0.00 USD", "0.00 CNY"])],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
+    let cell = five_hour_cell_text(&widths, true, &row);
+    assert!(
+        !cell.contains('—'),
+        "a zero balance still renders, not the no-data dash: {cell:?}"
+    );
+    assert!(
+        cell.starts_with('['),
+        "still rendered as a bracketed balance: {cell:?}"
+    );
+}
+
+/// `deepseek_amount_w` accounts for all totals across all currencies, so the
+/// widest amount from any currency sets the padding for every profile. The
+/// first currency in each cell starts at the same column across profiles.
+#[test]
+fn deepseek_amount_w_spans_all_currencies() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(
+        vec![
+            deepseek_profile("multi", &["1.71 USD", "197.50 CNY"]),
+            deepseek_profile("single", &["3.14 USD"]),
+        ],
+        None,
+        vec![],
+    ));
+    let widths = OverviewWidths::new(120, &app, false);
+    assert_eq!(
+        widths.deepseek_amount_w, 6,
+        "amount_w must be 6 (from '197.50'), not capped at 4 or 5"
+    );
+
+    let multi_row = render_overview_row(&app, 0, &widths, false, false, None);
+    let single_row = render_overview_row(&app, 1, &widths, false, false, None);
+    let multi_cell = five_hour_cell_text(&widths, true, &multi_row);
+    let single_cell = five_hour_cell_text(&widths, true, &single_row);
+
+    // The first currency in both cells starts at the same column: position
+    // 1 (bracket) + amount_w (6) + 1 (space) = 8.
+    assert_eq!(
+        multi_cell.find("CNY"),
+        single_cell.find("USD"),
+        "first currencies in both cells start at the same column:\n  {multi_cell:?}\n  {single_cell:?}"
+    );
+}
+
+/// The 7d cell text, padding included, under the `7d` header; empty when the
+/// column is dropped. Mirrors `five_hour_cell_text` so the pin proves the cell
+/// sits under its own header, not just that a stamp exists somewhere on the row.
+fn seven_day_cell_text(widths: &OverviewWidths, row: &Line<'static>) -> String {
+    if widths.seven_day == 0 {
+        return String::new();
+    }
+    let header = line_text(&overview_header(widths, false));
+    let col = header
+        .find("7d")
+        .expect("the accounts table carries a `7d` header");
+    line_text(row)
+        .chars()
+        .skip(col)
+        .take(widths.seven_day)
+        .collect()
+}
+
+/// A 12-char account row under `reset_display = both` must never lose its 5h
+/// wall-clock stamp (`· HH:MM`) while the 7d column still paints only the bare
+/// `XX%`. The 7d tier at inner totals 93..101 reserved 17 cells for a bar but
+/// painted 4 (the bar gate is `widths.seven_day >= 18`), so the 5h clock bonus
+/// starved and the stamp dropped between 96 and 97 terminal cols with nothing
+/// gained.
+///
+/// Sweeps TERMINAL widths 40..=170; each render runs in the list-area inner
+/// width 4 cells narrower (the accounts panel's 2 border cells + 1 padding cell
+/// per side, same offset the render smoke test pins). Asserts the 7d stamp map
+/// stays monotone and every 5h-stamp loss is paid for by a newly appeared 7d
+/// bar, then pins the 96/97 boundary in both directions.
+#[test]
+fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut p = profile("aaaaaaaaaaaa", 40.0, 60.0, 3 * 3600 + 1800);
+    if let Some(ref mut usage) = p.usage {
+        usage.seven_day = Some(UsageWindow {
+            utilization: 60.0,
+            resets_at: Some(reset_in(4 * 86400 + 43200)),
+        });
+    }
+    let mut config = config_with(vec![p], None, vec![]);
+    config.state.reset_display = Some(crate::profile::ResetDisplay::Both);
+    let app = App::new(config);
+
+    let mut five_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_stamp = Vec::with_capacity((170 - 40 + 1) as usize);
+    let mut seven_bar = Vec::with_capacity((170 - 40 + 1) as usize);
+
+    for terminal in 40u16..=170 {
+        let widths = OverviewWidths::new(terminal - 4, &app, false);
+        let row = render_overview_row(&app, 0, &widths, false, false, None);
+        let five = five_hour_cell_text(&widths, false, &row);
+        let seven = seven_day_cell_text(&widths, &row);
+        five_stamp.push(five.contains('·'));
+        seven_stamp.push(seven.contains('·'));
+        seven_bar.push(seven.contains('['));
+    }
+
+    // The 7d stamp never blinks: once it appears at some width it stays at
+    // every wider width, like the live column.
+    for i in 1..seven_stamp.len() {
+        assert!(
+            !seven_stamp[i - 1] || seven_stamp[i],
+            "7d stamp disappears at terminal width {}",
+            40 + i
+        );
+    }
+
+    // A width that drops the 5h stamp must newly show the 7d bar at that same
+    // width, so the loss is a real trade, never a bare gutter.
+    for i in 1..five_stamp.len() {
+        if five_stamp[i - 1] && !five_stamp[i] {
+            assert!(
+                seven_bar[i] && !seven_bar[i - 1],
+                "5h stamp lost with no new 7d bar at terminal width {}",
+                40 + i
+            );
+        }
+    }
+
+    // The measured boundary, pinned in both directions: 96 and 97 cols both
+    // keep the stamp. Before the fix 97 dropped it while 96 kept it.
+    assert!(five_stamp[96 - 40], "5h stamp present at 96 cols");
+    assert!(
+        five_stamp[97 - 40],
+        "5h stamp present at 97 cols (the defect width)"
+    );
+}
+
+// ── Fork-only tests (codex harness, account-email column) ────────────────────
+
+/// Two-profile roster used by the email-column tests: an OAuth profile and an
+/// api-key profile (index 1), so placeholder gating is exercised on both row
+/// kinds. Longest name is `ax-main` (7), which the name tier clamps up to its
+/// 8-cell floor at every width.
+/// The fork's email column reads each profile's anchor cache off disk, so
+/// every test that renders it holds a sandbox — upstream's home tripwire
+/// (`profile.rs`) now panics rather than letting a test resolve the operator's
+/// real `~/.clauth`.
+fn email_fixture() -> (crate::testutil::HomeSandbox, App) {
+    // The guard rides WITH the App: the fork's email column reads each
+    // profile's anchor cache off disk, and upstream's home tripwire panics on a
+    // test that resolved the operator's real `~/.clauth`. Returning it means a
+    // new caller cannot forget to hold one.
+    let home = crate::testutil::HomeSandbox::new();
     let oauth = profile("ax-main", 95.0, 10.0, 3600);
     let mut api = profile("relay", 95.0, 0.0, 3600);
     api.base_url = Some("https://api.example.com".into());
     api.api_key = Some("sk-test".into());
     api.usage = None;
     let config = config_with(vec![oauth, api], Some("ax-main"), vec![]);
-    App::new(config)
+    (home, App::new(config))
 }
 
 /// Layout invariants across widths. The 5-tuple equality is a regression
-/// tripwire (today's implementation computes the upstream columns before it
-/// reads `has_email`, so it cannot fail; it exists to catch a refactor that
-/// lets the carve feed back into column sizing). The live protections are the
-/// no-clip bound — REAL row content including the TIMER_SLOT that
-/// `fixed_overview_width` omits — checked against BOTH the width model and
-/// the actually-rendered line, and gap parity on ungranted layouts.
+/// tripwire (today's implementation computes the upstream columns — including
+/// the `live` one — before it reads `has_email`, so it cannot fail; it exists
+/// to catch a refactor that lets the carve feed back into column sizing). The
+/// live protections are the no-clip bound — REAL row content including the
+/// TIMER_SLOT that `fixed_overview_width` omits — checked against BOTH the
+/// width model and the actually-rendered line, and gap parity on ungranted
+/// layouts.
 #[test]
 fn email_column_never_disturbs_the_upstream_columns() {
-    let app = email_fixture();
+    let (_home, app) = email_fixture();
     let long = "a-very-long-account-email@example-domain.com";
     for width in [30u16, 48, 53, 58, 64, 81, 93, 102, 110, 124, 140, 200] {
         let plain = OverviewWidths::new(width, &app, false);
@@ -1284,14 +2283,14 @@ fn email_column_never_disturbs_the_upstream_columns() {
                 plain.kind,
                 plain.five_hour,
                 plain.seven_day,
-                plain.route
+                plain.live
             ),
             (
                 with.name,
                 with.kind,
                 with.five_hour,
                 with.seven_day,
-                with.route
+                with.live
             ),
             "regression tripwire: carve fed back into column sizing at {width}"
         );
@@ -1301,7 +2300,7 @@ fn email_column_never_disturbs_the_upstream_columns() {
                 with.kind,
                 with.five_hour,
                 with.seven_day,
-                with.route,
+                with.live,
                 with.gap,
             ) + TIMER_SLOT
                 + ACCOUNT_GAP
@@ -1338,7 +2337,7 @@ fn email_column_never_disturbs_the_upstream_columns() {
             plain.kind,
             plain.five_hour,
             plain.seven_day,
-            plain.route,
+            plain.live,
             2,
         ) + TIMER_SLOT;
         if plain_min <= width as usize {
@@ -1347,7 +2346,7 @@ fn email_column_never_disturbs_the_upstream_columns() {
                 plain.kind,
                 plain.five_hour,
                 plain.seven_day,
-                plain.route,
+                plain.live,
                 plain.gap,
             ) + TIMER_SLOT;
             assert!(
@@ -1358,25 +2357,26 @@ fn email_column_never_disturbs_the_upstream_columns() {
     }
 }
 
-/// The exact grant boundary and the cap. For this roster (max name 7 →
-/// clamped to the 8 floor; narrow bands: kind 6 / 5h 12 / no 7d / no route)
-/// the real row costs `base 33 + TIMER_SLOT 5`, so the column needs
-/// `38 + ACCOUNT_GAP + ACCOUNT_MIN = 52` columns: one short of that gets
-/// nothing, 52 gets exactly ACCOUNT_MIN. A very wide terminal caps the column
-/// at ACCOUNT_MAX and flows the excess into the elastic gaps (clamped at 8).
+/// The exact grant boundary and the cap. For this roster (max name 7 → clamped
+/// to the 8 floor) width 76 settles on kind 12 / 5h 17 / 7d 5 / live 4, whose
+/// `fixed_overview_width` at GAP_MIN is 57; the real row adds TIMER_SLOT, so it
+/// costs 62 and the column needs `62 + ACCOUNT_GAP + ACCOUNT_MIN = 76` columns:
+/// 75 gets nothing, 76 gets exactly ACCOUNT_MIN. A very wide terminal caps the
+/// column at ACCOUNT_MAX and flows the excess into the elastic gaps (clamped
+/// at 8).
 #[test]
 fn email_column_grant_boundary_and_cap() {
-    let app = email_fixture();
-    assert_eq!(OverviewWidths::new(51, &app, true).account, 0);
-    assert_eq!(OverviewWidths::new(52, &app, true).account, ACCOUNT_MIN);
+    let (_home, app) = email_fixture();
+    assert_eq!(OverviewWidths::new(75, &app, true).account, 0);
+    assert_eq!(OverviewWidths::new(76, &app, true).account, ACCOUNT_MIN);
     let wide = OverviewWidths::new(300, &app, true);
     assert_eq!(wide.account, ACCOUNT_MAX);
     assert_eq!(wide.gap, 8, "excess spare beyond the cap widens gaps");
 }
 
 /// Cell semantics, pinned via em-dash DELTAS against the no-column layout of
-/// the same row (the route and 7d columns legitimately render their own
-/// em-dashes, so a bare `contains('—')` would be tautological):
+/// the same row (the 7d column legitimately renders its own em-dash, so a bare
+/// `contains('—')` would be tautological):
 /// - OAuth + cached email → the address renders (truncated to the column).
 /// - OAuth + no email → exactly ONE extra em-dash (the pending placeholder).
 /// - api-key profile → blank cell, ZERO extra em-dashes (not applicable is
@@ -1384,12 +2384,12 @@ fn email_column_grant_boundary_and_cap() {
 /// - column not granted → no cell at all.
 #[test]
 fn email_cell_semantics_by_profile_kind() {
-    let app = email_fixture();
+    let (_home, app) = email_fixture();
     let granted = OverviewWidths::new(160, &app, true);
     let plain = OverviewWidths::new(160, &app, false);
     assert!(granted.account >= ACCOUNT_MIN);
 
-    let header = line_text(&overview_header(&granted));
+    let header = line_text(&overview_header(&granted, false));
     assert!(
         header.contains("email"),
         "header names the column: {header}"
@@ -1434,13 +2434,12 @@ fn email_cell_semantics_by_profile_kind() {
     );
 }
 
-// ── overview row state cues ──────────────────────────────────────────────
-
 // CDX-2 acceptance: a codex profile with published passive usage renders the
 // harness tag, the codex-slot active dot, and real usage bars — asserted on
 // the rendered line, not eyeballed.
 #[test]
 fn codex_row_renders_harness_tag_and_usage_bars() {
+    let _home = crate::testutil::HomeSandbox::new();
     let mut cdx = profile("cdx-a", 95.0, 62.0, 3600);
     cdx.harness = crate::profile::Harness::Codex;
     let mut config = config_with(vec![cdx], None, vec![]);
@@ -1454,5 +2453,3 @@ fn codex_row_renders_harness_tag_and_usage_bars() {
     assert!(text.contains('●'), "codex-slot active dot renders: {text}");
     assert!(text.contains("62"), "utilization figure renders: {text}");
 }
-
-// ── fallback chain panel: auto-sizing + row trailers ─────────────────────

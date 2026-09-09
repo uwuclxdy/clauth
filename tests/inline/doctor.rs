@@ -105,10 +105,14 @@ mod codex_check {
 
     /// Persist one codex profile (+ optional active marker) into the sandbox.
     fn seed_codex_profile(name: &str, active: bool) {
-        let mut p = blank_profile(name);
+        let mut p = blank_profile(&crate::profile::ProfileName::from(name));
         p.harness = crate::profile::Harness::Codex;
         save_profile(&p).expect("persist profile");
-        crate::codex::write_profile_auth(name, &auth_bytes("at-a", "acct-a")).unwrap();
+        crate::codex::write_profile_auth(
+            &crate::profile::ProfileName::from(name),
+            &auth_bytes("at-a", "acct-a"),
+        )
+        .unwrap();
         let state = AppState {
             profiles: vec![name.into()],
             active_codex_profile: active.then(|| name.into()),
@@ -122,10 +126,14 @@ mod codex_check {
     #[test]
     fn warns_on_a_quarantined_codex_profile() {
         let _home = HomeSandbox::new();
-        let mut p = blank_profile("cdx-dead");
+        let mut p = blank_profile(&crate::profile::ProfileName::from("cdx-dead"));
         p.harness = crate::profile::Harness::Codex;
         save_profile(&p).unwrap();
-        crate::codex::write_profile_auth("cdx-dead", &auth_bytes("at-d", "acct-d")).unwrap();
+        crate::codex::write_profile_auth(
+            &crate::profile::ProfileName::from("cdx-dead"),
+            &auth_bytes("at-d", "acct-d"),
+        )
+        .unwrap();
         save_app_state(&AppState {
             profiles: vec!["cdx-dead".into()],
             auth_broken: vec!["cdx-dead".into()],
@@ -143,7 +151,7 @@ mod codex_check {
     #[test]
     fn warns_when_standby_keep_alive_is_not_landing() {
         let _home = HomeSandbox::new();
-        let mut p = blank_profile("cdx-stale");
+        let mut p = blank_profile(&crate::profile::ProfileName::from("cdx-stale"));
         p.harness = crate::profile::Harness::Codex;
         save_profile(&p).unwrap();
         let old = crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() - 20 * 86_400);
@@ -157,7 +165,8 @@ mod codex_check {
         })
         .to_string()
         .into_bytes();
-        crate::codex::write_profile_auth("cdx-stale", &bytes).unwrap();
+        crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-stale"), &bytes)
+            .unwrap();
         save_app_state(&AppState {
             profiles: vec!["cdx-stale".into()],
             ..AppState::default()
@@ -199,7 +208,7 @@ mod codex_check {
     #[test]
     fn silent_when_no_codex_profile_exists() {
         let _home = HomeSandbox::new();
-        save_profile(&blank_profile("work")).unwrap();
+        save_profile(&blank_profile(&crate::profile::ProfileName::from("work"))).unwrap();
         save_app_state(&AppState {
             profiles: vec!["work".into()],
             ..AppState::default()
@@ -257,7 +266,8 @@ mod codex_check {
         let _home = HomeSandbox::new();
         seed_codex_profile("cdx-a", true);
         crate::codex::write_live(&auth_bytes("at-a", "acct-a")).unwrap();
-        let path = crate::codex::profile_auth_path("cdx-a").unwrap();
+        let path =
+            crate::codex::profile_auth_path(&crate::profile::ProfileName::from("cdx-a")).unwrap();
         set_mtime(
             &path,
             std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400),

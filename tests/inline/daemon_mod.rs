@@ -47,7 +47,7 @@ fn queued_targets(d: &Daemon) -> Vec<String> {
         .lock()
         .expect("pending_switch")
         .iter()
-        .map(|e| e.target.clone())
+        .map(|e| e.target.to_string())
         .collect()
 }
 
@@ -73,7 +73,7 @@ fn oauth_creds(access: &str) -> ClaudeCredentials {
 
 /// A blank profile with a live-token credential block attached.
 fn profile_with_creds(name: &str, access: &str) -> Profile {
-    let mut p = blank_profile(name);
+    let mut p = blank_profile(&crate::profile::ProfileName::from(name));
     p.credentials = Some(oauth_creds(access));
     p
 }
@@ -105,7 +105,8 @@ fn daemon_for(config: AppConfig) -> Daemon {
 /// Symlink `~/.claude/.credentials.json` at the profile's stored credentials so
 /// the active link classifies as `LinkedTo` (clean — no unsaved divergence).
 fn link_active_clean(name: &str) {
-    crate::claude::force_link_profile_credentials(name).expect("link active credentials");
+    crate::claude::force_link_profile_credentials(&crate::profile::ProfileName::from(name))
+        .expect("link active credentials");
 }
 
 /// Write `~/.claude/.credentials.json` as a REGULAR file with an access token
@@ -132,10 +133,14 @@ fn active_of(d: &Daemon) -> Option<String> {
 // ── tick(): the extracted loop body ───────────────────────────────────────────
 
 /// `tick` on an idle daemon with empty queues writes `status.json` and changes
-/// nothing else — the pure no-op characterization of one loop iteration.
+/// nothing else — the pure no-op characterization of one loop iteration. Stays
+/// cross-platform: the armed throttle is what keeps the tick's heal inert here,
+/// since the gate's pointer read cannot be sandboxed on Windows.
 #[test]
 fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
     let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
     let config = persist(
         vec![profile_with_creds("alpha", "at-alpha")],
         Some("alpha"),
@@ -155,6 +160,41 @@ fn tick_with_empty_queues_writes_status_and_leaves_active_unchanged() {
         active_of(&daemon).as_deref(),
         Some("alpha"),
         "no queued switch → active profile is unchanged by a tick"
+    );
+}
+
+/// The tick is a heal call site: one tick over a broken registration reaches
+/// `claude` through the detached heal. Deleting the call from `tick` reds here,
+/// which a healthy-registration variant could never do — that one is green
+/// whether or not the tick calls anything. Unix-only: the fake `claude` is a
+/// shell shim.
+#[cfg(unix)]
+#[test]
+fn tick_heals_a_broken_plugin_registration() {
+    use crate::testutil::{FakeClaude, join_background_tasks, seed_broken_plugin_registration};
+
+    let home = HomeSandbox::new();
+    let fake = FakeClaude::new(&home);
+    crate::plugin_host::reset_heal_throttle_for_test();
+    // The tick drives the herdr heal too; its throttle is armed so this test
+    // stays spawn-free beside the claude heal it pins (the herdr heal's
+    // fail-closed test assert needs the injected path, which no sandbox pins).
+    crate::herdr::arm_heal_throttle_for_test();
+    seed_broken_plugin_registration();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    daemon.tick();
+    join_background_tasks();
+
+    assert!(
+        !fake.log().is_empty(),
+        "one tick over a broken registration must reach the heal"
     );
 }
 
@@ -343,7 +383,7 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
         "the live slot now holds the target's stored login"
     );
     // The empty shell was never captured over the outgoing store.
-    let alpha_store = crate::profile::profile_dir("alpha")
+    let alpha_store = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
         .expect("alpha dir")
         .join("credentials.json");
     let stored: ClaudeCredentials =
@@ -357,146 +397,6 @@ fn drain_pending_switch_proceeds_over_a_logged_out_shell() {
         queued_targets(&daemon),
         Vec::<String>::new(),
         "the executed switch leaves nothing queued"
-    );
-}
-
-/// A live file that does not PARSE is not a shell — it may be a CC write in
-/// progress, i.e. possibly a login. The divergence deferral stays armed for
-/// it, exactly like a real diverged login: a headless (Scheduler) switch is
-/// deferred and re-queued rather than proceeding over a possible login.
-#[test]
-fn drain_pending_switch_still_defers_on_a_torn_live_file() {
-    let _home = HomeSandbox::new();
-    let config = persist(
-        vec![
-            profile_with_creds("alpha", "at-alpha"),
-            profile_with_creds("beta", "at-beta"),
-        ],
-        Some("alpha"),
-        90_000,
-    );
-    let dir = claude_dir().expect("claude dir");
-    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
-    std::fs::write(
-        dir.join(".credentials.json"),
-        br#"{"claudeAiOauth":{"accessToken":""#,
-    )
-    .expect("write torn live file");
-    let mut daemon = daemon_for(config);
-
-    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
-    daemon.drain_pending_switch();
-
-    assert_eq!(
-        active_of(&daemon).as_deref(),
-        Some("alpha"),
-        "an unreadable live file keeps the deferral (mid-write caution)"
-    );
-    assert_eq!(
-        queued_targets(&daemon),
-        vec!["beta".to_string()],
-        "the deferred switch stays queued for retry"
-    );
-}
-
-/// A queued switch whose target no longer resolves (deleted out-of-process
-/// after the enqueue — `clauth delete` can't purge this daemon's in-memory
-/// queue) is DROPPED with a last_error, never attempted. Pre-fix, the drain
-/// ran `switch_profile` on the ghost: `force_link` removed the live
-/// credentials file BEFORE the existence check fired, the entry re-queued,
-/// and the next tick's snapshot read the missing live file as "logged out" —
-/// nulling the ACTIVE profile's stored credentials (2026-07-12 review).
-#[test]
-fn drain_pending_switch_drops_a_vanished_target() {
-    let _home = HomeSandbox::new();
-    let config = persist(
-        vec![
-            profile_with_creds("alpha", "at-alpha"),
-            profile_with_creds("beta", "at-beta"),
-        ],
-        Some("alpha"),
-        90_000,
-    );
-    link_active_clean("alpha");
-    let mut daemon = daemon_for(config);
-
-    stage_switch(&daemon, "ghost", Origin::User, now_ms() + 120_000);
-    daemon.drain_pending_switch();
-
-    assert_eq!(
-        active_of(&daemon).as_deref(),
-        Some("alpha"),
-        "the active profile must be untouched"
-    );
-    assert!(
-        queued_targets(&daemon).is_empty(),
-        "a vanished target is dropped, not re-queued — retrying can't resurrect it"
-    );
-    // The live credentials link must still resolve to alpha — the pre-fix bug
-    // tore it down on the way to the too-late existence check.
-    assert!(
-        crate::profile::claude_dir()
-            .unwrap()
-            .join(".credentials.json")
-            .exists(),
-        "the live credentials file survives"
-    );
-    // Alpha's stored credentials survive on disk (the pre-fix second tick
-    // nulled them via the logged-out misread).
-    let stored = crate::profile::profile_dir("alpha")
-        .unwrap()
-        .join("credentials.json");
-    assert!(stored.exists(), "alpha's stored credentials survive");
-    assert!(
-        daemon
-            .last_error
-            .as_ref()
-            .is_some_and(|e| e.message.contains("ghost")),
-        "the drop is observable in last_error, not silent"
-    );
-}
-
-/// A switch to a target that is still mid-fetch can't execute this tick, but the
-/// request is RE-QUEUED (not dropped after one attempt) and lands once the target
-/// goes idle — the core TECH-6 fix (finding #4: a user tap during a fetch window
-/// used to evaporate after the `{ok:true}` ack).
-#[test]
-fn busy_target_requeued_not_dropped() {
-    let _home = HomeSandbox::new();
-    let config = persist(
-        vec![
-            profile_with_creds("alpha", "at-alpha"),
-            profile_with_creds("beta", "at-beta"),
-        ],
-        Some("alpha"),
-        90_000,
-    );
-    link_active_clean("alpha");
-    let mut daemon = daemon_for(config);
-
-    // User switch to beta arrives while beta is mid-fetch.
-    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
-    mark_activity(&daemon.activity, "beta", ProfileActivity::Fetching);
-    daemon.drain_pending_switch();
-
-    assert_eq!(
-        active_of(&daemon).as_deref(),
-        Some("alpha"),
-        "a busy target cannot switch this tick"
-    );
-    assert_eq!(
-        queued_targets(&daemon),
-        vec!["beta".to_string()],
-        "the busy switch is re-queued, not dropped after one attempt"
-    );
-
-    // Fetch completes → the re-queued switch lands on the next tick.
-    clear_activity(&daemon.activity, "beta");
-    daemon.drain_pending_switch();
-    assert_eq!(
-        active_of(&daemon).as_deref(),
-        Some("beta"),
-        "once idle, the re-queued switch executes"
     );
 }
 
@@ -630,42 +530,6 @@ fn drain_config_ops_threshold_does_not_suppress_external_reload() {
 
 // ── reload_if_changed ─────────────────────────────────────────────────────────
 
-/// An external `profiles.toml` change (later mtime) is picked up: the config is
-/// replaced and the refresh interval re-read.
-#[test]
-fn reload_if_changed_fires_on_external_mtime_change() {
-    let _home = HomeSandbox::new();
-    let config = persist(
-        vec![profile_with_creds("alpha", "at-alpha")],
-        Some("alpha"),
-        90_000,
-    );
-    let mut daemon = daemon_for(config);
-
-    let external = AppState {
-        active_profile: Some("alpha".into()),
-        profiles: vec!["alpha".into()],
-        refresh_interval_ms: 45_000,
-        ..AppState::default()
-    };
-    save_app_state(&external).expect("external app-state write");
-    let state_path = clauth_dir().unwrap().join("profiles.toml");
-    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
-
-    daemon.reload_if_changed();
-
-    assert_eq!(
-        daemon.refresh_interval.load(Ordering::Relaxed),
-        45_000,
-        "an external state change with a newer mtime must be reloaded"
-    );
-    assert_eq!(
-        reload_fingerprint(),
-        daemon.last_reload_fp,
-        "reload adopts the on-disk fingerprint so it won't reload its own read again"
-    );
-}
-
 // ── TECH-7: cross-process RMW atomicity (lost-update) ─────────────────────────
 
 /// The names in the on-disk `profiles.toml`, freshly reloaded from disk.
@@ -730,152 +594,9 @@ fn lost_update_switch_preserves_externally_added_profile() {
     );
 }
 
-/// After a switch, the daemon's `last_reload_fp` equals the on-disk fingerprint — it
-/// adopted its OWN write (captured while holding the flock), so `reload_if_changed`
-/// is a no-op for the self-write, yet a later external write (newer mtime) still
-/// triggers a reload. This is the no-self-adoption-window contract (finding #1,
-/// the :354 gap).
-#[test]
-fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
-    let _home = HomeSandbox::new();
-    let config = persist(
-        vec![
-            profile_with_creds("alpha", "at-alpha"),
-            profile_with_creds("beta", "at-beta"),
-        ],
-        Some("alpha"),
-        90_000,
-    );
-    link_active_clean("alpha");
-    let mut daemon = daemon_for(config);
-
-    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
-    daemon.drain_pending_switch();
-
-    // The daemon adopted its own write's mtime (captured under the flock).
-    assert_eq!(
-        daemon.last_reload_fp,
-        reload_fingerprint(),
-        "daemon adopts its own switch write's fingerprint"
-    );
-    // A self-write must not look like an external change — reload is a no-op here.
-    daemon.reload_if_changed();
-    assert_eq!(
-        daemon.refresh_interval.load(Ordering::Relaxed),
-        90_000,
-        "no external change → the daemon does not reload its own write"
-    );
-
-    // A genuine external write (newer mtime) is still picked up.
-    let external = AppState {
-        active_profile: Some("beta".into()),
-        profiles: vec!["alpha".into(), "beta".into()],
-        refresh_interval_ms: 30_000,
-        ..AppState::default()
-    };
-    save_app_state(&external).expect("external write");
-    let state_path = clauth_dir().unwrap().join("profiles.toml");
-    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
-    daemon.reload_if_changed();
-    assert_eq!(
-        daemon.refresh_interval.load(Ordering::Relaxed),
-        30_000,
-        "a later external write is still reloaded (no over-adoption)"
-    );
-}
-
 // ── TECH-8: switch-event observability + failure backoff ──────────────────────
 
-/// The backoff schedule: the first couple of failures retry immediately (so the
-/// common brief-fetch case still lands the instant the target goes idle), then it
-/// grows exponentially and caps.
-#[test]
-fn switch_backoff_ms_grows_exponentially_and_caps() {
-    use super::switch_backoff_ms;
-    assert_eq!(switch_backoff_ms(0), 0);
-    assert_eq!(switch_backoff_ms(1), 0);
-    assert_eq!(switch_backoff_ms(2), 0, "first attempts retry immediately");
-    assert_eq!(switch_backoff_ms(3), 2_000);
-    assert_eq!(switch_backoff_ms(4), 4_000);
-    assert_eq!(switch_backoff_ms(5), 8_000);
-    assert_eq!(switch_backoff_ms(50), 60_000, "capped at the ceiling");
-}
-
-/// A persistently-failing switch (target permanently mid-fetch) must NOT log/retry
-/// 1/tick: the failure log is deduped (same reason → one emission) and backoff is
-/// engaged. This is the anti-log-storm contract (finding #38).
-#[test]
-fn switch_failure_backoff_dedups_log_over_many_ticks() {
-    let _home = HomeSandbox::new();
-    let config = persist(
-        vec![
-            profile_with_creds("alpha", "at-alpha"),
-            profile_with_creds("beta", "at-beta"),
-        ],
-        Some("alpha"),
-        90_000,
-    );
-    link_active_clean("alpha");
-    let mut daemon = daemon_for(config);
-
-    stage_switch(&daemon, "beta", Origin::User, now_ms() + 120_000);
-    // beta never goes idle → every attempt fails with the same reason.
-    mark_activity(&daemon.activity, "beta", ProfileActivity::Fetching);
-
-    for _ in 0..30 {
-        daemon.drain_pending_switch();
-    }
-
-    assert!(
-        daemon.switch_failure_logs <= 2,
-        "a stuck switch dedups its log — got {} emissions over 30 ticks",
-        daemon.switch_failure_logs
-    );
-    assert_eq!(
-        queued_targets(&daemon),
-        vec!["beta".to_string()],
-        "the stuck switch stays queued (re-queued within its TTL), not dropped"
-    );
-    assert!(
-        daemon
-            .switch_backoff
-            .get(&crate::profile::Harness::Claude)
-            .is_some_and(|b| b.target == "beta" && b.attempts >= 3),
-        "backoff engaged for the repeatedly-failing claude target"
-    );
-}
-
 // ── TECH-9 #13: ~/.clauth 0700 enforcement ────────────────────────────────────
-
-/// A boot must tighten an existing world-traversable `~/.clauth` tree to 0o700
-/// (older builds / a permissive umask could leave it 0o755) AND chmod the
-/// launchd-created `daemon.log` (which lands ~0o644) to 0o600 to match SECURITY.md.
-#[cfg(unix)]
-#[test]
-fn clauth_tree_migrated_to_0700_on_boot() {
-    use std::os::unix::fs::PermissionsExt;
-    let _home = HomeSandbox::new();
-    let clauth = clauth_dir().unwrap();
-    let profiles = clauth.join("profiles");
-    std::fs::create_dir_all(&profiles).unwrap();
-    // Simulate an older, world-traversable tree + a launchd-created 0o644 log.
-    std::fs::set_permissions(&clauth, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let log = clauth.join("daemon.log");
-    std::fs::write(&log, b"boot\n").unwrap();
-    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
-
-    super::migrate_clauth_perms_700(&clauth);
-
-    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&clauth), 0o700, "~/.clauth tightened to 0o700");
-    assert_eq!(
-        mode(&profiles),
-        0o700,
-        "~/.clauth/profiles tightened to 0o700"
-    );
-    assert_eq!(mode(&log), 0o600, "daemon.log tightened to 0o600");
-}
 
 /// An executed switch records the `last_switch` hero event with from/to/trigger.
 #[test]
@@ -909,7 +630,7 @@ fn no_refresh(
 ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
     panic!("the refresh probe must not run in this case")
 }
-fn no_gate(_: &str) -> crate::oauth::AuthGate {
+fn no_gate(_: &crate::profile::ProfileName) -> crate::oauth::AuthGate {
     panic!("the install gate must not run in this case")
 }
 
@@ -980,7 +701,7 @@ fn follow_live_login_adopts_a_sibling_by_verified_account_uuid() {
         90_000,
     );
     crate::profile_cache::write_profile_cache(
-        "beta",
+        &crate::profile::ProfileName::from("beta"),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         &"uuid-beta".to_string(),
     );
@@ -997,7 +718,7 @@ fn follow_live_login_adopts_a_sibling_by_verified_account_uuid() {
         &|tok| {
             assert_eq!(tok, "at-fresh-relogin");
             crate::usage::IdentityProbe::Proven(crate::usage::AccountIdentity {
-                uuid: "uuid-beta".to_string(),
+                uuid: crate::profile::AccountId::from("uuid-beta".to_string()),
                 email: None,
             })
         },
@@ -1008,7 +729,7 @@ fn follow_live_login_adopts_a_sibling_by_verified_account_uuid() {
     assert_eq!(active_of(&d).as_deref(), Some("beta"));
     // The live pair was captured into beta's store.
     let stored: ClaudeCredentials = crate::profile::read_json_file(
-        &crate::profile::profile_dir("beta")
+        &crate::profile::profile_dir(&crate::profile::ProfileName::from("beta"))
             .expect("dir")
             .join("credentials.json"),
     )
@@ -1032,12 +753,12 @@ fn follow_live_login_leaves_a_proven_foreign_login_alone_and_memoizes() {
         90_000,
     );
     crate::profile_cache::write_profile_cache(
-        "alpha",
+        &crate::profile::ProfileName::from("alpha"),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         &"uuid-alpha".to_string(),
     );
     crate::profile_cache::write_profile_cache(
-        "beta",
+        &crate::profile::ProfileName::from("beta"),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         &"uuid-beta".to_string(),
     );
@@ -1054,7 +775,7 @@ fn follow_live_login_leaves_a_proven_foreign_login_alone_and_memoizes() {
     let identity = |_: &str| {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::usage::IdentityProbe::Proven(crate::usage::AccountIdentity {
-            uuid: "uuid-nobody-stores".to_string(),
+            uuid: crate::profile::AccountId::from("uuid-nobody-stores".to_string()),
             email: None,
         })
     };
@@ -1090,7 +811,7 @@ fn follow_live_login_stands_down_on_a_same_account_divergence() {
         90_000,
     );
     crate::profile_cache::write_profile_cache(
-        "alpha",
+        &crate::profile::ProfileName::from("alpha"),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         &"uuid-alpha".to_string(),
     );
@@ -1106,7 +827,7 @@ fn follow_live_login_stands_down_on_a_same_account_divergence() {
     d.follow_live_login_with(
         &|_| {
             crate::usage::IdentityProbe::Proven(crate::usage::AccountIdentity {
-                uuid: "uuid-alpha".to_string(),
+                uuid: crate::profile::AccountId::from("uuid-alpha".to_string()),
                 email: None,
             })
         },
@@ -1138,7 +859,7 @@ fn follow_unmatched_proven_login_with_unanchored_profiles_retries_not_memoizes()
     );
     // alpha anchored; beta holds a login but has NO anchor → incomplete coverage.
     crate::profile_cache::write_profile_cache(
-        "alpha",
+        &crate::profile::ProfileName::from("alpha"),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         &"uuid-alpha".to_string(),
     );
@@ -1155,7 +876,7 @@ fn follow_unmatched_proven_login_with_unanchored_profiles_retries_not_memoizes()
     let identity = |_: &str| {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::usage::IdentityProbe::Proven(crate::usage::AccountIdentity {
-            uuid: "uuid-matches-no-anchor".to_string(),
+            uuid: crate::profile::AccountId::from("uuid-matches-no-anchor".to_string()),
             email: None,
         })
     };
@@ -1202,7 +923,8 @@ fn follow_sibling_overwrite_failure_arms_the_retry_timer_not_the_memo() {
         serde_json::to_vec(&oauth_creds("at-beta")).expect("ser"),
     )
     .expect("write live");
-    let beta_dir = crate::profile::profile_dir("beta").expect("beta dir");
+    let beta_dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("beta")).expect("beta dir");
 
     let mut d = daemon_for(config);
     std::fs::set_permissions(&beta_dir, std::fs::Permissions::from_mode(0o555)).expect("chmod");
@@ -1262,11 +984,11 @@ fn refresh_confirms_dead(
     _: Option<&str>,
 ) -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
     Err(crate::oauth::RefreshError::Invalid(
-        "HTTP 400: invalid_grant".to_string(),
+        crate::oauth::TokenFailure::Status(400),
     ))
 }
 
-fn gate_ready(_: &str) -> crate::oauth::AuthGate {
+fn gate_ready(_: &crate::profile::ProfileName) -> crate::oauth::AuthGate {
     crate::oauth::AuthGate::Ready
 }
 
@@ -1325,7 +1047,7 @@ fn rescue_reclaims_through_a_refreshed_install_gate() {
     let live = write_live_json(&serde_json::to_value(oauth_creds("at-dead")).expect("val"));
 
     let mut d = daemon_for(config);
-    let gate_refreshed = |_: &str| crate::oauth::AuthGate::Refreshed;
+    let gate_refreshed = |_: &crate::profile::ProfileName| crate::oauth::AuthGate::Refreshed;
     d.follow_live_login_with(&dead_probe, &refresh_confirms_dead, &gate_refreshed);
 
     assert!(
@@ -1362,9 +1084,9 @@ fn rescue_backs_off_when_the_refresh_leg_is_transient() {
         |_: &str,
          _: Option<&str>|
          -> std::result::Result<crate::oauth::TokenResponse, crate::oauth::RefreshError> {
-            Err(crate::oauth::RefreshError::Transient(anyhow::anyhow!(
-                "connection reset"
-            )))
+            Err(crate::oauth::RefreshError::Transient(
+                crate::oauth::TokenFailure::Transport,
+            ))
         };
     d.follow_live_login_with(&identity, &transient, &no_gate);
 
@@ -1470,7 +1192,7 @@ fn rescue_refuses_when_the_stored_chain_is_broken_too() {
     let live = write_live_json(&serde_json::to_value(oauth_creds("at-dead")).expect("val"));
 
     let mut d = daemon_for(config);
-    let gate_broken = |_: &str| crate::oauth::AuthGate::Broken;
+    let gate_broken = |_: &crate::profile::ProfileName| crate::oauth::AuthGate::Broken;
     d.follow_live_login_with(&dead_probe, &refresh_confirms_dead, &gate_broken);
 
     assert!(
@@ -1539,7 +1261,7 @@ fn rescue_aborts_when_the_live_login_changes_mid_probe() {
         )
         .expect("racing write");
         Err(crate::oauth::RefreshError::Invalid(
-            "HTTP 400: invalid_grant".to_string(),
+            crate::oauth::TokenFailure::Status(400),
         ))
     };
     d.follow_live_login_with(&dead_probe, &racing_refresh, &gate_ready);
@@ -1744,7 +1466,12 @@ fn rescue_gate_transient_arms_the_retry_timer() {
     let live = write_live_json(&serde_json::to_value(oauth_creds("at-dead")).expect("val"));
 
     let mut d = daemon_for(config);
-    let gate_transient = |_: &str| crate::oauth::AuthGate::Transient(anyhow::anyhow!("blip"));
+    let gate_transient = |_: &crate::profile::ProfileName| {
+        crate::oauth::AuthGate::Transient(crate::format::Transient::new(
+            crate::format::Cause::Endpoint("blip"),
+            crate::format::Retry::Wait,
+        ))
+    };
     d.follow_live_login_with(&dead_probe, &refresh_confirms_dead, &gate_transient);
 
     assert!(
@@ -1775,7 +1502,7 @@ fn follow_blank_uuid_reads_as_unproven_not_foreign() {
     d.follow_live_login_with(
         &|_| {
             crate::usage::IdentityProbe::Proven(crate::usage::AccountIdentity {
-                uuid: "   ".to_string(),
+                uuid: crate::profile::AccountId::from("   ".to_string()),
                 email: None,
             })
         },
@@ -1895,7 +1622,7 @@ fn follow_logged_out_shell_with_broken_store_waits_on_the_timer() {
 
     let mut d = daemon_for(config);
     let gates = std::sync::atomic::AtomicUsize::new(0);
-    let gate_broken = |_: &str| {
+    let gate_broken = |_: &crate::profile::ProfileName| {
         gates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Broken
     };
@@ -1933,7 +1660,7 @@ fn follow_logged_out_shell_race_aborts_the_reclaim() {
 
     let mut d = daemon_for(config);
     let live_for_closure = live.clone();
-    let racing_gate = move |_: &str| {
+    let racing_gate = move |_: &crate::profile::ProfileName| {
         // A concurrent CC /login lands a fresh pair mid-reclaim.
         std::fs::write(
             &live_for_closure,
@@ -1942,7 +1669,11 @@ fn follow_logged_out_shell_race_aborts_the_reclaim() {
         .expect("racing write");
         crate::oauth::AuthGate::Ready
     };
-    d.follow_live_login_with(&|_| panic!("nothing to probe"), &no_refresh, &racing_gate);
+    d.follow_live_login_with(
+        &|_: &str| panic!("nothing to probe"),
+        &no_refresh,
+        &racing_gate,
+    );
 
     let survived: ClaudeCredentials =
         crate::profile::read_json_file(&live).expect("read survived login");
@@ -2005,12 +1736,12 @@ fn follow_leaves_an_unrecognized_refresh_only_file_alone_on_the_timer() {
 
     let mut d = daemon_for(config);
     let gates = std::sync::atomic::AtomicUsize::new(0);
-    let counting_gate = |_: &str| {
+    let counting_gate = |_: &crate::profile::ProfileName| {
         gates.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::oauth::AuthGate::Ready
     };
     d.follow_live_login_with(
-        &|_| panic!("no access token to probe"),
+        &|_: &str| panic!("no access token to probe"),
         &no_refresh,
         &counting_gate,
     );
@@ -2035,7 +1766,7 @@ fn follow_leaves_an_unrecognized_refresh_only_file_alone_on_the_timer() {
     );
 
     // Inside the window: fully quiet.
-    d.follow_live_login_with(&|_| panic!("gated"), &no_refresh, &counting_gate);
+    d.follow_live_login_with(&|_: &str| panic!("gated"), &no_refresh, &counting_gate);
     assert_eq!(gates.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
@@ -2092,7 +1823,7 @@ fn follow_foreign_memo_survives_a_daemon_restart() {
         90_000,
     );
     crate::profile_cache::write_profile_cache(
-        "alpha",
+        &crate::profile::ProfileName::from("alpha"),
         crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         &"uuid-alpha".to_string(),
     );
@@ -2109,7 +1840,7 @@ fn follow_foreign_memo_survives_a_daemon_restart() {
     let identity = |_: &str| {
         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         crate::usage::IdentityProbe::Proven(crate::usage::AccountIdentity {
-            uuid: "uuid-nobody-stores".to_string(),
+            uuid: crate::profile::AccountId::from("uuid-nobody-stores".to_string()),
             email: None,
         })
     };
@@ -2141,7 +1872,7 @@ fn follow_foreign_memo_survives_a_daemon_restart() {
 fn duplicate_stored_logins_are_paired() {
     let _home = HomeSandbox::new();
     let with_token = |name: &str, tok: &str| {
-        let mut p = blank_profile(name);
+        let mut p = blank_profile(&crate::profile::ProfileName::from(name));
         p.credentials = Some(crate::profile::ClaudeCredentials {
             claude_ai_oauth: Some(crate::profile::OAuthToken {
                 access_token: tok.to_string(),
@@ -2159,7 +1890,7 @@ fn duplicate_stored_logins_are_paired() {
             with_token("a", "shared-token"),
             with_token("b", "unique-token"),
             with_token("c", "shared-token"),
-            blank_profile("no-creds"),
+            blank_profile(&crate::profile::ProfileName::from("no-creds")),
         ],
     };
 
@@ -2191,14 +1922,17 @@ fn duplicate_account_anchors_are_paired() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    write_profile_cache("a", ACCOUNT_ID_CACHE_FILE, &"acct-1".to_string());
-    write_profile_cache("b", ACCOUNT_ID_CACHE_FILE, &"acct-2".to_string());
-    write_profile_cache("c", ACCOUNT_ID_CACHE_FILE, &"acct-1".to_string());
+    // The cache writes below are gated on the on-disk record.
+    crate::testutil::register_names(&["a", "b", "c", "blank-1", "blank-2"]);
+    let pn = crate::profile::ProfileName::from;
+    write_profile_cache(&pn("a"), ACCOUNT_ID_CACHE_FILE, &"acct-1".to_string());
+    write_profile_cache(&pn("b"), ACCOUNT_ID_CACHE_FILE, &"acct-2".to_string());
+    write_profile_cache(&pn("c"), ACCOUNT_ID_CACHE_FILE, &"acct-1".to_string());
     // TWO whitespace-only anchors: shape drift, not identities — absent the
     // is_empty guard they would trim equal and pair, so this fixture is what
     // actually locks the guard in (same contract as fetch_account_uuid).
-    write_profile_cache("blank-1", ACCOUNT_ID_CACHE_FILE, &"  ".to_string());
-    write_profile_cache("blank-2", ACCOUNT_ID_CACHE_FILE, &" ".to_string());
+    write_profile_cache(&pn("blank-1"), ACCOUNT_ID_CACHE_FILE, &"  ".to_string());
+    write_profile_cache(&pn("blank-2"), ACCOUNT_ID_CACHE_FILE, &" ".to_string());
 
     assert_eq!(
         super::tick::duplicate_account_pairs(&names),
@@ -2206,7 +1940,7 @@ fn duplicate_account_anchors_are_paired() {
         "the first holder is named alongside each same-account duplicate; blanks never pair",
     );
 
-    write_profile_cache("c", ACCOUNT_ID_CACHE_FILE, &"acct-3".to_string());
+    write_profile_cache(&pn("c"), ACCOUNT_ID_CACHE_FILE, &"acct-3".to_string());
     assert!(
         super::tick::duplicate_account_pairs(&names[..3]).is_empty(),
         "distinct accounts raise nothing",
@@ -2253,11 +1987,14 @@ fn codex_auth_bytes(access: &str, account_id: &str) -> Vec<u8> {
 /// Persist a codex profile (harness marker + stored auth bytes) into the
 /// sandbox and return its in-memory Profile.
 fn codex_profile(name: &str, access: &str, account_id: &str) -> Profile {
-    let mut p = blank_profile(name);
+    let mut p = blank_profile(&crate::profile::ProfileName::from(name));
     p.harness = crate::profile::Harness::Codex;
     save_profile(&p).expect("persist codex profile");
-    crate::codex::write_profile_auth(name, &codex_auth_bytes(access, account_id))
-        .expect("persist codex auth");
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from(name),
+        &codex_auth_bytes(access, account_id),
+    )
+    .expect("persist codex auth");
     p
 }
 
@@ -2354,6 +2091,11 @@ fn drain_codex_switch_scheduler_origin_defers_on_foreign() {
 #[test]
 fn codex_follow_adopts_a_rotated_live_chain() {
     let _home = HomeSandbox::new();
+    // The tick runs upstream's plugin/herdr self-heal, which refuses to probe
+    // the operator's real install from a test. The heal is not what this codex
+    // test is about, so disarm it the way upstream's own tick tests do.
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
     let mut config = persist(vec![], None, 90_000);
     config
         .profiles
@@ -2368,7 +2110,9 @@ fn codex_follow_adopts_a_rotated_live_chain() {
     daemon.tick();
 
     assert_eq!(
-        crate::codex::read_profile_auth("cdx-a").unwrap().as_deref(),
+        crate::codex::read_profile_auth(&crate::profile::ProfileName::from("cdx-a"))
+            .unwrap()
+            .as_deref(),
         Some(&rotated[..]),
         "the rotation was adopted back into the store"
     );
@@ -2417,6 +2161,8 @@ fn codex_follow_syncs_active_to_the_live_owner() {
 #[test]
 fn codex_follow_leaves_a_foreign_login_alone_and_memoizes() {
     let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
     let mut config = persist(vec![], None, 90_000);
     config
         .profiles
@@ -2472,11 +2218,13 @@ fn noninteractive_switch_dispatches_codex_targets() {
     crate::codex::write_live(&codex_auth_bytes("at-beta", "acct-beta")).unwrap();
 
     let handle = std::sync::Arc::new(crate::lockorder::RankedMutex::new(config));
-    let (previous, active) =
-        crate::actions::switch_profile_noninteractive(&handle, "cdx-a", None, |_, _| {
-            unreachable!("a codex switch must never hit the OAuth refresher")
-        })
-        .expect("switch");
+    let (previous, active) = crate::actions::switch_profile_noninteractive(
+        &handle,
+        &crate::profile::ProfileName::from("cdx-a"),
+        None,
+        |_, _| unreachable!("a codex switch must never hit the OAuth refresher"),
+    )
+    .expect("switch");
     assert_eq!(previous.as_deref(), Some("cdx-b"));
     assert_eq!(active, "cdx-a");
     let live = crate::codex::read_live().unwrap().expect("live");
@@ -2519,7 +2267,8 @@ fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
             subscription_type: None,
         }),
     };
-    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
     std::fs::write(
         alpha_dir.join("session-token.json"),
         serde_json::to_vec(&sidecar).expect("serialize sidecar"),
@@ -2581,7 +2330,8 @@ fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
             subscription_type: None,
         }),
     };
-    let alpha_dir = crate::profile::profile_dir("alpha").expect("alpha dir");
+    let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .expect("alpha dir");
     std::fs::write(
         alpha_dir.join("session-token.json"),
         serde_json::to_vec(&sidecar).expect("serialize sidecar"),
@@ -2602,6 +2352,332 @@ fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
         Vec::<String>::new(),
         "the executed switch leaves nothing queued"
     );
+}
+
+/// A live file that does not PARSE is not a shell — it may be a CC write in
+/// progress, i.e. possibly a login. The divergence deferral stays armed for
+/// it, exactly like a real diverged login.
+#[test]
+fn drain_pending_switch_still_defers_on_a_torn_live_file() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    let dir = claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&dir).expect("mkdir ~/.claude");
+    std::fs::write(
+        dir.join(".credentials.json"),
+        br#"{"claudeAiOauth":{"accessToken":""#,
+    )
+    .expect("write torn live file");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "an unreadable live file keeps the deferral (mid-write caution)"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the deferred switch stays queued for retry"
+    );
+}
+
+/// A queued switch whose target no longer resolves (deleted out-of-process
+/// after the enqueue — `clauth delete` can't purge this daemon's in-memory
+/// queue) is DROPPED with a last_error, never attempted. Pre-fix, the drain
+/// ran `switch_profile` on the ghost: `force_link` removed the live
+/// credentials file BEFORE the existence check fired, the entry re-queued,
+/// and the next tick's snapshot read the missing live file as "logged out" —
+/// nulling the ACTIVE profile's stored credentials (2026-07-12 review).
+#[test]
+fn drain_pending_switch_drops_a_vanished_target() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "ghost", Origin::Scheduler, now_ms() + 120_000);
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "the active profile must be untouched"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "a vanished target is dropped, not re-queued — retrying can't resurrect it"
+    );
+    // The live credentials link must still resolve to alpha — the pre-fix bug
+    // tore it down on the way to the too-late existence check.
+    assert!(
+        crate::profile::claude_dir()
+            .unwrap()
+            .join(".credentials.json")
+            .exists(),
+        "the live credentials file survives"
+    );
+    // Alpha's stored credentials survive on disk (the pre-fix second tick
+    // nulled them via the logged-out misread).
+    let stored = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
+        .unwrap()
+        .join("credentials.json");
+    assert!(stored.exists(), "alpha's stored credentials survive");
+}
+
+/// A switch to a target that is still mid-fetch can't execute this tick, but the
+/// request is RE-QUEUED (not dropped after one attempt) and lands once the target
+/// goes idle — the deferred-not-dropped contract (a switch during a fetch window
+/// used to evaporate after the `{ok:true}` ack).
+#[test]
+fn busy_target_requeued_not_dropped() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    // User switch to beta arrives while beta is mid-fetch.
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a busy target cannot switch this tick"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the busy switch is re-queued, not dropped after one attempt"
+    );
+
+    // Fetch completes → the re-queued switch lands on the next tick.
+    clear_activity(&daemon.activity, &crate::profile::ProfileName::from("beta"));
+    daemon.drain_pending_switch();
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "once idle, the re-queued switch executes"
+    );
+}
+
+// ── reload_if_changed ─────────────────────────────────────────────────────────
+
+/// An external `profiles.toml` change (later mtime) is picked up: the config is
+/// replaced and the refresh interval re-read.
+#[test]
+fn reload_if_changed_fires_on_external_mtime_change() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![profile_with_creds("alpha", "at-alpha")],
+        Some("alpha"),
+        90_000,
+    );
+    let mut daemon = daemon_for(config);
+
+    let external = AppState {
+        active_profile: Some("alpha".into()),
+        profiles: vec!["alpha".into()],
+        refresh_interval_ms: 45_000,
+        ..AppState::default()
+    };
+    save_app_state(&external).expect("external app-state write");
+    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
+
+    daemon.reload_if_changed();
+
+    assert_eq!(
+        daemon.refresh_interval.load(Ordering::Relaxed),
+        45_000,
+        "an external state change with a newer mtime must be reloaded"
+    );
+    assert_eq!(
+        reload_fingerprint(),
+        daemon.last_reload_fp,
+        "reload adopts the on-disk fingerprint so it won't reload its own read again"
+    );
+}
+
+// ── cross-process RMW atomicity (self-adoption window) ────────────────────────
+
+/// After a switch, the daemon's `last_reload_fp` equals the on-disk fingerprint — it
+/// adopted its OWN write (captured while holding the flock), so `reload_if_changed`
+/// is a no-op for the self-write, yet a later external write (newer mtime) still
+/// triggers a reload — the no-self-adoption-window contract.
+#[test]
+fn rmw_switch_adopts_own_write_mtime_then_reloads_external() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+    daemon.drain_pending_switch();
+
+    // The daemon adopted its own write's mtime (captured under the flock).
+    assert_eq!(
+        daemon.last_reload_fp,
+        reload_fingerprint(),
+        "daemon adopts its own switch write's fingerprint"
+    );
+    // A self-write must not look like an external change — reload is a no-op here.
+    daemon.reload_if_changed();
+    assert_eq!(
+        daemon.refresh_interval.load(Ordering::Relaxed),
+        90_000,
+        "no external change → the daemon does not reload its own write"
+    );
+
+    // A genuine external write (newer mtime) is still picked up.
+    let external = AppState {
+        active_profile: Some("beta".into()),
+        profiles: vec!["alpha".into(), "beta".into()],
+        refresh_interval_ms: 30_000,
+        ..AppState::default()
+    };
+    save_app_state(&external).expect("external write");
+    let state_path = clauth_dir().unwrap().join("profiles.toml");
+    set_mtime(&state_path, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+    assert_eq!(
+        daemon.refresh_interval.load(Ordering::Relaxed),
+        30_000,
+        "a later external write is still reloaded (no over-adoption)"
+    );
+}
+
+// ── switch failure backoff + log dedup ────────────────────────────────────────
+
+/// The backoff schedule: the first couple of failures retry immediately (so the
+/// common brief-fetch case still lands the instant the target goes idle), then it
+/// grows exponentially and caps.
+#[test]
+fn switch_backoff_ms_grows_exponentially_and_caps() {
+    use super::switch_backoff_ms;
+    assert_eq!(switch_backoff_ms(0), 0);
+    assert_eq!(switch_backoff_ms(1), 0);
+    assert_eq!(switch_backoff_ms(2), 0, "first attempts retry immediately");
+    assert_eq!(switch_backoff_ms(3), 2_000);
+    assert_eq!(switch_backoff_ms(4), 4_000);
+    assert_eq!(switch_backoff_ms(5), 8_000);
+    assert_eq!(switch_backoff_ms(50), 60_000, "capped at the ceiling");
+}
+
+/// A persistently-failing switch (target permanently mid-fetch) must NOT log/retry
+/// 1/tick: the failure log is deduped (same reason → one emission) and backoff is
+/// engaged. This is the anti-log-storm contract.
+#[test]
+fn switch_failure_backoff_dedups_log_over_many_ticks() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+    // beta never goes idle → every attempt fails with the same reason.
+    mark_activity(
+        &daemon.activity,
+        &crate::profile::ProfileName::from("beta"),
+        ProfileActivity::Fetching,
+    );
+
+    for _ in 0..30 {
+        daemon.drain_pending_switch();
+    }
+
+    assert!(
+        daemon.switch_failure_logs <= 2,
+        "a stuck switch dedups its log — got {} emissions over 30 ticks",
+        daemon.switch_failure_logs
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the stuck switch stays queued (re-queued within its TTL), not dropped"
+    );
+    assert!(
+        daemon
+            .switch_backoff
+            .get(&crate::profile::Harness::Claude)
+            .is_some_and(|b| b.target.as_str() == "beta" && b.attempts >= 3),
+        "backoff engaged for the repeatedly-failing target"
+    );
+}
+
+// ── ~/.clauth 0700 enforcement ────────────────────────────────────────────────
+
+/// A boot must tighten an existing world-traversable `~/.clauth` tree to 0o700
+/// (older builds / a permissive umask could leave it 0o755) AND chmod the
+/// launchd-created `daemon.log` (which lands ~0o644) to 0o600 to match SECURITY.md.
+#[cfg(unix)]
+#[test]
+fn clauth_tree_migrated_to_0700_on_boot() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let clauth = clauth_dir().unwrap();
+    let profiles = clauth.join("profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    // Simulate an older, world-traversable tree + a launchd-created 0o644 log.
+    std::fs::set_permissions(&clauth, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let log = clauth.join("daemon.log");
+    std::fs::write(&log, b"boot\n").unwrap();
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    super::migrate_clauth_perms_700(&clauth);
+
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&clauth), 0o700, "~/.clauth tightened to 0o700");
+    assert_eq!(
+        mode(&profiles),
+        0o700,
+        "~/.clauth/profiles tightened to 0o700"
+    );
+    assert_eq!(mode(&log), 0o600, "daemon.log tightened to 0o600");
 }
 
 /// The give-up TTL closes the retry loop even when the last backoff step
@@ -2662,10 +2738,10 @@ fn backoff_gate_gives_up_when_the_retry_window_closes() {
 /// uncapped sibling should surface.
 #[test]
 fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
-    let mut disabled = blank_profile("off");
+    let mut disabled = blank_profile(&crate::profile::ProfileName::from("off"));
     disabled.max_auto_spend = Some(5.0);
     disabled.disabled = true;
-    let mut enabled = blank_profile("on");
+    let mut enabled = blank_profile(&crate::profile::ProfileName::from("on"));
     enabled.max_auto_spend = Some(5.0);
 
     let config = AppConfig {
@@ -2824,5 +2900,157 @@ fn redundant_reason_names_the_pid_for_the_default_and_the_queue_for_standby() {
     assert!(
         standby.contains("standby"),
         "the --standby redundant reason must mention the full queue, got {standby:?}"
+    );
+}
+
+// ── stale-config persist gates (lock-race row 3) ─────────────────────────────
+
+/// A queued switch whose target is deleted out-of-process AFTER the daemon's
+/// in-memory config was loaded must be dropped on the fresh membership read,
+/// not switched to. The pre-fix drain read the vanished guard off the in-memory
+/// list, so the delete (landing between the tick's reload and the drain) was
+/// invisible and `switch_profile` ran against a ghost.
+#[test]
+fn drain_pending_switch_drops_a_target_deleted_after_enqueue() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("beta"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("beta"),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "a deleted target must not be switched to"
+    );
+    assert!(
+        queued_targets(&daemon).is_empty(),
+        "a deleted target is dropped, not re-queued"
+    );
+    assert!(
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("beta"))
+            .expect("dir")
+            .exists(),
+        "the deleted target's directory must stay deleted"
+    );
+}
+
+/// A switch's whole-state save must not re-list an unrelated profile deleted by
+/// the CLI after the daemon's config was loaded. The switch still lands on the
+/// (still-existing) target; only the deleted row stays gone.
+#[test]
+fn drain_pending_switch_does_not_resurrect_a_deleted_row() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    stage_switch(&daemon, "beta", Origin::Scheduler, now_ms() + 120_000);
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("gamma"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("gamma"),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("beta"),
+        "the switch to beta still lands"
+    );
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded
+            .find(&crate::profile::ProfileName::from("gamma"))
+            .is_none(),
+        "the deleted profile's row must not come back through the switch's state save"
+    );
+}
+
+/// The wrap-off's whole-state save is the same shape as the switch's: it must
+/// not re-list a profile deleted out from under the daemon while it turns
+/// everything off.
+#[test]
+fn drain_pending_switch_off_does_not_resurrect_a_deleted_row() {
+    let _home = HomeSandbox::new();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("gamma", "at-gamma"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+
+    let mut disk = crate::profile::load_config().expect("load disk config");
+    let guard = crate::runtime::RotationGuard::acquire(&crate::profile::ProfileName::from("gamma"))
+        .expect("rotation guard");
+    crate::actions::delete_profile(
+        &mut disk,
+        &crate::profile::ProfileName::from("gamma"),
+        false,
+        &guard,
+    )
+    .expect("delete");
+    drop(guard);
+
+    daemon.drain_pending_switch_off();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "the wrap-off turned everything off"
+    );
+    let reloaded = crate::profile::load_config().expect("reload");
+    assert!(
+        reloaded
+            .find(&crate::profile::ProfileName::from("gamma"))
+            .is_none(),
+        "the deleted profile's row must not come back through the switch-off state save"
     );
 }

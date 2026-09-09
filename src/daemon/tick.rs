@@ -110,7 +110,7 @@ pub(super) fn duplicate_account_pairs(names: &[String]) -> Vec<(String, String)>
             (
                 name.as_str(),
                 crate::profile_cache::load_profile_cache::<String>(
-                    name,
+                    &crate::profile::ProfileName::from(name.as_str()),
                     crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
                 ),
             )
@@ -163,6 +163,13 @@ impl super::Daemon {
         self.drain_pending_switch_off();
         self.drain_config_ops();
         self.write_status();
+        // Converge a broken plugin registration in the background. The gate is two
+        // registry reads inline and a needed heal runs detached (throttled inside
+        // `heal_detached`), so this never blocks the run loop.
+        crate::plugin_host::heal_detached();
+        // Same shape for the herdr plugin: update a stale install in the
+        // background, throttled inside its own `heal_detached`.
+        crate::herdr::heal_detached();
     }
 
     /// CDX-1 codex follow (docs/codex-support/PLAN.md §0.4): keep the stored
@@ -198,7 +205,7 @@ impl super::Daemon {
             return;
         }
 
-        let step = crate::lock::with_state_lock(|| -> anyhow::Result<Step> {
+        let step = crate::lock::with_state_lock(|_held| -> anyhow::Result<Step> {
             let Some(bytes) = crate::codex::read_live()? else {
                 return Ok(Step::Quiet);
             };
@@ -243,7 +250,10 @@ impl super::Daemon {
                 .find(|(n, _)| *n == owner)
                 .is_some_and(|(_, stored)| stored[..] != bytes[..]);
             if adopted {
-                crate::codex::write_profile_auth(&owner, &bytes)?;
+                crate::codex::write_profile_auth(
+                    &crate::profile::ProfileName::from(owner.as_str()),
+                    &bytes,
+                )?;
             }
             // Sync the marker while still under the flock, and hand the fresh
             // profiles.toml mtime out so the next reload_if_changed doesn't
@@ -255,7 +265,7 @@ impl super::Daemon {
                 // our delta, and we adopt this write's fingerprint below —
                 // copying one field back would drop a same-tick external edit
                 // until an unrelated later write re-triggered the reload.
-                cfg.state = crate::profile::update_app_state(move |s| {
+                cfg.state = crate::profile::update_app_state(move |s, _held| {
                     s.active_codex_profile = Some(target.as_str().into());
                 })?;
                 Some(reload_fingerprint())
@@ -353,7 +363,7 @@ impl super::Daemon {
             // Name the account when its email half is cached — "SAME ACCOUNT
             // (user@x)" turns the warning from a puzzle into an instruction.
             let email = crate::profile_cache::load_profile_cache::<String>(
-                first,
+                &crate::profile::ProfileName::from(first.as_str()),
                 crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
             )
             .map(|e| format!(" ({e})"))
@@ -398,7 +408,7 @@ impl super::Daemon {
     /// failure against the login.
     fn follow_live_login(&mut self) {
         let cfg = self.config.clone();
-        let gate = move |name: &str| {
+        let gate = move |name: &crate::profile::ProfileName| {
             crate::oauth::ensure_installable(&cfg, name, crate::oauth::refresh_result)
         };
         self.follow_live_login_with(
@@ -416,7 +426,7 @@ impl super::Daemon {
         &mut self,
         identity: &dyn Fn(&str) -> crate::usage::IdentityProbe,
         refresh: RefreshProbe,
-        install_gate: &dyn Fn(&str) -> crate::oauth::AuthGate,
+        install_gate: &dyn Fn(&crate::profile::ProfileName) -> crate::oauth::AuthGate,
     ) {
         let before = (self.follow_memo, self.follow_retry_at);
         self.follow_live_login_inner(identity, refresh, install_gate);
@@ -432,14 +442,14 @@ impl super::Daemon {
         &mut self,
         identity: &dyn Fn(&str) -> crate::usage::IdentityProbe,
         refresh: RefreshProbe,
-        install_gate: &dyn Fn(&str) -> crate::oauth::AuthGate,
+        install_gate: &dyn Fn(&crate::profile::ProfileName) -> crate::oauth::AuthGate,
     ) {
         use crate::claude::{LinkState, classify_credentials_link};
 
         let Some(active) = ({
             #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let cfg = self.config.lock().expect("config poisoned");
-            cfg.state.active_profile.as_deref().map(str::to_string)
+            cfg.state.active_profile.as_ref().cloned()
         }) else {
             self.follow_memo = None;
             return;
@@ -607,15 +617,16 @@ impl super::Daemon {
             #[allow(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             let mut cfg = self.config.lock().expect("config poisoned");
             // Re-check under the lock: an interleaved switch changes the story.
-            if cfg.state.active_profile.as_deref() != Some(active.as_str()) {
+            if cfg.state.active_profile.as_ref() != Some(&active) {
                 return;
             }
+            let owner = crate::profile::ProfileName::from(owner.as_str());
             crate::actions::overwrite_captured_profile(&mut cfg, &owner, snapshot).and_then(|()| {
                 // Narrow delta (TECH-7): this writer owns only
                 // `active_profile`; a concurrent login/chain edit keeps
                 // its own fields.
-                cfg.state = crate::profile::update_app_state(|s| {
-                    s.active_profile = Some(owner.as_str().into());
+                cfg.state = crate::profile::update_app_state(|s, held| {
+                    s.set_active(Some(owner.clone()), held);
                 })?;
                 Ok(())
             })
@@ -689,13 +700,13 @@ impl super::Daemon {
         let mut anchors_complete = true;
         for p in &cfg.profiles {
             let anchor = crate::profile_cache::load_profile_cache::<String>(
-                p.name.as_str(),
+                &p.name,
                 crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
             )
             .filter(|anchor| !anchor.trim().is_empty());
             match anchor {
-                Some(anchor) if anchor == uuid => {
-                    return if p.name.as_str() == active {
+                Some(anchor) if anchor == uuid.as_str() => {
+                    return if p.name == active {
                         LiveOwner::ActiveItself
                     } else {
                         LiveOwner::Sibling(p.name.as_str().to_string())
@@ -760,7 +771,7 @@ impl super::Daemon {
         live: &crate::profile::ClaudeCredentials,
         fingerprint: Option<u64>,
         refresh: RefreshProbe,
-        install_gate: &dyn Fn(&str) -> crate::oauth::AuthGate,
+        install_gate: &dyn Fn(&crate::profile::ProfileName) -> crate::oauth::AuthGate,
     ) {
         let retry_at = crate::usage::now_ms() + FOLLOW_PROBE_RETRY_MS;
         let scopes = live.scopes_joined();
@@ -827,14 +838,15 @@ impl super::Daemon {
                     self.follow_retry_at = retry_at;
                     logline!(
                         "clauth daemon: live login for '{active}' looks dead but the \
-                         endpoint would not confirm it ({e:#}); retrying"
+                         endpoint would not confirm it ({}); retrying",
+                        e.log_detail()
                     );
                     return;
                 }
             },
         }
         self.reclaim_live_slot(
-            active,
+            &crate::profile::ProfileName::from(active),
             "is dead (endpoint-confirmed, matches no stored account)",
             // Overwrite exactly the corpse we probed: a fingerprint moved by
             // a concurrent CC write means fresh credentials landed there —
@@ -853,10 +865,10 @@ impl super::Daemon {
     /// overwritten.
     fn reclaim_live_slot(
         &mut self,
-        active: &str,
+        active: &crate::profile::ProfileName,
         cause: &str,
         still_unchanged: &dyn Fn() -> bool,
-        install_gate: &dyn Fn(&str) -> crate::oauth::AuthGate,
+        install_gate: &dyn Fn(&crate::profile::ProfileName) -> crate::oauth::AuthGate,
     ) {
         let retry_at = crate::usage::now_ms() + FOLLOW_PROBE_RETRY_MS;
         // AUTH-1: never install a dead token — the stored chain must itself
@@ -875,7 +887,8 @@ impl super::Daemon {
                 self.follow_retry_at = retry_at;
                 logline!(
                     "clauth daemon: live login for '{active}' {cause} but its stored login \
-                     could not be refreshed ({e:#}); retrying"
+                     could not be refreshed ({}); retrying",
+                    e.text_with_status()
                 );
                 return;
             }
@@ -985,12 +998,14 @@ impl super::Daemon {
         // queue holds a raw name this process alone owns) is DROPPED, not
         // retried: no re-login can resurrect a profile that no longer exists,
         // and attempting it would run `switch_profile`'s side effects against
-        // a ghost. Recorded in last_error so the drop is observable.
-        let target_exists = self
-            .config
-            .lock()
-            .map(|c| c.find(&winner.target).is_some())
-            .unwrap_or(false);
+        // a ghost. Read off DISK, not the in-memory config: the reload that
+        // would have seen the delete runs only at the top of this tick, so a
+        // delete landing after it leaves the in-memory list stale here. The
+        // logline keeps the drop observable.
+        let target_exists = crate::profile::is_configured(&crate::profile::ProfileName::from(
+            winner.target.as_str(),
+        ))
+        .unwrap_or(false);
         if !target_exists {
             logline!(
                 "clauth daemon: dropping queued switch to '{}': profile no longer exists (deleted?)",
@@ -1070,7 +1085,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.as_deref().map(str::to_string));
+            .and_then(|c| c.state.active_profile.as_ref().cloned());
         let mut discard_diverged = false;
         if let Some(active) = &outgoing
             && active != &winner.target
@@ -1114,7 +1129,13 @@ impl super::Daemon {
                 return;
             }
             crate::oauth::AuthGate::Transient(e) => {
-                self.fail_switch(winner, now, &format!("refresh failed transiently ({e})"));
+                // The daemon log is an operator surface with no companion log of
+                // its own, so it names the status like CLI stderr does.
+                self.fail_switch(
+                    winner,
+                    now,
+                    &format!("refresh failed transiently ({})", e.text_with_status()),
+                );
                 return;
             }
         }
@@ -1131,13 +1152,19 @@ impl super::Daemon {
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|| {
+            // Destination-based: a move landing on the preferred (home) account
+            // logs as a return whether the return pass or an exhaustion walk onto
+            // a clear preferred put us there. Captured under the same lock so the
+            // log names the two apart without threading the cause through the
+            // switch action.
+            let returning = cfg.find(&winner.target).is_some_and(|p| p.preferred);
+            crate::lock::with_state_lock(|_held| {
                 // RESCUE-2: re-check under the flock — the divergence may have
                 // resolved (follow adopted it) since the gate above; archive +
                 // discard only what is still genuinely unsaved.
                 let discard =
-                    discard_diverged && outgoing.as_deref().is_some_and(active_diverged_unsaved);
-                if let Some(active) = outgoing.as_deref().filter(|_| discard) {
+                    discard_diverged && outgoing.as_ref().is_some_and(active_diverged_unsaved);
+                if let Some(active) = outgoing.as_ref().filter(|_| discard) {
                     let dest = crate::claude::archive_live_credentials(active)?;
                     logline!(
                         "clauth daemon: archived '{active}'s unsaved live login to {} — a \
@@ -1148,11 +1175,11 @@ impl super::Daemon {
                 } else {
                     switch_profile(&mut cfg, &winner.target)?;
                 }
-                Ok(reload_fingerprint())
+                Ok((reload_fingerprint(), returning))
             })
         };
         match result {
-            Ok(fp) => {
+            Ok((fp, returning)) => {
                 self.rebuild_tokens();
                 self.last_reload_fp = fp;
                 // TECH-8: record the hero event; clear any failure backoff/dedup.
@@ -1163,7 +1190,14 @@ impl super::Daemon {
                     trigger: origin_trigger(winner.origin),
                 });
                 self.switch_backoff.remove(&winner.harness);
-                logline!("clauth daemon: switched to '{}'", winner.target);
+                if returning {
+                    logline!(
+                        "clauth daemon: returned to preferred account '{}'",
+                        winner.target
+                    );
+                } else {
+                    logline!("clauth daemon: switched to '{}'", winner.target);
+                }
             }
             Err(e) => {
                 self.fail_switch(winner, now, &format!("switch failed: {e}"));
@@ -1186,7 +1220,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_codex_profile.as_deref().map(str::to_string));
+            .and_then(|c| c.state.active_codex_profile.as_ref().cloned());
         // Same TECH-7 shape as the claude arm: hold the flock across the
         // switch AND the post-write mtime read.
         let result = {
@@ -1195,7 +1229,7 @@ impl super::Daemon {
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|| {
+            crate::lock::with_state_lock(|_held| {
                 let report =
                     crate::actions::codex_switch_profile(&mut cfg, &winner.target, policy)?;
                 Ok((report, reload_fingerprint()))
@@ -1314,7 +1348,7 @@ impl super::Daemon {
             .config
             .lock()
             .ok()
-            .and_then(|c| c.state.active_profile.as_deref().map(str::to_string));
+            .and_then(|c| c.state.active_profile.as_ref().cloned());
         let Some(active) = active else {
             return; // already off
         };
@@ -1331,7 +1365,7 @@ impl super::Daemon {
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
-            crate::lock::with_state_lock(|| {
+            crate::lock::with_state_lock(|_held| {
                 switch_off(&mut cfg)?;
                 Ok(reload_fingerprint())
             })

@@ -1,0 +1,65 @@
+{
+  "version": 4,
+  "providers": {
+    "anthropic": {
+      "kind": "first_party",
+      "name": "Anthropic",
+      "vendor": "anthropic"
+    },
+    "avian": {
+      "kind": "reseller",
+      "name": "Avian"
+    },
+    "cloudflare": {
+      "kind": "reseller",
+      "name": "Cloudflare"
+    },
+    "dashscope": {
+      "kind": "first_party",
+      "name": "DashScope",
+      "vendor": "alibaba"
+    },
+    "deepseek": {
+      "kind": "first_party",
+      "name": "DeepSeek",
+      "vendor": "deepseek"
+    },
+    "groq": {
+      "kind": "reseller",
+      "name": "Groq"
+    },
+    "minimax": {
+      "kind": "first_party",
+      "name": "MiniMax",
+      "vendor": "minimax"
+    },
+    "moonshot": {
+      "kind": "first_party",
+      "name": "Moonshot AI",
+      "vendor": "moonshot"
+    },
+    "openai": {
+      "kind": "first_party",
+      "name": "OpenAI",
+      "vendor": "openai"
+    },
+    "openrouter": {
+      "kind": "reseller",
+      "name": "OpenRouter"
+    },
+    "together": {
+      "kind": "reseller",
+      "name": "Together AI"
+    },
+    "xai": {
+      "kind": "first_party",
+      "name": "xAI",
+      "vendor": "xai"
+    },
+    "zai": {
+      "kind": "first_party",
+      "name": "Z.AI",
+      "vendor": "zai"
+    }
+  }
+}

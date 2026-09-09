@@ -133,7 +133,10 @@ pub(crate) fn refresh(
         )));
     }
     serde_json::from_str(&text).map_err(|e| {
-        CodexRefreshError::Transient(crate::oauth::token_parse_error(e, status, text.len()))
+        CodexRefreshError::Transient(anyhow::anyhow!(
+            "{}",
+            crate::oauth::token_parse_error(&e, status, text.len()).log_detail()
+        ))
     })
 }
 

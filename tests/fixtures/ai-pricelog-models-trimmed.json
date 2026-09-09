@@ -1,0 +1,439 @@
+{
+  "version": 4,
+  "models": {
+    "claude-opus-5": {
+      "curated": true,
+      "name": "Claude Opus 5",
+      "sources": {
+        "anthropic": [
+          "claude-opus-5"
+        ],
+        "deepinfra": [
+          "claude-opus-5"
+        ],
+        "digitalocean": [
+          "claude-opus-5"
+        ],
+        "openrouter": [
+          "anthropic/claude-opus-5"
+        ]
+      },
+      "vendor": "anthropic"
+    },
+    "cloudflare/@cf/deepseek-ai/deepseek-v4-pro-0813": {
+      "curated": false,
+      "sources": {
+        "cloudflare": [
+          "@cf/deepseek-ai/deepseek-v4-pro-0813"
+        ]
+      },
+      "vendor": "deepseek-ai"
+    },
+    "deepseek-r1": {
+      "curated": true,
+      "name": "R1",
+      "sources": {
+        "deepseek": [
+          "deepseek-r1"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-r1"
+        ]
+      },
+      "vendor": "deepseek"
+    },
+    "deepseek-v3": {
+      "curated": true,
+      "name": "DeepSeek V3",
+      "sources": {
+        "deepinfra": [
+          "deepseek-v3"
+        ],
+        "deepseek": [
+          "deepseek-v3"
+        ]
+      },
+      "vendor": "deepseek"
+    },
+    "deepseek-v3.2": {
+      "curated": true,
+      "name": "DeepSeek V3.2",
+      "sources": {
+        "dashscope": [
+          "deepseek-v3.2"
+        ],
+        "deepinfra": [
+          "deepseek-v3.2"
+        ],
+        "deepseek": [
+          "deepseek-v3.2"
+        ],
+        "digitalocean": [
+          "deepseek-v3.2"
+        ],
+        "novita": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-v3.2"
+        ],
+        "sambanova": [
+          "deepseek-v3.2"
+        ]
+      },
+      "vendor": "deepseek"
+    },
+    "deepseek-v4-flash": {
+      "curated": true,
+      "name": "DeepSeek V4 Flash",
+      "sources": {
+        "avian": [
+          "deepseek-v4-flash"
+        ],
+        "dashscope": [
+          "deepseek-v4-flash"
+        ],
+        "deepinfra": [
+          "deepseek-v4-flash"
+        ],
+        "deepseek": [
+          "deepseek-v4-flash"
+        ],
+        "digitalocean": [
+          "deepseek-v4-flash"
+        ],
+        "novita": [
+          "deepseek/deepseek-v4-flash"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-v4-flash"
+        ]
+      },
+      "vendor": "deepseek"
+    },
+    "deepseek-v4-pro": {
+      "curated": true,
+      "name": "DeepSeek V4 Pro",
+      "sources": {
+        "avian": [
+          "deepseek-v4-pro"
+        ],
+        "dashscope": [
+          "deepseek-v4-pro"
+        ],
+        "deepinfra": [
+          "deepseek-v4-pro"
+        ],
+        "deepseek": [
+          "deepseek-v4-pro"
+        ],
+        "digitalocean": [
+          "deepseek-v4-pro"
+        ],
+        "fireworks": [
+          "deepseek-v4-pro"
+        ],
+        "novita": [
+          "deepseek/deepseek-v4-pro"
+        ],
+        "openrouter": [
+          "deepseek/deepseek-v4-pro"
+        ],
+        "together": [
+          "deepseek-v4-pro"
+        ]
+      },
+      "vendor": "deepseek"
+    },
+    "glm-4.5": {
+      "curated": true,
+      "name": "GLM 4.5",
+      "sources": {
+        "openrouter": [
+          "z-ai/glm-4.5"
+        ],
+        "zai": [
+          "glm-4.5"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "glm-5.1": {
+      "curated": true,
+      "name": "GLM 5.1",
+      "sources": {
+        "avian": [
+          "glm-5.1"
+        ],
+        "dashscope": [
+          "glm-5.1"
+        ],
+        "digitalocean": [
+          "glm-5.1"
+        ],
+        "novita": [
+          "zai-org/glm-5.1"
+        ],
+        "openrouter": [
+          "z-ai/glm-5.1"
+        ],
+        "zai": [
+          "glm-5.1"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "glm-5.2": {
+      "curated": true,
+      "name": "GLM 5.2",
+      "sources": {
+        "avian": [
+          "glm-5.2"
+        ],
+        "dashscope": [
+          "glm-5.2"
+        ],
+        "databricks": [
+          "glm-5.2"
+        ],
+        "digitalocean": [
+          "glm-5.2"
+        ],
+        "fireworks": [
+          "glm-5.2"
+        ],
+        "novita": [
+          "zai-org/glm-5.2"
+        ],
+        "openrouter": [
+          "z-ai/glm-5.2"
+        ],
+        "scaleway": [
+          "glm-5.2"
+        ],
+        "together": [
+          "glm-5.2"
+        ],
+        "zai": [
+          "glm-5.2"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "glm-5.3-flash": {
+      "curated": true,
+      "name": "GLM 5.3 Flash",
+      "sources": {
+        "digitalocean": [
+          "glm-5.3-flash"
+        ],
+        "novita": [
+          "zai-org/glm-5.3-flash"
+        ],
+        "openrouter": [
+          "z-ai/glm-5.3-flash"
+        ],
+        "together": [
+          "glm-5.3-flash"
+        ],
+        "zai": [
+          "glm-5.3-flash"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "gpt-4.1": {
+      "curated": true,
+      "name": "GPT-4.1",
+      "sources": {
+        "digitalocean": [
+          "gpt-4.1"
+        ],
+        "openai": [
+          "gpt-4.1"
+        ],
+        "openrouter": [
+          "openai/gpt-4.1"
+        ]
+      },
+      "vendor": "openai"
+    },
+    "grok-4.5": {
+      "curated": true,
+      "name": "Grok 4.5",
+      "sources": {
+        "openrouter": [
+          "x-ai/grok-4.5"
+        ],
+        "xai": [
+          "grok-4.5"
+        ]
+      },
+      "vendor": "xai"
+    },
+    "grok-4.6": {
+      "curated": true,
+      "name": "Grok 4.6",
+      "sources": {
+        "openrouter": [
+          "x-ai/grok-4.6"
+        ],
+        "xai": [
+          "grok-4.6"
+        ]
+      },
+      "vendor": "xai"
+    },
+    "kimi-k2.6": {
+      "curated": true,
+      "name": "Kimi K2.6",
+      "sources": {
+        "avian": [
+          "kimi-k2.6"
+        ],
+        "deepinfra": [
+          "kimi-k2.6"
+        ],
+        "digitalocean": [
+          "kimi-k2.6"
+        ],
+        "fireworks": [
+          "kimi-k2.6"
+        ],
+        "moonshot": [
+          "kimi-k2.6"
+        ],
+        "novita": [
+          "moonshotai/kimi-k2.6"
+        ],
+        "openrouter": [
+          "moonshotai/kimi-k2.6"
+        ]
+      },
+      "vendor": "moonshot"
+    },
+    "kimi-k2.7-code": {
+      "curated": true,
+      "name": "Kimi K2.7 Code",
+      "sources": {
+        "dashscope": [
+          "kimi-k2.7-code"
+        ],
+        "deepinfra": [
+          "kimi-k2.7-code"
+        ],
+        "fireworks": [
+          "kimi-k2.7-code"
+        ],
+        "moonshot": [
+          "kimi-k2.7-code"
+        ],
+        "novita": [
+          "moonshotai/kimi-k2.7-code"
+        ],
+        "openrouter": [
+          "moonshotai/kimi-k2.7-code"
+        ],
+        "together": [
+          "kimi-k2.7-code"
+        ]
+      },
+      "vendor": "moonshot"
+    },
+    "minimax/MiniMax-M2.5-Lightning": {
+      "curated": false,
+      "sources": {
+        "minimax": [
+          "MiniMax-M2.5-Lightning"
+        ]
+      },
+      "vendor": "minimax"
+    },
+    "openrouter/aion-labs/aion-2.0": {
+      "curated": false,
+      "sources": {
+        "openrouter": [
+          "aion-labs/aion-2.0"
+        ]
+      },
+      "vendor": "aion-labs"
+    },
+    "openrouter/anthropic/claude-3-haiku": {
+      "curated": false,
+      "sources": {
+        "openrouter": [
+          "anthropic/claude-3-haiku"
+        ]
+      },
+      "vendor": "anthropic"
+    },
+    "qwen3.6-27b": {
+      "curated": true,
+      "name": "Qwen3.6 27B",
+      "sources": {
+        "deepinfra": [
+          "qwen3.6-27b"
+        ],
+        "groq": [
+          "qwen/qwen3.6-27b"
+        ],
+        "novita": [
+          "qwen/qwen3.6-27b"
+        ],
+        "openrouter": [
+          "qwen/qwen3.6-27b"
+        ]
+      },
+      "vendor": "alibaba"
+    },
+    "qwen3.8-max": {
+      "curated": true,
+      "name": "Qwen3.8 Max",
+      "sources": {
+        "dashscope": [
+          "qwen3.8-max"
+        ],
+        "deepinfra": [
+          "qwen3.8-max"
+        ],
+        "digitalocean": [
+          "qwen3.8-max"
+        ],
+        "novita": [
+          "qwen/qwen3.8-max"
+        ],
+        "openrouter": [
+          "qwen/qwen3.8-max"
+        ]
+      },
+      "vendor": "alibaba"
+    },
+    "synth-future-effective": {
+      "curated": false,
+      "sources": {
+        "openai": [
+          "synth-future-effective"
+        ]
+      },
+      "vendor": "openai"
+    },
+    "synth-overlap": {
+      "curated": false,
+      "sources": {
+        "zai": [
+          "synth-overlap"
+        ]
+      },
+      "vendor": "zai"
+    },
+    "synth-volume-tier": {
+      "curated": false,
+      "sources": {
+        "openai": [
+          "synth-volume-tier"
+        ]
+      },
+      "vendor": "openai"
+    }
+  }
+}

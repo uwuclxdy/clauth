@@ -8,7 +8,10 @@ use crate::testutil::{HomeSandbox, blank_profile};
 
 /// Build an in-memory config from profile names + an initial chain.
 fn config(names: &[&str], chain: &[&str]) -> AppConfig {
-    let profiles: Vec<Profile> = names.iter().map(|n| blank_profile(n)).collect();
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|n| blank_profile(&crate::profile::ProfileName::from(*n)))
+        .collect();
     AppConfig {
         state: AppState {
             active_profile: names.first().map(|n| (*n).into()),
@@ -35,7 +38,9 @@ fn add_appends_and_seeds_default_threshold() {
     add(&mut c, "b").unwrap();
     assert_eq!(chain_of(&c), vec!["a", "b"]);
     assert_eq!(
-        c.find("b").unwrap().fallback_threshold,
+        c.find(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .fallback_threshold,
         Some(DEFAULT_THRESHOLD)
     );
 }
@@ -59,9 +64,16 @@ fn add_unknown_profile_errors() {
 fn add_preserves_an_existing_threshold() {
     let _h = HomeSandbox::new();
     let mut c = config(&["a", "b"], &["a"]);
-    c.find_mut("b").unwrap().fallback_threshold = Some(50.0);
+    c.find_mut(&crate::profile::ProfileName::from("b"))
+        .unwrap()
+        .fallback_threshold = Some(50.0);
     add(&mut c, "b").unwrap();
-    assert_eq!(c.find("b").unwrap().fallback_threshold, Some(50.0));
+    assert_eq!(
+        c.find(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .fallback_threshold,
+        Some(50.0)
+    );
 }
 
 #[test]
@@ -113,11 +125,26 @@ fn set_threshold_clamps_to_0_100() {
     let _h = HomeSandbox::new();
     let mut c = config(&["a"], &["a"]);
     set_threshold(&mut c, "a", 150.0).unwrap();
-    assert_eq!(c.find("a").unwrap().fallback_threshold, Some(100.0));
+    assert_eq!(
+        c.find(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .fallback_threshold,
+        Some(100.0)
+    );
     set_threshold(&mut c, "a", -5.0).unwrap();
-    assert_eq!(c.find("a").unwrap().fallback_threshold, Some(0.0));
+    assert_eq!(
+        c.find(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .fallback_threshold,
+        Some(0.0)
+    );
     set_threshold(&mut c, "a", 80.0).unwrap();
-    assert_eq!(c.find("a").unwrap().fallback_threshold, Some(80.0));
+    assert_eq!(
+        c.find(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .fallback_threshold,
+        Some(80.0)
+    );
 }
 
 #[test]
@@ -131,19 +158,32 @@ fn set_threshold_unknown_profile_errors() {
 fn set_last_resort_sets_clears_and_persists() {
     let _h = HomeSandbox::new();
     let mut c = config(&["a"], &["a"]);
-    assert!(!c.find("a").unwrap().last_resort, "off by default");
+    assert!(
+        !c.find(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .last_resort,
+        "off by default"
+    );
     // Ok(false): writes only the profile's config.toml, never profiles.toml.
     assert!(!set_last_resort(&mut c, "a", true).unwrap());
-    assert!(c.find("a").unwrap().last_resort);
+    assert!(
+        c.find(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .last_resort
+    );
     // Survives a reload — the mark is persisted to the profile's config.toml,
     // not in-memory only.
-    let toml_path = crate::profile::profile_dir("a")
+    let toml_path = crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
         .unwrap()
         .join("config.toml");
     let toml = std::fs::read_to_string(toml_path).unwrap();
     assert!(toml.contains("last_resort = true"), "persisted: {toml}");
     assert!(!set_last_resort(&mut c, "a", false).unwrap());
-    assert!(!c.find("a").unwrap().last_resort);
+    assert!(
+        !c.find(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .last_resort
+    );
 }
 
 #[test]
@@ -223,15 +263,26 @@ fn rename_updates_every_reference_and_moves_the_dir() {
     // "a" is active AND a chain member — rename must update the name list, the chain,
     // the active marker, AND move the on-disk directory.
     let mut c = config(&["a", "b"], &["a", "b"]);
-    save_profile(c.find("a").unwrap()).unwrap();
-    assert!(profile_dir("a").unwrap().exists());
+    save_profile(c.find(&crate::profile::ProfileName::from("a")).unwrap()).unwrap();
+    assert!(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .exists()
+    );
 
     assert!(
         rename(&mut c, "a", "renamed").unwrap(),
         "a real rename writes state"
     );
-    assert!(c.find("a").is_none(), "old name gone from config");
-    assert!(c.find("renamed").is_some(), "new name present");
+    assert!(
+        c.find(&crate::profile::ProfileName::from("a")).is_none(),
+        "old name gone from config"
+    );
+    assert!(
+        c.find(&crate::profile::ProfileName::from("renamed"))
+            .is_some(),
+        "new name present"
+    );
     assert_eq!(
         chain_of(&c),
         vec!["renamed", "b"],
@@ -242,8 +293,18 @@ fn rename_updates_every_reference_and_moves_the_dir() {
         Some("renamed"),
         "active marker renamed",
     );
-    assert!(!profile_dir("a").unwrap().exists(), "old dir moved");
-    assert!(profile_dir("renamed").unwrap().exists(), "new dir present");
+    assert!(
+        !crate::profile::profile_dir(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .exists(),
+        "old dir moved"
+    );
+    assert!(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("renamed"))
+            .unwrap()
+            .exists(),
+        "new dir present"
+    );
 }
 
 #[test]
@@ -255,7 +316,8 @@ fn rename_to_an_existing_name_is_rejected() {
         "a collision must be refused"
     );
     assert!(
-        c.find("a").is_some() && c.find("b").is_some(),
+        c.find(&crate::profile::ProfileName::from("a")).is_some()
+            && c.find(&crate::profile::ProfileName::from("b")).is_some(),
         "nothing renamed on rejection"
     );
 }
@@ -279,8 +341,12 @@ fn rename_to_the_same_name_is_a_noop() {
 fn membership_edits_route_by_harness() {
     let _h = HomeSandbox::new();
     let mut c = config(&["a", "cdx1", "cdx2"], &["a"]);
-    c.find_mut("cdx1").unwrap().harness = crate::profile::Harness::Codex;
-    c.find_mut("cdx2").unwrap().harness = crate::profile::Harness::Codex;
+    c.find_mut(&crate::profile::ProfileName::from("cdx1"))
+        .unwrap()
+        .harness = crate::profile::Harness::Codex;
+    c.find_mut(&crate::profile::ProfileName::from("cdx2"))
+        .unwrap()
+        .harness = crate::profile::Harness::Codex;
 
     // Codex adds land in the codex chain; the claude chain never moves.
     assert!(add(&mut c, "cdx1").unwrap());
@@ -295,7 +361,9 @@ fn membership_edits_route_by_harness() {
     assert_eq!(codex_chain, vec!["cdx1", "cdx2"]);
     // A default threshold seeds exactly like the claude side.
     assert_eq!(
-        c.find("cdx1").unwrap().fallback_threshold,
+        c.find(&crate::profile::ProfileName::from("cdx1"))
+            .unwrap()
+            .fallback_threshold,
         Some(crate::fallback::DEFAULT_THRESHOLD)
     );
 
@@ -321,7 +389,7 @@ fn membership_edits_route_by_harness() {
 
     // Persisted state mirrors both chains (the TECH-7 merge routed too):
     // update_app_state with a no-op returns the freshest on-disk state.
-    let disk = crate::profile::update_app_state(|_| {}).unwrap();
+    let disk = crate::profile::update_app_state(|_, _| {}).unwrap();
     assert_eq!(
         disk.codex_fallback_chain
             .iter()
@@ -336,7 +404,9 @@ fn membership_edits_route_by_harness() {
 fn claude_edits_never_touch_the_codex_chain() {
     let _h = HomeSandbox::new();
     let mut c = config(&["a", "b", "cdx"], &["a"]);
-    c.find_mut("cdx").unwrap().harness = crate::profile::Harness::Codex;
+    c.find_mut(&crate::profile::ProfileName::from("cdx"))
+        .unwrap()
+        .harness = crate::profile::Harness::Codex;
     c.state.codex_fallback_chain = vec!["cdx".into()];
     assert!(add(&mut c, "b").unwrap());
     assert_eq!(chain_of(&c), vec!["a", "b"]);

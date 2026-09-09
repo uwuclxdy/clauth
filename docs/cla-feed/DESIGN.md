@@ -1,7 +1,18 @@
 # CLA-FEED — daemon-fed session token (Fable-capable long-lived slot)
 
-Status: CLA-FEED-1 in progress (2026-07-21). Fork-only feature; upstream PR is a
-separate later decision (record in SYNC.md fork-delta inventory).
+Status: **SUPERSEDED 2026-09-09 (UPS-17).** This design shipped fork-only, was
+contributed upstream as PR #59, and was MERGED there as `rolling-token` after
+seven review rounds — which added race fixes the fork's own CLA-FEED code never
+received (a `--clear` full exit, a watching leash, `try_acquire`/NoWait pacing,
+the scopes-based sidecar classifier, expired-backup clock gates). The UPS-17
+sync therefore DELETED the fork's implementation and adopted upstream's:
+`clauth rolling-token <p>` / `clauth static-token <p> [--clear]` replace
+`clauth feed <p> on|off`, `Profile::rolling_token` replaces `session_feed`
+(read through a serde alias so an installed fork profile stays armed), and
+`status.json` publishes `rolling_token` instead of `session_feed`. This
+document is kept for the WHY — the Fable-gate problem and the refresh-race it
+had to avoid — not as a description of the shipped code. For that, read
+upstream's `wiki/Daemon.md` and `src/claude.rs`.
 
 ## Problem
 

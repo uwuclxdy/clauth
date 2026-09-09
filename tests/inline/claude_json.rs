@@ -7,6 +7,10 @@ use serde_json::json;
 
 use crate::testutil::{HomeSandbox, set_mtime};
 
+// Every sync test holds a `HomeSandbox` even though its members live in a
+// tempdir: the syncer resolves the operator's own `~/.claude.json` to decide
+// which member gets CC's write style, and a test may not read that home.
+
 fn write_json(path: &Path, value: &Value) {
     fs::write(path, serde_json::to_vec_pretty(value).expect("serialize")).expect("write");
 }
@@ -22,6 +26,7 @@ fn t(offset: u64) -> SystemTime {
 
 #[test]
 fn shared_fields_propagate_from_newest_to_others() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -47,6 +52,7 @@ fn shared_fields_propagate_from_newest_to_others() {
 
 #[test]
 fn per_profile_fields_never_propagate() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -133,6 +139,7 @@ fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
 
 #[test]
 fn account_scoped_model_caches_stay_per_profile() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -177,6 +184,7 @@ fn account_scoped_model_caches_stay_per_profile() {
 /// are account-scoped, so a sync must never carry one profile's into another.
 #[test]
 fn the_login_managed_api_key_never_propagates() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -213,6 +221,7 @@ fn the_login_managed_api_key_never_propagates() {
 
 #[test]
 fn shared_key_absent_in_winner_is_removed_from_target() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -237,6 +246,7 @@ fn shared_key_absent_in_winner_is_removed_from_target() {
 
 #[test]
 fn unparseable_file_is_skipped() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -261,6 +271,7 @@ fn unparseable_file_is_skipped() {
 
 #[test]
 fn newest_mtime_wins_regardless_of_argument_order() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -277,6 +288,7 @@ fn newest_mtime_wins_regardless_of_argument_order() {
 
 #[test]
 fn converged_target_is_not_rewritten() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     let b = tmp.path().join("b.json");
@@ -297,6 +309,7 @@ fn converged_target_is_not_rewritten() {
 
 #[test]
 fn single_file_is_noop() {
+    let _home = HomeSandbox::new();
     let tmp = tempfile::tempdir().expect("tempdir");
     let a = tmp.path().join("a.json");
     write_json(&a, &json!({"numStartups": 1}));
@@ -466,4 +479,47 @@ fn live_oauth_account_uuid_absent_or_blank_reads_none() {
     )
     .expect("write");
     assert_eq!(home_oauth_account_uuid(), None);
+}
+
+/// Regression for a break that compiles clean: every session now runs out of its
+/// own `runtime-<sid>/`, so a discovery hardcoded to `<profile>/runtime` finds
+/// nothing and cross-profile `.claude.json` reconciliation silently dies for
+/// every live session. Isolated copies stay excluded, as they were.
+#[test]
+fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
+    let home = HomeSandbox::new();
+    let global = home.home().join(".claude.json");
+    let profiles = home.home().join(".clauth/profiles");
+    let legacy = profiles.join("p1/runtime/.claude.json");
+    let session = profiles.join("p1/runtime-4242-0/.claude.json");
+    let sibling = profiles.join("p2/runtime-4242-1/.claude.json");
+    let isolated = profiles.join("p1/runtime-isolated-4242-2/.claude.json");
+    for path in [&global, &legacy, &session, &sibling, &isolated] {
+        fs::create_dir_all(path.parent().expect("has parent")).expect("mkdir");
+        write_json(path, &json!({}));
+    }
+
+    let paths = known_paths().expect("known paths");
+
+    assert!(
+        paths.contains(&global),
+        "the global file is always a member"
+    );
+    assert!(
+        paths.contains(&session),
+        "a live session's own runtime-<sid> copy must be a sync member"
+    );
+    assert!(
+        paths.contains(&sibling),
+        "another profile's session copy must be a member too"
+    );
+    assert!(
+        paths.contains(&legacy),
+        "a legacy unsuffixed runtime/ copy must stay a member"
+    );
+    assert!(
+        !paths.contains(&isolated),
+        "an isolated per-session copy must not be a sync member"
+    );
+    assert_eq!(paths.len(), 4, "no member beyond those four: {paths:#?}");
 }

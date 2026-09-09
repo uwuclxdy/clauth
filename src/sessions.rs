@@ -5,28 +5,21 @@
 //! store. The cost ceiling is deliberate: a session's first and last user
 //! message come from a bounded HEAD read and a seek-from-end TAIL read of each
 //! JSONL, never a full-transcript parse — the token subsystem already shows a
-//! full parse is too heavy to run per index build (see `docs/sessions-design.md`).
+//! full parse is too heavy to run per index build.
 //!
 //! This is the A1 foundation: the index core plus preview redaction. Later
 //! passes fill the remaining [`SessionInfo`] fields — A2 the per-session
 //! `tokens`/`cost` annotation, A3 the `last_ran_profile` stamp — so those fields
 //! are defined now but left `None` here.
 
-// Staged foundation: nothing in the non-test build calls this module yet. The
-// A2 annotation pass and the TUI/CLI sessions surface consume it; drop this
-// allow once the first of those wires `build_index` in.
-#![allow(
-    dead_code,
-    reason = "A1 session-index foundation, wired by a later phase"
-)]
-
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::hash_map::Entry;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -52,6 +45,12 @@ const PREVIEW_MAX_CHARS: usize = 200;
 /// them; the cap bounds the descent and (with symlink dirs treated as files)
 /// avoids cycles.
 const WALK_MAX_DEPTH: usize = 8;
+/// Walk depth that stops at `projects/<slug>/<id>.jsonl`, the only shape Claude
+/// Code's `--resume` resolves. Everything the deeper walk adds is a nested
+/// per-session tree (`subagents/`, `workflows/`, `tool-results/`) whose ids CC
+/// answers no-match for, so a target that has to end in a spawned session picks
+/// from this set and the browsing surfaces keep the full one.
+const TOP_LEVEL_DEPTH: usize = 2;
 
 /// The fixed mask a secret-shaped substring is replaced with.
 const MASK: &str = "[REDACTED]";
@@ -85,7 +84,8 @@ pub(crate) struct SessionInfo {
     /// break grouping and gut the path display. Only the previews below are.
     pub(crate) workspace: String,
     /// Source file path — the tie-breaker when the same session id shows up in
-    /// two stores at an equal mtime. Module-private: consumers key off `id`.
+    /// two stores at an equal mtime. Module-private: consumers key off `id`, and
+    /// a caller that wants one session's path takes [`find_session`].
     path: PathBuf,
     /// File mtime — a cheap freshness key that needs no parse.
     pub(crate) updated: SystemTime,
@@ -94,6 +94,7 @@ pub(crate) struct SessionInfo {
     /// Last user message, redacted preview (`None` when the tail held none).
     pub(crate) last_message: Option<String>,
     /// Which store the transcript came from.
+    #[allow(dead_code, reason = "written at index time; read by the Sessions tab")]
     pub(crate) source: SessionSource,
     /// Per-session token total — A2 fills this; `None` = absent from stats.
     pub(crate) tokens: Option<u64>,
@@ -101,15 +102,6 @@ pub(crate) struct SessionInfo {
     pub(crate) cost: Option<f64>,
     /// Profile the session last ran under — A3 fills this; `None` = unknown.
     pub(crate) last_ran_profile: Option<String>,
-}
-
-impl SessionInfo {
-    /// The transcript's on-disk path — the storage line `clauth info` prints.
-    /// An accessor keeps the field module-private (consumers still key off `id`
-    /// for dedup) while exposing it for display.
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 /// Sessions that share one workspace (`cwd`), newest-first within the group.
@@ -289,21 +281,7 @@ fn preview_of(raw: &str) -> Option<String> {
     if trimmed.is_empty() {
         return None;
     }
-    Some(truncate_chars(trimmed, PREVIEW_MAX_CHARS))
-}
-
-/// Truncate to at most `max` characters, appending an ellipsis when cut.
-/// `char_indices().nth(max)` yields a valid UTF-8 boundary, so a multi-byte
-/// character is never split.
-fn truncate_chars(s: &str, max: usize) -> String {
-    match s.char_indices().nth(max) {
-        Some((idx, _)) => {
-            let mut out = s[..idx].to_string();
-            out.push('…');
-            out
-        }
-        None => s.to_string(),
-    }
+    Some(crate::format::truncate(trimmed, PREVIEW_MAX_CHARS))
 }
 
 /// Head metadata recovered from a transcript's first lines. The session id is
@@ -419,11 +397,18 @@ fn session_id_from_path(path: &Path) -> Option<String> {
     Some(stem.to_string())
 }
 
+/// A file's mtime — the freshness key every ordering here is built on. `None`
+/// when it can't be read, which drops the file from that ordering rather than
+/// ranking it at an invented time.
+fn mtime_of(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
+}
+
 /// Index one file into a [`SessionInfo`], or `None` when it has no usable
 /// filename stem or its metadata can't be read. Head metadata is best-effort.
 fn scan_file(path: &Path, source: &SessionSource) -> Option<SessionInfo> {
     let id = session_id_from_path(path)?;
-    let updated = std::fs::metadata(path).ok()?.modified().ok()?;
+    let updated = mtime_of(path)?;
     let head = read_head(path);
     Some(SessionInfo {
         id,
@@ -441,24 +426,45 @@ fn scan_file(path: &Path, source: &SessionSource) -> Option<SessionInfo> {
 
 /// Recursively collect `*.jsonl` paths under `dir` (depth-capped). A symlinked
 /// directory is treated as a file and never descended, bounding the walk.
-fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+///
+/// Returns `false` when any directory could not be read — the depth cap
+/// truncating a subtree included — so a caller whose answer depends on seeing
+/// EVERY transcript (the prune) can refuse rather than mistake a partial walk
+/// for a complete one. A skipped symlinked directory hides a subtree the same
+/// way, so it too marks the walk incomplete. The collected paths are still
+/// returned: the read paths keep their fail-soft behavior and ignore the flag.
+fn collect_jsonl(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> bool {
     if depth == 0 {
-        return;
+        return false;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+        return false;
     };
-    for entry in entries.flatten() {
+    let mut complete = true;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            complete = false;
+            continue;
+        };
         let Ok(file_type) = entry.file_type() else {
+            complete = false;
             continue;
         };
         let path = entry.path();
+        if file_type.is_symlink() {
+            // Never followed (bounds the walk), but a link hides whatever it
+            // points at, so the walk did not see everything under it.
+            complete = false;
+        }
         if file_type.is_dir() {
-            collect_jsonl(&path, depth - 1, out);
+            if !collect_jsonl(&path, depth - 1, out) {
+                complete = false;
+            }
         } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
             out.push(path);
         }
     }
+    complete
 }
 
 /// Index every `*.jsonl` under one store's `projects/` dir into `by_id`, keeping
@@ -535,6 +541,155 @@ pub(crate) fn build_index() -> Vec<WorkspaceGroup> {
     group_by_workspace(by_id.into_values().collect())
 }
 
+// ── Targeted lookup: one session, without the index's per-transcript reads ────
+//
+// [`build_index`] head- AND tail-reads every transcript to build previews, which
+// a by-id caller then throws away: 11.3 s for `clauth info latest` over a
+// 12k-session store, against 44 ms for the same answer here. The lookups below
+// walk that store for filenames and mtimes, then read the head of the ONE file
+// they resolved to.
+//
+// The GLOBAL store only, unlike the index. A live isolated runtime's own store
+// belongs to a session another process is running; `clauth resume` and the
+// `delegate` resume both spawn against the shared store, where Claude Code would
+// answer `No conversation found` for an id that only exists in an isolated tree.
+// An isolated run's transcript reaches this store once the rescue lifts it out.
+
+/// One session located by id, carrying only what a targeted caller needs. The
+/// [`SessionInfo`] fields absent here — previews, token totals — are exactly the
+/// per-transcript reads this lookup exists to avoid.
+#[derive(Debug, Clone)]
+pub(crate) struct SessionRef {
+    /// The transcript filename stem: the id `--resume` resolves by.
+    pub(crate) id: String,
+    /// The transcript's on-disk path.
+    pub(crate) path: PathBuf,
+    /// File mtime — free here (the walk stats every candidate to order them)
+    /// and what a caller compares one store's answer against another's.
+    pub(crate) updated: SystemTime,
+}
+
+/// A transcript in a live isolated runtime's own store: real, listed by
+/// `clauth sessions`, and unreachable by a resume until that run ends and the
+/// rescue lifts it into the shared store.
+#[derive(Debug, Clone)]
+pub(crate) struct IsolatedHold {
+    pub(crate) session: SessionRef,
+    /// The profile whose live isolated run owns that store.
+    pub(crate) profile: String,
+}
+
+impl SessionRef {
+    /// The workspace this session was recorded in, from the head of its own
+    /// transcript. `None` when the head records no `cwd` — a resume then has
+    /// nowhere to run, the same dead end as no transcript at all.
+    pub(crate) fn workspace(&self) -> Option<PathBuf> {
+        let workspace = read_head(&self.path).workspace;
+        (!workspace.is_empty()).then(|| PathBuf::from(workspace))
+    }
+}
+
+/// Every `*.jsonl` path in the global store, none of them opened. `depth` picks
+/// how much of it the caller means: [`WALK_MAX_DEPTH`] for every transcript the
+/// listing shows, [`TOP_LEVEL_DEPTH`] for the ones a resume can reach.
+fn global_transcripts(depth: usize) -> Vec<PathBuf> {
+    let Ok(projects) = claude_dir().map(|d| d.join("projects")) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    collect_jsonl(&projects, depth, &mut paths);
+    paths
+}
+
+/// Locate one session by exact id. When the same id sits in more than one
+/// project-slug dir, the newest mtime wins and an equal mtime falls back to the
+/// greater path — [`insert_newest`]'s rule, so a targeted lookup and the index
+/// resolve one id to the same file.
+pub(crate) fn find_session(session_id: &str) -> Option<SessionRef> {
+    let (updated, path) = global_transcripts(WALK_MAX_DEPTH)
+        .into_iter()
+        .filter(|p| session_id_from_path(p).as_deref() == Some(session_id))
+        .filter_map(|p| mtime_of(&p).map(|t| (t, p)))
+        .max_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)))?;
+    Some(SessionRef {
+        id: session_id.to_owned(),
+        path,
+        updated,
+    })
+}
+
+/// The newest session in the store — what a `latest` target resolves to. The
+/// ordering is the index's own newest-first key ([`group_by_workspace`] then
+/// `flatten_newest_first`): greatest mtime, then the smallest id, then
+/// [`insert_newest`]'s greater-path duplicate rule. Paths are unique, so the
+/// comparison is total and the pick never depends on `read_dir` order.
+///
+/// Only [`TOP_LEVEL_DEPTH`] of the store, unlike the listing. `latest` has to
+/// end in a session Claude Code will actually open, and CC resolves `--resume`
+/// against a UUID or a session title: handed a nested transcript's `agent-<hex>`
+/// stem it answers no-match, in `--print` as an error and interactively by
+/// dropping the operator into the session picker with nothing selected
+/// (observed on CC 2.1.221). So a store whose
+/// newest file is a subagent transcript resolves `latest` to the newest session
+/// under it, and the listing keeps naming that transcript first.
+pub(crate) fn newest_session() -> Option<SessionRef> {
+    global_transcripts(TOP_LEVEL_DEPTH)
+        .into_iter()
+        .filter_map(|p| Some((mtime_of(&p)?, session_id_from_path(&p)?, p)))
+        .max_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| b.1.cmp(&a.1))
+                .then_with(|| a.2.cmp(&b.2))
+        })
+        .map(|(updated, id, path)| SessionRef { id, path, updated })
+}
+
+/// The workspace one session was recorded in, located by transcript filename —
+/// [`find_session`] plus [`SessionRef::workspace`] in one call, which is all the
+/// `delegate` resume path needs. `None` covers both dead ends it reports as one:
+/// no transcript of that id, and a transcript recording no workspace.
+pub(crate) fn workspace_of(session_id: &str) -> Option<PathBuf> {
+    find_session(session_id)?.workspace()
+}
+
+/// Every transcript a live isolated runtime is holding, at the same tier-1 cost
+/// (filenames and mtimes, nothing opened).
+///
+/// These are never resolutions — a resume spawns against the shared store and
+/// cannot read any of them. They exist to EXPLAIN what the shared store alone
+/// cannot: a session `clauth sessions` just listed is not "no session found",
+/// and the newest session on the machine going missing from `latest` is not a
+/// reason to silently resume the second newest.
+pub(crate) fn live_isolated_holds() -> Vec<IsolatedHold> {
+    isolated_holds(WALK_MAX_DEPTH)
+}
+
+/// The same holds, cut to the transcripts a rescue could make resumable —
+/// [`newest_session`]'s own depth, so the two sides of a `latest` comparison
+/// range over the same kind of file. A nested transcript can never become
+/// `latest`, so one being newer is no reason to refuse a resume.
+pub(crate) fn live_isolated_top_level_holds() -> Vec<IsolatedHold> {
+    isolated_holds(TOP_LEVEL_DEPTH)
+}
+
+fn isolated_holds(depth: usize) -> Vec<IsolatedHold> {
+    let mut out = Vec::new();
+    for (profile, projects) in crate::runtime::live_isolated_stores() {
+        let mut paths = Vec::new();
+        collect_jsonl(&projects, depth, &mut paths);
+        for path in paths {
+            let (Some(id), Some(updated)) = (session_id_from_path(&path), mtime_of(&path)) else {
+                continue;
+            };
+            out.push(IsolatedHold {
+                session: SessionRef { id, path, updated },
+                profile: profile.clone(),
+            });
+        }
+    }
+    out
+}
+
 /// Annotate one session in place with its token total and API-equivalent cost —
 /// the full-transcript parse [`build_index`] deliberately skips, so a caller pays
 /// it only when it wants these figures. Idempotent; safe to re-run.
@@ -545,20 +700,37 @@ pub(crate) fn build_index() -> Vec<WorkspaceGroup> {
 /// `Some(0)` — when the file yields no token-bearing row, so a session with no
 /// usage renders blank rather than a misleading zero.
 ///
-/// `cost` follows [`PriceTable::total_cost`]: `Some(usd)` when a table is present
-/// and at least one of the session's models has a matching rate; `None` when no
-/// table is given OR every model is unpriced. The priced/unpriced boundary is read
-/// from the rate table directly, not from `usd > 0`, so a priced but genuinely
-/// zero-cost session is `Some(0.0)` — distinct from an unpriced `None`.
+/// `cost` sums each (model, day) pair's hourly buckets at that day's dated rate
+/// ([`PriceTable::cost_day`]): `Some(usd)` when a table is present and at least
+/// one pair has a matching rate; `None` when no table is given OR every pair is
+/// unpriced. The priced/unpriced boundary is read from the rate table directly,
+/// not from `usd > 0`, so a priced but genuinely zero-cost session is
+/// `Some(0.0)` — distinct from an unpriced `None`.
 pub(crate) fn annotate(info: &mut SessionInfo, price: Option<&PriceTable>) {
-    let models = crate::tokens::file_model_tokens(&info.path);
+    let days = crate::tokens::file_hourly_model_tokens(&info.path);
     // >= 1 token-bearing row ⇒ a real total (possibly 0); no rows ⇒ blank.
-    info.tokens = (!models.is_empty()).then(|| models.iter().map(|m| m.in_out()).sum());
+    info.tokens = (!days.is_empty()).then(|| {
+        days.iter()
+            .map(|d| {
+                d.hours
+                    .iter()
+                    .map(|h| h.input.saturating_add(h.output))
+                    .sum::<u64>()
+            })
+            .sum()
+    });
     info.cost = price.and_then(|p| {
-        let (usd, _unpriced) = p.total_cost(&models);
-        // "At least one model priced" is read off the table, not `usd > 0`, so a
+        let mut usd = 0.0;
+        let mut any_priced = false;
+        for d in &days {
+            if let Some(c) = p.cost_day(&d.model, &d.day, &d.hours) {
+                usd += c;
+                any_priced = true;
+            }
+        }
+        // "At least one pair priced" is read off the table, not `usd > 0`, so a
         // priced zero-cost session reads `Some(0.0)` while all-unpriced reads None.
-        models.iter().any(|m| p.cost(m).is_some()).then_some(usd)
+        any_priced.then_some(usd)
     });
 }
 
@@ -646,60 +818,152 @@ fn fold_owner(map: &mut HashMap<String, SessionOwner>, id: &str, profile: &str) 
     }
 }
 
-/// Session ids this run owns: the file stems under `projects_dir`, filtered to
-/// this run's window on a shared (cross-profile) store. An isolated store is
-/// exclusive to the profile, so every file counts regardless of mtime.
-fn run_session_ids(projects_dir: &Path, isolated: bool, run_start: SystemTime) -> Vec<String> {
-    let mut paths = Vec::new();
-    collect_jsonl(projects_dir, WALK_MAX_DEPTH, &mut paths);
+/// The flock-POLL wait the hook's exact-owner stamp tolerates before it
+/// degrades and skips the write. It bounds only the cross-process flock poll
+/// ([`crate::lock::StateLock::acquire_with_timeout`]); the in-process
+/// `THREAD_LOCK` wait that precedes the poll is unbounded. The hook manifest
+/// gives the caller a 10 s host timeout, so this must sit well under it; a
+/// hook must not block a tool call on a lock, which is why
+/// `hook_note::ScopeLock` degrades on its own 2 s wait for the same reason.
+const STAMP_STATE_LOCK_WAIT: Duration = Duration::from_secs(2);
+
+/// Land the hook's exact per-conversation attribution into the durable owner
+/// store. Unlike [`fold_owner`], this SETS `Known(profile)` unconditionally:
+/// the hook's answer is exact, so a prior `Contested` (or a differing sweep
+/// guess) must never survive it. Called only for the MAIN conversation scope,
+/// and only when the resolution first set or changed the account, so the
+/// state flock is taken only on a real attribution, never every hook fire.
+///
+/// The flock poll is bounded well under the hook's host timeout (the in-process
+/// `THREAD_LOCK` wait before it is not): a hook must not block a tool call on a
+/// lock, so a contended state lock skips the stamp rather than stalling the
+/// note.
+pub(crate) fn stamp_exact_owner(session_id: &str, profile: &str) {
+    let held = match crate::lock::StateLock::acquire_with_timeout(STAMP_STATE_LOCK_WAIT) {
+        Ok(held) => held,
+        Err(e) => {
+            crate::logline::to_logfile(format_args!(
+                "clauth: skipping the exact session owner stamp: {e}"
+            ));
+            return;
+        }
+    };
+    let result = (|| {
+        let Some(path) = store_path() else {
+            return Ok(());
+        };
+        let mut store = load_store(&path);
+        store.sessions.insert(
+            session_id.to_owned(),
+            SessionOwner::Known(profile.to_owned()),
+        );
+        save_store(&path, &store)
+    })();
+    drop(held);
+    if let Err(e) = result {
+        crate::logline::to_logfile(format_args!(
+            "clauth: failed to stamp exact session owner: {e}"
+        ));
+    }
+}
+
+/// Session ids this run owns, from the walk's paths: filtered to this run's
+/// window on a shared (cross-profile) store. An isolated store is exclusive to
+/// the profile, so every file counts regardless of mtime.
+fn run_session_ids(paths: &[PathBuf], isolated: bool, run_start: SystemTime) -> Vec<String> {
     paths
-        .into_iter()
-        .filter(|p| isolated || touched_since(p, run_start))
-        .filter_map(|p| session_id_from_path(&p))
+        .iter()
+        .filter(|p| isolated || touched_since(p.as_path(), run_start))
+        .filter_map(|p| session_id_from_path(p.as_path()))
         .collect()
 }
 
 /// Whether `path`'s mtime is at or after `since`. Fail-soft: an unreadable mtime
 /// counts as outside the window (not this run's), so it is left unstamped.
 fn touched_since(path: &Path, since: SystemTime) -> bool {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .map(|mtime| mtime >= since)
-        .unwrap_or(false)
+    mtime_of(path).is_some_and(|mtime| mtime >= since)
 }
 
 /// Record which sessions a `clauth start` run owned into the global store.
 ///
 /// `projects_dir` is where the run's transcripts landed: an isolated runtime's
-/// exclusive `runtime-isolated/projects/` (`isolated = true` — every file maps to
+/// own `runtime-isolated-<sid>/projects/` (`isolated = true` — every file maps to
 /// `profile`), or the shared global `~/.claude/projects/` (`isolated = false` —
 /// only files touched at or after `run_start` are attributed, catching new and
 /// resumed-during-this-run sessions without claiming another profile's untouched
 /// ones).
 ///
-/// The read-modify-write runs under the state flock so two concurrent
-/// `clauth start` runs fold their stamps in serially instead of clobbering each
-/// other. Best-effort throughout: the session already ran, so any IO error is
-/// logged and swallowed — never propagated to fail `start`.
+/// Ids the exact per-conversation writer attributed are skipped outright
+/// (owner ruling 2026-09-02): the hook record IS their attribution, and a
+/// sweep fold could only contest it or stamp a rival account beside it. The
+/// mtime sweep stays for ids the exact writer never saw — subagent
+/// transcripts, hook-less conversations, and ids it saw but never
+/// attributed. Read [`owner_of`] for the skip's other half.
+///
+/// A shared run also prunes the owner store in the same pass — the destructive
+/// half. It drops every owner whose id has no transcript in the walked global
+/// tree, refused on two guards ([`prepare_prune`]): an incomplete walk (some
+/// subtree unreadable, the depth cap truncated, or a symlinked dir skipped) and
+/// an empty walk (never read as "no transcripts exist") both skip the prune
+/// rather than bulk-reap.
+///
+/// The keep-set and refusal checks are computed above the state flock; they
+/// read nothing it protects, and a session going live between the read and the
+/// prune only widens the keep-set — the safe direction. The read-modify-write
+/// then runs under the flock so two concurrent `clauth start` runs retain, fold
+/// their stamps, and save serially instead of clobbering each other. Best-effort
+/// throughout: the session already ran, so any IO error is logged and swallowed
+/// — never propagated to fail `start`.
 pub(crate) fn stamp_run_sessions(
     profile: &str,
     projects_dir: &Path,
     isolated: bool,
     run_start: SystemTime,
 ) {
-    let ids = run_session_ids(projects_dir, isolated, run_start);
-    if ids.is_empty() {
+    let mut paths = Vec::new();
+    let walk_complete = collect_jsonl(projects_dir, WALK_MAX_DEPTH, &mut paths);
+    let ids: Vec<String> = run_session_ids(&paths, isolated, run_start)
+        .into_iter()
+        .filter(|id| crate::hook_note::resolved_account(id).is_none())
+        .collect();
+
+    // An isolated run never prunes and, with no ids to fold, has nothing to do
+    // under the state flock; skip the acquisition.
+    if isolated && ids.is_empty() {
         return;
     }
-    let result = crate::lock::with_state_lock(|| {
+
+    // The prune runs on a shared run only. An isolated run's walk is its own
+    // throwaway tree, not the global tree the prune keys on, and the owner
+    // store deliberately holds ids whose transcripts live only in isolated
+    // stores — exactly the population this prune must not reap.
+    let prune_keep = if isolated {
+        None
+    } else {
+        prepare_prune(&paths, walk_complete)
+    };
+
+    let result = crate::lock::with_state_lock(|_held| {
         let Some(path) = store_path() else {
             return Ok(());
         };
         let mut store = load_store(&path);
-        for id in &ids {
-            fold_owner(&mut store.sessions, id, profile);
+        let mut changed = false;
+
+        if let Some(keep) = &prune_keep {
+            changed = prune_owner_store_with_inputs(&mut store, keep);
         }
-        save_store(&path, &store)?;
+
+        if !ids.is_empty() {
+            for id in &ids {
+                fold_owner(&mut store.sessions, id, profile);
+            }
+            changed = true;
+        }
+
+        if changed {
+            save_store(&path, &store)?;
+        }
         Ok(())
     });
     if let Err(e) = result {
@@ -707,10 +971,108 @@ pub(crate) fn stamp_run_sessions(
     }
 }
 
-/// Annotate each session's `last_ran_profile` from the global owner store.
-/// Loads the store once, so a caller can attach owners without paying the
-/// per-session full-transcript parse [`annotate`] costs. Leaves `None` for a
-/// session that is absent or `Contested` (both mean "unknown").
+/// The prune's keep-set, computed above the state flock. Everything the
+/// retention needs except the per-id grace read, which must stay late: a fire
+/// landing after a stale grace read would reap a live record, the wrong
+/// direction, while a session going live after a stale isolated read only
+/// widens the keep-set.
+///
+/// Two populations are kept even when the walked global tree has no transcript
+/// for them: an id whose transcript lives only in a live isolated store
+/// ([`live_isolated_holds`]), and an id whose main-scope record fired within
+/// the hook's missing-transcript grace — a SessionStart stamped before Claude
+/// Code wrote the transcript file must survive the same way the record sweep
+/// keeps that record.
+struct PruneKeep {
+    live: HashSet<String>,
+    isolated_ids: HashSet<String>,
+}
+
+/// The refusal checks plus the keep-set, or `None` when the prune is refused.
+///
+/// Two walk guards are load-bearing. An INCOMPLETE walk — some directory below
+/// the root could not be read, the depth cap truncated a subtree, or a
+/// symlinked dir hid one — is refused: [`collect_jsonl`] reports the partial
+/// failure, and pruning on a walk that silently missed a subtree is a bulk
+/// reap. An EMPTY walk is refused, never treated as "no transcripts exist": a
+/// genuinely empty global store and a walk that saw nothing answer the same,
+/// and pruning either wipes the store.
+///
+/// The walk is the FULL [`WALK_MAX_DEPTH`], not [`TOP_LEVEL_DEPTH`]: nested
+/// per-session trees (`subagents/`, `workflows/`, `tool-results/`) hold real
+/// transcripts deeper than the resume-visible depth, and pruning on the shallow
+/// walk would reap their owners too.
+fn prepare_prune(paths: &[PathBuf], walk_complete: bool) -> Option<PruneKeep> {
+    if !walk_complete {
+        logline!(
+            "clauth: refusing to prune session owners: the global transcript walk was incomplete"
+        );
+        return None;
+    }
+    if paths.is_empty() {
+        logline!(
+            "clauth: refusing to prune session owners: the global transcript walk returned nothing"
+        );
+        return None;
+    }
+    let live: HashSet<String> = paths
+        .iter()
+        .filter_map(|p| session_id_from_path(p))
+        .collect();
+    let isolated_ids: HashSet<String> = live_isolated_holds()
+        .into_iter()
+        .map(|hold| hold.session.id)
+        .collect();
+    Some(PruneKeep { live, isolated_ids })
+}
+
+/// Retain only kept owners, in place on a pre-loaded store. Returns whether the
+/// store changed. Shared runs only: the caller skips this on an isolated run,
+/// whose walk is the isolated throwaway tree rather than the global tree the
+/// prune keys on, and whose owner-store entries are exactly the isolated
+/// transcripts this prune must not reap.
+fn prune_owner_store_with_inputs(store: &mut SessionProfiles, keep: &PruneKeep) -> bool {
+    let before = store.sessions.len();
+    store.sessions.retain(|id, _| {
+        keep.live.contains(id)
+            || keep.isolated_ids.contains(id)
+            || crate::hook_note::last_fire_within_missing_transcript_grace(id)
+    });
+    store.sessions.len() != before
+}
+
+/// Testable wrapper: prepare the keep-set, then retain.
+/// [`stamp_run_sessions`] splits these so the prepare runs above the state
+/// flock and only the retain stays inside it.
+#[cfg(test)]
+fn prune_owner_store(store: &mut SessionProfiles, paths: &[PathBuf], walk_complete: bool) -> bool {
+    let Some(keep) = prepare_prune(paths, walk_complete) else {
+        return false;
+    };
+    prune_owner_store_with_inputs(store, &keep)
+}
+
+/// One session's owner, or `None` when it is absent or `Contested` — both mean
+/// unknown, and a `Contested` id must never resolve to either contender.
+fn owner_in(store: &SessionProfiles, session_id: &str) -> Option<String> {
+    match store.sessions.get(session_id)? {
+        SessionOwner::Known(p) => Some(p.clone()),
+        SessionOwner::Contested => None,
+    }
+}
+
+/// The profile one session last ran under — the single-id counterpart to
+/// [`annotate_owners`], for a caller holding an id rather than an index.
+pub(crate) fn owner_of(session_id: &str) -> Option<String> {
+    crate::hook_note::resolved_account(session_id)
+        .or_else(|| owner_in(&load_store(&store_path()?), session_id))
+}
+
+/// Annotate each session's `last_ran_profile`. The exact per-conversation
+/// observation wins where it exists; the global owner store answers for ids it
+/// never saw. Loads the store once, so a caller can attach owners without
+/// paying the per-session full-transcript parse [`annotate`] costs. Leaves
+/// `None` for a session that is absent or `Contested` (both mean "unknown").
 pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
     let Some(path) = store_path() else {
         return;
@@ -718,10 +1080,8 @@ pub(crate) fn annotate_owners(groups: &mut [WorkspaceGroup]) {
     let store = load_store(&path);
     for group in groups.iter_mut() {
         for session in group.sessions.iter_mut() {
-            session.last_ran_profile = match store.sessions.get(&session.id) {
-                Some(SessionOwner::Known(p)) => Some(p.clone()),
-                Some(SessionOwner::Contested) | None => None,
-            };
+            session.last_ran_profile = crate::hook_note::resolved_account(&session.id)
+                .or_else(|| owner_in(&store, &session.id));
         }
     }
 }

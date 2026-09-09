@@ -10,8 +10,8 @@ use super::super::app::{App, MainItemKind};
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::{
-    ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split, is_past_reset,
-    reset_resume, spinner_frame, spinner_style, window_summary_spans_bracketed,
+    NO_DATA, ResetFmt, account_type_label, cue_style, fetch_cue_color, fixed, fixed_split,
+    is_past_reset, reset_resume, spinner_frame, spinner_style, window_summary_spans_bracketed,
 };
 use super::header::pulse_name_spans;
 use super::panes::{
@@ -22,6 +22,7 @@ use crate::fallback::{
     BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
 };
 use crate::profile::{AppConfig, Profile};
+use crate::providers::Provider;
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
     switch_grade_kick_lifts,
@@ -94,7 +95,7 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let emails = overview_emails(app);
     let widths = OverviewWidths::new(list_area.width, app, emails.iter().any(Option::is_some));
-    let header = overview_header(&widths);
+    let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
     let items = app.main_items();
@@ -158,16 +159,18 @@ fn overview_emails(app: &App) -> Vec<Option<String>> {
                     // Codex identity lives in the stored auth.json JWTs, not
                     // the claude-side anchor caches (CDX-1 T8).
                     let email = if *is_codex {
-                        crate::codex::read_profile_auth(name)
-                            .ok()
-                            .flatten()
-                            .and_then(|b| crate::codex::CodexAuthFile::parse(&b).ok())
-                            .and_then(|a| a.email())
+                        crate::codex::read_profile_auth(&crate::profile::ProfileName::from(
+                            name.as_str(),
+                        ))
+                        .ok()
+                        .flatten()
+                        .and_then(|b| crate::codex::CodexAuthFile::parse(&b).ok())
+                        .and_then(|a| a.email())
                     } else {
                         is_oauth
                             .then(|| {
                                 crate::profile_cache::load_profile_cache::<String>(
-                                    name,
+                                    &crate::profile::ProfileName::from(name.as_str()),
                                     crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
                                 )
                             })
@@ -226,19 +229,46 @@ struct OverviewWidths {
     kind: usize,
     five_hour: usize,
     seven_day: usize,
-    /// Fallback-chain position column (fork codex UX: `chain_summary`'s
-    /// "route" cell); 0 when the terminal is too narrow.
-    route: usize,
-    /// Account-email column (the identity anchor's readable half). Carved
+    /// `LIVE_W` when the live-session column fits, `0` when it is dropped.
+    live: usize,
+    /// Account-email column (fork: the identity anchor's readable half). Carved
     /// purely from the width left over once every other column is at full
     /// size, so layouts without it are unchanged; 0 when no profile has a
     /// cached email or the terminal is too narrow.
     account: usize,
     gap: usize,
+    /// Widest amount string (`"1.71"` of `"1.71 USD"`) across DeepSeek rows, so
+    /// currencies align in the column. `0` when no DeepSeek balance is cached.
+    deepseek_amount_w: usize,
 }
 
-/// Fixed 2-space separator before the account column (outside the elastic
-/// `gap` math — the column is spare-carved, not part of the shrink cascade).
+/// Width of the live-session column: its `live` header text, which is also the
+/// widest cell any real count reaches (`99⇄`). It never widens for a bigger
+/// count, because the column is budgeted on width alone and its cost has to be
+/// constant for that to hold.
+const LIVE_W: usize = 4;
+
+/// Widest the name column ever reaches (the clamp ceiling at wide widths).
+const NAME_MAX: usize = 22;
+/// Widest the kind column ever reaches.
+const KIND_MAX: usize = 16;
+/// Widest the 5h column reaches before the wall-clock stamp bonus.
+const FIVE_HOUR_MAX: usize = 26;
+/// Widest the 7d column reaches before the wall-clock stamp bonus.
+const SEVEN_DAY_MAX: usize = 27;
+/// `total` at which the name clamp lets a name reach [`NAME_MAX`].
+const NAME_WIDE_AT: usize = 86;
+/// `total` at which the kind column reaches [`KIND_MAX`].
+const KIND_WIDE_AT: usize = 92;
+/// `total` at which the 5h column reaches [`FIVE_HOUR_MAX`].
+const FIVE_HOUR_WIDE_AT: usize = 81;
+/// `total` at which the 7d column reaches [`SEVEN_DAY_MAX`].
+const SEVEN_DAY_WIDE_AT: usize = 102;
+/// Minimum gap between overview columns.
+const GAP_MIN: usize = 2;
+
+/// Fixed 2-space separator before the account column (fork; outside the
+/// elastic `gap` math — the column is spare-carved, not part of the shrink cascade).
 const ACCOUNT_GAP: usize = 2;
 /// Below this the truncated email stops being recognizable — skip the column.
 const ACCOUNT_MIN: usize = 12;
@@ -255,114 +285,168 @@ impl OverviewWidths {
             .map(|p| p.name.chars().count())
             .max()
             .unwrap_or(8);
-        let mut name = max_name.clamp(8, if total >= 86 { 22 } else { 16 });
-        let mut kind = if total >= 92 {
-            16
-        } else if total >= 66 {
-            12
-        } else {
-            6
-        };
-        // 26 = [bar]+pct+reset, 17 = [bar]+pct only.
-        let mut five_hour = if total >= 81 {
-            26
-        } else if total >= 64 {
-            17
-        } else {
-            12
-        };
-        let mut seven_day = if total >= 102 {
-            26
-        } else if total >= 93 {
-            17
-        } else if total >= 58 {
-            5
-        } else {
-            0
-        };
-        let mut route = if total >= 88 {
-            13
-        } else if total >= 68 {
-            9
-        } else {
-            0
-        };
-        let gap_min = 2;
-        while fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min) > total {
-            if route > 0 {
-                route = 0;
-            } else if seven_day >= 17 {
-                seven_day = 5;
-            } else if seven_day > 0 {
-                seven_day = 0;
-            } else if five_hour > 17 {
-                five_hour = 17;
-            } else if five_hour > 12 {
-                five_hour = 12;
-            } else if kind > 6 {
-                kind = 6;
-            } else if name > 8 {
-                name -= 1;
-            } else {
-                break;
-            }
-        }
+        let shows_clock = ResetFmt::from_state(&app.config().state).shows_clock();
+        let (name, kind, mut five_hour, mut seven_day) = overview_tiers(max_name, total);
+        let live = live_column_width(max_name, total);
 
-        // A wall-clock stamp needs 10 cells beyond the countdown (the worst real
-        // product is `6d 23h · 12:05am`, since `reset_column` drops the day
-        // qualifier once a countdown carries it). Take them ONLY from slack the
-        // layout would otherwise spend on gap padding, after the shrink loop has
-        // settled — so turning the setting on can add a stamp but never cost a
-        // countdown or a bar. Widening the tier itself instead pushed the 7d
-        // column down to 5 at 130 columns, deleting its bar. A column that gets
-        // only part of the 10 still degrades cleanly in `reset_suffix`.
-        if ResetFmt::from_state(&app.config().state).shows_clock() {
+        if shows_clock {
             const CLOCK_COLS: usize = 10;
+            // A wall-clock stamp needs 10 cells beyond the countdown (the worst
+            // real product is `6d 23h · 12:05am`, since `reset_column` drops
+            // the day qualifier once a countdown carries it). Take them ONLY
+            // from slack the layout would otherwise spend on gap padding, after
+            // the live column and the shrink loop have settled — so turning the
+            // setting on can add a stamp but never cost a countdown, a bar or
+            // the live column. Widening the tier itself instead pushed the 7d
+            // column down to 5 at 130 columns, deleting its bar. A column that
+            // gets only part of the 10 still degrades cleanly in
+            // `reset_suffix`.
             let slack = |five: usize, seven: usize| {
                 total.saturating_sub(
-                    fixed_overview_width(name, kind, five, seven, route, gap_min) + TIMER_SLOT,
+                    fixed_overview_width(name, kind, five, seven, live, GAP_MIN) + TIMER_SLOT,
                 )
             };
-            if five_hour == 26 {
+            if five_hour == FIVE_HOUR_MAX {
                 five_hour += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
-            if seven_day == 26 {
+            if seven_day == SEVEN_DAY_MAX {
                 seven_day += CLOCK_COLS.min(slack(five_hour, seven_day));
             }
         }
 
-        let base = fixed_overview_width(name, kind, five_hour, seven_day, route, gap_min);
+        let base = fixed_overview_width(name, kind, five_hour, seven_day, live, GAP_MIN);
+        let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
+        let gap_slots = column_count.saturating_sub(1).max(1);
         // `fixed_overview_width` omits the TIMER_SLOT the row always renders;
         // the carve must work from REAL spare or the granted row overflows
         // and clips the 5h column at boundary widths.
         let mut spare = total.saturating_sub(base + TIMER_SLOT);
-        // Account column: takes precedence over gap widening (information over
-        // whitespace), but only from genuine spare — never shrinks a column.
+        // Account column (fork): takes precedence over gap widening (information
+        // over whitespace), but only from genuine spare — never shrinks a column.
         let account = if has_email && spare >= ACCOUNT_GAP + ACCOUNT_MIN {
             (spare - ACCOUNT_GAP).min(ACCOUNT_MAX)
         } else {
             0
         };
-        let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
-        let gap_slots = column_count.saturating_sub(1).max(1);
         if account > 0 {
             spare -= ACCOUNT_GAP + account;
         }
-        // Gap widening from the REAL leftover (same `spare` base as the
-        // carve; upstream's landed fix widens from the identical
-        // `total - base - TIMER_SLOT` figure — the fork's differs only by
-        // first deducting the email column above).
-        let gap = (gap_min + spare / gap_slots).clamp(gap_min, 8);
+        let gap = (GAP_MIN + spare / gap_slots).clamp(GAP_MIN, 8);
+
+        let deepseek_amount_w = app
+            .config()
+            .profiles
+            .iter()
+            .filter(|p| p.provider == Some(Provider::DeepSeek))
+            .filter_map(|p| p.third_party_usage.as_ref())
+            .flat_map(|s| s.rows.iter())
+            .filter(|r| crate::providers::is_balance_row(&r.label))
+            .filter_map(|r| r.value.rsplit_once(' ').map(|(a, _)| a.chars().count()))
+            .max()
+            .unwrap_or(0);
 
         Self {
             name,
             kind,
             five_hour,
             seven_day,
-            route,
+            live,
             account,
             gap,
+            deepseek_amount_w,
         }
+    }
+}
+
+/// The four semantic column widths after the tier ladders and the shrink loop
+/// have settled at `total`. The wall-clock stamp bonus is applied by the
+/// caller after the live column is decided.
+fn overview_tiers(max_name: usize, total: usize) -> (usize, usize, usize, usize) {
+    let mut name = max_name.clamp(8, if total >= NAME_WIDE_AT { NAME_MAX } else { 16 });
+    let mut kind = if total >= KIND_WIDE_AT {
+        KIND_MAX
+    } else if total >= 66 {
+        12
+    } else {
+        6
+    };
+    // 26 = [bar]+pct+reset, 17 = [bar]+pct only.
+    let mut five_hour = if total >= FIVE_HOUR_WIDE_AT {
+        FIVE_HOUR_MAX
+    } else if total >= 64 {
+        17
+    } else {
+        12
+    };
+    // One wider than 5h: `humanize_duration` hits 7 chars (`10h 20m`,
+    // `23h 59m`) inside the 7d countdown's 10h–23h band, and the 26-cell
+    // tier was sized for the 6-char ceiling. The bare-suffix fit check in
+    // `reset_suffix` deliberately does not clamp the countdown itself, so
+    // the column has to absorb the extra cell or it leaks into `live`.
+    let mut seven_day = if total >= SEVEN_DAY_WIDE_AT {
+        SEVEN_DAY_MAX
+    } else if total >= 58 {
+        5
+    } else {
+        0
+    };
+    while fixed_overview_width(name, kind, five_hour, seven_day, 0, GAP_MIN) > total {
+        if seven_day > 0 {
+            seven_day = 0;
+        } else if five_hour > 17 {
+            five_hour = 17;
+        } else if five_hour > 12 {
+            five_hour = 12;
+        } else if kind > 6 {
+            kind = 6;
+        } else if name > 8 {
+            name -= 1;
+        } else {
+            break;
+        }
+    }
+
+    (name, kind, five_hour, seven_day)
+}
+
+/// The live-session column width at `total`: [`LIVE_W`] only when the column
+/// fits here and at every wider width, `0` otherwise. Gated on width alone,
+/// never on whether anything is live, so the table never reflows when a
+/// session starts or stops.
+///
+/// Decided BEFORE the wall-clock stamp bonus, so it may take cells the stamp
+/// would otherwise use — but never a name, a bar or a countdown, and
+/// `reset_suffix` degrades cleanly on whatever the stamp gets.
+///
+/// The tier ladders jump by more than the one cell a width increment adds
+/// (`kind` 12→16, `seven_day` 5→27, `five_hour` 17→26), so the raw fit
+/// predicate can pass at one width, fail at the next and pass again. Once
+/// every ladder has saturated the leftover slack grows 1:1 with width, so the
+/// predicate is monotone from there on and only the bounded stretch up to that
+/// saturation width needs scanning.
+fn live_column_width(max_name: usize, total: usize) -> usize {
+    let fits = |w: usize| {
+        let (name, kind, five_hour, seven_day) = overview_tiers(max_name, w);
+        fixed_overview_width(name, kind, five_hour, seven_day, LIVE_W, GAP_MIN) + TIMER_SLOT <= w
+    };
+    // Two quantities bound the scan: the largest ladder threshold (past it no
+    // tier can still jump) and the width at which every ladder maximum plus the
+    // timer fits (past it the settled tiers stop changing, so slack grows 1:1).
+    // Take the larger so neither half is a coincidence the other one covers.
+    let largest_ladder_at = NAME_WIDE_AT
+        .max(KIND_WIDE_AT)
+        .max(FIVE_HOUR_WIDE_AT)
+        .max(SEVEN_DAY_WIDE_AT);
+    let saturation =
+        fixed_overview_width(NAME_MAX, KIND_MAX, FIVE_HOUR_MAX, SEVEN_DAY_MAX, 0, GAP_MIN)
+            + TIMER_SLOT;
+    let ceiling = saturation.max(largest_ladder_at);
+    if total >= ceiling {
+        if fits(total) { LIVE_W } else { 0 }
+    } else if (total..=ceiling).all(fits) {
+        LIVE_W
+    } else {
+        0
     }
 }
 
@@ -371,18 +455,18 @@ fn fixed_overview_width(
     kind: usize,
     five_hour: usize,
     seven_day: usize,
-    route: usize,
+    live: usize,
     gap: usize,
 ) -> usize {
-    let column_count = 3 + usize::from(seven_day > 0) + usize::from(route > 0);
+    let column_count = 3 + usize::from(seven_day > 0) + usize::from(live > 0);
     // 2 = cursor prefix. Timer slot is in the gap before 5h, not a column.
     // kind→timer gap is 4 chars narrower than standard (min 1).
     let narrow = gap.saturating_sub(4).max(1);
     let standard_gaps = column_count.saturating_sub(2);
-    4 + name + kind + five_hour + seven_day + route + standard_gaps * gap + narrow
+    4 + name + kind + five_hour + seven_day + live + standard_gaps * gap + narrow
 }
 
-fn overview_header(widths: &OverviewWidths) -> Line<'static> {
+fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     let mut spans = vec![Span::styled("  ", theme::label())];
     spans.push(Span::raw("  ")); // bell slot (blank in header)
     spans.push(Span::styled(fixed("account", widths.name), theme::label()));
@@ -395,8 +479,11 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
     spans.push(narrow_gap(widths));
     // Blank TIMER_SLOT keeps the label aligned over the bar.
     spans.push(Span::raw(" ".repeat(TIMER_SLOT)));
+    // The column doubles as a balance readout for DeepSeek accounts (no 5h
+    // window, just a USD total), so the header names both when one is present.
+    let five_label = if deepseek { "5h / balance" } else { LABEL_5H };
     spans.push(Span::styled(
-        fixed(LABEL_5H, widths.five_hour),
+        fixed(five_label, widths.five_hour),
         theme::label(),
     ));
     if widths.seven_day > 0 {
@@ -406,9 +493,9 @@ fn overview_header(widths: &OverviewWidths) -> Line<'static> {
             theme::label(),
         ));
     }
-    if widths.route > 0 {
+    if widths.live > 0 {
         spans.push(gap(widths));
-        spans.push(Span::styled(fixed("route", widths.route), theme::label()));
+        spans.push(Span::styled(fixed("live", widths.live), theme::label()));
     }
     Line::from(spans)
 }
@@ -434,7 +521,6 @@ fn render_overview_row(
         cfg.is_active(&profile.name)
     };
     let disabled = profile.is_disabled();
-    let name_str = profile.name.to_string();
     // Overview rows only: the refresh countdown carries the profile's
     // fetch-state cue (amber = last-known numbers, red = failed) so staleness
     // reads off the timer instead of the bar brackets.
@@ -458,7 +544,7 @@ fn render_overview_row(
             .activity
             .lock()
             .ok()
-            .and_then(|g| g.get(&name_str).copied())
+            .and_then(|g| g.get(profile.name.as_str()).copied())
             .unwrap_or(ProfileActivity::Idle);
         if !matches!(activity, ProfileActivity::Idle) {
             let frame = spinner_frame(app.tick_count);
@@ -469,7 +555,7 @@ fn render_overview_row(
                 .next_refresh_per_profile
                 .lock()
                 .ok()
-                .and_then(|m| m.get(&name_str).copied())
+                .and_then(|m| m.get(profile.name.as_str()).copied())
                 .map(|next_ms| {
                     let now = now_ms();
                     let secs = ((next_ms as i64 - now as i64) / 1000).max(0);
@@ -486,11 +572,9 @@ fn render_overview_row(
     };
 
     // Long-lived-token state from the per-frame-free cache (App::session_tokens).
-    // `token_danger` (expired or mis-filled) drives the `⊘` marker; `token_mode`
-    // (running on a genuine long-lived token) drives the type tag below.
-    let token_status = app.session_tokens.get(&name_str);
+    // `token_danger` (expired or mis-filled) drives the `⊘` marker.
+    let token_status = app.session_tokens.get(profile.name.as_str());
     let token_danger = token_status.is_some_and(|s| s.is_danger(now_ms() as i64));
-    let token_mode = token_status.is_some_and(|s| s.is_long_lived_mode());
 
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
@@ -513,7 +597,7 @@ fn render_overview_row(
     } else if token_danger {
         spans.push(Span::styled("⊘", hue(theme::danger())));
         spans.push(Span::raw(" "));
-    } else if app.bell_fired.contains_key(&name_str) {
+    } else if app.bell_fired.contains_key(profile.name.as_str()) {
         spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if active {
@@ -539,25 +623,30 @@ fn render_overview_row(
     spans.push(Span::styled(nt, ns));
     spans.push(Span::raw(np));
     spans.push(gap(widths));
-    // Type tag: a session-token profile appends ` ·token` so its mode reads on
-    // the list without drilling into Setup. The tag trails the tier, so
-    // `fixed_split` drops it first under width pressure (tier stays legible).
-    let mut label = account_type_label(profile);
-    if token_mode {
-        label.push_str(" ·token");
-    }
+    let label = account_type_label(profile);
+    // Read before the tag: a no-data dash is not a tier, and the row must not
+    // animate one. A lone glyph color-cycling beside the static faint dashes in
+    // the same row reads as live data, which is the opposite of what it means.
+    let no_tier = label == super::format::NO_DATA;
     // The credentialed identity-wave is ambient MOTION, which reads as "this
     // thing is live". A disabled account is not, so it renders the same flat dim
     // cell an uncredentialed row gets — dimming the pulse's crest would still
     // animate.
-    if profile.credentials.is_some() && !disabled {
+    if profile.credentials.is_some() && !disabled && !no_tier {
         let (clamped, pad) = fixed_split(&label, widths.kind);
-        let elapsed = app.started_at.elapsed().as_millis() as u64;
-        let mut pulse = pulse_name_spans(&clamped, theme::dim(), elapsed);
+        let mut pulse = pulse_name_spans(&clamped, theme::dim(), app.anim_ms());
         pulse.push(Span::raw(pad));
         spans.extend(pulse);
     } else {
-        spans.push(Span::styled(fixed(&label, widths.kind), theme::dim()));
+        // The dash joins the other no-data cells at `faint` only when it is the
+        // whole cell. A disabled row still flattens to dim, outranking no-data
+        // the way it outranks stale.
+        let style = if no_tier && !disabled {
+            theme::faint()
+        } else {
+            theme::dim()
+        };
+        spans.push(Span::styled(fixed(&label, widths.kind), style));
     }
     if widths.account > 0 {
         spans.push(Span::raw(" ".repeat(ACCOUNT_GAP)));
@@ -586,7 +675,7 @@ fn render_overview_row(
     let reset_style = |label, window: Option<&UsageWindow>| {
         let window = window?;
         drain_reset_style(
-            drain_rate(app, &name_str, profile, label, window),
+            drain_rate(app, &profile.name, profile, label, window),
             window_rate_unit(label),
             window,
         )
@@ -608,14 +697,22 @@ fn render_overview_row(
         }
         spans
     };
-    let five_spans = flatten(window_summary_spans_bracketed(
-        five_window.as_ref(),
-        widths.five_hour,
-        true,
-        reset_style(LABEL_5H, five_window.as_ref()),
-        reset_fmt,
-        five_window.as_ref().is_some_and(is_past_reset),
-    ));
+    let five_spans = if profile.provider == Some(Provider::DeepSeek) {
+        flatten(deepseek_balance_cell(
+            profile,
+            widths.five_hour,
+            widths.deepseek_amount_w,
+        ))
+    } else {
+        flatten(window_summary_spans_bracketed(
+            five_window.as_ref(),
+            widths.five_hour,
+            true,
+            reset_style(LABEL_5H, five_window.as_ref()),
+            reset_fmt,
+            five_window.as_ref().is_some_and(is_past_reset),
+        ))
+    };
     let five_len: usize = five_spans.iter().map(|s| s.content.chars().count()).sum();
     let five_pad = widths.five_hour.saturating_sub(five_len);
     spans.extend(five_spans);
@@ -635,49 +732,105 @@ fn render_overview_row(
         spans.extend(seven_spans);
         spans.push(Span::raw(" ".repeat(seven_pad)));
     }
-    if widths.route > 0 {
+    if widths.live > 0 {
         spans.push(gap(widths));
-        let (chain, chain_style) = chain_summary(&cfg, profile);
-        // The disabled flatten covers the fork route cell too — a disabled row
-        // reads as one flat dim line, headroom hues and the faint dash included.
-        let chain_style = if disabled { theme::dim() } else { chain_style };
-        spans.push(Span::styled(fixed(&chain, widths.route), chain_style));
+        spans.push(live_cell(
+            app.live_sessions.member(&profile.name),
+            widths.live,
+        ));
     }
 
     Line::from(spans)
 }
 
-/// The route cell: this profile's fallback-chain slot (`#N @ threshold%`),
-/// colored by 5h headroom against that threshold; `—` for non-members.
-fn chain_summary(cfg: &AppConfig, profile: &Profile) -> (String, Style) {
-    let Some(position) = cfg
-        .state
-        .fallback_chain
-        .iter()
-        .position(|n| n == &profile.name)
-    else {
-        return ("—".to_string(), theme::faint());
-    };
-    let threshold = threshold_for(profile);
-    let pct = profile
-        .usage
-        .as_ref()
-        .and_then(|u| u.five_hour.as_ref())
-        .map(|w| w.utilization)
-        .unwrap_or(0.0);
-    // Green/yellow/red headroom against the member's threshold (crossing =
-    // rotate) — inlined from the retired `format::health_color`.
-    let color = if pct >= threshold {
-        theme::danger_color()
-    } else if pct >= threshold * 0.8 {
-        theme::warning_color()
-    } else {
-        theme::success_color()
-    };
-    (
-        format!("#{} @ {threshold:.0}%", position + 1),
-        Style::default().fg(color),
+/// The row's live-session cell: how many `clauth start` sessions are running as
+/// this account, with `⇄` when at least one of them follows the fallback chain.
+/// Blank for an account hosting none — cloudy-tui hides a zero count.
+///
+/// Distinct from the row's leading `●`, which marks the one profile a bare
+/// `claude` authenticates as; an account can carry either, both, or neither.
+/// That is why the header reads `live` and not `active` — `active` is the `●`
+/// sense app-wide. Already the `TEXT_DIM` tier a disabled row flattens to, so it
+/// needs no `hue` pass of its own.
+fn live_cell(sessions: crate::live_sessions::MemberSessions, width: usize) -> Span<'static> {
+    if sessions.sessions == 0 {
+        return Span::raw(" ".repeat(width));
+    }
+    // `⇄` goes at the trailing cell so the count column is shared across rows
+    // and the marker lines up at the right edge.
+    let marker = if sessions.following > 0 { "⇄" } else { " " };
+    let count_w = width.saturating_sub(1);
+    Span::styled(
+        format!("{}{marker}", fixed(&sessions.sessions.to_string(), count_w)),
+        theme::dim(),
     )
+}
+
+/// `true` when any profile on the overview is a DeepSeek api-key account.
+/// Those report a USD balance instead of a 5h utilization window, so the
+/// column header and the per-row cell both swap to carry it.
+fn any_deepseek(app: &App) -> bool {
+    app.config()
+        .profiles
+        .iter()
+        .any(|p| p.provider == Some(Provider::DeepSeek))
+}
+
+/// DeepSeek balance total strings (e.g. `"1.71 USD"`, `"100.00 CNY"`) to show
+/// in the overview cell, sorted by numeric amount descending. All funded
+/// wallets are included; when none are funded, only the highest one is
+/// returned — an account with no funds is still a real account, and a blank
+/// cell would read as no-data. Empty when there is no cached snapshot or no
+/// balance row. The wallet set is the shared
+/// [`crate::providers::funded_wallets`] selection, so this column and the MCP
+/// roster's rank drop the same zero-amount wallets.
+fn deepseek_balances_to_show(profile: &Profile) -> Vec<String> {
+    let Some(stats) = profile.third_party_usage.as_ref() else {
+        return Vec::new();
+    };
+    let mut wallets = crate::providers::funded_wallets(&stats.rows);
+    let no_funded = wallets.is_empty();
+    if no_funded {
+        wallets = crate::providers::balance_wallets(&stats.rows);
+    }
+    wallets.sort_by(|a, b| b.amount.total_cmp(&a.amount));
+    if no_funded {
+        wallets.truncate(1);
+    }
+    wallets.into_iter().map(|w| w.value).collect()
+}
+
+/// The 5h-column cell for a DeepSeek profile: its total balance bracketed and
+/// dimmed (matching the OAuth bar's `[...]` shape), or [`NO_DATA`] when no
+/// cached balance row exists. Multiple balances are comma-joined (e.g.
+/// `[1.71 USD, 100.00 CNY]`). `amount_w` is the widest amount string across all
+/// DeepSeek rows so currencies line up under each other; the longest amount
+/// gets exactly one space before its currency. Width is exact so the column
+/// boundary holds.
+fn deepseek_balance_cell(profile: &Profile, width: usize, amount_w: usize) -> Vec<Span<'static>> {
+    let balances = deepseek_balances_to_show(profile);
+    if balances.is_empty() {
+        return vec![Span::styled(NO_DATA.to_string(), theme::faint())];
+    };
+    // Align each "amount CURRENCY": amount left-padded to the widest amount,
+    // then one space, then the currency. Multiple balances are comma-joined.
+    let inner: String = balances
+        .iter()
+        .map(|b| match b.rsplit_once(' ') {
+            Some((amount, currency)) => format!("{amount:<amount_w$} {currency}"),
+            None => b.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    // 2 cells reserved for brackets; truncate inner if it would overflow.
+    let inner_w = width.saturating_sub(2);
+    let inner: String = inner.chars().take(inner_w).collect();
+    let used = inner.chars().count() + 2;
+    let pad = width.saturating_sub(used);
+    vec![
+        Span::styled(format!("[{inner}]"), theme::dim()),
+        Span::raw(" ".repeat(pad)),
+    ]
 }
 
 /// The `(5h, 7d)` windows to show in the overview row. OAuth profiles use their
@@ -802,7 +955,17 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
                 .filter(|(target, _)| target.as_str() == name.as_str())
                 .map(|(_, secs)| *secs);
             chain_row(
-                &cfg, name, i, last, name_w, gauge_w, thr_w, reason, switch_eta,
+                &cfg,
+                name,
+                ChainRowCtx {
+                    index: i,
+                    last,
+                    name_w,
+                    gauge_w,
+                    thr_w,
+                    reason,
+                    switch_eta,
+                },
             )
         })
         .collect();
@@ -873,7 +1036,7 @@ fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
     if cfg.state.fallback_chain.len() <= 1 {
         return None;
     }
-    let active_name = cfg.state.active_profile.as_deref()?;
+    let active_name = cfg.state.active_profile.as_ref()?;
     let profile = cfg.find(active_name)?;
     let usage_info = profile.usage.as_ref()?;
     let usage = usage_info.five_hour.as_ref()?;
@@ -936,10 +1099,11 @@ impl ChainRow {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn chain_row(
-    cfg: &AppConfig,
-    name: &str,
+/// The geometry and trailer context one fallback-flow row renders under —
+/// position in the chain, the width budget, the blocked reason, and the
+/// projected switch eta. Grouped so [`chain_row`] stays under clippy's
+/// argument limit without an ad-hoc `#[allow]`.
+struct ChainRowCtx {
     index: usize,
     last: usize,
     name_w: usize,
@@ -947,7 +1111,18 @@ fn chain_row(
     thr_w: usize,
     reason: Option<BlockedReason>,
     switch_eta: Option<i64>,
-) -> ChainRow {
+}
+
+fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowCtx) -> ChainRow {
+    let ChainRowCtx {
+        index,
+        last,
+        name_w,
+        gauge_w,
+        thr_w,
+        reason,
+        switch_eta,
+    } = ctx;
     let active = cfg.is_active(name);
     let rail = if index == 0 && last == 0 {
         "╶"
@@ -999,8 +1174,23 @@ fn chain_row(
 
     ChainRow {
         base: spans,
-        hint: switch_eta
-            .map(|secs| Span::styled(format!("↩ ~{}", humanize_duration(secs)), theme::faint())),
+        hint: switch_eta.map(|secs| {
+            // `projected_switch` only ever fires off `burn_rate_eta`, so this
+            // hint is always an EXHAUSTION projection — a genuine event-driven
+            // return (healthy active, preferred just freed) has no eta to show.
+            // The `⌂` glyph therefore marks an exhaustion hop that LANDS on the
+            // home account, telling it apart from the plain `↩` of a hop onto any
+            // other member; it is keyed on the destination, not on the cause.
+            let glyph = if cfg.find(name).is_some_and(|p| p.preferred) {
+                "⌂"
+            } else {
+                "↩"
+            };
+            Span::styled(
+                format!("{glyph} ~{}", humanize_duration(secs)),
+                theme::faint(),
+            )
+        }),
         marker: reason.as_ref().map(reason_marker),
     }
 }
@@ -1082,7 +1272,7 @@ fn drain_reset_style(rate: Option<f64>, rate_unit: &str, window: &UsageWindow) -
 /// and a synthesized third-party window has no history to weigh.
 fn drain_rate(
     app: &App,
-    name: &str,
+    name: &crate::profile::ProfileName,
     profile: &Profile,
     label: &str,
     window: &UsageWindow,
@@ -1092,7 +1282,7 @@ fn drain_rate(
     {
         return app.active_burn_rate(name, usage);
     }
-    let per_day = crate::usage::window_avg_pace_per_day(label, window, now_epoch_secs(), 3600)?;
+    let per_day = crate::usage::window_avg_pace_per_day(label, window, now_epoch_secs())?;
     Some(if window_rate_unit(label) == "d" {
         per_day
     } else {

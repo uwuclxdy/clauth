@@ -167,8 +167,11 @@ fn resp_429() -> Vec<u8> {
 }
 
 fn two_profile_config() -> crate::profile::ConfigHandle {
+    // On disk too: `write_profile_cache` skips names `profiles.toml` does not
+    // carry, and the proxy's header-derived usage lands through it.
+    crate::testutil::register_names(&["cdx-a", "cdx-b"]);
     let mk = |n: &str| {
-        let mut p = crate::testutil::blank_profile(n);
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(n));
         p.harness = crate::profile::Harness::Codex;
         p
     };
@@ -223,8 +226,16 @@ fn responses_request() -> Vec<u8> {
 fn e2e_injects_identity_and_relays_the_sse_response() {
     let _home = HomeSandbox::new();
     let config = two_profile_config();
-    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
-    crate::codex::write_profile_auth("cdx-b", &codex_auth("at-b", "acct-b")).unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-a"),
+        &codex_auth("at-a", "acct-a"),
+    )
+    .unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-b"),
+        &codex_auth("at-b", "acct-b"),
+    )
+    .unwrap();
 
     let stub = spawn_stub(vec![sse_200_with_usage("42.0")]);
     let base = format!("http://127.0.0.1:{}", stub.port);
@@ -243,7 +254,7 @@ fn e2e_injects_identity_and_relays_the_sse_response() {
 
     // Usage captured from the flow-through headers into cdx-a's cache.
     let cached = crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
-        "cdx-a",
+        &crate::profile::ProfileName::from("cdx-a"),
         crate::profile_cache::USAGE_CACHE_FILE,
     )
     .expect("usage cached from headers");
@@ -255,7 +266,11 @@ fn e2e_injects_identity_and_relays_the_sse_response() {
 fn model_specific_header_family_does_not_replace_default_codex_usage() {
     let _home = HomeSandbox::new();
     let config = two_profile_config();
-    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-a"),
+        &codex_auth("at-a", "acct-a"),
+    )
+    .unwrap();
 
     let stub = spawn_stub(vec![sse_200_with_usage("42.0")]);
     let base = format!("http://127.0.0.1:{}", stub.port);
@@ -266,7 +281,7 @@ fn model_specific_header_family_does_not_replace_default_codex_usage() {
     );
 
     let cached = crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
-        "cdx-a",
+        &crate::profile::ProfileName::from("cdx-a"),
         crate::profile_cache::USAGE_CACHE_FILE,
     )
     .expect("default Codex usage cached");
@@ -307,7 +322,11 @@ fn e2e_get_models_is_forwarded_with_its_method_and_injected_identity() {
     // forward the GET (method preserved, identity injected), not reject it.
     let _home = HomeSandbox::new();
     let config = two_profile_config();
-    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-a"),
+        &codex_auth("at-a", "acct-a"),
+    )
+    .unwrap();
 
     let stub = spawn_stub(vec![json_200("{\"data\":[{\"id\":\"gpt-5.6-codex\"}]}")]);
     let base = format!("http://127.0.0.1:{}", stub.port);
@@ -338,7 +357,11 @@ fn e2e_non_get_non_post_is_405() {
     // The gate widened to GET+POST only — DELETE (etc.) is still rejected.
     let _home = HomeSandbox::new();
     let config = two_profile_config();
-    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-a"),
+        &codex_auth("at-a", "acct-a"),
+    )
+    .unwrap();
     let stub = spawn_stub(vec![]); // would panic if hit
     let base = format!("http://127.0.0.1:{}", stub.port);
     let req = b"DELETE /backend-api/codex/responses HTTP/1.1\r\nHost: x\r\n\r\n";
@@ -355,8 +378,16 @@ fn e2e_non_get_non_post_is_405() {
 fn e2e_429_rotates_to_the_next_account_and_replays() {
     let _home = HomeSandbox::new();
     let config = two_profile_config();
-    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
-    crate::codex::write_profile_auth("cdx-b", &codex_auth("at-b", "acct-b")).unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-a"),
+        &codex_auth("at-a", "acct-a"),
+    )
+    .unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-b"),
+        &codex_auth("at-b", "acct-b"),
+    )
+    .unwrap();
 
     // Active cdx-a 429s; the proxy must rotate to cdx-b and replay → 200.
     let stub = spawn_stub(vec![resp_429(), sse_200_with_usage("10.0")]);
@@ -380,7 +411,11 @@ fn e2e_429_rotates_to_the_next_account_and_replays() {
 fn e2e_unknown_path_is_404_without_forwarding() {
     let _home = HomeSandbox::new();
     let config = two_profile_config();
-    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-a"),
+        &codex_auth("at-a", "acct-a"),
+    )
+    .unwrap();
     // A stub that would panic if hit (0 responses queued).
     let stub = spawn_stub(vec![]);
     let base = format!("http://127.0.0.1:{}", stub.port);
@@ -446,7 +481,11 @@ fn e2e_relay_closes_promptly_on_response_completed_while_upstream_lingers() {
     // spurious connection error on every successful turn.
     let _home = HomeSandbox::new();
     let config = two_profile_config();
-    crate::codex::write_profile_auth("cdx-a", &codex_auth("at-a", "acct-a")).unwrap();
+    crate::codex::write_profile_auth(
+        &crate::profile::ProfileName::from("cdx-a"),
+        &codex_auth("at-a", "acct-a"),
+    )
+    .unwrap();
 
     let port = spawn_lingering_sse_stub(std::time::Duration::from_secs(10));
     let base = format!("http://127.0.0.1:{port}");
@@ -595,7 +634,7 @@ fn e2e_no_pool_answers_503() {
     let _home = HomeSandbox::new();
     // Codex profiles exist but NONE has a stored login → empty pool.
     let mk = |n: &str| {
-        let mut p = crate::testutil::blank_profile(n);
+        let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(n));
         p.harness = crate::profile::Harness::Codex;
         p
     };

@@ -34,6 +34,14 @@ fn runtime_path(home: &Path, profile: &str) -> PathBuf {
         .join("settings.json")
 }
 
+/// A live session's own copy, `runtime-<sid>/settings.json`.
+fn session_runtime_path(home: &Path, profile: &str, sid: &str) -> PathBuf {
+    home.join(".clauth/profiles")
+        .join(profile)
+        .join(format!("runtime-{sid}"))
+        .join("settings.json")
+}
+
 fn isolated_path(home: &Path, profile: &str) -> PathBuf {
     home.join(".clauth/profiles")
         .join(profile)
@@ -268,6 +276,51 @@ fn unparseable_member_is_skipped_not_clobbered() {
         json!("dark"),
         "the newest PARSEABLE member is the winner"
     );
+}
+
+/// Regression for a break that compiles clean: every session now runs out of its
+/// own `runtime-<sid>/`, so a discovery hardcoded to `<profile>/runtime` finds
+/// nothing and `settings.json` reconciliation silently dies for every live
+/// session. The isolated exclusion has to survive the widening.
+#[test]
+fn known_paths_reach_per_session_copies_and_still_exclude_isolated() {
+    let home = HomeSandbox::new();
+    let base = base_path(home.home());
+    let legacy = runtime_path(home.home(), "p1");
+    let session = session_runtime_path(home.home(), "p1", "4242-0");
+    let sibling = session_runtime_path(home.home(), "p2", "4242-1");
+    let isolated = home
+        .home()
+        .join(".clauth/profiles/p1")
+        .join("runtime-isolated-4242-2")
+        .join("settings.json");
+    for path in [&base, &legacy, &session, &sibling, &isolated] {
+        write_json(path, &json!({"env": {}}), t(1));
+    }
+
+    let paths = known_paths().expect("known paths");
+
+    assert!(
+        paths.contains(&base),
+        "the operator base is always a member"
+    );
+    assert!(
+        paths.contains(&session),
+        "a live session's own runtime-<sid> copy must be a sync member"
+    );
+    assert!(
+        paths.contains(&sibling),
+        "another profile's session copy must be a member too"
+    );
+    assert!(
+        paths.contains(&legacy),
+        "a legacy unsuffixed runtime/ copy must stay a member"
+    );
+    assert!(
+        !paths.contains(&isolated),
+        "an isolated per-session copy must not be a sync member"
+    );
+    assert_eq!(paths.len(), 4, "no member beyond those four: {paths:#?}");
 }
 
 #[test]
@@ -548,6 +601,19 @@ fn codex_profiles_are_invisible_to_settings_sync() {
         "cdx",
         "harness = \"codex\"\nenv = { CODEX_ONLY = \"y\" }\n",
     );
+
+    // Both get a shared `runtime/` dir: upstream's walk lists the dirs that
+    // EXIST, so a config-only profile contributes no target either way and the
+    // assertion below would pass for the wrong reason.
+    for profile in ["claude-p", "cdx"] {
+        fs::create_dir_all(
+            home.home()
+                .join(".clauth/profiles")
+                .join(profile)
+                .join("runtime"),
+        )
+        .expect("mkdir runtime");
+    }
 
     let paths = known_paths().expect("known paths");
     assert!(

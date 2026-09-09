@@ -148,7 +148,12 @@ fn exchange_code(
     if status >= 400 {
         return Err(crate::oauth::http_error(status, &text));
     }
-    serde_json::from_str(&text).map_err(|e| crate::oauth::token_parse_error(e, status, text.len()))
+    serde_json::from_str(&text).map_err(|e| {
+        anyhow::anyhow!(
+            "{}",
+            crate::oauth::token_parse_error(&e, status, text.len()).log_detail()
+        )
+    })
 }
 
 /// Best-effort API-key mint (codex's own `.ok()` semantics — `None` on any

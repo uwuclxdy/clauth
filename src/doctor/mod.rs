@@ -21,6 +21,7 @@ use anyhow::Result;
 
 use self::core::{Check, Status, exit_code, freshness, now_ms, read_status, skew};
 use crate::daemon::SCHEMA_VERSION;
+use crate::out::outln;
 use crate::profile::clauth_dir;
 
 // ── impure probes (each best-effort, never panics) ────────────────────────────
@@ -416,7 +417,9 @@ fn check_codex() -> Option<Check> {
             "capture it: clauth login <name> --codex",
         ));
     };
-    let stored = crate::codex::read_profile_auth(active).ok().flatten();
+    let stored = crate::codex::read_profile_auth(&crate::profile::ProfileName::from(active))
+        .ok()
+        .flatten();
     let owner_matches = stored
         .as_deref()
         .and_then(|b| crate::codex::CodexAuthFile::parse(b).ok())
@@ -432,7 +435,7 @@ fn check_codex() -> Option<Check> {
 
     // Snapshot staleness: refresh-token server TTL is unknown (PLAN.md §0.8),
     // so an old parked snapshot may die silently — surface age past 7 days.
-    let stale_days = crate::codex::profile_auth_path(active)
+    let stale_days = crate::codex::profile_auth_path(&crate::profile::ProfileName::from(active))
         .ok()
         .and_then(|p| std::fs::metadata(p).ok())
         .and_then(|m| m.modified().ok())
@@ -530,12 +533,12 @@ pub(crate) fn run() -> Result<()> {
         checks.push(check);
     }
 
-    println!("clauth doctor {}\n", env!("CARGO_PKG_VERSION"));
+    outln!("clauth doctor {}\n", env!("CARGO_PKG_VERSION"));
     for c in &checks {
-        println!("{}", c.render());
+        outln!("{}", c.render());
     }
     let code = exit_code(&checks);
-    println!(
+    outln!(
         "\n{} check(s), {} failing.",
         checks.len(),
         checks.iter().filter(|c| c.status == Status::Fail).count()

@@ -48,8 +48,8 @@ pub(crate) struct LastError {
 /// living only in `daemon.log`. `to` is `None` for a wrap-off. Main-thread-only.
 #[derive(Debug, Clone)]
 pub(crate) struct LastSwitch {
-    pub(crate) from: Option<String>,
-    pub(crate) to: Option<String>,
+    pub(crate) from: Option<crate::profile::ProfileName>,
+    pub(crate) to: Option<crate::profile::ProfileName>,
     pub(crate) at_ms: u64,
     /// What drove it: `"user"` (socket tap), `"scheduler"` (auto), `"wrap_off"`.
     pub(crate) trigger: &'static str,
@@ -62,7 +62,7 @@ pub(crate) struct LastSwitch {
 /// retries with exponential backoff once a target has failed repeatedly.
 #[derive(Debug, Clone)]
 pub(crate) struct SwitchBackoff {
-    pub(crate) target: String,
+    pub(crate) target: crate::profile::ProfileName,
     /// Consecutive failed attempts for this target.
     pub(crate) attempts: u32,
     /// Epoch-ms before which no further attempt is made (backoff window).

@@ -37,13 +37,16 @@ fn stats_builds_heading_and_body_rows() {
     assert_eq!(stats.rows.len(), 4);
     assert_eq!(stats.rows[0].kind, StatRowKind::Heading);
     assert_eq!(stats.rows[0].label, "USD balance");
-    assert_eq!(stats.rows[1].label, "total");
+    // The literal, not the constant: this row's label is a cross-module contract
+    // (the overview's balance column and the MCP roster's wallet rank both match
+    // on it), so a rename has to red here rather than follow silently.
+    assert_eq!(stats.rows[1].label, "api balance");
     assert_eq!(stats.rows[1].value, "110.00 USD");
     assert!(stats.rows[1..].iter().all(|r| r.kind == StatRowKind::Body));
 }
 
 #[test]
-fn stats_unavailable_carries_danger_row() {
+fn stats_unfunded_with_no_wallets_carries_the_refusal_alone() {
     let raw = DeepSeekResponse {
         is_available: false,
         balance_infos: vec![],
@@ -53,6 +56,33 @@ fn stats_unavailable_carries_danger_row() {
     assert_eq!(stats.rows.len(), 1);
     assert_eq!(stats.rows[0].kind, StatRowKind::Danger);
     assert!(stats.rows[0].label.is_empty());
+    assert_eq!(stats.rows[0].value, crate::providers::LOW_BALANCE);
+}
+
+/// `is_available: false` is DeepSeek's verdict that the balance cannot fund a
+/// call, and the response still carries the wallets. Dropping them left the
+/// reader unable to see how short the account was, and the old copy claimed
+/// clauth could not read a figure it had in hand.
+#[test]
+fn stats_unfunded_keeps_the_wallet_rows_beside_the_refusal() {
+    let raw = DeepSeekResponse {
+        is_available: false,
+        balance_infos: vec![DeepSeekBalance {
+            currency: "CNY".to_string(),
+            total_balance: "0.00".to_string(),
+            granted_balance: "0.00".to_string(),
+            topped_up_balance: "0.00".to_string(),
+        }],
+    };
+    let stats = stats(&raw);
+    assert!(!stats.is_available);
+    // The four rows the available path builds, plus the refusal.
+    assert_eq!(stats.rows.len(), 5);
+    assert_eq!(stats.rows[1].label, "api balance");
+    assert_eq!(stats.rows[1].value, "0.00 CNY");
+    let last = stats.rows.last().expect("refusal row");
+    assert_eq!(last.kind, StatRowKind::Danger);
+    assert_eq!(last.value, crate::providers::LOW_BALANCE);
 }
 
 #[test]

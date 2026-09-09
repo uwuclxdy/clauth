@@ -13,20 +13,21 @@ use ratatui::widgets::Paragraph;
 use super::super::app::App;
 use super::super::theme;
 use super::format::{
-    ResetFmt, activity_verb, is_past_reset, reset_in_secs, reset_phrase, spinner_frame,
+    ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
     spinner_style,
 };
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, active_pill,
-    draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
-    section_box, section_box_verbatim,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
+    active_pill, draw_profile_selector, empty_state, key_cell, master_detail, pill,
+    rail_hint_lines, section_box, section_box_verbatim,
 };
-use crate::format::{endpoint_label, plan_label};
+use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
-use crate::providers::StatRowKind;
+use crate::providers::{Provider, StatRowKind};
 use crate::usage::{
-    ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, StreakCounts, UsageWindow, WindowDollars,
-    ideal_pace_pct, is_stuck_streak, kick_block_switch_grade, now_epoch_secs, now_ms,
+    ExtraPeriod, FetchStatus, KickBlock, ProfileActivity, QueueSlot, StreakCounts, UsageWindow,
+    WindowDollars, humanize_duration, ideal_pace_pct, is_stuck_streak, kick_block_switch_grade,
+    now_epoch_secs, now_ms, queue_anchor_cached, switch_grade_kick_lifts,
 };
 
 const KEY_W: usize = 8;
@@ -79,6 +80,13 @@ struct HeaderState {
     kick_block: Option<KickBlock>,
     /// Config-derived diagnostic flags driving the `└` fix hints.
     diag: DiagFlags,
+    /// The shown profile's auto-start queue slot, resolved before the Config
+    /// guard (rank order) like the chain card used to; `None` when the queue
+    /// toggle is off or the profile holds no slot. The `usage auto-start`
+    /// countdown on the `plan` row combines the slot's shared gate estimate
+    /// with the profile's own window reset (the LATER wins — see `kick_text`),
+    /// and reads the reset alone when this is `None`.
+    queue_slot: Option<QueueSlot>,
 }
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -103,6 +111,12 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .lock()
         .map(|m| m.clone())
         .unwrap_or_default();
+    // The queue anchor + the switch-grade lift set, both read before the Config
+    // lock (AutoStartQueue 240 and KickBlockState 230 < Config 400). The anchor
+    // is the CACHED one: `queue_anchor` would replay per-profile history files,
+    // which a render pass must not.
+    let queue_anchor = queue_anchor_cached(&app.auto_start_queue);
+    let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
     let cfg = app.config();
     let profile = cfg
         .profiles
@@ -145,7 +159,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .is_oauth()
             .then(|| {
                 crate::profile_cache::load_profile_cache::<String>(
-                    profile.name.as_str(),
+                    &profile.name,
                     crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
                 )
             })
@@ -169,6 +183,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling),
             }
         },
+        queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(&profile.name),
     };
 
     let show_estimates = cfg.state.show_estimates;
@@ -201,10 +216,13 @@ fn build_usage_lines(
     lines.extend(header_lines(profile, header, inner_w));
     lines.push(Line::from(""));
 
-    // Api-key/provider accounts (recognised or generic) render via the third-party
-    // rows/bars path; OAuth accounts — including OAuth run against a custom
-    // base_url — fall through to their live window bars.
-    if profile.api_key.is_some() || profile.is_third_party() {
+    // Accounts whose usage figures live in the third-party cache — a recognised
+    // provider or a generic api-key endpoint — render via the third-party
+    // rows/bars path, the shared cache selector (`usage_cache_is_third_party`,
+    // the same predicate the profile load seeds `third_party_usage` with);
+    // OAuth accounts — including OAuth run against a custom base_url — fall
+    // through to their live window bars.
+    if profile.usage_cache_is_third_party() {
         lines.extend(build_tp_rows(
             profile,
             inner_w,
@@ -379,7 +397,7 @@ impl Stat {
         // Natural width — `header_pad` right-aligns the whole block to `pct_col`,
         // so the `%` lands in the same column every row without padding the
         // number. (A fixed `{:>3.0}` width added stray spaces after the amount.)
-        let pct_str = format!("{:.0}%", self.pct);
+        let pct_str = format_pct(self.pct);
 
         // The amount sits in its own right-aligned column just left of the %,
         // with a 2-space gap when present.
@@ -514,7 +532,7 @@ fn make_window_stat(
     let burn_rate = gates
         .show_estimates
         .then(|| {
-            crate::usage::window_avg_pace_per_day(label, &window, now, 3600).map(|per_day| {
+            crate::usage::window_avg_pace_per_day(label, &window, now).map(|per_day| {
                 if rate_unit == "d" {
                     per_day
                 } else {
@@ -568,7 +586,7 @@ fn collect_stats(profile: &Profile, reset_fmt: ResetFmt) -> Vec<Stat> {
     let now_secs = now_epoch_secs();
     let mut stats: Vec<Stat> = Vec::new();
     for (label, w) in usage.windows() {
-        let trailing = reset_in_secs(w)
+        let trailing = reset_in_secs_at(w, now_secs)
             .map(|secs| format!("  {}", reset_phrase(secs, reset_fmt)))
             .unwrap_or_default();
         // Absolute $ figures on the eyebrow when the window carries them (null on
@@ -741,33 +759,43 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
         .third_party_usage
         .as_ref()
         .and_then(|s| s.plan.clone())
+        // Forked exactly as the BODY below is, so the header cannot name a
+        // different account kind than the bars under it. `is_oauth()` is the
+        // wrong test here: it keys on `base_url` alone, so a hybrid (OAuth pair
+        // plus a custom endpoint) reads "api" directly above the live Anthropic
+        // windows its own `usage` fed.
         .or_else(|| {
-            profile
-                .usage
-                .as_ref()
-                .and_then(|u| u.plan.as_ref())
-                .map(plan_label)
-        })
-        // With no fetched plan, show the OAuth token's tier (what the Overview
-        // shows) instead of a bare "oauth"; api-key profiles keep "api".
-        // `is_oauth` gates out the base-url branch of `endpoint_label`, so it
-        // only ever resolves to a tier here, never a raw endpoint url.
-        .unwrap_or_else(|| {
-            if profile.is_oauth() {
-                endpoint_label(profile)
+            if profile.usage_cache_is_third_party() {
+                Some("api".to_string())
             } else {
-                "api".to_string()
+                account_tier(profile).and_then(|t| t.display())
             }
         });
-    let mut plan_spans = vec![key_span("plan"), Span::styled(plan.clone(), theme::body())];
+    // No tier known yet takes the house no-data dash: a bare "Claude" here read
+    // as a real plan on the one row an operator checks their plan from.
+    let plan_w = plan.as_deref().map(|s| s.chars().count()).unwrap_or(1);
+    let plan_span = match plan {
+        Some(label) => Span::styled(label, theme::body()),
+        None => Span::styled("—".to_string(), theme::faint()),
+    };
+    let plan_key = key_span("plan");
+    let left_w = plan_key.width() + plan_w;
+    let mut plan_spans = vec![plan_key, plan_span];
+    // The fork's `[ active ]` pill holds the row's right edge (the fact this
+    // row is checked for); the auto-start countdown right-aligns into the
+    // room left of it, so both fit when both apply.
+    let pill_w = if header.is_active {
+        "[ active ]".chars().count() + 1
+    } else {
+        0
+    };
+    let right_edge = (inner_w as usize).saturating_sub(pill_w);
+    if profile.auto_start {
+        plan_spans.extend(kick_spans(&kick_text(profile, header), left_w, right_edge));
+    }
     if header.is_active {
-        // "[ active ]" = 10 chars; left side = key block + plan chars; pad the gap.
-        let left_w = KEY_W + KEY_GUTTER + plan.chars().count();
-        let indicator_w = "[ active ]".chars().count(); // 10
-        let pad = (inner_w as usize)
-            .saturating_sub(left_w)
-            .saturating_sub(indicator_w);
-        plan_spans.push(Span::raw(" ".repeat(pad)));
+        let used: usize = plan_spans.iter().map(Span::width).sum();
+        plan_spans.push(Span::raw(" ".repeat(right_edge.saturating_sub(used) + 1)));
         plan_spans.extend(active_pill());
     }
 
@@ -782,6 +810,57 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     }
     lines.extend(status_lines(profile, header, inner_w));
     lines
+}
+
+/// The `usage auto-start in …` value, shown for ANY account that opted into
+/// `auto_start`, queue toggle on or off. The value is THIS account's next
+/// kick: with a queue slot, the LATER of the queue's next-opening estimate
+/// and the account's own 5h window reset — the kick fires once the queue
+/// gate has cleared AND this window has lapsed, so either clock can delay
+/// it, and the gate alone would name an instant no kick fires at. Without a
+/// slot (toggle off, or the profile is excluded from the queue) it is the
+/// account's own reset alone — the lapsed-leg kick fires the moment that
+/// reset passes.
+fn kick_text(profile: &Profile, header: &HeaderState) -> String {
+    let now = now_epoch_secs();
+    let own_reset_in = profile
+        .usage
+        .as_ref()
+        .and_then(|u| u.five_hour.as_ref())
+        .and_then(|w| reset_in_secs_at(w, now))
+        .filter(|secs| *secs > 0);
+    let next_in = match header.queue_slot {
+        Some(slot) => match (slot.next_in, own_reset_in) {
+            (Some(gate), Some(reset)) => Some(gate.max(reset)),
+            (Some(gate), None) => Some(gate),
+            (None, reset) => reset,
+        },
+        None => own_reset_in,
+    };
+    match next_in {
+        Some(secs) => format!("usage auto-start in {}", humanize_duration(secs)),
+        None => "usage auto-start due now".to_string(),
+    }
+}
+
+/// Spans putting `text` flush against the pane's right edge on the `plan` row,
+/// keeping the house 3-cell minimum gap from the row's left content (cloudy-tui
+/// spacing). Truncates with `…` when the row can't hold both; drops the kick
+/// when not even a countdown hint fits.
+fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
+    let avail = inner_w.saturating_sub(left_w);
+    if avail < 3 {
+        return Vec::new();
+    }
+    let text = crate::format::truncate(text, avail - 3);
+    if text.chars().count() < 4 {
+        return Vec::new();
+    }
+    let pad = avail - text.chars().count();
+    vec![
+        Span::raw(" ".repeat(pad)),
+        Span::styled(text, theme::faint()),
+    ]
 }
 
 /// One row of the `status` block paired with its optional `└`/`├` fix hint.
@@ -1020,6 +1099,31 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
                 UsageDiag::Stale
             });
         }
+        Some(FetchStatus::AuthExpired) => {
+            // No countdown: the profile is session-suppressed, so there is no
+            // next attempt to count down to. Only a re-login (or a manual
+            // refresh, which retries once) moves this.
+            //
+            // Three dead-credential causes read as three labels. "expired" only
+            // when a session actually lapsed; an account that never stored one
+            // reaches this state too (a working api key does not authenticate
+            // the usage gateway), and telling that operator something expired
+            // sends them hunting for what to renew instead of to the login they
+            // have not run. A non-Alibaba profile has no session at all, so its
+            // verdict can only mean the api key itself was rejected.
+            let label = if profile.console.is_some() {
+                "login expired"
+            } else if profile.provider != Some(Provider::Alibaba) {
+                "key rejected"
+            } else {
+                "login needed"
+            };
+            spans.extend([
+                Span::styled("[ ", theme::dim()),
+                Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
+                Span::styled(" ]", theme::dim()),
+            ]);
+        }
         _ => match countdown {
             // A scheduled refresh is work lined up — the cloudy-tui `queued`
             // dot (`◌` in ACCENT), not a spinner: nothing is running yet.
@@ -1233,6 +1337,25 @@ fn build_tp_rows(
             match profile.fetch_status {
                 Some(FetchStatus::Failed) => "no usage available",
                 Some(FetchStatus::RateLimited) => "rate limited, retrying",
+                // The ways a provider's usage credential can be unusable read
+                // differently to the operator, and the profile itself says
+                // which one this is: a lapsed or never-captured console session
+                // (Alibaba), or a dead api key (any other provider, whose
+                // verdict only a 401 can produce).
+                Some(FetchStatus::AuthExpired) if profile.console.is_some() => {
+                    "console login expired, run clauth login"
+                }
+                Some(FetchStatus::AuthExpired) if profile.provider != Some(Provider::Alibaba) => {
+                    "api key rejected, re-enter it on the setup tab"
+                }
+                Some(FetchStatus::AuthExpired) => "console login needed, run clauth login",
+                // A profile no leg will ever fetch must not claim to be
+                // loading — the same rule `oauth_empty_msg` applies. An Alibaba
+                // profile is never in here: its quota runs on the console
+                // session, so it is scheduled with or without an api key.
+                _ if !crate::usage::third_party_credentialed(profile) => {
+                    "no api key set, add one on the setup tab"
+                }
                 _ => "loading",
             }
         };
@@ -1370,9 +1493,9 @@ fn fmt_amount(n: f64) -> String {
     }
 }
 
-/// Key column width for third-party stat rows (wider than `KEY_W` to fit
-/// labels like "topped up" plus a 1-space gap).
-const TP_KEY_W: usize = 10;
+/// Key column width for third-party stat rows (wider than `KEY_W` to fit the
+/// longest label — DeepSeek's `api balance` — plus a 1-space gap).
+const TP_KEY_W: usize = 11;
 
 fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled(

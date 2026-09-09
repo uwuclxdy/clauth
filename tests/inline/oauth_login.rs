@@ -142,17 +142,197 @@ fn callback_aborts_on_a_state_mismatch() {
     assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
 }
 
+/// Bytes only the browser redirect could have supplied.
+const CALLBACK_CANARY: &str = "CALLBACK-BYTES-CANARY";
+
+/// An OAuth `error` param is still fatal, and its bytes now reach nothing. Both
+/// params are uncapped upstream text and used to be interpolated whole into the
+/// `bail!` — which lands on `clauth login`'s stderr and the TUI Setup toast.
+/// Worse than the token-endpoint bodies this module's sibling fix removed: those
+/// at least passed a first-line + 200-char trim first.
 #[test]
-fn callback_aborts_on_an_oauth_error_param() {
+fn callback_aborts_on_an_oauth_error_param_without_echoing_it() {
     let (verdict, response) = callback_roundtrip(
-        "GET /callback?error=access_denied&error_description=denied HTTP/1.1\r\n",
+        &format!(
+            "GET /callback?error=access_denied&error_description={CALLBACK_CANARY} HTTP/1.1\r\n"
+        ),
         "STATE",
     );
     let err = verdict
         .expect_err("an OAuth error param is fatal")
         .to_string();
-    assert!(err.contains("authorization failed"), "err was: {err}");
+    assert_eq!(err, "you declined the authorization request");
     assert!(response.starts_with("HTTP/1.1 400"), "got: {response}");
+    assert!(
+        !response.contains(CALLBACK_CANARY),
+        "the page must not reflect it either: {response}"
+    );
+
+    // An `error` code outside RFC 6749's set is where the bytes are least
+    // trustworthy, so NONE of them are kept — not even capped into the log.
+    let (verdict, _) = callback_roundtrip(
+        &format!(
+            "GET /callback?error={CALLBACK_CANARY}&error_description={CALLBACK_CANARY} HTTP/1.1\r\n"
+        ),
+        "STATE",
+    );
+    let err = verdict
+        .expect_err("an unrecognized error code is still fatal")
+        .to_string();
+    assert!(
+        !err.contains(CALLBACK_CANARY),
+        "an unrecognized code must not be echoed: {err}"
+    );
+    assert_eq!(err, "anthropic refused the login");
+}
+
+/// The parse is what drops the browser's bytes, so pin the whole map. Every
+/// value any arm carries onward is one of `parse`'s own literals — asserted by
+/// reading `log_detail` back, which is the only thing that still names a code.
+#[test]
+fn authorize_rejection_parses_rfc6749_codes_and_anonymizes_the_rest() {
+    use crate::oauth_login::AuthorizeRejection;
+    for (code, detail, user) in [
+        (
+            "access_denied",
+            "access_denied",
+            "you declined the authorization request",
+        ),
+        (
+            "server_error",
+            "server_error",
+            "anthropic is having trouble",
+        ),
+        (
+            "temporarily_unavailable",
+            "temporarily_unavailable",
+            "anthropic is having trouble",
+        ),
+        (
+            "invalid_request",
+            "invalid_request",
+            "anthropic refused the login",
+        ),
+        (
+            "unauthorized_client",
+            "unauthorized_client",
+            "anthropic refused the login",
+        ),
+        (
+            "unsupported_response_type",
+            "unsupported_response_type",
+            "anthropic refused the login",
+        ),
+        (
+            "invalid_scope",
+            "invalid_scope",
+            "anthropic refused the login",
+        ),
+    ] {
+        let r = AuthorizeRejection::parse(code);
+        assert_eq!(r.log_detail(), detail, "log detail for {code}");
+        assert_eq!(r.user_message(), user, "user copy for {code}");
+    }
+
+    let odd = AuthorizeRejection::parse(CALLBACK_CANARY);
+    assert!(
+        !odd.log_detail().contains(CALLBACK_CANARY),
+        "an unrecognized code must not survive into the log"
+    );
+    assert_eq!(
+        odd.log_detail(),
+        "an error code outside RFC 6749's set (withheld)"
+    );
+}
+
+/// `clauth login` is the path where the status ruling bites hardest: an
+/// interactive user hitting a 400 on a fresh login has no log open beside the
+/// terminal. So stderr names the status and the TUI toast does not — asserted
+/// together, because a status that silently stops reaching stderr looks exactly
+/// like one that was never added.
+#[test]
+fn login_names_the_status_on_stderr_but_not_in_the_toast() {
+    use crate::oauth::TokenFailure;
+    use crate::oauth_login::LoginError;
+
+    let rejected = LoginError::Exchange(TokenFailure::Status(400));
+    assert_eq!(
+        rejected.cli_message(),
+        "anthropic rejected the request (HTTP 400): run clauth login again for a fresh code"
+    );
+    assert_eq!(
+        rejected.user_message(),
+        "anthropic rejected the request: run clauth login again for a fresh code"
+    );
+    assert!(
+        !rejected.user_message().contains("400"),
+        "the toast must not carry the status: {}",
+        rejected.user_message()
+    );
+
+    // The advice is NOT "retry in a moment", which is what reusing the refresh
+    // path's mapping produced. A code exchange is rejected at the END of the
+    // flow: the loopback listener is gone and the code is spent, expired, or
+    // never matched the PKCE verifier, so waiting fixes none of them. A 429 is
+    // the case that makes it obvious — a refresh would genuinely wait and
+    // re-attempt next tick, a login has no next tick.
+    for status in [400, 429, 503] {
+        let m = LoginError::Exchange(TokenFailure::Status(status)).user_message();
+        assert!(
+            m.ends_with(": run clauth login again for a fresh code"),
+            "a spent authorization code is only fixed by a new login, got: {m}"
+        );
+        assert!(
+            !m.contains("retry in a moment"),
+            "there is nothing left to retry once the flow has ended: {m}"
+        );
+    }
+
+    // A transport failure never saw a status, so the two forms coincide rather
+    // than inventing one, and the advice is the connection — the one blocker
+    // worth clearing BEFORE running the command again.
+    let offline = LoginError::Exchange(TokenFailure::Transport);
+    assert_eq!(
+        offline.cli_message(),
+        "could not reach anthropic: check your connection and retry"
+    );
+    assert_eq!(offline.cli_message(), offline.user_message());
+
+    // Every clauth-authored failure renders identically on both surfaces —
+    // there is no upstream status to withhold from one of them.
+    let local = LoginError::Local(anyhow::anyhow!("OAuth state mismatch (possible CSRF)"));
+    assert_eq!(local.cli_message(), local.user_message());
+    assert_eq!(local.user_message(), "OAuth state mismatch (possible CSRF)");
+}
+
+/// Same structural guard as `oauth::TokenFailure`: no `Display` and no
+/// `Into<anyhow::Error>`, so a surface cannot print the browser's words even by
+/// accident. Positive controls prove the probe discriminates.
+#[test]
+fn authorize_rejection_has_no_printable_escape_hatch() {
+    use crate::oauth_login::{AuthorizeRejection, LoginError};
+    use crate::testutil::{NotDisplay as _, NotIntoAnyhow as _, Probe};
+    assert!(Probe::<String>::is_display(), "positive control");
+    assert!(Probe::<std::io::Error>::into_anyhow(), "positive control");
+    for (name, displays, converts) in [
+        (
+            "AuthorizeRejection",
+            Probe::<AuthorizeRejection>::is_display(),
+            Probe::<AuthorizeRejection>::into_anyhow(),
+        ),
+        (
+            "LoginError",
+            Probe::<LoginError>::is_display(),
+            Probe::<LoginError>::into_anyhow(),
+        ),
+    ] {
+        assert!(!displays, "{name} must stay Display-free");
+        assert!(
+            !converts,
+            "{name} must not convert into anyhow::Error — that is the `?` that \
+             would collapse the CLI/toast split back into one rendering"
+        );
+    }
 }
 
 #[test]
@@ -206,4 +386,49 @@ fn wait_for_code_times_out_at_the_deadline() {
         .expect_err("an already-passed deadline must bail")
         .to_string();
     assert!(err.contains("timed out"), "err was: {err}");
+}
+
+/// The `clauth login` summary names the account's plan from the token the login
+/// just stored. `login_profile_from_raw` mints `"free"` for a Free account, so
+/// this is the round trip that keeps the line reading `Claude Free` rather than
+/// echoing a raw wire token or claiming a tier the account never had.
+#[test]
+fn login_summary_names_the_plan_a_free_login_stored() {
+    let creds = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: Some("free".into()),
+        }),
+    };
+    assert!(
+        super::login_summary(&creds)
+            .contains("  plan: Claude Free (token verified against the API)"),
+        "got: {}",
+        super::login_summary(&creds)
+    );
+}
+
+/// No claim on the token is not a failed login: the probe is best-effort and the
+/// usage poll re-derives the tier within a cycle, so the line says so instead of
+/// naming a tier or reading as an error.
+#[test]
+fn login_summary_defers_when_the_token_claims_no_plan() {
+    let creds = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+        }),
+    };
+    let summary = super::login_summary(&creds);
+    assert!(
+        summary.contains("  plan: will populate on the first usage refresh"),
+        "got: {summary}"
+    );
+    assert!(!summary.contains("verified"), "got: {summary}");
 }

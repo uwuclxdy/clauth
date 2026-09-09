@@ -61,7 +61,12 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   bit off codex's PATH-alias helper binaries under a live isolated session —
   `auth.json`'s 0600 comes from `atomic_write_600` at seed, not from the
   sweep). Upstream's `docs/codex-plan.md` phase 3 carries the same exemption,
-  so this one reconciles rather than persists.
+  so this one reconciles rather than persists. **UPS-17 retyped the whole
+  engine onto upstream's API layer** — `ProfileName` everywhere a profile name
+  flows, `with_state_lock(|held| …)` witnesses, `AccountId`, upstream's
+  `TokenFailure` (which carries no `Display`, so every codex log line renders
+  `log_detail()` / `text_with_status()`), and upstream's `gc_stale_runtimes`
+  family, into which the codex-home sweep is wired as `gc_codex_homes`.
 - **Scheduler hardening**: SCW-1 per-model scoped weekly windows in both
   walks, SCW-2 per-member gates + `weekly at` override (folded into
   `ChainMember.weekly_line/scoped_line/check_scoped`), RLS-1 stuck-rate-limit
@@ -70,10 +75,16 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
 - **Daemon surface**: status.json fork fields (`forecast`, `burn_aware`,
   `weekly_switch_threshold`, `last_error`), tokens.json feed, per-member
   gate/override socket commands, ccsbar/ccu client contracts.
-- **Claude-side**: macOS Keychain-first link ordering, RESCUE-1
+- **Claude-side**: RESCUE-1
   dead-live-login reclaim, CLA-SPLIT hardening on top of merged #53
   (genuinely-long-lived engagement gate, force-snapshot guard), auth-broken
   quarantine surfaces, `--new` / `--codex` / `--browser` login flags.
+  **NOT the Keychain write ordering any more** — the fork's "Keychain FIRST,
+  then mutate" relink was dropped in UPS-17 for upstream's
+  `publish_credential_link` + `keychain_mirror_source(Leave|SignOut)` shape,
+  which rebuilt that path around a rename-not-unlink publish and an explicit
+  absent-source policy. Same failure the fork's ordering was written for, now
+  upstream's to keep correct.
   **NOT browser OAuth login itself** — upstream has that (`src/oauth_login.rs`
   on `mommy`, full inline PKCE + loopback). The fork's only delta there is the
   CDX-3 R4 extraction of the shared mechanics into `src/loopback.rs` so codex's
@@ -81,21 +92,21 @@ time and invalidates every hash `.agent/PROGRESS.md` and memory cite.
   being upstreamable on its own. (Corrected 2026-07-25 — this bullet used to
   claim the feature; measure with `git grep` against `upstream/mommy` before
   trusting any line in this inventory.)
-- **CLA-FEED session-token feed** (`docs/cla-feed/DESIGN.md`): per-profile
-  `session_feed` flag; the daemon re-stamps `session-token.json` from the
-  usage chain's access token on every rotation (full scopes +
-  `subscriptionType`, no refresh token → plan-gated models work in sessions
-  while the refresh chain stays clauth-private); switch-in gate re-feeds or
-  arms (`ensure_installable` feed branches), terminal chain death restores
-  the preserved static mint (`session-token.static.json`); `clauth feed
-  <p> on|off`; status.json additive `session_feed` key; scheduler
-  proactive-rotation feed override; EXP-2 re-feed timer (`claude_feed_tick`
-  5-min scan + `refeed_session_token` with `fresh_horizon_ms` threaded
-  through the feed gates — switch paths keep the 60s grace; active-profile
-  Keychain mirror). **Contributed upstream as PR #59** (2026-07-25, branch
-  `feat/session-token-feed` cut from `upstream/mommy`, two-commit series:
-  feed core, then the timer) — when it merges this bullet collapses to
-  whatever the fork still adds on top of the merged form.
+- ~~**CLA-FEED session-token feed**~~ — **GONE from the fork delta (UPS-17,
+  2026-09-09).** Contributed as PR #59, MERGED upstream as `rolling-token`
+  (upstream commit `7340d44`, seven review rounds), and adopted back wholesale
+  by this sync: the fork's `session_feed` flag, `feed_session_token`,
+  `arm_feed_from_disk`, `feed_install_gate`, `claude_feed_tick`,
+  `MINT_HORIZON_MS` and the `clauth feed` verb are DELETED in favour of
+  upstream's `rolling_token` / `stamp_rolling_token` / `arm_rolling_from_disk`
+  / `rolling_install_gate` / `restamp_rolling_token` / `sidecar_kind_of` and
+  the `clauth rolling-token` + `clauth static-token [--clear]` verbs. The one
+  line the fork still owns is a serde ALIAS: `#[serde(alias = "session_feed")]`
+  on `ProfileConfig::rolling_token`, so a profile this fork armed under the old
+  key stays armed across the upgrade (upstream deliberately carries no alias —
+  no released upstream ever wrote that key). The alias is dead weight once the
+  daemon rewrites each armed profile's `config.toml`; drop it at a later sync.
+  Design rationale kept at `docs/cla-feed/DESIGN.md`, marked superseded.
 - **EXP-2 codex 401 kick**: CDX-6 poll `Unauthorized` →
   `codex_auth_kicks` → CDX-3 standby force-refresh
   (`codex_refresh_parked(force)` bypasses only `standby_due`), with a
@@ -110,7 +121,20 @@ Contribution branches are cut from `upstream/mommy`, never from fork `main`
 upstream's shape, let the fork adopt the upstream form back on the next sync.
 The fork's standing upstream threads live in `.agent/PROGRESS.md`.
 
-**The codex engine's endgame (UPS-7, 2026-07-25):** upstream owns the codex
+**Endgame status (UPS-17, 2026-09-09):** the maintainer closed the design
+thread on 2026-09-02 — "#69 supersedes it and #51 will not be merged" — and
+left PR #69 in CHANGES_REQUESTED with ten required items, roughly fourteen
+minors, and a head that no longer merges or compiles against `mommy`. So the
+fork keeps its own codex engine (path A) until #69's round 2 lands: the two
+codex layers now coexist by design, this fork's on `Profile`/`AppState`, and
+upstream's future one on `codex-profiles.toml`. When #69 merges, the "Codex
+engine" bullet collapses and a one-off migration moves the codex names out of
+`profiles.toml` (`profiles`, `active_codex_profile`, `codex_fallback_chain`,
+per-profile `harness`) into upstream's roster — neither upstream's `AppState`
+nor #69's `CodexState::load` migrates them, and upstream's serde drops unknown
+keys on the next save.
+
+**The original plan (UPS-7, 2026-07-25):** upstream owns the codex
 design now — `docs/codex-plan.md` on `mommy` is the spec, and we implement it
 as a six-part series on a branch cut from the **v0.14 tag** (branch cut from a
 TAG, not `upstream/mommy` — the one deliberate exception to the rule above).

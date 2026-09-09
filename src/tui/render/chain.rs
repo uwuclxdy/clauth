@@ -22,13 +22,14 @@ use super::super::app::{
     chain_items, parse_max_spend, parse_threshold, parse_weekly_override,
 };
 use super::super::theme;
-use super::format::{ResetFmt, reset_pill, reset_resume};
+use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resume};
 use super::global_config::default_reminder;
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, bold_when,
-    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines,
-    key_cell, label_style, master_detail, name_color, pill, rail_hint_lines, section_box,
-    section_box_verbatim, select_line, wrap_words,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
+    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
+    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
+    wrap_words,
 };
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, soonest_resume,
@@ -78,7 +79,7 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                             .state
                             .fallback_chain
                             .get(*i)
-                            .map(|n| n.to_string())
+                            .cloned()
                             .unwrap_or_default();
                         // `#n` right-aligned in a fixed 3 cells, so `#1` and
                         // `#10` start their names on the same column. The
@@ -103,20 +104,29 @@ fn draw_chain_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bo
                         } else {
                             bold_when(name_color(cfg.is_active(&name)), selected && focused)
                         };
-                        let mut spans = vec![rail, Span::styled(name.clone(), ns)];
-                        if let Some(reason) = cfg
-                            .find(&name)
-                            .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(&name).copied()))
-                        {
-                            // Right-align the 1-cell blocked-reason marker at the
-                            // row's last content column (the scrollbar owns the
-                            // padding cell beyond it, so they never collide).
-                            let used: usize = spans.iter().map(|s| s.width()).sum();
-                            let pad = (w as usize).saturating_sub(used + 1);
-                            if pad > 0 {
-                                spans.push(Span::raw(" ".repeat(pad)));
+                        let reason = cfg.find(&name).and_then(|p| {
+                            blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied())
+                        });
+                        let rail_w = rail.width();
+                        let mut spans = vec![rail];
+                        match &reason {
+                            // The 1-cell marker is right-aligned at the row's last
+                            // content column (the scrollbar owns the padding cell
+                            // beyond it, so they never collide), and the name is
+                            // clamped to whatever that leaves. Unclamped, a long
+                            // enough name pushed the marker past the pane and
+                            // ratatui dropped it, so a blocked account rendered
+                            // identically to a healthy one. Only a row that
+                            // actually carries a marker pays the clamp — the name
+                            // column's width therefore tracks blocked state.
+                            Some(reason) => {
+                                let name_w = (w as usize).saturating_sub(rail_w + 2);
+                                let (text, pad) = fixed_split(&name, name_w);
+                                spans.push(Span::styled(text, ns));
+                                spans.push(Span::raw(format!("{pad} ")));
+                                spans.push(reason_marker(reason));
                             }
-                            spans.push(reason_marker(&reason));
+                            None => spans.push(Span::styled(name.to_string(), ns)),
                         }
                         Line::from(spans)
                     }
@@ -148,7 +158,7 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = items
         .get(app.chain_cursor.min(items.len().saturating_sub(1)))
         .copied();
-    // Switch-grade kick blocks — read before the Config lock (rank order:
+    // Switch-grade kick blocks, read before the Config lock (rank order:
     // KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
 
@@ -165,26 +175,24 @@ fn draw_chain_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         match selected {
             Some(ChainItemKind::Member(i)) => {
                 let cfg = app.config();
-                let name = cfg
-                    .state
-                    .fallback_chain
-                    .get(i)
-                    .map(|n| n.to_string())
-                    .unwrap_or_default();
-                let kick_lift = kick_lifts.get(&name).copied();
+                let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
+                let kick_lift = kick_lifts.get(name.as_str()).copied();
                 let (lines, rows_start) = member_detail(
                     &cfg,
                     &name,
-                    detail_focused,
-                    app.fallback_detail_cursor,
-                    app.fallback_armed_remove,
-                    app.fallback_threshold_draft.as_ref(),
-                    app.fallback_max_spend_draft.as_ref(),
-                    app.fallback_weekly_draft.as_ref(),
-                    inner_w,
-                    kick_lift,
+                    MemberCard {
+                        focused: detail_focused,
+                        row_cursor: app.fallback_detail_cursor,
+                        armed_remove: app.fallback_armed_remove,
+                        editing: app.fallback_threshold_draft.as_ref(),
+                        max_spend_editing: app.fallback_max_spend_draft.as_ref(),
+                        weekly_editing: app.fallback_weekly_draft.as_ref(),
+                        width: inner_w,
+                        kick_lift,
+                        sessions: app.live_sessions.member(&name),
+                    },
                 );
-                (name, true, lines, rows_start)
+                (name.to_string(), true, lines, rows_start)
             }
             Some(ChainItemKind::Add) => (
                 "add to chain".to_string(),
@@ -329,7 +337,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
         BlockedReason::Canceled => (DIAG_CANCELED.to_string(), theme::danger().bold(), None),
         BlockedReason::AuthBroken => (DIAG_AUTH_BROKEN.to_string(), theme::danger().bold(), None),
         BlockedReason::WeeklySpent { resets_in } => (
-            "weekly spent".to_string(),
+            DIAG_WEEKLY_SPENT.to_string(),
             theme::danger().bold(),
             resets_in.as_ref().map(|s| reset_pill(*s, fmt)),
         ),
@@ -356,7 +364,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             theme::warning().bold(),
             Some("still serving".to_string()),
         ),
-        BlockedReason::Stale => ("stale data".to_string(), theme::dim().bold(), None),
+        BlockedReason::Stale => (DIAG_STALE.to_string(), theme::dim().bold(), None),
     };
     let mut spans = pill(label, style);
     if let Some(suffix) = suffix {
@@ -371,7 +379,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
 /// ladder has no notion of), so bridging the two just to share strings would
 /// couple two ladders that are allowed to diverge. Same register: short,
 /// lowercase, names the concrete next action.
-fn reason_fix(reason: &BlockedReason, name: &str) -> String {
+fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> String {
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
@@ -383,11 +391,75 @@ fn reason_fix(reason: &BlockedReason, name: &str) -> String {
         BlockedReason::ScopedSpent { .. } => {
             "that model's weekly window is spent, other models still serve".to_string()
         }
-        BlockedReason::WeeklySoft { .. } => {
-            "past the weekly switch line, still serving".to_string()
-        }
+        BlockedReason::WeeklySoft { .. } => DIAG_WEEKLY_SOFT.to_string(),
         BlockedReason::Stale => "last usage check failed".to_string(),
     }
+}
+
+/// The member card's live-session block: how many `clauth start` sessions are
+/// running as THIS member, plus — only once one of them has actually swapped —
+/// when that happened and the caveat that makes the figure honest.
+///
+/// `live` is the one word every TUI surface counting sessions uses (the
+/// Overview column header, the Plugin runtime row, the Setup tab's disable
+/// gate), so the count reads the same wherever the operator meets it on screen.
+/// The CLI's refusals share the noun but not the phrasing — they answer a
+/// different question (why a command was refused), so they word it their own
+/// way.
+///
+/// The follower qualifier (`N, M with fallback`) returned to this card on
+/// 2026-07-27 after a one-day removal: `⇄` on the Overview cell still carries
+/// the same split for the column view, but this card is where the chain facts
+/// live. A glyph alone could not say "1 of these is movable" next to rows
+/// that already spell out every other chain fact. Shown only when
+/// `following > 0`. A pure-pinned count has no split to name. Both surfaces
+/// read the same `MemberSessions::following` field.
+///
+/// No leading blank: the caller owns the gaps around the block (post-pill
+/// blank above, post-live blank below), so where it sits in the card is the
+/// caller's decision and stays consistent whether or not 5h data exists.
+///
+/// Claude Code re-reads its credentials on its NEXT REQUEST, an mtime `stat` on
+/// the request path with no watcher behind it, so a session that just swapped
+/// keeps authenticating as the old member until it next talks. `current_member`
+/// is therefore where clauth PUT the link, not who is being billed this second,
+/// and nothing in the registry can observe the pickup — hence a caveat rather
+/// than an invented "not yet picked up" state. A session that never swapped has
+/// no repointed link and so gets no caveat.
+fn live_session_lines(
+    sessions: crate::live_sessions::MemberSessions,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if sessions.sessions == 0 {
+        return Vec::new();
+    }
+    let count = if sessions.following > 0 {
+        format!(
+            "{}, {} with fallback",
+            sessions.sessions, sessions.following
+        )
+    } else {
+        sessions.sessions.to_string()
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled(key_cell("live", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(count, theme::dim()),
+    ])];
+    let Some(at) = sessions.last_swap_at else {
+        return lines;
+    };
+    // An AGE, so it reads through `relative_age` (single largest unit, local
+    // stamp past 30 days) rather than the two-unit `humanize_duration` the countdowns
+    // use — a countdown is a duration, this is a point in the past.
+    lines.push(Line::from(vec![
+        Span::styled(key_cell("last swap", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(relative_age(at), theme::dim()),
+    ]));
+    lines.extend(help_tooltip_lines(
+        "picked up on the session's next request",
+        width,
+    ));
+    lines
 }
 
 /// The blocked-reason pill block: each pill on its own row with its `└` fix
@@ -422,22 +494,41 @@ fn pill_block(pills: Vec<(Vec<Span<'static>>, String)>, width: usize) -> Vec<Lin
     lines
 }
 
-/// Priority, 5h gauge with threshold tick, headroom figure, and the
-/// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
-/// Caret only when focused.
-#[allow(clippy::too_many_arguments)]
-fn member_detail(
-    cfg: &AppConfig,
-    name: &str,
+/// The member card's render context — pane focus, cursor, edit drafts, width,
+/// the kick lift, and the live-session tally. Grouped so [`member_detail`]
+/// stays under clippy's argument limit without an ad-hoc `#[allow]`.
+#[derive(Clone, Copy, Default)]
+struct MemberCard<'a> {
     focused: bool,
     row_cursor: usize,
     armed_remove: bool,
-    editing: Option<&InputState>,
-    max_spend_editing: Option<&InputState>,
-    weekly_editing: Option<&InputState>,
+    editing: Option<&'a InputState>,
+    max_spend_editing: Option<&'a InputState>,
+    weekly_editing: Option<&'a InputState>,
     width: usize,
     kick_lift: Option<i64>,
+    sessions: crate::live_sessions::MemberSessions,
+}
+
+/// Live-session count, 5h gauge with threshold tick, headroom figure, and the
+/// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
+/// Caret only when focused.
+fn member_detail(
+    cfg: &AppConfig,
+    name: &crate::profile::ProfileName,
+    card: MemberCard<'_>,
 ) -> (Vec<Line<'static>>, usize) {
+    let MemberCard {
+        focused,
+        row_cursor,
+        armed_remove,
+        editing,
+        max_spend_editing,
+        weekly_editing,
+        width,
+        kick_lift,
+        sessions,
+    } = card;
     let Some(profile) = cfg.find(name) else {
         return (
             vec![Line::from(Span::styled(
@@ -479,6 +570,16 @@ fn member_detail(
         lines.push(Line::from(""));
     }
 
+    // Live-session block above the 5h gauge, so the chain-movable count reads
+    // ahead of the gauge that decides when it moves. The block owns no padding:
+    // the gap above is the post-pill blank (when pills exist); the gap below is
+    // the trailing blank emitted here when the block is non-empty.
+    let live_lines = live_session_lines(sessions, width);
+    if !live_lines.is_empty() {
+        lines.extend(live_lines);
+        lines.push(Line::from(""));
+    }
+
     // `5h usage` — gauge lives on the kv key row (matching the `rotate at`
     // grammar), headroom figure indented beneath it. Two lines, not three:
     // the standalone eyebrow is folded into the key.
@@ -494,14 +595,17 @@ fn member_detail(
     }
     lines.push(Line::from(gauge_spans));
 
-    let figure = match pct {
-        Some(v) => format!("{:.0}% until rotate", (threshold - v).max(0.0)),
-        None => String::new(),
-    };
-    lines.push(Line::from(vec![
-        Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
-        Span::styled(figure, theme::faint()),
-    ]));
+    // No 5h reading means no headroom figure — an empty continuation line here
+    // read as a deliberate gap on exactly the accounts that had nothing to say.
+    if let Some(v) = pct {
+        lines.push(Line::from(vec![
+            Span::raw(" ".repeat(KEY_W + KEY_GUTTER)),
+            Span::styled(
+                format!("{:.0}% until rotate", (threshold - v).max(0.0)),
+                theme::faint(),
+            ),
+        ]));
+    }
     lines.push(Line::from(""));
 
     // Where the FALLBACK_ROWS loop starts, taken from the buffer itself rather
@@ -523,15 +627,18 @@ fn member_detail(
         let line = detail_row(
             *row,
             selected,
-            threshold,
-            profile.weekly_threshold,
-            cfg.state.weekly_switch_threshold_pct(),
-            profile.check_weekly,
-            profile.check_scoped,
-            profile.last_resort,
-            profile.max_auto_spend.unwrap_or(0.0),
-            cfg.state.spend_budget_switching,
-            armed_remove,
+            MemberRow {
+                threshold,
+                weekly_override: profile.weekly_threshold,
+                weekly_default: cfg.state.weekly_switch_threshold_pct(),
+                check_weekly: profile.check_weekly,
+                check_scoped: profile.check_scoped,
+                last_resort: profile.last_resort,
+                preferred: profile.preferred,
+                max_spend: profile.max_auto_spend.unwrap_or(0.0),
+                spend_budget: cfg.state.spend_budget_switching,
+                armed_remove,
+            },
             row_editing,
         );
         lines.push(if selected {
@@ -546,7 +653,7 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(threshold_range_tooltip(input, width)),
                 None if selected => lines.extend(help_tooltip_lines(
-                    &format!("switches to the next account once 5h usage hits {threshold:.0}%"),
+                    "switches to the next account once 5h usage passes this level",
                     width,
                 )),
                 None => {}
@@ -559,20 +666,14 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(weekly_override_range_tooltip(input, width)),
                 None if selected => {
-                    let chain_default = cfg.state.weekly_switch_threshold_pct();
                     let hint = if !profile.check_weekly {
-                        "weekly gate is off — this line isn't checked for this account".to_string()
+                        "weekly gate is off, this line isn't checked for this account"
+                    } else if profile.weekly_threshold.is_some() {
+                        "switches away from this account once weekly usage passes this level"
                     } else {
-                        match profile.weekly_threshold {
-                            Some(v) => format!(
-                                "switches away once weekly usage hits {v:.0}% here (chain default {chain_default:.0}%)"
-                            ),
-                            None => format!(
-                                "follows the chain-wide weekly limit ({chain_default:.0}%); type a value to override"
-                            ),
-                        }
+                        "switches away from this account at the chain's shared weekly level"
                     };
-                    lines.extend(help_tooltip_lines(&hint, width));
+                    lines.extend(help_tooltip_lines(hint, width));
                 }
                 None => {}
             }
@@ -599,6 +700,12 @@ fn member_detail(
         if *row == FallbackRow::LastResort && selected {
             lines.extend(help_tooltip_lines(
                 &last_resort_hint(cfg, name, profile.last_resort),
+                width,
+            ));
+        }
+        if *row == FallbackRow::Preferred && selected {
+            lines.extend(help_tooltip_lines(
+                &preferred_hint(cfg, name, profile.preferred),
                 width,
             ));
         }
@@ -647,7 +754,7 @@ fn member_detail(
 /// Hint under the `last resort` toggle — phrased for the state flipping it
 /// would produce: on → describes the standing behavior; off → what turning it
 /// on does, naming the member the (exclusive) mark would move away from.
-fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
+fn last_resort_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool) -> String {
     if on {
         return "this account keeps working once every other one is spent".to_string();
     }
@@ -664,6 +771,19 @@ fn last_resort_hint(cfg: &AppConfig, name: &str, on: bool) -> String {
     }
 }
 
+/// Hint under the `preferred` toggle — twin of [`last_resort_hint`]: on →
+/// describes the standing return behavior; off → what turning it on does,
+/// naming the member the (exclusive) mark would move away from.
+fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool) -> String {
+    if on {
+        return "work returns to this account once it's free again".to_string();
+    }
+    match cfg.profiles.iter().find(|p| p.preferred && p.name != *name) {
+        Some(marked) => format!("make this the home account instead of '{}'", marked.name),
+        None => "return work to this account once it's free again".to_string(),
+    }
+}
+
 /// Sub-line under the `rotate at` field while typing: the valid range, in DANGER
 /// when the current buffer parses out of range (or non-numeric), else faint —
 /// the threshold twin of the Config-tab refresh editor's `refresh_range_tooltip`.
@@ -676,10 +796,10 @@ fn threshold_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
     }
 }
 
-/// Sub-line under the `weekly at` field while typing: the valid range plus
-/// the empty-clears rule, DANGER when the buffer parses invalid.
+/// Sub-line under the `weekly at` field while typing: the valid range, DANGER
+/// when the buffer parses invalid.
 fn weekly_override_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
-    let range = "50-100 % · empty follows the chain default";
+    let range = "50-100 %";
     if parse_weekly_override(input.trimmed()).is_none() {
         invalid_tooltip_lines(range, width)
     } else {
@@ -705,7 +825,7 @@ fn max_spend_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static
 /// nothing — that is the reading this line exists to stop. `spend_room` fails
 /// closed on money (unknown spend never reads as $0), so each of its refusals
 /// gets its own copy instead of one $0-implying fallback.
-fn max_spend_hint(cfg: &AppConfig, name: &str, ceiling: f64) -> String {
+fn max_spend_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, ceiling: f64) -> String {
     if !cfg.state.spend_budget_switching {
         return "turn on allow extra usage in config before this does anything".to_string();
     }
@@ -729,21 +849,42 @@ fn max_spend_hint(cfg: &AppConfig, name: &str, ceiling: f64) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn detail_row(
-    row: FallbackRow,
-    selected: bool,
+/// The member values one FALLBACK_ROWS row renders, read off the member's
+/// `Profile` and the chain-wide `AppState` in [`member_detail`]. Grouped so
+/// [`detail_row`] stays under clippy's argument limit without an ad-hoc
+/// `#[allow]`.
+#[derive(Clone, Copy)]
+struct MemberRow {
     threshold: f64,
     weekly_override: Option<f64>,
     weekly_default: f64,
     check_weekly: bool,
     check_scoped: bool,
     last_resort: bool,
+    preferred: bool,
     max_spend: f64,
     spend_budget: bool,
     armed_remove: bool,
+}
+
+fn detail_row(
+    row: FallbackRow,
+    selected: bool,
+    values: MemberRow,
     editing: Option<&InputState>,
 ) -> Line<'static> {
+    let MemberRow {
+        threshold,
+        weekly_override,
+        weekly_default,
+        check_weekly,
+        check_scoped,
+        last_resort,
+        preferred,
+        max_spend,
+        spend_budget,
+        armed_remove,
+    } = values;
     let arrow = if editing.is_some() {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
@@ -839,16 +980,19 @@ fn detail_row(
                             format!("{weekly_default:.0}%"),
                             theme::faint(),
                         ));
-                        spans.push(Span::styled("   chain default", theme::faint()));
                     }
                 },
             }
             Line::from(spans)
         }
-        FallbackRow::CheckWeekly | FallbackRow::CheckScoped | FallbackRow::LastResort => {
+        FallbackRow::CheckWeekly
+        | FallbackRow::CheckScoped
+        | FallbackRow::LastResort
+        | FallbackRow::Preferred => {
             let (key, on) = match row {
                 FallbackRow::CheckWeekly => ("weekly gate", check_weekly),
                 FallbackRow::CheckScoped => ("scoped gate", check_scoped),
+                FallbackRow::Preferred => ("preferred", preferred),
                 _ => ("last resort", last_resort),
             };
             let (value, style) = if on {
@@ -925,18 +1069,6 @@ fn detail_row(
             ])
         }
     }
-}
-
-fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
-    // The terminal cursor (set via frame.set_cursor_position) owns the caret
-    // glyph — render the whole buffer with uniform styling.
-    let body = if invalid {
-        theme::danger()
-    } else {
-        theme::body()
-    }
-    .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
 }
 
 fn add_detail(app: &App, focused: bool, width: usize) -> Vec<Line<'static>> {

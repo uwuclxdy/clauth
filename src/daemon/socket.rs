@@ -219,7 +219,7 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             };
             if let Ok(mut q) = h.refetch_queue.lock() {
                 for n in names {
-                    q.insert(n);
+                    q.insert(n.to_string());
                 }
             }
             // No wake here: the usage refetch is drained by the scheduler thread on
@@ -238,19 +238,21 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
                 return err_code("unknown_profile", &format!("unknown profile '{raw}'"));
             };
             let op = match cmd.cmd.as_str() {
-                "fallback_add" => ConfigOp::FallbackAdd(name),
-                "fallback_remove" => ConfigOp::FallbackRemove(name),
+                "fallback_add" => ConfigOp::FallbackAdd(name.to_string()),
+                "fallback_remove" => ConfigOp::FallbackRemove(name.to_string()),
                 "fallback_move" => match cmd.dir.as_deref().and_then(MoveDir::parse) {
-                    Some(dir) => ConfigOp::FallbackMove(name, dir),
+                    Some(dir) => ConfigOp::FallbackMove(name.to_string(), dir),
                     None => return err("fallback_move requires dir: \"up\" or \"down\""),
                 },
                 "set_threshold" => match cmd.value.as_ref().and_then(serde_json::Value::as_f64) {
-                    Some(v) if (0.0..=100.0).contains(&v) => ConfigOp::SetThreshold(name, v),
+                    Some(v) if (0.0..=100.0).contains(&v) => {
+                        ConfigOp::SetThreshold(name.to_string(), v)
+                    }
                     _ => return err("set_threshold requires a numeric value within 0..=100"),
                 },
                 "set_last_resort" => {
                     match cmd.value.as_ref().and_then(serde_json::Value::as_bool) {
-                        Some(on) => ConfigOp::SetLastResort(name, on),
+                        Some(on) => ConfigOp::SetLastResort(name.to_string(), on),
                         None => return err("set_last_resort requires a boolean value"),
                     }
                 }
@@ -258,10 +260,12 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
                 // explicit null (or absent value) clears back to the
                 // chain-wide default.
                 "set_member_weekly" => match cmd.value.as_ref() {
-                    None | Some(serde_json::Value::Null) => ConfigOp::SetMemberWeekly(name, None),
+                    None | Some(serde_json::Value::Null) => {
+                        ConfigOp::SetMemberWeekly(name.to_string(), None)
+                    }
                     Some(v) => match v.as_f64() {
                         Some(v) if (0.0..=100.0).contains(&v) => {
-                            ConfigOp::SetMemberWeekly(name, Some(v))
+                            ConfigOp::SetMemberWeekly(name.to_string(), Some(v))
                         }
                         _ => {
                             return err(
@@ -273,7 +277,7 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
                 "set_check_weekly" | "set_check_scoped" => {
                     let scoped = cmd.cmd == "set_check_scoped";
                     match cmd.value.as_ref().and_then(serde_json::Value::as_bool) {
-                        Some(on) => ConfigOp::SetUsageGate(name, scoped, on),
+                        Some(on) => ConfigOp::SetUsageGate(name.to_string(), scoped, on),
                         None => return err(&format!("{} requires a boolean value", cmd.cmd)),
                     }
                 }
@@ -325,7 +329,10 @@ fn dispatch(line: &str, status_path: &Path, h: &SocketHandles) -> String {
             {
                 return err(&format!("{e}"));
             }
-            enqueue_config(h, ConfigOp::Rename(old, new_name.trim().to_string()));
+            enqueue_config(
+                h,
+                ConfigOp::Rename(old.to_string(), new_name.trim().to_string()),
+            );
             ok()
         }
         other => err(&format!("unknown cmd '{other}'")),
@@ -344,23 +351,22 @@ fn enqueue_config(h: &SocketHandles, op: ConfigOp) {
 }
 
 /// Case-insensitively resolve a raw profile name to its canonical form, or `None`.
-fn resolve(h: &SocketHandles, profile: &str) -> Option<String> {
-    h.config.lock().ok().and_then(|c| c.canonical_name(profile))
+fn resolve(h: &SocketHandles, profile: &str) -> Option<crate::profile::ProfileName> {
+    h.config
+        .lock()
+        .ok()
+        .and_then(|c| c.canonical_name(profile))
+        .map(|n| crate::profile::ProfileName::from(n.as_str()))
 }
 
 /// Every profile name — the `refresh`-all set. A credential-less name enqueued
 /// here is a harmless no-op: the scheduler's `merge_forced` only fetches forced
 /// names that appear in a fetch snapshot, so it silently ignores the rest.
-fn all_names(h: &SocketHandles) -> Vec<String> {
+fn all_names(h: &SocketHandles) -> Vec<crate::profile::ProfileName> {
     h.config
         .lock()
         .ok()
-        .map(|c| {
-            c.profiles
-                .iter()
-                .map(|p| p.name.as_str().to_string())
-                .collect()
-        })
+        .map(|c| c.profiles.iter().map(|p| p.name.clone()).collect())
         .unwrap_or_default()
 }
 

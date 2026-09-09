@@ -192,3 +192,87 @@ fn global_entry_drifted_flags_stale_command_and_args() {
     );
     assert_eq!(global_entry_drifted(), Some(true));
 }
+
+/// Both `_meta` keys are required on every request now that no handshake
+/// carries them. Drop one and a conforming server answers `-32602`, which the
+/// probe would report as a broken clauth.
+#[test]
+fn the_probe_frame_is_a_well_formed_stateless_opener() {
+    let frame = discover_frame();
+
+    assert_eq!(frame["method"].as_str(), Some("server/discover"));
+    let meta = &frame["params"]["_meta"];
+    assert_eq!(
+        meta["io.modelcontextprotocol/protocolVersion"].as_str(),
+        Some("2026-07-28")
+    );
+    assert!(
+        meta["io.modelcontextprotocol/clientCapabilities"].is_object(),
+        "clientCapabilities is required, got: {meta}"
+    );
+}
+
+/// A discover result whose capabilities carry no `tools` is the failure a
+/// forced `tools/list` cannot see: the server answers, and the client still
+/// exposes nothing.
+#[test]
+fn the_discover_probe_needs_an_advertised_tools_capability() {
+    let with_tools = json!({
+        "jsonrpc": "2.0", "id": 1,
+        "result": { "resultType": "complete", "capabilities": { "tools": {} } }
+    });
+    assert_eq!(parse_discover_reply(&with_tools.to_string()), McpProbe::Ok);
+
+    let without = json!({
+        "jsonrpc": "2.0", "id": 1,
+        "result": { "resultType": "complete", "capabilities": {} }
+    });
+    assert_eq!(
+        parse_discover_reply(&without.to_string()),
+        McpProbe::Failed("server advertises no tools capability".to_string())
+    );
+}
+
+/// A `clauth` too old to know `server/discover` answers method-not-found, and
+/// the tab's one line of reason is the only place that can say so.
+#[test]
+fn the_discover_probe_names_a_pre_stateless_binary() {
+    let old = json!({
+        "jsonrpc": "2.0", "id": 1,
+        "error": { "code": -32601, "message": "Method not found" }
+    });
+    let McpProbe::Failed(reason) = parse_discover_reply(&old.to_string()) else {
+        panic!("a method-not-found reply must fail the probe");
+    };
+    assert!(
+        reason.contains("predates the stateless protocol"),
+        "reason must name the cause, got: {reason}"
+    );
+
+    // Any other error keeps the server's own message.
+    let other = json!({
+        "jsonrpc": "2.0", "id": 1,
+        "error": { "code": -32022, "message": "Unsupported protocol version" }
+    });
+    let McpProbe::Failed(reason) = parse_discover_reply(&other.to_string()) else {
+        panic!("an error reply must fail the probe");
+    };
+    assert!(
+        reason.contains("Unsupported protocol version"),
+        "reason must carry the server's message, got: {reason}"
+    );
+}
+
+/// The probe's child is a full `clauth mcp` server, so it must say who spawned
+/// it: without this the handshake registers a bare session for its own lifetime
+/// and the live tally counts a session nobody is running.
+#[test]
+fn the_mcp_probe_marks_its_child_as_a_probe() {
+    let env = crate::testutil::env_overrides(&probe_command());
+
+    assert_eq!(
+        env.get(crate::mcp::MCP_PROBE_ENV),
+        Some(&Some("1".to_string())),
+        "the probe's child must be marked, got: {env:?}"
+    );
+}

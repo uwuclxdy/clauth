@@ -37,6 +37,9 @@ allow = [
     "BSL-1.0",
     "Unicode-3.0",
     "CDLA-Permissive-2.0",
+    # notify v8 ships CC0-1.0 alone (LICENSE-CC0, no MIT twin). CC0 is
+    # FSF-approved; notify is the only CC0 crate in the tree.
+    "CC0-1.0",
 ]
 # Confidence threshold for SPDX expression matching.
 confidence-threshold = 0.8

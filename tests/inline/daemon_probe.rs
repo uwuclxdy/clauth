@@ -29,22 +29,6 @@ fn write_status(generated_at: &str) {
     .expect("write status");
 }
 
-/// Opens + exclusively locks the daemon lock file, standing in for a live
-/// daemon. The returned handle must stay alive for the duration of the probe.
-fn hold_daemon_lock() -> std::fs::File {
-    let dir = clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dir.join(super::super::LOCK_FILE))
-        .expect("open lock");
-    f.try_lock().expect("acquire test lock");
-    f
-}
-
 // ── status_is_fresh (pure half) ──────────────────────────────────────────────
 
 #[test]
@@ -157,14 +141,20 @@ fn claim_now(dir: &std::path::Path, standby: bool) -> Claim {
     claim_singleton_with(dir, standby, 1, std::time::Duration::ZERO).expect("claim")
 }
 
-/// How long the fake probe below sits on both flocks. A literal, deliberately
-/// NOT derived from [`CLAIM_RETRY`]: a hold that scales with the constant under
-/// test shrinks with it, so the fixture could never catch the retry window
-/// collapsing. It has to outlast the first attempt, so a one-shot claim loses
-/// the race, and the full window has to clear it, so the retry wins — the first
-/// holds by construction (`probe_holding_both` returns while still holding), the
-/// second is pinned below.
-const PROBE_HOLD: std::time::Duration = std::time::Duration::from_millis(150);
+/// How long the fake probe below keeps holding once a test ARMS its release. A
+/// literal, deliberately NOT derived from [`CLAIM_RETRY`]: a hold that scales
+/// with the constant under test shrinks with it, so the fixture could never
+/// catch the retry window collapsing. It has to outlast the first attempt, so a
+/// one-shot claim loses the race, and the full window has to clear it, so the
+/// retry wins — the first holds by construction (the release is armed
+/// immediately before the retried call), the second is pinned below.
+///
+/// The sleep runs INSIDE the probe thread (not a separate release thread), so
+/// the locks drop the instant it wakes — no inter-thread channel hop between
+/// the timer and the `drop`. That hop was the macOS debug-leg flake: a 3-core
+/// runner under load scheduled the release thread's wakeup past the retry
+/// margin, so all three attempts saw the probe holding.
+const PROBE_HOLD: std::time::Duration = std::time::Duration::from_millis(60);
 // The shipped schedule must outlive PROBE_HOLD, or the recovery this test proves
 // cannot happen and it reds for a fixture reason instead of a real one.
 // `as_millis` because Duration's comparisons are not const — it also floors a
@@ -184,11 +174,9 @@ const _: () = assert!(
 /// singleton lock before `standby_waiting` opens the slot file, so nothing in
 /// production holds both at once. Read it as a worst case, not as a model of the
 /// probes.
-fn probe_holding_both(
-    dir: &std::path::Path,
-    hold: std::time::Duration,
-) -> std::thread::JoinHandle<()> {
+fn probe_holding_both(dir: &std::path::Path) -> ProbeHold {
     let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<std::time::Duration>();
     let dir = dir.to_path_buf();
     let handle = std::thread::spawn(move || {
         let a = crate::profile::open_state_file(&dir.join(super::super::LOCK_FILE)).expect("open");
@@ -197,12 +185,36 @@ fn probe_holding_both(
             .expect("open");
         s.try_lock().expect("probe takes the free standby lock");
         held_tx.send(()).expect("signal held");
+        let hold = release_rx.recv().unwrap_or(std::time::Duration::ZERO);
         std::thread::sleep(hold);
-        drop(s);
-        drop(a);
     });
     held_rx.recv().expect("probe reports both flocks held");
-    handle
+    ProbeHold {
+        release: release_tx,
+        handle,
+    }
+}
+
+/// A probe sitting on both flocks until told to release.
+///
+/// The probe thread receives the hold duration from [`release_after`] and sleeps
+/// in-thread, so the locks drop the instant the sleep ends — no separate release
+/// thread to schedule. The duration is armed at the retried call (not when the
+/// probe took the locks), so a control running under the hold cannot expire it,
+/// and the margin is whatever the caller arms.
+struct ProbeHold {
+    release: std::sync::mpsc::Sender<std::time::Duration>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl ProbeHold {
+    /// Let go `after` from NOW. Call it immediately before the retried operation
+    /// under test, so the margin is measured from that call and not from however
+    /// long the assertions before it took.
+    fn release_after(self, after: std::time::Duration) -> std::thread::JoinHandle<()> {
+        let _ = self.release.send(after);
+        self.handle
+    }
 }
 
 #[test]
@@ -295,15 +307,17 @@ fn no_standby_exits_rather_than_taking_the_free_slot() {
 fn a_transient_probe_hold_never_forces_an_exit() {
     let _home = HomeSandbox::new();
     let dir = sandbox_dir();
-    let probe = probe_holding_both(&dir, PROBE_HOLD);
+    let probe = probe_holding_both(&dir);
 
     // Positive control: a single attempt reads the probe as a live daemon plus a
     // live standby, which is exactly the wrong answer the retry exists to undo.
+    // Runs under an unconditional hold, so it cannot race the release.
     assert!(
         matches!(claim_now(&dir, true), Claim::Redundant),
         "one attempt cannot tell a probe from a holder"
     );
 
+    let probe = probe.release_after(PROBE_HOLD);
     let claim = claim_singleton(&dir, true).expect("claim");
     assert!(
         matches!(claim, Claim::Active(_)),
@@ -323,18 +337,18 @@ fn a_won_standby_slot_is_kept_rather_than_re_taken() {
         panic!("the first instance takes the singleton lock");
     };
 
-    let started = std::time::Instant::now();
+    let attempts = claim_attempts(&dir);
     let claim = claim_singleton(&dir, true).expect("claim");
-    let elapsed = started.elapsed();
 
     assert!(
         matches!(claim, Claim::Standby(_)),
         "the second instance parks in the standby slot"
     );
-    assert!(
-        elapsed < CLAIM_RETRY,
-        "a won slot must stand: the claim took {elapsed:?}, past the {CLAIM_RETRY:?} gap it \
-         would only wait for by re-testing an answer it already had"
+    assert_eq!(
+        claim_attempts(&dir),
+        attempts + 1,
+        "a won slot must stand: the claim re-tested an answer it already had instead \
+         of returning it"
     );
     assert!(
         standby_waiting(),
@@ -484,6 +498,52 @@ fn wait_for_active_times_out_while_the_lock_stays_held() {
         started.elapsed() >= std::time::Duration::from_millis(80),
         "it waited the full window before giving up"
     );
+}
+
+/// A transient reader of the singleton lock (TUI header dot at 1 Hz,
+/// `clauth daemon --status`) holds the flock for microseconds and releases it.
+/// Without retry, `claim_by_replacing_with`'s fast path reads this as a daemon,
+/// falls through to `holder_pid` (which returns `None` for a reader with no pid
+/// sidecar), and bails naming a daemon that isn't there. The retry clears it.
+#[test]
+fn replace_retries_past_a_transient_lock_reader() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+
+    // A transient probe holds the singleton lock briefly, then releases.
+    let probe = probe_holding_both(&dir);
+
+    // Positive control: a one-shot (no retry) reads the probe as a held daemon
+    // and fails because the transient reader has no pid sidecar. Runs under an
+    // unconditional hold, so it cannot race the release.
+    let err = claim_by_replacing_retry_with(
+        &dir,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+        1,
+        std::time::Duration::ZERO,
+    )
+    .expect_err("one-shot reads the transient probe as a daemon and bails on the missing pid");
+    assert!(
+        err.to_string().contains("unreadable"),
+        "the bail names the unreadable pid, got {err}"
+    );
+
+    // With the production retry schedule: the probe clears by the second
+    // attempt and `--replace` takes the free lock as a clean start.
+    let probe = probe.release_after(PROBE_HOLD);
+    let claim = claim_by_replacing_with(
+        &dir,
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+    )
+    .expect("replace retries past the transient probe");
+    assert!(
+        matches!(claim, Claim::Active(_)),
+        "the retry cleared the transient and claimed the lock"
+    );
+
+    probe.join().expect("probe thread");
 }
 
 // ── FetchLease (single-fetcher lease over usage-fetch.lock) ───────────────────

@@ -55,7 +55,10 @@ impl ShowcaseHome {
         // Pre-seed usage history files on disk so on_tick → apply_usage doesn't
         // overwrite the in-memory seed with an empty/partial reload.
         for (name, entries) in &build_synthetic_history() {
-            let history_path = crate::profile::profile_history_path(name).expect("history path");
+            let history_path = crate::profile::profile_history_path(
+                &crate::profile::ProfileName::from(name.clone()),
+            )
+            .expect("history path");
             std::fs::create_dir_all(history_path.parent().unwrap()).expect("history dir");
             let content: String = entries
                 .iter()
@@ -293,12 +296,14 @@ fn oauth_profile(
         fallback_threshold,
         weekly_threshold: None,
         last_resort: false,
-        session_feed: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: Some(UsageInfo {
             plan: Some(PlanInfo {
@@ -313,6 +318,7 @@ fn oauth_profile(
             spend,
             codex_rate_limit_reached: None,
             codex_reset_credits: None,
+            open_at: None,
         }),
         fetch_status,
         provider: None,
@@ -334,12 +340,14 @@ fn api_profile(name: &str) -> Profile {
         fallback_threshold: None,
         weekly_threshold: None,
         last_resort: false,
-        session_feed: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: None,
@@ -360,12 +368,14 @@ fn failed_profile(name: &str) -> Profile {
         fallback_threshold: Some(90.0),
         weekly_threshold: None,
         last_resort: false,
-        session_feed: false,
+        preferred: false,
+        rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
         check_scoped: true,
         bell_threshold: None,
         disabled: false,
+        console: None,
         credentials: None,
         usage: None,
         fetch_status: Some(FetchStatus::Failed),
@@ -728,24 +738,30 @@ fn settle(app: &mut app::App, what: &str, mut pred: impl FnMut(&app::App) -> boo
 
 /// Helper: read profile fields without holding the config guard across handle_key.
 fn base_url_of(app: &app::App, name: &str) -> Option<String> {
-    app.config().find(name).and_then(|p| p.base_url.clone())
+    app.config()
+        .find(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.base_url.clone())
 }
 
 fn auto_start_of(app: &app::App, name: &str) -> bool {
     app.config()
-        .find(name)
+        .find(&crate::profile::ProfileName::from(name))
         .map(|p| p.auto_start)
         .unwrap_or(false)
 }
 
 fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
-    app.config().find(name).and_then(|p| p.fallback_threshold)
+    app.config()
+        .find(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.fallback_threshold)
 }
 
 #[test]
 fn demo_data_drives_all_actions() {
     let _home = ShowcaseHome::new();
-    let mut app = app::App::new(demo_config());
+    let config = demo_config();
+    crate::profile::save_app_state(&config.state).expect("persist state");
+    let mut app = app::App::new(config);
     seed_usage(&app);
     seed_timers(&app);
     seed_history(&app);
@@ -812,7 +828,7 @@ fn demo_data_drives_all_actions() {
     {
         let cfg = app.config();
         let util = cfg
-            .find("personal")
+            .find(&crate::profile::ProfileName::from("personal"))
             .and_then(|p| p.usage.as_ref())
             .and_then(|u| u.five_hour.as_ref())
             .map(|w| w.utilization);
@@ -961,7 +977,9 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Enter); // confirm
     assert_eq!(app.profile_count(), before - 1, "delete drops one profile");
     assert!(
-        app.config().find("research").is_none(),
+        app.config()
+            .find(&crate::profile::ProfileName::from("research"))
+            .is_none(),
         "the deleted profile is gone from the config"
     );
 
@@ -1012,7 +1030,7 @@ fn demo_data_drives_all_actions() {
     );
     let created = {
         let cfg = app.config();
-        cfg.find("sandbox-test")
+        cfg.find(&crate::profile::ProfileName::from("sandbox-test"))
             .map(|p| (p.base_url.clone(), p.api_key.clone()))
     };
     assert!(
@@ -1049,7 +1067,9 @@ fn demo_data_drives_all_actions() {
         "delete the newly created profile"
     );
     assert!(
-        app.config().find("sandbox-test").is_none(),
+        app.config()
+            .find(&crate::profile::ProfileName::from("sandbox-test"))
+            .is_none(),
         "sandbox-test must be gone after delete"
     );
 

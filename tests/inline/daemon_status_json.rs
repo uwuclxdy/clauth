@@ -31,6 +31,8 @@ fn build_status_top_level_shape_and_active() {
     };
     config.state.active_profile = Some("work".into());
     config.state.refresh_interval_ms = 300_000;
+    // The account_email cache writes below are gated on the on-disk record.
+    crate::testutil::register_names(&["work", "home"]);
 
     let v = build_status(&config, config.state.refresh_interval_ms, None, false);
 
@@ -47,6 +49,33 @@ fn build_status_top_level_shape_and_active() {
     assert!(v["forecast"]["to"].is_null());
     assert_eq!(v["refresh_interval_ms"], 300_000);
     assert!(v["generated_at"].as_str().unwrap().contains('T'));
+    // Exact key sets — a silent rename/removal anywhere in the contract fails
+    // here rather than in a downstream reader.
+    let mut top: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+    top.sort_unstable();
+    assert_eq!(
+        top,
+        [
+            // Fork-only keys are additive under schema 1; the menu-bar clients
+            // read them (docs/ccsbar/DESIGN.md).
+            "active_codex_profile",
+            "active_profile",
+            "burn_aware",
+            "clauth_version",
+            "codex_fallback_chain",
+            "fallback_chain",
+            "forecast",
+            "generated_at",
+            "last_error",
+            "last_switch",
+            "pending_switch",
+            "profiles",
+            "refresh_interval_ms",
+            "schema",
+            "weekly_switch_threshold",
+            "wrap_off",
+        ],
+    );
     let profiles = v["profiles"].as_array().unwrap();
     let mut per: Vec<&str> = profiles[0]
         .as_object()
@@ -58,24 +87,31 @@ fn build_status_top_level_shape_and_active() {
     assert_eq!(
         per,
         [
+            // Fork-only, additive: the identity anchor's operator half.
             "account_email",
             "active",
             "auth_status",
             "auto_start",
+            // Additive under schema 1 (interleaved auto-start queue): the
+            // profile's queue slot and the queue's shared next-open estimate,
+            // `null` for a profile that holds no slot.
+            "auto_start_queue",
             "base_url",
             "bell_threshold",
+            // Fork-only, additive: the codex leg's published readings.
             "codex_rate_limit_reached",
             "codex_reset_credits",
             "codex_snapshot_at",
             "fallback",
             "fetch_status",
             "fetched_at",
+            // Fork-only, additive: which harness owns the profile.
             "harness",
             "has_live_session",
             "name",
             "next_refresh_at",
             "provider",
-            "session_feed",
+            "rolling_token",
             "stale",
             "third_party",
             "tier",
@@ -95,7 +131,7 @@ fn build_status_top_level_shape_and_active() {
     // anchor's email half is cached, then the cached value verbatim.
     assert!(work["account_email"].is_null());
     crate::profile_cache::write_profile_cache(
-        "work",
+        &crate::profile::ProfileName::from("work"),
         crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
         &"work@example.com".to_string(),
     );
@@ -119,7 +155,7 @@ fn build_status_top_level_shape_and_active() {
     // OAuth-only gate: an API profile (OAuth→API conversion keeps the cached
     // anchor) must read null, matching the TUI's is_api gate.
     crate::profile_cache::write_profile_cache(
-        "home",
+        &crate::profile::ProfileName::from("home"),
         crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
         &"home@example.com".to_string(),
     );
@@ -170,6 +206,79 @@ fn build_status_fallback_membership_and_armed() {
     assert_eq!(v["fallback_chain"], serde_json::json!(["a", "b"]));
 }
 
+// ── disabled: hidden from the feed by default, surfaced via include_disabled ──
+
+#[test]
+fn build_status_hides_disabled_by_default_and_shows_with_include_disabled() {
+    let _home = HomeSandbox::new();
+    let mut off = oauth_profile("off");
+    off.disabled = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("on"), off],
+    };
+
+    let hidden = build_status(&config, 300_000, None, false);
+    let hidden_names: Vec<&str> = hidden["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        hidden_names,
+        ["on"],
+        "a disabled account must not appear in the default feed"
+    );
+
+    let shown = build_status(&config, 300_000, None, true);
+    let mut shown_names: Vec<&str> = shown["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    shown_names.sort_unstable();
+    assert_eq!(
+        shown_names,
+        ["off", "on"],
+        "include_disabled=true must surface the full set"
+    );
+}
+
+// A disabled ACTIVE must stay visible even under the default hide, or the
+// top-level `active_profile` field names an entry `profiles[]` doesn't carry —
+// a reader following wiki/Daemon.md's contract (resolve `active_profile`
+// against `profiles[]`) would find nothing.
+#[test]
+fn build_status_keeps_a_disabled_active_visible_so_active_profile_never_dangles() {
+    let _home = HomeSandbox::new();
+    let mut active_off = oauth_profile("active-off");
+    active_off.disabled = true;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![active_off, oauth_profile("sibling")],
+    };
+    config.state.active_profile = Some("active-off".into());
+
+    let v = build_status(&config, 300_000, None, false);
+    let names: Vec<&str> = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"active-off"),
+        "the disabled ACTIVE profile must stay visible in profiles[] even under the default hide"
+    );
+    let active_name = v["active_profile"].as_str().unwrap();
+    assert!(
+        names.contains(&active_name),
+        "active_profile must always resolve against an entry in profiles[] — no dangling reference"
+    );
+}
+
 // ── AUTH-2: auth_status + pending_switch contract ─────────────────────────────
 
 fn set_expiry(p: &mut Profile, expires_at: i64) {
@@ -198,7 +307,7 @@ fn build_status_auth_status_ok_expiring_broken() {
         state: AppState::default(),
         profiles: vec![ok, expiring, broken],
     };
-    config.set_auth_broken("broken", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("broken"), true);
 
     let v = build_status(&config, 300_000, None, false);
     let profiles = v["profiles"].as_array().unwrap();
@@ -257,9 +366,16 @@ fn build_status_pending_switch_reflects_live_signal() {
         state: AppState::default(),
         profiles: vec![oauth_profile("work")],
     };
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
 
     // single-shot (no daemon) → pending_switch and last_error are present-but-null.
     let none = build_status(&config, 300_000, None, false);
+    assert!(
+        none.get("pending_switch").is_some(),
+        "pending_switch key is always present"
+    );
     assert!(none["pending_switch"].is_null());
     assert!(
         none.get("last_error").is_some(),
@@ -269,41 +385,6 @@ fn build_status_pending_switch_reflects_live_signal() {
         none["last_error"].is_null(),
         "single-shot has no drain history"
     );
-
-    // live daemon with an accepted-not-yet-applied switch → the target name, plus a
-    // recorded drain skip reason (TECH-6, additive — schema stays 1).
-    let status: std::collections::HashMap<String, crate::usage::FetchStatus> =
-        std::collections::HashMap::new();
-    let next: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let streaks: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    let last_switch = crate::daemon::LastSwitch {
-        from: Some("home".to_string()),
-        to: Some("work".to_string()),
-        at_ms: 1_700_000_000_000,
-        trigger: "user",
-    };
-    let live = LiveSignals {
-        status: &status,
-        next_refresh: &next,
-        streaks: &streaks,
-        pending_switch: Some("work"),
-        last_error: Some((
-            1_700_000_000_000,
-            "deferring switch to 'work': target is mid-fetch",
-        )),
-        last_switch: Some(&last_switch),
-    };
-    let v = build_status(&config, 300_000, Some(&live), false);
-    assert_eq!(v["pending_switch"], "work");
-    assert_eq!(
-        v["schema"], 1,
-        "last_error/last_switch/version are additive — schema must not bump"
-    );
-    // TECH-8: version always present; last_switch reflects the hero event.
-    assert_eq!(v["clauth_version"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(v["last_switch"]["from"], "home");
-    assert_eq!(v["last_switch"]["to"], "work");
-    assert_eq!(v["last_switch"]["trigger"], "user");
     assert!(
         none["clauth_version"].is_string(),
         "version present in single-shot too"
@@ -312,6 +393,40 @@ fn build_status_pending_switch_reflects_live_signal() {
         none["last_switch"].is_null(),
         "single-shot has no switch history"
     );
+
+    // live daemon with an accepted-not-yet-applied switch → the target name, plus a
+    // recorded drain skip reason (TECH-6, additive — schema stays 1).
+    let last_switch = crate::daemon::LastSwitch {
+        from: Some(crate::profile::ProfileName::from("home")),
+        to: Some(crate::profile::ProfileName::from("work")),
+        at_ms: 1_700_000_000_000,
+        trigger: "user",
+    };
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: Some("home"),
+        last_error: Some((
+            1_700_000_000_000,
+            "deferring switch to 'work': target is mid-fetch",
+        )),
+        last_switch: Some(&last_switch),
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(v["pending_switch"], "home");
+    assert_eq!(
+        v["schema"], SCHEMA_VERSION,
+        "pending_switch is part of schema 1 — no bump"
+    );
+    // TECH-8: version always present; last_switch reflects the hero event.
+    assert_eq!(v["clauth_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["last_switch"]["from"], "home");
+    assert_eq!(v["last_switch"]["to"], "work");
+    assert_eq!(v["last_switch"]["trigger"], "user");
     assert_eq!(
         v["last_error"]["message"],
         "deferring switch to 'work': target is mid-fetch"
@@ -321,6 +436,856 @@ fn build_status_pending_switch_reflects_live_signal() {
         "last_error.at is an ISO-8601 instant"
     );
 }
+
+/// The queue object is pinned by VALUE, not key presence: `position` is the
+/// member's 1-based slot in the shared order, `next_open_at` round-trips to
+/// anchor + gap, and every null shape is spelled out — toggle off, not a
+/// member, and member-with-no-anchor. Publishing `null` for every position
+/// would otherwise survive the key-list test.
+#[test]
+fn build_status_auto_start_queue_positions_and_null_cases() {
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let mut config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), oauth_profile("c")],
+    };
+
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &[],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(queue_of(&v, "b")["position"], 2);
+    // Round-trip rather than a formatted literal, so the pin is on the
+    // arithmetic (anchor + gap) and not on the ISO renderer.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+    );
+    assert_eq!(
+        queue_of(&v, "a")["next_open_at"],
+        queue_of(&v, "b")["next_open_at"],
+        "the estimate is the queue's, shared by every member"
+    );
+    // Null case 1: an OAuth profile that never opted into auto_start.
+    assert!(queue_of(&v, "c").is_null());
+
+    // Null case 2: a member with no anchor yet — the slot publishes, the
+    // stamp is null (reads as "due now").
+    let cold = LiveSignals {
+        queue_anchor: None,
+        ..live
+    };
+    let v = build_status(&config, 300_000, Some(&cold), false);
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert!(queue_of(&v, "a")["next_open_at"].is_null());
+
+    // Null case 3: the toggle off is a real off switch on the feed too.
+    config.state.auto_start_queue = false;
+    let v = build_status(&config, 300_000, Some(&live), false);
+    for name in ["a", "b", "c"] {
+        assert!(queue_of(&v, name).is_null());
+    }
+}
+
+/// An api-key profile's freshness derives from ITS cache
+/// (`THIRD_PARTY_CACHE_FILE`), and a name the live stores don't carry falls
+/// back to the same derivation — pre-fix both keyed on the OAuth
+/// `USAGE_CACHE_FILE`/status store, so a healthy hourly-refreshed api-key
+/// account rendered permanently as never-fetched (`fetch_status: null`).
+#[test]
+fn build_status_third_party_freshness_from_its_own_cache() {
+    let _home = HomeSandbox::new();
+    let mut api = Profile::new("zai".to_string(), None, None);
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    assert!(api.is_third_party(), "fixture must be an api-key profile");
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![api],
+    };
+
+    // Warm third-party cache, no OAuth cache: the profile is fetched.
+    crate::testutil::register_names(&["zai"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("zai"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    // Single-shot: freshness from the third-party cache mtime (just written).
+    let v = build_status(&config, 300_000, None, false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(p["fetch_status"], "Fresh");
+    assert!(!p["fetched_at"].is_null());
+    assert!(!p["next_refresh_at"].is_null());
+    assert_eq!(p["third_party"]["available"], true);
+
+    // Live daemon whose stores don't carry the name (the OAuth-leg stores
+    // never do for api-key profiles): same derivation, not null.
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        p["fetch_status"], "Fresh",
+        "a live daemon must not blank an api-key profile's freshness"
+    );
+    assert!(!p["next_refresh_at"].is_null());
+}
+
+/// `refresh_spent_accounts` OFF + a spent (100%-capped) OAuth window: the
+/// account is skipped until reset, so it has no pending refresh — the feed nulls
+/// `next_refresh_at` instead of the past mtime+interval stamp the derivation
+/// would otherwise emit. With the toggle ON (default) the same account keeps its
+/// derived countdown.
+#[test]
+fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
+    let _home = HomeSandbox::new();
+    let config = |refresh_spent: bool| AppConfig {
+        state: AppState {
+            refresh_spent_accounts: refresh_spent,
+            ..AppState::default()
+        },
+        profiles: vec![oauth_profile("maxed")],
+    };
+    // Warm the OAuth usage cache with a live 100%-capped 5h window.
+    crate::testutil::register_names(&["maxed"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("maxed"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+
+    // Toggle OFF → skipped-spent → next_refresh_at nulled.
+    let off = build_status(&config(false), 300_000, None, false);
+    let p = &off["profiles"].as_array().unwrap()[0];
+    assert!(
+        p["next_refresh_at"].is_null(),
+        "a spent skipped account has no pending refresh: {p}"
+    );
+
+    // Toggle ON (default) → still polled → derived countdown present.
+    let on = build_status(&config(true), 300_000, None, false);
+    let p = &on["profiles"].as_array().unwrap()[0];
+    assert!(
+        !p["next_refresh_at"].is_null(),
+        "polling a spent account still schedules a refresh: {p}"
+    );
+}
+
+/// The half a spent-skip gate keyed on `is_third_party` gets wrong: a GENERIC
+/// api-key endpoint (`provider` is `None`, so that predicate says false) is
+/// fetched on the cadence by the third-party leg, and `drop_spent_oauth` blanks
+/// the OAuth leg's countdown map alone — so a spent account is skipped on one
+/// leg while the other still has a refresh pending, and the feed published
+/// `null` over it.
+///
+/// The fixture is the HYBRID, which is the reachable shape: one Setup endpoint
+/// edit on a spent OAuth account (`edit_profile_endpoint`) keeps the pair, the
+/// key and the maxed `usage_cache.json`, so that reading is CURRENT rather than
+/// leftover and the OAuth leg is genuinely mid-skip.
+#[test]
+fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
+    let _home = HomeSandbox::new();
+    let mut api = oauth_profile("litellm");
+    api.base_url = Some("http://127.0.0.1:4000".to_string());
+    api.api_key = Some("k".to_string());
+    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
+    assert!(
+        !api.is_third_party() && api.usage_cache_is_third_party(),
+        "fixture must be the case the two predicates disagree on",
+    );
+    let config = AppConfig {
+        state: AppState {
+            refresh_spent_accounts: false,
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    };
+    crate::testutil::register_names(&["litellm"]);
+    // Current, not stale: the OAuth leg still polls this pair, and this is the
+    // reading `drop_spent_oauth` skips on.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 100.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            ..Default::default()
+        },
+    );
+    // The cache this account's own leg writes.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("litellm"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+
+    // Single-shot: derived off the third-party cache's mtime, not suppressed.
+    let single = build_status(&config, 300_000, None, false);
+    let p = &single["profiles"].as_array().unwrap()[0];
+    assert!(
+        !p["next_refresh_at"].is_null(),
+        "the third-party leg refreshes this account on the cadence: {p}"
+    );
+
+    // Live daemon: the countdown that leg published must reach the feed
+    // verbatim — a stamp the mtime derivation could not have produced, so this
+    // fails on suppression rather than on the two paths agreeing by accident.
+    let next: std::collections::HashMap<String, u64> = [("litellm".to_string(), 4_102_444_800_000)]
+        .into_iter()
+        .collect();
+    let empty_status = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    let p = &v["profiles"].as_array().unwrap()[0];
+    assert_eq!(
+        p["next_refresh_at"], "2100-01-01T00:00:00+00:00",
+        "the live third-party countdown must reach the feed: {p}"
+    );
+}
+
+// RLS-1: the additive per-profile `stale` flag = the daemon distrusts this
+// reading as a deep-slot stuck RateLimited (live status RateLimited AND the 429
+// streak past the active cap) — the SAME predicate `scan_auto_switch` acts on,
+// so the published cue and the switch decision cannot drift. Additive: schema
+// stays 1; the single-shot (no streaks) is always false.
+#[test]
+fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
+    use crate::usage::FetchStatus;
+    use std::collections::HashMap;
+
+    let _home = HomeSandbox::new();
+    // TWO profiles, so a "computed once and applied to every row" regression
+    // (rather than keyed per profile name) is catchable.
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    let next: HashMap<String, u64> = HashMap::new();
+    let deep = crate::usage::ACTIVE_CAP_MAX_STREAK + 1;
+    let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()["stale"]
+            .clone()
+    };
+
+    // single-shot (no daemon / no streaks) → stale is present-and-false.
+    let none = build_status(&config, 300_000, None, false);
+    assert_eq!(
+        none["schema"], 1,
+        "stale is additive — schema must not bump"
+    );
+    assert_eq!(
+        stale_of("work", &none),
+        false,
+        "single-shot never publishes a distrusted reading"
+    );
+
+    // Two profiles in ONE body: `work` is a deep-slot stuck RateLimited (→ stale),
+    // `home` is Fresh with an (irrelevant) equally-deep streak (→ NOT stale). This
+    // one call proves the flag keys on the profile's OWN status+streak, is
+    // per-profile (not one value smeared across the array), and that streak depth
+    // alone never stales a live reading.
+    let status = HashMap::from([
+        ("work".to_string(), FetchStatus::RateLimited),
+        ("home".to_string(), FetchStatus::Fresh),
+    ]);
+    let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
+    let live = LiveSignals {
+        status: &status,
+        third_party_status: &Default::default(),
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(
+        stale_of("work", &v),
+        true,
+        "a deep-slot stuck RateLimited reading is published as stale"
+    );
+    assert_eq!(
+        stale_of("home", &v),
+        false,
+        "a Fresh sibling is never stale however deep its streak — and stale is \
+         per-profile, not computed once and applied to the whole array"
+    );
+
+    // Shallow RateLimited (≤ cap) → not yet distrusted.
+    let status = HashMap::from([("work".to_string(), FetchStatus::RateLimited)]);
+    let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
+    let live = LiveSignals {
+        status: &status,
+        third_party_status: &Default::default(),
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(
+        stale_of("work", &v),
+        false,
+        "a shallow RateLimited reading is not stale"
+    );
+}
+
+/// The third-party leg writes its outcomes to `third_party_status`, not the
+/// OAuth `status` store the feed used to read alone. A name missing from that
+/// one fell through to the mtime derivation — and an `AuthExpired` fetch writes
+/// no cache, so the field came out `null`: a dead console session was
+/// indistinguishable from a profile that had never been fetched. That is the
+/// exact dishonesty "detect it, stop fetching, say why" was chosen to avoid.
+#[test]
+fn build_status_publishes_the_third_party_legs_own_status() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = Profile::new("qwen".to_string(), Some(base.to_string()), None);
+    qwen.provider = crate::providers::Provider::from_base_url(base);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["qwen".into()],
+            ..AppState::default()
+        },
+        profiles: vec![qwen],
+    };
+    let empty: HashMap<String, FetchStatus> = HashMap::new();
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+
+    // No cache on disk (an AuthExpired fetch writes none), so the mtime
+    // derivation has nothing — the live third-party store is the only source.
+    let tp = HashMap::from([("qwen".to_string(), FetchStatus::AuthExpired)]);
+    let live = LiveSignals {
+        status: &empty,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "AuthExpired",
+        "a dead console session must not read as never-fetched",
+    );
+    // `stale` is contracted as a stuck 429 off the OAuth store and must not
+    // start following the third-party leg.
+    assert_eq!(v["profiles"][0]["stale"], false);
+
+    // A third-party 429 reaches the feed too — pre-fix it published whatever the
+    // cache mtime said, which is a freshness claim about a rejected poll.
+    let tp = HashMap::from([("qwen".to_string(), FetchStatus::RateLimited)]);
+    let live = LiveSignals {
+        status: &empty,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(v["profiles"][0]["fetch_status"], "RateLimited");
+}
+
+/// The OAuth leg keeps precedence, exactly as the TUI's own merge does: a
+/// hybrid profile carrying both must not have its OAuth verdict overwritten.
+#[test]
+fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["both".into()],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("both".to_string(), None, None)],
+    };
+    let status = HashMap::from([("both".to_string(), FetchStatus::Fresh)]);
+    let tp = HashMap::from([("both".to_string(), FetchStatus::AuthExpired)]);
+    let next = HashMap::new();
+    let streaks = HashMap::new();
+    let live = LiveSignals {
+        status: &status,
+        third_party_status: &tp,
+        next_refresh: &next,
+        streaks: &streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: None,
+        queue_blocked: &[],
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert_eq!(v["profiles"][0]["fetch_status"], "Fresh");
+}
+
+/// The daemonless surfaces (`clauth status --json`, `clauth list`) derive
+/// freshness from the usage cache's mtime, so a warm cache behind a DEAD
+/// console session published `fetch_status: "Fresh"` — a live measurement over
+/// a credential that can never self-heal, which is the exact failure this
+/// design was chosen over "keep last-known values" to avoid. The durable
+/// verdict is keyed by credential fingerprint, so it can only ever say
+/// "the last fetch under the credential you still hold died".
+#[test]
+fn build_status_reports_a_recorded_dead_credential_without_a_daemon() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let session = |token: &str| crate::profile::ConsoleCredential {
+        token: token.to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    };
+    let profile = |token: &str| {
+        let mut p = Profile::new("qwen".to_string(), Some(base.to_string()), None);
+        p.provider = crate::providers::Provider::from_base_url(base);
+        p.console = Some(session(token));
+        p
+    };
+    let config_of = |p: Profile| AppConfig {
+        state: AppState {
+            profiles: vec!["qwen".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+
+    // A cache written just now: the mtime derivation calls this "Fresh".
+    crate::testutil::register_names(&["qwen"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("qwen"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: Vec::new(),
+            bars: Vec::new(),
+            plan: Some("lite".to_string()),
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let dead = config_of(profile("dead-token"));
+    let v = build_status(&dead, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "Fresh",
+        "precondition: the mtime derivation alone calls a warm cache Fresh",
+    );
+
+    // Record the verdict against the credential the profile holds.
+    let fp = crate::usage::profile_credential_fingerprint(&dead.profiles[0])
+        .expect("a console-credentialed profile has a fingerprint");
+    crate::profile_cache::write_auth_expired(&crate::profile::ProfileName::from("qwen"), fp);
+
+    let v = build_status(&dead, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "AuthExpired",
+        "no daemon, warm cache, dead session — must not read as a live measurement",
+    );
+
+    // A re-login changes the credential, so the record stops applying on its
+    // own. THIS is what makes persisting it safe.
+    let relogged = config_of(profile("fresh-token"));
+    let v = build_status(&relogged, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["fetch_status"], "Fresh",
+        "a record for a credential the profile no longer holds is inert",
+    );
+}
+
+/// The record must never invent a reading for a profile nothing has fetched.
+#[test]
+fn build_status_leaves_a_never_fetched_profile_unknown() {
+    let _home = HomeSandbox::new();
+    let base = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut p = Profile::new("cold".to_string(), Some(base.to_string()), None);
+    p.provider = crate::providers::Provider::from_base_url(base);
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec!["cold".into()],
+            ..AppState::default()
+        },
+        profiles: vec![p],
+    };
+    let v = build_status(&config, 300_000, None, false);
+    assert!(
+        v["profiles"][0]["fetch_status"].is_null(),
+        "no cache and no verdict is unknown, not a status",
+    );
+}
+
+/// The published `rolling_token` is what the sidecar HOLDS — the same content
+/// classification the TUI renders — never the config flag. status.json is the
+/// one surface where a reader has no second source to check against, so a
+/// flag-driven value would tell external readers a degraded mint is routine
+/// hours-scale maintenance (or hide a rolling bearer behind a mint's 30-day
+/// warning ramp).
+#[test]
+fn build_status_rolling_token_is_the_sidecar_content_not_the_config_flag() {
+    let _home = HomeSandbox::new();
+    let name = "roll-truth";
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config_with_flag = |rolling_token: bool| {
+        let mut p = oauth_profile(name);
+        p.rolling_token = rolling_token;
+        AppConfig {
+            state: AppState::default(),
+            profiles: vec![p],
+        }
+    };
+    let sidecar = |scopes: Vec<&str>, plan: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "sk-ant-oat01-status-fixture".to_string(),
+            refresh_token: None,
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(scopes.into_iter().map(String::from).collect()),
+            subscription_type: plan.map(String::from),
+        }),
+    };
+
+    // Flag ON, sidecar degraded onto the mint: publish the mint.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:sessions:claude_code"],
+            None,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config_with_flag(true), 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], false,
+        "a degraded profile must publish the mint it is actually on"
+    );
+
+    // Flag OFF, sidecar holding a rolling bearer: publish the bearer.
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&sidecar(
+            vec!["user:inference", "user:profile"],
+            Some("max"),
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config_with_flag(false), 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], true,
+        "what sessions actually hold outranks the flag in both directions"
+    );
+}
+
+/// A mis-fill (rotating pair) publishes `rolling_token: false` even though its
+/// chain-shaped scopes would scope-classify as rolling — the classifier's
+/// refresh-token arm pre-empts the inference. Without it, status.json told
+/// external readers "routine hours-scale maintenance" over the exact state the
+/// TUI renders `[ mis-filled ]` for, on the same file, same frame.
+#[test]
+fn build_status_rolling_token_is_false_for_a_misfill() {
+    let _home = HomeSandbox::new();
+    let name = "roll-misfill";
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut p = oauth_profile(name);
+    p.rolling_token = true;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![p],
+    };
+    // What a mis-fill IS: a copy of credentials.json — refresh token, chain
+    // scopes, plan stamp and all.
+    let misfill = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-misfill".to_string(),
+            refresh_token: Some("rt-misfill".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+            scopes: Some(vec![
+                "user:inference".to_string(),
+                "user:profile".to_string(),
+            ]),
+            subscription_type: Some("max".to_string()),
+        }),
+    };
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec_pretty(&misfill).unwrap(),
+    )
+    .unwrap();
+    let v = build_status(&config, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["rolling_token"], false,
+        "a mis-fill is the state the split exists to detect, not a rolling token"
+    );
+}
+
+/// The published `profiles[]` entries deserialize into [`ProfileEntry`] — the
+/// typed spelling the reader (`clauth list`) derives its fields from. A field
+/// the writer drops or renames reds here instead of in a reader's typed access.
+#[test]
+fn published_entries_deserialize_into_the_typed_contract() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    // Warm the cache so the entry carries real window rows.
+    crate::testutil::register_names(&["work"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 42.4,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+
+    let v = build_status(&config, 300_000, None, false);
+    let entries: Vec<ProfileEntry> = serde_json::from_value(v["profiles"].clone()).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.name.as_str(), "work");
+    assert!(entry.active);
+    assert_eq!(entry.windows.len(), 1);
+    assert_eq!(entry.windows[0].label, "5h");
+    assert_eq!(entry.windows[0].utilization_pct, 42.4);
+    // The window row's published key set, pinned like the entry's above: both
+    // sides derive from one struct, so a rename compiles clean and would
+    // silently change the wire shape for every external reader.
+    let mut win_keys: Vec<&str> = v["profiles"][0]["windows"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    win_keys.sort_unstable();
+    assert_eq!(win_keys, ["label", "resets_at", "utilization_pct"]);
+}
+
+/// The feed must publish the queue the ELECTION is running, not a wider one.
+/// `auto_start_queue_members` drops switch-grade kick-blocked profiles, and the
+/// scheduler and the TUI both supply that set — the feed used to pass an empty
+/// one, so a blocked account kept a position and inflated `N` for as long as
+/// the limiter's advertised ceiling stood (hours, not the "one poll" the code
+/// claimed). Every OTHER member's `next_open_at` is then computed off the wrong
+/// `5h / N` and reads earlier than the gap actually applied (review round 4).
+///
+/// Both legs, because the two surfaces read the set from different places: a
+/// live daemon passes its in-memory blocks through `LiveSignals`, and the
+/// daemonless `status --json` re-derives them from the same `kick_block.json`
+/// caches the scheduler writes through — on the same `kick_block_switch_grade`
+/// predicate, which the third profile below pins by NOT being excluded.
+#[test]
+fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
+    use crate::profile_cache::{KICK_BLOCK_CACHE_FILE, write_profile_cache};
+    use crate::usage::KickBlock;
+    let _home = HomeSandbox::new();
+    let queued = |name: &str| {
+        let mut p = oauth_profile(name);
+        p.auto_start = true;
+        p
+    };
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec!["a".into(), "b".into(), "c".into()],
+            auto_start_queue: true,
+            ..AppState::default()
+        },
+        profiles: vec![queued("a"), queued("b"), queued("c")],
+    };
+    let queue_of = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .expect("profile published")["auto_start_queue"]
+            .clone()
+    };
+
+    // Live leg: the scheduler's own blocked set, handed over.
+    let empty_status = std::collections::HashMap::new();
+    let empty_next = std::collections::HashMap::new();
+    let empty_streaks = std::collections::HashMap::new();
+    let anchor = 1_780_000_000i64;
+    let blocked = [crate::profile::ProfileName::from("b")];
+    let live = LiveSignals {
+        status: &empty_status,
+        third_party_status: &Default::default(),
+        next_refresh: &empty_next,
+        streaks: &empty_streaks,
+        pending_switch: None,
+        last_error: None,
+        last_switch: None,
+        queue_anchor: Some(anchor),
+        queue_blocked: &blocked,
+    };
+    let v = build_status(&config, 300_000, Some(&live), false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "a kick-blocked member holds no published slot, as it holds none in the election"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "the members behind it close up rather than leaving a hole"
+    );
+    // The N the estimate is sized from, which is the half of this that a
+    // position assertion alone would miss.
+    let published = queue_of(&v, "a")["next_open_at"]
+        .as_str()
+        .expect("an anchored queue publishes a next-open stamp")
+        .to_string();
+    assert_eq!(
+        crate::usage::iso_to_epoch_secs(&published),
+        Some(anchor + crate::usage::queue_gap_secs(2, 300_000)),
+        "the gap is 5h/2, not the 5h/3 an un-excluded member would publish"
+    );
+
+    // Daemonless leg: the same verdict re-derived from disk. `c` gets a block
+    // that is NOT switch-grade (one 429, no `rejected`), so the predicate is
+    // pinned in both directions by the same run.
+    crate::testutil::register_names(&["a", "b", "c"]);
+    let far_ahead = crate::usage::now_epoch_secs() + 3600;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("b"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 2,
+            rejected: true,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    write_profile_cache(
+        &crate::profile::ProfileName::from("c"),
+        KICK_BLOCK_CACHE_FILE,
+        &KickBlock {
+            streak: 1,
+            rejected: false,
+            until: Some(far_ahead),
+            next_retry: far_ahead,
+        },
+    );
+    let v = build_status(&config, 300_000, None, false);
+    assert!(
+        queue_of(&v, "b").is_null(),
+        "`status --json` reads the same block off `kick_block.json`"
+    );
+    assert_eq!(queue_of(&v, "a")["position"], 1);
+    assert_eq!(
+        queue_of(&v, "c")["position"],
+        2,
+        "a burst 429 is not switch-grade and never costs a queue slot"
+    );
+}
+
+// ── CDX-1 T7 + forecast: fork-only status.json fields (all additive — the
+// schema stays 1; docs/ccsbar/DESIGN.md is the reader contract) ──────────────
 
 // The daemon's published forecast is the same `fallback::next_target` walk the
 // switch decision runs — the single source of truth for "would switch to X"
@@ -403,9 +1368,10 @@ fn forecast_hydrates_usage_from_disk_and_skips_a_weekly_dead_member() {
             })
             .collect(),
     };
+    crate::testutil::register_names(&["a", "b", "c"]);
     for (name, info) in &caches {
         crate::profile_cache::write_profile_cache(
-            name,
+            &crate::profile::ProfileName::from(*name),
             crate::profile_cache::USAGE_CACHE_FILE,
             info,
         );
@@ -421,144 +1387,6 @@ fn forecast_hydrates_usage_from_disk_and_skips_a_weekly_dead_member() {
     assert_eq!(forecast["action"], "switch");
     assert_eq!(forecast["to"], "c");
 }
-
-/// `refresh_spent_accounts` OFF + a spent (100%-capped) OAuth window: the
-/// account is skipped until reset, so it has no pending refresh — the feed nulls
-/// `next_refresh_at` instead of the past mtime+interval stamp the derivation
-/// would otherwise emit. With the toggle ON (default) the same account keeps its
-/// derived countdown.
-#[test]
-fn build_status_nulls_next_refresh_for_a_spent_skipped_account() {
-    let _home = HomeSandbox::new();
-    let config = |refresh_spent: bool| AppConfig {
-        state: AppState {
-            refresh_spent_accounts: refresh_spent,
-            ..AppState::default()
-        },
-        profiles: vec![oauth_profile("maxed")],
-    };
-    // Warm the OAuth usage cache with a live 100%-capped 5h window.
-    crate::profile_cache::write_profile_cache(
-        "maxed",
-        crate::profile_cache::USAGE_CACHE_FILE,
-        &crate::usage::UsageInfo {
-            five_hour: Some(crate::usage::UsageWindow {
-                utilization: 100.0,
-                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
-            }),
-            ..Default::default()
-        },
-    );
-
-    // Toggle OFF → skipped-spent → next_refresh_at nulled.
-    let off = build_status(&config(false), 300_000, None, false);
-    let p = &off["profiles"].as_array().unwrap()[0];
-    assert!(
-        p["next_refresh_at"].is_null(),
-        "a spent skipped account has no pending refresh: {p}"
-    );
-
-    // Toggle ON (default) → still polled → derived countdown present.
-    let on = build_status(&config(true), 300_000, None, false);
-    let p = &on["profiles"].as_array().unwrap()[0];
-    assert!(
-        !p["next_refresh_at"].is_null(),
-        "polling a spent account still schedules a refresh: {p}"
-    );
-}
-
-// RLS-1: the additive per-profile `stale` flag = the daemon distrusts this
-// reading as a deep-slot stuck RateLimited (live status RateLimited AND the 429
-// streak past the active cap) — the SAME predicate `scan_auto_switch` acts on,
-// so the published cue and the switch decision cannot drift. Additive: schema
-// stays 1; the single-shot (no streaks) is always false.
-#[test]
-fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
-    use crate::usage::FetchStatus;
-    use std::collections::HashMap;
-
-    let _home = HomeSandbox::new();
-    // TWO profiles, so a "computed once and applied to every row" regression
-    // (rather than keyed per profile name) is catchable.
-    let config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![oauth_profile("work"), oauth_profile("home")],
-    };
-    let next: HashMap<String, u64> = HashMap::new();
-    let deep = crate::usage::ACTIVE_CAP_MAX_STREAK + 1;
-    let stale_of = |name: &str, v: &serde_json::Value| -> serde_json::Value {
-        v["profiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|p| p["name"] == name)
-            .unwrap()["stale"]
-            .clone()
-    };
-
-    // single-shot (no daemon / no streaks) → stale is present-and-false.
-    let none = build_status(&config, 300_000, None, false);
-    assert_eq!(
-        none["schema"], 1,
-        "stale is additive — schema must not bump"
-    );
-    assert_eq!(
-        stale_of("work", &none),
-        false,
-        "single-shot never publishes a distrusted reading"
-    );
-
-    // Two profiles in ONE body: `work` is a deep-slot stuck RateLimited (→ stale),
-    // `home` is Fresh with an (irrelevant) equally-deep streak (→ NOT stale). This
-    // one call proves the flag keys on the profile's OWN status+streak, is
-    // per-profile (not one value smeared across the array), and that streak depth
-    // alone never stales a live reading.
-    let status = HashMap::from([
-        ("work".to_string(), FetchStatus::RateLimited),
-        ("home".to_string(), FetchStatus::Fresh),
-    ]);
-    let streaks = HashMap::from([("work".to_string(), deep), ("home".to_string(), deep)]);
-    let live = LiveSignals {
-        status: &status,
-        next_refresh: &next,
-        streaks: &streaks,
-        pending_switch: None,
-        last_error: None,
-        last_switch: None,
-    };
-    let v = build_status(&config, 300_000, Some(&live), false);
-    assert_eq!(
-        stale_of("work", &v),
-        true,
-        "a deep-slot stuck RateLimited reading is published as stale"
-    );
-    assert_eq!(
-        stale_of("home", &v),
-        false,
-        "a Fresh sibling is never stale however deep its streak — and stale is \
-         per-profile, not computed once and applied to the whole array"
-    );
-
-    // Shallow RateLimited (≤ cap) → not yet distrusted.
-    let status = HashMap::from([("work".to_string(), FetchStatus::RateLimited)]);
-    let streaks = HashMap::from([("work".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK)]);
-    let live = LiveSignals {
-        status: &status,
-        next_refresh: &next,
-        streaks: &streaks,
-        pending_switch: None,
-        last_error: None,
-        last_switch: None,
-    };
-    let v = build_status(&config, 300_000, Some(&live), false);
-    assert_eq!(
-        stale_of("work", &v),
-        false,
-        "a shallow RateLimited reading is not stale"
-    );
-}
-
-// ---- CDX-1 T7: codex fields (all additive — schema stays 1) ----
 
 // A mixed claude+codex config publishes per-profile harness, per-slot active
 // truth, codex identity from the stored JWTs, the pinned codex_snapshot_at
@@ -589,7 +1417,8 @@ fn build_status_publishes_codex_fields() {
     let mut cdx = Profile::new("cdx-a".to_string(), None, None);
     cdx.harness = crate::profile::Harness::Codex;
     save_profile(&cdx).unwrap();
-    crate::codex::write_profile_auth("cdx-a", &bytes).unwrap();
+    crate::testutil::register_names(&["cdx-a"]);
+    crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-a"), &bytes).unwrap();
 
     let mut config = AppConfig {
         state: AppState::default(),
@@ -640,7 +1469,7 @@ fn build_status_publishes_codex_fields() {
     // Once the CDX-6 poll has cached a count it is published verbatim, next
     // to the verdict from the same body.
     crate::profile_cache::write_profile_cache(
-        "cdx-a",
+        &crate::profile::ProfileName::from("cdx-a"),
         crate::profile_cache::USAGE_CACHE_FILE,
         &crate::usage::UsageInfo {
             codex_rate_limit_reached: Some("rate_limit_reached".to_string()),
@@ -703,7 +1532,8 @@ fn build_status_codex_auth_status_expiring_and_broken() {
     let mut cdx = Profile::new("cdx-a".to_string(), None, None);
     cdx.harness = crate::profile::Harness::Codex;
     save_profile(&cdx).unwrap();
-    crate::codex::write_profile_auth("cdx-a", &bytes).unwrap();
+    crate::testutil::register_names(&["cdx-a"]);
+    crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-a"), &bytes).unwrap();
 
     let mut config = AppConfig {
         state: AppState::default(),
@@ -713,147 +1543,10 @@ fn build_status_codex_auth_status_expiring_and_broken() {
     let v = build_status(&config, 300_000, None, false);
     assert_eq!(v["profiles"][0]["auth_status"], "expiring");
 
-    config.set_auth_broken("cdx-a", true);
+    config.set_auth_broken(&crate::profile::ProfileName::from("cdx-a"), true);
     let v = build_status(&config, 300_000, None, false);
     assert_eq!(
         v["profiles"][0]["auth_status"], "broken",
         "broken outranks expiring"
     );
-}
-
-// ── Upstream v0.13 tests (daemon singleton modes, disable, #58 final) ──────
-
-#[test]
-fn build_status_hides_disabled_by_default_and_shows_with_include_disabled() {
-    let _home = HomeSandbox::new();
-    let mut off = oauth_profile("off");
-    off.disabled = true;
-    let config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![oauth_profile("on"), off],
-    };
-
-    let hidden = build_status(&config, 300_000, None, false);
-    let hidden_names: Vec<&str> = hidden["profiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["name"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        hidden_names,
-        ["on"],
-        "a disabled account must not appear in the default feed"
-    );
-
-    let shown = build_status(&config, 300_000, None, true);
-    let mut shown_names: Vec<&str> = shown["profiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["name"].as_str().unwrap())
-        .collect();
-    shown_names.sort_unstable();
-    assert_eq!(
-        shown_names,
-        ["off", "on"],
-        "include_disabled=true must surface the full set"
-    );
-}
-
-// A disabled ACTIVE must stay visible even under the default hide, or the
-// top-level `active_profile` field names an entry `profiles[]` doesn't carry —
-// a reader following wiki/daemon.md's contract (resolve `active_profile`
-// against `profiles[]`) would find nothing.
-#[test]
-fn build_status_keeps_a_disabled_active_visible_so_active_profile_never_dangles() {
-    let _home = HomeSandbox::new();
-    let mut active_off = oauth_profile("active-off");
-    active_off.disabled = true;
-    let mut config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![active_off, oauth_profile("sibling")],
-    };
-    config.state.active_profile = Some("active-off".into());
-
-    let v = build_status(&config, 300_000, None, false);
-    let names: Vec<&str> = v["profiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p["name"].as_str().unwrap())
-        .collect();
-    assert!(
-        names.contains(&"active-off"),
-        "the disabled ACTIVE profile must stay visible in profiles[] even under the default hide"
-    );
-    let active_name = v["active_profile"].as_str().unwrap();
-    assert!(
-        names.contains(&active_name),
-        "active_profile must always resolve against an entry in profiles[] — no dangling reference"
-    );
-}
-
-// ── AUTH-2: auth_status + pending_switch contract ─────────────────────────────
-
-/// An api-key profile's freshness derives from ITS cache
-/// (`THIRD_PARTY_CACHE_FILE`), and a name the live stores don't carry falls
-/// back to the same derivation — pre-fix both keyed on the OAuth
-/// `USAGE_CACHE_FILE`/status store, so a healthy hourly-refreshed api-key
-/// account rendered permanently as never-fetched (`fetch_status: null`).
-#[test]
-fn build_status_third_party_freshness_from_its_own_cache() {
-    let _home = HomeSandbox::new();
-    let mut api = Profile::new("zai".to_string(), None, None);
-    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
-    api.api_key = Some("k".to_string());
-    api.provider = crate::providers::Provider::from_base_url(api.base_url.as_deref().unwrap());
-    assert!(api.is_third_party(), "fixture must be an api-key profile");
-    let config = AppConfig {
-        state: AppState::default(),
-        profiles: vec![api],
-    };
-
-    // Warm third-party cache, no OAuth cache: the profile is fetched.
-    crate::profile_cache::write_profile_cache(
-        "zai",
-        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
-        &crate::providers::ThirdPartyStats {
-            is_available: true,
-            rows: vec![],
-            bars: vec![],
-            plan: None,
-            endpoint: None,
-            best_effort: false,
-        },
-    );
-
-    // Single-shot: freshness from the third-party cache mtime (just written).
-    let v = build_status(&config, 300_000, None, false);
-    let p = &v["profiles"].as_array().unwrap()[0];
-    assert_eq!(p["fetch_status"], "Fresh");
-    assert!(!p["fetched_at"].is_null());
-    assert!(!p["next_refresh_at"].is_null());
-    assert_eq!(p["third_party"]["available"], true);
-
-    // Live daemon whose stores don't carry the name (the OAuth-leg stores
-    // never do for api-key profiles): same derivation, not null.
-    let empty_status = std::collections::HashMap::new();
-    let empty_next = std::collections::HashMap::new();
-    let empty_streaks = std::collections::HashMap::new();
-    let live = LiveSignals {
-        status: &empty_status,
-        next_refresh: &empty_next,
-        streaks: &empty_streaks,
-        pending_switch: None,
-        last_error: None,
-        last_switch: None,
-    };
-    let v = build_status(&config, 300_000, Some(&live), false);
-    let p = &v["profiles"].as_array().unwrap()[0];
-    assert_eq!(
-        p["fetch_status"], "Fresh",
-        "a live daemon must not blank an api-key profile's freshness"
-    );
-    assert!(!p["next_refresh_at"].is_null());
 }
