@@ -137,10 +137,40 @@ fn key_role(path: KeyPath<'_>, custom_env: &BTreeSet<String>) -> KeyRule {
 /// `~/.claude/settings.json` plus each SHARED per-session runtime copy, via
 /// [`crate::jsonsync::runtime_files_under`].
 fn known_paths() -> Result<Vec<PathBuf>> {
-    Ok(crate::jsonsync::runtime_files_under(
-        &claude_dir()?,
-        "settings.json",
-    ))
+    let mut paths = crate::jsonsync::runtime_files_under(&claude_dir()?, "settings.json");
+    // Harness gate (fork): a codex profile's dir never becomes a sync target.
+    // Upstream's walk already cannot reach one by construction — a codex start
+    // builds `codex-home/`, never a `runtime*/` dir, and only the latter matches
+    // `is_shared_runtime_dir_name` — but the invariant is the fork's to keep,
+    // not a shape upstream promises, and a hand-made `runtime/` under a codex
+    // profile would otherwise take claude's managed key set into a tree the
+    // codex CLI reads. The operator's own `~/.claude/settings.json` (first
+    // entry) has no profile dir above it, so it can never match.
+    paths.retain(|path| {
+        path.parent()
+            .and_then(Path::parent)
+            .is_none_or(|profile_dir| !is_codex_profile_dir(profile_dir))
+    });
+    Ok(paths)
+}
+
+/// Harness gate (fork): a codex profile runs `codex` against its own isolated
+/// CODEX_HOME — it has no claude `runtime/settings.json` to sync, and its
+/// `config.toml` `[env]` belongs to the codex side, never to the managed key
+/// set written into `~/.claude/settings.json`. Judged from the same
+/// `harness = "codex"` line `profile::render_config_toml` writes; an unreadable
+/// config reads as claude here — per-profile-env safety is separately handled
+/// by [`per_profile_env_keys`]'s own fail-closed read of the same file.
+fn is_codex_profile_dir(dir: &Path) -> bool {
+    #[derive(Deserialize)]
+    struct HarnessOnly {
+        harness: Option<String>,
+    }
+    std::fs::read_to_string(dir.join("config.toml"))
+        .ok()
+        .and_then(|raw| toml::from_str::<HarnessOnly>(&raw).ok())
+        .and_then(|c| c.harness)
+        .is_some_and(|h| h == "codex")
 }
 
 /// Just the `[env]` table of a profile's `config.toml`. A dedicated minimal
@@ -170,7 +200,7 @@ fn per_profile_env_keys() -> Option<BTreeSet<String>> {
         return Some(keys);
     };
     for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) || is_codex_profile_dir(&entry.path()) {
             continue;
         }
         let path = entry.path().join("config.toml");

@@ -213,6 +213,7 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> Profile {
         total: None,
     };
     Profile {
+        harness: crate::profile::Harness::Claude,
         name: "tp".into(),
         base_url: Some("https://api.example.com".into()),
         api_key: Some("k".into()),
@@ -269,6 +270,7 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> Profile {
         });
     }
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: Some("https://api.deepseek.com/anthropic".into()),
         api_key: Some("k".into()),
@@ -337,6 +339,7 @@ fn deepseek_profile_from_cache(name: &str, captured: &str) -> Profile {
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
     Profile {
         name: name.into(),
+        harness: crate::profile::Harness::Claude,
         base_url: None,
         api_key: None,
         auto_start: false,
@@ -464,8 +467,8 @@ fn broken_login_marker_outranks_bell_and_active() {
     config.state.auth_broken.push("a".into());
     let mut app = App::new(config);
     app.bell_fired.insert("a".into(), true);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let text = line_text(&line);
     assert!(text.contains('×'), "broken login renders ×: {text}");
     assert!(!text.contains('!'), "bell yields to ×: {text}");
@@ -481,8 +484,8 @@ fn bell_marker_shows_when_login_is_fine() {
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
     app.bell_fired.insert("a".into(), true);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, false);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(text.contains('!'), "{text}");
     assert!(!text.contains('×'), "{text}");
 }
@@ -499,8 +502,8 @@ fn token_danger_marker_outranks_bell_and_active() {
     app.bell_fired.insert("a".into(), true); // bell also fired
     app.session_tokens
         .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let text = line_text(&line);
     assert!(text.contains('⊘'), "mis-filled token renders ⊘: {text}");
     assert!(!text.contains('!'), "bell yields to ⊘: {text}");
@@ -529,8 +532,8 @@ fn canceled_marker_is_dead_first() {
     config.state.auth_broken.push("a".into()); // also auth-broken
     let mut app = App::new(config);
     app.bell_fired.insert("a".into(), true); // bell also fired
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let text = line_text(&line);
     assert!(text.contains('⊖'), "canceled renders ⊖: {text}");
     assert!(!text.contains('×'), "broken login yields to ⊖: {text}");
@@ -550,8 +553,8 @@ fn broken_login_outranks_token_danger_marker() {
     let mut app = App::new(config);
     app.session_tokens
         .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
-    let widths = OverviewWidths::new(80, &app);
-    let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(80, &app, false);
+    let text = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(text.contains('×'), "broken login wins: {text}");
     assert!(!text.contains('⊘'), "token marker yields to ×: {text}");
 }
@@ -565,11 +568,12 @@ fn long_lived_token_expired_marks() {
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
-    let widths = OverviewWidths::new(120, &app);
+    // Wide terminal so the type column isn't clamped narrow enough to drop the tag.
+    let widths = OverviewWidths::new(120, &app, false);
 
     app.session_tokens
         .insert("a".into(), S::LongLived(Some(now_ms() as i64 + 340 * day)));
-    let live = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let live = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(
         !live.contains('⊘'),
         "a live token raises no danger marker: {live}"
@@ -577,7 +581,7 @@ fn long_lived_token_expired_marks() {
 
     app.session_tokens
         .insert("a".into(), S::LongLived(Some(now_ms() as i64 - day)));
-    let dead = line_text(&render_overview_row(&app, 0, &widths, false, true));
+    let dead = line_text(&render_overview_row(&app, 0, &widths, false, true, None));
     assert!(dead.contains('⊘'), "expired token raises ⊘: {dead}");
 }
 
@@ -595,8 +599,8 @@ fn cached_row_colors_countdown_amber_and_underlines_nothing() {
         .lock()
         .unwrap()
         .insert("a".to_string(), now_ms() + 30_000);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     assert!(
         line.spans
             .iter()
@@ -629,8 +633,8 @@ fn failed_row_colors_countdown_red() {
         .lock()
         .unwrap()
         .insert("a".to_string(), now_ms() + 30_000);
-    let widths = OverviewWidths::new(80, &app);
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let widths = OverviewWidths::new(80, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let bracket = line
         .spans
         .iter()
@@ -663,12 +667,12 @@ fn third_party_row_drain_colors_both_countdowns() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let config = config_with(vec![third_party_profile(60.0, 30.0)], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(200, &app);
+    let widths = OverviewWidths::new(200, &app, false);
     assert!(
         widths.five_hour >= 26 && widths.seven_day >= 26,
         "test needs both columns wide enough to render a (reset) suffix",
     );
-    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true));
+    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true, None));
     assert_eq!(suffixes.len(), 2, "both windows render a (reset) suffix");
     for s in suffixes {
         assert_ne!(
@@ -693,8 +697,8 @@ fn oauth_row_drain_colors_the_seven_day_countdown() {
     });
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(200, &app);
-    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true));
+    let widths = OverviewWidths::new(200, &app, false);
+    let suffixes = reset_suffixes(&render_overview_row(&app, 0, &widths, false, true, None));
     assert_eq!(suffixes.len(), 2);
     assert_eq!(
         suffixes[0].style.fg,
@@ -722,7 +726,7 @@ fn gap_widening_never_clips_the_row() {
     let config = config_with(vec![a, b], Some("ax-main"), vec![]);
     let app = App::new(config);
     for width in 34u16..=200 {
-        let w = OverviewWidths::new(width, &app);
+        let w = OverviewWidths::new(width, &app, false);
         let min =
             fixed_overview_width(w.name, w.kind, w.five_hour, w.seven_day, w.live, 2) + TIMER_SLOT;
         if min > width as usize {
@@ -745,6 +749,7 @@ fn gap_widening_never_clips_the_row() {
 /// `PlanTier::from_subscription_type(..).display()`.
 fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
     Profile {
+        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -788,13 +793,13 @@ fn credentialed_long_label_clamps_to_kind_width() {
     let a = credentialed_profile("acct", "enterprise");
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(60, &app);
+    let widths = OverviewWidths::new(60, &app, false);
     assert_eq!(
         widths.kind, 6,
         "test assumes a 6-wide kind column at this pane width"
     );
 
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let chars: Vec<char> = line_text(&line).chars().collect();
 
     // 2 = cursor slot, 2 = marker slot (both always exactly 2 chars).
@@ -838,9 +843,9 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
     }
     let config = config_with(vec![a, b], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(80, &app);
+    let widths = OverviewWidths::new(80, &app, false);
 
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true, None);
     let name_span = disabled_line
         .spans
         .iter()
@@ -852,7 +857,7 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
         "a disabled account's name renders dim, not the active/inactive name_color"
     );
 
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true, None);
     let enabled_name_span = enabled_line
         .spans
         .iter()
@@ -925,7 +930,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
     config.state.auth_broken.push("a".into());
     config.state.auth_broken.push("b".into());
     let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, false);
 
     let non_dim = |line: &Line<'static>| -> Vec<String> {
         line.spans
@@ -936,7 +941,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
             .collect()
     };
 
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true, None);
     assert_eq!(
         non_dim(&disabled_line),
         Vec::<String>::new(),
@@ -944,7 +949,7 @@ fn disabled_row_flattens_every_semantic_hue_to_dim() {
     );
 
     // The control row must still carry hue, or the assertion above is vacuous.
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true, None);
     assert!(
         !non_dim(&enabled_line).is_empty(),
         "control: an enabled row keeps its semantic colors"
@@ -989,8 +994,8 @@ fn disabled_row_type_cell_does_not_pulse() {
     let snapshot = |idx: usize| -> Vec<(String, Option<ratatui::style::Color>)> {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(450 * idx as u64);
-        let widths = OverviewWidths::new(110, &app);
-        render_overview_row(&app, 0, &widths, false, true)
+        let widths = OverviewWidths::new(110, &app, false);
+        render_overview_row(&app, 0, &widths, false, true, None)
             .spans
             .iter()
             .map(|s| (s.content.to_string(), s.style.fg))
@@ -1006,8 +1011,8 @@ fn disabled_row_type_cell_does_not_pulse() {
     let enabled_snapshot = |elapsed_ms: u64| -> Vec<Option<ratatui::style::Color>> {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(elapsed_ms);
-        let widths = OverviewWidths::new(110, &app);
-        render_overview_row(&app, 1, &widths, false, true)
+        let widths = OverviewWidths::new(110, &app, false);
+        render_overview_row(&app, 1, &widths, false, true, None)
             .spans
             .iter()
             .map(|s| s.style.fg)
@@ -1051,8 +1056,8 @@ fn no_tier_type_cell_does_not_pulse() {
     let snapshot = |idx: usize, phase_ms: u64| -> Vec<(String, Option<ratatui::style::Color>)> {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(phase_ms);
-        let widths = OverviewWidths::new(110, &app);
-        render_overview_row(&app, idx, &widths, false, true)
+        let widths = OverviewWidths::new(110, &app, false);
+        render_overview_row(&app, idx, &widths, false, true, None)
             .spans
             .iter()
             .map(|s| (s.content.to_string(), s.style.fg))
@@ -1113,8 +1118,9 @@ fn no_tier_type_cell_reads_faint_unless_something_real_shares_the_cell() {
     let cell = |idx: usize| -> (String, Option<ratatui::style::Color>) {
         let mut app = App::new(config.clone());
         app.anim_phase_ms = Some(0);
-        let widths = OverviewWidths::new(110, &app);
-        let span = render_overview_row(&app, idx, &widths, false, true).spans[KIND_SPAN].clone();
+        let widths = OverviewWidths::new(110, &app, false);
+        let span =
+            render_overview_row(&app, idx, &widths, false, true, None).spans[KIND_SPAN].clone();
         (span.content.to_string(), span.style.fg)
     };
 
@@ -1178,10 +1184,10 @@ fn disabled_row_blanks_the_refresh_countdown_at_full_width() {
         m.insert("a".to_string(), now_ms() + 42_000);
         m.insert("b".to_string(), now_ms() + 42_000);
     }
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, false);
 
-    let disabled_line = render_overview_row(&app, 0, &widths, false, true);
-    let enabled_line = render_overview_row(&app, 1, &widths, false, true);
+    let disabled_line = render_overview_row(&app, 0, &widths, false, true, None);
+    let enabled_line = render_overview_row(&app, 1, &widths, false, true, None);
     let text =
         |l: &Line<'static>| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
 
@@ -1248,10 +1254,10 @@ fn stale_window_fades_bar_fill_and_percent() {
     let live = profile("b", 95.0, 73.0, 3600); // reset in 1h
     let config = config_with(vec![stale, live], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, false);
 
-    let stale_line = render_overview_row(&app, 0, &widths, false, true);
-    let live_line = render_overview_row(&app, 1, &widths, false, true);
+    let stale_line = render_overview_row(&app, 0, &widths, false, true, None);
+    let live_line = render_overview_row(&app, 1, &widths, false, true, None);
     let (stale_bracket, stale_fill, stale_pct) = bar_fade_spans(&stale_line);
     let (live_bracket, live_fill, live_pct) = bar_fade_spans(&live_line);
 
@@ -1292,9 +1298,9 @@ fn disabled_and_past_reset_row_stays_fully_dim() {
     a.disabled = true;
     let config = config_with(vec![a], None, vec![]);
     let app = App::new(config);
-    let widths = OverviewWidths::new(110, &app);
+    let widths = OverviewWidths::new(110, &app, false);
 
-    let line = render_overview_row(&app, 0, &widths, false, true);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
     let non_dim: Vec<String> = line
         .spans
         .iter()
@@ -1633,9 +1639,9 @@ fn the_live_column_counts_live_sessions_and_marks_chain_followers() {
         live_row("4242-2", "spare", false),
     ]);
 
-    let widths = OverviewWidths::new(160, &app);
-    let main = render_overview_row(&app, 0, &widths, false, false);
-    let spare = render_overview_row(&app, 1, &widths, false, false);
+    let widths = OverviewWidths::new(160, &app, false);
+    let main = render_overview_row(&app, 0, &widths, false, false, None);
+    let spare = render_overview_row(&app, 1, &widths, false, false, None);
 
     assert_eq!(
         live_cell_text(&widths, &main),
@@ -1669,8 +1675,8 @@ fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
     let mut app = App::new(config_with(vec![p], Some("main"), vec![]));
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
 
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
 
     assert_eq!(
         live_cell_text(&widths, &row),
@@ -1691,8 +1697,8 @@ fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
     ));
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "other", true)]);
 
-    let widths = OverviewWidths::new(160, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(160, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
 
     assert_eq!(live_cell_text(&widths, &row), "    ");
 }
@@ -1710,14 +1716,28 @@ fn the_live_column_holds_its_place_while_nothing_is_live() {
         vec![],
     ));
 
-    let idle_widths = OverviewWidths::new(160, &app);
+    let idle_widths = OverviewWidths::new(160, &app, false);
     let idle_header = line_text(&overview_header(&idle_widths, false));
-    let idle_row = line_text(&render_overview_row(&app, 0, &idle_widths, false, false));
+    let idle_row = line_text(&render_overview_row(
+        &app,
+        0,
+        &idle_widths,
+        false,
+        false,
+        None,
+    ));
 
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
-    let busy_widths = OverviewWidths::new(160, &app);
+    let busy_widths = OverviewWidths::new(160, &app, false);
     let busy_header = line_text(&overview_header(&busy_widths, false));
-    let busy_row = line_text(&render_overview_row(&app, 0, &busy_widths, false, false));
+    let busy_row = line_text(&render_overview_row(
+        &app,
+        0,
+        &busy_widths,
+        false,
+        false,
+        None,
+    ));
 
     assert_eq!(idle_header, busy_header, "the header must not move");
     let col = idle_header.find("live").expect("a `live` header");
@@ -1744,7 +1764,7 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
     app.live_sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "main", true)]);
 
     for width in 34u16..=200 {
-        let widths = OverviewWidths::new(width, &app);
+        let widths = OverviewWidths::new(width, &app, false);
         let header = line_text(&overview_header(&widths, false));
         if widths.live == 0 {
             assert!(
@@ -1753,7 +1773,7 @@ fn the_live_column_is_dropped_rather_than_clipped_when_it_does_not_fit() {
             );
             continue;
         }
-        let row = line_text(&render_overview_row(&app, 0, &widths, false, false));
+        let row = line_text(&render_overview_row(&app, 0, &widths, false, false, None));
         assert!(
             header.chars().count() <= width as usize,
             "the header overflows at {width} cols ({} cells): {header:?}",
@@ -1827,7 +1847,7 @@ fn header_reads_5h_balance_when_a_deepseek_profile_is_present() {
         Some("main"),
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
+    let widths = OverviewWidths::new(120, &app, false);
     let header = line_text(&overview_header(&widths, any_deepseek(&app)));
     assert!(
         header.contains("5h / balance"),
@@ -1846,7 +1866,7 @@ fn header_keeps_plain_5h_when_no_deepseek_profile_is_present() {
         Some("main"),
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
+    let widths = OverviewWidths::new(120, &app, false);
     let header = line_text(&overview_header(&widths, any_deepseek(&app)));
     assert!(
         !header.contains("balance"),
@@ -1872,8 +1892,8 @@ fn deepseek_row_shows_total_balance_in_5h_column() {
         Some("main"),
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 1, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 1, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.starts_with("[1.71 USD"),
@@ -1904,12 +1924,12 @@ fn a_deepseek_cache_written_before_the_rename_still_shows_its_balance() {
     ds.third_party_usage = Some(stats);
     let app = App::new(config_with(vec![ds], Some("ds"), vec![]));
 
-    let widths = OverviewWidths::new(120, &app);
+    let widths = OverviewWidths::new(120, &app, false);
     assert_eq!(
         widths.deepseek_amount_w, 5,
         "the legacy row still sizes the amount column (from `31.45`), not 0",
     );
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.starts_with("[31.45 CNY"),
@@ -1928,8 +1948,8 @@ fn deepseek_row_without_balance_shows_no_data_dash() {
         Some("ds"),
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert_eq!(
         cell.trim(),
@@ -1953,9 +1973,9 @@ fn deepseek_balance_currencies_align_across_rows() {
         Some("short"),
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let short_row = render_overview_row(&app, 0, &widths, false, false);
-    let long_row = render_overview_row(&app, 1, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let short_row = render_overview_row(&app, 0, &widths, false, false, None);
+    let long_row = render_overview_row(&app, 1, &widths, false, false, None);
     let short_cell = five_hour_cell_text(&widths, true, &short_row);
     let long_cell = five_hour_cell_text(&widths, true, &long_row);
 
@@ -1983,8 +2003,8 @@ fn deepseek_multi_currency_shows_all_above_zero() {
         None,
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("USD") && cell.contains("CNY"),
@@ -2009,8 +2029,8 @@ fn deepseek_multi_currency_only_shows_above_zero() {
         None,
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("CNY") && !cell.contains("USD"),
@@ -2032,8 +2052,8 @@ fn deepseek_two_wallet_renders_only_the_funded_wallet() {
         None,
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("498.18 CNY"),
@@ -2061,8 +2081,8 @@ fn deepseek_single_wallet_renders_unchanged() {
         None,
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         cell.contains("3640.55 CNY"),
@@ -2080,8 +2100,8 @@ fn deepseek_all_zero_shows_the_highest() {
         None,
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
-    let row = render_overview_row(&app, 0, &widths, false, false);
+    let widths = OverviewWidths::new(120, &app, false);
+    let row = render_overview_row(&app, 0, &widths, false, false, None);
     let cell = five_hour_cell_text(&widths, true, &row);
     assert!(
         !cell.contains('—'),
@@ -2107,14 +2127,14 @@ fn deepseek_amount_w_spans_all_currencies() {
         None,
         vec![],
     ));
-    let widths = OverviewWidths::new(120, &app);
+    let widths = OverviewWidths::new(120, &app, false);
     assert_eq!(
         widths.deepseek_amount_w, 6,
         "amount_w must be 6 (from '197.50'), not capped at 4 or 5"
     );
 
-    let multi_row = render_overview_row(&app, 0, &widths, false, false);
-    let single_row = render_overview_row(&app, 1, &widths, false, false);
+    let multi_row = render_overview_row(&app, 0, &widths, false, false, None);
+    let single_row = render_overview_row(&app, 1, &widths, false, false, None);
     let multi_cell = five_hour_cell_text(&widths, true, &multi_row);
     let single_cell = five_hour_cell_text(&widths, true, &single_row);
 
@@ -2176,8 +2196,8 @@ fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
     let mut seven_bar = Vec::with_capacity((170 - 40 + 1) as usize);
 
     for terminal in 40u16..=170 {
-        let widths = OverviewWidths::new(terminal - 4, &app);
-        let row = render_overview_row(&app, 0, &widths, false, false);
+        let widths = OverviewWidths::new(terminal - 4, &app, false);
+        let row = render_overview_row(&app, 0, &widths, false, false, None);
         let five = five_hour_cell_text(&widths, false, &row);
         let seven = seven_day_cell_text(&widths, &row);
         five_stamp.push(five.contains('·'));
@@ -2214,4 +2234,222 @@ fn five_hour_stamp_never_lost_without_a_7d_bar_gain() {
         five_stamp[97 - 40],
         "5h stamp present at 97 cols (the defect width)"
     );
+}
+
+// ── Fork-only tests (codex harness, account-email column) ────────────────────
+
+/// Two-profile roster used by the email-column tests: an OAuth profile and an
+/// api-key profile (index 1), so placeholder gating is exercised on both row
+/// kinds. Longest name is `ax-main` (7), which the name tier clamps up to its
+/// 8-cell floor at every width.
+/// The fork's email column reads each profile's anchor cache off disk, so
+/// every test that renders it holds a sandbox — upstream's home tripwire
+/// (`profile.rs`) now panics rather than letting a test resolve the operator's
+/// real `~/.clauth`.
+fn email_fixture() -> (crate::testutil::HomeSandbox, App) {
+    // The guard rides WITH the App: the fork's email column reads each
+    // profile's anchor cache off disk, and upstream's home tripwire panics on a
+    // test that resolved the operator's real `~/.clauth`. Returning it means a
+    // new caller cannot forget to hold one.
+    let home = crate::testutil::HomeSandbox::new();
+    let oauth = profile("ax-main", 95.0, 10.0, 3600);
+    let mut api = profile("relay", 95.0, 0.0, 3600);
+    api.base_url = Some("https://api.example.com".into());
+    api.api_key = Some("sk-test".into());
+    api.usage = None;
+    let config = config_with(vec![oauth, api], Some("ax-main"), vec![]);
+    (home, App::new(config))
+}
+
+/// Layout invariants across widths. The 5-tuple equality is a regression
+/// tripwire (today's implementation computes the upstream columns — including
+/// the `live` one — before it reads `has_email`, so it cannot fail; it exists
+/// to catch a refactor that lets the carve feed back into column sizing). The
+/// live protections are the no-clip bound — REAL row content including the
+/// TIMER_SLOT that `fixed_overview_width` omits — checked against BOTH the
+/// width model and the actually-rendered line, and gap parity on ungranted
+/// layouts.
+#[test]
+fn email_column_never_disturbs_the_upstream_columns() {
+    let (_home, app) = email_fixture();
+    let long = "a-very-long-account-email@example-domain.com";
+    for width in [30u16, 48, 53, 58, 64, 81, 93, 102, 110, 124, 140, 200] {
+        let plain = OverviewWidths::new(width, &app, false);
+        let with = OverviewWidths::new(width, &app, true);
+        assert_eq!(plain.account, 0, "no emails → no column at {width}");
+        assert_eq!(
+            (
+                plain.name,
+                plain.kind,
+                plain.five_hour,
+                plain.seven_day,
+                plain.live
+            ),
+            (
+                with.name,
+                with.kind,
+                with.five_hour,
+                with.seven_day,
+                with.live
+            ),
+            "regression tripwire: carve fed back into column sizing at {width}"
+        );
+        if with.account > 0 {
+            let used = fixed_overview_width(
+                with.name,
+                with.kind,
+                with.five_hour,
+                with.seven_day,
+                with.live,
+                with.gap,
+            ) + TIMER_SLOT
+                + ACCOUNT_GAP
+                + with.account;
+            assert!(
+                used <= width as usize,
+                "granted layout clips the 5h column at width {width}: used {used}"
+            );
+            // Model ↔ renderer: the actually-rendered row must fit too, with
+            // the widest possible email in the cell.
+            let rendered = line_text(&render_overview_row(
+                &app,
+                0,
+                &with,
+                false,
+                true,
+                Some(long),
+            ));
+            assert!(
+                rendered.chars().count() <= width as usize,
+                "rendered row overflows at width {width}: {rendered:?}"
+            );
+        } else {
+            // No column → the gap must not depend on has_email at all.
+            assert_eq!(plain.gap, with.gap, "gap drifted with no column at {width}");
+        }
+        // Gap widening works from real spare in BOTH branches: whenever the
+        // columns fit at all (upstream deliberately overflows-and-clips below
+        // ~33 cols), the widened layout must still fit — the upstream bug was
+        // gap widening from the TIMER_SLOT-undercounted figure clipping the
+        // 5h column's `%` at narrow widths.
+        let plain_min = fixed_overview_width(
+            plain.name,
+            plain.kind,
+            plain.five_hour,
+            plain.seven_day,
+            plain.live,
+            2,
+        ) + TIMER_SLOT;
+        if plain_min <= width as usize {
+            let plain_used = fixed_overview_width(
+                plain.name,
+                plain.kind,
+                plain.five_hour,
+                plain.seven_day,
+                plain.live,
+                plain.gap,
+            ) + TIMER_SLOT;
+            assert!(
+                plain_used <= width as usize,
+                "gap widening overflows the plain layout at width {width}: used {plain_used}"
+            );
+        }
+    }
+}
+
+/// The exact grant boundary and the cap. For this roster (max name 7 → clamped
+/// to the 8 floor) width 76 settles on kind 12 / 5h 17 / 7d 5 / live 4, whose
+/// `fixed_overview_width` at GAP_MIN is 57; the real row adds TIMER_SLOT, so it
+/// costs 62 and the column needs `62 + ACCOUNT_GAP + ACCOUNT_MIN = 76` columns:
+/// 75 gets nothing, 76 gets exactly ACCOUNT_MIN. A very wide terminal caps the
+/// column at ACCOUNT_MAX and flows the excess into the elastic gaps (clamped
+/// at 8).
+#[test]
+fn email_column_grant_boundary_and_cap() {
+    let (_home, app) = email_fixture();
+    assert_eq!(OverviewWidths::new(75, &app, true).account, 0);
+    assert_eq!(OverviewWidths::new(76, &app, true).account, ACCOUNT_MIN);
+    let wide = OverviewWidths::new(300, &app, true);
+    assert_eq!(wide.account, ACCOUNT_MAX);
+    assert_eq!(wide.gap, 8, "excess spare beyond the cap widens gaps");
+}
+
+/// Cell semantics, pinned via em-dash DELTAS against the no-column layout of
+/// the same row (the 7d column legitimately renders its own em-dash, so a bare
+/// `contains('—')` would be tautological):
+/// - OAuth + cached email → the address renders (truncated to the column).
+/// - OAuth + no email → exactly ONE extra em-dash (the pending placeholder).
+/// - api-key profile → blank cell, ZERO extra em-dashes (not applicable is
+///   not the same as pending — every other surface omits the field).
+/// - column not granted → no cell at all.
+#[test]
+fn email_cell_semantics_by_profile_kind() {
+    let (_home, app) = email_fixture();
+    let granted = OverviewWidths::new(160, &app, true);
+    let plain = OverviewWidths::new(160, &app, false);
+    assert!(granted.account >= ACCOUNT_MIN);
+
+    let header = line_text(&overview_header(&granted, false));
+    assert!(
+        header.contains("email"),
+        "header names the column: {header}"
+    );
+
+    let row = |widths: &OverviewWidths, idx: usize, email: Option<&str>| {
+        line_text(&render_overview_row(&app, idx, widths, false, true, email))
+    };
+    let dashes = |s: &str| s.matches('—').count();
+
+    // OAuth with an email: the address renders truncated, no added em-dash.
+    let long = "a-very-long-account-email@example-domain.com";
+    let with = row(&granted, 0, Some(long));
+    let shown: String = long.chars().take(granted.account - 1).collect();
+    assert!(
+        with.contains(&format!("{shown}…")),
+        "long email truncates with an ellipsis: {with}"
+    );
+    assert_eq!(dashes(&with), dashes(&row(&plain, 0, None)));
+
+    // OAuth, anchor not seeded: exactly one extra em-dash — the placeholder.
+    assert_eq!(
+        dashes(&row(&granted, 0, None)),
+        dashes(&row(&plain, 0, None)) + 1,
+        "unseeded OAuth row must carry the pending placeholder"
+    );
+
+    // Api-key profile: blank cell — no placeholder for a profile kind that
+    // categorically has no account email.
+    assert_eq!(
+        dashes(&row(&granted, 1, None)),
+        dashes(&row(&plain, 1, None)),
+        "api-key row must not render a placeholder"
+    );
+
+    // Column not granted (too narrow for even ACCOUNT_MIN) → no cell at all.
+    let narrow = OverviewWidths::new(40, &app, true);
+    assert_eq!(narrow.account, 0);
+    assert!(
+        !row(&narrow, 0, Some(long)).contains('@'),
+        "no email cell without the column"
+    );
+}
+
+// CDX-2 acceptance: a codex profile with published passive usage renders the
+// harness tag, the codex-slot active dot, and real usage bars — asserted on
+// the rendered line, not eyeballed.
+#[test]
+fn codex_row_renders_harness_tag_and_usage_bars() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut cdx = profile("cdx-a", 95.0, 62.0, 3600);
+    cdx.harness = crate::profile::Harness::Codex;
+    let mut config = config_with(vec![cdx], None, vec![]);
+    config.state.active_codex_profile = Some("cdx-a".into());
+    let app = App::new(config);
+    let widths = OverviewWidths::new(100, &app, false);
+    let line = render_overview_row(&app, 0, &widths, false, true, None);
+    let text = line_text(&line);
+    assert!(text.contains("Codex"), "harness tag renders: {text}");
+    assert!(text.contains('█'), "usage bar renders: {text}");
+    assert!(text.contains('●'), "codex-slot active dot renders: {text}");
+    assert!(text.contains("62"), "utilization figure renders: {text}");
 }

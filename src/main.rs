@@ -3,9 +3,12 @@ mod alibaba_login;
 mod claude;
 mod claude_json;
 mod cli;
+mod codex;
 mod completions;
 mod daemon;
+mod doctor;
 mod fallback;
+mod fallback_config;
 mod format;
 mod herdr;
 mod hook_note;
@@ -20,6 +23,7 @@ mod live_sessions;
 mod lock;
 mod lockorder;
 mod logline;
+mod loopback;
 mod mcp;
 mod oauth;
 mod oauth_login;
@@ -34,6 +38,7 @@ mod profile;
 mod profile_cache;
 mod profile_json;
 mod providers;
+mod proxy;
 mod runtime;
 mod sessions;
 mod sessions_cli;
@@ -189,6 +194,9 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::List { all, disabled } => list::run(all || disabled),
         Command::Jobs { json } => jobs_cli::run(json),
         Command::Sessions { json, tokens } => sessions_cli::run_sessions(json, tokens),
+        Command::Fallback { rest } => cmd_fallback(&rest),
+        Command::Proxy { rest } => cmd_proxy(&rest),
+        Command::Doctor => doctor::run(),
         Command::Resume { target, profile } => {
             sessions_cli::run_resume(&target, profile.as_deref())
         }
@@ -303,6 +311,16 @@ fn cmd_start(name: &str, rest: &[String], isolation: Isolation, follows_chain: b
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     refuse_if_disabled(&config, &canonical)?;
+    // Fork (CDX-1b): a codex profile runs `codex` in its own isolated
+    // CODEX_HOME — no claude runtime tree, no fallback chain to follow.
+    if config.find(&canonical).is_some_and(|p| p.is_codex()) {
+        if isolation == Isolation::Isolated {
+            anyhow::bail!(
+                "codex starts are always isolated (their own CODEX_HOME) — drop --isolated"
+            );
+        }
+        return start::run_codex(canonical.as_str(), rest);
+    }
     start::run(&config, &canonical, rest, isolation, None, follows_chain)
 }
 
@@ -473,6 +491,8 @@ fn api_reauth_snapshot(
     stored: Option<&crate::profile::Profile>,
 ) -> actions::CaptureSnapshot {
     actions::CaptureSnapshot {
+        account_email: None,
+        live_login: false,
         credentials: stored.and_then(|p| p.credentials.as_ref().cloned()),
         base_url,
         api_key,
@@ -502,10 +522,14 @@ fn collect_api_reauth_snapshot(
 }
 
 /// Run the browser OAuth flow (preamble, authorize-URL paste fallback, minted
-/// tokens, login summary, identity-anchor seed) and wrap it in a capture
+/// tokens, login summary, identity-anchor probe) and wrap it in a capture
 /// snapshot. Shared by `cmd_login`'s new and reauth OAuth arms so the two stay
-/// in lockstep.
-fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnapshot> {
+/// in lockstep. Takes `config` for the CAP-3 sibling-ownership check below.
+fn run_oauth_browser(
+    config: &AppConfig,
+    reauth: bool,
+    target: &str,
+) -> Result<actions::CaptureSnapshot> {
     if reauth {
         outln!("clauth: re-authenticating existing profile '{target}', opening a browser…");
     } else {
@@ -526,16 +550,44 @@ fn run_oauth_browser(reauth: bool, target: &str) -> Result<actions::CaptureSnaps
         "clauth: login complete.\n{}",
         oauth_login::login_summary(&outcome.credentials)
     );
-    // The uuid the login's own verification probe saw rides the snapshot to
-    // whichever action commits it, which is what anchors the profile — so
-    // `oauth::try_adopt_live_rotation` can prove a diverged live login is the
-    // SAME account even after the stored token dies. Seeding it here instead
-    // would anchor an account whose commit may still fail.
+    // Probe the identity anchor for unattended mirror adoption (best-effort —
+    // a probe failure never fails the login): the account uuid+email this
+    // login authenticates as, cached per profile so
+    // `oauth::try_adopt_live_rotation` can verify a diverged live login is the
+    // SAME account even after the stored token dies. The identity rides the
+    // snapshot (CAP-2) so the capture writes it as the anchor — writing it
+    // here first was the 2026-07-12 pollution: the capture re-anchored from
+    // the UNRELATED live login's hint, clobbering this authoritative probe.
+    let probed = outcome
+        .credentials
+        .claude_ai_oauth
+        .as_ref()
+        .map(|o| o.access_token.clone())
+        .and_then(|tok| crate::usage::fetch_account_identity(&tok));
+    // CAP-3: refuse to store an account a SIBLING profile already holds — two
+    // profiles polling one account is a self-inflicted rate-limit pin
+    // (2026-07-12, twice: a blind capture, then a wrong-account re-login).
+    // Nothing has been written yet, so the refusal is side-effect-free; the
+    // freshly minted tokens are simply discarded.
+    if let Some(id) = &probed
+        && let Some(owner) = actions::account_owner(config, id, &ProfileName::from(target))
+    {
+        let who = id.email.as_deref().unwrap_or(&id.uuid);
+        anyhow::bail!(
+            "this browser login is {who}, and profile '{owner}' already holds that \
+             account — storing it twice would make both profiles double-poll it \
+             into a rate limit. Nothing was saved. To refresh that account, run \
+             `clauth login {owner}`; to put a DIFFERENT account into '{target}', \
+             sign claude.com out in the browser, log into that account, and rerun."
+        );
+    }
     Ok(actions::CaptureSnapshot {
         credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
-        account_uuid: outcome.account_uuid,
+        account_uuid: probed.as_ref().map(|id| id.uuid.clone()),
+        account_email: probed.and_then(|id| id.email),
+        live_login: false,
     })
 }
 
@@ -578,6 +630,21 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     });
     let reauth = matches!(route, LoginRoute::Reauth(_));
     let is_api = args.is_api_mode();
+
+    // CDX-1: harness immutability, reverse direction. Without this guard a
+    // bare `clauth login <codex-profile>` falls into the claude reauth path,
+    // writing claude credentials into a codex profile — a corrupt hybrid that
+    // also re-enters the Anthropic fetch legs (breaking the §0.1 exclusion
+    // invariant). The forward direction (`--codex` at a claude profile) is
+    // guarded inside `codex_capture_into_profile`; the writer-level backstop
+    // lives in `overwrite_captured_profile`. Ahead of the `--setup-token`
+    // branch so a claude-shaped sidecar can never land in a codex profile
+    // either.
+    if reauth && !args.codex && config.find(&target).is_some_and(|p| p.is_codex()) {
+        anyhow::bail!(
+            "profile '{target}' is a codex profile — re-auth it with: clauth login {target} --codex"
+        );
+    }
 
     // CLA-SPLIT capture flow: `--setup-token` writes the profile's
     // session-token sidecar and touches NOTHING else — the usage OAuth pair,
@@ -623,6 +690,39 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         return Ok(());
     }
 
+    // CDX-3 R5: `--codex --browser` mints a fresh codex login via the PKCE
+    // loopback flow straight into the profile store — the live
+    // ~/.codex/auth.json and the codex active slot are never touched.
+    if args.codex && args.browser {
+        let bytes = codex::login::browser_login_snapshot(|p| match p {
+            codex::login::CodexLoginProgress::AuthorizeUrl(url) => {
+                outln!("clauth: opening the browser for a codex login…");
+                outln!("  if it doesn't open, paste this URL yourself:\n  {url}");
+            }
+            codex::login::CodexLoginProgress::ExchangingCode => {
+                outln!("clauth: login callback received — exchanging the code…");
+            }
+        })?;
+        actions::codex_store_browser_login(&mut config, &target, &bytes)?;
+        outln!(
+            "clauth: stored the new codex login in profile '{target}' (the live codex \
+             login is unchanged). Switch to it with:  clauth {target}"
+        );
+        return Ok(());
+    }
+
+    // CDX-1 T5: `--codex` captures the live ~/.codex/auth.json — no browser,
+    // no prompt collection. The actions layer owns every guard (store mode,
+    // live presence, account dedup, harness immutability).
+    if args.codex {
+        actions::codex_capture_into_profile(&mut config, &target)?;
+        outln!(
+            "clauth: captured the live codex login into profile '{target}'. \
+             Switch codex accounts with:  clauth {target}"
+        );
+        return Ok(());
+    }
+
     if reauth {
         let snapshot = if is_api {
             use std::io::IsTerminal as _;
@@ -633,7 +733,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
                 std::io::stdin().is_terminal(),
             )?
         } else {
-            run_oauth_browser(true, &target)?
+            run_oauth_browser(&config, true, &target)?
         };
         actions::overwrite_captured_profile(&mut config, &target, snapshot)?;
         // On a reauth `--model` is an explicit override; without it the
@@ -671,7 +771,7 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     } else {
-        let snapshot = run_oauth_browser(false, &target)?;
+        let snapshot = run_oauth_browser(&config, false, &target)?;
         // The requested default model rides the capture's own save, so the
         // profile's sessions route there from the first launch.
         actions::capture_into_profile(
@@ -1225,6 +1325,11 @@ fn cmd_switch(name: &str) -> Result<()> {
     let config = load_config()?;
     let canonical = resolve_or_bail(&config, name)?;
     refuse_if_disabled(&config, &canonical)?;
+    // CDX-1 T5: `clauth <name>` stays THE switch verb — the target's harness
+    // picks the path. The claude path is untouched.
+    if config.find(&canonical).is_some_and(|p| p.is_codex()) {
+        return cmd_switch_codex(config, &canonical);
+    }
     actions::switch_profile_cli(config, &canonical)
 }
 
@@ -1736,3 +1841,153 @@ mod feature_coverage;
 #[cfg(test)]
 #[path = "../tests/inline/cli.rs"]
 mod tests;
+
+fn cmd_proxy(rest: &[String]) -> Result<()> {
+    let mut port = proxy::DEFAULT_PROXY_PORT;
+    let mut print_only = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--print-config" => {
+                print_only = true;
+                i += 1;
+            }
+            "--port" => {
+                let value = rest
+                    .get(i + 1)
+                    .ok_or_else(|| anyhow::anyhow!("--port needs a value"))?;
+                port = value
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("invalid port: {value}"))?;
+                i += 2;
+            }
+            other => anyhow::bail!(
+                "usage: clauth proxy [--port N] | clauth proxy --print-config [--port N] \
+                 (got '{other}')"
+            ),
+        }
+    }
+    if print_only {
+        proxy::print_config(port);
+        Ok(())
+    } else {
+        platform::init();
+        proxy::run(port)
+    }
+}
+
+fn cmd_switch_codex(mut config: AppConfig, canonical: &str) -> Result<()> {
+    use std::io::{IsTerminal as _, Write as _};
+
+    let mut policy = actions::ForeignLivePolicy::Refuse;
+    if actions::codex_live_is_foreign(&config)?
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
+        out!(
+            "clauth: the live codex login matches no stored profile. Archive it to \
+             ~/.clauth/quarantine and switch anyway? [y/N] "
+        );
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        if !reauth_confirmed(&answer) {
+            outln!("clauth: aborted. Live codex login left in place.");
+            return Ok(());
+        }
+        policy = actions::ForeignLivePolicy::Archive;
+    }
+
+    let report = actions::codex_switch_profile(&mut config, &ProfileName::from(canonical), policy)?;
+    if let Some(owner) = &report.adopted_back {
+        outln!("clauth: adopted the refreshed live login back into '{owner}' first.");
+    }
+    if let Some(path) = &report.archived {
+        outln!(
+            "clauth: archived the outgoing live login to {}.",
+            path.display()
+        );
+    }
+    outln!("clauth: codex now uses '{canonical}'.");
+    if codex::codex_processes_running() {
+        outln!(
+            "clauth: note — running codex sessions keep their current account until they \
+             exit; the switch applies to new sessions."
+        );
+    }
+    Ok(())
+}
+
+fn cmd_fallback(rest: &[String]) -> Result<()> {
+    const USAGE: &str = "usage: clauth fallback list | add <profile> | remove <profile> | \
+                         up <profile> | down <profile> | threshold <profile> <pct> | \
+                         last-resort <profile> <on|off>";
+    let mut config = load_config()?;
+    match rest {
+        [sub] if sub == "list" => {
+            let line = |names: &[crate::profile::ProfileName]| {
+                if names.is_empty() {
+                    "(empty)".to_string()
+                } else {
+                    names
+                        .iter()
+                        .map(|n| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" → ")
+                }
+            };
+            outln!("claude chain: {}", line(&config.state.fallback_chain));
+            outln!("codex  chain: {}", line(&config.state.codex_fallback_chain));
+            Ok(())
+        }
+        [sub, name] if sub == "add" => {
+            if fallback_config::add(&mut config, name)? {
+                outln!("clauth: added '{name}' to its harness's fallback chain");
+            } else {
+                outln!("clauth: '{name}' is already a chain member");
+            }
+            Ok(())
+        }
+        [sub, name] if sub == "remove" => {
+            if fallback_config::remove(&mut config, name)? {
+                outln!("clauth: removed '{name}' from its chain");
+            } else {
+                outln!("clauth: '{name}' was not a chain member");
+            }
+            Ok(())
+        }
+        [sub, name] if sub == "up" || sub == "down" => {
+            let Some(dir) = fallback_config::MoveDir::parse(sub) else {
+                anyhow::bail!("{USAGE}"); // unreachable: guarded by the match arm
+            };
+            if fallback_config::move_member(&mut config, name, dir)? {
+                outln!("clauth: moved '{name}' {sub}");
+            } else {
+                outln!("clauth: '{name}' did not move (not a member, or at the boundary)");
+            }
+            Ok(())
+        }
+        [sub, name, pct] if sub == "threshold" => {
+            let value: f64 = pct
+                .parse()
+                .map_err(|_| anyhow::anyhow!("threshold must be a number, got '{pct}'"))?;
+            fallback_config::set_threshold(&mut config, name, value)?;
+            outln!("clauth: '{name}' switch threshold set to {value}%");
+            Ok(())
+        }
+        [sub, name, onoff] if sub == "last-resort" => {
+            let on = match onoff.as_str() {
+                "on" => true,
+                "off" => false,
+                _ => anyhow::bail!("{USAGE}"),
+            };
+            fallback_config::set_last_resort(&mut config, name, on)?;
+            outln!(
+                "clauth: '{name}' last-resort mark {}",
+                if on { "set" } else { "cleared" }
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("{USAGE}"),
+    }
+}

@@ -25,6 +25,11 @@ pub(crate) const THIRD_PARTY_CACHE_FILE: &str = "third_party_cache.json";
 /// login belonging to a DIFFERENT account (`oauth::try_adopt_live_rotation`).
 pub(crate) const ACCOUNT_ID_CACHE_FILE: &str = "account_id.json";
 
+/// The account EMAIL paired with [`ACCOUNT_ID_CACHE_FILE`] — the operator-
+/// readable half of the identity anchor (surfaced in the TUI Setup tab,
+/// `status.json`, and the daemon's same-account tripwire). Written/dropped
+/// wherever the uuid anchor moves; backfilled by the same `/profile` fetch.
+pub(crate) const ACCOUNT_EMAIL_CACHE_FILE: &str = "account_email.json";
 /// The last adopt refusal announced for this profile, as one of the reason
 /// keys `oauth::try_adopt_live_rotation` refuses with (a bare JSON string).
 /// The refusal is a STANDING state while the live slot stays unadoptable, and
@@ -45,6 +50,14 @@ pub(crate) const PROFILE_FETCHED_CACHE_FILE: &str = "profile_fetched.json";
 /// doesn't forget a live block mid-outage; removed the moment a kick lands.
 pub(crate) const KICK_BLOCK_CACHE_FILE: &str = "kick_block.json";
 
+/// CDX-6: the codex plan tier (`pro`/`plus`/`free`/…) as the LIVE backend
+/// last reported it (`wham/usage` top-level `plan_type`). The stored
+/// id_token's `chatgpt_plan_type` claim goes stale the moment the account
+/// upgrades (it only re-mints when codex itself refreshes) — `tier_label`
+/// prefers this cache over the claim so an upgrade shows within a poll
+/// interval (AX report 2026-07-22: ax-codex-cl upgraded plus→pro, label
+/// stuck on plus).
+pub(crate) const CODEX_PLAN_CACHE_FILE: &str = "codex_plan.json";
 /// The last third-party fetch for this profile died on a credential that can
 /// never self-heal ([`crate::usage::FetchStatus::AuthExpired`]), recorded
 /// against the fingerprint of the credential that produced it.
@@ -253,6 +266,45 @@ pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, 
         return;
     };
     let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
+}
+
+/// CAP-1: keep the identity anchor coherent with a sanctioned live-credential
+/// capture — the anchor must move with the store. The captured login's uuid
+/// comes from CC's own `~/.claude.json` `oauthAccount` block when present;
+/// when it is absent/mid-write the stale anchor is DROPPED rather than left
+/// lying. A wrong anchor silently re-routes the identity-guarded adopt/follow
+/// paths (2026-07-12: a profile held a sibling's chain behind its own stale
+/// anchor), while a missing one makes them refuse until the hourly `/profile`
+/// fetch re-backfills it — refuse-and-heal beats trusting a lie.
+pub(crate) fn refresh_account_anchor(name: &ProfileName) {
+    // ONE read of ~/.claude.json for both halves — two independent reads
+    // could straddle a rewrite and pair one account's uuid with another's
+    // email (the exact split this pair exists to prevent).
+    match crate::claude_json::live_oauth_account_pair() {
+        Some((uuid, email)) => {
+            write_profile_cache(
+                name,
+                ACCOUNT_ID_CACHE_FILE,
+                &crate::profile::AccountId::from(uuid),
+            );
+            // The email moves (or drops) in lockstep with the uuid so the
+            // anchor pair can never describe two different accounts.
+            match email {
+                Some(email) => write_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE, &email),
+                None => remove_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE),
+            }
+        }
+        None => drop_account_anchor(name),
+    }
+}
+
+/// Remove `name`'s identity anchor pair (no login → no identity to anchor).
+/// Email FIRST: a torn drop (crash/unlink failure between the two) must leave
+/// uuid-present + email-absent — harmless, later re-seeded under an agreeing
+/// uuid — never a surviving email the backfill would pair with a NEW uuid.
+pub(crate) fn drop_account_anchor(name: &ProfileName) {
+    remove_profile_cache(name, ACCOUNT_EMAIL_CACHE_FILE);
+    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
 }
 
 /// Delete `<profile_dir>/<file>`. Best-effort, same contract as the writer: an

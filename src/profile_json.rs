@@ -39,6 +39,9 @@ pub(crate) fn is_canceled_cached(name: &ProfileName) -> bool {
 /// `ANTHROPIC_BASE_URL` reroutes requests without retyping the account, the
 /// same managed-field-only rule [`crate::profile::stored_provider`] applies.
 pub(crate) fn provider_label(profile: &Profile) -> String {
+    if profile.is_codex() {
+        return "openai".to_string();
+    }
     match profile.provider {
         Some(p) => p.display_name().to_string(),
         None if profile.is_oauth() => "anthropic".to_string(),
@@ -57,6 +60,22 @@ pub(crate) fn provider_label(profile: &Profile) -> String {
 /// subscription is canceled, so a `Free` reading already carries it, and the
 /// marker belongs on the status line the way every other surface renders it.
 pub(crate) fn tier_label(profile: &Profile) -> Option<String> {
+    // Codex plan tier: prefer the LIVE `plan_type` the CDX-6 poll cached
+    // (fresh within a poll interval of a plan change) over the stored
+    // id_token claim, which only re-mints when codex itself refreshes —
+    // stale for days after an upgrade (observed: plus→pro, 2026-07-22).
+    if profile.is_codex() {
+        if let Some(plan) =
+            load_profile_cache::<String>(&profile.name, crate::profile_cache::CODEX_PLAN_CACHE_FILE)
+                .filter(|p| !p.trim().is_empty())
+        {
+            return Some(plan);
+        }
+        let bytes = crate::codex::read_profile_auth(&profile.name)
+            .ok()
+            .flatten()?;
+        return crate::codex::CodexAuthFile::parse(&bytes).ok()?.plan();
+    }
     if profile.usage_cache_is_third_party() {
         return None;
     }

@@ -1,2 +1,5 @@
 /target
-scripts
+.gitnexus
+# upstream keeps scripts/ local-only; the fork tracks its codex sim harness
+scripts/*
+!scripts/codex-sim/

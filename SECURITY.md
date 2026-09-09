@@ -10,12 +10,15 @@ Report privately through GitHub: open the repo's **Security** tab and pick **Rep
 
 Only the latest release. Binary installs stay current through the verified auto-updater below; `cargo` installs update with `cargo install clauth`.
 
+This fork has no releases: the supported version is `main`, built from source (see **Auto-update verification** and **Install-script verification** below).
+
 ## Data at rest
 
 Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-only: every clauth-owned file is `0600`, every directory `0700`. No exceptions list to drift out of date. The only credential copy outside it is the macOS Keychain item below. clauth's one other tree of its own is `~/.local/share/clauth/`, which holds the bundled plugin and no credentials; what a switch writes into Claude Code's own `~/.claude/` is listed at the end of this section.
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
+| `~/.clauth/` (root) | everything below | dir `0700` |
 | `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/mcp-logins.json` | Claude Code's MCP-server OAuth logins, parked here whenever the profile stores no Claude login of its own and merged back once it regains one. Live bearer credentials, minted against each server and belonging to no Claude account | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
@@ -26,6 +29,14 @@ Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-onl
 | `~/.clauth/profiles/<name>/runtime-<sid>/settings.json` | one live session's Claude Code settings. An endpoint profile's key is **not** in it: the file carries an `apiKeyHelper` line naming `clauth __api-key <profile>`, which Claude Code runs per request to mint the key | `0600` |
 | `~/.clauth/jobs/<id>.json` | backgrounded `delegate` prompt + result | file `0600`, dir `0700` |
 | `~/.clauth/live_sessions/<sid>.json`, `~/.clauth/live_bare/<pid>` | liveness markers for running sessions: pid, profile name, working directory, flags. No credentials | file `0600`, dir `0700` |
+| `~/.clauth/profiles/<name>/codex-auth.json` | this fork: a codex profile's login, the captured or minted `~/.codex/auth.json` kept byte-verbatim (OpenAI access + refresh tokens) | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/codex-home/` | this fork: the isolated `CODEX_HOME` a `clauth start <codex-profile>` runs in. clauth seeds its `auth.json` at `0600`; the rest is codex's own state. The permission sweep tightens the dir itself to `0700` but does not descend into it, because codex plants executable helpers there that a blanket `0600` would break | dir `0700`; contents as codex writes them |
+| `~/.clauth/quarantine/<epoch-ms>-<seq>-<label>.codex-auth.json` | this fork: a live codex login clauth did not recognise, archived before a switch replaced it rather than destroyed. Live credentials; nothing prunes it | file `0600`, dir `0700` |
+| `~/.clauth/status.json` | daemon feed for the menu bar: profile names, usage %, active/pending switch, the next-move forecast. No tokens or API keys | `0600` |
+| `~/.clauth/tokens.json` | this fork: daemon feed for the menu bar, machine-wide token counts + API-equivalent cost. No token values, no credentials | `0600` |
+| `~/.clauth/codex-proxy.json` | this fork: the `clauth proxy` heartbeat (port + timestamp), so the daemon's passive codex usage leg stands down while the proxy serves. No credentials | `0600` |
+| `~/.clauth/daemon.log` | this fork's LaunchAgent: daemon stderr (may echo a config-parse error) | `0600` (under the `0700` dir) |
+| `~/.clauth/clauthd.sock` | this fork: daemon control socket | `0600` |
 | usage and price caches, session history, logs, lock files (`~/.clauth/`) | last-known usage, third-party state, burn samples, event log, advisory locks | file `0600`, dir `0700` |
 | `~/.local/share/clauth/` (macOS `~/Library/Application Support/clauth/`, Windows `%APPDATA%\clauth\`) | the bundled Claude Code plugin, laid down where `claude plugin` can register it: `plugin.json`, the `hooks/` dir, a generated `marketplace.json`, and an install marker under `markers/`. Content-keyed under `versions/`, with a `current@claude` pointer at the live one. No credentials | your umask; not re-tightened |
 
@@ -42,6 +53,7 @@ clauth writes and clears that item; it never reads it back during normal operati
   - The repair never follows a symlink out of the tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the default user-profile ACLs, which clauth does not loosen.
 - A switch rewrites three files: `~/.claude/.credentials.json`, parts of `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`), and `~/.claude.json`, whose stale account-identity block is dropped so Claude Code re-derives identity from the new token.
   - The rest of `~/.claude/` is left alone. On macOS the switch writes the Keychain item above as well, because Claude Code reads the Keychain before the file there.
+- On this fork, two more notes on the same invariants. `status.json` and `tokens.json` are rebuildable caches, so they are written atomically at `0600` but without the fsync. The daemon also runs the tree re-tightening on boot, before its first tick: `daemon.log` is opened by launchd (`StandardErrorPath`) at the process umask rather than by clauth, and that pass takes it to `0600` to match the table. Neither pass descends into a profile's `codex-home/` (see its row).
 
 ## Network activity
 
@@ -63,9 +75,15 @@ Every request clauth makes, and what rides along with it:
 | `openrouter.ai/api/v1/credits` and `/api/v1/key` | only for profiles whose base URL is OpenRouter | that provider's API key |
 | an Alibaba console gateway (`bailian-cs.console.aliyun.com` or its regional twin for your site) | usage poll for a Model Studio profile, whose API key cannot read its own quota | that profile's stored `[console]` session, never its API key |
 | `bailian.console.aliyun.com` or `modelstudio.console.alibabacloud.com` | `clauth login` on a Model Studio profile, opened in your browser to capture that console session | no credentials; the callback comes back to a loopback listener |
+| `auth.openai.com/oauth/authorize` | this fork: `clauth login <profile> --codex --browser`, opened in your browser | no credentials; a PKCE challenge + random `state` |
+| `auth.openai.com/oauth/token` | this fork: that login's code exchange, and the daemon's standby refresh of a parked codex profile's chain | the one-time code + PKCE verifier, or that profile's stored codex refresh token |
+| `chatgpt.com/backend-api/wham/usage` | this fork: read-only usage poll for stored codex profiles, at codex CLI's own cadence; never refreshes, never touches a refresh token | that profile's codex access token |
+| `chatgpt.com/backend-api/codex` | this fork, only while `clauth proxy` runs: codex's own requests, forwarded with the selected pool account's `Authorization` + `ChatGPT-Account-ID` in place of the caller's | that account's codex access token, plus whatever codex sent |
 | a custom base URL you set | requests against an API-endpoint profile, plus a best-effort usage probe against that same origin | whatever you configured |
 
 Your stored Claude access tokens go to `api.anthropic.com` and nowhere else. Your refresh token goes to `platform.claude.com`, which is the token endpoint Claude Code's own client refreshes against: every pair is minted there, whether from a refresh or from the interactive `clauth login`, which follows Claude Code's OAuth flow by opening `claude.com` in your browser to authorize and posting the one-time code back to `platform.claude.com`. clauth runs no telemetry or analytics; it talks to the hosts above and no others.
+
+On this fork, codex credentials go to `auth.openai.com` and `chatgpt.com` and nowhere else, and the first row never fires: the self-updater is compiled out (see **Auto-update verification**), so no release check is made. `clauth proxy` listens on `127.0.0.1:<port>` (default `4517`), plain HTTP, loopback only; a request whose path does not begin with `/backend-api/codex` is answered 404 without forwarding, and the upstream scheme and host are constants no client byte can relocate.
 
 ## What acts on your behalf
 
@@ -81,12 +99,16 @@ Background, automatic:
   - All three are off or zero by default. An account with subscription quota left always wins over one that costs money, and once the ceiling is spent clauth stops using that account.
 - **Token refresh.** Anthropic refresh tokens are single-use, so refreshing spends the stored token for a fresh pair. By default it fires ahead of expiry, early enough that a running `claude` never reaches its own refresh threshold.
   - Set the Config tab's `rotation` row to `lazy` to refresh only after a request is rejected. Pressing `t` forces a rotation either way.
+- **Codex standby refresh** (this fork). OpenAI refresh tokens are single-use with server-side reuse detection, so the daemon renews a parked codex profile's chain on its own, when the access token is within 48 h of expiry or the chain has not advanced in 7 days, and only chains clauth holds exclusively: never the live login codex itself advances, never a profile leased to an isolated session. It sends no inference.
+- **Codex auto-switch and proxy rotation** (this fork). A codex fallback chain, empty by default, relinks the live `~/.codex/auth.json` on its own once the active codex account is spent, the way the claude chain does. With `clauth proxy` running, a 429 mid-conversation rotates the *request* to the next pool account and replays it; the pool is the codex chain, or every codex profile with a stored login when the chain is empty. Both send only what codex sent.
 
 User-invoked, only when you run the command:
 
 - **Interactive login (`clauth login <profile>`).** Opens your browser to Claude's OAuth authorize page and binds a loopback listener on `127.0.0.1:<random port>` to catch the redirect, then exchanges the returned code for a fresh token pair written into the new profile.
   - It reproduces Claude Code's own PKCE flow, touches no other account, and never opens a usage window. On macOS this is why `clauth login` works at all: Claude Code's own `/login` under a custom config dir writes only a per-config-dir Keychain item, never the profile's credentials file.
 - **`clauth start` / `clauth resume`.** Spawns `claude` against the profile you named, so everything that session sends bills to that account. clauth forwards your args and sends nothing of its own.
+- **`clauth login <profile> --codex`** (this fork) reads the live `~/.codex/auth.json` into the profile store with no network call; `--codex --browser` runs codex's own PKCE flow against `auth.openai.com` instead, with the callback on `localhost:1455` (fallback `1457`), and leaves the live login untouched. **`clauth start <codex-profile>`** spawns `codex` in that profile's isolated `CODEX_HOME`, so everything that session sends bills to that account.
+- **`clauth doctor`** (this fork) is read-only against your accounts. It proves the Keychain write grant with a throwaway `clauth-doctor-probe` item, added then deleted, and reads the real item's metadata only, never its secret.
 
 - **Rolling session token (`clauth rolling-token <profile>`).** Points the profile's `session-token.json` at that profile's own OAuth usage chain: the daemon re-stamps the file with the chain's current access token, minus the refresh token, so sessions still hold nothing rotatable.
   - It also **widens what that credential can reach**. A `claude setup-token` mint carries two scopes, `user:inference` and `user:sessions:claude_code`; the rolling bearer carries the chain's full granted set.
@@ -102,6 +124,15 @@ Agent-invoked, only when the Claude Code plugin is installed:
 
 Nothing else sends inference or writes to your account.
 
+## Fork surfaces (macOS)
+
+Upstream now carries the Keychain write on switch itself (the `security -i` stdin command line, one item per config dir), so what this fork adds on top is narrower than it used to be.
+
+- **Stable code signature for the Keychain grant.** The one-time "Always Allow" the login Keychain asks for is bound to the binary's code signature; an ad-hoc signature re-prompts on every rebuild, which is what left an unattended 3 a.m. auto-switch blocked on a dialog nobody clicks. `dist/macos/signed-install.sh` re-signs the binary with a stable identity so the grant persists across rebuilds, and `clauth doctor` warns when the running binary is ad-hoc signed. clauth still never *reads* the real item's secret.
+- **Control socket (`~/.clauth/clauthd.sock`) command authority is same-UID.** The daemon listens on a Unix socket chmod'd `0600` under the `0700` dir. Any process running as the same user can connect and issue `switch` / `refresh` / fallback-config / `rename` commands; there is no additional auth beyond OS file ownership. This is the same trust boundary as the files themselves (a same-UID process can already read the tokens); the socket only enqueues, and the daemon validates every command. It is not exposed on any network.
+- **`clauth proxy` trust boundary.** Loopback only, no TLS, no auth beyond that same-UID boundary: any local process that reaches `127.0.0.1:<port>` sends requests under the selected codex account. It is opt-in (codex only talks through it once you paste the printed provider block) and its own process, so proxy-down is codex-down, never clauth-down.
+- **`status.json` / `tokens.json` / `daemon.log` content.** The two feeds carry profile names, usage percentages, the active/pending switch and token counts, **no tokens or API keys**. `daemon.log` is daemon stderr; it may echo a config-parse error whose Display could include a profile's `config.toml` snippet, so it is written under the `0700` dir and chmod'd `0600` on boot. None is sent anywhere; all are local, user-private files.
+
 ## Auto-update verification
 
 Binary installs check for a newer release in the background on launch. Every step fails closed, so if any of them errors the update is skipped and the running binary stays put:
@@ -116,9 +147,13 @@ Binary installs check for a newer release in the background on launch. Every ste
 
 Releases are signed in CI with a passwordless minisign key kept as a GitHub Actions secret; the signing step writes the key to disk and deletes it on exit. The public half is pinned in `src/update.rs`.
 
+**This fork ships none of that.** It has no release pipeline and no signed assets, and the updater is compiled out at the source: `FORK_BUILD` in `src/update.rs` makes the background check never spawn and `should_self_replace` always false, so a fork binary can never be replaced by an upstream release that lacks the fork's features. `CLAUTH_NO_UPDATE=1` is honoured but redundant. Rebuild from source to upgrade.
+
 ## Install-script verification
 
 `install.sh` (the `curl | bash` path) uses `cargo` when it's available. When it pulls a prebuilt binary instead, it downloads `sha256sums.txt` from the same release and checks the binary against it before installing, failing closed on a download or checksum error. It writes nothing to your shell profile and only prints a `PATH` hint when the install dir isn't already on it. If piping a script to a shell isn't your thing, `cargo install clauth` does the same job.
+
+On this fork `install.sh` is a source build: it requires `cargo`, runs `cargo install --path . --locked` from the checkout, downloads nothing, and has no `--nocargo`. `cargo install clauth` from crates.io installs upstream, not this fork.
 
 ## Process execution
 
@@ -133,6 +168,9 @@ Every command below goes through an argument vector, never a shell, so there is 
 | `/usr/bin/security` | macOS only: writing and clearing the Keychain item above |
 | `xdg-open` (Linux), `open` (macOS), `rundll32` (Windows) | opening a URL: the browser login page, or a status incident from the Status tab. The URL is passed as one argument |
 | `kill` / `taskkill`, plus `ps` on macOS and `tasklist` on Windows | `clauth daemon --replace` only: the pid is checked against a running clauth daemon before it is signalled (Linux reads `/proc/<pid>/cmdline` instead of shelling out) |
+| `codex` (from `PATH`) | this fork: `clauth start <codex-profile>`, in that profile's isolated `CODEX_HOME` with your extra args forwarded, and `clauth resume <codex-profile>` (`codex resume --last`) after switching to it |
+| `pgrep -x codex` | this fork: before a codex switch, to warn that a running session keeps its in-memory account until its next refresh; the switch proceeds either way |
+| `/bin/launchctl list`, `/usr/bin/codesign -dvv`, `/usr/bin/security` on a throwaway `clauth-doctor-probe` item | this fork: `clauth doctor` only, on macOS |
 
 clauth runs no other external commands.
 
@@ -158,3 +196,5 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 | `auto_start = false` (the default) | clauth sends no inference of its own |
 | `install.sh --nocargo` | forces a verified binary download instead of `cargo install` |
 | `cargo install` | never self-replaces; update with `cargo install clauth` |
+| an empty codex `fallback_chain` (the default) | this fork: the daemon never switches codex accounts on its own (the proxy pool then spans every codex profile with a stored login) |
+| not running `clauth proxy` (the default) | this fork: codex talks to OpenAI directly; nothing is injected or replayed |

@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon status fallback proxy doctor mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -31,8 +31,10 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
-    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
+    elif [ "$COMP_CWORD" -eq 2 ] && { [ "$prev" = "which" ] || [ "$prev" = "status" ]; }; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "completions" ]; then
+        COMPREPLY=( $(compgen -W "bash zsh fish install" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
@@ -86,8 +88,10 @@ _clauth() {
             'sessions[list Claude Code sessions (add --json / --tokens)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
-            'daemon[run the headless scheduler with no TUI]' \
-            'status[print the usage / auto-switch snapshot as JSON]' \
+            'status[print the daemon feed as JSON]' \
+            'fallback[edit the auto-switch chain and its thresholds]' \
+            'proxy[run the codex injection proxy for in-session codex fallback]' \
+            'doctor[check the local install: daemon, proxy, plugin, permissions]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
             'completions[emit shell completion script]'
@@ -129,6 +133,8 @@ _clauth() {
         _values 'flag' '--json[emit the stable machine-readable array]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
         _values 'flag' '--profile[resume under this profile instead of prompting]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == completions ]]; then
+        _values 'arg' 'bash' 'zsh' 'fish' 'install[install into the shell rc]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == login ]]; then
         _values 'flag' __CLATHA_LOGIN_FLAGS__
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == delete ]]; then
@@ -171,9 +177,11 @@ complete -c clauth -f -n __fish_is_first_token -a jobs -d "List the delegate job
 complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
 complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
-complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
-complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
-complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
+complete -c clauth -f -n __fish_is_first_token -a status -d "Print the daemon feed as JSON"
+complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit a shell completion script"
+complete -c clauth -f -n __fish_is_first_token -a fallback -d "Edit the auto-switch chain and its thresholds"
+complete -c clauth -f -n __fish_is_first_token -a proxy -d "Run the codex injection proxy for in-session codex fallback"
+complete -c clauth -f -n __fish_is_first_token -a doctor -d "Check the local install: daemon, proxy, plugin, permissions"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
 complete -c clauth -f -n "__fish_seen_subcommand_from herdr" -a install -d "Install the plugin and wire it into herdr's config"

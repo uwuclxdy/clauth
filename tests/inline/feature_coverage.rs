@@ -134,6 +134,14 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         "Headless",
         &[
             "build_status",
+            "switch_valid_profile",
+            "snapshot_reply_is_one_line",
+            // fallback configuration over the socket (CBAR-2)
+            "fallback_add_remove",
+            "set_threshold_validates",
+            "add_appends",
+            "set_wrap_off_toggles",
+            // Daemon::tick loop body characterization (TECH-5)
             "tick_with_empty_queues",
             "drain_pending_switch_executes",
             "drain_pending_switch_skips",
@@ -179,6 +187,109 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
             "cross_thread_with_state_lock_serializes",
             "same_thread_reentrancy_does_not_deadlock",
             "poison_recovery_after_panicking_closure",
+        ],
+    ),
+    // ── Fork additions ────────────────────────────────────────────────────
+    // The README's `### Fork additions` bullets sit inside `## Features`, so
+    // `extract_features` reads them too and each one needs its own row.
+    (
+        // capture + browser mint, the switch verb, the daemon's follow and
+        // standby refresh, the isolated `clauth start`, and the codex chain.
+        "Codex accounts.",
+        &[
+            "capture_creates_an_active_codex_profile",
+            "switch_installs_the_target_chain",
+            "switch_adopts_back_a_rotated_outgoing_chain",
+            "switch_over_a_foreign_login_refuses_or_archives_by_policy",
+            "codex_follow_adopts_a_rotated_live_chain",
+            "codex_profiles_are_excluded_from_both_fetch_legs",
+            "cross_harness_switches_are_refused",
+            "login_codex_flag_and_its_browser_modifier",
+            "tui_switch_dispatches_codex_targets_to_the_codex_slot",
+            // CDX-3 standby refresh + PKCE login
+            "refresh_failure_truth_table",
+            "apply_refresh_overwrites_only_present_fields_and_stamps_last_refresh",
+            "codex_standby_tick_refreshes_a_due_parked_profile",
+            "codex_standby_tick_never_spends_the_live_owner_chain",
+            "build_auth_json_writes_the_codex_shape_with_explicit_auth_mode",
+            "browser_login_store_never_touches_live_or_the_active_slot",
+            // CDX-1b isolated start
+            "acquire_builds_the_isolated_home_and_holds_a_lease",
+            "acquire_refuses_the_live_owner_and_loginless_profiles",
+            // CDX-4 codex chain + per-harness independence
+            "codex_walk_fires_only_on_an_exhausted_active",
+            "codex_limiter_verdict_drives_the_switch_and_clears_on_reset",
+            "membership_edits_route_by_harness",
+            "pending_switch_gates_are_harness_scoped",
+            "scan_codex_auto_switch_enqueues_past_a_pending_claude_entry",
+        ],
+    ),
+    (
+        // CDX-5: identity injection, the mid-stream 429 rotate-and-replay,
+        // and the passive tick that stands down while it runs.
+        "Injection proxy.",
+        &[
+            "e2e_injects_identity_and_relays_the_sse_response",
+            "e2e_429_rotates_to_the_next_account_and_replays",
+            "codex_passive_tick_stands_down_while_the_proxy_is_active",
+        ],
+    ),
+    (
+        "`clauth doctor`.",
+        &[
+            "freshness_tracks_the_1s_write_cadence_not_the_refresh_interval",
+            "exit_code_is_nonzero_only_when_something_failed",
+            "skew_classifies_version_and_schema_mismatches",
+            "render_shows_a_fix_only_when_not_passing",
+        ],
+    ),
+    (
+        // every verb the socket answers, plus the one-line reply contract.
+        "Daemon control socket.",
+        &[
+            "switch_valid_profile_enqueues_and_acks",
+            "refresh_one_enqueues_only_that_profile",
+            "fallback_add_remove_enqueue_canonical_name",
+            "fallback_move_parses_dir_and_rejects_bad_dir",
+            "set_last_resort_validates_bool_and_enqueues",
+            "set_threshold_validates_range_and_type",
+            "set_wrap_off_requires_bool",
+            "set_weekly_threshold_validates_range_on_the_socket",
+            "per_member_weekly_and_gate_commands_validate_and_enqueue",
+            "rename_valid_enqueues_canonical_op_and_acks",
+            "snapshot_reply_is_one_line_around_a_pretty_status_file",
+            "error_replies_carry_stable_error_code",
+        ],
+    ),
+    (
+        // TOK-3: the pure snapshot builder behind `~/.clauth/tokens.json`.
+        "`tokens.json` feed.",
+        &[
+            "snapshot_has_schema_version_and_all_four_periods",
+            "week_and_month_windows_filter_daily_models",
+            "incomplete_split_marks_period_and_cost_as_floor",
+            "caps_period_at_eight_rows_folding_the_tail_into_others",
+            "lifetime_totals_and_cost_count_cache",
+        ],
+    ),
+    (
+        // the additive keys the menu-bar clients read.
+        "Fork-only `status.json` fields.",
+        &[
+            "build_status_publishes_codex_fields",
+            "build_status_keeps_the_two_active_slots_independent",
+            "build_status_codex_auth_status_expiring_and_broken",
+            "build_status_forecast_publishes_next_target_and_last_resort",
+            "published_entries_deserialize_into_the_typed_contract",
+        ],
+    ),
+    (
+        // FORK_BUILD compiles the updater out: it never replaces the binary
+        // and never spawns the background check.
+        "No self-update.",
+        &[
+            "fork_build_never_self_replaces_even_off_cargo",
+            "fork_build_spawn_returns_none",
         ],
     ),
 ];

@@ -15,6 +15,7 @@ fn reset_in(secs: i64) -> String {
 
 fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,

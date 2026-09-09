@@ -33,8 +33,11 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// HTTP connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// HTTP response-receive timeout.
-const RECV_TIMEOUT: Duration = Duration::from_secs(10);
+/// HTTP response-receive timeout. Counts through the BODY read in ureq 3
+/// (see the proxy's pinned timeout-semantics tests), so it must cover the
+/// whole ~194 KiB feed on a slow link — background poll, a generous bound
+/// costs nothing (timeout-sweep 2026-07-18).
+const RECV_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on the response body. The real feed is ~194 KiB; 2 MiB is generous
 /// headroom while still bounding a hostile / runaway response.
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;

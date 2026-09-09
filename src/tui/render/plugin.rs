@@ -49,6 +49,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     ])
     .areas(area);
 
+    // `master_detail` owns the selector|detail split: desktop uses upstream's
+    // house contract (`selector_width` + `Min(20)`), narrow terminals stack the
+    // panes instead of shrinking the detail to ~13 cells (the fork's phone
+    // adaptation in `panes.rs`).
     let (selector, detail) = master_detail(top, app.plugin.row_count());
 
     draw_selector(frame, selector, app);

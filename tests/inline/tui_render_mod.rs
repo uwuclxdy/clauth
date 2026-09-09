@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 
 fn oauth(name: &str, five: f64, seven: f64, auto: bool) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -526,6 +527,8 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
         base_url: None,
         api_key: None,
         account_uuid: None,
+        account_email: None,
+        live_login: true,
     })));
     app.config_draft = Some(draft);
     let out = dump(&app, 120, 30);
@@ -641,6 +644,8 @@ fn capture_name_caret_follows_edit_position() {
             base_url: None,
             api_key: None,
             account_uuid: None,
+            account_email: None,
+            live_login: true,
         }),
         input,
         from_divergence: false,
@@ -1149,6 +1154,7 @@ fn tokens_models_view_empty_filter_names_the_filter() {
 /// off `auth_broken`, so the chip tests need no live windows.
 fn bare(name: &str) -> Profile {
     Profile {
+        harness: Default::default(),
         name: name.into(),
         base_url: None,
         api_key: None,

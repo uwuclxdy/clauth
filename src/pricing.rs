@@ -596,6 +596,27 @@ impl PriceTable {
             .or_else(|| self.history.first().map(|s| s.models.as_slice()))
     }
 
+    /// Test-only seam: a table whose single snapshot (captured 2026-01-01)
+    /// holds `models`, so any query date resolves to them. The fields are
+    /// module-private, so a test OUTSIDE `pricing` (the fork's tokens.json
+    /// snapshot tests) cannot build one by hand — this is the one door, and it
+    /// is compiled out of the shipped binary.
+    #[cfg(test)]
+    pub(crate) fn for_test(models: Vec<PricedModel>) -> Self {
+        Self {
+            models: models.clone(),
+            history: vec![RateSnapshot {
+                captured: "2026-01-01".to_owned(),
+                models,
+            }],
+            store: Vec::new(),
+            aliases: Vec::new(),
+            canonical: CanonicalMap::default(),
+            fetched_at_ms: 0,
+            memo: Mutex::default(),
+        }
+    }
+
     /// API-equivalent cost in USD for one model's recorded tokens at
     /// `(date, hour)`. `None` when no rate matches (unknown / unpriced model).
     /// Counts all four token buckets.

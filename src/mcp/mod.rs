@@ -4924,8 +4924,15 @@ fn hold_bare_session_marker() -> Option<std::fs::File> {
 /// up the stdio transport. Returns the bare-session marker because `serve` has to
 /// hold it across `block_on`.
 fn startup() -> Option<std::fs::File> {
-    crate::runtime::gc_stale_runtimes();
-    jobs::gc(now_ms());
+    // Fork (timeout-sweep 2026-07-18): housekeeping OFF the startup path. The
+    // initialize reply must come promptly — the TUI's MCP probe budgets 3 s,
+    // while `gc_stale_runtimes` can legitimately run long (multi-GB isolated
+    // trees). Both sweeps are lock-guarded and safe at any entry point, so a
+    // detached thread alongside the server is fine.
+    std::thread::spawn(|| {
+        crate::runtime::gc_stale_runtimes();
+        jobs::gc(now_ms());
+    });
     // Converge a broken plugin registration without ever blocking the stdio
     // handshake: the gate is two registry reads inline, and a needed heal runs
     // on its own thread (throttled inside `heal_detached`), never on stdout.

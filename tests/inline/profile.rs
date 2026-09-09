@@ -1439,6 +1439,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
     let creds = oauth_credentials();
 
     let profile = Profile {
+        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -1554,6 +1555,79 @@ fn credential_and_cache_files_have_restricted_permissions() {
         0o600,
         "touch-receipt.json mode should be 0o600, got {:#o}",
         receipt_mode & 0o777,
+    );
+}
+
+/// The blanket 0o600 sweep must NOT descend into a profile's isolated
+/// `codex-home/`: codex plants PATH-alias helper binaries there, and
+/// `load_config` runs the sweep on every entry point, so an unguarded walk
+/// strips their exec bit out from under a running isolated session — one
+/// `clauth which` is enough. The dir node itself still tightens to 0o700, and
+/// everything outside `codex-home/` is swept as before.
+#[cfg(unix)]
+#[test]
+fn perms_sweep_skips_an_isolated_codex_home() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let name = "perm-test-codex-home";
+
+    let codex_home = profile_subpath(&crate::profile::ProfileName::from(name), "codex-home")
+        .expect("codex-home path");
+    let helper_dir = codex_home.join("bin");
+    std::fs::create_dir_all(&helper_dir).expect("create codex-home/bin");
+    let helper = helper_dir.join("codex-shim");
+    std::fs::write(&helper, b"#!/bin/sh\n").expect("write helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod helper");
+
+    // A sibling under the profile dir but OUTSIDE codex-home: still swept.
+    let sibling = profile_subpath(&crate::profile::ProfileName::from(name), "sibling.json")
+        .expect("sibling path");
+    std::fs::write(&sibling, b"{}").expect("write sibling");
+    std::fs::set_permissions(&sibling, std::fs::Permissions::from_mode(0o644))
+        .expect("chmod sibling");
+
+    // The basename alone must not exempt: a profile literally NAMED
+    // `codex-home` is an ordinary claude profile and keeps getting swept.
+    let decoy = profile_subpath(
+        &crate::profile::ProfileName::from("codex-home"),
+        "creds.json",
+    )
+    .expect("decoy path");
+    std::fs::create_dir_all(decoy.parent().expect("decoy parent")).expect("create decoy dir");
+    std::fs::write(&decoy, b"{}").expect("write decoy");
+    std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o644)).expect("chmod decoy");
+
+    enforce_clauth_perms(&clauth_dir().expect("clauth_dir"));
+
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .unwrap_or_else(|e| panic!("metadata {}: {e}", p.display()))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+
+    assert_eq!(
+        mode(&helper),
+        0o755,
+        "the sweep stripped the exec bit off a codex helper binary",
+    );
+    assert_eq!(
+        mode(&codex_home),
+        0o700,
+        "the codex-home dir node itself must still be tightened",
+    );
+    assert_eq!(
+        mode(&sibling),
+        0o600,
+        "a file outside codex-home must be swept"
+    );
+    assert_eq!(
+        mode(&decoy),
+        0o600,
+        "a profile named `codex-home` is not an isolated codex home",
     );
 }
 
@@ -2378,6 +2452,184 @@ check_scoped = false
     assert!(!loaded.check_scoped, "an explicit false survives the load");
 }
 
+// ── Fork-only tests (codex harness engine + the config.toml 0600 writers) ────
+
+/// config.toml can carry a third-party `api_key`, so BOTH writers that touch it
+/// must land it `0o600` — `save_profile` on the normal path AND the drift-rewrite
+/// path (`maybe_rewrite_config_toml`), which historically used the umask-default
+/// `atomic_write` and could leave a world-readable `0o644` API key (TECH-9 #15).
+#[cfg(unix)]
+#[test]
+fn config_toml_is_0600_including_the_drift_rewrite_path() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("perm-test-config-toml");
+
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.base_url = Some("https://api.deepseek.com/anthropic".into());
+    profile.api_key = Some("sk-secret-must-be-0600".into());
+
+    // Normal path: save_profile writes config.toml at 0o600.
+    save_profile(&profile).expect("save_profile");
+    let cfg = profile_subpath(&name, "config.toml").expect("config path");
+    let mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "save_profile config.toml mode, got {mode:#o}");
+
+    // Drift-rewrite path: `maybe_rewrite_config_toml` only writes when
+    // `render_config_toml` produces un-parseable TOML (its Err branch) — every
+    // value that round-trips is a no-op. A NaN threshold is the deterministic
+    // lever: it renders `fallback_threshold = NaN`, which TOML rejects (it spells
+    // NaN `nan`), so the branch fires and rewrites. We loosen the mode first and
+    // assert the rewrite re-tightens to 0o600 — the regression guard against this
+    // path drifting back to the umask-default `atomic_write` (TECH-9 #15).
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    profile.fallback_threshold = Some(f64::NAN);
+    let raw = std::fs::read_to_string(&cfg).unwrap();
+    maybe_rewrite_config_toml(&cfg, &raw, &profile);
+    let after = std::fs::read_to_string(&cfg).unwrap();
+    assert_ne!(
+        after, raw,
+        "drift-rewrite must have fired (content changed)"
+    );
+    let mode2 = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode2, 0o600,
+        "drift-rewrite config.toml mode, got {mode2:#o}"
+    );
+}
+
+// Every config.toml written before the harness field existed must load as
+// Claude — absent = Claude, zero migration.
+#[test]
+fn profile_config_harness_defaults_to_claude() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert_eq!(cfg.harness, Harness::Claude);
+}
+
+#[test]
+fn profile_config_reads_harness_codex() {
+    let cfg: ProfileConfig = toml::from_str("harness = \"codex\"\n").expect("parse codex config");
+    assert_eq!(cfg.harness, Harness::Codex);
+}
+
+#[test]
+fn harness_round_trips_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.harness = Harness::Codex;
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.harness, Harness::Codex);
+}
+
+// A Claude profile's render must not emit an uncommented harness line: parsed
+// back it stays Claude, so `maybe_rewrite_config_toml`'s semantic compare
+// never rewrites a pre-CDX config.toml just because the field now exists.
+#[test]
+fn claude_render_keeps_harness_commented() {
+    let profile = Profile::new("p".to_string(), None, None);
+    let rendered = render_config_toml(&profile);
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(parsed.harness, Harness::Claude);
+}
+
+// Old profiles.toml (no codex fields) loads with defaults, and a claude-only
+// state keeps serializing WITHOUT the codex keys — byte stability for every
+// existing install.
+#[test]
+fn app_state_codex_fields_default_and_stay_omitted() {
+    let state: AppState =
+        toml::from_str("active_profile = \"a\"\nprofiles = [\"a\"]\n").expect("parse old state");
+    assert!(state.active_codex_profile.is_none());
+    assert!(state.codex_fallback_chain.is_empty());
+    let rendered = toml::to_string_pretty(&state).expect("render state");
+    assert!(!rendered.contains("active_codex_profile"));
+    assert!(!rendered.contains("codex_fallback_chain"));
+}
+
+#[test]
+fn app_state_codex_fields_round_trip() {
+    let state = AppState {
+        active_codex_profile: Some(crate::profile::ProfileName::from("cdx")),
+        codex_fallback_chain: vec![
+            crate::profile::ProfileName::from("cdx"),
+            crate::profile::ProfileName::from("cdx2"),
+        ],
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&state).expect("render state");
+    let back: AppState = toml::from_str(&rendered).expect("parse state");
+    assert_eq!(back.active_codex_profile.as_deref(), Some("cdx"));
+    assert_eq!(back.codex_fallback_chain.len(), 2);
+}
+
+// The codex active slot is independent of the claude one: activating a claude
+// profile never makes it codex-active and vice versa.
+#[test]
+fn is_active_codex_tracks_the_codex_slot_only() {
+    let a = crate::profile::ProfileName::from("a");
+    let b = crate::profile::ProfileName::from("b");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile(&a),
+            crate::testutil::blank_profile(&b),
+        ],
+    };
+    config.state.active_profile = Some(a.clone());
+    config.state.active_codex_profile = Some(b.clone());
+    assert!(config.is_active(&a) && !config.is_active(&b));
+    assert!(config.is_active_codex("b") && !config.is_active_codex("a"));
+}
+
+// remove() must clear every codex slot the departing profile occupies,
+// mirroring the claude-side guarantees (chain membership + active marker).
+#[test]
+fn remove_clears_codex_membership_and_active_slot() {
+    let _home = HomeSandbox::new();
+    let cdx = crate::profile::ProfileName::from("cdx");
+    let cdx2 = crate::profile::ProfileName::from("cdx2");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![
+            crate::testutil::blank_profile(&cdx),
+            crate::testutil::blank_profile(&cdx2),
+        ],
+    };
+    config.state.profiles = vec![cdx.clone(), cdx2.clone()];
+    config.state.active_codex_profile = Some(cdx.clone());
+    config.state.codex_fallback_chain = vec![cdx.clone(), cdx2.clone()];
+    crate::lock::with_state_lock(|held| {
+        config.remove(&cdx, held);
+        Ok(())
+    })
+    .expect("remove");
+    assert!(config.state.active_codex_profile.is_none());
+    assert_eq!(config.state.codex_fallback_chain.len(), 1);
+    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "cdx2");
+}
+
+#[test]
+fn rename_updates_codex_slots() {
+    let _home = HomeSandbox::new();
+    let old = crate::profile::ProfileName::from("old");
+    let new = crate::profile::ProfileName::from("new");
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![crate::testutil::blank_profile(&old)],
+    };
+    config.state.profiles = vec![old.clone()];
+    config.state.active_codex_profile = Some(old.clone());
+    config.state.codex_fallback_chain = vec![old.clone()];
+    crate::lock::with_state_lock(|held| {
+        config.rename_all_occurrences(&old, &new, held);
+        Ok(())
+    })
+    .expect("rename");
+    assert_eq!(config.state.active_codex_profile.as_deref(), Some("new"));
+    assert_eq!(config.state.codex_fallback_chain[0].as_str(), "new");
+}
+
 /// The Alibaba console session survives a save/load round trip through
 /// `config.toml`'s `[console]` table, and its file keeps the 0600 posture every
 /// credential under `~/.clauth` carries.
@@ -2616,17 +2868,31 @@ fn rolling_token_round_trips_through_config_toml() {
     assert!(parsed.rolling_token);
 }
 
-/// The pre-rename `session_feed` spelling is deliberately NOT aliased: no
-/// released clauth ever wrote it, and a permanent alias for something that
-/// never shipped is pure legacy surface. An unknown key parses as OFF.
+/// FORK DIVERGENCE (UPS-17): the pre-rename `session_feed` spelling IS read,
+/// as a serde alias for `rolling_token`.
+///
+/// Upstream carries no alias, and its own test asserts exactly that — for
+/// upstream the key never shipped, so honouring it would be permanent legacy
+/// surface for nothing. This fork is the one install where it DID ship: the
+/// feature was written here as CLA-FEED, ran for seven weeks, and armed
+/// profiles on this machine still carry `session_feed = true` in their
+/// `config.toml`. Dropping the key silently on upgrade would disarm the split
+/// — sessions would fall back to whatever the sidecar holds and the operator
+/// would learn about it from a Fable refusal, not from clauth. The alias costs
+/// one attribute and retires itself: the next `config.toml` rewrite emits the
+/// canonical `rolling_token`.
 #[test]
-fn the_pre_rename_session_feed_key_is_not_carried() {
+fn the_pre_rename_session_feed_key_is_read_as_rolling_token() {
     let legacy: ProfileConfig =
         toml::from_str("session_feed = true\n").expect("parse legacy config");
     assert!(
-        !legacy.rolling_token,
-        "installs that ran the feature branch re-run `clauth rolling-token <p>` once"
+        legacy.rolling_token,
+        "a profile this fork armed under the old key stays armed across the upgrade"
     );
+    // And the canonical spelling still wins on its own.
+    let current: ProfileConfig =
+        toml::from_str("rolling_token = true\n").expect("parse current config");
+    assert!(current.rolling_token);
 }
 
 /// A test that forgets its sandbox must fail rather than reach the operator's

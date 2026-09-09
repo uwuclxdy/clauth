@@ -588,3 +588,47 @@ fn the_pause_warning_latches_and_clears_on_recovery() {
         "a clean read must clear the latch so a recurrence is reported again"
     );
 }
+
+/// Harness gate (fork): a codex profile is invisible to settings sync — its dir
+/// contributes no runtime/settings.json target, and its `config.toml` `[env]`
+/// keys never join the per-profile custom set that classifies claude keys.
+#[test]
+fn codex_profiles_are_invisible_to_settings_sync() {
+    let home = HomeSandbox::new();
+    write_config(home.home(), "claude-p", "env = { MY_KEY = \"x\" }\n");
+    write_config(
+        home.home(),
+        "cdx",
+        "harness = \"codex\"\nenv = { CODEX_ONLY = \"y\" }\n",
+    );
+
+    // Both get a shared `runtime/` dir: upstream's walk lists the dirs that
+    // EXIST, so a config-only profile contributes no target either way and the
+    // assertion below would pass for the wrong reason.
+    for profile in ["claude-p", "cdx"] {
+        fs::create_dir_all(
+            home.home()
+                .join(".clauth/profiles")
+                .join(profile)
+                .join("runtime"),
+        )
+        .expect("mkdir runtime");
+    }
+
+    let paths = known_paths().expect("known paths");
+    assert!(
+        paths.contains(&runtime_path(home.home(), "claude-p")),
+        "claude member stays a sync target"
+    );
+    assert!(
+        !paths.contains(&runtime_path(home.home(), "cdx")),
+        "codex profile dir must not become a sync target"
+    );
+
+    let keys = per_profile_env_keys().expect("env keys read");
+    assert!(keys.contains("MY_KEY"), "claude env key registers");
+    assert!(
+        !keys.contains("CODEX_ONLY"),
+        "codex config.toml env keys never join the managed set"
+    );
+}

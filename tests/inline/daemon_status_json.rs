@@ -31,12 +31,22 @@ fn build_status_top_level_shape_and_active() {
     };
     config.state.active_profile = Some("work".into());
     config.state.refresh_interval_ms = 300_000;
+    // The account_email cache writes below are gated on the on-disk record.
+    crate::testutil::register_names(&["work", "home"]);
 
     let v = build_status(&config, config.state.refresh_interval_ms, None, false);
 
     assert_eq!(v["schema"], SCHEMA_VERSION);
     assert_eq!(v["active_profile"], "work");
     assert_eq!(v["wrap_off"], false);
+    assert_eq!(
+        v["weekly_switch_threshold"], 98.0,
+        "unset state publishes the default weekly line"
+    );
+    assert_eq!(v["burn_aware"], false);
+    // Additive forecast object is always present; no chain here → "none".
+    assert_eq!(v["forecast"]["action"], "none");
+    assert!(v["forecast"]["to"].is_null());
     assert_eq!(v["refresh_interval_ms"], 300_000);
     assert!(v["generated_at"].as_str().unwrap().contains('T'));
     // Exact key sets — a silent rename/removal anywhere in the contract fails
@@ -46,12 +56,23 @@ fn build_status_top_level_shape_and_active() {
     assert_eq!(
         top,
         [
+            // Fork-only keys are additive under schema 1; the menu-bar clients
+            // read them (docs/ccsbar/DESIGN.md).
+            "active_codex_profile",
             "active_profile",
+            "burn_aware",
+            "clauth_version",
+            "codex_fallback_chain",
+            "fallback_chain",
+            "forecast",
             "generated_at",
+            "last_error",
+            "last_switch",
             "pending_switch",
             "profiles",
             "refresh_interval_ms",
             "schema",
+            "weekly_switch_threshold",
             "wrap_off",
         ],
     );
@@ -66,6 +87,8 @@ fn build_status_top_level_shape_and_active() {
     assert_eq!(
         per,
         [
+            // Fork-only, additive: the identity anchor's operator half.
+            "account_email",
             "active",
             "auth_status",
             "auto_start",
@@ -75,9 +98,15 @@ fn build_status_top_level_shape_and_active() {
             "auto_start_queue",
             "base_url",
             "bell_threshold",
+            // Fork-only, additive: the codex leg's published readings.
+            "codex_rate_limit_reached",
+            "codex_reset_credits",
+            "codex_snapshot_at",
             "fallback",
             "fetch_status",
             "fetched_at",
+            // Fork-only, additive: which harness owns the profile.
+            "harness",
             "has_live_session",
             "name",
             "next_refresh_at",
@@ -98,6 +127,23 @@ fn build_status_top_level_shape_and_active() {
     assert!(work["fetched_at"].is_null());
     assert!(work["next_refresh_at"].is_null());
     assert!(work["windows"].as_array().unwrap().is_empty());
+    // Additive account_email (schema stays 1): null until the identity
+    // anchor's email half is cached, then the cached value verbatim.
+    assert!(work["account_email"].is_null());
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("work"),
+        crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+        &"work@example.com".to_string(),
+    );
+    let v = build_status(&config, config.state.refresh_interval_ms, None, false);
+    let work = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "work")
+        .unwrap()
+        .clone();
+    assert_eq!(work["account_email"], "work@example.com");
     let home = v["profiles"]
         .as_array()
         .unwrap()
@@ -106,6 +152,26 @@ fn build_status_top_level_shape_and_active() {
         .unwrap()
         .clone();
     assert_eq!(home["active"], false);
+    // OAuth-only gate: an API profile (OAuth→API conversion keeps the cached
+    // anchor) must read null, matching the TUI's is_api gate.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("home"),
+        crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+        &"home@example.com".to_string(),
+    );
+    config.profiles[1].base_url = Some("https://api.example.com".to_string());
+    let v = build_status(&config, config.state.refresh_interval_ms, None, false);
+    let home = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "home")
+        .unwrap()
+        .clone();
+    assert!(
+        home["account_email"].is_null(),
+        "an API profile never surfaces the stale OAuth email"
+    );
 }
 
 #[test]
@@ -135,6 +201,9 @@ fn build_status_fallback_membership_and_armed() {
 
     let c = profiles.iter().find(|p| p["name"] == "c").unwrap();
     assert!(c["fallback"].is_null(), "not a chain member → null");
+
+    // Top-level ordered chain mirrors the per-profile positions.
+    assert_eq!(v["fallback_chain"], serde_json::json!(["a", "b"]));
 }
 
 // ── disabled: hidden from the feed by default, surfaced via include_disabled ──
@@ -301,20 +370,49 @@ fn build_status_pending_switch_reflects_live_signal() {
     let empty_next = std::collections::HashMap::new();
     let empty_streaks = std::collections::HashMap::new();
 
-    // single-shot (no daemon) → pending_switch is present-but-null.
+    // single-shot (no daemon) → pending_switch and last_error are present-but-null.
     let none = build_status(&config, 300_000, None, false);
     assert!(
         none.get("pending_switch").is_some(),
         "pending_switch key is always present"
     );
     assert!(none["pending_switch"].is_null());
+    assert!(
+        none.get("last_error").is_some(),
+        "last_error key is always present"
+    );
+    assert!(
+        none["last_error"].is_null(),
+        "single-shot has no drain history"
+    );
+    assert!(
+        none["clauth_version"].is_string(),
+        "version present in single-shot too"
+    );
+    assert!(
+        none["last_switch"].is_null(),
+        "single-shot has no switch history"
+    );
 
+    // live daemon with an accepted-not-yet-applied switch → the target name, plus a
+    // recorded drain skip reason (TECH-6, additive — schema stays 1).
+    let last_switch = crate::daemon::LastSwitch {
+        from: Some(crate::profile::ProfileName::from("home")),
+        to: Some(crate::profile::ProfileName::from("work")),
+        at_ms: 1_700_000_000_000,
+        trigger: "user",
+    };
     let live = LiveSignals {
         status: &empty_status,
         third_party_status: &Default::default(),
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: Some("home"),
+        last_error: Some((
+            1_700_000_000_000,
+            "deferring switch to 'work': target is mid-fetch",
+        )),
+        last_switch: Some(&last_switch),
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -323,6 +421,19 @@ fn build_status_pending_switch_reflects_live_signal() {
     assert_eq!(
         v["schema"], SCHEMA_VERSION,
         "pending_switch is part of schema 1 — no bump"
+    );
+    // TECH-8: version always present; last_switch reflects the hero event.
+    assert_eq!(v["clauth_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(v["last_switch"]["from"], "home");
+    assert_eq!(v["last_switch"]["to"], "work");
+    assert_eq!(v["last_switch"]["trigger"], "user");
+    assert_eq!(
+        v["last_error"]["message"],
+        "deferring switch to 'work': target is mid-fetch"
+    );
+    assert!(
+        v["last_error"]["at"].as_str().unwrap().contains('T'),
+        "last_error.at is an ISO-8601 instant"
     );
 }
 
@@ -358,6 +469,8 @@ fn build_status_auto_start_queue_positions_and_null_cases() {
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: Some(anchor),
         queue_blocked: &[],
     };
@@ -462,6 +575,8 @@ fn build_status_third_party_freshness_from_its_own_cache() {
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -599,6 +714,8 @@ fn build_status_keeps_a_generic_api_key_countdown_over_a_maxed_oauth_cache() {
         next_refresh: &next,
         streaks: &empty_streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -667,6 +784,8 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -692,6 +811,8 @@ fn build_status_stale_flags_a_deep_slot_stuck_rate_limited_profile() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -735,6 +856,8 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -756,6 +879,8 @@ fn build_status_publishes_the_third_party_legs_own_status() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -785,6 +910,8 @@ fn build_status_prefers_the_oauth_leg_when_both_stores_carry_a_name() {
         next_refresh: &next,
         streaks: &streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: None,
         queue_blocked: &[],
     };
@@ -1091,6 +1218,8 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         next_refresh: &empty_next,
         streaks: &empty_streaks,
         pending_switch: None,
+        last_error: None,
+        last_switch: None,
         queue_anchor: Some(anchor),
         queue_blocked: &blocked,
     };
@@ -1152,5 +1281,272 @@ fn build_status_auto_start_queue_drops_switch_grade_kick_blocked_members() {
         queue_of(&v, "c")["position"],
         2,
         "a burst 429 is not switch-grade and never costs a queue slot"
+    );
+}
+
+// ── CDX-1 T7 + forecast: fork-only status.json fields (all additive — the
+// schema stays 1; docs/ccsbar/DESIGN.md is the reader contract) ──────────────
+
+// The daemon's published forecast is the same `fallback::next_target` walk the
+// switch decision runs — the single source of truth for "would switch to X"
+// (a client-side mirror of the walk is what drifted when upstream changed the
+// walk semantics; readers should render THIS instead).
+#[test]
+fn build_status_forecast_publishes_next_target_and_last_resort() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), oauth_profile("home")],
+    };
+    config.state.active_profile = Some("work".into());
+    config.state.profiles = vec!["work".into(), "home".into()];
+    config.state.fallback_chain = vec!["work".into(), "home".into()];
+    config.profiles[1].last_resort = true;
+
+    let v = build_status(&config, 300_000, None, false);
+
+    // `home` has no usage cache → headroom → it is the walk's pick.
+    assert_eq!(v["forecast"]["action"], "switch");
+    assert_eq!(v["forecast"]["to"], "home");
+
+    // The exclusive last-resort mark rides the per-profile fallback object.
+    let profiles = v["profiles"].as_array().unwrap();
+    let home = profiles.iter().find(|p| p["name"] == "home").unwrap();
+    assert_eq!(home["fallback"]["last_resort"], true);
+    let work = profiles.iter().find(|p| p["name"] == "work").unwrap();
+    assert_eq!(work["fallback"]["last_resort"], false);
+}
+
+/// The forecast walk must see usage the DAEMON way — hydrated from the
+/// per-profile disk caches — because `Profile.usage` is only ever populated by
+/// the TUI thread. Regression: an un-hydrated walk read universal headroom and
+/// forecast a weekly-dead (7d=100) member as the next switch target.
+#[test]
+fn forecast_hydrates_usage_from_disk_and_skips_a_weekly_dead_member() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = HomeSandbox::new();
+
+    let win = |util: f64| {
+        Some(UsageWindow {
+            utilization: util,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        })
+    };
+    // active a: 5h exhausted · b: weekly-dead (7d=100, no 5h) · c: fresh.
+    let caches = [
+        (
+            "a",
+            UsageInfo {
+                five_hour: win(97.0),
+                ..UsageInfo::default()
+            },
+        ),
+        (
+            "b",
+            UsageInfo {
+                seven_day: win(100.0),
+                ..UsageInfo::default()
+            },
+        ),
+        (
+            "c",
+            UsageInfo {
+                five_hour: win(10.0),
+                ..UsageInfo::default()
+            },
+        ),
+    ];
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: caches
+            .iter()
+            .map(|(n, _)| {
+                let mut p = oauth_profile(n);
+                save_profile(&p).expect("save profile");
+                p.fallback_threshold = Some(95.0);
+                p
+            })
+            .collect(),
+    };
+    crate::testutil::register_names(&["a", "b", "c"]);
+    for (name, info) in &caches {
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(*name),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            info,
+        );
+    }
+    config.state.active_profile = Some("a".into());
+    config.state.profiles = vec!["a".into(), "b".into(), "c".into()];
+    config.state.fallback_chain = vec!["a".into(), "b".into(), "c".into()];
+
+    // Note: none of the in-memory profiles carry `usage` — exactly the daemon's
+    // shape. The forecast must still route around b to c.
+    assert!(config.profiles.iter().all(|p| p.usage.is_none()));
+    let forecast = super::forecast_json(&config);
+    assert_eq!(forecast["action"], "switch");
+    assert_eq!(forecast["to"], "c");
+}
+
+// A mixed claude+codex config publishes per-profile harness, per-slot active
+// truth, codex identity from the stored JWTs, the pinned codex_snapshot_at
+// contract, and the top-level active_codex_profile — while every claude field
+// keeps its exact prior meaning.
+#[test]
+fn build_status_publishes_codex_fields() {
+    let _home = HomeSandbox::new();
+
+    let id_token = crate::testutil::fake_jwt(&serde_json::json!({
+        "email": "cdx@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "pro",
+            "chatgpt_account_id": "acct-cdx",
+        },
+    }));
+    let bytes = serde_json::json!({
+        "tokens": {
+            "id_token": id_token,
+            "access_token": "at-cdx",
+            "refresh_token": "rt-cdx",
+            "account_id": "acct-cdx",
+        },
+    })
+    .to_string()
+    .into_bytes();
+
+    let mut cdx = Profile::new("cdx-a".to_string(), None, None);
+    cdx.harness = crate::profile::Harness::Codex;
+    save_profile(&cdx).unwrap();
+    crate::testutil::register_names(&["cdx-a"]);
+    crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-a"), &bytes).unwrap();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), cdx],
+    };
+    config.state.active_profile = Some("work".into());
+    config.state.active_codex_profile = Some("cdx-a".into());
+
+    let v = build_status(&config, 300_000, None, false);
+    assert_eq!(v["active_profile"], "work");
+    assert_eq!(v["active_codex_profile"], "cdx-a");
+
+    let profiles = v["profiles"].as_array().unwrap();
+    let by_name = |n: &str| {
+        profiles
+            .iter()
+            .find(|p| p["name"] == n)
+            .unwrap_or_else(|| panic!("profile {n} missing"))
+    };
+
+    let work = by_name("work");
+    assert_eq!(work["harness"], "claude");
+    assert_eq!(
+        work["active"], true,
+        "claude slot truth for claude profiles"
+    );
+    assert!(work["codex_snapshot_at"].is_null());
+    assert!(
+        work["codex_reset_credits"].is_null(),
+        "reset credits are a codex reading; claude profiles publish null"
+    );
+
+    let cdx = by_name("cdx-a");
+    assert_eq!(cdx["harness"], "codex");
+    assert_eq!(cdx["active"], true, "codex slot truth for codex profiles");
+    assert_eq!(cdx["account_email"], "cdx@example.com");
+    assert_eq!(cdx["tier"], "pro");
+    assert_eq!(cdx["auth_status"], "ok");
+    assert!(
+        cdx["codex_snapshot_at"].as_str().unwrap().contains('T'),
+        "snapshot stamp is ISO 8601"
+    );
+    assert!(
+        cdx["codex_reset_credits"].is_null(),
+        "no poll has carried a count yet: null, never a fabricated 0"
+    );
+
+    // Once the CDX-6 poll has cached a count it is published verbatim, next
+    // to the verdict from the same body.
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cdx-a"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            codex_rate_limit_reached: Some("rate_limit_reached".to_string()),
+            codex_reset_credits: Some(1),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    let v = build_status(&config, 300_000, None, false);
+    let cdx = v["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "cdx-a")
+        .unwrap()
+        .clone();
+    assert_eq!(cdx["codex_reset_credits"], 1);
+    assert_eq!(cdx["codex_rate_limit_reached"], "rate_limit_reached");
+}
+
+// The two active slots are independent in the published truth: a codex switch
+// must never flip a claude profile's `active` and vice versa.
+#[test]
+fn build_status_keeps_the_two_active_slots_independent() {
+    let _home = HomeSandbox::new();
+    let mut cdx = Profile::new("cdx-a".to_string(), None, None);
+    cdx.harness = crate::profile::Harness::Codex;
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth_profile("work"), cdx],
+    };
+    // Only the codex slot is set: the claude profile must NOT report active.
+    config.state.active_codex_profile = Some("cdx-a".into());
+
+    let v = build_status(&config, 300_000, None, false);
+    let profiles = v["profiles"].as_array().unwrap();
+    assert_eq!(profiles[0]["name"], "work");
+    assert_eq!(profiles[0]["active"], false);
+    assert_eq!(profiles[1]["name"], "cdx-a");
+    assert_eq!(profiles[1]["active"], true);
+    assert!(v["active_profile"].is_null());
+}
+
+// The codex auth_status arms beyond "ok": a stored access token past its JWT
+// exp reports "expiring"; a quarantined profile reports "broken" (and broken
+// outranks expiring) — the same value set + precedence as the claude leg.
+#[test]
+fn build_status_codex_auth_status_expiring_and_broken() {
+    let _home = HomeSandbox::new();
+    let expired_jwt = crate::testutil::fake_jwt(&serde_json::json!({ "exp": 1_000_000 }));
+    let bytes = serde_json::json!({
+        "tokens": {
+            "access_token": expired_jwt,
+            "refresh_token": "rt-old",
+            "account_id": "acct-old",
+        },
+    })
+    .to_string()
+    .into_bytes();
+
+    let mut cdx = Profile::new("cdx-a".to_string(), None, None);
+    cdx.harness = crate::profile::Harness::Codex;
+    save_profile(&cdx).unwrap();
+    crate::testutil::register_names(&["cdx-a"]);
+    crate::codex::write_profile_auth(&crate::profile::ProfileName::from("cdx-a"), &bytes).unwrap();
+
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![cdx],
+    };
+
+    let v = build_status(&config, 300_000, None, false);
+    assert_eq!(v["profiles"][0]["auth_status"], "expiring");
+
+    config.set_auth_broken(&crate::profile::ProfileName::from("cdx-a"), true);
+    let v = build_status(&config, 300_000, None, false);
+    assert_eq!(
+        v["profiles"][0]["auth_status"], "broken",
+        "broken outranks expiring"
     );
 }

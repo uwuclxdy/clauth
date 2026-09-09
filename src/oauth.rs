@@ -274,7 +274,12 @@ impl TokenFailure {
 /// Classify a failed [`TokenResponse`] deserialization into [`TokenFailure::Body`]
 /// — taking `e` by reference so the serde error itself cannot be moved into the
 /// result and carried onward.
-fn token_parse_error(e: &serde_json::Error, status: u16, body_len: usize) -> TokenFailure {
+// pub(crate) (fork): the codex refresh shares the withholding rule.
+pub(crate) fn token_parse_error(
+    e: &serde_json::Error,
+    status: u16,
+    body_len: usize,
+) -> TokenFailure {
     TokenFailure::Body {
         status,
         kind: match e.classify() {
@@ -329,7 +334,9 @@ const HTTP_RECV_HEADERS_SECS: u64 = 15;
 pub(crate) const TOKEN_HTTP_DEADLINES: Duration =
     Duration::from_secs(HTTP_CONNECT_SECS + HTTP_RECV_HEADERS_SECS);
 
-static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+// pub(crate) (fork): one HTTP agent serves both harnesses' token endpoints —
+// `codex::oauth` posts to auth.openai.com through the same client.
+pub(crate) static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
     ureq::Agent::config_builder()
         .timeout_connect(Some(Duration::from_secs(HTTP_CONNECT_SECS)))
         .timeout_recv_response(Some(Duration::from_secs(HTTP_RECV_HEADERS_SECS)))
@@ -342,6 +349,58 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .build()
         .into()
 });
+
+/// The CDX-5 proxy's upstream agent — the token AGENT's config plus a global
+/// timeout so a blackholed upstream that sends the response head then goes
+/// TCP-silent mid-SSE-stream can't park a connection thread forever (review
+/// MED: the streaming body read is otherwise unbounded).
+///
+/// The global timeout is a LEAK BACKSTOP, not turn-end detection: ureq's
+/// `timeout_global` fires even while bytes are actively flowing (pinned by
+/// `ureq_global_timeout_truncates_an_actively_streaming_body`), so any value
+/// a live stream can reach truncates that turn mid-flight. Turn-end comes
+/// from the relay's terminal-event sniffer (`proxy::sse`); this ceiling only
+/// bounds a genuinely wedged connection, and must stay far above any
+/// legitimate single-request stream.
+///
+/// `timeout_recv_response` is deliberately ABSENT: in ureq 3 that deadline
+/// keeps running through the BODY read, not just the headers (pinned by
+/// `ureq_recv_response_timeout_kills_the_streaming_body`). The 2026-07-18
+/// incident's actual assassin was a 30 s value here — every model turn whose
+/// stream outlived 30 s died as `TRUNCATED … timeout: receive response`,
+/// which codex reports as "stream closed before response.completed" and
+/// replays from scratch (the first-pass diagnosis blamed the then-15-minute
+/// global; the timestamped relay summaries this incident added showed the
+/// kills at 29 s). SSE headers arrive immediately on a 200, so an
+/// headers-only bound has nothing real to protect anyway — connect +
+/// global cover the wedge cases.
+pub(crate) static PROXY_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(10)))
+        .timeout_global(Some(Duration::from_secs(2 * 60 * 60)))
+        .http_status_as_error(false)
+        .build()
+        .into()
+});
+
+/// Cap a raw HTTP error body to its first line, max 200 chars, before it
+/// reaches a user-facing toast — an upstream error page must not flood a
+/// one-line surface.
+// pub(crate) for the same single-source reason as `token_parse_error`.
+pub(crate) fn http_error(status: u16, body: &str) -> anyhow::Error {
+    let detail: String = body
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(200)
+        .collect();
+    if detail.is_empty() {
+        anyhow::anyhow!("HTTP {status}")
+    } else {
+        anyhow::anyhow!("HTTP {status}: {detail}")
+    }
+}
 
 /// A token-refresh failure, split so the AUTH-1 gate can tell a *permanently*
 /// revoked/invalid refresh token (quarantine the account — `clauth login` is the
@@ -1495,14 +1554,16 @@ pub(crate) fn apply_rotated_tokens_locked(
 }
 
 /// Adopt the live session's OWN token rotation instead of fighting it
-/// (rotation coherence — the future-proof half). The running `claude` and
-/// clauth hold ONE single-use refresh family; whoever refreshes first revokes
-/// the other. Rather than racing, concede: CC maintains
+/// (rotation coherence, the future-proof half — #24 review). The running
+/// `claude` and clauth hold ONE single-use refresh family; whoever refreshes
+/// first revokes the other. Rather than racing, concede: CC maintains
 /// `~/.claude/.credentials.json` as a regular-file mirror of its Keychain
-/// login (rewritten at least on every CC launch), a prompt-free read path to
-/// CC's current pair. When that mirror holds a FRESHER pair for the SAME
-/// account, adopt it into the profile store — no refresh spent — so clauth
-/// stays correct whatever refresh schedule a future Claude Code ships.
+/// login (rewritten at least on every CC launch), which is a prompt-free read
+/// path to CC's current pair. When that mirror holds a FRESHER pair for the
+/// SAME account, adopt it into the profile store — no refresh spent, any
+/// stale `auth_broken` quarantine cleared (the account was never dead, we
+/// just lost the race) — so clauth stays correct whatever refresh schedule a
+/// future Claude Code ships.
 ///
 /// Gates, in order — every one must pass:
 ///   * `name` is the ACTIVE profile (only its chain is shared with a live CC);
@@ -1527,7 +1588,7 @@ pub(crate) fn apply_rotated_tokens_locked(
 /// Returns the adopted `(access, refresh)` pair so the caller can sync its
 /// in-memory `TokenList` exactly like every other rotation site — without it,
 /// the next poll would run on the superseded entry, spend the revoked refresh
-/// token, and fail on the very account the adopt just saved.
+/// token, and falsely quarantine the very account the adopt just saved.
 ///
 /// `_rotation_guard` is proof the caller holds this profile's per-profile
 /// rotation lock: the adopt mutates the same stored credential fields as a
@@ -1783,6 +1844,10 @@ pub(crate) fn try_adopt_live_rotation(
         }
         profile.set_credentials(Some(live.clone()), held);
         save_profile(profile)?;
+        if cfg.set_auth_broken(name, false) {
+            logline!("clauth: '{name}' re-adopted from the live session — auth_broken cleared");
+        }
+        let _ = crate::profile::save_app_state(&cfg.state);
         Ok::<bool, anyhow::Error>(true)
     })
     .unwrap_or(false);
@@ -1838,16 +1903,16 @@ pub(crate) fn try_adopt_live_rotation(
 }
 
 /// Whether the live `.credentials.json` holds a login clauth does NOT own —
-/// i.e. genuinely [`crate::claude::LinkState::Diverged`] and not merely a
-/// stale regular-file mirror of this profile's own pre-rotation pair. On
-/// macOS Claude Code rewrites the live file as a regular-file copy of the
-/// Keychain, so the moment a rotation lands, `classify_credentials_link`
-/// reports Diverged against the NEW stored token even though the live login
-/// is still our own chain one step behind — that stale-mirror case must still
-/// be mirrored, or the coherence write would skip exactly when it matters.
-/// Only a live token matching NEITHER the new nor the pre-rotation pair is
-/// foreign (a real CC re-login); an unreadable/unclassifiable state is
-/// treated as foreign so a state we cannot understand is never overwritten.
+/// i.e. genuinely [`LinkState::Diverged`] and not merely a stale regular-file
+/// mirror of this profile's own pre-rotation pair. On macOS Claude Code
+/// rewrites the live file as a regular-file copy of the Keychain, so the
+/// moment a rotation lands, `classify_credentials_link` reports Diverged
+/// against the NEW stored token even though the live login is still our own
+/// chain one step behind — that stale-mirror case must still be mirrored, or
+/// the coherence write would skip exactly when it matters. Only a live token
+/// matching NEITHER the new nor the pre-rotation pair is foreign (a real CC
+/// re-login); an unreadable/unclassifiable state is treated as foreign so a
+/// state we cannot understand is never overwritten.
 #[cfg(target_os = "macos")]
 fn live_login_is_foreign(name: &ProfileName, old_access: &str) -> bool {
     match crate::claude::classify_credentials_link(name) {
@@ -1907,17 +1972,21 @@ pub(crate) enum AuthGate {
     Transient(crate::format::Transient),
 }
 
-/// Pre-install auth gate (AUTH-1 / Incident C). Installing `name`'s stored
-/// credentials into the macOS Keychain instantly re-authenticates every running
-/// `claude` on this machine, so a dead token must never be installed: this
-/// refreshes an expiring OAuth token before install, quarantines a revoked one
-/// ([`AuthGate::Broken`]), and passes healthy or third-party targets through.
-/// Every branch is pinned by the `gate_*` tests in this module's test file.
+/// Pre-install auth gate (AUTH-1 / Incident C). Before a switch installs `name`'s
+/// stored credentials into the macOS Keychain — which instantly re-authenticates
+/// every running `claude` on this machine — make sure the token is live:
+///   * third-party (api-key) profiles bypass the gate;
+///   * an OAuth access token with more than [`AUTH_GATE_GRACE_MS`] of life
+///     installs as-is;
+///   * an expiring/expired token is refreshed through `refresher` and the rotated
+///     pair persisted before install;
+///   * a revoked/invalid refresh token quarantines the profile (`auth_broken`,
+///     [`AuthGate::Broken`]) and refuses the switch.
 ///
-/// `refresher` is injected so the gate is testable offline (real callers pass
-/// [`refresh_result`]). The config mutex is never held across the HTTP refresh,
-/// and the per-profile `RotationGuard` wraps the refresh so a live session or
-/// sibling worker cannot double-spend the single-use token.
+/// `refresher` is injected so the gate is unit-testable offline (real callers
+/// pass [`refresh_result`]; tests pass a fixture). The config mutex is never held
+/// across the HTTP refresh, and the per-profile `RotationGuard` wraps the refresh
+/// so a live session or sibling worker cannot double-spend the single-use token.
 pub(crate) fn ensure_installable(
     config: &crate::profile::ConfigHandle,
     name: &ProfileName,
@@ -1971,10 +2040,10 @@ fn vanilla_install_gate(
         }
         // #53 review: the split engages only for a token that actually IS
         // long-lived. A sidecar holding a rotating pair is a mis-fill —
-        // installing it would front sessions with a dies-in-hours token and
-        // no refresher, so it is IGNORED (credentials.json installs below,
-        // exactly as if the sidecar weren't there) and called out here, the
-        // per-switch chokepoint, rather than on every hot-path stat.
+        // installing it would put a dies-in-hours token in front of sessions
+        // with no refresher, so it is IGNORED (credentials.json installs
+        // below, exactly as if the sidecar weren't there) and called out
+        // here, the per-switch chokepoint, rather than on every hot-path stat.
         Some(crate::claude::SessionTokenStatus::NotLongLived) => {
             logline!(
                 "clauth: '{name}' session-token.json holds a rotating pair (refresh \

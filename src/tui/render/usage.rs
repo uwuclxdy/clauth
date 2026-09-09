@@ -18,8 +18,8 @@ use super::format::{
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
-    draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
-    section_box, section_box_verbatim,
+    active_pill, draw_profile_selector, empty_state, key_cell, master_detail, pill,
+    rail_hint_lines, section_box, section_box_verbatim,
 };
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
@@ -60,9 +60,16 @@ struct DiagFlags {
 
 /// Runtime state gathered once under locks; keeps line builders lock-free.
 struct HeaderState {
+    /// Whether this profile holds the live credentials — drives the plan row's
+    /// `[ active ]` pill.
+    is_active: bool,
     activity: ProfileActivity,
     next_refresh_ms: Option<u64>,
     tick: u64,
+    /// The stored login's email (the identity anchor's readable half),
+    /// mirroring the Setup tab's `account` row. OAuth-only; `None` until a
+    /// login or the /profile fetch seeds it.
+    account_email: Option<String>,
     /// Consecutive-failure counts for the shown profile (zeroed when absent).
     /// The retry suffix names which retry the countdown leads to, so a deep slot
     /// reads as stuck from the count alone, no judgment label.
@@ -133,6 +140,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // `config` (via `cfg`) is outer of activity/refresh-timer in lock order.
     let header = HeaderState {
+        is_active: cfg.is_active(&profile.name),
         activity: app
             .activity
             .lock()
@@ -145,6 +153,17 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .ok()
             .and_then(|m| m.get(profile.name.as_str()).copied()),
         tick: app.tick_count,
+        // One tiny cached-file read, cursor profile only — the same per-frame
+        // page-cache read the Setup tab's `account` row makes.
+        account_email: profile
+            .is_oauth()
+            .then(|| {
+                crate::profile_cache::load_profile_cache::<String>(
+                    &profile.name,
+                    crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+                )
+            })
+            .flatten(),
         streaks: streaks
             .get(profile.name.as_str())
             .copied()
@@ -762,14 +781,33 @@ fn header_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
     let plan_key = key_span("plan");
     let left_w = plan_key.width() + plan_w;
     let mut plan_spans = vec![plan_key, plan_span];
+    // The fork's `[ active ]` pill holds the row's right edge (the fact this
+    // row is checked for); the auto-start countdown right-aligns into the
+    // room left of it, so both fit when both apply.
+    let pill_w = if header.is_active {
+        "[ active ]".chars().count() + 1
+    } else {
+        0
+    };
+    let right_edge = (inner_w as usize).saturating_sub(pill_w);
     if profile.auto_start {
-        plan_spans.extend(kick_spans(
-            &kick_text(profile, header),
-            left_w,
-            inner_w as usize,
-        ));
+        plan_spans.extend(kick_spans(&kick_text(profile, header), left_w, right_edge));
     }
+    if header.is_active {
+        let used: usize = plan_spans.iter().map(Span::width).sum();
+        plan_spans.push(Span::raw(" ".repeat(right_edge.saturating_sub(used) + 1)));
+        plan_spans.extend(active_pill());
+    }
+
     let mut lines = vec![Line::from(plan_spans)];
+    // Account row — which login this profile actually holds, so
+    // which-account-is-this never needs forensics (Setup tab's sibling).
+    if let Some(email) = header.account_email.as_deref() {
+        lines.push(Line::from(vec![
+            key_span("account"),
+            Span::styled(email.to_string(), theme::dim()),
+        ]));
+    }
     lines.extend(status_lines(profile, header, inner_w));
     lines
 }

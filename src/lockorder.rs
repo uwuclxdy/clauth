@@ -197,6 +197,10 @@ pub(crate) mod rank {
         /// neighbors.
         RollingPacing = 1400;
         PendingSwitch = 1500;
+        /// Fallback-config edits queued by the daemon control socket for the main
+        /// loop to apply. Leaf — the socket pushes standalone; the main loop
+        /// drains into a `Vec` and releases before taking `config`.
+        PendingConfigOps = 1600;
         PendingSwitchOff = 1700;
         /// MCP reply-digest snapshot (`mcp::digest::DigestTracker`): the
         /// since-your-last-call baseline every clone of the stdio server shares.

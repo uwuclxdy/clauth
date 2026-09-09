@@ -498,6 +498,8 @@ fn header_lines_plan_falls_back_to_account_tier() {
     });
     // No `usage`, no `third_party_usage` → the plan-label fallback is exercised.
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -562,9 +564,11 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
         "fixture must be the hybrid shape, or this pins nothing"
     );
     let header = HeaderState {
+        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        account_email: None,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -603,9 +607,11 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
         }),
     });
     let header = HeaderState {
+        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        account_email: None,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -651,9 +657,11 @@ fn header_lines_auto_start_kick_text_reads_the_later_of_gate_and_own_reset() {
             ..Default::default()
         });
         let header = HeaderState {
+            is_active: false,
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
+            account_email: None,
             streaks: StreakCounts::default(),
             kick_block: None,
             queue_slot: slot,
@@ -763,9 +771,11 @@ fn header_lines_kick_text_truncates_then_drops_on_tight_rows() {
         ..Default::default()
     });
     let header = HeaderState {
+        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        account_email: None,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: Some(QueueSlot {
@@ -813,9 +823,11 @@ fn a_key_without_an_endpoint_renders_through_the_oauth_arm() {
     );
 
     let header = HeaderState {
+        is_active: false,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
+        account_email: None,
         streaks: StreakCounts::default(),
         kick_block: None,
         queue_slot: None,
@@ -860,6 +872,8 @@ fn header_lines_plan_keeps_api_for_api_key_profiles() {
         Some("sk-fixture".to_string()),
     );
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -893,6 +907,8 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
 
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.usage = Some(UsageInfo {
+        codex_rate_limit_reached: None,
+        codex_reset_credits: None,
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
@@ -900,6 +916,8 @@ fn status_lines_shows_canceled_from_a_prior_sessions_cached_plan() {
         ..Default::default()
     });
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -947,6 +965,8 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
 
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.usage = Some(UsageInfo {
+        codex_rate_limit_reached: None,
+        codex_reset_credits: None,
         plan: Some(PlanInfo {
             tier: PlanTier::Free,
             subscription_status: None,
@@ -954,6 +974,8 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
         ..Default::default()
     });
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -984,6 +1006,8 @@ fn status_lines_no_canceled_pill_when_subscription_is_active() {
 fn disabled_rung_header(kick: bool) -> HeaderState {
     use crate::usage::KickBlock;
     HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1120,6 +1144,8 @@ fn kick_block_pins_its_own_pill_even_on_a_fresh_row() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Fresh);
     let header = |kick_block: Option<KickBlock>| HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1203,6 +1229,8 @@ fn the_block_leads_its_own_line_and_never_abuts_the_fetch_state() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            is_active: false,
+            account_email: None,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
@@ -1283,6 +1311,8 @@ fn status_lines_connects_two_plus_hints_into_one_rail() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            is_active: false,
+            account_email: None,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 45_000),
             tick: 0,
@@ -1351,6 +1381,8 @@ fn status_lines_single_hint_has_no_rail() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Failed);
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 20_000),
         tick: 0,
@@ -1394,6 +1426,8 @@ fn status_lines_wrapped_non_last_hint_bridges_its_continuation() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            is_active: false,
+            account_email: None,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 30_000),
             tick: 0,
@@ -1445,6 +1479,8 @@ fn status_lines_no_hint_row_after_closed_rail_stays_unbridged() {
     let lines: Vec<String> = status_lines(
         &profile,
         &HeaderState {
+            is_active: false,
+            account_email: None,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 14_000),
             tick: 0,
@@ -1485,6 +1521,8 @@ fn rate_limited_suffix_counts_the_retry() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::RateLimited);
     let header = |streak: u32| HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1527,6 +1565,8 @@ fn a_failing_refresh_names_itself_on_the_cached_row() {
     let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
     profile.fetch_status = Some(FetchStatus::Cached);
     let header = |refresh_fail: u32| HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1587,6 +1627,8 @@ fn a_streak_pill_turns_red_only_once_it_is_stuck() {
             .expect("a streak pill")
     };
     let header = |streaks: StreakCounts| HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: Some(now_ms() + 90_000),
         tick: 0,
@@ -1650,6 +1692,8 @@ fn spent_skipped_account_pill_is_bare() {
             .join("\n")
     };
     let header = HeaderState {
+        is_active: false,
+        account_email: None,
         activity: ProfileActivity::Idle,
         next_refresh_ms: None,
         tick: 0,
@@ -1725,6 +1769,8 @@ fn extra_bar_dedups_against_spend_and_scales_cents() {
     let with = |extra: Option<crate::usage::ExtraUsage>, spend: Option<crate::usage::SpendInfo>| {
         let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
         profile.usage = Some(crate::usage::UsageInfo {
+            codex_rate_limit_reached: None,
+            codex_reset_credits: None,
             plan: None,
             five_hour: None,
             seven_day: None,
@@ -1821,6 +1867,8 @@ fn status_lines_renders_the_auto_start_divergence() {
         joined(status_lines(
             &profile,
             &HeaderState {
+                is_active: false,
+                account_email: None,
                 activity: ProfileActivity::Idle,
                 next_refresh_ms: Some(now_ms() + 90_000),
                 tick: 0,
@@ -1860,6 +1908,8 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            is_active: false,
+            account_email: None,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
@@ -1899,6 +1949,8 @@ fn auth_broken_suppresses_the_lesser_pills() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            is_active: false,
+            account_email: None,
             activity: ProfileActivity::Idle,
             next_refresh_ms: Some(now_ms() + 90_000),
             tick: 0,
@@ -1957,6 +2009,8 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
     let out = joined(status_lines(
         &profile,
         &HeaderState {
+            is_active: false,
+            account_email: None,
             activity: ProfileActivity::Idle,
             next_refresh_ms: None,
             tick: 0,
@@ -1977,5 +2031,52 @@ fn auth_broken_does_not_render_a_reassuring_idle_line() {
     assert!(
         !out.contains("up to date"),
         "no idle dot may sit under a dead-login pill: {out}"
+    );
+}
+
+// ── Fork-only tests (account-email header row) ──────────────────────────────
+
+#[test]
+fn usage_header_names_the_linked_account() {
+    let profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    let header = |email: Option<&str>| HeaderState {
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        is_active: false,
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        account_email: email.map(str::to_string),
+        queue_slot: None,
+        diag: DiagFlags::default(),
+    };
+    let text = |lines: &[Line<'static>]| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    };
+
+    let with = text(&header_lines(
+        &profile,
+        &header(Some("x@computelabs.ai")),
+        60,
+    ));
+    let account = with
+        .iter()
+        .find(|l| l.starts_with("account"))
+        .expect("account row renders when the email is cached");
+    assert!(account.contains("x@computelabs.ai"), "{account}");
+    let account_idx = with.iter().position(|l| l.starts_with("account")).unwrap();
+    let status_idx = with.iter().position(|l| l.starts_with("status")).unwrap();
+    assert!(
+        account_idx < status_idx,
+        "account sits between plan and status: {with:?}"
+    );
+
+    let without = text(&header_lines(&profile, &header(None), 60));
+    assert!(
+        !without.iter().any(|l| l.starts_with("account")),
+        "no cached email → no account row: {without:?}"
     );
 }

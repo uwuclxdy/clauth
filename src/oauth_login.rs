@@ -11,12 +11,16 @@
 //! and uses a loopback redirect to `http://localhost:<port>/callback`. The code is
 //! then exchanged at `platform.claude.com/v1/oauth/token` via [`crate::oauth`].
 //! The authorize-host risk knob is documented on [`AUTHORIZE_URL`].
+//!
+//! Fork note: the codex browser login (`codex::login`) runs its own PKCE +
+//! loopback flow through [`crate::loopback`]; this module is upstream's claude
+//! flow, unchanged.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use sha2::{Digest, Sha256};
 
 use crate::logline::logline;
@@ -158,11 +162,13 @@ fn authorize_url(redirect_uri: &str, challenge: &str, state: &str) -> String {
     )
 }
 
-/// The request target (path?query) from an HTTP request line: `GET <target> HTTP/1.1`.
+/// The request-target of an HTTP request line (`GET /callback?x=1 HTTP/1.1`
+/// → `/callback?x=1`), or `None` when the line is not shaped like one.
 fn request_target(request_line: &str) -> Option<&str> {
     let mut parts = request_line.split_whitespace();
-    let _method = parts.next()?;
-    parts.next()
+    let method = parts.next()?;
+    let target = parts.next()?;
+    (method == "GET" && target.starts_with('/')).then_some(target)
 }
 
 /// Progress milestones reported through `login_with`'s callback. The CLI
@@ -569,14 +575,10 @@ pub(crate) fn login_with(
     let (verifier, challenge) = new_pkce().map_err(LoginError::Local)?;
     let state = random_b64url(32).map_err(LoginError::Local)?;
 
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .context("failed to bind the loopback listener for the OAuth callback")
+    // Fork: the shared binder (`loopback::bind_loopback`), so the claude and
+    // codex flows have one implementation of the loopback listener.
+    let (listener, port) = crate::loopback::bind_loopback(crate::loopback::BindPort::Ephemeral)
         .map_err(LoginError::Local)?;
-    let port = listener
-        .local_addr()
-        .map_err(anyhow::Error::from)
-        .map_err(LoginError::Local)?
-        .port();
     let redirect_uri = format!("http://localhost:{port}/callback");
     let url = authorize_url(&redirect_uri, &challenge, &state);
 

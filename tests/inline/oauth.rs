@@ -52,6 +52,7 @@ fn drain_http_request(sock: &mut std::net::TcpStream) -> Vec<u8> {
 fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -187,6 +188,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 
     let _home = HomeSandbox::new();
     let profile = Profile {
+        harness: crate::profile::Harness::Claude,
         name: "test-rotate-one-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -252,6 +254,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
 fn profile_without_refresh_token_excluded() {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: crate::profile::Harness::Claude,
         name: "test-oauth-no-rt".into(),
         base_url: None,
         api_key: None,
@@ -346,6 +349,7 @@ fn future_expiry() -> i64 {
 fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: None,
         api_key: None,
@@ -389,6 +393,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
 fn third_party_config(name: &str) -> AppConfig {
     use std::collections::BTreeMap;
     let profile = Profile {
+        harness: crate::profile::Harness::Claude,
         name: name.into(),
         base_url: Some("https://api.deepseek.com/anthropic".to_string()),
         api_key: Some("sk-fixture".to_string()),
@@ -2713,6 +2718,57 @@ fn gate_session_token_ready_even_when_auth_broken() {
     ));
 }
 
+// ── Fork-only: TECH-7 delta persist ─────────────────────────────────────────
+
+/// `mark_auth_broken` persists its ONE delta against the latest disk state.
+/// A blind whole-state save from this process's snapshot would clobber a flag
+/// a CONCURRENT process minted in between (the daemon marking one profile
+/// while a CLI reauth clears another) — the TECH-7 lost-update surface.
+#[test]
+fn mark_auth_broken_merges_with_disk_instead_of_clobbering() {
+    let _home = HomeSandbox::new();
+
+    // "mine" exists on disk: the quarantine write refuses to resurrect a row
+    // the profile list no longer carries, so a registered profile is what
+    // isolates the lost-update question from the deleted-row one.
+    crate::profile::save_profile(&Profile::new("mine".to_string(), None, None))
+        .expect("save profile");
+    // Another process already quarantined "other" on disk; this process's
+    // in-memory snapshot predates that and doesn't know.
+    crate::profile::update_app_state(|s, _held| {
+        s.profiles.push("mine".into());
+        s.auth_broken.push("other".into());
+    })
+    .expect("seed disk state");
+    let handle: crate::profile::ConfigHandle =
+        std::sync::Arc::new(crate::lockorder::RankedMutex::new(AppConfig {
+            state: AppState::default(),
+            profiles: vec![],
+        }));
+
+    mark_auth_broken(&handle, &crate::profile::ProfileName::from("mine"), true);
+
+    let disk = crate::profile::load_config().expect("reload").state;
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
+        "this process's mark lands"
+    );
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
+        "the concurrent writer's flag survives — no blind whole-state clobber"
+    );
+
+    mark_auth_broken(&handle, &crate::profile::ProfileName::from("mine"), false);
+    let disk = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !disk.auth_broken.iter().any(|n| n.as_str() == "mine"),
+        "the clear lands as a delta too"
+    );
+    assert!(
+        disk.auth_broken.iter().any(|n| n.as_str() == "other"),
+        "and still leaves the concurrent flag alone"
+    );
+}
 /// CLA-SPLIT: the install arm reads a mint with the SAME grace every other
 /// verdict on these bytes uses (`AUTH_GATE_GRACE_MS` = CC's five-minute
 /// refresh threshold = the backup-restore rule). Three minutes of life is

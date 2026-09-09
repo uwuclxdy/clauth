@@ -286,6 +286,8 @@ pub(crate) struct OAuthToken {
 #[derive(Debug, Clone)]
 pub(crate) struct Profile {
     pub(crate) name: ProfileName,
+    /// Which CLI this profile's credentials belong to. See [`Harness`].
+    pub(crate) harness: Harness,
     pub(crate) base_url: Option<String>,
     pub(crate) api_key: Option<String>,
     /// Fires a 1-token Haiku ping each 30s tick while no 5h window is active.
@@ -371,6 +373,7 @@ impl Profile {
         let provider = base_url.as_deref().and_then(Provider::from_base_url);
         Self {
             name: name.into(),
+            harness: Harness::default(),
             base_url,
             api_key,
             auto_start: false,
@@ -437,6 +440,10 @@ impl Profile {
     /// [`Profile::usage_cache_is_third_party`], which is a wider set.
     pub(crate) fn is_third_party(&self) -> bool {
         self.provider.is_some()
+    }
+
+    pub(crate) fn is_codex(&self) -> bool {
+        self.harness == Harness::Codex
     }
 
     /// Whether this account's usage figures live in `third_party_cache.json`
@@ -539,6 +546,21 @@ impl Profile {
             self.credentials.as_mut()
         }
     }
+}
+
+/// Which CLI a profile's credentials belong to (CDX-1). Persisted in the
+/// profile's config.toml as `harness = "codex"`; absent = Claude, so every
+/// pre-CDX config loads unchanged. Immutable after creation — a profile never
+/// converts across harnesses (delete + recreate instead), and the two live
+/// credential stores (`~/.claude` + Keychain vs `~/.codex/auth.json`) have
+/// independent active slots (`AppState::active_profile` vs
+/// `AppState::active_codex_profile`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum Harness {
+    #[default]
+    Claude,
+    Codex,
 }
 
 /// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
@@ -740,6 +762,14 @@ pub(crate) struct AppState {
         skip_serializing_if = "is_true"
     )]
     pub(crate) preemptive_rotation: bool,
+    /// CDX-6: poll `wham/usage` for codex profiles' rate-limit windows with
+    /// their stored access tokens — per-account live usage without a running
+    /// session (the passive JSONL/proxy legs only see accounts that run).
+    /// Default ON (AX decision 2026-07-22, reversing feasibility §2.5's ban —
+    /// see `codex::poll`); the off switch exists because the endpoint is a
+    /// private API that may change or gate without notice.
+    #[serde(default = "default_codex_usage_poll", skip_serializing_if = "is_true")]
+    pub(crate) codex_usage_poll: bool,
     /// When false, the background usage fetch skips accounts already pinned at
     /// their 100% window cap (spent) until the window resets — a spent window
     /// can't change until then, so re-polling only burns quota + poll load.
@@ -796,16 +826,28 @@ pub(crate) struct AppState {
     /// Divergence modal (current behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_divergence: Option<DivergenceChoice>,
-    /// Chain-wide weekly (7d) exhaustion line, percent — past it an account
-    /// counts as exhausted in BOTH walk directions (switch trigger + candidate
-    /// acceptance); the wrap-off `Off` decision ignores it and keys on the
-    /// 100% hard cap (`WEEKLY_HARD_BLOCK_PCT` in `fallback.rs`). `None` =
-    /// [`DEFAULT_WEEKLY_SWITCH_PCT`]. Read through
+    /// Chain-wide weekly (7d) exhaustion SOFT line, percent — past it an account
+    /// counts as exhausted for the switch trigger + candidate acceptance. `None`
+    /// = [`DEFAULT_WEEKLY_SWITCH_PCT`]. Read through
     /// [`AppState::weekly_switch_threshold_pct`], which resets hand-edited
-    /// garbage to the default. Global (not per-member like the 5h
-    /// threshold): the line protects the CHAIN — a wrong hop strands days.
+    /// garbage to the default. Global (not per-member like the 5h threshold):
+    /// the line protects the CHAIN — a wrong hop strands days. The wrap-off
+    /// `Off` decision ignores this soft line and keys on the 100% hard cap
+    /// (`WEEKLY_HARD_BLOCK_PCT` in `fallback.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) weekly_switch_threshold: Option<f64>,
+    /// The codex-harness active slot (CDX-1) — which profile's chain currently
+    /// lives in `~/.codex/auth.json`. Independent of `active_profile` (claude):
+    /// the two CLIs have separate live credential stores, so switching one
+    /// never unlinks the other. Omitted from profiles.toml until first used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) active_codex_profile: Option<ProfileName>,
+    /// Codex-harness fallback chain (CDX-4 walks it; CDX-1 only stores +
+    /// validates). Chains are per-harness: a codex profile can never enter
+    /// `fallback_chain` and vice versa — the claude auto-switch path would
+    /// otherwise install a profile with no claude credentials.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) codex_fallback_chain: Vec<ProfileName>,
     /// Burn-aware floor: the lowest 5h utilization at which a projected switch
     /// may fire (`burn_aware_switching` only). The projection replaces the
     /// static threshold with "would cross 100% before the next poll", and on a
@@ -876,9 +918,9 @@ impl AppState {
     /// The effective weekly exhaustion line: the configured value when it sits
     /// inside [`MIN_WEEKLY_SWITCH_PCT`]`..=`[`MAX_WEEKLY_SWITCH_PCT`], else the
     /// DEFAULT (a reset, not a clamp-to-nearest-bound: fail-safe high beats
-    /// honoring a hand-edited `40.0` as `50`) — an out-of-band value edited
-    /// into profiles.toml must not silently disable the weekly gate
-    /// (rationale in `fallback.rs`).
+    /// honoring a hand-edited 40.0 as 50) — an out-of-band value hand-edited
+    /// into profiles.toml must not silently disable the weekly gate (rationale
+    /// in `fallback.rs`).
     pub(crate) fn weekly_switch_threshold_pct(&self) -> f64 {
         self.weekly_switch_threshold
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v))
@@ -909,6 +951,12 @@ fn default_show_estimates() -> bool {
 }
 
 fn default_refresh_spent() -> bool {
+    true
+}
+
+/// CDX-6 codex usage polling defaults ON (AX decision 2026-07-22); the flag
+/// exists as the kill switch for a private-API dependency.
+fn default_codex_usage_poll() -> bool {
     true
 }
 
@@ -995,6 +1043,7 @@ impl Default for AppState {
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),
+            codex_usage_poll: default_codex_usage_poll(),
             refresh_spent_accounts: true,
             auto_start_queue: false,
             theme: None,
@@ -1006,6 +1055,8 @@ impl Default for AppState {
             refresh_interval_ms: default_refresh_interval(),
             default_divergence: None,
             weekly_switch_threshold: None,
+            active_codex_profile: None,
+            codex_fallback_chain: Vec::new(),
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
             herdr: HerdrSettings::default(),
@@ -1029,6 +1080,13 @@ pub(crate) type ConfigHandle =
 impl AppConfig {
     pub(crate) fn is_active(&self, name: &ProfileName) -> bool {
         self.state.active_profile.as_ref() == Some(name)
+    }
+
+    /// Codex-slot counterpart of [`AppConfig::is_active`] — true when `name`'s
+    /// chain currently lives in `~/.codex/auth.json`. The two slots are
+    /// independent by design (see [`Harness`]).
+    pub(crate) fn is_active_codex(&self, name: &str) -> bool {
+        self.state.active_codex_profile.as_deref() == Some(name)
     }
 
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
@@ -1072,7 +1130,16 @@ impl AppConfig {
             .map(str::to_string)
     }
 
+    /// Add a profile, or REPLACE an existing one with the same name (upsert).
+    /// Re-authenticating an existing profile (`clauth login <existing>`) captures
+    /// through here; append-only would leave a duplicate `Profile` + a duplicate
+    /// name in `state.profiles`. The name in `state.profiles` is left untouched on
+    /// replace (it is already present and kept in sync with `self.profiles`).
     pub(crate) fn add(&mut self, profile: Profile) {
+        if let Some(existing) = self.profiles.iter_mut().find(|p| p.name == profile.name) {
+            *existing = profile;
+            return;
+        }
         self.state.profiles.push(profile.name.clone());
         self.profiles.push(profile);
     }
@@ -1082,8 +1149,12 @@ impl AppConfig {
         self.state.profiles.retain(|n| n != name);
         self.state.fallback_chain.retain(|n| n != name);
         self.state.auth_broken.retain(|n| n != name);
+        self.state.codex_fallback_chain.retain(|n| n != name);
         if self.is_active(name) {
             self.state.set_active(None, held);
+        }
+        if self.is_active_codex(name) {
+            self.state.active_codex_profile = None;
         }
     }
 
@@ -1108,11 +1179,22 @@ impl AppConfig {
         if let Some(slot) = self.state.fallback_chain.iter_mut().find(|n| **n == *old) {
             *slot = new.clone();
         }
+        if let Some(slot) = self
+            .state
+            .codex_fallback_chain
+            .iter_mut()
+            .find(|n| **n == *old)
+        {
+            *slot = new.clone();
+        }
         if let Some(slot) = self.state.auth_broken.iter_mut().find(|n| **n == *old) {
             *slot = new.clone();
         }
         if self.is_active(old) {
             self.state.set_active(Some(new.clone()), held);
+        }
+        if self.is_active_codex(old) {
+            self.state.active_codex_profile = Some(new.clone());
         }
     }
 }
@@ -1230,6 +1312,8 @@ struct ConsoleConfig {
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
 struct ProfileConfig {
+    #[serde(default)]
+    harness: Harness,
     base_url: Option<String>,
     api_key: Option<String>,
     #[serde(default, alias = "kick_timer")]
@@ -1244,15 +1328,14 @@ struct ProfileConfig {
     weekly_threshold: Option<f64>,
     #[serde(default)]
     last_resort: bool,
-    /// CLA-ROLL. No alias for the pre-rename `session_feed` spelling: no
-    /// released clauth ever wrote that key, so carrying it here would be a
-    /// permanent legacy alias for something that never shipped. Installs that
-    /// ran the feature branch under its old name re-run
-    /// `clauth rolling-token <profile>` once after upgrading.
-    #[serde(default)]
-    rolling_token: bool,
     #[serde(default)]
     preferred: bool,
+    /// CLA-ROLL. Fork: `session_feed` is the pre-rename spelling this fork's
+    /// installs wrote for the same flag (CLA-FEED, 2026-07/08), so it is read
+    /// as an alias — an upgrade keeps the profile armed, and the next config
+    /// rewrite normalizes the key.
+    #[serde(default, alias = "session_feed")]
+    rolling_token: bool,
     #[serde(default)]
     max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
@@ -1642,15 +1725,76 @@ pub(crate) fn tmp_sibling(path: &Path) -> PathBuf {
     ))
 }
 
-pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+/// Core tempfile+rename writer (fork, TECH-9). `mode = Some(m)` creates the
+/// temp file at that Unix mode (and any dir it must create at 0o700, since a
+/// 0o600 file under a world-readable dir still leaks via the dir entry);
+/// `None` uses the default umask mode and `create_dir_all` for a missing
+/// parent. `durable = true` `fsync`s the file before the rename and
+/// best-effort `fsync`s the parent dir after, so a crash/power-loss can't
+/// leave a zero-length or lost file. `durable = false` is the fast path
+/// reserved for the 1/s `status.json` write, a rebuildable cache. The staging
+/// name comes from upstream's [`tmp_sibling`]: unique per WRITER, not merely
+/// per process, so two threads aiming at one destination never share it.
+fn write_and_rename(
+    path: &Path,
+    content: &[u8],
+    mode: Option<u32>,
+    durable: bool,
+) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     if !dir.exists() {
-        std::fs::create_dir_all(dir)?;
+        match mode {
+            Some(_) => mkdir_700(dir)?,
+            None => std::fs::create_dir_all(dir)?,
+        }
     }
     let tmp = tmp_sibling(path);
-    std::fs::write(&tmp, content)?;
+    // Clear any stale temp so `create_new` lands on a fresh inode — guarantees
+    // the requested mode is applied at creation, never inherited from a looser
+    // file. Unique per writer, so this can only fire on a leftover from a
+    // crashed process whose pid was recycled, never on a live sibling's file.
+    if tmp.exists() {
+        std::fs::remove_file(&tmp)?;
+    }
+    let mut f = {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(m);
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        // A `create_new` failure propagates WITHOUT deleting the temp: it
+        // belongs to another writer, not to us.
+        opts.open(&tmp)?
+    };
+    // The temp is ours now, so clean it up on any write/sync failure — a partial
+    // write must never leak under the 0700 dir (the rename arm cleans up its own).
+    let write_result = {
+        use std::io::Write;
+        f.write_all(content).and_then(|()| {
+            // Flush data+metadata to disk BEFORE the rename so the rename can
+            // never expose a zero-length file after a crash.
+            if durable { f.sync_all() } else { Ok(()) }
+        })
+    };
+    drop(f);
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            if durable {
+                // Best-effort: fsync the directory so the rename itself is durable.
+                if let Ok(d) = std::fs::File::open(dir) {
+                    let _ = d.sync_all();
+                }
+            }
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e)
@@ -1658,44 +1802,24 @@ pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::R
     }
 }
 
+/// Tempfile + rename write; readers always see old or new, never partial.
+/// Durable (fsync before rename) — see [`write_and_rename`].
+pub(crate) fn atomic_write(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    write_and_rename(path, content.as_ref(), None, true)
+}
+
 /// Like [`atomic_write`] but creates the temp file with mode 0o600 (Unix only)
 /// so the file is never world-readable even for the instant before the rename.
-/// On non-Unix this is identical to [`atomic_write`].
+/// Durable. On non-Unix the mode is ignored.
 pub(crate) fn atomic_write_600(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    if !dir.exists() {
-        // A 0o600 file under a world-readable dir still leaks via the dir entry;
-        // any dir this helper must create is 0o700 to keep the secret contained.
-        mkdir_700(dir)?;
-    }
-    let tmp = tmp_sibling(path);
-    // Clear any stale temp so `create_new` lands on a fresh inode — guarantees
-    // the 0o600 mode is applied at creation, never inherited from a looser file.
-    // Unique per writer, so this can only fire on a leftover from a crashed
-    // process whose pid was recycled, never on a live sibling's staging file.
-    if tmp.exists() {
-        std::fs::remove_file(&tmp)?;
-    }
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        f.write_all(content.as_ref())?;
-    }
-    #[cfg(not(unix))]
-    std::fs::write(&tmp, content)?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    write_and_rename(path, content.as_ref(), Some(0o600), true)
+}
+
+/// Like [`atomic_write_600`] but NON-durable — the fast path for the 1/s
+/// `status.json` write, a rebuildable menu-bar cache where an fsync every second
+/// buys no correctness (TECH-9 #5 keeps this the only un-synced writer).
+pub(crate) fn atomic_write_600_fast(path: &Path, content: impl AsRef<[u8]>) -> std::io::Result<()> {
+    write_and_rename(path, content.as_ref(), Some(0o600), false)
 }
 
 /// Create `path` as a directory (recursively) with mode 0o700 on Unix,
@@ -1731,6 +1855,21 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
+/// True for a profile's isolated `codex-home/` (`profiles/<name>/codex-home`),
+/// the one subtree [`enforce_clauth_perms`] must not descend into. Matches on
+/// the grandparent being the profiles root, not the basename alone, so a
+/// profile literally NAMED `codex-home` still gets swept.
+#[cfg(unix)]
+fn is_isolated_codex_home(path: &Path) -> bool {
+    if path.file_name() != Some(std::ffi::OsStr::new("codex-home")) {
+        return false;
+    }
+    let Ok(root) = profiles_root() else {
+        return false;
+    };
+    path.parent().and_then(Path::parent) == Some(root.as_path())
+}
+
 /// Retighten an existing `~/.clauth` tree to the owner-only invariant (0o700
 /// dirs, 0o600 files). Installs created before the invariant carry umask modes
 /// no writer revisits once the bytes stop changing, so [`load_config`] runs
@@ -1738,6 +1877,14 @@ pub(crate) fn open_state_file(path: &Path) -> std::io::Result<std::fs::File> {
 /// shared-mode runtime is full of links into the operator's `~/.claude`, and
 /// following one would chmod a file clauth does not own. Best-effort per entry
 /// — a chmod failure on one path never aborts the walk or the load.
+///
+/// A profile's isolated `codex-home/` is codex's tree, not ours: codex plants
+/// PATH-alias helper binaries inside it, and a blanket 0o600 strips their exec
+/// bit — on EVERY entry point, so a single `clauth which` breaks a running
+/// isolated session. The descent stops there; the dir node itself is still
+/// tightened to 0o700. Nothing is loosened by the exemption: the seed writes
+/// `codex-home/auth.json` through [`atomic_write_600`], so the credential's
+/// mode comes from its writer rather than from this sweep.
 pub(crate) fn enforce_clauth_perms(root: &Path) {
     #[cfg(unix)]
     {
@@ -1753,7 +1900,10 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
         if meta.permissions().mode() & 0o777 != want {
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
         }
-        if is_dir && let Ok(entries) = std::fs::read_dir(root) {
+        if is_dir
+            && !is_isolated_codex_home(root)
+            && let Ok(entries) = std::fs::read_dir(root)
+        {
             for entry in entries.flatten() {
                 enforce_clauth_perms(&entry.path());
             }
@@ -1849,6 +1999,29 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
         mkdir_700(&clauth_dir()?)?;
         atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
             .context("failed to write profiles.toml")
+    })
+}
+
+/// Atomically read-modify-write the persisted `AppState` INSIDE the state flock:
+/// reload the on-disk state, apply `delta` (which must touch ONLY the field(s)
+/// this caller owns), and write the merged result. Returns the merged state so the
+/// caller can re-sync its in-memory copy.
+///
+/// This is the cross-process lost-update fix (TECH-7, finding #1). The blind
+/// [`save_app_state`] rewrites the WHOLE `profiles.toml` from a snapshot loaded
+/// OUTSIDE the flock, so a writer that changed one field (e.g. a switch setting
+/// `active_profile`) silently clobbers a concurrent writer's change to a DIFFERENT
+/// field (e.g. a `clauth login` that appended a profile) — the appended profile is
+/// permanently orphaned. Reloading inside the flock and applying a narrow delta
+/// makes the two writers commute: each preserves the other's field.
+pub(crate) fn update_app_state(
+    delta: impl FnOnce(&mut AppState, &StateLockHeld),
+) -> Result<AppState> {
+    with_state_lock(|held| {
+        let mut state = load_app_state()?;
+        delta(&mut state, held);
+        save_app_state(&state)?;
+        Ok(state)
     })
 }
 
@@ -2253,6 +2426,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
 
     let profile = Profile {
         name: name.clone(),
+        harness: config.harness,
         base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
@@ -2305,6 +2479,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     let needs_rewrite = match toml::from_str::<ProfileConfig>(&rendered) {
         Ok(canonical) => {
             let on_disk = ProfileConfig {
+                harness: profile.harness,
                 base_url: profile.base_url.clone(),
                 api_key: profile.api_key.clone(),
                 auto_start: profile.auto_start,
@@ -2515,6 +2690,15 @@ fn render_config_toml(profile: &Profile) -> String {
     }
 
     let mut out = String::from("# clauth profile configuration\n\n");
+
+    out.push_str("# Which CLI this profile's credentials belong to: \"claude\" (default) or\n");
+    out.push_str("# \"codex\". Set at profile creation — never edit by hand; a profile does\n");
+    out.push_str("# not convert across harnesses.\n");
+    match profile.harness {
+        Harness::Codex => out.push_str("harness = \"codex\"\n"),
+        Harness::Claude => out.push_str("# harness = \"claude\"\n"),
+    }
+    out.push('\n');
 
     out.push_str("# Base URL for an API-endpoint profile. Leave commented for an OAuth\n");
     out.push_str("# (Pro / Max / Team / Enterprise) profile.\n");

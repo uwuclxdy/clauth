@@ -62,6 +62,7 @@ fn cell_is_always_exactly_width() {
 
 fn cue_profile(status: Option<FetchStatus>) -> Profile {
     Profile {
+        harness: crate::profile::Harness::Claude,
         name: "p".into(),
         base_url: None,
         api_key: None,
@@ -622,4 +623,14 @@ fn relative_age_switches_to_a_local_stamp_at_thirty_days() {
             "the arm rendered UTC digits, not local wall clock: {dated:?}"
         );
     }
+}
+
+// ── Fork-only tests (codex harness) ─────────────────────────────────────────
+
+// CDX-1 T8: the kind column is the harness tag for codex profiles.
+#[test]
+fn account_type_label_tags_codex_profiles() {
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("cdx"));
+    p.harness = crate::profile::Harness::Codex;
+    assert_eq!(account_type_label(&p), "Codex");
 }

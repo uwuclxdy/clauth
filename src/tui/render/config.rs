@@ -24,7 +24,9 @@ const KEY_W: usize = 11;
 const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    // +1 for the trailing `+ new` picker row.
+    // +1 for the trailing `+ new` picker row. `master_detail` keeps upstream's
+    // desktop selector|detail split (`selector_width` + `Constraint::Min(20)`)
+    // and adds the fork's narrow-terminal (phone) stacking on top.
     let items = app.config().profiles.len() + 1;
     let (selector, settings) = master_detail(area, items);
 
@@ -117,6 +119,10 @@ struct Snap {
     captured_live: bool,
     /// Recognised third-party provider display name, if any.
     provider: Option<&'static str>,
+    /// The account email this profile's login last authenticated as (identity
+    /// anchor's email half) — shows WHICH account the stored credentials
+    /// belong to, so a wrong-account capture is visible at a glance.
+    account_email: Option<String>,
     /// This account's login IS the Alibaba console login
     /// ([`crate::profile::Profile::console_login_target`]). Read here so the
     /// `Login` row's hint and label describe the flow ⏎ actually runs: the
@@ -189,6 +195,7 @@ impl Snap {
             captured: false,
             captured_live: false,
             provider: None,
+            account_email: None,
             console_login: false,
             session_token: None,
             rolling_token: false,
@@ -274,6 +281,12 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 captured_live: false,
                 provider: p.provider.map(|p| p.display_name()),
                 console_login: p.console_login_target().is_some(),
+                // One tiny cached-file read, cursor profile only — login/daemon
+                // keep it current; the OS page cache makes the per-frame cost nil.
+                account_email: crate::profile_cache::load_profile_cache::<String>(
+                    &p.name,
+                    crate::profile_cache::ACCOUNT_EMAIL_CACHE_FILE,
+                ),
                 // ONE sidecar read per frame feeds both facts. The status is
                 // derived from the same classification rather than a second
                 // parse: Misfilled ⇔ `NotLongLived` (both mean "refresh token
@@ -457,6 +470,21 @@ fn draw_settings_rows(
         ]));
     }
 
+    // Account row — the email the stored OAuth login belongs to (the identity
+    // anchor's readable half), so which-account-is-this never needs forensics.
+    // OAuth-only; absent until a login or the /profile fetch seeds it.
+    let account_email = if is_api {
+        None
+    } else {
+        snap.account_email.as_deref()
+    };
+    if let Some(email) = account_email {
+        lines.push(Line::from(vec![
+            Span::styled(format!("account{}", " ".repeat(KEY_W - 7)), theme::label()),
+            Span::styled(email.to_string(), theme::dim()),
+        ]));
+    }
+
     if let Some(status) = &snap.session_token {
         lines.extend(session_token_lines(
             status,
@@ -470,8 +498,9 @@ fn draw_settings_rows(
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
     // cursor placement after rendering. The header block above is variable
-    // (optional status + type + optional provider + optional session + blank),
-    // so the row loop's base index is simply what has been pushed so far.
+    // (optional status + type + optional provider + optional account +
+    // optional session + blank), so the row loop's base index is simply what
+    // has been pushed so far.
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = lines.len() as u16;
 

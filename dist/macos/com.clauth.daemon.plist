@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  clauth daemon LaunchAgent (template).
+  Install with dist/macos/daemon-install.sh, which substitutes the
+  __CLAUTH_BIN__ / __LOG__ / __PATH__ placeholders and loads it. Runs
+  `clauth daemon` at login so auto-switch + status.json work with no TUI open.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.clauth.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLAUTH_BIN__</string>
+        <string>daemon</string>
+        <string>--standby</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart only on a crash (non-zero exit). A clean exit (e.g. another
+         instance already holds the lock) must NOT trigger a restart loop. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>

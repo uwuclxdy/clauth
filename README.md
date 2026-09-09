@@ -5,12 +5,12 @@
 <h1 align="center">Claude Code multi-account manager & MCP Plugin</h1>
 
 <p align="center">
-  <a href="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml"><img src="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg" alt="Release build status" /></a>
-  <a href="https://crates.io/crates/clauth"><img src="https://shields.uwuclxdy.dev/github/v/release/uwuclxdy/clauth?sort=semver&logo=rust&label=version&color=orange" alt="latest version" /></a>
-  <a href="https://github.com/uwuclxdy/clauth/releases"><img src="https://shields.uwuclxdy.dev/github/downloads/uwuclxdy/clauth/total?label=downloads&color=blue" alt="GitHub release downloads" /></a>
-  <img src="https://shields.uwuclxdy.dev/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-2b90d9" alt="Linux, macOS, Windows" />
-  <a href="LICENSE"><img src="https://shields.uwuclxdy.dev/badge/license-MIT-green" alt="MIT license" /></a>
+  <a href="https://github.com/xingfanxia/clauth/actions/workflows/ci.yml"><img src="https://github.com/xingfanxia/clauth/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI status" /></a>
+  <img src="https://img.shields.io/badge/platform-macOS-2b90d9" alt="macOS" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license" /></a>
 </p>
+
+<p align="center"><em>macOS-focused fork — real Keychain account switching, browser-OAuth login, and a headless auto-switch daemon + <code>status.json</code> feed for a menu-bar app. Forked from the upstream <code>clauth</code> TUI (see the <code>upstream</code> git remote and LICENSE).</em></p>
 
 <p align="center">
   <a href="#features">Features</a> ·
@@ -29,6 +29,27 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 ![clauth TUI demo: switching Claude Code accounts with live usage bars](media/demo.gif)
 
+### The signature move: hot-swap a login under a live session
+
+On macOS this fork's headline trick rests on one non-obvious fact: a running
+`claude` re-reads its login from **one macOS Keychain item** (`Claude Code-credentials`)
+on *every request*. So rewriting that one item hot-swaps the active account
+underneath a live session — no restart, no re-login. The `clauth daemon` does it
+automatically when the active account's 5-hour window fills:
+
+<p align="center">
+  <img src="media/hot-swap.gif" width="640" alt="hot-swap animation — the daemon rewrites one Keychain item at 95%, the next request picks up the new account" />
+</p>
+
+<p align="center">
+  <img src="media/infographic-hotswap.jpg" width="640" alt="how the macOS Keychain hot-swap works" />
+</p>
+
+Pair it with **[ccsbar](https://github.com/xingfanxia/ccsbar)** (Claude Code
+Switcher Bar), the native menu-bar companion that reads this daemon's
+`status.json` feed and makes the next switch visible before it fires. Full
+write-up: [I Taught My Claude Accounts to Rotate Themselves](https://blog.ax0x.ai/hot-swapping-claude-logins).
+
 > Font is kinda off on the recording, I promise it looks better than this.
 
 ## Features
@@ -43,24 +64,45 @@ Most account tools do one half. clauth pairs instant **switching between multipl
 
 Full reference: **[the wiki](https://github.com/uwuclxdy/clauth/wiki)**.
 
+### Fork additions
+
+Everything above is upstream clauth. This fork ([`xingfanxia/clauth`](https://github.com/xingfanxia/clauth)) adds, on macOS:
+
+- **Codex accounts.** `clauth login <profile> --codex` captures the live `~/.codex/auth.json` (OpenAI Codex CLI) into a codex profile, `--codex --browser` mints a fresh codex login through codex's own PKCE flow, and `--new` refuses to touch an existing profile. `clauth <profile>` switches codex accounts with the same verb, `clauth start <codex-profile>` runs `codex` in that profile's isolated `CODEX_HOME`, and `clauth fallback add <codex-profile>` builds a codex auto-switch chain independent of the claude one. Design notes: `docs/codex-support/`.
+- **Injection proxy.** `clauth proxy [--port N]` is an opt-in loopback proxy for codex (`clauth proxy --print-config` prints the provider block to paste): it swaps in the selected account's identity, forwards to `chatgpt.com`, and on a 429 rotates to the next account and replays before codex sees a byte.
+- **`clauth doctor`.** A read-only health check of the daemon and the macOS wiring: `status.json` freshness and schema, the daemon lock, the control socket, the LaunchAgent, the binary's code signature, the Keychain write grant, the codex login and the proxy.
+- **Daemon control socket.** `~/.clauth/clauthd.sock` takes newline-delimited JSON, one command per connection: `snapshot`, `switch`, `refresh`, `fallback_add`, `fallback_remove`, `fallback_move`, `set_threshold`, `set_last_resort`, `set_member_weekly` (`null` clears), `set_check_weekly`, `set_check_scoped`, `set_wrap_off`, `set_weekly_threshold`, `rename`. Every command only enqueues, so `ok` means accepted; `status.json` shows it land.
+- **`tokens.json` feed.** Beside `status.json` the daemon publishes `~/.clauth/tokens.json`: machine-wide token counts and API-equivalent cost across every account, for the menu bar. No token values, no credentials.
+- **Fork-only `status.json` fields.** `harness`, `account_email`, the codex fields, the daemon's next-move `forecast`, `burn_aware` and the rest of the additive set are specified in [docs/ccsbar/DESIGN.md](docs/ccsbar/DESIGN.md), the contract the menu-bar clients ([ccsbar](https://github.com/xingfanxia/ccsbar), Pulse) read.
+- **No self-update.** The upstream updater is compiled out (`FORK_BUILD` in `src/update.rs`), so the signed self-updates above do not apply here: rebuild from source to upgrade. See [Install](#install).
+
 ## How it works
 
 Claude Code stores its session in `~/.claude/.credentials.json` (OAuth tokens) and the `env` block of `~/.claude/settings.json` (base URL, API key). clauth keeps a per-profile snapshot of both. A switch swaps those two in place and leaves the rest of `~/.claude/` untouched. `clauth start` takes a different route: it launches `claude` against a temporary `~/.claude` mirror, so several accounts run at once.
 
 ## Install
 
-Linux, macOS, Windows (Git Bash / MSYS2).
+This fork targets **macOS** (the Keychain switching, browser-OAuth login, and daemon are macOS features). It ships **no prebuilt release binaries** and is **not** published to crates.io under this name, so build it from source. Do **not** run `cargo install clauth`: that pulls the upstream crate without any of the fork's features.
 
 ```bash
-cargo install clauth
+git clone https://github.com/xingfanxia/clauth
+cd clauth
+./install.sh          # cargo install --path . --locked  → ~/.cargo/bin/clauth
 ```
+
+Or build without installing:
 
 ```bash
-# no Rust toolchain needed; --nocargo forces a binary download
-curl -fsSL https://raw.githubusercontent.com/uwuclxdy/clauth/mommy/install.sh | bash
+cargo build --release   # binary at ./target/release/clauth
 ```
 
-Binary installs update themselves in the background, checksum and signature verified before anything is replaced; `CLAUTH_NO_UPDATE=1` turns that off. Cargo installs upgrade with `cargo install clauth`. On first launch clauth offers to install shell completions, asking before it touches your shell rc. More: [Install](https://github.com/uwuclxdy/clauth/wiki/Install).
+The macOS auto-switch daemon installs as a login LaunchAgent:
+
+```bash
+dist/macos/daemon-install.sh
+```
+
+This fork's binary does **not** self-update: it has no release pipeline, and the upstream self-updater is compiled out so it can never replace the fork with an upstream build. Rebuild from source to upgrade; details in [SECURITY.md](SECURITY.md). On first launch clauth offers to install shell completions, asking before it touches your shell rc. More: [Install](https://github.com/uwuclxdy/clauth/wiki/Install).
 
 ## Quickstart
 
@@ -121,7 +163,7 @@ The active profile shows in orange. Usage bars are cached locally, so they stay 
 
 ## Claude Code plugin
 
-clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is nothing to add by hand. `/plugin marketplace add uwuclxdy/clauth` then `/plugin install clauth@clauth` works too; it registers the same plugin against this repo instead, and clauth re-points it at the local tree the next time it runs. Either way the plugin's tools are `clauth mcp`, so the binary has to be on your `PATH`.
+clauth ships a plugin that exposes your profiles to a live Claude Code session via MCP. Install it from the TUI: Plugin tab, `plugin` row, <kbd>f</kbd>, confirm. That drives Claude Code's own installer against a plugin tree clauth materializes locally, so there is nothing to add by hand. `/plugin marketplace add xingfanxia/clauth` then `/plugin install clauth@clauth` works too; it registers the same plugin against this repo instead, and clauth re-points it at the local tree the next time it runs. Either way the plugin's tools are `clauth mcp`, so the binary has to be on your `PATH`.
 
 A registration that breaks repairs itself: `clauth mcp` heals one at startup, so does the daemon's tick, and `clauth start` heals one before `claude` launches. That last one covers what a hook cannot, since a marketplace too broken to load means the plugin never loads and its hooks never fire.
 
