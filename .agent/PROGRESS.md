@@ -2999,3 +2999,46 @@ Post-deploy verification, all read-only:
 
 ccsbar and Pulse rebuilt and installed against it (`/Applications/ccsbar.app`,
 `/Applications/Pulse.app` 1.0.9, its auto-update preference still 0).
+
+### UPS-17 client follow-through (2026-09-09)
+
+Both GUI clients caught up and reinstalled; neither needed a daemon change.
+
+**Pulse `a26b229`** — it had been emitting `clauth feed <p> on|off` ever since
+the #59 review renamed that verb to `rolling-token` / `static-token`, so its
+rolling-token switch exited 2 and the account never armed. It survived a whole
+sync with a green suite because a test asserted the literal dead argv: a test
+that pins what the code emits, without ever asking whether anything accepts it,
+can only confirm the bug. Found by auditing the deployed daemon. Pulse now
+probes every verb it can emit against the installed `clauth <verb> --help`.
+**Any client of this CLI needs that gate** — a rename here is silent on the
+other side of the socket.
+
+**ccsbar `cc8ee91`** — the menu-bar label is the whole fleet now, one brand
+glyph and one pool figure per harness, where the figure is the mean over
+countable accounts of the **weekly** window. It was `max(5h, 7d)`, which in
+practice meant the 5h one, and AX watched the label swing 95 → 5 over a lunch
+break. The week is also the only window codex publishes, so both harnesses read
+on one axis. Four panel toggles: active-account-instead-of-pool,
+remaining-instead-of-used, bars, and show-disarmed-mark. Panel type and geometry
+scaled up; the whole label is composited into one `NSImage` because
+`MenuBarExtra` drops sibling views.
+
+**Open, not started — codex auto-switch is hard to arm and silent about it.**
+AX's words: 「codex auto switch is kinda not straightforward」. Upstream has not
+solved this — `upstream/mommy` carries no codex code at all, issue #45 is open
+with the maintainer declining it, and `docs/codex-plan.md` is a spec handed to
+us. So it is ours. Three concrete items, in the order they would pay off:
+
+1. `snapshot_codex_chain` (`src/fallback.rs:1729`) returns `None` unless the
+   active codex profile is already a chain member, and nothing anywhere says
+   so — a codex profile outside the chain gets no `fallback` block at all
+   (`src/daemon/status_json.rs`, the `position()?` early-return), so `armed` is
+   absent rather than `false`. `doctor`'s `check_codex` has no chain check.
+2. **The proxy already auto-arms and the daemon does not.** `pool_snapshot`
+   (`src/proxy/mod.rs`) falls back to every codex profile with a stored login
+   when the chain is empty; the daemon walk refuses instead. Teaching the walk
+   the proxy's rule would delete the manual chain setup outright.
+3. The TUI cannot edit the codex chain — its candidate picker filters codex
+   profiles out (`src/tui/app.rs`), logged as deliberate debt. CLI or socket
+   only, and `wiki/Auto-Switch.md` never says the word codex.
