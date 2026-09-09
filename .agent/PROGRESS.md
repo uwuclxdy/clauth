@@ -2970,3 +2970,32 @@ completion scripts.
 `src/tui/render/footer.rs:317`, byte-identical to upstream's own code, where
 this machine's clippy 1.96 is stricter than upstream's CI (the same red UPS-15
 recorded and declined to fix).
+
+### UPS-17 deployed (2026-09-09)
+
+`~/.cargo/bin/clauth` swapped to **0.15.1** on a fresh inode (rm + cp — a
+same-inode overwrite gets the running LaunchAgent SIGKILLed), both LaunchAgents
+reloaded, daemon and proxy up. Rollback binary at
+`scratchpad/ups/clauth-0.13.1-rollback`, pre-swap `profiles.toml` beside it.
+
+Post-deploy verification, all read-only:
+
+- `status.json` regenerates on schema 1, `clauth_version` 0.15.1, and carries
+  every fork key the two GUI clients read — `forecast`, `burn_aware`,
+  `weekly_switch_threshold`, `last_error`, `last_switch`,
+  `active_codex_profile`, `codex_fallback_chain`, plus per-profile `harness`,
+  `account_email`, `codex_snapshot_at`, `codex_rate_limit_reached`,
+  `codex_reset_credits` — with upstream's `rolling_token` and
+  `auto_start_queue` alongside.
+- **The `session_feed` alias did its job**: the three claude profiles still
+  carry `session_feed = true` on disk, and `ax-main` publishes
+  `rolling_token: true` — i.e. its sidecar still holds a rolling bearer and the
+  split stayed engaged across the upgrade. The key normalizes to
+  `rolling_token` on the next config rewrite.
+- `auth_broken` is byte-identical before and after (`ax-cl`, `ax-backup` —
+  both already quarantined; the upgrade touched no login).
+- Codex polling live again on the new build: `ax-codex-xfx` 85% weekly with 1
+  banked reset, `ax-codex-dev0` at 100%.
+
+ccsbar and Pulse rebuilt and installed against it (`/Applications/ccsbar.app`,
+`/Applications/Pulse.app` 1.0.9, its auto-update preference still 0).
