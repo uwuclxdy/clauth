@@ -56,6 +56,7 @@ fn hybrid_creds() -> crate::profile::ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -147,6 +148,7 @@ fn hybrid_renders_the_activity_and_deadline_of_its_provider_cache() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let name = hybrid.name.clone();
@@ -553,6 +555,7 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("serialize live login"),

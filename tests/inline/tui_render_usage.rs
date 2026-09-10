@@ -218,6 +218,7 @@ fn empty_msg_failed_fetch_is_terminal() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     profile.fetch_status = Some(FetchStatus::Failed);
@@ -234,6 +235,7 @@ fn empty_msg_pending_fetch_loads() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(oauth_empty_msg(&profile), "loading");
@@ -253,6 +255,7 @@ fn empty_msg_disabled_profile_is_terminal() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     profile.disabled = true;
@@ -586,6 +589,7 @@ fn header_lines_plan_falls_back_to_account_tier() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     // No `usage`, no `third_party_usage` → the plan-label fallback is exercised.
@@ -640,6 +644,7 @@ fn header_lines_plan_shows_a_hybrid_oauth_profiles_fetched_tier() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     profile.usage = Some(crate::usage::UsageInfo {
@@ -692,6 +697,7 @@ fn header_lines_plan_dashes_when_no_tier_is_known() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("something_new".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let header = HeaderState {

@@ -931,6 +931,7 @@ fn snap_rolling_token_is_the_sidecar_content_not_the_config_flag() {
             expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
             scopes: Some(scopes.into_iter().map(String::from).collect()),
             subscription_type: plan.map(String::from),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 

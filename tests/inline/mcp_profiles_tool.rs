@@ -346,6 +346,7 @@ fn seed_canceled_account() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("pro".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&profile).expect("save profile");

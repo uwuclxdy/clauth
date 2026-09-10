@@ -35,6 +35,7 @@ fn oauth_profile(name: &str, refresh: &str) -> Profile {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
@@ -109,6 +110,7 @@ fn live_oauth(refresh: Option<&str>) -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -143,6 +145,7 @@ fn live_session_token(access: &str) -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -474,6 +477,7 @@ fn a_rotating_login_is_never_attributed_to_a_sidecar() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     assert_eq!(

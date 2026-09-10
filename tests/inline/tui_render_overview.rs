@@ -860,6 +860,7 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> Profile {
                 expires_at: None,
                 scopes: None,
                 subscription_type: Some(subscription_type.into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
@@ -990,6 +991,7 @@ fn oauth_creds() -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }

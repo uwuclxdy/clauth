@@ -433,6 +433,7 @@ fn oauth_profile(name: &str, refresh: &str) -> crate::profile::Profile {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     profile

@@ -436,6 +436,7 @@ pub(crate) fn rotation_fixture_config(
             expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");

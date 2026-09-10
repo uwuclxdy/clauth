@@ -85,6 +85,7 @@ fn auto_start_queue_view_resolves_slots_from_config_and_anchor() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         p

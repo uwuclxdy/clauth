@@ -50,6 +50,7 @@ fn oauth_profile_disabled(name: &str, disabled: bool) -> crate::profile::Profile
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     p.disabled = disabled;
@@ -5600,6 +5601,7 @@ fn a_disk_pair_that_moved_past_the_spent_token_is_returned_not_quarantined() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save profile");
@@ -5635,6 +5637,7 @@ fn carrying_an_external_rotation_clears_a_stale_quarantine() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save profile");
@@ -9350,6 +9353,7 @@ fn write_live_mirror(access: &str, expires_at: i64) {
             expires_at: Some(expires_at),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(&live, serde_json::to_vec(&creds).expect("serialize mirror"))
@@ -9946,6 +9950,7 @@ fn write_rolling_sidecar(name: &str, exp_in_ms: i64) {
             expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
             scopes: Some(vec!["user:inference".into(), "user:profile".into()]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp rolling sidecar");
@@ -10404,6 +10409,7 @@ fn claude_rolling_tick_relogin_hold_releases_on_a_credential_write() {
                 expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -10447,6 +10453,7 @@ fn claude_rolling_tick_reaches_the_gate_for_a_misfilled_sidecar() {
                 expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),

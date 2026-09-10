@@ -76,6 +76,7 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
@@ -212,6 +213,7 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
@@ -278,6 +280,7 @@ fn profile_without_refresh_token_excluded() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
@@ -373,6 +376,7 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
                 expires_at,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }),
         usage: None,
@@ -898,6 +902,7 @@ mod keychain_mirror_gate {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -995,6 +1000,7 @@ mod adopt_live_rotation {
                 expires_at,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         }
     }
@@ -1664,6 +1670,7 @@ mod adopt_live_rotation {
                     expires_at: Some(future_expiry() + 86_400_000),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             })
             .unwrap(),
@@ -2036,6 +2043,7 @@ fn save_disk_profile(name: &str, refresh: &str, expires_at: Option<i64>) {
             expires_at,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&p).expect("save disk profile");
@@ -2702,6 +2710,7 @@ fn gate_session_token_ready_even_when_auth_broken() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -2743,6 +2752,7 @@ fn gate_refuses_a_mint_inside_ccs_refresh_window() {
                     expires_at: Some(crate::usage::now_ms() as i64 + exp_in_ms),
                     scopes: None,
                     subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
                 }),
             })
             .expect("ser"),
@@ -3433,6 +3443,7 @@ fn rotate_names_the_api_key_command_for_a_keyless_third_party_profile() {
             expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");
@@ -3493,6 +3504,7 @@ fn rotate_names_the_split_state_for_a_keyed_third_party_profile() {
             expires_at: Some(crate::usage::now_ms() as i64 + 86_400_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");
@@ -3657,6 +3669,7 @@ fn rolling_gate_fresh_sidecar_ready_without_refresh() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3745,6 +3758,7 @@ fn rolling_gate_stale_sidecar_feeds_from_comfortable_chain_without_spend() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3797,6 +3811,7 @@ fn rolling_gate_stale_sidecar_stale_chain_refreshes_and_restamps() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3878,6 +3893,7 @@ fn rolling_gate_dead_chain_restores_static_mint() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -3912,6 +3928,7 @@ fn rolling_gate_dead_chain_without_backup_stays_broken() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -4064,6 +4081,7 @@ fn rotation_hook_never_overwrites_a_misfilled_sidecar() {
                 expires_at: Some(future_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4111,6 +4129,7 @@ fn rolling_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed preserves mint");
@@ -4124,6 +4143,7 @@ fn rolling_gate_heals_a_misfilled_sidecar_when_a_backup_exists() {
                 expires_at: Some(future_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4217,6 +4237,7 @@ fn rolling_gate_misfill_without_backup_keeps_the_disengaged_vanilla_posture() {
                 expires_at: Some(future_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4277,6 +4298,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
                 expires_at: Some(beyond_horizon_expiry()),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("ser"),
@@ -4298,6 +4320,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
                 "user:profile".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4316,6 +4339,7 @@ fn restamp_due_fires_inside_the_horizon_or_on_a_misfill() {
                 "user:profile".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4342,6 +4366,7 @@ fn restamp_restamps_a_dying_bearer_the_switch_gate_calls_fresh() {
             expires_at: Some(future_expiry()), // +1h: dying,  but "fresh" to the switch gate
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -4392,6 +4417,7 @@ fn restamp_rotates_when_the_chain_is_inside_the_horizon_too() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -4441,6 +4467,7 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -4457,6 +4484,7 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
             expires_at: Some(past_expiry()),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4505,6 +4533,7 @@ fn restamp_never_parks_behind_a_held_rotation_lock() {
                 "user:profile".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -4577,6 +4606,7 @@ fn restamp_on_a_misfill_with_no_live_backup_never_takes_the_vanilla_gate() {
             expires_at: Some(now_ms() as i64 + 3_600_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -4596,6 +4626,7 @@ fn restamp_on_a_misfill_with_no_live_backup_never_takes_the_vanilla_gate() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -4719,6 +4750,7 @@ fn rotated_tokens_do_not_resurrect_a_deleted_profile() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save profile");

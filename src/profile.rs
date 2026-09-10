@@ -281,6 +281,37 @@ pub(crate) struct OAuthToken {
     pub(crate) scopes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) subscription_type: Option<String>,
+    /// Every key of the login block this struct does not name, kept verbatim on
+    /// both boundaries of every store rewrite. Claude Code writes fields of its
+    /// own into `claudeAiOauth` (`rateLimitTier`, `refreshTokenExpiresAt`,
+    /// `clientId`) and re-emits them only on a token save, so a typed model
+    /// that silently dropped them made every clauth write of the store sticky
+    /// (issue #75): the parse lost them before any merge could see them, and
+    /// the serialize never emitted them. This is the login block's share of
+    /// [`preserve_extra_blocks`]'s rule — the store's own value is the record,
+    /// the model is a patch onto it — and it fixes the parse boundary too,
+    /// which no write-side merge can reach: a first capture has no disk bytes
+    /// to merge from.
+    #[serde(flatten, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub(crate) extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl OAuthToken {
+    /// `..Self::default_extra()` — the struct-update tail for every constructor
+    /// minting a login from clauth's own flow, where no outside writer has put
+    /// anything into the block yet. `Default` is deliberately not derived: the
+    /// named fields carry no defaults (`access_token` has none), so this named
+    /// constructor is the one spelling of "starts empty".
+    pub(crate) fn default_extra() -> Self {
+        Self {
+            access_token: String::new(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            extra: serde_json::Map::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2028,9 +2059,178 @@ pub(crate) fn load_app_state() -> Result<AppState> {
 pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     with_state_lock(|_held| {
         mkdir_700(&clauth_dir()?)?;
-        atomic_write_600(&app_state_path()?, toml::to_string_pretty(state)?)
+        let path = app_state_path()?;
+        let rendered = toml::to_string_pretty(state).context("failed to render profiles.toml")?;
+        atomic_write_600(&path, preserve_unmodelled_state_keys(rendered, &path))
             .context("failed to write profiles.toml")
     })
+}
+
+/// Re-attach onto a rendered `profiles.toml` every top-level key the on-disk
+/// file holds that `AppState` does not model — the `profiles.toml` half of the
+/// rule `serialize_credentials_preserving_extra` states for the credential
+/// store: a rewrite over itself must keep what the model cannot hold.
+///
+/// `AppState` is a closed struct, so a plain re-serialize deletes unknown keys
+/// on every save, and the writers that put them there are exactly the ones
+/// clauth must not overrule: a NEWER clauth whose keys this binary has not
+/// learned (an older install against a newer config silently erases them —
+/// the `auto_start_queue` regression, issue #75) and an operator's hand-edit.
+///
+/// Two exclusions, each closing the other's hole. "Modelled" is decided by
+/// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
+/// modelled key the new state just moved to a default (absent from the render,
+/// its `skip_serializing_if` omitted it) cannot come back from disk with its
+/// stale value — resurrection. But that round-trip erases a modelled key whose
+/// ON-DISK value is itself the skipped default (`show_pace = false` written
+/// by hand), so the second exclusion drops any key the RENDER already names —
+/// without it, a save that moves such a key off default emits it twice, and a
+/// duplicate top-level key is a hard parse error bricking the file. A carried
+/// key is one the model's round-trip never saw AND the render does not write.
+fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return rendered; // nothing on disk to preserve (first save)
+    };
+    let Ok(disk) = raw.parse::<toml::Table>() else {
+        return rendered; // unparseable: not ours to resurrect keys from
+    };
+    let Ok(modelled) = modelled_state_keys(&raw) else {
+        // The state did not parse, so which keys are modelled is UNKNOWN, and
+        // carrying everything would duplicate modelled keys already in the
+        // render — a duplicate top-level key is a hard parse error, bricking
+        // the file this save is supposed to keep loadable. Carry nothing.
+        return rendered;
+    };
+    // A key the render itself writes must never be carried beside its copy.
+    let Ok(rendered_keys) = rendered.parse::<toml::Table>() else {
+        return rendered; // a render that does not parse: nothing safe to merge
+    };
+    let carried: Vec<(String, toml::Value)> = disk
+        .into_iter()
+        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .collect();
+    if carried.is_empty() {
+        return rendered; // the common case: nothing unmodelled on disk
+    }
+    merge_carried_keys(rendered, &carried)
+}
+
+/// Every top-level `profiles.toml` key `AppState` recognizes, derived by
+/// parsing `raw` and re-serializing it: the keys the type emits are exactly the
+/// keys it holds. Serde ignores unmodelled keys on the parse, so their absence
+/// from the re-render is what marks them; this needs no maintained key array
+/// and cannot drift when `AppState` gains a field (a new field's key appears in
+/// the round-trip output on its own). Err on a file that does not parse as
+/// `AppState` — the caller must refuse to carry rather than guess.
+fn modelled_state_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
+    let state = toml::from_str::<AppState>(raw).map_err(|_| ())?;
+    toml::to_string_pretty(&state)
+        .ok()
+        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
+        .map(|t| t.keys().cloned().collect())
+        .ok_or(())
+}
+
+/// Marker comment written above keys `AppState` does not model, so a hand-editor
+/// sees they were carried rather than authored by this save.
+const PRESERVED_KEYS_MARKER: &str =
+    "# keys preserved from the previous file; not modelled by this clauth:";
+
+/// Splice `carried` top-level keys into a rendered TOML document, preserving
+/// table-header scoping — the shared core of the `profiles.toml` and
+/// `config.toml` carries. Appending everything as trailing text (the shape this
+/// replaced) lands a scalar AFTER the render's last `[table]` header, i.e.
+/// inside that table: into `[env]` it is a type error that bricks
+/// `load_profile`, into `[herdr]` it is silently dropped on the next load.
+///
+/// So scalars insert as top-level lines BEFORE the first table header of the
+/// render, tables append at the end (a `[key]` block is top-level wherever it
+/// sits, and its own sub-scope is its own), and within the carried set a
+/// table-valued key is emitted before any carried scalar follows it — the same
+/// trap one level down, from `BTreeMap`'s ordering of the carry itself.
+/// An unrenderable value drops rather than corrupting the document.
+/// A value that renders as one or more `[key]`-headed blocks: a table, or an
+/// array of tables (`[[key]]`). `is_table()` alone misses the array shape,
+/// which is a `Value::Array` whose elements are all tables.
+fn is_table_shaped(value: &toml::Value) -> bool {
+    value.is_table()
+        || value
+            .as_array()
+            .is_some_and(|a| !a.is_empty() && a.iter().all(|v| v.is_table()))
+}
+
+pub(crate) fn merge_carried_keys(rendered: String, carried: &[(String, toml::Value)]) -> String {
+    let lines: Vec<&str> = rendered.lines().collect();
+    // First line that opens a table header — `render_config_toml` and the state
+    // render both emit top-level scalars before any table, so this is the
+    // insertion point for carried scalars.
+    let first_table = lines.iter().position(|l| l.trim_start().starts_with('['));
+    let scalar_cutoff = first_table.unwrap_or(lines.len());
+
+    let mut out = String::with_capacity(rendered.len() + 64);
+    let mut head: Vec<String> = Vec::new();
+    let mut tail: Vec<String> = Vec::new();
+    for (key, value) in carried {
+        let entry: toml::Table = [(key.clone(), value.clone())].into_iter().collect();
+        let Ok(block) = toml::to_string(&entry) else {
+            continue; // unrenderable: drop rather than corrupt
+        };
+        let block = block.trim_end().to_string();
+        // Table-shaped values (a table, or an array of tables — `[[key]]`)
+        // go to the tail; everything else is a top-level scalar for the head.
+        // An array of tables landing in `head` would swallow a later scalar
+        // into its last element, the same scoping trap one level down.
+        if is_table_shaped(value) {
+            tail.push(block);
+        } else {
+            head.push(block);
+        }
+    }
+    if head.is_empty() && tail.is_empty() {
+        return rendered; // nothing renderable; the render alone is the answer
+    }
+    // Scalars: before the first table header, with the marker naming them.
+    if !head.is_empty() {
+        head.insert(0, PRESERVED_KEYS_MARKER.to_string());
+    }
+    // Tables carry the marker only when no scalar block introduced one above —
+    // a marker already naming this save's carried keys, and the tail's blocks
+    // are no farther from it than the render's own trailing sections are.
+    if !tail.is_empty() && head.is_empty() {
+        tail.insert(0, PRESERVED_KEYS_MARKER.to_string());
+    }
+    for (i, line) in lines.iter().enumerate() {
+        if i == scalar_cutoff && !head.is_empty() {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str(&head.join("\n"));
+            out.push('\n');
+            if !line.trim().is_empty() {
+                out.push('\n');
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Cutoff past the last line (render had no table header): the loop above
+    // never reached the insert point, so the head lands after everything.
+    if scalar_cutoff >= lines.len() && !head.is_empty() {
+        if !out.is_empty() && !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&head.join("\n"));
+        out.push('\n');
+    }
+    if !tail.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(&tail.join("\n"));
+        out.push('\n');
+    }
+    out
 }
 
 /// Set or clear `name`'s persisted `auth_broken` flag against the CURRENT
@@ -2523,6 +2723,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
     if needs_rewrite {
         let _ = with_state_lock(|_held| {
             // config.toml can carry `api_key` — same 0600 rule as save_profile.
+            let rendered = preserving_config_render(&rendered, config_path);
             let _ = atomic_write_600(config_path, &rendered);
             Ok(())
         });
@@ -2602,12 +2803,70 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
 
         atomic_write_600(
             &profile_config_path(&profile.name)?,
-            render_config_toml(profile),
+            preserving_config_render(
+                &render_config_toml(profile),
+                &profile_config_path(&profile.name)?,
+            ),
         )
         .context("failed to write config.toml")?;
 
         Ok(())
     })
+}
+
+/// `render_config_toml`'s output with every top-level key the config already
+/// holds that `ProfileConfig` does not model re-attached under a marker — the
+/// `config.toml` half of the same rule `serialize_credentials_preserving_extra`
+/// states for the credential store. The writers that put such keys there are
+/// the ones clauth must not overrule: a newer clauth (whose `auto_start`/
+/// `fallback_threshold` ancestors were themselves once new keys) and an
+/// operator's hand-edit; deleting them on every config mutation (issue #75's
+/// `clauth disable` erasure) loses data no other writer holds.
+///
+/// "Modelled" is decided by round-tripping the ON-DISK file through
+/// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, and for
+/// the same reason: a modelled key the profile just moved to a default is
+/// absent from the render, and must not come back from disk. `load_profile`'s
+/// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
+/// them does not add write thrash.
+pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {
+    let Ok(raw) = std::fs::read_to_string(config_path) else {
+        return rendered.to_string(); // no file yet: nothing to preserve
+    };
+    let Ok(disk) = raw.parse::<toml::Table>() else {
+        return rendered.to_string(); // unparseable: not ours to resurrect keys from
+    };
+    let Ok(modelled) = modelled_config_keys(&raw) else {
+        // Same refusal as the profiles.toml carry: an unparseable config
+        // cannot be classified, and carrying everything would duplicate the
+        // modelled keys already in the render — a duplicate top-level key is
+        // a hard parse error on the next load.
+        return rendered.to_string();
+    };
+    // A key the render itself writes must never be carried beside its copy.
+    let Ok(rendered_keys) = rendered.parse::<toml::Table>() else {
+        return rendered.to_string(); // a render that does not parse: merge nothing
+    };
+    let carried: Vec<(String, toml::Value)> = disk
+        .into_iter()
+        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .collect();
+    if carried.is_empty() {
+        return rendered.to_string(); // the common case
+    }
+    merge_carried_keys(rendered.to_string(), &carried)
+}
+
+/// Every top-level `config.toml` key `ProfileConfig` recognizes, derived the
+/// same way `modelled_state_keys` derives its set: parse, re-render, take the
+/// keys. Err on a file that does not parse — the caller refuses to carry.
+fn modelled_config_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
+    let config = toml::from_str::<ProfileConfig>(raw).map_err(|_| ())?;
+    toml::to_string(&config)
+        .ok()
+        .and_then(|rendered| rendered.parse::<toml::Table>().ok())
+        .map(|t| t.keys().cloned().collect())
+        .ok_or(())
 }
 
 /// Write rotated credentials to a sidecar BEFORE `save_profile`. Single-use

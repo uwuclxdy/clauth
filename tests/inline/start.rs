@@ -813,6 +813,7 @@ fn a_start_after_a_switch_off_does_not_pair_the_departed_key_with_the_started_en
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let target = Profile::new(

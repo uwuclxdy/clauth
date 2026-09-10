@@ -30,6 +30,7 @@ fn warming(name: &str) -> Profile {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     p

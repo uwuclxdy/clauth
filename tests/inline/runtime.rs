@@ -5631,6 +5631,7 @@ fn member(name: &str) -> Profile {
             expires_at: Some(1_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     profile
@@ -6008,6 +6009,7 @@ fn a_swap_adopts_a_crash_staged_sidecar_before_moving_the_store_mtime() {
                 expires_at: Some(9_000),
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         };
         crate::profile::stage_rotated_credentials(

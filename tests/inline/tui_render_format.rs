@@ -182,6 +182,7 @@ fn account_type_label_dashes_an_unfetched_plan() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("something_new".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_type_label(&unclassified), NO_DATA);

@@ -401,6 +401,7 @@ fn login_summary_names_the_plan_a_free_login_stored() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("free".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     assert!(
@@ -423,6 +424,7 @@ fn login_summary_defers_when_the_token_claims_no_plan() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let summary = super::login_summary(&creds);

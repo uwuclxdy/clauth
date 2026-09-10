@@ -35,6 +35,7 @@ fn sample_creds(access: &str, refresh: &str) -> ClaudeCredentials {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }

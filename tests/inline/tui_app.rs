@@ -754,6 +754,7 @@ fn config_rows_login_and_delete_creds_visibility() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 
@@ -849,6 +850,7 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
 
@@ -985,6 +987,7 @@ fn config_rows_login_tracks_api_mode_when_draft_types_a_base_url() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
 
@@ -1562,6 +1565,7 @@ fn split_creds(access: &str, refresh: Option<&str>) -> crate::profile::ClaudeCre
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -1926,6 +1930,7 @@ fn clear_session_token_on_a_rolling_profile_disarms_and_takes_the_backup() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -2927,6 +2932,7 @@ fn login_creds(refresh: &str) -> crate::profile::ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -2951,6 +2957,7 @@ fn creds_ra(refresh: &str, access: &str) -> crate::profile::ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -4038,6 +4045,7 @@ fn divergence_poll_ignores_a_stale_clauth_symlink() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let work_dir =
@@ -4093,6 +4101,7 @@ fn divergence_poll_ignores_a_macos_regular_file_mirror() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let work_dir =
@@ -5762,6 +5771,7 @@ fn focused_account_types_the_hybrid_on_its_credential() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let api_key_only = Profile::new(
@@ -6465,6 +6475,7 @@ fn fallback_last_resort_toggle_persists_and_refreshes_tokens() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let mut app = app_with_unlinked_profiles(vec![profile]);
@@ -6709,6 +6720,7 @@ fn plain_live_login(refresh: &str) -> std::path::PathBuf {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
         .expect("serialize live login"),
@@ -7028,6 +7040,7 @@ fn stored_oauth_profile(name: &str, expires_at: i64) -> crate::profile::Profile 
             expires_at: Some(expires_at),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&p).expect("save profile");
@@ -7054,6 +7067,7 @@ fn collect_tokens_carries_the_auth_broken_flag() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let mut flagged = crate::testutil::blank_profile(&crate::profile::ProfileName::from("flagged"));
@@ -8136,6 +8150,7 @@ fn oauth_login(access: &str, refresh: Option<&str>) -> crate::profile::ClaudeCre
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -8829,6 +8844,7 @@ fn duplicate_copies_the_settings_and_leaves_the_login_and_the_radios_behind() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&src).expect("save source");

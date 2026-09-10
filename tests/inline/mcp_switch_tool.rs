@@ -30,6 +30,7 @@ fn seed_active_linked() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&p).expect("save profile");
@@ -96,6 +97,7 @@ fn seed_active_plus_target() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     save_profile(&target).expect("save target");

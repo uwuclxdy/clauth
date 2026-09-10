@@ -1207,6 +1207,7 @@ fn a_delegate_after_a_switch_off_does_not_pair_the_departed_key_with_the_target_
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let target = crate::profile::Profile::new(

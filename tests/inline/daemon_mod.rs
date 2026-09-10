@@ -59,6 +59,7 @@ fn oauth_creds(access: &str) -> ClaudeCredentials {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -357,6 +358,7 @@ fn drain_pending_switch_proceeds_over_a_stale_clauth_symlink() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))
@@ -420,6 +422,7 @@ fn drain_pending_switch_proceeds_over_a_macos_regular_file_mirror() {
             expires_at: Some(future_expiry()),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let alpha_dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alpha"))

@@ -20,6 +20,7 @@ fn oauth(name: &str) -> Profile {
             expires_at: None,
             scopes: None,
             subscription_type: Some("max".to_string()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     p
@@ -805,6 +806,7 @@ fn list_table_stacks_both_dead_credentials_and_dedupes_the_identical_pair() {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     let mut config = AppConfig {

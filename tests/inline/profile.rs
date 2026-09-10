@@ -206,9 +206,12 @@ fn preemptive_rotation_defaults_true_and_an_explicit_off_survives_a_round_trip()
 // `auto_rescue` was the opt-in behind the isolated-transcript rescue, which every
 // isolated run now gets unconditionally. `AppState` carries no
 // `deny_unknown_fields`, so a profiles.toml written while the key existed still
-// loads — the key is ignored rather than refused, and nothing renders it back.
-// The load half is the one that matters: refusing it would lock an operator out
-// of every account on the first launch after an upgrade.
+// loads — the key is ignored rather than refused, and nothing renders it back
+// through the model. A save now CARRIES it like any unmodelled key
+// (`save_app_state_keeps_unknown_keys_the_file_already_holds`): retired here
+// is indistinguishable from future-here, and the file is the record. The load
+// half is the one that matters: refusing it would lock an operator out of
+// every account on the first launch after an upgrade.
 #[test]
 fn a_profiles_toml_carrying_the_removed_auto_rescue_key_still_loads() {
     let state: AppState = toml::from_str("profiles = []\nauto_rescue = true\n")
@@ -221,7 +224,81 @@ fn a_profiles_toml_carrying_the_removed_auto_rescue_key_still_loads() {
     let rendered = toml::to_string_pretty(&state).expect("render state");
     assert!(
         !rendered.contains("auto_rescue"),
-        "the key is dropped on the next save, not carried forward: \n{rendered}"
+        "the model itself never re-emits the key: \n{rendered}"
+    );
+}
+
+// `save_app_state` rewrites profiles.toml over itself, and the file is shared
+// with writers this binary does not model: a newer clauth (the
+// `auto_start_queue` erasure, issue #75) or an operator's hand-edit. The key
+// belongs to whoever put it in the file; a save that only changes a modelled
+// field must keep it.
+#[test]
+fn save_app_state_keeps_unknown_keys_the_file_already_holds() {
+    let _home = HomeSandbox::new();
+
+    let state = AppState {
+        profiles: vec![crate::profile::ProfileName::from("holder")],
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("save clean state");
+
+    let path = app_state_path().expect("app_state_path");
+    let with_unknown = format!(
+        "{}some_unknown_future_key = \"keepme\"\n",
+        std::fs::read_to_string(&path).expect("read state file")
+    );
+    std::fs::write(&path, with_unknown).expect("write state file + unknown key");
+
+    let next = AppState {
+        profiles: vec![
+            crate::profile::ProfileName::from("holder"),
+            crate::profile::ProfileName::from("fixture"),
+        ],
+        ..AppState::default()
+    };
+    save_app_state(&next).expect("save state again");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert!(
+        after.contains("some_unknown_future_key = \"keepme\""),
+        "the unknown key survived the save:\n{after}"
+    );
+    assert!(
+        after.contains("\"fixture\""),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+// A modelled key the new state moved off its on-disk value must take the new
+// value — carrying is for keys the model does not hold, never a stale-copy
+// resurrection of one it does.
+#[test]
+fn save_app_state_does_not_resurrect_a_modelled_key_from_disk() {
+    let _home = HomeSandbox::new();
+
+    save_app_state(&AppState {
+        burn_aware_switching: true,
+        ..AppState::default()
+    })
+    .expect("save with burn_aware on");
+
+    let path = app_state_path().expect("app_state_path");
+    std::fs::write(
+        &path,
+        std::fs::read_to_string(&path).expect("read") + "\nsome_unknown_future_key = \"keepme\"\n",
+    )
+    .expect("append unknown key");
+
+    save_app_state(&AppState::default()).expect("save burn_aware off");
+    let after = std::fs::read_to_string(&path).expect("read after");
+    assert!(
+        !after.contains("burn_aware_switching = true"),
+        "the modelled change is not resurrected from disk:\n{after}"
+    );
+    assert!(
+        after.contains("some_unknown_future_key = \"keepme\""),
+        "the unknown key survives:\n{after}"
     );
 }
 
@@ -502,6 +579,7 @@ fn oauth_credentials() -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -1096,6 +1174,7 @@ fn pair(access: &str, refresh: &str) -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -1437,6 +1516,7 @@ fn scopes_joined_space_joins_preserving_order_and_maps_empty_to_none() {
             expires_at: None,
             scopes,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     assert_eq!(
@@ -2588,6 +2668,142 @@ fn save_profile_preserves_mcp_oauth_across_a_login_refresh() {
     );
 }
 
+/// An OAuth block holding keys `OAuthToken` does not model (`rateLimitTier`,
+/// `refreshTokenExpiresAt`, `clientId` — all written by Claude Code through the
+/// symlinked store) keeps them through a plain load → mutate → save, the exact
+/// shape of every config mutation (`clauth disable`, a TUI toggle): the parse
+/// must carry the subkeys into memory and the save must write them back
+/// (issue #75).
+#[test]
+fn save_profile_preserves_unmodelled_claude_ai_oauth_keys() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("subkey".to_string(), None, None);
+    profile.credentials = Some(pair("login-v1", "refresh-v1"));
+    save_profile(&profile).expect("save v1");
+
+    let name = crate::profile::ProfileName::from("subkey");
+    let cred_path = profile_credentials_path(&name).expect("cred path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    stored["claudeAiOauth"]["rateLimitTier"] = serde_json::json!("default_claude_max_5x");
+    stored["claudeAiOauth"]["refreshTokenExpiresAt"] = serde_json::json!(1_790_000_000_000_i64);
+    stored["claudeAiOauth"]["clientId"] = serde_json::json!("client-abc");
+    std::fs::write(&cred_path, serde_json::to_vec(&stored).unwrap()).expect("write subkeys");
+
+    // The config-mutation shape: load (parse), flip a modelled field, save.
+    let mut loaded = load_profile(&name).expect("load profile");
+    loaded.disabled = true;
+    save_profile(&loaded).expect("save the disable");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read after")).expect("parse");
+    assert_eq!(
+        after["claudeAiOauth"]["accessToken"], "login-v1",
+        "the login is untouched"
+    );
+    assert_eq!(
+        after["claudeAiOauth"]["rateLimitTier"], "default_claude_max_5x",
+        "rateLimitTier survived the rewrite"
+    );
+    assert_eq!(
+        after["claudeAiOauth"]["refreshTokenExpiresAt"], 1_790_000_000_000_i64,
+        "refreshTokenExpiresAt survived the rewrite"
+    );
+    assert_eq!(
+        after["claudeAiOauth"]["clientId"], "client-abc",
+        "clientId survived the rewrite"
+    );
+}
+
+/// A login captured FROM a live file holding unmodelled OAuth subkeys keeps
+/// them: the capture parses the live store into `ClaudeCredentials` and saves
+/// it into a fresh profile store, so the subkeys must survive the parse — the
+/// write-side merge has no disk bytes to merge from on a first capture
+/// (issue #75).
+#[test]
+fn a_captured_login_keeps_the_unmodelled_oauth_keys_it_was_minted_with() {
+    let _home = HomeSandbox::new();
+
+    let login: ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "access-1",
+            "refreshToken": "refresh-1",
+            "expiresAt": 1_789_000_000_000_i64,
+            "scopes": ["user:inference"],
+            "subscriptionType": "team",
+            "rateLimitTier": "default_claude_max_5x",
+            "refreshTokenExpiresAt": 1_790_000_000_000_i64,
+            "clientId": "client-abc"
+        },
+        "mcpOAuth": { "linear": { "accessToken": "mock-linear" } }
+    }))
+    .expect("a live CC store with unmodelled subkeys parses");
+
+    // The capture sink: store the parsed login into a fresh profile.
+    let mut profile = Profile::new("caught".to_string(), None, None);
+    profile.credentials = Some(login);
+    save_profile(&profile).expect("save captured profile");
+
+    let cred_path =
+        profile_credentials_path(&crate::profile::ProfileName::from("caught")).expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    let oauth = &stored["claudeAiOauth"];
+    assert_eq!(
+        oauth["rateLimitTier"], "default_claude_max_5x",
+        "rateLimitTier"
+    );
+    assert_eq!(
+        oauth["refreshTokenExpiresAt"], 1_790_000_000_000_i64,
+        "refreshTokenExpiresAt"
+    );
+    assert_eq!(oauth["clientId"], "client-abc", "clientId");
+}
+
+/// The parse and the serialize are the two boundaries that can drop an
+/// unmodelled key; this pins the round trip through the typed model.
+#[test]
+fn a_round_trip_through_the_typed_model_keeps_the_extras() {
+    let login: ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "access-1",
+            "refreshToken": "refresh-1",
+            "rateLimitTier": "default_claude_max_5x",
+            "clientId": "client-abc"
+        }
+    }))
+    .expect("parse");
+    let round: serde_json::Value =
+        serde_json::to_value(&login).expect("serialize the parsed login back");
+    assert_eq!(
+        round["claudeAiOauth"]["rateLimitTier"],
+        "default_claude_max_5x"
+    );
+    assert_eq!(round["claudeAiOauth"]["clientId"], "client-abc");
+}
+
+/// A login minted by clauth's own browser flow carries no extras, and the
+/// serialized store must not grow an empty catch-all key for it.
+#[test]
+fn a_fresh_login_serializes_with_no_catch_all_key() {
+    let login = pair("access", "refresh");
+    let round: serde_json::Value = serde_json::to_value(&login).expect("serialize");
+    let oauth = &round["claudeAiOauth"];
+    let mut keys: Vec<&str> = oauth
+        .as_object()
+        .expect("oauth object")
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["accessToken", "refreshToken"],
+        "a fresh login serializes only its modelled fields, got {oauth}"
+    );
+}
+
 /// The crash-recovery leg is the one write that reaches `credentials.json`
 /// without going through `save_profile`, so it owes the same preservation. The
 /// staged sidecar holds the rotated login alone; writing those bytes raw drops
@@ -2642,6 +2858,308 @@ fn rolling_token_round_trips_through_config_toml() {
     let rendered = render_config_toml(&profile);
     let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
     assert!(parsed.rolling_token);
+}
+
+/// `save_profile` rewrites `config.toml` over itself, and the file is shared
+/// with writers this binary does not model (a newer clauth, a hand-edit).
+/// A save that changes one modelled field must keep the keys it does not know
+/// (issue #75, the config.toml sibling of the profiles.toml erasure).
+#[test]
+fn save_profile_keeps_unknown_config_toml_keys() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("cfgkeep".to_string(), None, None);
+    profile.fallback_threshold = Some(95.0);
+    save_profile(&profile).expect("save");
+
+    let config_path =
+        profile_config_path(&crate::profile::ProfileName::from("cfgkeep")).expect("config path");
+    let with_unknown = format!(
+        "{}\nsome_future_knob = true\n",
+        std::fs::read_to_string(&config_path).expect("read config")
+    );
+    std::fs::write(&config_path, with_unknown).expect("write config + unknown key");
+
+    profile.disabled = true;
+    save_profile(&profile).expect("save the disable");
+
+    let after = std::fs::read_to_string(&config_path).expect("read after");
+    assert!(
+        after.contains("some_future_knob = true"),
+        "the unknown key survived the config rewrite:\n{after}"
+    );
+    assert!(
+        after.contains("disabled = true"),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+/// A carried scalar must land at TOP LEVEL, never inside the render's trailing
+/// `[env]`/`[models]`/`[console]` table: appended after the header it becomes
+/// an env var (wrong type for `env` bricks `load_profile`; a string silently
+/// joins the env block and leaks into CC settings). The reviewer round caught
+/// the trailing-append shape doing exactly that.
+#[test]
+fn a_carried_scalar_stays_top_level_beside_a_trailing_table() {
+    let _home = HomeSandbox::new();
+
+    let name = crate::profile::ProfileName::from("cfgenv");
+    let config_path = profile_config_path(&name).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("parent")).expect("create profile dir");
+    // The knob sits top-level ABOVE [env] — the placement a hand-edit or an
+    // older clauth's file has. The test's point is where the SAVE puts it, not
+    // where a corrupted file left it.
+    std::fs::write(
+        &config_path,
+        "fallback_threshold = 95.0\n\nsome_future_knob = true\n\n[env]\nHTTP_PROXY = \"http://localhost:8080\"\n",
+    )
+    .expect("write config");
+
+    let mut loaded = load_profile(&name).expect("load profile");
+    loaded.disabled = true;
+    save_profile(&loaded).expect("save the disable");
+
+    let after = std::fs::read_to_string(&config_path).expect("read after");
+    // must still parse as a profile config, with the knob top-level
+    let parsed: ProfileConfig =
+        toml::from_str(&after).expect("the carried knob must not corrupt the file");
+    assert!(
+        !parsed.env.contains_key("some_future_knob"),
+        "the carried knob must not land inside [env]:\n{after}"
+    );
+    let table: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        table.get("some_future_knob"),
+        Some(&toml::Value::Boolean(true)),
+        "the knob is a top-level key:\n{after}"
+    );
+}
+
+/// The profiles.toml carry owes the same scoping rule: a scalar carried beside
+/// a non-default `[herdr]` block must not land inside it (`HerdrSettings`
+/// would silently drop the key on the next load — a loss, not a carry).
+#[test]
+fn a_carried_profiles_toml_scalar_stays_top_level_beside_herdr() {
+    let _home = HomeSandbox::new();
+
+    let state = AppState {
+        herdr: HerdrSettings {
+            popup_width: crate::profile::PopupWidth::Half,
+            ..HerdrSettings::default()
+        },
+        profiles: vec![crate::profile::ProfileName::from("holder")],
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("save with herdr non-default");
+
+    // The unknown key must be planted TOP-LEVEL, above the rendered [herdr]
+    // block — appending after it would nest the key inside [herdr] in the
+    // fixture itself, which is the corrupted-file shape, not a valid carry
+    // input. A hand-edit or an older clauth writes it top-level.
+    let path = app_state_path().expect("app_state_path");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    let herdr_at = raw.find("[herdr]").expect("herdr block present");
+    let planted = format!(
+        "{}some_unknown_future_key = \"keepme\"\n\n{}",
+        &raw[..herdr_at],
+        &raw[herdr_at..]
+    );
+    std::fs::write(&path, planted).expect("plant unknown key top-level");
+
+    // The second save ALSO renders a [herdr] block (non-default again), so
+    // the carried scalar must splice in ABOVE it — the exact shape where a
+    // trailing-append carry would nest it inside [herdr].
+    save_app_state(&state).expect("save again, herdr still non-default");
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let table: toml::Table = after.parse().expect("whole file parses");
+    assert_eq!(
+        table.get("some_unknown_future_key"),
+        Some(&toml::Value::String("keepme".into())),
+        "the carried key is top-level, not inside [herdr]:\n{after}"
+    );
+    assert!(
+        table
+            .get("herdr")
+            .and_then(|h| h.get("some_unknown_future_key"))
+            .is_none(),
+        "the carried key did not nest inside [herdr]:\n{after}"
+    );
+}
+
+/// A carried table-valued key and a carried scalar in one save: the scalar
+/// must not end up inside the carried table's own block either.
+#[test]
+fn carried_tables_and_scalars_keep_their_own_scopes() {
+    let merged = crate::profile::merge_carried_keys(
+        "fallback_threshold = 95.0\n".to_string(),
+        &[
+            (
+                "a_table".to_string(),
+                toml::Value::Table(
+                    [("x".to_string(), toml::Value::Integer(2))]
+                        .into_iter()
+                        .collect(),
+                ),
+            ),
+            ("z_scalar".to_string(), toml::Value::Boolean(true)),
+        ],
+    );
+    let table: toml::Table = merged.parse().expect("merged doc parses");
+    assert_eq!(
+        table.get("z_scalar"),
+        Some(&toml::Value::Boolean(true)),
+        "scalar stays top-level:\n{merged}"
+    );
+    assert!(
+        table.get("a_table").is_some_and(|t| t.get("x").is_some()),
+        "table keeps its own sub-keys:\n{merged}"
+    );
+}
+
+/// Round-2 review hole: a modelled key whose on-disk value EQUALS its
+/// `skip_serializing_if` default (`show_pace = false`, a hand-edit writing the
+/// default) is erased from the round-trip key set. When the new state then
+/// moves the key OFF default, the render emits it AND the disk copy gets
+/// carried — a duplicate top-level key, which TOML hard-rejects, bricking
+/// profiles.toml. A carried key must be absent from the render as well.
+#[test]
+fn a_modelled_key_moved_off_default_is_not_carried_beside_its_render() {
+    let _home = HomeSandbox::new();
+
+    save_app_state(&AppState::default()).expect("save a default state");
+    let path = app_state_path().expect("app_state_path");
+    // A hand-edit writes the default explicitly: modelled, but the round-trip
+    // of THIS file omits it (its value is the skipped one).
+    std::fs::write(
+        &path,
+        std::fs::read_to_string(&path).expect("read") + "show_pace = false\n",
+    )
+    .expect("plant an explicit default");
+
+    // The state moves the key off its default, so the render emits it.
+    save_app_state(&AppState {
+        show_pace: true,
+        ..AppState::default()
+    })
+    .expect("save with show_pace on");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let table: toml::Table = after
+        .parse()
+        .unwrap_or_else(|e| panic!("a duplicate show_pace would fail this parse: {e}\n{after}"));
+    assert_eq!(
+        table.get("show_pace"),
+        Some(&toml::Value::Boolean(true)),
+        "exactly one show_pace, the rendered one:\n{after}"
+    );
+}
+
+/// TOML-valid but `AppState`-invalid disk (a modelled key with a wrong-typed
+/// value) reaches the classification refusal — the round-1 finding-4 path —
+/// and must carry nothing: the render alone lands, loadable.
+#[test]
+fn a_state_file_with_a_wrongly_typed_modelled_key_carries_nothing() {
+    let _home = HomeSandbox::new();
+
+    let path = app_state_path().expect("app_state_path");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    // Valid TOML; `profiles` is not a list, so `AppState` refuses it.
+    std::fs::write(
+        &path,
+        "profiles = \"holder\"\nsome_unknown_future_key = \"keepme\"\n",
+    )
+    .expect("write unclassifiable state");
+
+    save_app_state(&AppState::default()).expect("save over it");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: AppState = toml::from_str(&after).expect("the written file loads");
+    assert!(parsed.profiles.is_empty(), "the render landed whole");
+    assert!(
+        !after.contains("some_unknown_future_key"),
+        "an unclassifiable file carries nothing — duplicating the render's keys would brick it:\n{after}"
+    );
+}
+
+/// An array-of-tables (`[[key]]`) is not `is_table()`; carried with a scalar it
+/// must still land in the tail (after every scalar), or the scalar sorts after
+/// the array block and is swallowed into its last element.
+#[test]
+fn a_carried_array_of_tables_does_not_swallow_a_later_scalar() {
+    let merged = crate::profile::merge_carried_keys(
+        "fallback_threshold = 95.0\n".to_string(),
+        &[
+            (
+                "a_arr".to_string(),
+                toml::Value::Array(vec![toml::Value::Table(
+                    [("x".to_string(), toml::Value::Integer(2))]
+                        .into_iter()
+                        .collect(),
+                )]),
+            ),
+            ("z_scalar".to_string(), toml::Value::Boolean(true)),
+        ],
+    );
+    let table: toml::Table = merged.parse().expect("merged doc parses");
+    assert_eq!(
+        table.get("z_scalar"),
+        Some(&toml::Value::Boolean(true)),
+        "scalar stays top-level after the array-of-tables:\n{merged}"
+    );
+}
+
+/// An unparseable on-disk file must not widen the carry to everything: modelled
+/// keys would come back from disk beside the render's copy of the same key,
+/// and a duplicate top-level key is a hard parse error — the file this save
+/// was supposed to keep loadable. Carrying nothing is the safe direction.
+#[test]
+fn an_unparseable_state_file_carries_nothing() {
+    let _home = HomeSandbox::new();
+
+    let path = app_state_path().expect("app_state_path");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = [\"holder\"\nnot toml at all {{{\n")
+        .expect("write unparseable state");
+
+    save_app_state(&AppState {
+        profiles: vec![crate::profile::ProfileName::from("holder")],
+        ..AppState::default()
+    })
+    .expect("save over unparseable file");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: AppState = toml::from_str(&after).expect("the written file loads");
+    assert_eq!(parsed.profiles.len(), 1, "the render landed whole");
+    assert!(
+        !after.contains("not toml at all"),
+        "nothing is resurrected from an unparseable body — carrying nothing is the safe direction:\n{after}"
+    );
+    assert!(
+        !after.contains(PRESERVED_KEYS_MARKER),
+        "no carry marker over an unclassifiable file:\n{after}"
+    );
+}
+
+/// A plain load must not rewrite `config.toml` just because it holds unknown
+/// keys — the drift check compares typed-vs-typed, so unknown keys must not
+/// count as drift and must not trigger a write.
+#[test]
+fn loading_a_config_toml_with_unknown_keys_does_not_rewrite_it() {
+    let _home = HomeSandbox::new();
+
+    let name = crate::profile::ProfileName::from("cfgload");
+    let config_path = profile_config_path(&name).expect("config path");
+    std::fs::create_dir_all(config_path.parent().expect("parent")).expect("create profile dir");
+    let body = "fallback_threshold = 95.0\n\nsome_future_knob = true\n";
+    std::fs::write(&config_path, body).expect("write config");
+
+    let before = std::fs::read_to_string(&config_path).expect("read before");
+    let _profile = load_profile(&name).expect("load");
+    let after = std::fs::read_to_string(&config_path).expect("read after");
+    assert_eq!(
+        before, after,
+        "a load rewrites config.toml over unknown keys:\n{after}"
+    );
 }
 
 /// The pre-rename `session_feed` spelling is deliberately NOT aliased: no

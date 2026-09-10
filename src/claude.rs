@@ -301,6 +301,7 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
             expires_at: Some(expires_at),
             scopes: Some(SETUP_TOKEN_SCOPES.iter().map(|s| s.to_string()).collect()),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
@@ -365,6 +366,11 @@ pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::p
         expires_at: chain.expires_at,
         scopes: chain.scopes.clone(),
         subscription_type: chain.subscription_type.clone(),
+        // A fresh mint from clauth's own chain, not a rewrite over a prior
+        // store, so it starts with no outside-written keys to keep. Claude
+        // Code adds its own on its first save into the sidecar, and the
+        // rolling re-stamp replaces them until that next save.
+        ..crate::profile::OAuthToken::default_extra()
     }
 }
 
@@ -479,6 +485,7 @@ pub(crate) fn write_session_token_with_backup(
             expires_at: Some(expires_at),
             scopes: Some(SETUP_TOKEN_SCOPES.iter().map(|s| s.to_string()).collect()),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;

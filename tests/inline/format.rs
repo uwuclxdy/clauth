@@ -418,6 +418,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("something_new".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&unclassified), None);
@@ -449,6 +450,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: Some(sub.into()),
+                ..crate::profile::OAuthToken::default_extra()
             }),
         })
     };
@@ -497,6 +499,7 @@ fn account_tier_reads_back_a_free_logins_stored_token() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("free".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&free), Some(PlanTier::Free));
@@ -534,6 +537,7 @@ fn account_tier_still_renders_every_known_tier() {
             expires_at: None,
             scopes: None,
             subscription_type: Some("pro".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     assert_eq!(account_tier(&token_only), Some(PlanTier::Pro));

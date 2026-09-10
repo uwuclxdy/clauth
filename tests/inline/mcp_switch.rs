@@ -27,6 +27,7 @@ fn creds(access: &str, refresh: &str) -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -41,6 +42,7 @@ fn creds_expired(access: &str, refresh: &str) -> ClaudeCredentials {
             expires_at: Some(crate::usage::now_ms() as i64 - 60_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }

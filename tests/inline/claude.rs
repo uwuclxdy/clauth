@@ -10,6 +10,7 @@ fn creds(access: &str, refresh: Option<&str>) -> ClaudeCredentials {
             expires_at: None,
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     }
 }
@@ -1117,6 +1118,7 @@ fn installed_session_token_tracks_what_a_switch_installs() {
             expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
             scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp rolling");
@@ -2450,6 +2452,7 @@ fn stamp_rolling_token_writes_a_refreshless_long_lived_shape() {
             expires_at: Some(exp),
             scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -2495,6 +2498,7 @@ fn first_stamp_preserves_the_mint_once_and_only_the_mint() {
         expires_at: Some(now + 8 * 3_600_000),
         scopes: None,
         subscription_type: Some("max".into()),
+        ..crate::profile::OAuthToken::default_extra()
     };
     stamp_rolling_token(&crate::profile::ProfileName::from(name), &fed("at-1")).expect("feed 1");
     stamp_rolling_token(&crate::profile::ProfileName::from(name), &fed("at-2")).expect("feed 2");
@@ -2546,6 +2550,7 @@ fn restore_static_mint_round_trip() {
             expires_at: Some(now + 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed");
@@ -2588,6 +2593,7 @@ fn write_session_token_with_backup_stamps_both_from_the_same_mint() {
             expires_at: Some(now + 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed preserves mint 1");
@@ -2637,6 +2643,7 @@ fn heal_misfilled_sidecar_quarantines_and_restores_the_mint() {
             expires_at: Some(now + 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("feed preserves mint");
@@ -2726,6 +2733,7 @@ fn refreshless(
         expires_at,
         scopes: scopes.map(|s| s.into_iter().map(String::from).collect()),
         subscription_type: plan.map(String::from),
+        ..crate::profile::OAuthToken::default_extra()
     }
 }
 
@@ -2833,6 +2841,7 @@ fn a_mint_in_its_final_month_is_still_preserved() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -2852,6 +2861,7 @@ fn a_mint_in_its_final_month_is_still_preserved() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("roll");
@@ -2899,6 +2909,7 @@ fn a_rolling_bearer_is_never_preserved_as_the_mint() {
                 "user:profile".to_string(),
             ]),
             subscription_type: plan.map(String::from),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 
@@ -2924,6 +2935,7 @@ fn a_rolling_bearer_is_never_preserved_as_the_mint() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("roll");
@@ -2956,6 +2968,7 @@ fn a_rolling_bearer_is_never_preserved_as_the_mint() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("roll 2");
@@ -2980,6 +2993,7 @@ fn quarantining_a_misfill_removes_the_sidecar() {
             expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
             scopes: None,
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3030,6 +3044,7 @@ fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
             expires_at: Some(now + life_h * 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 
@@ -3046,6 +3061,7 @@ fn arming_from_disk_stamps_the_post_guard_chain_not_a_stale_snapshot() {
             expires_at: Some(now + 60_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3113,6 +3129,7 @@ fn arming_from_disk_skips_a_profile_cleared_while_it_waited() {
             expires_at: Some(now + 8 * 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     });
     crate::profile::save_profile(&profile).expect("save");
@@ -3125,6 +3142,7 @@ fn arming_from_disk_skips_a_profile_cleared_while_it_waited() {
             expires_at: Some(now + 60_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3182,6 +3200,7 @@ fn a_restored_mint_is_preserved_again_on_the_next_roll() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3217,6 +3236,7 @@ fn a_restored_mint_is_preserved_again_on_the_next_roll() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("re-roll");
@@ -3255,6 +3275,7 @@ fn arming_from_disk_rechecks_chain_staleness_after_the_guard_wait() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
 
@@ -3275,6 +3296,7 @@ fn arming_from_disk_rechecks_chain_staleness_after_the_guard_wait() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3326,6 +3348,7 @@ fn a_rotating_pair_classifies_misfilled_never_rolling() {
             "user:profile".to_string(),
         ]),
         subscription_type: Some("max".into()),
+        ..crate::profile::OAuthToken::default_extra()
     };
     assert_eq!(sidecar_kind_of(&with_refresh), SidecarKind::Misfilled);
     // And a mis-fill is never preserved as the mint, through the classifier
@@ -3350,6 +3373,7 @@ fn a_rotating_pair_classifies_misfilled_never_rolling() {
             expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("roll");
@@ -3384,6 +3408,7 @@ fn a_backup_that_is_not_a_mint_is_quarantined_never_restored() {
             expires_at: Some(now + 8 * 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("stamp");
@@ -3455,6 +3480,7 @@ fn an_expired_backup_is_never_restored() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3472,6 +3498,7 @@ fn an_expired_backup_is_never_restored() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3540,6 +3567,7 @@ fn an_unreadable_sidecar_aborts_the_roll_instead_of_forfeiting_the_mint() {
             expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
             scopes: None,
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     );
     let err =
@@ -3579,6 +3607,7 @@ fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3606,6 +3635,7 @@ fn a_fresh_mint_replaces_an_expired_backup_on_the_next_roll() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("roll");
@@ -3646,6 +3676,7 @@ fn a_fresher_sidecar_mint_upgrades_a_live_but_older_backup() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     let roll = || {
@@ -3660,6 +3691,7 @@ fn a_fresher_sidecar_mint_upgrades_a_live_but_older_backup() {
                     "user:profile".to_string(),
                 ]),
                 subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
             },
         )
         .expect("roll");
@@ -3742,6 +3774,7 @@ fn preserve_quarantines_a_displaced_slot_holder_that_was_never_a_mint() {
                 "user:profile".to_string(),
             ]),
             subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
         },
     )
     .expect("roll");
@@ -3788,6 +3821,7 @@ fn a_backup_inside_ccs_refresh_window_reads_as_expired() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(
@@ -3826,6 +3860,7 @@ fn restore_quarantines_a_misfilled_sidecar_before_overwriting_it() {
                 "user:sessions:claude_code".to_string(),
             ]),
             subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
         }),
     };
     std::fs::write(

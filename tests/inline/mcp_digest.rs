@@ -372,6 +372,7 @@ fn seed_switchable_pair() {
                 expires_at: None,
                 scopes: None,
                 subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
             }),
         });
         save_profile(&p).expect("save profile");

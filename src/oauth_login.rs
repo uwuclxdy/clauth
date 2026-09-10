@@ -472,6 +472,10 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
             expires_at: Some((now_ms() + token.expires_in * 1000) as i64),
             scopes,
             subscription_type: None,
+            // A login clauth mints itself has no outside-written keys to keep;
+            // Claude Code adds its own (`rateLimitTier`, `clientId`) on its
+            // first token save, and the catch-all holds them from then on.
+            ..OAuthToken::default_extra()
         }),
     }
 }
