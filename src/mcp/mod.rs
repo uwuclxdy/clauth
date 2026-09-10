@@ -1217,7 +1217,7 @@ across accounts."
                     // Refuse a target `delegate` must not spend on BEFORE the
                     // job file is reserved: the caller gets the refusal
                     // synchronously, never a running job whose collected result
-                    // carries it. The blocking path runs the same three gates
+                    // carries it. The blocking path runs the same gates
                     // inside `run_delegate`; `resolve_fanout` runs them per
                     // fan-out member.
                     let name_pn = ProfileName::from(name.clone());
@@ -3733,6 +3733,28 @@ fn preflight_target(
     if config.is_auth_broken(name) && !crate::claude::has_own_inference_endpoint(profile) {
         return Err(crate::format::login_expired(name).line());
     }
+    // The provider's own verdict, not clauth's guess at a figure: the freshest
+    // cached third-party stats say this account cannot fund a call, so the
+    // spawn would die mid-run on the provider's refusal (a 402) after the
+    // setup spend. A missing cache is no verdict — an OAuth member, or a
+    // provider clauth has never fetched for — and passes. The age rides so a
+    // reader can discount a verdict the provider's next fetch may replace.
+    // Bounded to third-party profiles: a hand-edited config can strand a
+    // stale verdict on a profile that no longer runs third-party, where no
+    // fetch leg would ever refresh it away, and the guard keeps that file
+    // inert here the way it was before this arm existed.
+    if profile.is_third_party()
+        && let Some(stats) = load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
+        && !stats.is_available
+    {
+        let age = crate::profile_json::cache_age_secs(name, THIRD_PARTY_CACHE_FILE)
+            .map(|secs| format!(" (cached {})", render::cached_when(secs)))
+            .unwrap_or_default();
+        return Err(format!(
+            "cannot fund a run: {name} — {}{age}; name another account",
+            render::third_party_headline(&stats),
+        ));
+    }
     Ok(())
 }
 
@@ -3741,7 +3763,8 @@ fn preflight_target(
 /// single `profile` resolves under), a name resolving to no account, or
 /// anything [`preflight_target`] refuses — a disabled member, a recognised
 /// third-party member with no inference auth source, a quarantined one that
-/// does not serve its own inference.
+/// does not serve its own inference, an unfunded one (the provider's own
+/// balance verdict).
 /// Runs before any spawn: N delegates is N real usage windows with no undo.
 fn resolve_fanout(config: &AppConfig, raw: &[String]) -> std::result::Result<Vec<String>, String> {
     // An empty list passes every check below vacuously and would return a

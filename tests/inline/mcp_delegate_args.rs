@@ -52,6 +52,26 @@ fn seed_profiles(names: &[&str], disabled: bool) {
     }
 }
 
+/// Seed `names` as third-party profiles (recognised endpoint + a working key,
+/// so preflight's earlier arms admit them) — the shape whose cached provider
+/// stats the unfunded arm reads.
+fn seed_third_party_profiles(names: &[&str]) {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in names {
+        crate::actions::create_blank_profile(
+            &mut config,
+            (*name).to_string(),
+            Some("https://api.deepseek.com".to_string()),
+            Some("sk-test-unfunded".to_string()),
+            None,
+        )
+        .expect("create profile");
+    }
+}
+
 /// Drive the async `delegate` tool with `CLAUTH_MCP_DEPTH` cleared, so the
 /// recursion guard does not mask the argument guard under test. Every caller
 /// holds a `HomeSandbox`, whose `HOME_TEST_LOCK` serializes the env mutation.
@@ -1736,4 +1756,185 @@ fn a_fanout_joins_its_detached_tasks_before_the_driver_returns() {
          leaving them to teardown lets the runtime discard a queued one un-run"
     );
     crate::testutil::assert_jobs_done(2);
+}
+
+// ── unfunded gate ─────────────────────────────────────────────────────────────
+
+/// Seed `name`'s third-party stats cache through the same writer the fetch legs
+/// use, so the gate reads what production wrote.
+fn seed_stats_cache(name: &str, bytes: &str) {
+    let stats: crate::providers::ThirdPartyStats =
+        serde_json::from_str(bytes).expect("stats cache parses");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
+}
+
+/// A target whose freshest cached provider stats carry the provider's own
+/// "cannot fund a call" verdict (`is_available: false`) is refused at routing
+/// time, naming the account, the figure the provider still reported, the age of
+/// the read, and the fix. The spawn it prevents is the one that dies mid-run on
+/// the provider's 402 after the setup spend.
+#[test]
+fn an_unfunded_target_is_refused_at_routing_time() {
+    let home = HomeSandbox::new();
+    seed_third_party_profiles(&["broke"]);
+    seed_stats_cache("broke", crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES);
+    // Pin the age by value: the cache file's mtime sits 5410 s back, a span
+    // whose minute-granular rendering ("1h 30m") holds for ~50 s of test
+    // jitter, so the equality below cannot flake on clock noise.
+    let cache = crate::profile_cache::profile_cache_path(
+        &crate::profile::ProfileName::from("broke"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path resolves");
+    crate::testutil::set_mtime(
+        &cache,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(5410),
+    );
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["broke".to_string()]),
+        prompt: Some("hi".to_string()),
+        // Not for the refusal — preflight fires first — but for the state
+        // where the gate is missing: the call must stop at the cwd gate, never
+        // at a real spawn.
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_eq!(result.is_error, Some(true), "the refusal is a tool error");
+    assert_eq!(
+        first_text(&result),
+        "delegate to `broke` failed: cannot fund a run: broke — api balance: \
+         0.00 CNY (balance too low) (cached 1h 30m ago); name another account; \
+         target `broke`: no 5h/7d limits; api balance: 0.00 CNY (balance too \
+         low) (cached 1h 30m ago)",
+        "the refusal names the account, the provider's figure, the verdict, \
+         the cache age and the fix, and the headroom clause dates the same \
+         cache"
+    );
+}
+
+/// The funded control: `is_available: true` passes the gate, and the call then
+/// stops at the cwd gate — preflight runs first, so the cwd sentence pinned
+/// here is proof the unfunded arm did not fire.
+#[test]
+fn a_funded_target_passes_the_unfunded_gate() {
+    let home = HomeSandbox::new();
+    seed_third_party_profiles(&["rich"]);
+    seed_stats_cache("rich", crate::testutil::DEEPSEEK_CACHE_BYTES);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["rich".to_string()]),
+        prompt: Some("hi".to_string()),
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    let text = first_text(&result);
+    assert!(
+        text.contains("cwd does not exist"),
+        "a funded target clears the gate and stops at the cwd gate instead: {text}",
+    );
+}
+
+/// An unfunded fan-out member refuses the whole call before any spawn: N
+/// delegates is N real windows with no undo, so the caller re-issues without the
+/// dead member rather than learning which half ran.
+#[test]
+fn an_unfunded_fanout_member_refuses_the_call_before_any_spawn() {
+    let home = HomeSandbox::new();
+    seed_third_party_profiles(&["rich", "broke"]);
+    seed_stats_cache("broke", crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["rich".to_string(), "broke".to_string()]),
+        prompt: Some("hi".to_string()),
+        // Same missing-gate stop as the single-target test above.
+        cwd: Some(
+            home.home()
+                .join("does-not-exist")
+                .to_str()
+                .unwrap()
+                .to_string(),
+        ),
+        ..base()
+    });
+    assert_refusal(&result, &["broke", "balance too low"]);
+}
+
+/// No cache at all — an OAuth member, or a provider clauth has never fetched
+/// for — carries no verdict, and preflight passes: the gate reads the
+/// provider's verdict, never a guess at a figure.
+#[test]
+fn a_target_with_no_third_party_cache_passes_preflight() {
+    let _home = HomeSandbox::new();
+    seed_profiles(&["oauth"], false);
+    let config = crate::profile::load_config().expect("config loads");
+    let pn = crate::profile::ProfileName::from("oauth");
+    let profile = config.find(&pn).expect("seeded profile resolves");
+    assert_eq!(
+        super::preflight_target(profile, &config, &pn),
+        Ok(()),
+        "no cache is no verdict: preflight passes"
+    );
+}
+
+/// A first-party profile with a stale third-party cache passes: a hand-edited
+/// config can leave an unfunded verdict behind on a profile whose endpoint no
+/// longer runs third-party, and no fetch leg would ever refresh it away, so
+/// the verdict arm is bounded to profiles the third-party fetch still writes
+/// for.
+#[test]
+fn a_first_party_profile_with_a_stale_third_party_cache_passes() {
+    let _home = HomeSandbox::new();
+    seed_profiles(&["plain"], false);
+    seed_stats_cache("plain", crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES);
+    let config = crate::profile::load_config().expect("config loads");
+    let pn = crate::profile::ProfileName::from("plain");
+    let profile = config.find(&pn).expect("seeded profile resolves");
+    assert_eq!(
+        super::preflight_target(profile, &config, &pn),
+        Ok(()),
+        "a cache the fetch legs would never refresh is no verdict here: \
+         preflight passes"
+    );
+}
+
+/// A disabled account's fix outranks its wallet: the disabled sentence stays
+/// first, so the reader is not sent hunting a balance the enable restores.
+/// Seeded third-party (the drained-account shape: an unfunded verdict, then
+/// the operator disables the account) — the guard makes arm 4 unreachable
+/// for a blank first-party fixture, which would leave this pin vacuous.
+#[test]
+fn the_disabled_sentence_outranks_the_unfunded_one() {
+    let _home = HomeSandbox::new();
+    seed_third_party_profiles(&["broke"]);
+    let mut config = crate::profile::load_config().expect("config loads");
+    crate::actions::disable_profile(&mut config, &crate::profile::ProfileName::from("broke"))
+        .expect("disable profile");
+    seed_stats_cache("broke", crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["broke".to_string()]),
+        prompt: Some("hi".to_string()),
+        ..base()
+    });
+    assert_refusal(&result, &["profile is disabled", "clauth enable"]);
+    let text = first_text(&result);
+    assert!(
+        !text.contains("failed: cannot fund a run"),
+        "the disabled sentence is the refusal; the headroom footer may still \
+         name the verdict beside its figure, but the reason is not the \
+         unfunded one: {text}"
+    );
 }

@@ -809,15 +809,22 @@ fn freshness_clause(v: &Value) -> String {
             String::new()
         };
     };
-    let when = if secs == 0 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", humanize_duration(secs as i64))
-    };
+    let when = cached_when(secs);
     if stale {
         format!(" (cached {when}, stale)")
     } else {
         format!(" (cached {when})")
+    }
+}
+
+/// The `when` half of every `cached` clause: zero reads as just-written,
+/// anything older is a duration. One spelling, so the headroom prose, a dated
+/// unknown and a routing refusal all date a figure the same way.
+pub(crate) fn cached_when(secs: u64) -> String {
+    if secs == 0 {
+        "just now".to_string()
+    } else {
+        format!("{} ago", humanize_duration(secs as i64))
     }
 }
 
@@ -828,12 +835,7 @@ fn age_clause(v: &Value) -> String {
     let Some(secs) = v.get("fetched_secs_ago").and_then(Value::as_u64) else {
         return String::new();
     };
-    let when = if secs == 0 {
-        "just now".to_string()
-    } else {
-        format!("{} ago", humanize_duration(secs as i64))
-    };
-    format!(" (cached {when})")
+    format!(" (cached {})", cached_when(secs))
 }
 
 /// The headroom clause, off the discriminated payload

@@ -311,7 +311,7 @@ fn windows_of(name: &ProfileName, third_party: bool, provider: Option<Provider>)
 /// would render that as `cached just now` with `stale` false — maximum
 /// confidence for the one stamp that proves the clock is wrong — where an
 /// undated figure says exactly what clauth knows: it cannot date this one.
-fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
+pub(crate) fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
     let mtime = profile_cache_mtime_ms(name, file)?;
     now_ms().checked_sub(mtime).map(|age| age / 1000)
 }
