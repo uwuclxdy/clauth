@@ -323,6 +323,10 @@ fn console_url_is_the_vendor_page_per_provider() {
         Provider::OpenRouter.console_url("https://openrouter.ai/api"),
         Some("https://openrouter.ai/settings/keys")
     );
+    assert_eq!(
+        Provider::MiniMax.console_url("https://api.minimax.io/anthropic"),
+        Some("https://platform.minimax.io/user-center/payment/token-plan")
+    );
 }
 
 #[test]
@@ -344,5 +348,98 @@ fn console_url_answers_none_for_a_base_url_the_provider_does_not_own() {
         Provider::Zai.console_url("https://token-plan.ap-southeast-1.maas.aliyuncs.com"),
         None
     );
+    assert_eq!(
+        Provider::MiniMax.console_url("https://api.minimax.cn/anthropic"),
+        None,
+        "the CN host is a different region's account; its key must not be offered the intl console"
+    );
     assert_eq!(Provider::DeepSeek.console_url(""), None);
+}
+
+// ── Provider::publishes_windows ───────────────────────────────────────────────
+
+/// The arm behind the MCP headroom prose: a provider marked as publishing no
+/// windows is told it has no 5h/7d limit, so a regression on the MiniMax arm
+/// reads as a false denial on every MiniMax account. Exact spellings, both
+/// directions.
+#[test]
+fn publishes_windows_names_every_provider() {
+    assert!(Provider::Zai.publishes_windows());
+    assert!(Provider::Alibaba.publishes_windows());
+    assert!(Provider::MiniMax.publishes_windows());
+    assert!(!Provider::DeepSeek.publishes_windows());
+    assert!(!Provider::OpenRouter.publishes_windows());
+}
+
+// ── ThirdPartyStats::to_usage_info ────────────────────────────────────────────
+
+#[test]
+fn to_usage_info_maps_the_two_windows_the_chain_judges() {
+    let usage = crate::testutil::stats_with_bars(vec![
+        crate::testutil::bar_reset_in("5h", 62.0, 3_600),
+        crate::testutil::bar_reset_in("7d", 31.0, 86_400),
+    ])
+    .to_usage_info()
+    .expect("both windows present");
+    assert_eq!(usage.five_hour.as_ref().map(|w| w.utilization), Some(62.0));
+    assert_eq!(usage.seven_day.as_ref().map(|w| w.utilization), Some(31.0));
+    let resets_at = usage.five_hour.and_then(|w| w.resets_at);
+    // Equality against the constructed instant, not a liveness property: a
+    // regression that synthesizes any future instant passes a "is it live"
+    // check and rides a wrong reset into every liveness judgment downstream.
+    let parsed = resets_at
+        .as_deref()
+        .and_then(crate::usage::iso_to_epoch_secs)
+        .expect("the provider's own reset instant parses");
+    let expected = crate::usage::now_epoch_secs() + 3_600;
+    assert!(
+        (parsed - expected).abs() <= 1,
+        "the bar's own instant rides through verbatim: {resets_at:?}"
+    );
+}
+
+#[test]
+fn to_usage_info_drops_windows_that_are_not_5h_or_7d() {
+    // z.ai's 30d ceiling is account-wide, not per-model, so folding it into
+    // `weekly_scoped` would block the member as though one model were capped.
+    let usage = crate::testutil::stats_with_bars(vec![
+        crate::testutil::bar("5h", 10.0),
+        crate::testutil::bar("30d", 99.0),
+    ])
+    .to_usage_info()
+    .expect("the 5h window still maps");
+    assert!(usage.seven_day.is_none());
+    assert!(usage.weekly_scoped.is_empty());
+}
+
+#[test]
+fn to_usage_info_declines_a_stats_with_no_recognised_window() {
+    assert!(
+        crate::testutil::stats_with_bars(Vec::new())
+            .to_usage_info()
+            .is_none()
+    );
+    assert!(
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar("30d", 5.0)])
+            .to_usage_info()
+            .is_none(),
+        "a balance-only or monthly-only provider contributes no chain window"
+    );
+}
+
+#[test]
+fn to_usage_info_refuses_best_effort_stats() {
+    // The generic scanner's guess at an unknown endpoint is a figure nobody
+    // verified; believing it would park an account out of the rotation.
+    let mut stats = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 99.0)]);
+    stats.best_effort = true;
+    assert!(stats.to_usage_info().is_none());
+}
+
+#[test]
+fn to_usage_info_clamps_a_bar_into_the_utilization_range() {
+    let usage = crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 140.0)])
+        .to_usage_info()
+        .expect("still a window");
+    assert_eq!(usage.five_hour.map(|w| w.utilization), Some(100.0));
 }

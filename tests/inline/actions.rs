@@ -5085,6 +5085,111 @@ fn a_console_login_stores_the_session_and_leaves_the_api_key_alone() {
     assert!(loaded.console.is_some(), "the session still landed");
 }
 
+/// The endpoint edit drops the third-party DISK cache with the in-memory
+/// stats: `bootstrap_third_party` reseeds a leftover cache `Fresh` on the
+/// restart/boot paths, and the usage-store mirror drives the auto-switch
+/// walk off the reseed. A live process's in-memory mirror entry survives
+/// until the profile's next fetch — the boundary the src comment names.
+#[test]
+fn an_endpoint_edit_drops_the_third_party_disk_cache() {
+    let _home = HomeSandbox::new();
+    let stats = || crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]);
+    let cache = |name: &str| {
+        crate::profile_cache::load_profile_cache::<crate::providers::ThirdPartyStats>(
+            &crate::profile::ProfileName::from(name),
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        )
+    };
+
+    // A provider change drops it.
+    let p = Profile::new(
+        "cache-moved".to_string(),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-k".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["cache-moved", "cache-rotated"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cache-moved"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats(),
+    );
+    assert!(
+        cache("cache-moved").is_some(),
+        "the fixture wrote the old provider's cache"
+    );
+    let mut config = inactive_config(p);
+    edit_profile_endpoint(
+        &mut config,
+        &crate::profile::ProfileName::from("cache-moved"),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("zai-key".to_string()),
+    )
+    .expect("edit_profile_endpoint");
+    assert!(
+        cache("cache-moved").is_none(),
+        "the old provider's cache does not survive the move"
+    );
+
+    // …and so does a rotated key on the SAME provider — the stats were
+    // fetched under a credential just replaced.
+    let p = Profile::new(
+        "cache-rotated".to_string(),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-k".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cache-rotated"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats(),
+    );
+    let mut config = inactive_config(p);
+    edit_profile_endpoint(
+        &mut config,
+        &crate::profile::ProfileName::from("cache-rotated"),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-rotated".to_string()),
+    )
+    .expect("edit_profile_endpoint");
+    assert!(
+        cache("cache-rotated").is_none(),
+        "a rotated key drops the stats fetched under the old one"
+    );
+
+    // The preset-apply path moves the endpoint without touching the key, and
+    // its own comment claims it re-derives the provider "exactly like
+    // `edit_profile_endpoint`" — the cache drop has to hold there too.
+    let p = Profile::new(
+        "cache-preset".to_string(),
+        Some("https://api.minimax.io/anthropic".to_string()),
+        Some("sk-cp-k".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["cache-preset"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cache-preset"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats(),
+    );
+    assert!(
+        cache("cache-preset").is_some(),
+        "the fixture wrote the old provider's cache"
+    );
+    let mut config = inactive_config(p);
+    edit_profile_preset(
+        &mut config,
+        &crate::profile::ProfileName::from("cache-preset"),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        crate::profile::ModelSettings::default(),
+    )
+    .expect("edit_profile_preset");
+    assert!(
+        cache("cache-preset").is_none(),
+        "a preset that moves the endpoint drops the old provider's cache"
+    );
+}
+
 /// `main.rs`'s reauth contract is that the snapshot clears the old type's
 /// leftovers. The console session is a FOURTH credential, and it is meaningless
 /// off Alibaba: left behind, an endpoint move parks a live Model Studio session

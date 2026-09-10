@@ -10,7 +10,7 @@
 
 use serde::Deserialize;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
 use crate::usage::epoch_secs_to_iso;
 
 pub(super) const DISPLAY_NAME: &str = "Z.ai";
@@ -206,11 +206,6 @@ fn fmt_count(n: f64) -> String {
     } else {
         format!("{n:.0}")
     }
-}
-
-/// Epoch-ms (z.ai `nextResetTime`) → ISO-8601 UTC.
-fn ms_to_iso(ms: i64) -> String {
-    epoch_secs_to_iso(ms / 1000)
 }
 
 /// Epoch-secs → z.ai's `yyyy-MM-dd HH:mm:ss` UTC date param (space-separated, no

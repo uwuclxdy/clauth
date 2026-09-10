@@ -2210,6 +2210,7 @@ impl App {
             );
             bootstrap_third_party(
                 &h.third_party_usage_store,
+                &h.usage_store,
                 &h.third_party_status,
                 &h.last_fetched,
                 &third_party,
@@ -2411,6 +2412,19 @@ impl App {
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
                 }
+                // A third-party member's bars are its usage snapshot. The
+                // scheduler writes the snapshot and mirrors its derived window
+                // into the usage store as two separate acquisitions, so an
+                // apply landing between them still owes this account a figure:
+                // derive it off the snapshot. The `is_none` guard keeps that a
+                // fallback — the store's own entry, whichever leg wrote it,
+                // always wins.
+                if p.usage.is_none()
+                    && let Some(stats) = p.third_party_usage.as_ref()
+                {
+                    p.usage = stats.to_usage_info();
+                }
+
                 // #74 degraded cue: cache age past the derived threshold reads
                 // stale, independent of fetch_status. Same threshold, same
                 // maxed-window exemption, and same age source as

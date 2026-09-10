@@ -3,7 +3,7 @@
 use super::*;
 
 use crate::profile::ProfileName;
-use crate::profile_cache::{USAGE_CACHE_FILE, write_profile_cache};
+use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
 use crate::testutil::HomeSandbox;
 
 /// A payload carrying only what these tests vary.
@@ -1827,6 +1827,65 @@ fn the_real_reader_replays_the_decision_leg_over_the_disk_cache() {
     assert!(
         note.ends_with(". no fallback is set; further agent spawns may fail with 429s."),
         "the approved tail: {note}",
+    );
+}
+
+/// The replay judges a third-party member's provider windows the way the live
+/// leg does — the scheduler mirrors this same derivation into the store the
+/// walk reads. An OAuth-only replay reads the member as windowless headroom,
+/// which flips `chain_acts` true over a switch the live leg refuses and
+/// silences a nudge whose failure nothing catches. `b`'s leftover OAuth cache
+/// from the seed (10%) is the control: an implementation still reading it
+/// answers headroom in the spent case and reds this test.
+#[test]
+fn the_replay_judges_a_third_party_members_windows_like_the_live_leg() {
+    let _home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history();
+    // Recast `b` as an api-key account: its figures now live in the
+    // third-party cache, and the OAuth cache the seed wrote goes inert.
+    let mut config = crate::profile::load_config().expect("reload");
+    let b = config
+        .profiles
+        .iter_mut()
+        .find(|p| p.name.as_str() == "b")
+        .expect("member b");
+    b.base_url = Some("https://api.minimax.io/anthropic".to_string());
+    b.api_key = Some("sk-cp-k".to_string());
+    crate::profile::save_profile(b).expect("save b");
+    let provider_window = |pct: f64| {
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar_reset_in("5h", pct, 3_600)])
+    };
+
+    // A clear provider window is a target the walk lands on, same as a clear
+    // OAuth one.
+    write_profile_cache(
+        &ProfileName::from("b"),
+        THIRD_PARTY_CACHE_FILE,
+        &provider_window(10.0),
+    );
+    let read = read_nudge(&task_fire("conv-tp-clear"), None).expect("eligible and readable");
+    assert!(
+        read.chain_acts,
+        "a clear provider window is a target, same as a clear OAuth one"
+    );
+
+    // A spent one leaves the walk nowhere to point, so the nudge lands.
+    write_profile_cache(
+        &ProfileName::from("b"),
+        THIRD_PARTY_CACHE_FILE,
+        &provider_window(97.0),
+    );
+    let fire = task_fire("conv-tp-spent");
+    let read = read_nudge(&fire, None).expect("eligible and readable");
+    assert!(
+        !read.chain_acts,
+        "the spent provider window leaves the walk nowhere to point"
+    );
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    assert!(
+        note.starts_with("clauth note: 5h window 97% used ("),
+        "the uncovered session hears it: {note}",
     );
 }
 

@@ -4833,7 +4833,6 @@ fn the_profiles_entry_names_both_scopes_and_the_reply_shape() {
 #[test]
 fn roster_rank_reports_free_percent_from_the_best_known_window() {
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
-    use crate::providers::{ThirdPartyStats, UsageBar};
     use crate::usage::{UsageInfo, UsageWindow};
 
     let _home = HomeSandbox::new();
@@ -4874,20 +4873,16 @@ fn roster_rank_reports_free_percent_from_the_best_known_window() {
 
     // A third-party provider has no `windows`, but its own bars carry the same
     // percentages, and 5h still outranks 7d.
-    let bar = |label: &str, pct: f64| UsageBar {
-        label: label.to_string(),
-        pct,
-        resets_at: None,
-        used: None,
-        total: None,
-    };
     write_profile_cache(
         &crate::profile::ProfileName::from("bars"),
         THIRD_PARTY_CACHE_FILE,
         &ThirdPartyStats {
             is_available: true,
             rows: Vec::new(),
-            bars: vec![bar("7d", 94.0), bar("5h", 8.0)],
+            bars: vec![
+                crate::testutil::bar("7d", 94.0),
+                crate::testutil::bar("5h", 8.0),
+            ],
             plan: Some("pro".to_string()),
             endpoint: None,
             best_effort: false,
@@ -5204,6 +5199,54 @@ fn a_folded_live_usage_clause_gates_the_pct_fields_on_window_liveness() {
     assert_eq!(
         unstamped["live_usage"]["5h_used_pct"], 30.0,
         "no stamp is missing data, not a lapsed window: the row stays, the share stays",
+    );
+}
+
+/// An api-key account whose disk still holds a stale OAuth `usage_cache.json`
+/// from an earlier OAuth life ranks off its own provider bars, never the
+/// stale Anthropic window — the same stale-leftover read
+/// `profile_json::published_windows` guards against, and the reason
+/// `load_windows` answers nothing for an api-key account, dropping the rank
+/// onto the provider's own live bars.
+#[test]
+fn roster_rank_ignores_a_stale_oauth_cache_on_an_api_key_account() {
+    use crate::profile::{Profile, save_profile};
+    use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, write_profile_cache};
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("zai-x");
+    save_profile(&Profile::new(
+        "zai-x".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("k".to_string()),
+    ))
+    .expect("save the profile");
+    crate::testutil::register_names(&["zai-x"]);
+
+    // A leftover OAuth cache claiming a nearly-spent 5h window would rank the
+    // account Window(5.0) — the stale Anthropic figure, not this account's.
+    write_profile_cache(
+        &name,
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 95.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
+    );
+    write_profile_cache(
+        &name,
+        THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 40.0)]),
+    );
+
+    assert_eq!(
+        roster_rank(&name),
+        RosterRank::Window(60.0),
+        "the provider bar answers, the stale OAuth window never reaches the rank",
     );
 }
 

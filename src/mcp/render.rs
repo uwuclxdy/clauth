@@ -846,7 +846,7 @@ fn age_clause(v: &Value) -> String {
 ///
 /// A third-party account is told it has no 5h/7d limit only when clauth knows
 /// it has none. A provider that publishes usage windows of its own (z.ai,
-/// Alibaba) HAS the limits whether or not this one response carried any, so a
+/// Alibaba, MiniMax) HAS the limits whether or not this one response carried any, so a
 /// denial beside its figure is false; a provider answering with a wallet or a
 /// counter (DeepSeek, ollama, a generic endpoint) has none, and saying so is
 /// what stops its figure reading as one more window someone can wait out. The

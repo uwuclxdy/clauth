@@ -1,0 +1,262 @@
+//! MiniMax provider — Token Plan interval + weekly windows.
+//!
+//! One endpoint: `GET https://api.minimax.io/v1/token_plan/remains`, authorised
+//! by the same api key the `/anthropic` completions endpoint takes. It answers
+//! `model_remains[]` — one entry per plan bucket (`general` for text, `video`
+//! for the video product), each carrying a rolling interval window and a weekly
+//! one as REMAINING percentages plus their start and end instants in epoch-ms.
+//!
+//! Claude Code traffic bills against the `general` bucket, so that entry drives
+//! the bars; every bucket is listed as a text row, since a reader picking this
+//! account wants to see the whole plan. `video` shares the account but not the
+//! window Claude Code spends, which is exactly why it must not become a bar.
+//!
+//! Only the international host is claimed. MiniMax also fronts a China-region
+//! endpoint, but the typed fetch resolves its quota host from a constant rather
+//! than from the profile's own `base_url` (see [`ThirdPartyTarget`]), so
+//! claiming a second origin here would send one region's api key to the other
+//! region's host. A CN account keeps falling through to the generic scanner
+//! until that plumbing carries the base URL.
+//!
+//! [`ThirdPartyTarget`]: super::ThirdPartyTarget
+
+use serde::Deserialize;
+
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
+use crate::usage::{LABEL_5H, LABEL_7D};
+
+pub(super) const DISPLAY_NAME: &str = "MiniMax";
+
+pub(super) const ORIGIN: &str = "https://api.minimax.io";
+
+/// Where an operator mints the api key this provider authenticates with. The
+/// token-plan endpoint reads the Subscription Key (`sk-cp-…`), minted on the
+/// payment/token-plan page; the basic-information page this used to name is
+/// the pay-as-you-go key page, a different credential for a different billing
+/// mode (the vendor's quickstart-preparation guide splits the two).
+pub(super) const CONSOLE_URL: &str = "https://platform.minimax.io/user-center/payment/token-plan";
+
+const REMAINS_PATH: &str = "/v1/token_plan/remains";
+
+/// The plan bucket Claude Code's completions bill against — the one whose
+/// windows become bars. Every other bucket (`video`) rides as a row only.
+const CLAUDE_CODE_BUCKET: &str = "general";
+
+pub(super) fn matches_base_url(url: &str) -> bool {
+    super::url_matches_host(url, ORIGIN)
+}
+
+pub(super) fn fetch(api_key: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
+    let text = super::get_json(&format!("{ORIGIN}{REMAINS_PATH}"), api_key)?;
+    parse(&text)
+}
+
+/// The in-band codes that mean the api key itself is dead, mapped to
+/// [`ThirdPartyError::AuthExpired`] so a rejected key stops polling and
+/// renders `(key rejected)` like every other endpoint: `1004` authentication
+/// failed, `2049` invalid api key (the observed answer on this host). Every
+/// other non-zero code stays a plain failure — a rate limit or an empty
+/// balance has its own recovery and must not suppress the cadence.
+const AUTH_EXPIRED_CODES: [i64; 2] = [1004, 2049];
+
+/// Body → stats, split from HTTP for testability. The in-band verdict gates
+/// everything: `base_resp.status_code` is MiniMax's own result and rides an
+/// HTTP 200 — a rejected key answers 200 with a non-zero code, so the
+/// transport status alone would publish an empty plan as a healthy one. The
+/// envelope is NON-defaulted for the same reason: a 200 body without it is no
+/// verdict at all, and deserializing one to success would publish that healthy
+/// empty plan (cache overwritten, `Fresh`-stamped, and the walk's windows for
+/// the account removed) — every sibling provider fails closed on a missing
+/// verdict.
+fn parse(text: &str) -> Result<ThirdPartyStats, ThirdPartyError> {
+    let body: RemainsResponse = serde_json::from_str(text).map_err(|_| ThirdPartyError::Parse)?;
+    match body.base_resp.status_code {
+        0 => Ok(stats(&body.model_remains)),
+        code if AUTH_EXPIRED_CODES.contains(&code) => Err(ThirdPartyError::AuthExpired),
+        _ => Err(ThirdPartyError::Status),
+    }
+}
+
+/// Pure `model_remains[]` → bars + rows, split from HTTP for testability.
+fn stats(models: &[ModelRemains]) -> ThirdPartyStats {
+    ThirdPartyStats {
+        is_available: true,
+        rows: rows(models),
+        bars: bars(models),
+        // The response names no plan tier — the endpoint path is the only
+        // "token plan" in it, and inventing a label from a path would put a
+        // word in the vendor's mouth on every account.
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// The bucket whose windows become bars: `general` when the account has one,
+/// else a lone bucket (an account entitled to exactly one product cannot be
+/// ambiguous). An account carrying several buckets and no `general` yields no
+/// bars rather than a guess about which one Claude Code spends.
+fn bar_bucket(models: &[ModelRemains]) -> Option<&ModelRemains> {
+    models
+        .iter()
+        .find(|m| m.model_name == CLAUDE_CODE_BUCKET)
+        .or(match models {
+            [only] => Some(only),
+            _ => None,
+        })
+}
+
+/// 5h + 7d bars off the Claude Code bucket. MiniMax reports what is LEFT, so
+/// each percentage is inverted into the utilization every other provider's bar
+/// carries; a bucket missing one of the two contributes only the other.
+fn bars(models: &[ModelRemains]) -> Vec<UsageBar> {
+    let Some(m) = bar_bucket(models) else {
+        return Vec::new();
+    };
+    let mut bars = Vec::new();
+    if let Some(pct) = utilization(m.current_interval_remaining_percent) {
+        bars.push(UsageBar {
+            label: LABEL_5H.to_string(),
+            pct,
+            resets_at: m.end_time.map(ms_to_iso),
+            used: None,
+            total: None,
+        });
+    }
+    if let Some(pct) = utilization(m.current_weekly_remaining_percent) {
+        bars.push(UsageBar {
+            label: LABEL_7D.to_string(),
+            pct,
+            resets_at: m.weekly_end_time.map(ms_to_iso),
+            used: None,
+            total: None,
+        });
+    }
+    bars
+}
+
+/// One row per plan bucket, so an account's whole entitlement is visible even
+/// though only [`CLAUDE_CODE_BUCKET`] draws bars. The row states what is LEFT,
+/// matching the vendor's own console wording rather than the bars' inverted
+/// figure — the label says `remaining`, so the two never read as contradicting
+/// each other.
+fn rows(models: &[ModelRemains]) -> Vec<StatRow> {
+    if models.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = vec![StatRow {
+        label: "remaining".to_string(),
+        value: String::new(),
+        kind: StatRowKind::Heading,
+    }];
+    for m in models {
+        let pct = |p: Option<i64>| match p {
+            Some(p) => format!("{p}%"),
+            None => "-".to_string(),
+        };
+        // Each bucket's windows are its own lengths — the `video` interval is
+        // 24h where `general`'s is 5h — so the shorthand is derived from the
+        // instants the response itself carries rather than printed as the 5h/7d
+        // the bars follow. A response omitting them falls back to those labels:
+        // they still name the windows by role for the bucket the bars read. A
+        // STATED span the row has no shorthand for (a 90-minute window) prints
+        // no length at all — a length the response itself contradicts is worse
+        // than none.
+        let interval = match (m.start_time, m.end_time) {
+            (Some(_), Some(_)) => window_label(m.start_time, m.end_time),
+            _ => Some(LABEL_5H.to_string()),
+        };
+        let weekly = match (m.weekly_start_time, m.weekly_end_time) {
+            (Some(_), Some(_)) => window_label(m.weekly_start_time, m.weekly_end_time),
+            _ => Some(LABEL_7D.to_string()),
+        };
+        let span = |label: Option<String>, pct: String| match label {
+            Some(l) => format!("{l} {pct}"),
+            None => pct,
+        };
+        rows.push(StatRow {
+            label: m.model_name.clone(),
+            value: format!(
+                "{} · {}",
+                span(interval, pct(m.current_interval_remaining_percent)),
+                span(weekly, pct(m.current_weekly_remaining_percent))
+            ),
+            // A spent bucket is the one figure a reader is scanning for.
+            kind: match m.current_interval_remaining_percent {
+                Some(0) => StatRowKind::Danger,
+                _ => StatRowKind::Body,
+            },
+        });
+    }
+    rows
+}
+
+/// Remaining percentage → utilization, clamped into 0..=100. `None` for an
+/// absent figure, so a bucket reporting nothing yields no bar rather than a
+/// full-headroom one.
+fn utilization(remaining_pct: Option<i64>) -> Option<f64> {
+    remaining_pct.map(|r| (100.0 - r as f64).clamp(0.0, 100.0))
+}
+
+/// A window's length as a row spells it, derived from the instants the
+/// response carries: `5h` for `general`'s interval, `24h` for `video`'s, `7d`
+/// for the shared week; spans of whole days at two days or more spell in days,
+/// any other whole number of hours in hours. `None` when the span is missing
+/// or not a whole number of hours — a shape the row has no shorthand for and
+/// must not guess at.
+fn window_label(start_ms: Option<i64>, end_ms: Option<i64>) -> Option<String> {
+    let secs = end_ms?.checked_sub(start_ms?)? / 1000;
+    if secs >= 48 * 3600 && secs % 86_400 == 0 {
+        Some(format!("{}d", secs / 86_400))
+    } else if secs >= 3600 && secs % 3600 == 0 {
+        Some(format!("{}h", secs / 3600))
+    } else {
+        None
+    }
+}
+
+// ── Wire types ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct RemainsResponse {
+    #[serde(default)]
+    model_remains: Vec<ModelRemains>,
+    // Non-defaulted: this is the verdict, the one field a healthy empty plan
+    // cannot be told apart on, so a body without it fails closed (see `parse`).
+    base_resp: BaseResp,
+}
+
+/// MiniMax's in-band result envelope: `status_code` 0 is success, and it rides
+/// an HTTP 200 even for a rejected key.
+#[derive(Debug, Deserialize)]
+struct BaseResp {
+    status_code: i64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ModelRemains {
+    #[serde(default)]
+    model_name: String,
+    /// Start of the rolling interval window, epoch-ms.
+    #[serde(default)]
+    start_time: Option<i64>,
+    /// End of the rolling interval window, epoch-ms.
+    #[serde(default)]
+    end_time: Option<i64>,
+    /// Start of the weekly window, epoch-ms.
+    #[serde(default)]
+    weekly_start_time: Option<i64>,
+    /// End of the weekly window, epoch-ms.
+    #[serde(default)]
+    weekly_end_time: Option<i64>,
+    /// Percentage of the interval window still available (100 = untouched).
+    #[serde(default)]
+    current_interval_remaining_percent: Option<i64>,
+    /// Percentage of the weekly window still available.
+    #[serde(default)]
+    current_weekly_remaining_percent: Option<i64>,
+}
+
+#[cfg(test)]
+#[path = "../../tests/inline/providers_minimax.rs"]
+mod tests;

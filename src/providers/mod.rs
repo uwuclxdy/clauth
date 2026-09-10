@@ -23,8 +23,9 @@
 //!    than a generic failure, which is what stops the cadence and tells the
 //!    operator to re-authenticate instead of waiting. The shared `get_json`
 //!    already maps a 401 to it — a dead api key has no refresh path either — so
-//!    a provider only needs to produce the verdict itself when its credential
-//!    is session-shaped (Alibaba) and the death arrives in an HTTP 200 body.
+//!    a provider only needs to produce the verdict itself when the death
+//!    arrives in an HTTP 200 body: Alibaba's session verdict and MiniMax's
+//!    in-band dead-key codes.
 //!
 //! No render-layer changes needed — [`ThirdPartyStats`] carries provider-agnostic
 //! [`UsageBar`]s (percentage windows) and [`StatRow`]s (text), which
@@ -35,6 +36,7 @@
 pub(crate) mod alibaba;
 mod deepseek;
 mod generic;
+mod minimax;
 mod openrouter;
 mod zai;
 
@@ -127,6 +129,7 @@ pub(crate) enum Provider {
     Zai,
     Alibaba,
     OpenRouter,
+    MiniMax,
 }
 
 impl Provider {
@@ -140,6 +143,8 @@ impl Provider {
             Some(Self::Alibaba)
         } else if openrouter::matches_base_url(url) {
             Some(Self::OpenRouter)
+        } else if minimax::matches_base_url(url) {
+            Some(Self::MiniMax)
         } else {
             None
         }
@@ -151,23 +156,24 @@ impl Provider {
             Self::Zai => zai::DISPLAY_NAME,
             Self::Alibaba => alibaba::DISPLAY_NAME,
             Self::OpenRouter => openrouter::DISPLAY_NAME,
+            Self::MiniMax => minimax::DISPLAY_NAME,
         }
     }
 
     /// Whether this provider publishes usage windows of its own (percentage
-    /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai` and
-    /// `Alibaba` do; `DeepSeek` and `OpenRouter` publish a wallet. The MCP
-    /// headroom clause denies a 5h/7d limit only where it knows the provider
-    /// has none: a windows-publishing provider HAS the limits even when one
-    /// cached response carried no bars.
+    /// bars under 5h/7d-style labels) rather than a scalar balance. `Zai`,
+    /// `Alibaba` and `MiniMax` do; `DeepSeek` and `OpenRouter` publish a
+    /// wallet. The MCP headroom clause denies a 5h/7d limit only where it
+    /// knows the provider has none: a windows-publishing provider HAS the
+    /// limits even when one cached response carried no bars.
     pub(crate) fn publishes_windows(self) -> bool {
-        matches!(self, Self::Zai | Self::Alibaba)
+        matches!(self, Self::Zai | Self::Alibaba | Self::MiniMax)
     }
 
     /// The vendor page where this endpoint's api key is minted, for a surface
     /// that offers to open it. [`alibaba`] answers with four different pages,
     /// since its four endpoints are two products across two consoles; the other
-    /// three have one page each.
+    /// four have one page each.
     ///
     /// `None` means the `base_url` doesn't belong to `self`, which is why every
     /// arm re-checks it rather than only the arm that has to. Returning a page
@@ -181,6 +187,7 @@ impl Provider {
             Self::OpenRouter => {
                 openrouter::matches_base_url(base_url).then_some(openrouter::CONSOLE_URL)
             }
+            Self::MiniMax => minimax::matches_base_url(base_url).then_some(minimax::CONSOLE_URL),
         }
     }
 
@@ -198,6 +205,7 @@ impl Provider {
             // The api key is not a quota credential here — the console session is.
             Self::Alibaba => alibaba::fetch(console),
             Self::OpenRouter => openrouter::fetch(api_key),
+            Self::MiniMax => minimax::fetch(api_key),
         }
     }
 }
@@ -234,6 +242,7 @@ impl ThirdPartyTarget {
                 // One of four console gateways, chosen by region + site.
                 Provider::Alibaba => alibaba::gateway_origin(console.as_ref()).to_string(),
                 Provider::OpenRouter => openrouter::ORIGIN.to_string(),
+                Provider::MiniMax => minimax::ORIGIN.to_string(),
             },
             Self::Generic { base_url } => api_origin(base_url).unwrap_or_else(|| base_url.clone()),
         }
@@ -286,6 +295,13 @@ pub(crate) fn api_origin(base_url: &str) -> Option<String> {
         &base_url[..scheme_end],
         &after[..auth_end]
     ))
+}
+
+/// Epoch-ms → ISO-8601 UTC: the reset-instant shape every provider's windows
+/// arrive in (z.ai `nextResetTime`, Alibaba `per1WeekResetTime`, MiniMax
+/// `end_time`), one helper so the conversions cannot drift apart.
+pub(crate) fn ms_to_iso(ms: i64) -> String {
+    crate::usage::epoch_secs_to_iso(ms / 1000)
 }
 
 /// Fetch usage for a third-party target. `hint` is the endpoint path that last
@@ -387,6 +403,51 @@ impl ThirdPartyStats {
     }
 }
 
+impl ThirdPartyStats {
+    /// These stats as the [`UsageInfo`] the scheduling layer reads, or `None`
+    /// when this provider published no window clauth recognises.
+    ///
+    /// A provider bar and an OAuth window are the same measurement — a rolling
+    /// percentage with a reset instant — so mapping the two labels the chain
+    /// actually judges (`5h`, `7d`) lets a third-party member take part in
+    /// auto-switch, `clauth list`'s used columns, and the published
+    /// `status.json` `windows` array with no per-provider branching downstream.
+    ///
+    /// Two deliberate exclusions:
+    ///
+    /// - Any other label (z.ai's `30d`) is dropped rather than folded into
+    ///   [`UsageInfo::weekly_scoped`]. That vec means per-MODEL weekly windows
+    ///   and carries the `check_scoped` gate's semantics; a monthly account-wide
+    ///   ceiling landing there would block the member as though one model were
+    ///   capped, which is neither what it measures nor what the gate documents.
+    /// - `best_effort` stats — the generic scanner's guess at an unknown
+    ///   endpoint's shape — never become windows. A misread field there is a
+    ///   figure nobody verified, and the cost of believing it is an account
+    ///   parked out of the rotation on a number the vendor never published.
+    ///   They keep rendering as bars, which is a claim about the display only.
+    pub(crate) fn to_usage_info(&self) -> Option<crate::usage::UsageInfo> {
+        if self.best_effort {
+            return None;
+        }
+        let window = |label: &str| {
+            self.bars
+                .iter()
+                .find(|b| b.label == label)
+                .map(|b| crate::usage::UsageWindow {
+                    utilization: b.pct.clamp(0.0, 100.0),
+                    resets_at: b.resets_at.clone(),
+                })
+        };
+        let five_hour = window(crate::usage::LABEL_5H);
+        let seven_day = window(crate::usage::LABEL_7D);
+        (five_hour.is_some() || seven_day.is_some()).then(|| crate::usage::UsageInfo {
+            five_hour,
+            seven_day,
+            ..Default::default()
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StatRow {
     /// Left-hand label. Empty for single-line messages (e.g. "unavailable").
@@ -439,9 +500,9 @@ pub(crate) enum ThirdPartyError {
     /// refresh path exists — only an operator re-login clears it. Distinct from
     /// `Status` because retrying on the cadence can never succeed: the scheduler
     /// session-suppresses this profile and the UI names the login instead of a
-    /// network fault. Two producers: a 401 from the shared `get_json` (a dead
-    /// api key), and Alibaba's 48-hour console session (the verdict rides an
-    /// HTTP 200 body).
+    /// network fault. Three producers: a 401 from the shared `get_json` (a dead
+    /// api key), Alibaba's 48-hour console session, and MiniMax's in-band
+    /// dead-key codes — the latter two ride HTTP 200 bodies.
     AuthExpired,
 }
 

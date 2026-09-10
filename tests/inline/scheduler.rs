@@ -1218,6 +1218,7 @@ fn bootstrap_legs_keep_separate_stamps_for_a_hybrid_profile() {
     );
     super::bootstrap_third_party(
         &tp_store,
+        &store,
         &tp_status,
         &last_fetched,
         &[tp_entry("hybrid")],
@@ -5222,7 +5223,8 @@ fn bootstrap_third_party_seeds_any_cache() {
     use std::time::{Duration, SystemTime};
 
     use super::{
-        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, bootstrap_third_party, now_ms,
+        FetchStatus, ThirdPartyStatusStore, ThirdPartyUsageStore, UsageStore,
+        bootstrap_third_party, now_ms,
     };
     use crate::profile::profile_subpath;
     use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, write_profile_cache};
@@ -5233,6 +5235,9 @@ fn bootstrap_third_party_seeds_any_cache() {
     let store: ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    // The OAuth-shaped map the auto-switch walk reads: a seeded third-party
+    // account has to reach it too, or its window is invisible to the chain.
+    let usage_store_for_mirror: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
 
     let stats = |pct: f64| ThirdPartyStats {
         is_available: true,
@@ -5249,7 +5254,7 @@ fn bootstrap_third_party_seeds_any_cache() {
         best_effort: false,
     };
     // Fresh cache (just written) seeds `Fresh`; a 2h-old cache seeds `Cached`.
-    crate::testutil::register_names(&["cached", "stale"]);
+    crate::testutil::register_names(&["cached", "stale", "windowless"]);
     write_profile_cache(
         &crate::profile::ProfileName::from("cached"),
         THIRD_PARTY_CACHE_FILE,
@@ -5259,6 +5264,27 @@ fn bootstrap_third_party_seeds_any_cache() {
         &crate::profile::ProfileName::from("stale"),
         THIRD_PARTY_CACHE_FILE,
         &stats(20.0),
+    );
+    // A best-effort cache the derivation declines: whatever the mirror held
+    // for the account must be REMOVED, not left standing — a provider that
+    // stopped publishing windows must not keep answering the walk with a
+    // frozen figure.
+    let mut windowless = stats(50.0);
+    windowless.best_effort = true;
+    write_profile_cache(
+        &crate::profile::ProfileName::from("windowless"),
+        THIRD_PARTY_CACHE_FILE,
+        &windowless,
+    );
+    usage_store_for_mirror.lock().unwrap().insert(
+        "windowless".to_string(),
+        crate::usage::UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 50.0,
+                resets_at: None,
+            }),
+            ..Default::default()
+        },
     );
     let stale_path = profile_subpath(
         &crate::profile::ProfileName::from("stale"),
@@ -5270,9 +5296,15 @@ fn bootstrap_third_party_seeds_any_cache() {
         SystemTime::now() - Duration::from_secs(2 * 3600),
     );
 
-    let entries = vec![tp_entry("cached"), tp_entry("stale"), tp_entry("missing")];
+    let entries = vec![
+        tp_entry("cached"),
+        tp_entry("stale"),
+        tp_entry("windowless"),
+        tp_entry("missing"),
+    ];
     bootstrap_third_party(
         &store,
+        &usage_store_for_mirror,
         &status,
         &last_fetched,
         &entries,
@@ -5290,6 +5322,31 @@ fn bootstrap_third_party_seeds_any_cache() {
     assert!(
         !store.lock().unwrap().contains_key("missing"),
         "a profile with no cache is left for the scheduler"
+    );
+    assert_eq!(
+        usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .get("cached")
+            .and_then(|u| u.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(12.0),
+        "the seeded window is mirrored into the map auto-switch reads"
+    );
+    assert!(
+        !usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .contains_key("missing"),
+        "a profile with no cache contributes no mirrored window either"
+    );
+    assert!(
+        !usage_store_for_mirror
+            .lock()
+            .unwrap()
+            .contains_key("windowless"),
+        "a cache the derivation declines REMOVES the mirrored entry, so a \
+         stopped publication stops answering the walk"
     );
     assert_eq!(
         status.lock().unwrap().get("cached").copied(),
@@ -5320,6 +5377,42 @@ fn bootstrap_third_party_seeds_any_cache() {
     assert!(
         stamp <= now && stamp >= now.saturating_sub(5_000),
         "the seeded third-party profile stamps last_fetched at the cache mtime"
+    );
+}
+
+/// The mirror's `None` arm on its own — the stale-cache guard half of
+/// `publish_third_party_windows`'s own doc, which the bootstrap test above
+/// drives only through a seeded cache: a provider that stopped publishing
+/// windows has no current reading, and a frozen entry would keep answering
+/// the walk with a figure nothing refreshes.
+#[test]
+fn a_none_derivation_removes_the_mirrored_window() {
+    use super::publish_third_party_windows;
+    use crate::profile::ProfileName;
+    use crate::usage::{UsageInfo, UsageWindow};
+
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let name = ProfileName::from("windowless");
+    let live = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 40.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    store
+        .lock()
+        .unwrap()
+        .insert("windowless".to_string(), live.clone());
+    publish_third_party_windows(&store, &name, None);
+    assert!(
+        !store.lock().unwrap().contains_key("windowless"),
+        "a stopped publication removes the entry the walk reads"
+    );
+    publish_third_party_windows(&store, &name, Some(live));
+    assert!(
+        store.lock().unwrap().contains_key("windowless"),
+        "a resumed publication re-inserts it"
     );
 }
 

@@ -314,7 +314,7 @@ fn a_body_whose_windows_all_lapsed_is_never_stale() {
     );
     match &windows {
         ProfileWindows::Oauth { usage, .. } => assert!(
-            crate::profile_json::oauth_windows(usage.as_deref().expect("a cache")).is_empty(),
+            crate::profile_json::usage_windows(usage.as_deref().expect("a cache")).is_empty(),
             "fixture control: the surfaces really do publish no row here",
         ),
         ProfileWindows::ThirdParty { .. } => panic!("an OAuth account"),
@@ -711,4 +711,66 @@ fn published_windows_drops_rows_whose_reset_has_passed() {
     // And the 7d leg drops ON ITS OWN, not only in the all-lapsed set: the
     // first fixture's live 7d proved the row exists on this body, so the drop
     // here is the 7d filter's own verdict.
+}
+
+/// The other direction of the converted-profile guard: an api-key account
+/// whose provider publishes windows carries them in `windows[]`, read from its
+/// own third-party cache through the same derivation the walk reads.
+#[test]
+fn published_windows_carries_a_third_party_accounts_provider_windows() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "zai-keyed".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("k".to_string()),
+    ))
+    .expect("save the profile");
+    crate::testutil::register_names(&["zai-keyed"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("zai-keyed"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar("5h", 62.0),
+            crate::testutil::bar("7d", 31.0),
+        ]),
+    );
+
+    let windows = published_windows(&crate::profile::ProfileName::from("zai-keyed"));
+    assert_eq!(windows.len(), 2, "both provider windows publish");
+    assert_eq!(windows[0].label, "5h");
+    assert_eq!(windows[0].utilization_pct, 62.0);
+    assert_eq!(windows[1].label, "7d");
+    assert_eq!(windows[1].utilization_pct, 31.0);
+}
+
+/// A provider bar whose `resets_at` has passed derives a row that then DROPS:
+/// the derived window passes through the same liveness filter the OAuth row
+/// does, so a lapsed provider window publishes no stale figure while its
+/// OAuth sibling renders dashes for the same shape.
+#[test]
+fn published_windows_drops_a_lapsed_provider_bar() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_profile(&Profile::new(
+        "zai-old".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("k".to_string()),
+    ))
+    .expect("save the profile");
+    crate::testutil::register_names(&["zai-old"]);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("zai-old"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![
+            crate::testutil::bar_reset_in("5h", 62.0, -3_600),
+            crate::testutil::bar_reset_in("7d", 31.0, 86_400),
+        ]),
+    );
+
+    let windows = published_windows(&crate::profile::ProfileName::from("zai-old"));
+    assert_eq!(
+        windows.len(),
+        1,
+        "only the live 7d row survives: {windows:?}"
+    );
+    assert_eq!(windows[0].label, "7d");
 }

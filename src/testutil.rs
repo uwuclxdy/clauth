@@ -1252,3 +1252,48 @@ impl Drop for SlowClaude<'_> {
         }
     }
 }
+
+// ── Third-party stats fixtures ────────────────────────────────────────────────
+
+/// The `ThirdPartyStats` shell every typed-provider fixture builds: available,
+/// no rows, typed (never best-effort), carrying exactly the given bars — one
+/// definition so the non-bar fields cannot drift between test modules.
+pub(crate) fn stats_with_bars(
+    bars: Vec<crate::providers::UsageBar>,
+) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars,
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// One unstamped percentage bar — the shape a provider's `5h`/`7d` windows
+/// arrive as. [`bar_reset_in`] stamps one when a test needs liveness to hold.
+pub(crate) fn bar(label: &str, pct: f64) -> crate::providers::UsageBar {
+    crate::providers::UsageBar {
+        label: label.to_string(),
+        pct,
+        resets_at: None,
+        used: None,
+        total: None,
+    }
+}
+
+/// [`bar`] with a `resets_at` the given seconds into the future — a live
+/// window, for the surfaces that judge liveness off the stamp.
+pub(crate) fn bar_reset_in(
+    label: &str,
+    pct: f64,
+    secs_in_future: i64,
+) -> crate::providers::UsageBar {
+    crate::providers::UsageBar {
+        resets_at: Some(crate::usage::epoch_secs_to_iso(
+            crate::usage::now_epoch_secs() + secs_in_future,
+        )),
+        ..bar(label, pct)
+    }
+}

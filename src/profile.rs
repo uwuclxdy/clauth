@@ -2079,10 +2079,11 @@ fn usage_cache_is_third_party(
 /// profile keeps the ENDPOINT on both readers (the pair never reaches it),
 /// but the classification still disagrees: this read sees no pair and answers
 /// third-party where the adopting load answers OAuth-cache. Only the
-/// callers that skip the full load — [`crate::mcp::digest`]'s sample and
-/// [`crate::profile_json::published_windows`] — can observe it; every other caller runs
+/// callers that skip the full load — [`crate::mcp::digest`]'s sample,
+/// [`crate::profile_json::published_windows`], and the MCP roster's
+/// `load_windows` — can observe it; every other caller runs
 /// `load_config` first, and `recover_pending_credentials` consumes the sidecar —
-/// and it costs at most one digest call reporting no refresh. Pinned, in that
+/// and it costs at most one digest call or one roster row reporting no refresh. Pinned, in that
 /// direction, by
 /// `a_staged_pair_is_the_one_state_the_lock_free_read_reads_differently` (both
 /// spellings), and pinned agreeing everywhere else by
@@ -2272,6 +2273,14 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     } else {
         None
     };
+    // A third-party account's windows ARE its usage snapshot, so seed `usage`
+    // from them at the same boundary. Every OAuth account keeps `None` here and
+    // is filled by the usage store as before — this load has no OAuth cache to
+    // read, and `third_party_usage` is `Some` only where that store never had an
+    // entry to begin with, so the two can't overwrite each other.
+    let usage = third_party_usage
+        .as_ref()
+        .and_then(crate::providers::ThirdPartyStats::to_usage_info);
 
     let profile = Profile {
         name: name.clone(),
@@ -2307,7 +2316,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
         disabled: config.disabled,
         console: console_credential(&config.console),
         credentials: slot(credentials),
-        usage: None,
+        usage,
         fetch_status: None,
         usage_stale: false,
         provider,

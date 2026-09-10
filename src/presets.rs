@@ -81,6 +81,17 @@ const BUILTINS: &[Builtin] = &[
         pin_every_tier: false,
     },
     Builtin {
+        name: "MiniMax",
+        // MiniMax fronts the Anthropic-shaped surface at `/anthropic`, so CC's
+        // `/v1/messages` lands on `/anthropic/v1/messages` (platform.minimax.io,
+        // "Claude Code" integration guide). The China-region host is a separate
+        // account and endpoint; only the international one ships, matching what
+        // `providers::minimax` claims.
+        base_url: "https://api.minimax.io/anthropic",
+        model: "MiniMax-M3",
+        pin_every_tier: false,
+    },
+    Builtin {
         name: "Qwen-TokenPlan-Intl",
         base_url: "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
         model: "qwen3.8-max",

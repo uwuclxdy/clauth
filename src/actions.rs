@@ -627,6 +627,18 @@ pub(crate) fn edit_profile_endpoint(
             .and_then(crate::providers::Provider::from_base_url);
         if provider != profile.provider || (provider.is_some() && profile.api_key != old_api_key) {
             profile.third_party_usage = None;
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
+            // a daemon boot/standby promotion, or the stood-down TUI's
+            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
+            // the reseed; a LIVE process's in-memory mirror entry survives
+            // until the profile's next fetch (≤ one interval; until restart
+            // if the edit left it no fetch leg) — no cross-process clear
+            // exists.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
         }
         // The console session is a FOURTH credential and it means nothing off
         // Alibaba: left behind, an endpoint move parks a live Model Studio
@@ -736,6 +748,18 @@ pub(crate) fn edit_profile_preset(
             .and_then(Provider::from_base_url);
         if provider != profile.provider {
             profile.third_party_usage = None;
+            // The disk cache holds the same stale figures, and
+            // `bootstrap_third_party` reseeds them `Fresh` — on a restart,
+            // a daemon boot/standby promotion, or the stood-down TUI's
+            // per-tick `hydrate_from_daemon_caches`. Dropping the file closes
+            // the reseed; a LIVE process's in-memory mirror entry survives
+            // until the profile's next fetch (≤ one interval; until restart
+            // if the edit left it no fetch leg) — no cross-process clear
+            // exists.
+            crate::profile_cache::remove_profile_cache(
+                name,
+                crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            );
         }
         profile.provider = provider;
         save_profile(profile)?;

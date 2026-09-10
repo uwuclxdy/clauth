@@ -2,9 +2,11 @@
 //! shape `clauth status --json` prints (one code path builds both, so they
 //! cannot drift). Contract: wiki/Daemon.md.
 //!
-//! Usage windows/tier come from the on-disk `usage_cache.json` (written by the
-//! scheduler), so this is process-independent: it returns the last-persisted
-//! numbers whether or not a scheduler is live. Two fields — `fetch_status` and
+//! Usage windows/tier come from the on-disk usage caches — `usage_cache.json`
+//! for an OAuth account, `third_party_cache.json` for an api-key one — written
+//! by the scheduler, so this is process-independent: it returns the
+//! last-persisted numbers whether or not a scheduler is live. Two fields —
+//! `fetch_status` and
 //! `next_refresh_at` — live only in the scheduler's in-memory stores; when a
 //! live daemon passes [`LiveSignals`] they come from there, otherwise they are
 //! derived from the cache-file mtime so the single-shot `status --json` still
@@ -206,7 +208,9 @@ pub(crate) struct ProfileEntry {
     /// The chain-membership object (`position` / `threshold` / `armed`), `None`
     /// when not a chain member.
     pub(crate) fallback: Option<serde_json::Value>,
-    /// The OAuth 5h/7d usage rows; empty when the profile has no OAuth cache.
+    /// The 5h/7d usage rows: an OAuth account's own windows, or an api-key
+    /// account's provider-derived ones. Empty when the cache behind them
+    /// holds none.
     pub(crate) windows: Vec<Window>,
     /// The third-party availability object (`available`), `None` for OAuth
     /// accounts.

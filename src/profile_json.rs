@@ -318,7 +318,7 @@ fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
 
 /// One published OAuth window row — the `{label, utilization_pct, resets_at}`
 /// spelling of a 5h, 7d, or per-model weekly window. Both writers
-/// ([`oauth_windows`] → the daemon's `status.json` feed and the MCP payloads)
+/// ([`usage_windows`] → the daemon's `status.json` feed and the MCP payloads)
 /// and the reader (`clauth list`'s 5h/7d columns) derive from this one struct,
 /// so a reader's key spelling cannot drift from what a writer emits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,7 +330,7 @@ pub(crate) struct Window {
 
 /// Whether one window row is still a CURRENT reading: a parseable `resets_at`
 /// in the future, or no parseable stamp at all. This is the row-level half of
-/// the [`oauth_windows`] drop (#74), shared with the MCP `5h/7d_used_pct`
+/// the [`usage_windows`] drop (#74), shared with the MCP `5h/7d_used_pct`
 /// fields and the roster's own rank, so one lapsed window cannot read as a
 /// spent account through one surface while the row it came from drops through
 /// another. Deliberately looser than [`crate::usage::five_hour_live`], which
@@ -368,14 +368,16 @@ pub(crate) fn usage_bar_is_live(b: &crate::providers::UsageBar) -> bool {
         .is_none_or(|resets_at| crate::usage::now_epoch_secs() < resets_at)
 }
 
-/// The [`Window`] rows of an OAuth usage read — 5h, 7d, then one entry per
-/// weekly model window (`7d <model>`). A window whose `resets_at` has passed
+/// The [`Window`] rows of a usage read — 5h, 7d, then one entry per weekly
+/// model window (`7d <model>`). Serves both cache shapes: an OAuth read
+/// directly, and a third-party read through the derivation
+/// [`published_windows`] maps it with. A window whose `resets_at` has passed
 /// drops here (#74): past its reset the figure is the previous window's last
 /// utilization, not a current reading, and a lapsed 5h at `100%` read as a
 /// permanently spent account. A window with no parseable `resets_at` stays —
 /// absence of a stamp is missing data, not a lapsed window, and the row
 /// without it is the honest shape every pre-reset row already publishes.
-pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
+pub(crate) fn usage_windows(usage: &UsageInfo) -> Vec<Window> {
     usage
         .windows()
         .into_iter()
@@ -391,7 +393,7 @@ pub(crate) fn oauth_windows(usage: &UsageInfo) -> Vec<Window> {
 /// The headroom a THIRD-PARTY account's own cache holds, as the two figure
 /// strings `clauth list`'s 5h/7d columns render: the provider's own usage bars
 /// under those exact labels first (a LIVE bar's figures; a lapsed one is the
-/// previous window's last reading and drops, the same call [`oauth_windows`]
+/// previous window's last reading and drops, the same call [`usage_windows`]
 /// makes), falling back to the first FUNDED wallet's balance — the same
 /// fall-through the MCP roster's rank uses, so a bar the roster ranks the
 /// account on cannot render as dashes here and vice versa. A live bar under a
@@ -437,24 +439,32 @@ pub(crate) fn third_party_columns(p: &Profile) -> (Option<String>, Option<String
     }
 }
 
-/// The profile's OAuth usage windows, read fresh from the disk cache; empty
-/// when there is no cache. The rows of the published `status.json` `windows`
-/// array — hence this flat spelling rather than [`ProfileWindows`]'s
-/// discriminated one, which the MCP surface renders.
+/// The profile's usage windows, read fresh from the disk cache; empty when
+/// there is no cache. The rows of the published `status.json` `windows` array —
+/// hence this flat spelling rather than [`ProfileWindows`]'s discriminated one,
+/// which the MCP surface renders.
 ///
-/// Empty TOO for an account whose figures live in the third-party cache, the
-/// shared cache selector's name-only form
-/// ([`crate::profile::stored_usage_cache_is_third_party`]): whatever
-/// `usage_cache.json` still holds for one is a leftover from an earlier OAuth
-/// life, and publishing it rendered a stale 100% Anthropic window beside
-/// `"third_party":{"available":true}` for an account with no Anthropic window.
+/// Each account is read from ITS OWN cache, on the shared cache selector's
+/// name-only form ([`crate::profile::stored_usage_cache_is_third_party`]) — an
+/// api-key account's windows come from `third_party_cache.json` via
+/// [`ThirdPartyStats::to_usage_info`], never from `usage_cache.json`. Reading
+/// the OAuth file for one published a stale 100% Anthropic window beside
+/// `"third_party":{"available":true}`, a leftover from an earlier OAuth life
+/// describing a window that account no longer has; keeping the two files apart
+/// is what makes publishing the third-party figures safe rather than a second
+/// way to render that same leftover.
 pub(crate) fn published_windows(name: &ProfileName) -> Vec<Window> {
     if crate::profile::stored_usage_cache_is_third_party(name) {
-        return Vec::new();
+        return load_profile_cache::<ThirdPartyStats>(name, THIRD_PARTY_CACHE_FILE)
+            .as_ref()
+            .and_then(ThirdPartyStats::to_usage_info)
+            .as_ref()
+            .map(usage_windows)
+            .unwrap_or_default();
     }
     load_profile_cache::<UsageInfo>(name, USAGE_CACHE_FILE)
         .as_ref()
-        .map(oauth_windows)
+        .map(usage_windows)
         .unwrap_or_default()
 }
 

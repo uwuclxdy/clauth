@@ -26,10 +26,9 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
 use crate::oauth_login::percent_encode;
 use crate::profile::{ConsoleCredential, ConsoleSite};
-use crate::usage::epoch_secs_to_iso;
 
 pub(super) const DISPLAY_NAME: &str = "Alibaba Model Studio";
 
@@ -366,7 +365,7 @@ fn window_bar(
     Some(UsageBar {
         label: label.to_string(),
         pct,
-        resets_at: reset_ms.map(|ms| epoch_secs_to_iso(ms / 1000)),
+        resets_at: reset_ms.map(ms_to_iso),
         // The response carries no absolute consumption — it is the tier's
         // allowance times the reported fraction, so it exists only when the
         // quota-config leg answered.

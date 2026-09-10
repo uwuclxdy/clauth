@@ -41,7 +41,7 @@ use crate::outln;
 use crate::profile::{AppConfig, Profile, ProfileName, load_config};
 use crate::profile_cache::{THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache};
 use crate::profile_json::{
-    ProfileWindows, oauth_windows, profile_windows, profile_windows_for, provider_label, tier_label,
+    ProfileWindows, profile_windows, profile_windows_for, provider_label, tier_label, usage_windows,
 };
 use crate::providers::ThirdPartyStats;
 use crate::runtime::{Isolation, ProfileRuntime};
@@ -164,7 +164,7 @@ fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
         // `unknown`.
         ProfileWindows::Oauth { usage, .. } => serde_json::json!({
             "kind": "oauth",
-            "windows": usage.as_deref().map(oauth_windows).unwrap_or_default(),
+            "windows": usage.as_deref().map(usage_windows).unwrap_or_default(),
         }),
         ProfileWindows::ThirdParty {
             stats, provider, ..
