@@ -159,6 +159,8 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] delegate_dot` | bool | `true` | report `clauth_delegate=working\|idle` pane metadata during delegate runs |
 | `[herdr] delegate_row_text` | bool | `false` | append `$clauth_delegate` to the sidebar row `install` writes |
 
+A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
+
 ## `config.toml`
 
 | Key | Type | Default | Controls |
