@@ -1,18 +1,23 @@
 //! KC-1 — Keychain read/write/delete round-trip. Uses a **throwaway service name**
 //! unique to this process; it never touches the real `Claude Code-credentials`
-//! item. It is the ONLY test that drives the real macOS Keychain (via the
-//! `/usr/bin/security` CLI the shipped write/delete path uses), so it is
-//! `#[ignore]`d: it still mutates the login Keychain (creates + deletes a
-//! throwaway item) as a side effect. Run it on demand instead:
-//!     cargo test keychain_round_trip -- --ignored
+//! item. The `#[ignore]`d tests in this file (KC-1, KC-3, KC-4, KC-5) are the
+//! only ones that drive the real macOS Keychain (via the `/usr/bin/security`
+//! CLI the shipped write/delete path uses), so each is `#[ignore]`d: they
+//! still mutate
+//! the login Keychain (create + delete throwaway items) as a side effect. Run
+//! them on demand instead:
+//!     cargo test keychain -- --ignored
 //! All other credential/divergence tests stay on the file model
 //! (`keychain::enabled()` is false under `cfg(test)`), so `cargo test` never
 //! touches the Keychain.
 
 use super::{
-    Keep, delete_at, keychain_service_for_config_dir, merge_and_put_at, merge_write, merged_blob,
-    put_blob_at, read_blob_at, run_with_deadline, security_quote,
+    Keep, PutTransport, SECURITY_ARGV_VALUE_MAX, SECURITY_STDIN_LINE_MAX,
+    add_generic_password_line, delete_at, keychain_service_for_config_dir, merge_and_put_at,
+    merge_write, merged_blob, put_blob_at, put_transport, read_blob_at, run_with_deadline,
+    security_quote,
 };
+use crate::logline::LogLines;
 use crate::profile::{ClaudeCredentials, OAuthToken};
 use std::path::Path;
 
@@ -488,4 +493,304 @@ fn keychain_service_canonicalization_resolves_dot_dot() {
         via_dotdot, direct,
         "`sub/..` must canonicalize to the parent directory"
     );
+}
+
+// ── KC-2: the transport ceilings (pure) ───────────────────────────────────────
+//
+// `security -i` reads ONE command per line into a bounded buffer. Past it the
+// value is silently cut and the tail parsed as another command, leaving the item
+// holding truncated JSON -- a destroyed login AND destroyed `mcpOAuth`. Harmless
+// while the mirror wrote a 1-2 KB login-only blob; reachable now that the blob
+// carries Claude Code's sibling keys. The boundary decision is pure, so both
+// ceilings are pinned without a Keychain.
+
+#[test]
+fn stdin_carries_a_line_up_to_the_ceiling() {
+    assert_eq!(
+        put_transport(SECURITY_STDIN_LINE_MAX, 100).expect("at the ceiling"),
+        PutTransport::Stdin,
+    );
+    assert_eq!(
+        put_transport(SECURITY_STDIN_LINE_MAX + 1, 100).expect("one past it"),
+        PutTransport::Argv,
+        "one byte past the ceiling must leave the stdin transport, not truncate",
+    );
+}
+
+#[test]
+fn argv_takes_over_up_to_its_own_ceiling() {
+    assert_eq!(
+        put_transport(1_000_000, SECURITY_ARGV_VALUE_MAX).expect("at the argv ceiling"),
+        PutTransport::Argv,
+    );
+    // Past the argv cap the write is refused outright: the cap holds a ~2x
+    // margin under the measured E2BIG break (which itself fails safe, leaving
+    // the item untouched), and a value that large is already pathological --
+    // its size is dominated by carried `mcpOAuth` entries.
+    assert!(put_transport(1_000_000, SECURITY_ARGV_VALUE_MAX + 1).is_err());
+}
+
+/// The ceiling is a measured fact of `security(1)`, not a tunable: the other
+/// transport tests key off `SECURITY_STDIN_LINE_MAX` symbolically, so a
+/// drifted constant passes them all — and one drifted to 4098+ routes
+/// over-cap lines through stdin where `security` truncates destructively.
+/// Pinned to literals instead, both directions. Measured on `mac-6`
+/// (macOS 26.5.2) 2026-09-01: a 4097-byte line including the `\n` (4096 of
+/// text) round-trips intact 6/6, a 4098-byte line truncates at 4096, so 4096
+/// incl `\n` (text <= 4095) is the safe key with 1-2 B of deliberate headroom.
+#[test]
+fn the_stdin_ceiling_is_pinned_to_the_measured_4096() {
+    assert_eq!(
+        put_transport(4096, 100).expect("a 4096-byte line resolves"),
+        PutTransport::Stdin,
+        "the constant drifted below 4096: conservative, but it abandons stdin for lines the \
+         probe measured as safe"
+    );
+    assert_eq!(
+        put_transport(4097, 100).expect("a 4097-byte line resolves"),
+        PutTransport::Argv,
+        "the constant drifted to 4097 or past: that spends the headroom under the destructive \
+         4098-byte break, and past 4097 truncation returns"
+    );
+}
+
+/// The refusal is the one user-facing string this module adds, and each clause
+/// is a distinct claim — the size, the cap, why stdin cannot carry it, the
+/// `mcpOAuth` remediation — so it is pinned by equality against a fixture that
+/// fixes both interpolated values as literals. A deleted clause, a reworded
+/// one, or a drifted `SECURITY_ARGV_VALUE_MAX` (the rendered literals no
+/// longer match) reds here instead of shipping silently.
+#[test]
+fn the_over_cap_refusal_names_the_size_the_cap_and_the_remediation() {
+    let err = put_transport(1_000_000, SECURITY_ARGV_VALUE_MAX + 1)
+        .expect_err("one byte past the argv cap must refuse");
+    assert_eq!(
+        err.to_string(),
+        "refusing to write a 524289-byte Keychain item: it is over the 524288-byte cap this \
+         writer keeps below the exec limit (the stdin transport would truncate it instead of \
+         failing). The item's size is dominated by the `mcpOAuth` entries carried beside the \
+         login; disable MCP servers or plugins that carry OAuth entries until the item shrinks \
+         below the cap",
+    );
+}
+
+/// One `mcpOAuth`-shaped sibling entry, sized like the real ones Claude Code
+/// writes (~420 escaped bytes each once quoting is applied).
+fn mcp_entry(n: usize) -> (String, serde_json::Value) {
+    (
+        format!("plugin:test:server{n}|{n:016x}"),
+        serde_json::json!({
+            "serverName": format!("plugin:test:server{n}"),
+            "serverUrl": format!("https://mcp.example{n}.com/mcp"),
+            "accessToken": "",
+            "discoveryState": {
+                "authorizationServerUrl": format!("https://mcp.example{n}.com"),
+                "resourceMetadataUrl":
+                    format!("https://mcp.example{n}.com/.well-known/oauth-protected-resource"),
+                "oauthMetadataFound": true
+            },
+            "clientId": format!("{n:0>36}"),
+            "issuer": format!("https://mcp.example{n}.com"),
+            "redirectUri": "http://localhost:3118/callback"
+        }),
+    )
+}
+
+/// An item whose composed `security -i` line exceeds that tool's 4096-byte input
+/// cap. `entries` of the shape above plus a login is what a real switch carries.
+fn oversized_item(entries: usize) -> serde_json::Value {
+    let mut mcp = serde_json::Map::new();
+    for n in 0..entries {
+        let (key, value) = mcp_entry(n);
+        mcp.insert(key, value);
+    }
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-OVERSIZE",
+            "refreshToken": "sk-ant-ort01-OVERSIZE",
+            "expiresAt": 1_900_000_000_000i64,
+            "scopes": ["user:inference", "user:profile"],
+            "subscriptionType": "max"
+        },
+        "mcpOAuth": mcp
+    })
+}
+
+// KC-3 -- the ceiling through the REAL `security`, on a throwaway service. Sized
+// like an operator carrying a dozen-plus OAuth MCP servers beside the login: the
+// case that used to come back truncated.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn a_blob_past_the_stdin_ceiling_round_trips_intact() {
+    let service = format!("clauth-ceiling-test-{}", std::process::id());
+    let account = "clauth-test-account";
+    delete_at(&service, account).expect("pre-clean");
+
+    // Sized by VALUE around the cap; every leg's composed LINE still lands
+    // past it — the 200-B access token, 74-B JSON scaffolding, 14 quote
+    // escapes and the line wrapper (87 B here; the service name carries the
+    // pid, so each digit of width moves it by one) add 375 B — so the loop
+    // drives the argv transport at increasing depths. The under-ceiling side
+    // of the boundary is KC-5's.
+    for value_len in [
+        SECURITY_STDIN_LINE_MAX - 200,
+        SECURITY_STDIN_LINE_MAX + 200,
+        32 * 1024,
+    ] {
+        let blob = serde_json::json!({
+            "claudeAiOauth": { "accessToken": "a".repeat(200) },
+            "mcpOAuth": { "srv": { "accessToken": "m".repeat(value_len) } },
+        });
+        put_blob_at(&service, account, &blob).expect("write");
+        assert_eq!(
+            read_blob_at(&service, account).expect("read").as_ref(),
+            Some(&blob),
+            "a {value_len}-byte value came back changed -- the transport truncated it",
+        );
+    }
+
+    // The field shape that made this reachable (#76): an auto-switch carrying
+    // twenty OAuth MCP discovery entries beside the login. Guarded so a
+    // shrunken fixture cannot silently slide back under the cap and stop
+    // exercising the argv branch.
+    let realistic = oversized_item(20);
+    let json_len = serde_json::to_string(&realistic).expect("serialize").len();
+    assert!(
+        json_len > SECURITY_STDIN_LINE_MAX,
+        "fixture must exceed the line cap to exercise the argv branch, got {json_len}"
+    );
+    // The argv arm's disclosure, pinned where it fires: the capture diverts
+    // the event line this thread raises, so this write leg can assert the
+    // owner-ruled EDR give-up is actually disclosed, with the composed line's
+    // own length and the literals the logline interpolates.
+    let lines = LogLines::new();
+    let _capture = lines.capture_here();
+    put_blob_at(&service, account, &realistic).expect("write");
+    drop(_capture);
+    let realistic_line = add_generic_password_line(
+        &service,
+        account,
+        &serde_json::to_string(&realistic).expect("serialize"),
+    )
+    .expect("compose");
+    assert_eq!(
+        lines.snapshot(),
+        vec![format!(
+            "clauth: Keychain item is {len} bytes on the `/usr/bin/security -i` line, over the \
+             4096 cap; writing it through argv instead, where the token is visible to same-UID \
+             `ps` for the life of the call",
+            len = realistic_line.len()
+        )],
+        "the argv transport must disclose the ps exposure, naming the real line length and cap"
+    );
+    assert_eq!(
+        read_blob_at(&service, account).expect("read").as_ref(),
+        Some(&realistic),
+        "the 20-entry mcpOAuth item came back changed -- the transport truncated it",
+    );
+
+    delete_at(&service, account).expect("cleanup");
+}
+
+/// KC-4 -- the rotation path over an oversized item. `Keep::Everything`
+/// (`keychain_mirror_rotation`) carries every key except the login through
+/// `profile::preserve_extra_blocks`, a superset of the allowlist the switch
+/// path carries, so it composes an even longer line. Both funnel through
+/// `put_blob_at`; this pins that the rotation caller is covered rather than
+/// assumed.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn keychain_rotation_over_an_oversized_item_keeps_the_siblings() {
+    let service = format!("clauth-test-rotate-{}", std::process::id());
+    let account = "clauth-test-account";
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+
+    // Seed the item the rotation will read and merge onto.
+    let seeded = oversized_item(20);
+    put_blob_at(&service, account, &seeded).expect("seed writes");
+
+    // Rotate: a fresh login for the same account, everything else carried.
+    let rotated = sample_creds("sk-ant-oat01-ROTATED", "sk-ant-ort01-ROTATED");
+    let login = serde_json::to_value(&rotated).expect("serialize");
+    merge_and_put_at(&service, account, &login, Keep::Everything).expect("rotation writes");
+
+    let back = read_blob_at(&service, account)
+        .expect("read")
+        .expect("the item exists");
+    assert_eq!(
+        back.get("mcpOAuth"),
+        seeded.get("mcpOAuth"),
+        "every sibling survives a rotation byte-identical"
+    );
+    assert_eq!(
+        back.pointer("/claudeAiOauth/accessToken")
+            .and_then(serde_json::Value::as_str),
+        Some("sk-ant-oat01-ROTATED"),
+        "the fresh login replaced the old one"
+    );
+
+    delete_at(&service, account).expect("cleanup");
+}
+
+/// KC-5's throwaway service: pid zero-padded to a fixed width, so the composed
+/// line length is deterministic across runs (a bare pid's digit count varies).
+fn edge_service() -> String {
+    format!("clauth-ceiling-edge-{:0>10}", std::process::id())
+}
+
+/// KC-5's fixture: a login-shaped blob whose composed `security -i` line lands
+/// just under the measured ceiling — the 3711-B `mcpOAuth` token plus the
+/// 200-B access token, 74-B JSON scaffolding, 14 quote escapes and 91-B line
+/// wrapper total 4090 B.
+fn near_ceiling_blob() -> serde_json::Value {
+    serde_json::json!({
+        "claudeAiOauth": { "accessToken": "a".repeat(200) },
+        "mcpOAuth": { "srv": { "accessToken": "m".repeat(3711) } },
+    })
+}
+
+/// KC-5's length arithmetic, pinned where it runs on EVERY platform: the
+/// ignored leg's window assert below executes only on macOS, so without this
+/// the composed length is checked nowhere a Linux gate can see.
+#[test]
+fn the_near_ceiling_fixture_composes_just_under_the_measured_line_cap() {
+    let json = serde_json::to_string(&near_ceiling_blob()).expect("serialize");
+    let line =
+        add_generic_password_line(&edge_service(), "clauth-test-account", &json).expect("compose");
+    let line_len = line.len();
+    assert!(
+        (4090..=4096).contains(&line_len),
+        "the fixture must compose a line just under the measured 4096-B ceiling, never over \
+         it; composed {line_len} B"
+    );
+}
+
+/// KC-5 -- the near side of the boundary KC-3 goes past: a line composed just
+/// UNDER the measured ceiling, through the REAL `security`, so the stdin
+/// transport is exercised at the boundary rather than only on KC-1's small
+/// login-only blobs. The length is asserted off the composed string itself —
+/// never the constant — so the leg cannot silently slide over the cap.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn a_line_just_under_the_stdin_ceiling_round_trips_intact() {
+    let service = edge_service();
+    let account = "clauth-test-account";
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+
+    let blob = near_ceiling_blob();
+    let json = serde_json::to_string(&blob).expect("serialize");
+    let line = add_generic_password_line(&service, account, &json).expect("compose");
+    let line_len = line.len();
+    assert!(
+        (4090..=4096).contains(&line_len),
+        "this leg must ride stdin just under the measured 4096-B ceiling, composed {line_len} B"
+    );
+    put_blob_at(&service, account, &blob).expect("write");
+    assert_eq!(
+        read_blob_at(&service, account).expect("read").as_ref(),
+        Some(&blob),
+        "a {line_len}-byte line under the ceiling came back changed -- the transport truncated it",
+    );
+
+    delete_at(&service, account).expect("cleanup");
 }

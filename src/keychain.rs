@@ -113,8 +113,9 @@ fn security_deadline() -> Duration {
 ///
 /// `stdin_payload`, when given, is written to the child's stdin which is then
 /// closed (EOF) — the transport for `security -i`'s command line, keeping the
-/// secret out of argv. The payload is a few KB and the write happens before the
-/// poll loop; a macOS pipe buffer is 64 KB, so the single write cannot block.
+/// secret out of argv. Its length is bounded by [`SECURITY_STDIN_LINE_MAX`] by
+/// construction (`put_blob_at` routes anything longer through argv instead), so
+/// the single write before the poll loop cannot block on the pipe buffer.
 ///
 /// `security` produces only a few bytes of output, so buffering it in the pipe
 /// while we poll cannot deadlock on a full pipe buffer.
@@ -209,6 +210,69 @@ fn run_with_deadline(
 
 /// Keychain generic-password service Claude Code reads/writes for its login.
 const SERVICE: &str = "Claude Code-credentials";
+
+/// Longest `security -i` command line this writer will send, trailing `\n`
+/// included. Measured on `mac-6` (macOS 26.5.2) 2026-09-01 against a throwaway
+/// service: the tool reads one command per line into a 4096-byte buffer of
+/// command TEXT. A 4097-byte line including the `\n` round-trips intact 6/6; a
+/// 4098-byte line truncates at 4096, the write exits 1, and the tail re-parses
+/// as `security: unknown command`. So `line_len <= 4096` including the `\n`
+/// (text <= 4095) holds 1-2 bytes of headroom under the break — and the branch
+/// must key on the exact line length, because the over-ceiling failure is
+/// DESTRUCTIVE: the truncated head still executes, leaving the item holding
+/// cut-off JSON.
+///
+/// This mattered nowhere until the mirror started preserving Claude Code's
+/// sibling keys: a login-only blob is 1-2 KB and never came close, while a blob
+/// carrying `mcpOAuth` for a dozen-plus OAuth MCP servers clears it easily.
+const SECURITY_STDIN_LINE_MAX: usize = 4096;
+
+/// Largest value this writer will put on `security`'s argv. Measured on `mac-6`
+/// (macOS 26.5.2) 2026-09-01: there is NO `security`-internal ceiling — the
+/// break is the exec limit itself, `E2BIG` (`Argument list too long`) at
+/// 1,048,000 bytes of argv with `kern.argmax` = 1,048,576 — and that break
+/// FAILS SAFE: exec never happens, so the item is left untouched. Values
+/// round-trip intact through 1,047,900 bytes, so this cap holds a ~2x margin
+/// under the one measured break; the margin, not the measurement, is what
+/// other macOS versions get. A blob past it is refused rather than sent — not
+/// the only non-destructive disposition (E2BIG past the break fails safe too),
+/// but the only one that names the size and the remediation instead of
+/// surfacing as a bare spawn failure.
+const SECURITY_ARGV_VALUE_MAX: usize = 512 * 1024;
+
+/// How [`put_blob_at`] hands one write to `security`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutTransport {
+    /// `security -i`, command line over stdin. Keeps the token out of this
+    /// process's argv, hence out of Endpoint Security exec logging (PR #21).
+    Stdin,
+    /// `security add-generic-password …` with the value as a real argv word.
+    /// Taken exactly when the `-i` command line would exceed
+    /// [`SECURITY_STDIN_LINE_MAX`], where `security` truncates instead of
+    /// failing — the EDR-log property is traded for an intact item. argv is
+    /// still same-UID-or-root only, the tradeoff PR #21 called already
+    /// accepted. Correctness wins: the alternative is a truncated item.
+    Argv,
+}
+
+/// Pick the transport for a `-i` command line of `line_len` bytes carrying a
+/// `value_len`-byte password. PURE, so the decision and both ceilings are pinned
+/// without a Keychain.
+fn put_transport(line_len: usize, value_len: usize) -> Result<PutTransport> {
+    if line_len <= SECURITY_STDIN_LINE_MAX {
+        return Ok(PutTransport::Stdin);
+    }
+    if value_len <= SECURITY_ARGV_VALUE_MAX {
+        return Ok(PutTransport::Argv);
+    }
+    anyhow::bail!(
+        "refusing to write a {value_len}-byte Keychain item: it is over the \
+         {SECURITY_ARGV_VALUE_MAX}-byte cap this writer keeps below the exec limit (the stdin \
+         transport would truncate it instead of failing). The item's size is dominated by the \
+         `mcpOAuth` entries carried beside the login; disable MCP servers or plugins that carry \
+         OAuth entries until the item shrinks below the cap"
+    )
+}
 
 /// `security(1)` exit status for `errSecItemNotFound` (-25300). Returned when no
 /// matching item exists; treated as "absent" (`None`) on read and a no-op on delete.
@@ -415,6 +479,20 @@ fn merge_write(incoming: &Value, existing: Option<&Value>, keep: Keep) -> Option
     Some(blob)
 }
 
+/// The `security -i` command line that writes `json` at `(service, account)`:
+/// one `add-generic-password -U`, every value [`security_quote`]-escaped,
+/// newline-terminated (`-i` is a line protocol). Split out of [`put_blob_at`]
+/// so the exact bytes the transport decision keys on are assertable without a
+/// Keychain.
+fn add_generic_password_line(service: &str, account: &str, json: &str) -> Result<String> {
+    Ok(format!(
+        "add-generic-password -U -s {} -a {} -w {}\n",
+        security_quote(service)?,
+        security_quote(account)?,
+        security_quote(json)?,
+    ))
+}
+
 /// Add-or-update the item at `(service, account)` with `blob` as its password,
 /// the whole `{"claudeAiOauth":{…}, …}` JSON object Claude Code expects, via
 /// `security add-generic-password -U`. `-U` updates the item in place when it
@@ -422,19 +500,24 @@ fn merge_write(incoming: &Value, existing: Option<&Value>, keep: Keep) -> Option
 /// through [`merge_and_put_at`] unless they have already derived the whole
 /// object, as the sign-out has.
 ///
-/// The command line is fed to `security -i` over **stdin**, not argv, so the
-/// token never appears in this process's own argv — keeping it out of
+/// The transport is chosen by size ([`put_transport`]). A command line that
+/// fits [`SECURITY_STDIN_LINE_MAX`] goes to `security -i` over **stdin**, so
+/// the token never appears in this process's own argv — keeping it out of
 /// process-exec logging (Endpoint Security `es_event_exec_t`, i.e. most EDR
 /// agents), which captures full command lines at exec time but not pipe
-/// contents. (Plain same-UID `ps` exposure was already an accepted tradeoff —
-/// TECH-9 #17: argv is readable only by the same UID or root on macOS, and a
-/// same-UID process already owns the 0o600 credential files — but the EDR log
-/// store was the one residual argv-only sink, and `-i` closes it.) `-i`'s
-/// tokenizer needs the [`security_quote`] escaping for values with whitespace;
-/// the inner command's exit code propagates as `security -i`'s own exit code
-/// (verified: 0 on success, 44 for `errSecItemNotFound`, 2 on usage error).
-/// The no-value `-w` prompt form is still unusable here — it reads from the
-/// controlling *tty* (`readpassphrase`), not stdin, so a pipe can't feed it.
+/// contents. A line past the cap rides argv instead (the value as a real `-w`
+/// argument word), DELIBERATELY giving up that EDR property only for blobs too
+/// large to keep it: past the cap `security -i` does not refuse but truncates,
+/// and a truncated item is a lost login plus lost MCP-server logins. (Plain
+/// same-UID `ps` exposure was already an accepted tradeoff: argv is readable
+/// only by the same UID or root on macOS, and a same-UID process already owns
+/// the 0o600 credential files.) `-i`'s tokenizer needs the [`security_quote`]
+/// escaping for values with whitespace, which the argv branch does not — argv
+/// words reach `security` verbatim; the inner command's exit code propagates
+/// as `security -i`'s own exit code (verified: 0 on success, 44 for
+/// `errSecItemNotFound`, 2 on usage error). The no-value `-w` prompt form is
+/// still unusable here — it reads from the controlling *tty*
+/// (`readpassphrase`), not stdin, so a pipe can't feed it.
 ///
 /// A write is gated on the keychain being UNLOCKED, never on the target item's
 /// trust list, so it lands silently against an item ACL'd to Claude Code alone
@@ -443,16 +526,39 @@ fn merge_write(incoming: &Value, existing: Option<&Value>, keep: Keep) -> Option
 /// one-time grant.
 fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
     let json = serde_json::to_string(blob).context("failed to serialize the Keychain item")?;
-    let line = format!(
-        "add-generic-password -U -s {} -a {} -w {}\n",
-        security_quote(service)?,
-        security_quote(account)?,
-        security_quote(&json)?,
-    );
-    let mut cmd = Command::new(SECURITY_BIN);
-    cmd.arg("-i");
-    let output = run_with_deadline(cmd, security_deadline(), Some(&line))
-        .with_context(|| format!("failed to run {SECURITY_BIN} add-generic-password"))?;
+    let line = add_generic_password_line(service, account, &json)?;
+    // Past `-i`'s line ceiling the tokenizer truncates the value instead of
+    // refusing, so the transport is chosen by size, not by preference.
+    let output = match put_transport(line.len(), json.len())? {
+        PutTransport::Stdin => {
+            let mut cmd = Command::new(SECURITY_BIN);
+            cmd.arg("-i");
+            run_with_deadline(cmd, security_deadline(), Some(&line))
+        }
+        PutTransport::Argv => {
+            logline!(
+                "clauth: Keychain item is {} bytes on the `{SECURITY_BIN} -i` line, over the \
+                 {SECURITY_STDIN_LINE_MAX} cap; writing it through argv instead, where the token \
+                 is visible to same-UID `ps` for the life of the call",
+                line.len()
+            );
+            // No `security_quote` here: argv words reach `security` verbatim, so
+            // the `-i` tokenizer's escaping would be written INTO the password.
+            let mut cmd = Command::new(SECURITY_BIN);
+            cmd.args([
+                "add-generic-password",
+                "-U",
+                "-s",
+                service,
+                "-a",
+                account,
+                "-w",
+                &json,
+            ]);
+            run_with_deadline(cmd, security_deadline(), None)
+        }
+    }
+    .with_context(|| format!("failed to run {SECURITY_BIN} add-generic-password"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -475,8 +581,13 @@ fn delete_at(service: &str, account: &str) -> Result<()> {
 }
 
 /// Build an error from a failed `security` invocation, including its stderr and
-/// exit code (never the password, which travels only on the child's stdin —
-/// `put_blob_at` via `security -i`, and is never echoed to stderr).
+/// exit code. The embedded stderr is NOT known to be password-free: `security`
+/// has echoed an escaped fragment of the written value into exactly this error
+/// text, on the truncated-line path (`unknown command "<tail>"`, observed in
+/// the field, GH #66). No `-i` line this writer sends exceeds
+/// [`SECURITY_STDIN_LINE_MAX`] (the argv arm sends no line at all), so that
+/// path is unreachable here — but no other failure mode's stderr has been
+/// measured, so treat the embedded text as possibly carrying credential bytes.
 fn security_error(op: &str, output: &std::process::Output) -> anyhow::Error {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let code = output
