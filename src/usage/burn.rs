@@ -214,7 +214,9 @@ pub(crate) fn funded_wallet_rate(
 }
 
 /// Compute the recency-weighted wallet-burn rate (wallet currency per day)
-/// for one wallet off its balance series plus the freshest reading.
+/// for one wallet off its balance series plus the freshest reading. The
+/// series must be chronological — the order [`crate::profile::load_wallet_history`]
+/// produces.
 ///
 /// The wallet arm of [`compute_burn_rates_from_history`], sharing its
 /// structure: samples are filtered to this wallet's `(label, currency)`

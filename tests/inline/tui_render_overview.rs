@@ -477,6 +477,59 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     );
 }
 
+/// A wallet-bearing active shows its runway beside the chain caption: the
+/// funded balance, its burn rate, and however long the two hold — the wallet
+/// sibling of the switch projection. No threshold, no warning hue; the
+/// operator judges the figure.
+#[test]
+fn a_wallet_bearing_active_shows_its_drains_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let ds = deepseek_profile("ds", &["63.34 CNY"]);
+    let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
+    let mut app = App::new(config);
+    let now = crate::usage::now_ms();
+    // A dense hourly series for the funded wallet, falling 4.5 CNY/h —
+    // chronological, the order `load_wallet_history` hands the cache.
+    app.wallet_cache.insert(
+        "ds".to_string(),
+        (1..=12u64)
+            .rev()
+            .map(|hours_ago| crate::usage::WalletSample {
+                ts: now - hours_ago * 3_600_000,
+                label: "api balance".to_string(),
+                amount: 63.34 + 4.5 * hours_ago as f64,
+                currency: "CNY".to_string(),
+            })
+            .collect(),
+    );
+    let lines = fallback_flow_lines(&app, 60);
+    let drains = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("drains in ~"))
+        .expect("a wallet-bearing active shows its runway");
+    assert!(
+        drains.contains("api balance drains in ~"),
+        "the line names the wallet it measures: {drains}"
+    );
+}
+
+/// An active with no balance series shows no drains line — a cold series is
+/// not a runway claim.
+#[test]
+fn a_wallet_bearing_active_without_a_series_shows_no_drains_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let ds = deepseek_profile("ds", &["63.34 CNY"]);
+    let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
+    let app = App::new(config);
+    let lines = fallback_flow_lines(&app, 60);
+    assert!(
+        !lines.iter().map(line_text).any(|t| t.contains("drains in")),
+        "no series, no runway: {:?}",
+        lines.iter().map(line_text).collect::<Vec<_>>()
+    );
+}
+
 // Nobody near their threshold at all — the ordinary healthy-chain case.
 #[test]
 fn healthy_chain_hides_resumes_hint() {

@@ -1796,6 +1796,14 @@ pub(crate) struct App {
     /// Last-known mtime per profile history file, for cache invalidation.
     pub(crate) history_mtimes: HashMap<String, std::time::SystemTime>,
 
+    /// Cached parsed wallet series per profile from wallet_history.jsonl —
+    /// the balance readings the wallet-burn rate replays. Same discipline as
+    /// [`Self::history_cache`]: the third-party fetch leg is the only writer,
+    /// this side is read-only and re-reads on an mtime bump.
+    pub(crate) wallet_cache: HashMap<String, Vec<crate::usage::WalletSample>>,
+    /// Last-known mtime per profile wallet-history file.
+    wallet_mtimes: HashMap<String, std::time::SystemTime>,
+
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
     /// marker, so it needn't stat each `session-token.json` per frame. Seeded
@@ -1938,6 +1946,24 @@ impl App {
                     history_mtimes.insert(name.to_string(), mtime);
                 }
                 history_cache.insert(name.to_string(), data);
+            }
+        }
+
+        // The wallet series mirrors it: same read-only discipline, same mtime
+        // invalidation, only the file and the type differ.
+        let mut wallet_cache: HashMap<String, Vec<crate::usage::WalletSample>> = HashMap::new();
+        let mut wallet_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
+        for profile in &config.profiles {
+            let name = &profile.name;
+            let data = crate::profile::load_wallet_history(name);
+            if !data.is_empty() {
+                if let Ok(path) = crate::profile::profile_wallet_history_path(name)
+                    && let Ok(meta) = std::fs::metadata(&path)
+                    && let Ok(mtime) = meta.modified()
+                {
+                    wallet_mtimes.insert(name.to_string(), mtime);
+                }
+                wallet_cache.insert(name.to_string(), data);
             }
         }
 
@@ -2099,6 +2125,8 @@ impl App {
             bell_fired: HashMap::new(),
             history_cache,
             history_mtimes,
+            wallet_cache,
+            wallet_mtimes,
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
@@ -2280,6 +2308,22 @@ impl App {
         .flatten()
     }
 
+    /// The funded wallet's burn rate for `profile`, computed from the
+    /// in-memory `wallet_cache` — never touches disk. The wallet twin of
+    /// [`Self::active_burn_rate`]: the Usage tab's balance row and the
+    /// overview drains line read it here, so neither render pass reads
+    /// `wallet_history.jsonl` while holding the config guard.
+    pub(crate) fn wallet_rate_for(&self, profile: &Profile) -> Option<crate::usage::WalletRate> {
+        let stats = profile.third_party_usage.as_ref()?;
+        crate::usage::funded_wallet_rate(
+            self.wallet_cache
+                .get(profile.name.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+            &stats.rows,
+        )
+    }
+
     /// UI-thread tail of bootstrap: rebuilds token snapshot, starts scheduler,
     /// applies usage, runs startup auto-switch. No HTTP.
     fn finish_bootstrap(&mut self) {
@@ -2386,6 +2430,7 @@ impl App {
         // Third-party stores BEFORE OAuth stores: ranks 270/280 < 300/350.
         let bells;
         let history_names;
+        let wallet_names;
         {
             let third_party_map = self.third_party_usage_store.lock().ok();
             let third_party_status_map = self.third_party_status.lock().ok();
@@ -2480,6 +2525,14 @@ impl App {
                 .filter(|p| p.usage.is_some())
                 .map(|p| p.name.to_string())
                 .collect::<Vec<_>>();
+            // Only third-party profiles carry a wallet series, so the refresh
+            // walk below stats no OAuth profile's absent file.
+            wallet_names = cfg
+                .profiles
+                .iter()
+                .filter(|p| p.usage_cache_is_third_party())
+                .map(|p| p.name.to_string())
+                .collect::<Vec<_>>();
         }
         for (name, threshold, util, fresh) in bells {
             // Ring or clear only on a live read — a synthetic/stale window (e.g.
@@ -2519,6 +2572,20 @@ impl App {
                     crate::profile::load_usage_history(&ProfileName::from(name.clone())),
                 );
                 self.history_mtimes.insert(name.clone(), mtime);
+            }
+        }
+        // The wallet series re-reads the same way.
+        for name in &wallet_names {
+            if let Ok(path) =
+                crate::profile::profile_wallet_history_path(&ProfileName::from(name.clone()))
+                && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
+                && self.wallet_mtimes.get(name) != Some(&mtime)
+            {
+                self.wallet_cache.insert(
+                    name.clone(),
+                    crate::profile::load_wallet_history(&ProfileName::from(name.clone())),
+                );
+                self.wallet_mtimes.insert(name.clone(), mtime);
             }
         }
     }

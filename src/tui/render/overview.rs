@@ -834,6 +834,27 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     };
     lines.push(Line::from(caption));
 
+    // A wallet-bearing active's runway: its funded balance and burn rate, and
+    // how long the two hold — the wallet sibling of the projection above. No
+    // threshold and no warning hue; the figure and its pace, the operator
+    // judges.
+    if let Some(active) = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n))
+        && let Some(rate) = app.wallet_rate_for(active)
+    {
+        let secs = (rate.amount / rate.per_day * 86_400.0) as i64;
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "{} drains in ~{}",
+                    rate.label,
+                    crate::usage::humanize_duration(secs)
+                ),
+                theme::faint(),
+            ),
+        ]));
+    }
+
     // `Off` projection: chain-wide, no target row to sit on — keep it a caption.
     if let Some((SwitchAction::Off, secs)) = &projection {
         lines.push(Line::from(vec![

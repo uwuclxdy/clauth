@@ -204,12 +204,16 @@ fn build_usage_lines(
     // OAuth accounts — including OAuth run against a custom base_url — fall
     // through to their live window bars.
     if profile.usage_cache_is_third_party() {
+        // In-memory series only (`app.wallet_cache`) — the same no-disk-read
+        // discipline the 5h rate's `history_cache` read keeps one branch up.
+        let wallet_rate = app.wallet_rate_for(profile);
         lines.extend(build_tp_rows(
             profile,
             inner_w,
             show_estimates,
             show_pace,
             reset_fmt,
+            wallet_rate.as_ref(),
         ));
         return lines;
     }
@@ -1293,12 +1297,17 @@ fn oauth_empty_msg(profile: &Profile) -> &'static str {
 
 /// Render provider-agnostic third-party stats. The header (plan + status) was
 /// already pushed by the caller; only the stats body goes here.
+///
+/// `wallet_rate` is the funded wallet's burn figure (in-memory series), which
+/// the balance row carries beside its value — the wallet sibling of the window
+/// bars' `· rate` eyebrow section.
 fn build_tp_rows(
     profile: &Profile,
     inner_w: u16,
     show_estimates: bool,
     show_pace: bool,
     reset_fmt: ResetFmt,
+    wallet_rate: Option<&crate::usage::WalletRate>,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -1375,7 +1384,22 @@ fn build_tp_rows(
                     StatRowKind::Faint => theme::faint(),
                     _ => theme::body(),
                 };
-                lines.push(Line::from(key_value_span(&row.label, &row.value, style)));
+                let mut spans = key_value_span(&row.label, &row.value, style);
+                // The rate rides only the funded wallet's own row — matched on
+                // (label, currency), since a two-wallet provider lists both
+                // under the same label with different currencies.
+                if let Some(rate) = wallet_rate.filter(|r| {
+                    r.label == row.label
+                        && crate::providers::parse_balance(&row.value)
+                            .is_some_and(|(currency, _)| currency == r.currency)
+                }) {
+                    spans.push(Span::styled(" · ", theme::dim()));
+                    spans.push(Span::styled(
+                        format!("~{:.1} {}/day", rate.per_day, rate.currency),
+                        theme::faint(),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
         }
     } else if !has_bars {
