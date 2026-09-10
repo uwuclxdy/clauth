@@ -1281,10 +1281,15 @@ pub(crate) struct RotationGuard {
 pub(crate) const ROTATION_LOCK_TIMEOUT: Duration =
     crate::oauth::TOKEN_HTTP_DEADLINES.saturating_add(KEYCHAIN_MIRROR_BUDGET);
 
-/// What a macOS rotation's Keychain mirror may spend under the rotation lock: two
-/// `security` invocations at `keychain::SECURITY_TIMEOUT` each, unclamped because
-/// `oauth::apply_rotated_tokens_locked` runs the mirror after its state-flock
-/// closure ends.
+/// What a macOS rotation's Keychain mirror is budgeted for under the rotation
+/// lock: two `security` invocations at `keychain::SECURITY_TIMEOUT` each,
+/// unclamped because `oauth::apply_rotated_tokens_locked` runs the mirror after
+/// its state-flock closure ends. The mirror makes THREE invocations since the
+/// write's read-back verify landed — the third rides past this budget
+/// deliberately (an unverifiable write completes rather than failing, so the
+/// under-cover costs a lock-waiter's margin, never a correct rotation, and a
+/// false [`ROTATION_LOCK_TIMEOUT`] firing is a named retry, never a fault);
+/// `keychain::SECURITY_TIMEOUT`'s doc carries the derivation.
 ///
 /// Spelled here rather than read out of `keychain`, which is macOS-gated while
 /// this deadline is one number on every host. Off macOS the term is not waste: it

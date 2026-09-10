@@ -38,8 +38,36 @@
 //! `claude.rs::carry_live_extra_best_effort` takes on the file path, and refusing
 //! instead would strand every headless macOS switch on the outgoing account.
 //! `claude.rs` wires all of it behind `#[cfg(target_os = "macos")]` + [`enabled`].
+//!
+//! **A successful write is only believed once read back.** `add-generic-password`
+//! exiting 0 is the tool's word, not proof the item holds the bytes sent: the
+//! `-i` line truncation (#66) exited 0 while the item held cut-off JSON, and
+//! nothing surfaced until a later read failed to parse it. So every write reads
+//! the item back RAW and byte-compares against the JSON it sent
+//! ([`verify_outcome`], the ruling on what that proved in
+//! [`write_disposition`]). Byte-equal is the only silent outcome. Different bytes,
+//! or an item that reads back ABSENT after a reported success, is a write KNOWN
+//! corrupt — the switch fails rather than complete on a lie, the read-back bytes
+//! are quarantined first, and the profile store still holds the intended login,
+//! so retrying the switch re-runs the write. A read-back that cannot run at all
+//! (the hold's subprocess budget already spent, [`security_deadline`] expiry, a
+//! read refusal over ssh) leaves the write LANDED BUT UNVERIFIED and the switch
+//! COMPLETE: the same refusal-of-refusal a failed read takes, because an
+//! unverifiable write must not fail a completed switch.
+//!
+//! **Unparseable bytes are quarantined, never destroyed.** A read that answers
+//! with bytes which are not the JSON object CC expects is usually a TRUNCATED
+//! one — the `claudeAiOauth` head survives with its tail cut (#66, #76) — and
+//! the overwrite/delete that used to treat such a read as "unreadable" is what
+//! turned one corruption into a lost login plus every MCP login in the item.
+//! The two sites that act on a failed read — the merge that overwrites the item
+//! and the sign-out that deletes it — park the raw bytes under
+//! `~/.clauth/keychain-quarantine/` first ([`quarantine_item_bytes`], the
+//! `atomic_write_600` posture the parked `mcp-logins.json` already holds) and
+//! name the file on the event line. The write or delete still lands: quarantine
+//! preserves the evidence, it does not refuse the switch.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -60,11 +88,22 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// single-threaded run loop, so an unbounded child would wedge auto-switch, the
 /// exact failure the daemon exists to prevent.
 ///
-/// **10 s because a mirror is TWO invocations**, a read and then a write or
-/// delete, where it used to be one. `lock.rs`'s 25 s state-lock timeout and the
-/// daemon's 30 s `WATCHDOG_DEADLINE` were sized against a 20 s mirror, and the
-/// daemon's comment says to bound this shell-out rather than loosen them, so
-/// halving keeps one mirror at the 20 s they assume.
+/// **10 s is the PER-CALL ceiling: the window one `security` invocation gets
+/// before it is killed** — on the read leg, the window an operator has to
+/// answer the one-time ACL dialog before the call gives up on them. A mirror
+/// is now THREE invocations (a read, then a write or delete, then the write's
+/// read-back verification, [`verify_write`]), where the deadlines above this
+/// were sized against two: `lock.rs`'s 25 s state-lock timeout and the daemon's
+/// 30 s `WATCHDOG_DEADLINE` sit against a 20 s mirror, and the daemon's
+/// comment says to bound this shell-out rather than loosen them. Inside a hold
+/// the clamp below still caps the AGGREGATE at that 20 s however many calls
+/// share it; outside one (the rotation mirror, which `oauth.rs` runs after its
+/// lock closure ends) a mirror's worst case is now 30 s against
+/// `runtime::KEYCHAIN_MIRROR_BUDGET`'s 20 — under-covered by exactly the
+/// verification call, deliberately left un-retuned here and reported to the
+/// caller instead. What keeps that gap safe is the verify leg's own failure
+/// mode: an UNVERIFIABLE write completes rather than failing, so the
+/// under-coverage costs a lock-waiter's margin, never a correct switch.
 ///
 /// This is the PER-CALL ceiling only. What a waiting peer actually feels is the
 /// whole flock hold, and a hold can run more than one mirror
@@ -81,20 +120,26 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// refusing outright has half as long to be answered before that.
 const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
-// A mirror is TWO invocations, so one costs `2 x SECURITY_TIMEOUT` at worst, and
-// that is the quantity `runtime::ROTATION_LOCK_TIMEOUT`'s floor budgets for this
-// leg. It is spelled over there because this module is macOS-gated while that
-// deadline is one number on every host; the check is a compile error rather than
-// a test because the quantity exists only in this build, so this is the only
-// build that can make it.
+// `runtime::KEYCHAIN_MIRROR_BUDGET` still equals the READ+WRITE pair — the two
+// invocations a mirror was when it was derived. The read-back verification
+// (`verify_write`) is a third, riding PAST that budget at its own
+// [`SECURITY_TIMEOUT`]. Retuning the budget to cover it means moving this
+// assert to `* 3` and `runtime::ROTATION_LOCK_TIMEOUT`'s floor term with it, in
+// one change — deliberately not done here (the under-coverage is reported to
+// the caller instead; see [`SECURITY_TIMEOUT`]'s doc for why it is safe to
+// leave). It is spelled over there because this module is macOS-gated while
+// that deadline is one number on every host; the check is a compile error
+// rather than a test because the quantity exists only in this build, so this
+// is the only build that can make it.
 //
-// Deliberately not `lock::SUBPROCESS_BUDGET`, which the two coincide with today:
+// Still deliberately not `lock::SUBPROCESS_BUDGET`, which it coincides with:
 // that bounds one state-flock hold's shell-outs in aggregate, and
 // `oauth::apply_rotated_tokens_locked` runs its mirror after the closure ends,
 // where `security_deadline` clamps nothing.
 const _: () = assert!(
     SECURITY_TIMEOUT.as_millis() * 2 == crate::runtime::KEYCHAIN_MIRROR_BUDGET.as_millis(),
-    "runtime::KEYCHAIN_MIRROR_BUDGET must stay two security invocations wide"
+    "runtime::KEYCHAIN_MIRROR_BUDGET must stay two SECURITY_TIMEOUTs wide (the read+write pair; \
+     the verify call rides past it)"
 );
 
 /// The deadline for the next `security` invocation: [`SECURITY_TIMEOUT`], clamped
@@ -331,43 +376,194 @@ enum Keep {
     CarriedOnly,
 }
 
-/// Read the JSON blob stored at `(service, account)` via
-/// `security find-generic-password -w`. `Ok(None)` when the item is absent
-/// (exit 44); any other failure is an error. Returns the RAW object rather than
-/// a typed [`ClaudeCredentials`], which models the login alone and would drop
-/// the very siblings the read exists to preserve.
-fn read_blob_at(service: &str, account: &str) -> Result<Option<Value>> {
+/// Read the item's password at `(service, account)` RAW — exactly the bytes
+/// `security find-generic-password -w` prints, trailing newline included —
+/// without parsing them. `Ok(None)` when the item is absent (exit 44); any
+/// other failure is an error. Two consumers need the bytes rather than a
+/// parsed object: the write's read-back verification byte-compares against what
+/// was sent, and the quarantine path preserves what a parse rejected.
+fn read_raw_at(service: &str, account: &str) -> Result<Option<String>> {
     let mut cmd = Command::new(SECURITY_BIN);
     cmd.args(["find-generic-password", "-s", service, "-a", account, "-w"]);
     let output = run_with_deadline(cmd, security_deadline(), None)
         .with_context(|| format!("failed to run {SECURITY_BIN} find-generic-password"))?;
     if output.status.success() {
-        // `-w` prints only the password (our JSON) followed by a trailing newline.
-        let json = String::from_utf8(output.stdout).context("Keychain password is not UTF-8")?;
-        let blob =
-            serde_json::from_str(json.trim_end()).context("Keychain item is not valid JSON")?;
-        Ok(Some(blob))
+        let raw = String::from_utf8(output.stdout).context("Keychain password is not UTF-8")?;
+        Ok(Some(raw))
     } else if output.status.code() == Some(EXIT_ITEM_NOT_FOUND) {
         Ok(None)
     } else {
-        Err(security_error("read", &output))
+        Err(security_error(SecurityOp::Read, &output))
+    }
+}
+
+/// Read the JSON blob stored at `(service, account)` via
+/// `security find-generic-password -w`. `Ok(None)` when the item is absent
+/// (exit 44); any other failure is an error. Returns the RAW object rather than
+/// a typed [`ClaudeCredentials`], which models the login alone and would drop
+/// the very siblings the read exists to preserve.
+///
+/// A read that returns bytes which are not JSON fails with [`UnparseableItem`]
+/// carrying them, so the caller can quarantine before overwriting or deleting
+/// the item; every other failure (a locked keychain, a timeout, a spent budget)
+/// saw no bytes and carries none.
+fn read_blob_at(service: &str, account: &str) -> Result<Option<Value>> {
+    let Some(raw) = read_raw_at(service, account)? else {
+        return Ok(None);
+    };
+    match serde_json::from_str(raw.trim_end()) {
+        Ok(blob) => Ok(Some(blob)),
+        Err(parse_error) => Err(anyhow::Error::new(UnparseableItem { raw, parse_error })),
+    }
+}
+
+/// A Keychain read that answered with bytes this module cannot parse as the
+/// JSON object Claude Code expects. The bytes ride the error — never its
+/// `Display`, which reaches event lines — because they are usually a TRUNCATED
+/// version of the real item (the `claudeAiOauth` head survives with its tail
+/// cut, #66/#76), and the two sites that act on a failed read used to destroy
+/// them by overwriting or deleting the item unseen.
+struct UnparseableItem {
+    /// The item's password exactly as `security -w` printed it, trailing
+    /// newline included.
+    raw: String,
+    parse_error: serde_json::Error,
+}
+
+// Hand-written like `ConsoleCredential`'s (`docs/security.md`): a derived
+// `Debug` would print `raw` — live credential bytes — and a stray `{:?}` on
+// this error would put a session on a log line. The length is all a debug
+// reader needs.
+impl std::fmt::Debug for UnparseableItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnparseableItem")
+            .field("raw_len", &self.raw.len())
+            .field("parse_error", &self.parse_error)
+            .finish()
+    }
+}
+
+impl std::fmt::Display for UnparseableItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The bytes stay off the Display: this text reaches event lines, and
+        // the point of carrying them on the struct is to keep them out of
+        // exactly those lines until the quarantine file takes them.
+        write!(f, "Keychain item is not valid JSON: {}", self.parse_error)
+    }
+}
+
+impl std::error::Error for UnparseableItem {}
+
+/// The raw item bytes a failed read carried, when it carried any. Only an
+/// unparseable read has bytes to preserve — the item answered, just not with
+/// JSON this module can merge; every other read failure (a locked keychain, a
+/// timeout, a budget clamped to zero) saw nothing and returns `None`, behaving
+/// exactly as it did before quarantine existed. PURE so the split — which
+/// failures quarantine, which do not — is pinned without a Keychain.
+fn carried_raw(e: &anyhow::Error) -> Option<&str> {
+    e.downcast_ref::<UnparseableItem>().map(|u| u.raw.as_str())
+}
+
+/// Where salvaged Keychain bytes land: `~/.clauth/keychain-quarantine/`, a
+/// sibling of `profiles/` in the owner-only tree (the parked
+/// `mcp-logins.json`'s placement is the precedent).
+const QUARANTINE_DIR: &str = "keychain-quarantine";
+
+/// The per-event file salvaged bytes from `service` land in, under `base`'s
+/// quarantine directory: a UTC timestamp names the event, the pid keeps two
+/// processes that salvage the same item in the same second apart (the daemon
+/// and a TUI each mirror on their own ticks), and the service name identifies
+/// WHICH item the file holds — the bare item and a namespaced per-config-dir
+/// one can both exist. Per-event, not per-salvage-unique: two salvages by the
+/// SAME process in the same second on the same service land on one path and
+/// the second rename silently replaces the first — reachable when one write's
+/// read leg salvages unparseable bytes and its verify leg then quarantines a
+/// corrupt read-back inside that second, and accepted because the surviving
+/// file then holds the later bytes of the same incident and the event line
+/// names the same path either way. PURE (the `put_transport` pattern) so the
+/// derivation is pinned without a Keychain.
+fn quarantine_path(base: &Path, service: &str, epoch_secs: i64, pid: u32) -> PathBuf {
+    // Compact UTC rather than `epoch_secs_to_iso`'s shape: a filename on macOS
+    // must not carry `:` (Finder renders it as a path separator), and an
+    // out-of-range epoch degrades to the raw seconds — still unique per event,
+    // still sortable, just not pretty.
+    let stamp = chrono::DateTime::from_timestamp(epoch_secs, 0).map_or_else(
+        || epoch_secs.to_string(),
+        |dt| dt.format("%Y%m%dT%H%M%SZ").to_string(),
+    );
+    // `/` and NUL are the bytes a path separator could hide in; spaces and
+    // dashes (all the real service names carry) stay legible.
+    let service = service.replace(['/', '\0'], "_");
+    base.join(QUARANTINE_DIR)
+        .join(format!("{stamp}-{pid}-{service}.json"))
+}
+
+/// Write `raw` — bytes salvaged from the item at `service`, which this module
+/// is about to overwrite or delete — to its quarantine file, and return the
+/// path. `atomic_write_600` owns the posture (0700 dir on create, 0600 file
+/// before the rename, `docs/security.md`'s tree invariant): the bytes are
+/// exactly as sensitive as a `credentials.json`, so they inherit its placement
+/// rather than landing outside the tree.
+fn quarantine_item_bytes(service: &str, raw: &str) -> Result<PathBuf> {
+    let path = quarantine_path(
+        &crate::profile::clauth_dir()?,
+        service,
+        crate::usage::now_epoch_secs(),
+        std::process::id(),
+    );
+    crate::profile::atomic_write_600(&path, raw).with_context(|| {
+        format!(
+            "failed to quarantine the Keychain item's bytes at {}",
+            path.display()
+        )
+    })?;
+    Ok(path)
+}
+
+/// How an event line names where salvaged bytes went: the file plus the
+/// recovery hint when the quarantine landed, the loss plus the re-auth hint
+/// when the write itself failed. Shared by the two sites that act on a failed
+/// read, so their wording cannot drift apart. PURE so the operator-facing text
+/// is pinned without staging an incident.
+fn quarantine_tail(quarantined: &Result<PathBuf>) -> String {
+    match quarantined {
+        Ok(path) => format!(
+            "raw bytes are preserved at {}: the `claudeAiOauth` login head usually survives this \
+             corruption, so re-authenticate any MCP server that reports a signed-out session, or \
+             slice the login out of the quarantined file",
+            path.display()
+        ),
+        Err(e) => format!(
+            "raw bytes could not be preserved ({e}): re-authenticate any MCP server that reports \
+             a signed-out session, or sign in again at claude.ai"
+        ),
     }
 }
 
 /// The item's current contents for a merge. An absent item is the first-write
 /// case and merges as `None` quietly; a read that FAILS also merges as `None`,
 /// but names the loss on the event line first (module doc: the write still
-/// lands, because a refused switch is worse than a lost MCP login).
+/// lands, because a refused switch is worse than a lost MCP login). A read
+/// that failed WITH BYTES quarantines them before returning — the overwrite
+/// below is exactly what would otherwise destroy them (#66/#76).
 fn blob_to_merge_with(service: &str, account: &str) -> Option<Value> {
     match read_blob_at(service, account) {
         Ok(blob) => blob,
         Err(e) => {
-            logline!(
-                "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
-                 The MCP server logins it held are replaced by whatever this profile last \
-                 stored, which on macOS is older than the item's own set: re-authenticate any \
-                 MCP server that reports a signed-out session, and any that starts failing"
-            );
+            match carried_raw(&e) {
+                Some(raw) => logline!(
+                    "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
+                     The MCP server logins it held are replaced by whatever this profile last \
+                     stored, which on macOS is older than the item's own set — their {}",
+                    quarantine_tail(&quarantine_item_bytes(service, raw))
+                ),
+                None => logline!(
+                    "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
+                     The MCP server logins it held are replaced by whatever this profile last \
+                     stored, which on macOS is older than the item's own set: re-authenticate \
+                     any MCP server that reports a signed-out session, and any that starts failing"
+                ),
+            }
             None
         }
     }
@@ -493,6 +689,183 @@ fn add_generic_password_line(service: &str, account: &str, json: &str) -> Result
     ))
 }
 
+/// What reading an item back after a reported-successful write proves about
+/// that write. Carries what the caller needs to act: the differing bytes to
+/// quarantine on [`VerifyOutcome::Corrupt`], the rendered cause to name on
+/// [`VerifyOutcome::Unverified`].
+#[derive(PartialEq, Eq)]
+enum VerifyOutcome {
+    /// Read back byte-equal to the JSON that was written.
+    Verified,
+    /// Read back with different bytes, which the variant carries for
+    /// quarantine. The item is KNOWN corrupt: completing the switch would lie.
+    Corrupt(String),
+    /// Read back absent after a write that reported success. Equally known
+    /// corrupt, but there are no bytes to quarantine — the write did not land.
+    Vanished,
+    /// The read-back itself could not run (a budget clamped to zero, a
+    /// deadline, a read refusal over ssh). The write's own exit code said it
+    /// landed, and an unverifiable write must not fail a completed switch, so
+    /// this arm is success for the caller — with the rendered cause for the
+    /// event line.
+    Unverified(String),
+}
+
+// Hand-written like `UnparseableItem`'s: `Corrupt` carries live read-back
+// credential bytes, and a derived `Debug` would print them. The cause on
+// `Unverified` is rendered error text, never the bytes, so it prints.
+impl std::fmt::Debug for VerifyOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VerifyOutcome::Verified => f.write_str("Verified"),
+            VerifyOutcome::Corrupt(raw) => f
+                .debug_struct("Corrupt")
+                .field("raw_len", &raw.len())
+                .finish(),
+            VerifyOutcome::Vanished => f.write_str("Vanished"),
+            VerifyOutcome::Unverified(cause) => {
+                f.debug_struct("Unverified").field("cause", cause).finish()
+            }
+        }
+    }
+}
+
+/// Decide what a read-back proves about `written`. PURE (the `put_transport`
+/// pattern) so the whole truth table — match, mismatch, absent, unreadable —
+/// is pinned without a Keychain. The comparison is BYTES, with only the `-w`
+/// output's trailing whitespace (which a written JSON never carries)
+/// normalized away: a value that differs by even leading whitespace is not
+/// what was written and must read as corrupt, never as a match.
+fn verify_outcome(read_back: Result<Option<String>>, written: &str) -> VerifyOutcome {
+    match read_back {
+        Err(e) => VerifyOutcome::Unverified(format!("{e:#}")),
+        Ok(None) => VerifyOutcome::Vanished,
+        Ok(Some(raw)) if raw.trim_end() == written => VerifyOutcome::Verified,
+        Ok(Some(raw)) => VerifyOutcome::Corrupt(raw),
+    }
+}
+
+/// What a read-back outcome makes [`verify_write`] do. Carries the payload
+/// each disposition needs: the read-back bytes to quarantine on
+/// [`WriteDisposition::QuarantineAndFail`], the rendered cause to name on
+/// [`WriteDisposition::CompleteWithNote`].
+#[derive(PartialEq, Eq)]
+enum WriteDisposition {
+    /// The read-back matched: nothing to say, nothing to do.
+    CompleteSilently,
+    /// Quarantine the carried bytes, name them on the event line, and FAIL the
+    /// write — the switch must not complete on a write known corrupt.
+    QuarantineAndFail(String),
+    /// FAIL the write: known corrupt, with no bytes to quarantine.
+    Fail,
+    /// Complete the switch, naming the carried cause on the event line — an
+    /// unverifiable write must not fail a completed switch.
+    CompleteWithNote(String),
+}
+
+// Hand-written like `UnparseableItem`'s: `QuarantineAndFail` carries the same
+// live read-back credential bytes, and a derived `Debug` would print them.
+impl std::fmt::Debug for WriteDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteDisposition::CompleteSilently => f.write_str("CompleteSilently"),
+            WriteDisposition::QuarantineAndFail(raw) => f
+                .debug_struct("QuarantineAndFail")
+                .field("raw_len", &raw.len())
+                .finish(),
+            WriteDisposition::Fail => f.write_str("Fail"),
+            WriteDisposition::CompleteWithNote(cause) => f
+                .debug_struct("CompleteWithNote")
+                .field("cause", cause)
+                .finish(),
+        }
+    }
+}
+
+/// Map a read-back outcome to its disposition. PURE, and pinned with
+/// [`disposition_verdict`] as its other half: the classification
+/// ([`verify_outcome`]) was pinned from the start, but the RULING — which
+/// outcomes fail a switch, which complete it — lived only in `verify_write`'s
+/// arms, and a one-line flip of it (a corrupt write completing a switch) left
+/// every test in the suite green. Both halves of the ruling now live in pure,
+/// truth-table-pinned code; [`verify_write`] is only the executor.
+fn write_disposition(outcome: VerifyOutcome) -> WriteDisposition {
+    match outcome {
+        VerifyOutcome::Verified => WriteDisposition::CompleteSilently,
+        VerifyOutcome::Corrupt(raw) => WriteDisposition::QuarantineAndFail(raw),
+        VerifyOutcome::Vanished => WriteDisposition::Fail,
+        VerifyOutcome::Unverified(cause) => WriteDisposition::CompleteWithNote(cause),
+    }
+}
+
+/// The verdict each disposition hands the caller — the owner-ruled M1
+/// enforcement in one pure place: a write KNOWN corrupt fails the switch, an
+/// UNVERIFIABLE one completes it. PURE and pinned beside the truth table so
+/// the `Err`/`Ok` literals live in tested code rather than in the executor's
+/// arms.
+fn disposition_verdict(disposition: &WriteDisposition) -> Result<()> {
+    match disposition {
+        WriteDisposition::CompleteSilently | WriteDisposition::CompleteWithNote(_) => Ok(()),
+        WriteDisposition::QuarantineAndFail(_) => Err(anyhow::anyhow!(
+            "Keychain write verified corrupt: the item read back different bytes than were \
+             written"
+        )),
+        WriteDisposition::Fail => Err(anyhow::anyhow!(
+            "Keychain write verified corrupt: the item is absent after a write that reported \
+             success"
+        )),
+    }
+}
+
+/// The read-back half of [`put_blob_at`]: read the item RAW, and execute the
+/// disposition the pure pair rules — [`write_disposition`] decides,
+/// [`disposition_verdict`] rules, this fn runs the side effects each
+/// disposition names (quarantine, event lines) and hands the ruling back
+/// verbatim. `Verified` is silent. `Corrupt` quarantines the read-back bytes
+/// and fails the write; `Vanished` fails it — a write known corrupt must not
+/// complete a switch, and the profile store still holds the intended login so
+/// the retry is safe. `Unverified` names the write as landed but unverified
+/// and lets it stand: the module's completing-the-switch posture, applied to
+/// a write whose only failure is that nobody could check it.
+fn verify_write(service: &str, account: &str, written: &str) -> Result<()> {
+    let disposition = write_disposition(verify_outcome(read_raw_at(service, account), written));
+    let verdict = disposition_verdict(&disposition);
+    match &disposition {
+        // Silence is the disposition, not an oversight.
+        WriteDisposition::CompleteSilently => {}
+        WriteDisposition::QuarantineAndFail(raw) => match quarantine_item_bytes(service, raw) {
+            Ok(path) => logline!(
+                "clauth: the macOS Keychain write reported success but the item read back with \
+                     different bytes, so it is known corrupt and the switch was not completed. The \
+                     corrupted item's raw bytes are preserved at {}; the profile store still holds \
+                     the intended login, so retry the switch to re-run the write",
+                path.display()
+            ),
+            Err(e) => logline!(
+                "clauth: the macOS Keychain write reported success but the item read back with \
+                     different bytes, so it is known corrupt and the switch was not completed. \
+                     Preserving the corrupted item's raw bytes failed ({e}); the profile store \
+                     still holds the intended login, so retry the switch to re-run the write"
+            ),
+        },
+        WriteDisposition::Fail => {
+            logline!(
+                "clauth: the macOS Keychain write reported success but the item read back absent, \
+                 so the write is known corrupt and the switch was not completed. The profile \
+                 store still holds the intended login, so retry the switch to re-run the write"
+            );
+        }
+        WriteDisposition::CompleteWithNote(cause) => {
+            logline!(
+                "clauth: the macOS Keychain write landed but could not be read back to verify \
+                 ({cause}); the switch stays complete. If Claude Code reports a signed-out or \
+                 broken session, retrying the switch re-runs the write"
+            );
+        }
+    }
+    verdict
+}
+
 /// Add-or-update the item at `(service, account)` with `blob` as its password,
 /// the whole `{"claudeAiOauth":{…}, …}` JSON object Claude Code expects, via
 /// `security add-generic-password -U`. `-U` updates the item in place when it
@@ -524,6 +897,16 @@ fn add_generic_password_line(service: &str, account: &str, json: &str) -> Result
 /// and raises no dialog of its own (measured on `mac-6` 2026-08-12). It also
 /// does not re-ACL the item, which is why the read leg keeps needing its own
 /// one-time grant.
+///
+/// A write that reports success is then VERIFIED: the item is read back raw
+/// and byte-compared against the JSON just sent ([`verify_write`]). The tool's
+/// exit code alone proved nothing — the `-i` truncation the transport ceilings
+/// exist to prevent exited 0 while the item held cut-off JSON. A byte-equal
+/// read-back is the only silent success; different bytes or an absent item
+/// fail the switch with the read-back bytes quarantined first, and a read-back
+/// that cannot run completes the switch as landed-but-unverified (the budget
+/// the whole hold shares is one reason it cannot run, which is exactly why
+/// that arm must not fail the write).
 fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
     let json = serde_json::to_string(blob).context("failed to serialize the Keychain item")?;
     let line = add_generic_password_line(service, account, &json)?;
@@ -559,11 +942,10 @@ fn put_blob_at(service: &str, account: &str, blob: &Value) -> Result<()> {
         }
     }
     .with_context(|| format!("failed to run {SECURITY_BIN} add-generic-password"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(security_error("write", &output))
+    if !output.status.success() {
+        return Err(security_error(SecurityOp::Write, &output));
     }
+    verify_write(service, account, &json)
 }
 
 /// Delete the item at `(service, account)` via `security delete-generic-password`.
@@ -576,28 +958,61 @@ fn delete_at(service: &str, account: &str) -> Result<()> {
     if output.status.success() || output.status.code() == Some(EXIT_ITEM_NOT_FOUND) {
         Ok(())
     } else {
-        Err(security_error("delete", &output))
+        Err(security_error(SecurityOp::Delete, &output))
     }
 }
 
-/// Build an error from a failed `security` invocation, including its stderr and
-/// exit code. The embedded stderr is NOT known to be password-free: `security`
-/// has echoed an escaped fragment of the written value into exactly this error
-/// text, on the truncated-line path (`unknown command "<tail>"`, observed in
-/// the field, GH #66). No `-i` line this writer sends exceeds
-/// [`SECURITY_STDIN_LINE_MAX`] (the argv arm sends no line at all), so that
-/// path is unreachable here — but no other failure mode's stderr has been
-/// measured, so treat the embedded text as possibly carrying credential bytes.
-fn security_error(op: &str, output: &std::process::Output) -> anyhow::Error {
-    let stderr = String::from_utf8_lossy(&output.stderr);
+/// Which `security` operation a failed invocation was running. WRITE is the
+/// only one that puts a credential on the command line at all, so the split —
+/// which failures may embed the tool's stderr and which must not — lives in
+/// the type, not in a string an op could misspell into the wrong arm.
+#[derive(Debug, Clone, Copy)]
+enum SecurityOp {
+    Read,
+    Write,
+    Delete,
+}
+
+impl SecurityOp {
+    fn as_str(self) -> &'static str {
+        match self {
+            SecurityOp::Read => "read",
+            SecurityOp::Write => "write",
+            SecurityOp::Delete => "delete",
+        }
+    }
+}
+
+/// Build an error from a failed `security` invocation, including its exit code.
+/// READ and DELETE embed the tool's stderr verbatim: no credential is ever sent
+/// on those calls, so the text cannot be one, and it is diagnostic (an ACL
+/// refusal reads differently from a usage error). WRITE does not — BY
+/// CONSTRUCTION rather than by measurement: `security` HAS echoed an escaped
+/// fragment of the written value into exactly this builder (`unknown command
+/// "<tail>"`, observed in the field, GH #66), and this text rides event lines
+/// into `daemon.log` — so a write failure reports the exit code and the stderr
+/// byte COUNT, never the bytes.
+fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Error {
     let code = output
         .status
         .code()
         .map_or_else(|| "signal".to_string(), |c| c.to_string());
-    anyhow::anyhow!(
-        "Keychain {op} failed (security exit {code}): {}",
-        stderr.trim()
-    )
+    match op {
+        SecurityOp::Write => anyhow::anyhow!(
+            "Keychain {} failed (security exit {code}): its {}-byte stderr is not shown, because \
+             a write's stderr can echo the value being written",
+            op.as_str(),
+            output.stderr.len()
+        ),
+        SecurityOp::Read | SecurityOp::Delete => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::anyhow!(
+                "Keychain {} failed (security exit {code}): {}",
+                op.as_str(),
+                stderr.trim()
+            )
+        }
+    }
 }
 
 /// Install `store`, the whole JSON object the file layer put in the live slot,
@@ -628,12 +1043,8 @@ pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<()> 
     merge_and_put_at(SERVICE, &account()?, &login, Keep::Everything)
 }
 
-/// Sign Claude Code out: drop the account-scoped keys and keep what belongs to
-/// no account, so a wrap-off or a forced relink onto a login-less profile stops
-/// the item serving an account without taking every MCP-server login with it. An
-/// item left holding nothing else is deleted outright, which keeps the
-/// clean-absence state this had before the strip. Idempotent, and an absent item
-/// is success.
+/// Sign Claude Code out of the real `Claude Code-credentials` item:
+/// [`sign_out_at`] at [`SERVICE`], under the OS login account.
 ///
 /// It is DESTRUCTIVE and the operator has no other copy of what it drops, so
 /// both acting branches say so on the event line: two of the callers discard the
@@ -642,27 +1053,52 @@ pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<()> 
 /// `force_link_profile_credentials` and `clear_claude_credentials` reach it,
 /// never the guarded relink, so a path that never meant to change accounts
 /// cannot destroy a login clauth does not hold (`claude::keychain_mirror_source`).
+pub(crate) fn keychain_sign_out() -> Result<()> {
+    sign_out_at(SERVICE, &account()?)
+}
+
+/// The sign-out core over an arbitrary `(service, account)`, parameterized the
+/// way [`read_blob_at`]/[`put_blob_at`]/[`delete_at`] are so the e2e leg
+/// (`tests/inline/keychain.rs`'s sign-out quarantine pin) drives a THROWAWAY
+/// item — the hardwired [`SERVICE`] could only be driven against the
+/// operator's real one.
+///
+/// Drop the account-scoped keys and keep what belongs to no account, so a
+/// wrap-off or a forced relink onto a login-less profile stops the item serving
+/// an account without taking every MCP-server login with it. An item left
+/// holding nothing else is deleted outright, which keeps the clean-absence
+/// state this had before the strip. Idempotent, and an absent item is success.
 ///
 /// A read that fails deletes instead: whatever it could not preserve is worth
 /// less than the item continuing to authenticate an account the operator just
-/// switched away from.
-pub(crate) fn keychain_sign_out() -> Result<()> {
-    let account = account()?;
+/// switched away from. A read that failed WITH BYTES quarantines them first
+/// ([`quarantine_item_bytes`]) — the delete still removes the login, but the
+/// evidence survives it, and the event line says where.
+fn sign_out_at(service: &str, account: &str) -> Result<()> {
     // The two `None` cases part here rather than sharing an early return: an
     // absent item is already signed out and says nothing, while a read that
-    // FAILED takes the most destructive branch there is, deleting the item whole
-    // without having seen what it held.
-    let mut blob = match read_blob_at(SERVICE, &account) {
-        Ok(None) => return delete_at(SERVICE, &account),
+    // FAILED takes the most destructive branch there is, deleting the item
+    // whole — now with its raw bytes quarantined first whenever the read
+    // brought any back (#66/#76).
+    let mut blob = match read_blob_at(service, account) {
+        Ok(None) => return delete_at(service, account),
         Ok(Some(blob)) => blob,
         Err(e) => {
-            logline!(
-                "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
-                 could not be read first ({e:#}), so the MCP server logins stored beside the \
-                 login went with it. Re-authenticate any MCP server that reports a signed-out \
-                 session"
-            );
-            return delete_at(SERVICE, &account);
+            match carried_raw(&e) {
+                Some(raw) => logline!(
+                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
+                     it could not be read first ({e:#}), so the MCP server logins stored beside \
+                     the login went with it — their {}",
+                    quarantine_tail(&quarantine_item_bytes(service, raw))
+                ),
+                None => logline!(
+                    "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
+                     could not be read first ({e:#}), so the MCP server logins stored beside the \
+                     login went with it. Re-authenticate any MCP server that reports a signed-out \
+                     session"
+                ),
+            }
+            return delete_at(service, account);
         }
     };
     match crate::claude::strip_account_credentials(&mut blob) {
@@ -671,14 +1107,14 @@ pub(crate) fn keychain_sign_out() -> Result<()> {
                 "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
                  stores no Claude login). Run `clauth <name>` to put one back"
             );
-            delete_at(SERVICE, &account)
+            delete_at(service, account)
         }
         crate::claude::SignOut::Write => {
             logline!(
                 "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
                  stores no Claude login); its MCP server logins were kept"
             );
-            put_blob_at(SERVICE, &account, &blob)
+            put_blob_at(service, account, &blob)
         }
         crate::claude::SignOut::Nothing => Ok(()),
     }

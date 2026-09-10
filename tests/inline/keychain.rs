@@ -1,9 +1,9 @@
 //! KC-1 — Keychain read/write/delete round-trip. Uses a **throwaway service name**
 //! unique to this process; it never touches the real `Claude Code-credentials`
-//! item. The `#[ignore]`d tests in this file (KC-1, KC-3, KC-4, KC-5) are the
-//! only ones that drive the real macOS Keychain (via the `/usr/bin/security`
-//! CLI the shipped write/delete path uses), so each is `#[ignore]`d: they
-//! still mutate
+//! item. The eight `#[ignore]`d tests in this file (KC-1's round-trip and
+//! siblings legs, KC-3, KC-4, KC-5, KC-9, KC-10, KC-11) are the only ones
+//! that drive the real macOS Keychain (via the `/usr/bin/security` CLI the
+//! shipped write/delete path uses), so each is `#[ignore]`d: they still mutate
 //! the login Keychain (create + delete throwaway items) as a side effect. Run
 //! them on demand instead:
 //!     cargo test keychain -- --ignored
@@ -12,14 +12,17 @@
 //! touches the Keychain.
 
 use super::{
-    Keep, PutTransport, SECURITY_ARGV_VALUE_MAX, SECURITY_STDIN_LINE_MAX,
-    add_generic_password_line, delete_at, keychain_service_for_config_dir, merge_and_put_at,
-    merge_write, merged_blob, put_blob_at, put_transport, read_blob_at, run_with_deadline,
-    security_quote,
+    Keep, PutTransport, SECURITY_ARGV_VALUE_MAX, SECURITY_BIN, SECURITY_STDIN_LINE_MAX, SecurityOp,
+    UnparseableItem, VerifyOutcome, WriteDisposition, add_generic_password_line, carried_raw,
+    delete_at, disposition_verdict, keychain_service_for_config_dir, merge_and_put_at, merge_write,
+    merged_blob, put_blob_at, put_transport, quarantine_path, quarantine_tail, read_blob_at,
+    run_with_deadline, security_deadline, security_error, security_quote, sign_out_at,
+    verify_outcome, write_disposition,
 };
 use crate::logline::LogLines;
 use crate::profile::{ClaudeCredentials, OAuthToken};
-use std::path::Path;
+use crate::testutil::HomeSandbox;
+use std::path::{Path, PathBuf};
 
 fn sample_creds(access: &str, refresh: &str) -> ClaudeCredentials {
     ClaudeCredentials {
@@ -792,5 +795,660 @@ fn a_line_just_under_the_stdin_ceiling_round_trips_intact() {
         "a {line_len}-byte line under the ceiling came back changed -- the transport truncated it",
     );
 
+    delete_at(&service, account).expect("cleanup");
+}
+
+// ── KC-6: what a read-back proves about a write (pure, no Keychain touched) ────
+//
+// `add-generic-password` exiting 0 is not proof the item holds the bytes sent:
+// the `-i` truncation (#66) exited 0 while the item held cut-off JSON. The
+// four-way decision — match, mismatch, absent, unreadable — is pure, so the
+// whole truth table is pinned without a Keychain.
+
+/// A read-back equal to the written JSON is the only silent success. The `-w`
+/// output carries a trailing newline the written JSON does not, so the compare
+/// normalizes trailing whitespace and nothing else.
+#[test]
+fn verify_outcome_matches_a_read_back_equal_to_the_written_json() {
+    let json = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-A"}}"#;
+    assert_eq!(
+        verify_outcome(Ok(Some(format!("{json}\n"))), json),
+        VerifyOutcome::Verified,
+        "the `-w` trailing newline is not part of the value"
+    );
+    assert_eq!(
+        verify_outcome(Ok(Some(json.to_string())), json),
+        VerifyOutcome::Verified,
+        "a read-back with no trailing whitespace at all is also a match"
+    );
+}
+
+/// A read-back with different bytes is a KNOWN-CORRUPT write, and the differing
+/// bytes ride the outcome — they are what the quarantine file must hold. The
+/// compare is on BYTES: leading whitespace is a different value, not a
+/// formatting difference, and must not pass as a match.
+#[test]
+fn verify_outcome_carries_the_read_back_bytes_of_a_mismatch() {
+    let written = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-A"}}"#;
+    let truncated = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-"#;
+    assert_eq!(
+        verify_outcome(Ok(Some(format!("{truncated}\n"))), written),
+        VerifyOutcome::Corrupt(format!("{truncated}\n")),
+        "the differing bytes ride the outcome, for the quarantine file to hold"
+    );
+    assert_eq!(
+        verify_outcome(Ok(Some(format!(" {written}\n"))), written),
+        VerifyOutcome::Corrupt(format!(" {written}\n")),
+        "the compare is on bytes, so leading whitespace is a mismatch, not a match"
+    );
+}
+
+/// An item that reads back ABSENT (exit 44) after a write that reported
+/// success: the write did not land, which is as known-corrupt as a mismatch —
+/// but with no bytes to quarantine, the variant carries none.
+#[test]
+fn verify_outcome_marks_an_absent_item_vanished() {
+    assert_eq!(
+        verify_outcome(Ok(None), r#"{"claudeAiOauth":{}}"#),
+        VerifyOutcome::Vanished,
+    );
+}
+
+/// A read-back that cannot run — a budget clamped to zero, a deadline, a read
+/// refusal over ssh — carries the rendered cause for the event line and is
+/// SUCCESS for the caller: the write's own exit code said it landed, and an
+/// unverifiable write must not fail a completed switch.
+#[test]
+fn verify_outcome_marks_a_failed_read_unverified_with_the_cause() {
+    assert_eq!(
+        verify_outcome(
+            Err(anyhow::anyhow!(
+                "/usr/bin/security exceeded its 10s deadline"
+            )),
+            "x"
+        ),
+        VerifyOutcome::Unverified("/usr/bin/security exceeded its 10s deadline".to_string()),
+    );
+    // The whole chain renders, not just the outer message: read failures
+    // arrive context-wrapped ("failed to run ... find-generic-password"
+    // around the exit-code error), and the event line names the real cause.
+    let chained =
+        anyhow::anyhow!("Keychain read failed (security exit 36): interaction not allowed")
+            .context("failed to run /usr/bin/security find-generic-password");
+    assert_eq!(
+        verify_outcome(Err(chained), "x"),
+        VerifyOutcome::Unverified(
+            "failed to run /usr/bin/security find-generic-password: Keychain read failed \
+             (security exit 36): interaction not allowed"
+                .to_string()
+        ),
+    );
+}
+
+// ── KC-6b: the RULING on what a read-back proved (pure, no Keychain) ───────────
+//
+// The classification above was pinned from the start; the ruling was not, and
+// one-line flips of it — a corrupt write completing a switch, an unverifiable
+// one failing it — shipped green with every test passing. The mapping and the
+// verdict are pure, so the owner-ruled dispositions are pinned without a
+// Keychain; `verify_write` only executes them.
+
+/// M1's owner ruling, the failing half: a write KNOWN corrupt — different
+/// read-back bytes, or an item that read back absent after a reported success
+/// — FAILS the switch. The corrupt arm quarantines the carried bytes first;
+/// the absent arm has none to quarantine.
+#[test]
+fn a_write_known_corrupt_fails_the_switch() {
+    let bytes = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-TRUNC"#.to_string();
+    assert_eq!(
+        write_disposition(VerifyOutcome::Corrupt(bytes.clone())),
+        WriteDisposition::QuarantineAndFail(bytes),
+        "a mismatched read-back is quarantined, then the write fails"
+    );
+    assert_eq!(
+        write_disposition(VerifyOutcome::Vanished),
+        WriteDisposition::Fail,
+        "an absent read-back fails the write too — no bytes to quarantine"
+    );
+    assert!(
+        disposition_verdict(&WriteDisposition::QuarantineAndFail(String::new())).is_err(),
+        "completing a switch over a known-corrupt write is the one outcome M1 refuses"
+    );
+    assert!(
+        disposition_verdict(&WriteDisposition::Fail).is_err(),
+        "an absent-after-success write fails the switch as surely as a mismatched one"
+    );
+}
+
+/// M1's owner ruling, the completing half: an UNVERIFIABLE write — the
+/// read-back could not run at all — completes the switch with the cause named
+/// on the event line, and a VERIFIED one completes silently.
+#[test]
+fn an_unverifiable_write_completes_the_switch() {
+    assert_eq!(
+        write_disposition(VerifyOutcome::Unverified("read refused".to_string())),
+        WriteDisposition::CompleteWithNote("read refused".to_string()),
+        "a read-back that cannot run completes the switch, naming why"
+    );
+    assert_eq!(
+        write_disposition(VerifyOutcome::Verified),
+        WriteDisposition::CompleteSilently,
+        "a matched read-back is the only silent outcome"
+    );
+    assert!(
+        disposition_verdict(&WriteDisposition::CompleteWithNote("x".to_string())).is_ok(),
+        "an unverifiable write must not fail a completed switch"
+    );
+    assert!(
+        disposition_verdict(&WriteDisposition::CompleteSilently).is_ok(),
+        "a verified write completes, silently"
+    );
+}
+
+/// The read-back bytes ride `Corrupt` and `QuarantineAndFail` for quarantine,
+/// but never through `Debug` — the same hand-written redaction as
+/// `UnparseableItem`'s, so a future `{:?}` render cannot put a session on a
+/// log line.
+#[test]
+fn the_verify_outcome_and_disposition_debug_never_print_the_bytes() {
+    let corrupt = VerifyOutcome::Corrupt(
+        r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-SECRET"#.to_string(),
+    );
+    assert!(
+        !format!("{corrupt:?}").contains("sk-ant-oat01-SECRET"),
+        "VerifyOutcome's Debug prints a length, never the bytes: {corrupt:?}"
+    );
+    let disposition = write_disposition(corrupt);
+    assert!(
+        !format!("{disposition:?}").contains("sk-ant-oat01-SECRET"),
+        "the disposition carries the same bytes and redacts them the same way: {disposition:?}"
+    );
+}
+
+// ── KC-7: quarantine before overwrite/delete (pure decision + derivation) ──────
+//
+// Two sites used to destroy salvageable bytes on an unparseable read: the merge
+// overwrote the item, the sign-out deleted it (#66/#76 — the corruption usually
+// leaves an intact `claudeAiOauth` head). The salvage decision and the path it
+// writes to are pure, so both are pinned without a Keychain.
+
+/// Only an unparseable read has bytes to preserve; every other read failure saw
+/// nothing and behaves exactly as it did before quarantine existed. The split
+/// is what keeps a locked keychain or a spent budget from writing a quarantine
+/// file full of nothing, and keeps the no-bytes event line (the re-authenticate
+/// one) the one those failures take.
+#[test]
+fn carried_raw_quarantines_only_an_unparseable_reads_bytes() {
+    let parse_error =
+        serde_json::from_str::<serde_json::Value>("not json").expect_err("garbage fails to parse");
+    let unparseable = anyhow::Error::new(UnparseableItem {
+        raw: r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-TRUNC"#.to_string(),
+        parse_error,
+    });
+    assert_eq!(
+        carried_raw(&unparseable),
+        Some(r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-TRUNC"#),
+        "an unparseable read carries its raw bytes for the quarantine file"
+    );
+    // Every failure that saw no bytes: a deadline, a budget refusal, a UTF-8
+    // failure, a read that errored on an exit code. None quarantine.
+    for e in [
+        anyhow::anyhow!("/usr/bin/security exceeded its 10.000s deadline and was killed"),
+        anyhow::anyhow!(
+            "/usr/bin/security not run: this lock hold's subprocess budget is already spent"
+        ),
+        anyhow::anyhow!("Keychain password is not UTF-8"),
+        anyhow::anyhow!("Keychain read failed (security exit 36): interaction not allowed"),
+    ] {
+        assert!(
+            carried_raw(&e).is_none(),
+            "a read failure with no bytes must not quarantine: {e}"
+        );
+    }
+}
+
+/// The bytes ride the error for quarantine, but never through `Debug`: the
+/// hand-written impl redacts `raw` to a length, because a derived `Debug` would
+/// print live credential bytes and a stray `{:?}` on this error would put a
+/// session on a log line (`ConsoleCredential`'s hand-written impl is the
+/// precedent, `docs/security.md`).
+#[test]
+fn an_unparseable_items_debug_never_prints_the_bytes() {
+    let parse_error =
+        serde_json::from_str::<serde_json::Value>("not json").expect_err("parse fails");
+    let item = UnparseableItem {
+        raw: r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-SECRET"#.to_string(),
+        parse_error,
+    };
+    let rendered = format!("{item:?}");
+    assert!(
+        !rendered.contains("sk-ant-oat01-SECRET"),
+        "Debug on the salvaged bytes must print a length, never the bytes: {rendered}"
+    );
+    assert!(
+        rendered.contains("raw_len"),
+        "the hand-written Debug is what keeps them off: {rendered}"
+    );
+}
+
+/// The per-event path: tree-placed (the quarantine dir is a sibling of
+/// `profiles/`), timestamped (UTC — a filename must not carry `:`, which
+/// Finder renders as a path separator), pid-separated (the daemon and a TUI
+/// can salvage the same item in the same second), and service-identifiable
+/// (the bare item and a namespaced per-config-dir one can both exist). An
+/// epoch past chrono's range degrades to the raw seconds rather than
+/// panicking or colliding.
+#[test]
+fn quarantine_path_is_timestamped_pid_separated_and_service_identified() {
+    let base = Path::new("/home/op/.clauth");
+    assert_eq!(
+        quarantine_path(base, "Claude Code-credentials", 1_771_234_565, 4213),
+        PathBuf::from(
+            "/home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json"
+        ),
+    );
+    assert_eq!(
+        quarantine_path(
+            base,
+            "Claude Code-credentials-0123abcd",
+            1_771_234_565,
+            4213
+        ),
+        PathBuf::from(
+            "/home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials-0123abcd.json"
+        ),
+    );
+    // A separator in the service cannot escape the dir.
+    assert_eq!(
+        quarantine_path(base, "../evil", 0, 1),
+        PathBuf::from("/home/op/.clauth/keychain-quarantine/19700101T000000Z-1-.._evil.json"),
+        "`/` is sanitized, never a path separator",
+    );
+    assert_eq!(
+        quarantine_path(base, "s", i64::MAX, 1).file_name(),
+        Some(std::ffi::OsStr::new("9223372036854775807-1-s.json")),
+        "an out-of-range epoch degrades to the raw seconds, still unique per event",
+    );
+}
+
+/// The wording that tells an operator where the salvaged bytes went, and how to
+/// get them back — pinned by equality because it renders during an incident,
+/// and a clause that silently drops off the line costs the recovery it names.
+/// The `{e}` of the failure arm is an io error from the quarantine write
+/// itself, never `security` stderr.
+#[test]
+fn quarantine_tail_names_the_file_and_the_recovery_or_the_loss() {
+    let path = PathBuf::from(
+        "/home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json",
+    );
+    assert_eq!(
+        quarantine_tail(&Ok(path)),
+        "raw bytes are preserved at /home/op/.clauth/keychain-quarantine/20260216T093605Z-4213-Claude Code-credentials.json: the `claudeAiOauth` login head usually survives this corruption, so re-authenticate any MCP server that reports a signed-out session, or slice the login out of the quarantined file",
+    );
+    assert_eq!(
+        quarantine_tail(&Err(anyhow::anyhow!("permission denied"))),
+        "raw bytes could not be preserved (permission denied): re-authenticate any MCP server \
+         that reports a signed-out session, or sign in again at claude.ai",
+    );
+}
+
+// ── KC-8: write errors never embed stderr (GH #66's echo) ──────────────────────
+//
+// `security` echoed an escaped fragment of the WRITTEN VALUE into its stderr on
+// the truncated-line path (`security: unknown command "CJuYW1lIjoi…"`), and
+// that text rode `security_error` into event lines and `daemon.log`. A write
+// failure now reports the exit code and the stderr byte COUNT, never the
+// bytes; read and delete failures keep the bytes — no credential is ever sent
+// on those calls, and the text is diagnostic.
+
+/// A `security` failure with the given exit code and stderr, in the shape
+/// `run_with_deadline` hands back. `code << 8` is the unix wait status for
+/// "exited with `code`"; the signal row below builds a killed child directly.
+fn security_output(code: i32, stderr: &str) -> std::process::Output {
+    use std::os::unix::process::ExitStatusExt;
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: Vec::new(),
+        stderr: stderr.as_bytes().to_vec(),
+    }
+}
+
+/// The write-op message, pinned by full equality against a fixture that fixes
+/// every interpolated value: exit 51 and a 57-byte stderr carrying exactly the
+/// echoed-value shape observed in the field. The count is the RAW stderr
+/// length — exactly the bytes withheld, all of them: the fixture pads both
+/// ends (raw 57, trimmed 53) so an edit switching the count to the trimmed
+/// length reds here instead of shipping a figure that does not name what was
+/// withheld. The equality proves the marker absent and the count present; the
+/// explicit `contains` assert names the defect class for whoever reads a
+/// failure here.
+#[test]
+fn a_write_error_reports_the_exit_code_and_stderr_size_never_the_bytes() {
+    let output = security_output(
+        51,
+        "  security: unknown command \"CJuYW1lIjoiZXhwIjoxNzA5fQ\"  ",
+    );
+    assert_eq!(
+        output.stderr.len(),
+        57,
+        "the fixture must hold its padded shape"
+    );
+    let err = security_error(SecurityOp::Write, &output);
+    assert_eq!(
+        err.to_string(),
+        "Keychain write failed (security exit 51): its 57-byte stderr is not shown, because \
+         a write's stderr can echo the value being written",
+    );
+    assert!(
+        !err.to_string().contains("CJuYW1lIjoi"),
+        "the echoed value fragment must never reach a write error's text"
+    );
+    assert!(
+        !err.to_string().contains("53-byte"),
+        "the withheld figure is the raw byte count, never the trimmed one"
+    );
+    // A child killed by a signal has no exit code at all; the split holds.
+    let signalled = {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(9),
+            stdout: Vec::new(),
+            stderr: b"x".to_vec(),
+        }
+    };
+    assert_eq!(
+        security_error(SecurityOp::Write, &signalled).to_string(),
+        "Keychain write failed (security exit signal): its 1-byte stderr is not shown, because \
+         a write's stderr can echo the value being written",
+    );
+}
+
+/// The control: read and delete send no credential, so their errors keep the
+/// stderr bytes — the diagnostic value (an ACL refusal reads differently from
+/// a usage error) is why the embedding arm exists at all.
+#[test]
+fn read_and_delete_errors_still_embed_stderr() {
+    let output = security_output(36, "SecKeychainSearchCopyNext: interaction not allowed");
+    assert_eq!(
+        security_error(SecurityOp::Read, &output).to_string(),
+        "Keychain read failed (security exit 36): SecKeychainSearchCopyNext: interaction not allowed",
+    );
+    assert_eq!(
+        security_error(SecurityOp::Delete, &output).to_string(),
+        "Keychain delete failed (security exit 36): SecKeychainSearchCopyNext: interaction not allowed",
+        "delete sends no credential either, and its stderr is diagnostic"
+    );
+}
+
+// ── KC-9: the quarantine path over a REAL Keychain item ────────────────────────
+//
+// The merge site's salvage, end to end: a merge onto an item holding truncated
+// JSON (#66/#76's defect shape — intact head, cut tail) must quarantine the
+// corrupted bytes BEFORE the overwrite that would destroy them, still complete
+// the write (the module's completing-the-switch posture), and say so on the
+// event line. The healthy verify leg of that same write is silent, which this
+// pins too: exactly one event line fires.
+
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
+    use std::process::Command;
+
+    let service = format!("clauth-test-quarantine-{}", std::process::id());
+    let account = "clauth-test-account";
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+
+    // Seed the defect: truncated JSON, an intact `claudeAiOauth` head with its
+    // tail cut — the exact shape the `-i` line truncation left in the field.
+    // Staged through the same `-i` line the real write used, so the item holds
+    // precisely what a truncated write would have left.
+    let garbage = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-TRUNCATED"#;
+    let line = add_generic_password_line(&service, account, garbage).expect("compose seed line");
+    let mut cmd = Command::new(SECURITY_BIN);
+    cmd.arg("-i");
+    let seeded = run_with_deadline(cmd, security_deadline(), Some(&line)).expect("run seed");
+    assert!(
+        seeded.status.success(),
+        "seeding the garbage item: {seeded:?}"
+    );
+
+    // The quarantine write lands under `~/.clauth`, which under `cfg(test)`
+    // must resolve to a sandbox — never the operator's real tree.
+    let sandbox = HomeSandbox::new();
+    let lines = LogLines::new();
+    let _capture = lines.capture_here();
+
+    // The merge path over the corrupted item: the read comes back unparseable,
+    // the bytes are quarantined, the merge proceeds as over an absent item,
+    // and the write lands and verifies (silently, on a healthy item).
+    let incoming = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "sk-ant-oat01-INCOMING" }
+    });
+    merge_and_put_at(&service, account, &incoming, Keep::CarriedOnly)
+        .expect("the switch still completes over a corrupted item");
+    drop(_capture);
+
+    // The event line: current shape plus the salvage, and the path it names is
+    // the file that holds the bytes.
+    let snapshot = lines.snapshot();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "one event line (the quarantine note; the healthy verify is silent): {snapshot:?}"
+    );
+    let event = &snapshot[0];
+    assert!(
+        event.starts_with(
+            "clauth: could not read the macOS Keychain login before replacing it (Keychain item \
+             is not valid JSON"
+        ),
+        "the line keeps its current shape: {event}"
+    );
+    let (_, salvaged) = event
+        .split_once("— their raw bytes are preserved at ")
+        .expect("the line names where the bytes went");
+    let (path_text, _) = salvaged
+        .split_once(": the `claudeAiOauth`")
+        .expect("the line carries the recovery hint");
+    let path = Path::new(path_text);
+    assert!(
+        path_text.contains(&service),
+        "the quarantine file is service-identifiable: {path_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read the quarantined bytes"),
+        format!("{garbage}\n"),
+        "the quarantine file holds the item's raw bytes, trailing `-w` newline included"
+    );
+
+    // The write still completed: the item now holds the incoming store whole.
+    assert_eq!(
+        read_blob_at(&service, account).expect("read").as_ref(),
+        Some(&incoming),
+        "the merge over a corrupted item still writes the incoming store"
+    );
+
+    // `docs/security.md`'s tree invariant, at the new artifact: 0600 file
+    // under a 0700 dir, exactly like the parked `mcp-logins.json`.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file_mode = std::fs::metadata(path)
+            .expect("quarantine file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "the quarantined bytes are owner-only");
+        let dir_mode = std::fs::metadata(path.parent().expect("quarantine dir"))
+            .expect("quarantine dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "the quarantine dir is owner-only");
+    }
+
+    drop(sandbox);
+    delete_at(&service, account).expect("cleanup");
+}
+
+/// KC-10 — the verify leg's CALL SITE and its `CompleteWithNote` ruling,
+/// against a real Keychain. The stageable read failure is the module doc's own
+/// probe shape: an item ACL'd to another binary (`-T /usr/bin/false`, the
+/// shape CC's own item has). The write lands silently (writes are gated on the
+/// keychain being unlocked, never the item's trust list); the verify READ then
+/// hits the ACL — an unanswered dialog at a console, a read refusal headless —
+/// either way the read cannot run, the write is named landed-but-unverified on
+/// one event line, and the switch completes. No Linux leg can kill a deleted
+/// `verify_write` call (nothing there can spawn `/usr/bin/security`); this leg
+/// is what kills it, on macOS only.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service, ACL-seeded); the verify read blocks up to SECURITY_TIMEOUT at a console — run explicitly with --ignored"]
+fn an_unverifiable_write_lands_and_completes_the_switch() {
+    use std::process::Command;
+
+    let service = format!("clauth-test-acl-{}", std::process::id());
+    let account = "clauth-test-account";
+    // Seed a FRESH item (no -U: -T belongs to the create) whose trust list
+    // names only /usr/bin/false, so our own find cannot read it back quietly.
+    let mut seed = Command::new(SECURITY_BIN);
+    seed.args([
+        "add-generic-password",
+        "-s",
+        &service,
+        "-a",
+        account,
+        "-w",
+        "seed-value",
+        "-T",
+        "/usr/bin/false",
+    ]);
+    let seeded = run_with_deadline(seed, security_deadline(), None).expect("seed the ACL'd item");
+    assert!(
+        seeded.status.success(),
+        "seeding the ACL'd item: {seeded:?}"
+    );
+
+    // The staged arm completes with a note, but an unexpected Corrupt
+    // read-back would quarantine — the sandbox keeps that off the operator's
+    // tree (and `clauth_dir` panics unsandboxed under cfg(test)).
+    let sandbox = HomeSandbox::new();
+    let lines = LogLines::new();
+    let _capture = lines.capture_here();
+
+    let blob = serde_json::json!({ "claudeAiOauth": { "accessToken": "sk-ant-oat01-ACL" } });
+    let result = put_blob_at(&service, account, &blob);
+    drop(_capture);
+
+    assert!(
+        result.is_ok(),
+        "an unverifiable write must not fail a completed switch: {result:?}"
+    );
+    let snapshot = lines.snapshot();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "exactly the landed-but-unverified line — the write itself is silent, and a healthy \
+         verify says nothing: {snapshot:?}"
+    );
+    let event = &snapshot[0];
+    assert!(
+        event.starts_with(
+            "clauth: the macOS Keychain write landed but could not be read back to verify ("
+        ),
+        "the line names the write as landed but unverified: {event}"
+    );
+    assert!(
+        event.ends_with(
+            "the switch stays complete. If Claude Code reports a signed-out or broken session, \
+             retrying the switch re-runs the write"
+        ),
+        "and names the remedy: {event}"
+    );
+
+    drop(sandbox);
+    // Best-effort cleanup: deleting an item ACL'd to another binary may itself
+    // prompt, and a leftover throwaway item is the acceptable residue of a
+    // failed cleanup — not worth burning SECURITY_TIMEOUT or redding the leg.
+    let _ = delete_at(&service, account);
+}
+
+/// KC-11 — the sign-out site's quarantine-before-delete, against a real
+/// Keychain item: the DESTRUCTIVE half of M2 (KC-9 pins the merge site's
+/// overwrite half). A sign-out over an item holding truncated JSON salvages
+/// the corrupted bytes BEFORE the delete that would destroy them, still
+/// deletes, and says so on the event line. Drives `sign_out_at` on a throwaway
+/// service — `keychain_sign_out` itself is hardwired to the real item.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
+    use std::process::Command;
+
+    let service = format!("clauth-test-signout-{}", std::process::id());
+    let account = "clauth-test-account";
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+
+    // Seed the defect exactly like KC-9: truncated JSON, an intact
+    // `claudeAiOauth` head with its tail cut, staged through the same
+    // `security -i` line a truncated write used.
+    let garbage = r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-TRUNCATED"#;
+    let line = add_generic_password_line(&service, account, garbage).expect("compose seed line");
+    let mut cmd = Command::new(SECURITY_BIN);
+    cmd.arg("-i");
+    let seeded = run_with_deadline(cmd, security_deadline(), Some(&line)).expect("run seed");
+    assert!(
+        seeded.status.success(),
+        "seeding the garbage item: {seeded:?}"
+    );
+
+    // The quarantine write lands under `~/.clauth`, which under `cfg(test)`
+    // must resolve to a sandbox — never the operator's real tree.
+    let sandbox = HomeSandbox::new();
+    let lines = LogLines::new();
+    let _capture = lines.capture_here();
+
+    // The sign-out over the corrupted item: the read comes back unparseable,
+    // the bytes are quarantined, and the delete still runs.
+    sign_out_at(&service, account).expect("the sign-out still completes over a corrupted item");
+    drop(_capture);
+
+    // The event line: current shape plus the salvage, and the path it names is
+    // the file that holds the bytes.
+    let snapshot = lines.snapshot();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "one event line — the quarantine note over the delete: {snapshot:?}"
+    );
+    let event = &snapshot[0];
+    assert!(
+        event.starts_with(
+            "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it could \
+             not be read first (Keychain item is not valid JSON"
+        ),
+        "the line keeps its current shape: {event}"
+    );
+    let (_, salvaged) = event
+        .split_once("— their raw bytes are preserved at ")
+        .expect("the line names where the bytes went");
+    let (path_text, _) = salvaged
+        .split_once(": the `claudeAiOauth`")
+        .expect("the line carries the recovery hint");
+    let path = Path::new(path_text);
+    assert!(
+        path_text.contains(&service),
+        "the quarantine file is service-identifiable: {path_text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).expect("read the quarantined bytes"),
+        format!("{garbage}\n"),
+        "the quarantine file holds the item's raw bytes, trailing `-w` newline included"
+    );
+
+    // The delete still happened: the item is gone.
+    assert!(
+        read_blob_at(&service, account).expect("read").is_none(),
+        "the sign-out still deletes the corrupted item"
+    );
+
+    drop(sandbox);
     delete_at(&service, account).expect("cleanup");
 }

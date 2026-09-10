@@ -32,8 +32,13 @@ use crate::profile::clauth_dir;
 
 /// How stale `status.json` may be before the `● daemon` dot flips green→amber.
 /// The daemon stamps it every ~1s loop tick, but a single tick can legitimately
-/// block up to the keychain shell-outs' 20s total kill deadline (a
-/// read-modify-write at 10s each), so the window rides just above that. It also lands at the daemon's tightened
+/// block on the keychain shell-outs: a rotation's mirror makes three `security`
+/// calls (read, write, read-back verify) at 10 s each, unclamped because it
+/// runs after the lock closure — 30 s worst, past
+/// `runtime::KEYCHAIN_MIRROR_BUDGET`'s 20 s term by design (see
+/// `keychain::SECURITY_TIMEOUT`'s doc) — so the window now sits AT the worst
+/// case rather than just above it, and a mirror that spends every deadline
+/// reads amber in its final instant. It also lands at the daemon's tightened
 /// [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE), so amber reads as "wedging,
 /// about to be aborted + restarted" rather than a transient slow tick.
 const DAEMON_STALE_MS: u64 = 30_000;

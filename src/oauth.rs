@@ -1351,7 +1351,10 @@ pub(crate) fn apply_rotated_tokens_locked(
     // on-device 2026-07-07). The mirror DECISION and the creds snapshot are
     // made under the locked section below, so the written pair is exactly the
     // persisted one; the `/usr/bin/security` shell-out itself runs after the
-    // flock is released (it can hang up to its 20 s kill deadline, and the
+    // flock is released (it can hang up to 30 s across its three `security`
+    // calls — read, write, and the write's read-back verify, 10 s each — riding
+    // past `runtime::KEYCHAIN_MIRROR_BUDGET`'s 20 s mirror term deliberately;
+    // see `keychain::SECURITY_TIMEOUT`'s doc for why that is safe, and the
     // global state flock must never be held across a subprocess — before this
     // function the locked section contained only fast disk writes). In-process
     // switches stay excluded for the whole window by the config mutex held
