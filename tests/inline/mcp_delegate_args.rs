@@ -1911,6 +1911,37 @@ fn a_first_party_profile_with_a_stale_third_party_cache_passes() {
     );
 }
 
+/// The keyless sentence outranks the unfunded one: a third-party target with
+/// no inference auth is refused for the missing key even when a stale
+/// unfunded verdict also sits in its cache — the key is the fix a login can
+/// deliver, the wallet reading may be stale.
+#[test]
+fn the_keyless_sentence_outranks_the_unfunded_one() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    crate::actions::create_blank_profile(
+        &mut config,
+        "nokey".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        None,
+        None,
+    )
+    .expect("create profile");
+    drop(config);
+    seed_stats_cache("nokey", crate::testutil::DEEPSEEK_UNFUNDED_CACHE_BYTES);
+    let config = crate::profile::load_config().expect("config loads");
+    let pn = crate::profile::ProfileName::from("nokey");
+    let profile = config.find(&pn).expect("seeded profile resolves");
+    let reason = super::preflight_target(profile, &config, &pn).expect_err("refused");
+    assert_eq!(
+        reason, "profile has no api key: nokey (run `clauth login nokey --api-key <key>`)",
+        "the keyless sentence is the refusal, not the unfunded one"
+    );
+}
+
 /// A disabled account's fix outranks its wallet: the disabled sentence stays
 /// first, so the reader is not sent hunting a balance the enable restores.
 /// Seeded third-party (the drained-account shape: an unfunded verdict, then
