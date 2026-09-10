@@ -1070,7 +1070,7 @@ fn carried_raw_quarantines_only_an_unparseable_reads_bytes() {
 /// hand-written impl redacts `raw` to a length, because a derived `Debug` would
 /// print live credential bytes and a stray `{:?}` on this error would put a
 /// session on a log line (`ConsoleCredential`'s hand-written impl is the
-/// precedent, `docs/security.md`).
+/// precedent).
 #[test]
 fn an_unparseable_items_debug_never_prints_the_bytes() {
     let parse_error =
@@ -1327,7 +1327,7 @@ fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
         "the merge over a corrupted item still writes the incoming store"
     );
 
-    // `docs/security.md`'s tree invariant, at the new artifact: 0600 file
+    // The 0600/0700 tree invariant, at the new artifact: 0600 file
     // under a 0700 dir, exactly like the parked `mcp-logins.json`.
     {
         use std::os::unix::fs::PermissionsExt;

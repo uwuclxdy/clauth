@@ -489,7 +489,7 @@ struct UnparseableItem {
     parse_error: serde_json::Error,
 }
 
-// Hand-written like `ConsoleCredential`'s (`docs/security.md`): a derived
+// Hand-written like `ConsoleCredential`'s: a derived
 // `Debug` would print `raw` — live credential bytes — and a stray `{:?}` on
 // this error would put a session on a log line. The length is all a debug
 // reader needs.
@@ -560,7 +560,7 @@ fn quarantine_path(base: &Path, service: &str, epoch_secs: i64, pid: u32) -> Pat
 /// Write `raw` — bytes salvaged from the item at `service`, which this module
 /// is about to overwrite or delete — to its quarantine file, and return the
 /// path. `atomic_write_600` owns the posture (0700 dir on create, 0600 file
-/// before the rename, `docs/security.md`'s tree invariant): the bytes are
+/// before the rename — the 0600/0700 tree invariant): the bytes are
 /// exactly as sensitive as a `credentials.json`, so they inherit its placement
 /// rather than landing outside the tree.
 fn quarantine_item_bytes(service: &str, raw: &str) -> Result<PathBuf> {
