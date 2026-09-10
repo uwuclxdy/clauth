@@ -8,6 +8,10 @@ Found a security issue? Report it privately through the [security policy](https:
 
 clauth handles live credentials. Before you paste any log, config, or output into an issue or PR, strip OAuth tokens, API keys, and the contents of `~/.claude/.credentials.json` or any `~/.clauth/profiles/*` file. An `sk-ant-*` string is a live credential, not an ID.
 
+## Commit shape
+
+PRs merge as merge commits with every commit intact, so your commit subjects land on the default branch verbatim. Conventional Commits (`fix(tokens): …`) and code/docs in separate commits read best there.
+
 ## Flag user-visible changes
 
 Anything a user reads or presses can change without failing a build, so it reads as diff noise and slips past review. If your PR moves any of these, say so in the summary with why you changed it:
