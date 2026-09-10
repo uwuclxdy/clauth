@@ -305,22 +305,79 @@ fn wallet_top_up_cuts_the_series() {
 
 #[test]
 fn wallet_unchanged_past_the_gap_cut_retires_the_rate() {
+    // Seeded through the REAL writer so bridge pairs shape the series the way
+    // a landing fetch does. An idle stretch longer than the 6h cut between two
+    // readings of the same amount retires the rate: WITHOUT the cut the deduped
+    // series still holds three distinct amounts (100 → 90 → 80) and a rate
+    // computes, so this pins the cut itself, not the sample floor.
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-cut");
     let now = crate::usage::now_ms();
-    // The balance last moved 7h ago and sits unchanged: the current append
-    // equals the last reading with a gap past the 6h cut, slicing the series
-    // below the sample floor — no stale slope renders.
-    let history = vec![
-        wallet_sample(now - 8 * HOUR, "api balance", "CNY", 100.0),
-        wallet_sample(now - 7 * HOUR, "api balance", "CNY", 90.0),
-    ];
+    let drain = |amount: f64, hours_ago: u64| {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &wallet_row_stats(amount),
+            now - hours_ago * 3_600_000,
+        );
+    };
+    drain(100.0, 10);
+    drain(90.0, 9); // an idle 7h follows this reading
+    drain(80.0, 2);
+    let history = crate::profile::load_wallet_history(&name);
     let rate = compute_wallet_rate_from_history(
         &history,
-        &wallet("api balance", "CNY", 90.0),
+        &wallet("api balance", "CNY", 80.0),
         W_LOOKBACK,
         W_MIN_SAMPLES,
         W_GAP_CUT,
     );
-    assert!(rate.is_none());
+    assert!(rate.is_none(), "rate={rate:?}");
+}
+
+#[test]
+fn wallet_short_idle_keeps_the_rate() {
+    // Control for the gap cut: the same drain with a 5h idle (under the 6h
+    // cut) keeps its rate — the cut retires only genuinely idle wallets, never
+    // an active one spacing its spend hours apart.
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-cut-ctrl");
+    let now = crate::usage::now_ms();
+    let drain = |amount: f64, hours_ago: u64| {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &wallet_row_stats(amount),
+            now - hours_ago * 3_600_000,
+        );
+    };
+    drain(100.0, 10);
+    drain(90.0, 9);
+    drain(80.0, 4); // a 5h idle, under the cut
+    let history = crate::profile::load_wallet_history(&name);
+    let rate = compute_wallet_rate_from_history(
+        &history,
+        &wallet("api balance", "CNY", 80.0),
+        W_LOOKBACK,
+        W_MIN_SAMPLES,
+        W_GAP_CUT,
+    )
+    .unwrap();
+    // (100 − 80)/9h ≈ 53 CNY/day on the deduped line.
+    assert!((rate - 53.0).abs() < 15.0, "rate={rate}");
+}
+
+fn wallet_row_stats(amount: f64) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![crate::providers::StatRow {
+            label: "api balance".to_string(),
+            value: format!("{amount:.2} CNY"),
+            kind: crate::providers::StatRowKind::Body,
+        }],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
 }
 
 #[test]

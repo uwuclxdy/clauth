@@ -1950,10 +1950,16 @@ impl App {
         }
 
         // The wallet series mirrors it: same read-only discipline, same mtime
-        // invalidation, only the file and the type differ.
+        // invalidation, only the file and the type differ — and only
+        // third-party profiles carry one, so the loop stats no OAuth
+        // profile's absent file.
         let mut wallet_cache: HashMap<String, Vec<crate::usage::WalletSample>> = HashMap::new();
         let mut wallet_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
-        for profile in &config.profiles {
+        for profile in config
+            .profiles
+            .iter()
+            .filter(|p| p.usage_cache_is_third_party())
+        {
             let name = &profile.name;
             let data = crate::profile::load_wallet_history(name);
             if !data.is_empty() {

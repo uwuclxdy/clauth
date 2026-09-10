@@ -837,8 +837,12 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // A wallet-bearing active's runway: its funded balance and burn rate, and
     // how long the two hold — the wallet sibling of the projection above. No
     // threshold and no warning hue; the figure and its pace, the operator
-    // judges.
+    // judges. Gated on the cache selector (a profile edited off a third-party
+    // endpoint keeps its never-evicted store entry) and on enabled-ness (the
+    // usage tab renders a disabled account terminal, no figures).
     if let Some(active) = cfg.state.active_profile.as_ref().and_then(|n| cfg.find(n))
+        && active.usage_cache_is_third_party()
+        && !active.is_disabled()
         && let Some(rate) = app.wallet_rate_for(active)
     {
         let secs = (rate.amount / rate.per_day * 86_400.0) as i64;

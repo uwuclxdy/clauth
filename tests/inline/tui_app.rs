@@ -7563,6 +7563,64 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
     );
 }
 
+/// The wallet series' TUI wiring, end to end on disk: `App::new` loads it at
+/// bootstrap, and `apply_usage` re-reads it when the file's mtime moves — the
+/// carrier the usage tab's balance-row clause and the overview's drains line
+/// read, so a regression here silences both surfaces with no other signal.
+#[test]
+fn wallet_series_loads_at_bootstrap_and_reloads_on_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-wire"]);
+    let name = crate::profile::ProfileName::from("ds-wire");
+    let now = crate::usage::now_ms();
+    let drain = |amount: f64, hours_ago: u64| {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &wire_wallet_stats(amount),
+            now - hours_ago * 3_600_000,
+        );
+    };
+    drain(100.0, 12);
+    drain(90.0, 11);
+    drain(80.0, 1);
+
+    let profile = crate::profile::Profile::new(
+        "ds-wire".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let mut app = app_with(vec![profile]);
+    assert_eq!(
+        app.wallet_cache.get("ds-wire").map(Vec::len),
+        Some(5),
+        "bootstrap loads the series: first reading + two bridge pairs",
+    );
+
+    // A landing fetch appends; the mtime bump is the reload signal.
+    drain(70.0, 0);
+    app.apply_usage();
+    assert_eq!(
+        app.wallet_cache.get("ds-wire").map(Vec::len),
+        Some(7),
+        "apply_usage re-reads a moved wallet history file",
+    );
+}
+
+fn wire_wallet_stats(amount: f64) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![crate::providers::StatRow {
+            label: "api balance".to_string(),
+            value: format!("{amount:.2} CNY"),
+            kind: crate::providers::StatRowKind::Body,
+        }],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
 /// #74 degraded cue, FEED half: `apply_usage` derives `usage_stale` off the
 /// DISK body's `fetched_at` vs `stale_after_ms`, with the spent-account
 /// exemption reading the disk cache too (never the live store — a spent
