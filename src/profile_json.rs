@@ -316,7 +316,7 @@ fn cache_age_secs(name: &ProfileName, file: &str) -> Option<u64> {
     now_ms().checked_sub(mtime).map(|age| age / 1000)
 }
 
-/// One published OAuth window row — the `{label, utilization_pct, resets_at}`
+/// One published window row — the `{label, utilization_pct, resets_at}`
 /// spelling of a 5h, 7d, or per-model weekly window. Both writers
 /// ([`usage_windows`] → the daemon's `status.json` feed and the MCP payloads)
 /// and the reader (`clauth list`'s 5h/7d columns) derive from this one struct,

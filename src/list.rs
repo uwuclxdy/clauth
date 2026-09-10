@@ -82,10 +82,11 @@ struct Row {
 impl Row {
     fn from_entry(config: &AppConfig, entry: &ProfileEntry) -> Row {
         let typed_name = &entry.name;
-        // A third-party account has no 5h/7d pool, so those columns render the
-        // provider's OWN headroom — its cached bars, or the wallet a scalar
-        // provider publishes — instead of the dashes a windowless OAuth account
-        // renders (owner ruling 2026-09-09 row 3).
+        // A third-party account renders its own headroom in these columns —
+        // its live cached bars, or the wallet a scalar provider publishes —
+        // rather than the store-derived windows the walk judges (owner ruling
+        // 2026-09-09 row 3, unchanged for the accounts whose provider now
+        // publishes 5h/7d windows: the columns stay the provider's figures).
         let (five_h, seven_d) = match config.find(typed_name) {
             Some(p) if p.usage_cache_is_third_party() => {
                 let (five, seven) = crate::profile_json::third_party_columns(p);
