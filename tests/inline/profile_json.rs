@@ -119,6 +119,81 @@ fn profile_windows_reads_a_third_party_accounts_own_cache() {
     }
 }
 
+/// A third-party account's funded wallet carries its burn rate off the balance
+/// series its own fetch leg records — the one figure every headroom surface
+/// renders beside the balance.
+#[test]
+fn profile_windows_carries_the_funded_wallets_rate() {
+    let _home = HomeSandbox::new();
+    seed_provider_cache("vendor", Duration::from_secs(100));
+    let name = crate::profile::ProfileName::from("vendor");
+    let now = crate::usage::now_ms();
+    // A dense hourly drain to the captured figure (the `total` wallet the
+    // vendor cache carries): 85.45 → 31.45 CNY at 4.5 CNY/h ≈ 108/day,
+    // seeded through the REAL writer so bridge pairs shape the series the
+    // way a landing fetch does.
+    for hours_ago in 1..=12u64 {
+        let amount = 31.45 + 4.5 * hours_ago as f64;
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &wallet_rows_stats(amount),
+            now - hours_ago * 3_600_000,
+        );
+    }
+
+    match profile_windows(&vendor_profile("vendor")) {
+        ProfileWindows::ThirdParty { wallet_rate, .. } => {
+            let rate = wallet_rate.expect("a funded wallet with a live series carries a rate");
+            assert_eq!(rate.currency, "CNY");
+            assert_eq!(rate.label, "total");
+            assert!((rate.amount - 31.45).abs() < 1e-9);
+            assert!(
+                (rate.per_day - 108.0).abs() < 8.0,
+                "per_day={}",
+                rate.per_day
+            );
+        }
+        ProfileWindows::Oauth { .. } => {
+            panic!("a third-party account has no 5h/7d window to report")
+        }
+    }
+}
+
+/// No balance series, no rate — the figure still renders; only its pace is
+/// missing, which is the cold-start shape every surface already tolerates.
+#[test]
+fn profile_windows_carries_no_wallet_rate_without_a_series() {
+    let _home = HomeSandbox::new();
+    seed_provider_cache("vendor", Duration::from_secs(100));
+
+    match profile_windows(&vendor_profile("vendor")) {
+        ProfileWindows::ThirdParty {
+            stats, wallet_rate, ..
+        } => {
+            assert!(stats.is_some(), "the cache is seeded");
+            assert!(wallet_rate.is_none(), "no series, no rate");
+        }
+        ProfileWindows::Oauth { .. } => {
+            panic!("a third-party account has no 5h/7d window to report")
+        }
+    }
+}
+
+fn wallet_rows_stats(amount: f64) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: vec![crate::providers::StatRow {
+            label: "total".to_string(),
+            value: format!("{amount:.2} CNY"),
+            kind: crate::providers::StatRowKind::Body,
+        }],
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
 /// Before its first provider fetch there is still no 5h/7d window — that half
 /// is structurally none — and no balance either, which is a genuine unknown.
 #[test]

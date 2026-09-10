@@ -168,13 +168,27 @@ fn windows_payload(windows: &ProfileWindows) -> serde_json::Value {
             "windows": usage.as_deref().map(usage_windows).unwrap_or_default(),
         }),
         ProfileWindows::ThirdParty {
-            stats, provider, ..
-        } => serde_json::json!({
-            "kind": "third_party",
-            "balance": stats.as_ref().map(render::third_party_headline),
-            "provider_windows": provider.is_some_and(|p| p.publishes_windows())
-                || stats.as_ref().is_some_and(|s| !s.bars.is_empty()),
-        }),
+            stats,
+            provider,
+            wallet_rate,
+            ..
+        } => {
+            let mut payload = serde_json::json!({
+                "kind": "third_party",
+                "balance": stats.as_ref().map(render::third_party_headline),
+                "provider_windows": provider.is_some_and(|p| p.publishes_windows())
+                    || stats.as_ref().is_some_and(|s| !s.bars.is_empty()),
+            });
+            // The wallet-burn rate, omitted when it carries no news (the same
+            // rule every optional field here follows): a first-class figure
+            // the roster and the delegate reply render beside the balance,
+            // the way they already share `fetched_secs_ago`.
+            if let Some(rate) = wallet_rate {
+                payload["wallet_burn_per_day"] = serde_json::json!(rate.per_day);
+                payload["wallet_burn_currency"] = serde_json::json!(rate.currency);
+            }
+            payload
+        }
     }
 }
 

@@ -886,6 +886,44 @@ fn windows_prose_dates_an_unknown_and_never_marks_it_stale() {
     );
 }
 
+/// The wallet-burn rate rides the balance it qualifies, before the freshness
+/// clause — the shortfall-report shape: the figure and its pace, the caller
+/// judges the runway.
+#[test]
+fn windows_prose_appends_the_wallet_burn_rate_to_the_figure() {
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 2.53 CNY",
+            "provider_windows": false,
+            "wallet_burn_per_day": 4.17,
+            "wallet_burn_currency": "CNY",
+        })),
+        "no 5h/7d limits; api balance: 2.53 CNY · ~4.2 CNY/day",
+    );
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "pro: 5h 12.5%, 7d 48%",
+            "provider_windows": true,
+            "wallet_burn_per_day": 4.17,
+            "wallet_burn_currency": "CNY",
+            "fetched_secs_ago": 30,
+        })),
+        "pro: 5h 12.5%, 7d 48% · ~4.2 CNY/day (cached 30s ago)",
+    );
+    // No rate fields, no clause — an account without a trustworthy slope
+    // renders exactly as it did before.
+    assert_eq!(
+        windows_prose(&serde_json::json!({
+            "kind": "third_party",
+            "balance": "api balance: 2.53 CNY",
+            "provider_windows": false,
+        })),
+        "no 5h/7d limits; api balance: 2.53 CNY",
+    );
+}
+
 #[test]
 fn profiles_prose_renders_each_row_with_unknown_for_null_fields() {
     // One carrier per row: the third-party account's figures ride its `windows`

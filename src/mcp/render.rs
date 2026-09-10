@@ -881,6 +881,15 @@ fn windows_prose(windows: &Value) -> String {
             } else {
                 format!("no 5h/7d limits; {figure}")
             };
+            // The wallet-burn rate rides the figure it qualifies — the same
+            // first-class-figure shape the Usage tab's rate rows carry, so a
+            // reader picking a delegate target judges the runway themselves.
+            if let (Some(per_day), Some(currency)) = (
+                windows.get("wallet_burn_per_day").and_then(Value::as_f64),
+                windows.get("wallet_burn_currency").and_then(Value::as_str),
+            ) {
+                out.push_str(&format!(" · ~{per_day:.1} {currency}/day"));
+            }
             out.push_str(&freshness_clause(windows));
             out
         }

@@ -230,6 +230,202 @@ fn recency_weighting_favors_recent_slope() {
     );
 }
 
+// --- compute_wallet_rate_from_history (the wallet arm) ---
+// Same clock-relative seeding as the window tests. A wallet BURNS DOWN, so
+// the fixtures fall and the rate is the negated slope.
+
+fn wallet(label: &str, currency: &str, amount: f64) -> crate::providers::Wallet {
+    crate::providers::Wallet {
+        label: label.to_string(),
+        value: format!("{amount} {currency}"),
+        currency: currency.to_string(),
+        amount,
+    }
+}
+
+fn wallet_sample(ts: u64, label: &str, currency: &str, amount: f64) -> WalletSample {
+    WalletSample {
+        ts,
+        label: label.to_string(),
+        amount,
+        currency: currency.to_string(),
+    }
+}
+
+const W_LOOKBACK: u64 = 24 * 60 * 60 * 1000;
+const W_MIN_SAMPLES: usize = 3;
+const W_GAP_CUT: u64 = 6 * 60 * 60 * 1000;
+const HOUR: u64 = 3_600_000;
+
+#[test]
+fn wallet_linear_drain_exact_rate_per_day() {
+    let now = crate::usage::now_ms();
+    // Perfectly linear fall 100→40 over 2h: a weighted fit recovers the exact
+    // slope regardless of the recency weighting. -30/h → 720 CNY/day.
+    let history = vec![
+        wallet_sample(now - 2 * HOUR, "api balance", "CNY", 100.0),
+        wallet_sample(now - 90 * 60_000, "api balance", "CNY", 85.0),
+        wallet_sample(now - HOUR, "api balance", "CNY", 70.0),
+        wallet_sample(now - 30 * 60_000, "api balance", "CNY", 55.0),
+    ];
+    let rate = compute_wallet_rate_from_history(
+        &history,
+        &wallet("api balance", "CNY", 40.0),
+        W_LOOKBACK,
+        W_MIN_SAMPLES,
+        W_GAP_CUT,
+    )
+    .unwrap();
+    assert!((rate - 720.0).abs() < 1.0, "rate={rate}");
+}
+
+#[test]
+fn wallet_top_up_cuts_the_series() {
+    let now = crate::usage::now_ms();
+    // Spend down to 40, top up to 200, then burn 200→188. A slope computed
+    // across the jump would blend spend with refill and read as negative burn.
+    let history = vec![
+        wallet_sample(now - 8 * HOUR, "api balance", "CNY", 100.0),
+        wallet_sample(now - 6 * HOUR, "api balance", "CNY", 70.0),
+        wallet_sample(now - 4 * HOUR, "api balance", "CNY", 40.0),
+        wallet_sample(now - 2 * HOUR, "api balance", "CNY", 200.0),
+        wallet_sample(now - HOUR, "api balance", "CNY", 194.0),
+    ];
+    // Post-top-up: 200, 194, 188 → -6/h → 144 CNY/day.
+    let rate = compute_wallet_rate_from_history(
+        &history,
+        &wallet("api balance", "CNY", 188.0),
+        W_LOOKBACK,
+        W_MIN_SAMPLES,
+        W_GAP_CUT,
+    )
+    .unwrap();
+    assert!((rate - 144.0).abs() < 2.0, "rate={rate}");
+}
+
+#[test]
+fn wallet_unchanged_past_the_gap_cut_retires_the_rate() {
+    let now = crate::usage::now_ms();
+    // The balance last moved 7h ago and sits unchanged: the current append
+    // equals the last reading with a gap past the 6h cut, slicing the series
+    // below the sample floor — no stale slope renders.
+    let history = vec![
+        wallet_sample(now - 8 * HOUR, "api balance", "CNY", 100.0),
+        wallet_sample(now - 7 * HOUR, "api balance", "CNY", 90.0),
+    ];
+    let rate = compute_wallet_rate_from_history(
+        &history,
+        &wallet("api balance", "CNY", 90.0),
+        W_LOOKBACK,
+        W_MIN_SAMPLES,
+        W_GAP_CUT,
+    );
+    assert!(rate.is_none());
+}
+
+#[test]
+fn wallet_too_few_transitions_yields_none() {
+    let now = crate::usage::now_ms();
+    // One recorded change: history point + current = 2 entries, below the
+    // floor of 3 — a rate is never shown from one transition.
+    let history = vec![wallet_sample(now - 2 * HOUR, "api balance", "CNY", 100.0)];
+    let rate = compute_wallet_rate_from_history(
+        &history,
+        &wallet("api balance", "CNY", 90.0),
+        W_LOOKBACK,
+        W_MIN_SAMPLES,
+        W_GAP_CUT,
+    );
+    assert!(rate.is_none());
+}
+
+#[test]
+fn wallet_identity_pairs_label_with_currency() {
+    let now = crate::usage::now_ms();
+    // The same row label carries two currencies (the DS5/DS6 shape); the CNY
+    // fit must read only its own series. Straight -18/h → 432 CNY/day.
+    let history = vec![
+        wallet_sample(now - 2 * HOUR, "api balance", "USD", 5.0),
+        wallet_sample(now - HOUR, "api balance", "USD", 3.0),
+        wallet_sample(now - 2 * HOUR, "api balance", "CNY", 100.0),
+        wallet_sample(now - HOUR, "api balance", "CNY", 82.0),
+        wallet_sample(now - 30 * 60_000, "api balance", "CNY", 73.0),
+    ];
+    let rate = compute_wallet_rate_from_history(
+        &history,
+        &wallet("api balance", "CNY", 64.0),
+        W_LOOKBACK,
+        W_MIN_SAMPLES,
+        W_GAP_CUT,
+    )
+    .unwrap();
+    assert!((rate - 432.0).abs() < 1.5, "rate={rate}");
+}
+
+#[test]
+fn wallet_rising_balance_after_a_top_up_reads_as_no_burn() {
+    let now = crate::usage::now_ms();
+    // Everything after the top-up still rises (credits landing): no positive
+    // burn is invented from a refill.
+    let history = vec![
+        wallet_sample(now - 3 * HOUR, "api balance", "CNY", 40.0),
+        wallet_sample(now - 2 * HOUR, "api balance", "CNY", 200.0),
+        wallet_sample(now - HOUR, "api balance", "CNY", 205.0),
+    ];
+    let rate = compute_wallet_rate_from_history(
+        &history,
+        &wallet("api balance", "CNY", 210.0),
+        W_LOOKBACK,
+        W_MIN_SAMPLES,
+        W_GAP_CUT,
+    );
+    assert!(rate.is_none());
+}
+
+#[test]
+fn funded_wallet_rate_picks_the_first_funded_wallet() {
+    let now = crate::usage::now_ms();
+    // DS5 shape: an unfunded USD wallet listed before the funded CNY one —
+    // the rate names the CNY wallet, off its own series.
+    let history = vec![
+        wallet_sample(now - 2 * HOUR, "api balance", "CNY", 100.0),
+        wallet_sample(now - HOUR, "api balance", "CNY", 88.0),
+        wallet_sample(now - 30 * 60_000, "api balance", "CNY", 76.0),
+    ];
+    let rows = vec![
+        crate::providers::StatRow {
+            label: "api balance".to_string(),
+            value: "0.00 USD".to_string(),
+            kind: crate::providers::StatRowKind::Body,
+        },
+        crate::providers::StatRow {
+            label: "api balance".to_string(),
+            value: "63.34 CNY".to_string(),
+            kind: crate::providers::StatRowKind::Body,
+        },
+    ];
+    let rate = funded_wallet_rate(&history, &rows).unwrap();
+    assert_eq!(rate.currency, "CNY");
+    assert_eq!(rate.label, "api balance");
+    assert!((rate.amount - 63.34).abs() < f64::EPSILON);
+    // (100-63.34)/2h ≈ 18.3 CNY/h → ≈440 CNY/day.
+    assert!(
+        rate.per_day > 300.0 && rate.per_day < 500.0,
+        "per_day={}",
+        rate.per_day
+    );
+}
+
+#[test]
+fn funded_wallet_rate_is_none_without_a_funded_wallet() {
+    let rows = vec![crate::providers::StatRow {
+        label: "api balance".to_string(),
+        value: "0.00 USD".to_string(),
+        kind: crate::providers::StatRowKind::Body,
+    }];
+    assert!(funded_wallet_rate(&[], &rows).is_none());
+}
+
 // --- project_utilization (issue #8 follow-up b: burn-aware auto-switch) ---
 
 #[test]

@@ -174,6 +174,12 @@ pub(crate) enum ProfileWindows {
         /// from what the PROVIDER publishes rather than from what one response
         /// carried. `None` for a generic endpoint.
         provider: Option<Provider>,
+        /// The funded wallet's burn rate off the profile's balance series —
+        /// the one figure every headroom surface renders beside the balance
+        /// (the roster row and the delegate reply read it through
+        /// [`crate::mcp::windows_payload`]). `None` when no wallet is funded
+        /// or the series cannot yet support a slope.
+        wallet_rate: Option<crate::usage::WalletRate>,
     },
 }
 
@@ -293,10 +299,15 @@ fn windows_of(name: &ProfileName, third_party: bool, provider: Option<Provider>)
     if third_party {
         // The provider leg's only writer is a fetch outcome, so its file mtime
         // IS its read time and it keeps dating off the file.
+        let stats = load_profile_cache::<ThirdPartyStats>(name, file);
+        let wallet_rate = stats.as_ref().and_then(|s| {
+            crate::usage::funded_wallet_rate(&crate::profile::load_wallet_history(name), &s.rows)
+        });
         return ProfileWindows::ThirdParty {
-            stats: load_profile_cache::<ThirdPartyStats>(name, file),
+            stats,
             age_secs: cache_age_secs(name, file),
             provider,
+            wallet_rate,
         };
     }
     let usage = load_profile_cache::<UsageInfo>(name, file);

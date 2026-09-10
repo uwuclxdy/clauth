@@ -4,8 +4,8 @@ mod fetch;
 mod scheduler;
 
 pub(crate) use burn::{
-    BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletSample,
-    compute_burn_rates_from_history, project_utilization,
+    BURN_GAP_CUT_MS, BURN_LOOKBACK_MS, BURN_MIN_SAMPLES, WalletRate, WalletSample,
+    compute_burn_rates_from_history, funded_wallet_rate, project_utilization,
 };
 #[allow(unused_imports)]
 pub(crate) use fetch::{

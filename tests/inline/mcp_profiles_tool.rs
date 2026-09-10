@@ -563,6 +563,67 @@ fn a_two_wallet_profile_renders_its_funded_wallet_figure() {
     );
 }
 
+/// The wallet-burn rate on the row a model reads: the same two-wallet cache as
+/// the funded-figure ruling, plus the balance series its own fetch leg would
+/// have recorded, renders the rate beside the funded figure through the shared
+/// windows prose — the one carrier every headroom surface reads.
+#[test]
+fn a_wallet_series_renders_its_burn_rate_on_the_roster_row() {
+    let _home = HomeSandbox::new();
+    save_profile(&Profile::new(
+        "tw".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    ))
+    .expect("save tw");
+    save_app_state(&AppState {
+        active_profile: Some("tw".into()),
+        profiles: vec!["tw".into()],
+        ..Default::default()
+    })
+    .expect("save state");
+    crate::testutil::write_captured_third_party_cache(
+        "tw",
+        crate::testutil::CAPTURED_TWO_WALLET_DS_CACHE,
+    );
+    // A day of linear drain to the captured figure: 606.18 → 498.18 CNY over
+    // ~12h, the funded wallet's own series.
+    let name = crate::profile::ProfileName::from("tw");
+    let now = crate::usage::now_ms();
+    for (hours_ago, amount) in [(12u64, 606.18f64), (6, 552.18), (1, 498.18)] {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: vec![crate::providers::StatRow {
+                    label: "api balance".to_string(),
+                    value: format!("{amount:.2} CNY"),
+                    kind: crate::providers::StatRowKind::Body,
+                }],
+                bars: vec![],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+            },
+            now - hours_ago * 3_600_000,
+        );
+    }
+
+    let row = lines(&call_profiles(None, None)).remove(0);
+    assert!(
+        row.contains("api balance: 498.18 CNY · ~"),
+        "the rate rides the funded figure: {row}",
+    );
+    assert!(
+        row.contains("CNY/day"),
+        "the rate is named in the wallet's own currency: {row}",
+    );
+    assert!(
+        !row.contains("USD/day"),
+        "the unfunded USD wallet's series stays off the row: {row}",
+    );
+}
+
 /// One-wallet control for the ruling: a profile whose cache carries a single
 /// funded wallet renders exactly as it did before the rule — same figure,
 /// same row shape.
