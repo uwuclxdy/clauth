@@ -127,7 +127,8 @@ fn throughput_warnings(profile: &ProfileName, now: i64) -> Vec<serde_json::Value
 /// live figure instead of sorting the account to the bottom of the roster.
 /// The shared cache selector gates the read itself: a retyped profile's
 /// leftover `usage_cache.json` is a fossil from its OAuth life, not headroom,
-/// so it is dropped here exactly as `published_windows` drops it from the feed
+/// so this reader never opens it — the same cache-split `published_windows`
+/// reads by, whose third-party branch derives from the account's own cache —
 /// and the rank falls to the provider's own bars or wallet (#74).
 fn load_windows(name: &ProfileName) -> (Option<UsageWindow>, Option<UsageWindow>) {
     let live = |w: &Option<UsageWindow>| {
