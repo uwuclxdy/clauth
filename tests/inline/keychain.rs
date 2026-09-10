@@ -1,7 +1,7 @@
 //! KC-1 — Keychain read/write/delete round-trip. Uses a **throwaway service name**
 //! unique to this process; it never touches the real `Claude Code-credentials`
-//! item. The eight `#[ignore]`d tests in this file (KC-1's round-trip and
-//! siblings legs, KC-3, KC-4, KC-5, KC-9, KC-10, KC-11) are the only ones
+//! item. The nine `#[ignore]`d tests in this file (KC-1's round-trip and
+//! siblings legs, KC-3, KC-4, KC-5, KC-9, KC-10, KC-11, KC-12) are the only ones
 //! that drive the real macOS Keychain (via the `/usr/bin/security` CLI the
 //! shipped write/delete path uses), so each is `#[ignore]`d: they still mutate
 //! the login Keychain (create + delete throwaway items) as a side effect. Run
@@ -372,6 +372,65 @@ fn keychain_timeout_kills_a_hung_command() {
     assert!(
         elapsed < Duration::from_secs(3),
         "the child must be killed near the deadline (was {elapsed:?}), not left to run 30s"
+    );
+}
+
+// ── B2: the pipes drain concurrently with the poll loop (no Keychain touched) ──
+//
+// `run_with_deadline` used to read the child's piped output only after exit, on
+// the premise "security produces only a few bytes of output". Past the ~64 KiB
+// pipe buffer that premise is false — the 512 KiB argv cap admits items whose
+// every read legs the child into write() blocking: the child never exits, dies
+// at the deadline, and the read fails (the merge read as `None` with NO
+// quarantine bytes; the verify read as a +10 s stall into `Unverified`). Both
+// pipes are now drained by reader threads started before the poll loop.
+
+/// A child that writes more than the pipe buffer (~64 KiB) to stdout and exits
+/// must complete with ALL its bytes, not die at the deadline on a full pipe.
+/// Pre-drain, this exact child blocked on `write(2)`, never exited, and was
+/// killed at the deadline — the B2 defect.
+#[test]
+fn a_child_pasting_the_stdout_pipe_buffer_completes_with_all_its_bytes() {
+    use std::process::Command;
+    use std::time::Duration;
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "head -c 100000 /dev/zero"]);
+    let out = run_with_deadline(cmd, Duration::from_secs(5), None)
+        .expect("a big-output child completes well inside its deadline");
+    assert!(out.status.success(), "the child exits 0: {out:?}");
+    assert_eq!(
+        out.stdout.len(),
+        100_000,
+        "every byte the child wrote must come back, past the ~64 KiB pipe buffer"
+    );
+    assert!(
+        out.stderr.is_empty(),
+        "nothing was written to stderr: {out:?}"
+    );
+}
+
+/// The stderr twin: a child pasting the stderr pipe buffer must complete with
+/// all its bytes too — a full stderr pipe blocks the child exactly as a full
+/// stdout one does.
+#[test]
+fn a_child_pasting_the_stderr_pipe_buffer_completes_with_all_its_bytes() {
+    use std::process::Command;
+    use std::time::Duration;
+
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "head -c 100000 /dev/zero >&2"]);
+    let out = run_with_deadline(cmd, Duration::from_secs(5), None)
+        .expect("a big-stderr child completes well inside its deadline");
+    assert!(out.status.success(), "the child exits 0: {out:?}");
+    assert_eq!(
+        out.stderr.len(),
+        100_000,
+        "every byte the child wrote to stderr must come back"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "nothing was written to stdout: {out:?}"
     );
 }
 
@@ -1450,5 +1509,58 @@ fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
     );
 
     drop(sandbox);
+    delete_at(&service, account).expect("cleanup");
+}
+
+/// KC-12 — an item past the pipe buffer, end to end: a ~100 KiB blob (over the
+/// ~64 KiB pipe buffer, under the 512 KiB argv cap) writes through the argv
+/// transport, reads back byte-identical, and its verify leg completes
+/// `Verified` — the only silent outcome. Pre-drain this leg died at the 10 s
+/// deadline on BOTH read legs: the verify read stalled into `Unverified`, and
+/// the read-back `expect` panicked after its own 10 s stall — the B2 deadlock.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn an_item_past_the_pipe_buffer_round_trips_and_verifies() {
+    let service = format!("clauth-test-drain-{}", std::process::id());
+    let account = "clauth-test-account";
+    delete_at(&service, account).expect("pre-clean delete is idempotent");
+
+    // ~100 KiB of value: past the pipe buffer, composed line far past the
+    // 4096-byte stdin ceiling (argv transport), far under the 512 KiB cap.
+    let blob = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "a".repeat(200) },
+        "mcpOAuth": { "srv": { "accessToken": "m".repeat(100 * 1024) } },
+    });
+
+    // The write rides argv (one disclosure line) and its verify leg reads the
+    // ~100 KiB item back through the drain — byte-identical, so SILENT: no
+    // landed-but-unverified line may appear.
+    let lines = LogLines::new();
+    let _capture = lines.capture_here();
+    put_blob_at(&service, account, &blob).expect("write + verify complete");
+    drop(_capture);
+    let snapshot = lines.snapshot();
+    assert_eq!(
+        snapshot.len(),
+        1,
+        "exactly the argv disclosure — a byte-identical read-back is the only silent verify \
+         outcome: {snapshot:?}"
+    );
+    assert!(
+        snapshot[0].contains("writing it through argv"),
+        "the one line is the transport disclosure: {snapshot:?}"
+    );
+    assert!(
+        !snapshot[0].contains("could not be read back to verify"),
+        "the verify leg completed, not landed-unverified: {snapshot:?}"
+    );
+
+    // The read leg drains the same ~100 KiB and parses it back byte-identical.
+    assert_eq!(
+        read_blob_at(&service, account).expect("read").as_ref(),
+        Some(&blob),
+        "an item past the pipe buffer round-trips byte-identical through the drain"
+    );
+
     delete_at(&service, account).expect("cleanup");
 }

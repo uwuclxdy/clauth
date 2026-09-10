@@ -162,8 +162,17 @@ fn security_deadline() -> Duration {
 /// construction (`put_blob_at` routes anything longer through argv instead), so
 /// the single write before the poll loop cannot block on the pipe buffer.
 ///
-/// `security` produces only a few bytes of output, so buffering it in the pipe
-/// while we poll cannot deadlock on a full pipe buffer.
+/// `security` produces only a few bytes of output on the paths this module had
+/// measured — but the 512 KiB argv cap admits items whose `find-generic-password
+/// -w` print is past the pipe buffer (~64 KiB), so BOTH output pipes are drained
+/// concurrently with the poll loop by reader threads started before it: a child
+/// blocked on `write(2)` never exits, and read-after-exit would kill it at the
+/// deadline instead of returning the item (the merge read as a no-bytes failure,
+/// its siblings destroyed with nothing quarantined; the verify read as a +10 s
+/// stall into `Unverified`). The join after exit waits for EOF exactly as
+/// `wait_with_output` did; on the timeout path the readers are left to see EOF
+/// on their own once the killed child is reaped, so a dead child's pipes never
+/// hold the loop.
 fn run_with_deadline(
     mut cmd: Command,
     timeout: Duration,
@@ -223,21 +232,47 @@ fn run_with_deadline(
             return Err(e);
         }
     }
+    // Drain both pipes on their own threads, started BEFORE the poll loop: the
+    // child must be free to write past the pipe buffer while we wait for it to
+    // exit. Taking the handles moves the read ends into the threads, so they —
+    // not this fn — close them at EOF.
+    let stdout_reader = drain_pipe(
+        child
+            .stdout
+            .take()
+            .context("child stdout unexpectedly absent")?,
+    );
+    let stderr_reader = drain_pipe(
+        child
+            .stderr
+            .take()
+            .context("child stderr unexpectedly absent")?,
+    );
     let deadline = Instant::now() + timeout;
     loop {
         match child
             .try_wait()
             .with_context(|| format!("failed to poll {SECURITY_BIN}"))?
         {
-            Some(_status) => {
-                return child
-                    .wait_with_output()
-                    .with_context(|| format!("failed to collect {SECURITY_BIN} output"));
+            Some(status) => {
+                let stdout = collect_drained(stdout_reader)?;
+                let stderr = collect_drained(stderr_reader)?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
             }
             None => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // The readers are deliberately NOT joined here: they see EOF
+                    // once the reaped child's pipe ends close, and joining would
+                    // re-introduce an unbounded wait if anything else inherited
+                    // the write end. That case instead strands one reader thread
+                    // with its buffer — bounded, and it never holds this loop.
+                    // The accepted cost; do not "fix" it by re-adding the join.
                     // `{timeout:?}` rather than whole seconds: a clamped budget
                     // hands this sub-second values, which `as_secs()` prints as
                     // a nonsensical `0s`.
@@ -251,6 +286,30 @@ fn run_with_deadline(
             }
         }
     }
+}
+
+/// Read `pipe` to EOF on its own thread, so a child producing more than the
+/// pipe buffer cannot block on `write(2)` while the poll loop waits for it to
+/// exit — see [`run_with_deadline`].
+fn drain_pipe(
+    mut pipe: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+/// Reap a drain thread's bytes with the same error surface the post-exit
+/// `wait_with_output` had ("failed to collect … output"). A panic in the reader
+/// is not reachable — `read_to_end` does not panic — but the join is still
+/// handled rather than unwrapped.
+fn collect_drained(reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>) -> Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("output drain thread panicked"))?
+        .with_context(|| format!("failed to collect {SECURITY_BIN} output"))
 }
 
 /// Keychain generic-password service Claude Code reads/writes for its login.
