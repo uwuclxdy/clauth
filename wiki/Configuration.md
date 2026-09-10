@@ -214,6 +214,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
       usage_history.jsonl  # 2 days of samples, feeding burn-aware switching
+      wallet_history.jsonl # 2 days of balance readings, feeding the wallet-burn rate
       third_party_cache.json
       third_party_auth.json# set while the usage login is expired; a hash, never the credential
       account_id.json      # which account this is, so a re-login can be told apart
@@ -234,6 +235,6 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 
 Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. That is the whole tree: every path clauth writes is listed above, so a file you find here that is not is a leftover from an older version. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
-Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `credentials.json` or `session-token.json` signs that profile out.
+Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out.
 
 The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) clauth builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out.
