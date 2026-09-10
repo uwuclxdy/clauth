@@ -204,6 +204,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
   live_sessions/<sid>.json # one row per live `clauth start` session
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
+  keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
   profiles/
     work/
       config.toml          # everything in the table above
