@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,7 +18,7 @@ pub(crate) enum DivergenceChoice {
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
 use crate::providers::{Provider, ThirdPartyStats};
-use crate::usage::{FetchStatus, UsageInfo};
+use crate::usage::{FetchStatus, UsageInfo, WalletSample};
 
 /// A slot that reads like its inner value but writes only through the
 /// witness-gated [`SlotOps::set`]. `active_profile` and `credentials` are
@@ -1460,6 +1460,10 @@ struct HistoryLine {
     usage: UsageInfo,
 }
 
+/// Retention window shared by both per-profile series logs
+/// (`usage_history.jsonl`, `wallet_history.jsonl`).
+const HISTORY_RETENTION_MS: u64 = 2 * 24 * 60 * 60 * 1000;
+
 /// Prune a profile's usage_history.jsonl to keep at most 2 days of entries.
 /// Rewrites the file in place when there's anything to remove; no-op when it is
 /// missing, unparseable, or already within the retention window.
@@ -1478,7 +1482,7 @@ pub(crate) fn prune_usage_history(name: &ProfileName) {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-        - 2 * 24 * 60 * 60 * 1000;
+        - HISTORY_RETENTION_MS;
 
     let mut kept: Vec<&str> = Vec::new();
     let mut pruned: usize = 0;
@@ -1503,9 +1507,10 @@ pub(crate) fn prune_usage_history(name: &ProfileName) {
     }
 }
 
-/// Open a profile's `usage_history.jsonl` for append, creating it 0o600 on Unix.
-/// The log records per-profile utilization samples under `~/.clauth`, so it
-/// rides the owner-only invariant rather than the process umask.
+/// Open a profile's series log (`usage_history.jsonl` / `wallet_history.jsonl`)
+/// for append, creating it 0o600 on Unix. The logs record per-profile usage
+/// and balance samples under `~/.clauth`, so they ride the owner-only
+/// invariant rather than the process umask.
 fn history_append_file(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
@@ -1634,6 +1639,160 @@ pub(crate) fn load_usage_history(name: &ProfileName) -> Vec<(u64, UsageInfo)> {
         .collect();
     entries.sort_by_key(|(ts, _)| *ts);
     entries
+}
+
+pub(crate) fn profile_wallet_history_path(name: &ProfileName) -> Result<PathBuf> {
+    Ok(profile_dir(name)?.join("wallet_history.jsonl"))
+}
+
+/// Append this landing fetch's wallet readings to `wallet_history.jsonl` —
+/// the durable balance series the wallet-burn rate replays
+/// (`usage::burn::compute_wallet_rate_from_history`).
+///
+/// Mirrors [`append_usage_sample`]: per wallet, an unchanged reading (same
+/// amount under the same `(label, currency)` identity) writes nothing, and a
+/// changed one writes a bridge line stamping the previous amount 1 ms before
+/// the new reading so an idle stretch keeps its temporal density instead of
+/// replaying as one long ramp. Every wallet a provider reports is recorded —
+/// the rate renders the funded one's, but a wallet that drains to zero and
+/// later refills still needs its own series. One `write_all` per fetch so an
+/// append can never land interleaved; best-effort, a failure is logged,
+/// never fatal.
+pub(crate) fn append_wallet_readings(name: &ProfileName, stats: &ThirdPartyStats) {
+    append_wallet_readings_at(name, stats, crate::usage::now_ms());
+}
+
+/// Time-injected body of [`append_wallet_readings`] — the seam that lets a
+/// test seed the series through the REAL writer, bridge lines included, at
+/// controlled timestamps. Same role [`append_usage_sample_at`] plays for the
+/// window series.
+pub(crate) fn append_wallet_readings_at(name: &ProfileName, stats: &ThirdPartyStats, ts: u64) {
+    let wallets = crate::providers::balance_wallets(&stats.rows);
+    if wallets.is_empty() {
+        return;
+    }
+    // Last recorded reading per `(label, currency)` identity: the unchanged
+    // check and the bridge compare against each wallet's OWN prior reading,
+    // never a bare file tail (a multi-wallet provider interleaves its
+    // wallets' lines in one file).
+    let prior: HashMap<(String, String), WalletSample> = load_wallet_history(name)
+        .into_iter()
+        .map(|s| ((s.label.clone(), s.currency.clone()), s))
+        .collect();
+    let mut body = String::new();
+    for wallet in &wallets {
+        let prev = prior.get(&(wallet.label.clone(), wallet.currency.clone()));
+        if prev.is_some_and(|p| p.amount == wallet.amount) {
+            continue; // unchanged reading: the log grows only when numbers moved
+        }
+        if let Some(p) = prev {
+            extend_wallet_line(
+                &mut body,
+                ts.saturating_sub(1),
+                &p.label,
+                p.amount,
+                &p.currency,
+            );
+        }
+        extend_wallet_line(
+            &mut body,
+            ts,
+            &wallet.label,
+            wallet.amount,
+            &wallet.currency,
+        );
+    }
+    if body.is_empty() {
+        return;
+    }
+    let Ok(path) = profile_wallet_history_path(name) else {
+        return;
+    };
+    if let Some(dir) = path.parent()
+        && let Err(e) = mkdir_700(dir)
+    {
+        logline!("clauth: failed to create the profile dir for {name}: {e}");
+        return;
+    }
+    match history_append_file(&path) {
+        Ok(mut file) => {
+            use std::io::Write;
+            if let Err(e) = file.write_all(body.as_bytes()) {
+                logline!("clauth: failed to append wallet history for {name}: {e}");
+            }
+        }
+        Err(e) => logline!("clauth: failed to open wallet history for {name}: {e}"),
+    }
+}
+
+/// Serialize one series line onto `body`; skipped only on a serialization
+/// failure, which this plain-data struct cannot produce.
+fn extend_wallet_line(body: &mut String, ts: u64, label: &str, amount: f64, currency: &str) {
+    if let Ok(json) = serde_json::to_string(&WalletSample {
+        ts,
+        label: label.to_string(),
+        amount,
+        currency: currency.to_string(),
+    }) {
+        body.push_str(&json);
+        body.push('\n');
+    }
+}
+
+/// Load all parsed entries from a profile's wallet_history.jsonl, sorted by
+/// timestamp.
+pub(crate) fn load_wallet_history(name: &ProfileName) -> Vec<WalletSample> {
+    let Ok(path) = profile_wallet_history_path(name) else {
+        return vec![];
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return vec![];
+    };
+    let mut entries: Vec<WalletSample> = content
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    entries.sort_by_key(|s| s.ts);
+    entries
+}
+
+/// Prune a profile's wallet_history.jsonl to keep at most
+/// [`HISTORY_RETENTION_MS`] of entries — the same window and rewrite shape
+/// [`prune_usage_history`] applies to the usage series.
+pub(crate) fn prune_wallet_history(name: &ProfileName) {
+    let Ok(path) = profile_wallet_history_path(name) else {
+        return;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let cutoff = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+        - HISTORY_RETENTION_MS;
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut pruned: usize = 0;
+    for line in content.lines() {
+        if let Ok(entry) = serde_json::from_str::<WalletSample>(line) {
+            if entry.ts >= cutoff {
+                kept.push(line);
+            } else {
+                pruned += 1;
+            }
+        }
+    }
+
+    if pruned > 0 {
+        let body = kept.join("\n");
+        let body = if body.is_empty() { body } else { body + "\n" };
+        // 0o600: the rename swaps the inode, so a plain write would revert the
+        // history log (re-created 0o600 by the appender) to the umask.
+        if let Err(e) = atomic_write_600(&path, body) {
+            logline!("clauth: failed to prune wallet history for {name}: {e}");
+        }
+    }
 }
 
 fn profile_credentials_pending_path(name: &ProfileName) -> Result<PathBuf> {

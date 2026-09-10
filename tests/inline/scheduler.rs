@@ -4968,6 +4968,150 @@ fn fetch_third_party_due_inserts_known_auth_expired() {
     assert!(crate::profile_cache::auth_expired_matches(&name, fp));
 }
 
+// --- wallet_history.jsonl: the balance series the wallet-burn rate replays ---
+
+fn wallet_stats(values: &[(&str, &str)]) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: values
+            .iter()
+            .map(|&(label, value)| crate::providers::StatRow {
+                label: label.to_string(),
+                value: value.to_string(),
+                kind: crate::providers::StatRowKind::Body,
+            })
+            .collect(),
+        bars: vec![],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+fn stub_wallet_stats(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Ok(wallet_stats(&[("api balance", "18.89 CNY")]))
+}
+
+#[test]
+fn wallet_series_records_first_reading_then_bridge_on_change() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-series");
+    let t0 = 1_700_000_000_000u64;
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "10.00 CNY")]),
+        t0,
+    );
+    assert_eq!(
+        crate::profile::load_wallet_history(&name),
+        vec![crate::usage::WalletSample {
+            ts: t0,
+            label: "api balance".to_string(),
+            amount: 10.0,
+            currency: "CNY".to_string(),
+        }]
+    );
+    // Unchanged reading: nothing appended.
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "10.00 CNY")]),
+        t0 + 90_000,
+    );
+    assert_eq!(crate::profile::load_wallet_history(&name).len(), 1);
+    // Changed reading: bridge (prev amount 1 ms earlier) + the new one.
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "8.00 CNY")]),
+        t0 + 180_000,
+    );
+    let series = crate::profile::load_wallet_history(&name);
+    assert_eq!(series.len(), 3, "{series:?}");
+    assert_eq!((series[1].ts, series[1].amount), (t0 + 179_999, 10.0));
+    assert_eq!((series[2].ts, series[2].amount), (t0 + 180_000, 8.0));
+}
+
+#[test]
+fn wallet_series_keeps_each_wallets_readings_separate() {
+    // DS5/DS6 shape: an unfunded USD wallet listed before the funded CNY one,
+    // both under the SAME row label — a wallet's identity is (label, currency).
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-two");
+    let t0 = 1_700_000_000_000u64;
+    let both = wallet_stats(&[("api balance", "0.00 USD"), ("api balance", "63.34 CNY")]);
+    crate::profile::append_wallet_readings_at(&name, &both, t0);
+    assert_eq!(crate::profile::load_wallet_history(&name).len(), 2);
+    // Only the CNY wallet moves: the USD wallet records nothing new.
+    let drifted = wallet_stats(&[("api balance", "0.00 USD"), ("api balance", "60.14 CNY")]);
+    crate::profile::append_wallet_readings_at(&name, &drifted, t0 + 90_000);
+    let series = crate::profile::load_wallet_history(&name);
+    let usd: Vec<&crate::usage::WalletSample> =
+        series.iter().filter(|s| s.currency == "USD").collect();
+    let cny: Vec<&crate::usage::WalletSample> =
+        series.iter().filter(|s| s.currency == "CNY").collect();
+    assert_eq!(usd.len(), 1, "the unchanged USD wallet records nothing");
+    assert_eq!(cny.len(), 3, "bridge + new for the moved wallet");
+    assert_eq!(cny[2].amount, 60.14);
+}
+
+#[test]
+fn wallet_series_prunes_past_retention_but_keeps_the_bridge() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("ds-prune");
+    let now = crate::usage::now_ms();
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "5.00 CNY")]),
+        now - 3 * 24 * 3_600_000,
+    );
+    crate::profile::append_wallet_readings_at(
+        &name,
+        &wallet_stats(&[("api balance", "4.00 CNY")]),
+        now - 3_600_000,
+    );
+    crate::profile::prune_wallet_history(&name);
+    let series = crate::profile::load_wallet_history(&name);
+    // The 3-day-old reading drops; the 1-hour-old bridge pair stays.
+    assert_eq!(series.len(), 2, "{series:?}");
+    assert_eq!(series[0].amount, 5.0);
+    assert_eq!(series[1].amount, 4.0);
+}
+
+#[test]
+fn fetch_third_party_due_appends_the_wallet_series_beside_the_stats_cache() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-live"]);
+    let state = third_party_state(stub_wallet_stats);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![tp_entry("ds-live")]);
+    let series = crate::profile::load_wallet_history(&crate::profile::ProfileName::from("ds-live"));
+    assert_eq!(series.len(), 1, "{series:?}");
+    assert_eq!(
+        (
+            series[0].label.as_str(),
+            series[0].amount,
+            series[0].currency.as_str()
+        ),
+        ("api balance", 18.89, "CNY")
+    );
+}
+
+#[test]
+fn a_failed_third_party_fetch_appends_no_wallet_readings() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-dead"]);
+    let state = third_party_state(stub_network_error);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![tp_entry("ds-dead")]);
+    assert!(
+        crate::profile::load_wallet_history(&crate::profile::ProfileName::from("ds-dead"))
+            .is_empty()
+    );
+}
+
 /// A generic profile whose fetch found nothing is NOT session-suppressed: its
 /// transient no-data is already clamped by the fetch deferral, and suppressing
 /// stopped it from rescanning for the whole session. The AuthExpired arm stays.

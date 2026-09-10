@@ -1,7 +1,23 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
+
 use crate::usage::{UsageInfo, UsageWindow};
+
+/// One wallet reading from the per-profile balance series
+/// (`wallet_history.jsonl`): the third-party fetch leg appends one line per
+/// landing fetch for every wallet whose reading changed. A wallet's identity
+/// is `(label, currency)` — the same provider can list two wallets under one
+/// row label (DeepSeek's funded CNY beside an unfunded USD one), so the label
+/// alone does not name a wallet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct WalletSample {
+    pub(crate) ts: u64,
+    pub(crate) label: String,
+    pub(crate) amount: f64,
+    pub(crate) currency: String,
+}
 
 /// Lookback window shared by the burn-aware switch projection (`fallback.rs`)
 /// and the Overview ETA line (`burn_rate_eta`) — both trust only the last hour

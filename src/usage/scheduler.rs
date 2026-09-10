@@ -2885,6 +2885,10 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 // that read it have no other way to learn the session came back.
                 crate::profile_cache::clear_auth_expired(&name);
                 write_profile_cache(&name, THIRD_PARTY_CACHE_FILE, &stats);
+                // The balance series rides the same write point as the stats
+                // cache — one landing fetch, one set of readings — and the
+                // fallback legs write none (a cached copy is not a reading).
+                crate::profile::append_wallet_readings(&name, &stats);
                 // Derived before the move, so the mirror below costs no clone.
                 let derived = stats.to_usage_info();
                 if let Ok(mut store) = state.third_party_usage_store.lock() {
@@ -3135,9 +3139,10 @@ fn history_profile_names(config: &crate::profile::ConfigHandle) -> Vec<ProfileNa
         .unwrap_or_default()
 }
 
-/// Re-trim every usage-history log once the cadence has elapsed; reports whether
-/// it ran. The retention window itself is [`crate::profile::prune_usage_history`]'s
-/// 2 days — this only bounds how far past it a file can drift.
+/// Re-trim every per-profile series log (usage + wallet history) once the
+/// cadence has elapsed; reports whether it ran. The retention window itself is
+/// [`crate::profile::prune_usage_history`]'s 2 days — this only bounds how far
+/// past it a file can drift.
 ///
 /// A startup-only trim was enough while the TUI was the writer (a launch
 /// re-pruned), but the appender is the fetch path now, and a daemon under
@@ -3168,6 +3173,7 @@ fn prune_histories_if_due(
     }
     for name in history_profile_names(config) {
         crate::profile::prune_usage_history(&name);
+        crate::profile::prune_wallet_history(&name);
     }
     true
 }
@@ -3678,6 +3684,7 @@ pub(crate) fn spawn_refresher(
     let history_names = history_profile_names(&config);
     for name in &history_names {
         crate::profile::prune_usage_history(name);
+        crate::profile::prune_wallet_history(name);
     }
     let last_history_prune = AtomicU64::new(now_ms());
 
