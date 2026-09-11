@@ -104,7 +104,7 @@ An account's 5h window opens on its first real request, so a chain member you ha
 
 The chain runs wherever the decision loop runs: an open TUI, or `clauth daemon` with the TUI closed ([Daemon](Daemon)). Only one of them decides at a time.
 
-`clauth start <profile> --with-fallback` gives a single session its own chain, so that session hops accounts while your global one stays put. It needs a running daemon and an OAuth account inside a chain that holds a second member to move to, and it does not work on macOS or alongside `--isolated` ([Quickstart](Quickstart#rules-worth-knowing)).
+`clauth start <profile> --with-fallback` gives a single session its own chain, so that session hops accounts while your global one stays put. It needs a running daemon and an OAuth account inside a chain that holds a second member to move to, and it does not work alongside `--isolated` ([Quickstart](Quickstart#rules-worth-knowing)). On macOS the swap also writes the session's per-config-dir Keychain item, so the running session follows the chain there too.
 
 ## Mixing account types
 

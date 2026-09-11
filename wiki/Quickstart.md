@@ -88,7 +88,7 @@ clauth list           # account table with cached usage, no network
 ### Rules worth knowing
 
 - **`start` argument order.** clauth's own flags go before the profile name. Anything clauth does not recognize is forwarded to `claude` verbatim, leading hyphens included. Use `--` for a spelling both programs own, like `--help`.
-- **`start --with-fallback`** hands the session its own fallback chain. Refused by name when combined with `--isolated`, on macOS, on Windows without symlink privilege, or for a non-OAuth account.
+- **`start --with-fallback`** hands the session its own fallback chain. Refused by name when combined with `--isolated`, on Windows without symlink privilege, or for a non-OAuth account.
   - Also refused for an account outside the chain, when the chain has no other member, or when no `clauth daemon` is running.
 - **`start --isolated` keeps the session.** Its transcripts and session state are lifted into your global store before the throwaway runtime is discarded, so the run stays resumable and its tokens are counted. A hard kill (SIGKILL) skips that teardown; the next stale-runtime sweep lifts the tree into the global store before deleting it, so a killed session is rescued too. The `--rescue`/`--no-rescue` flags and the `auto_rescue` setting that used to decide this are gone; there is nothing to opt into and no way to opt out.
 - **`delete` and `disable` want a TTY.** Both prompt `[y/N]`; on a non-TTY stdin they refuse unless you pass `--yes`. `--force` is the only way past `delete`'s live-session guard, and `--yes` alone does not override it.
