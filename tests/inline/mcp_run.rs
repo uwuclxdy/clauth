@@ -1068,7 +1068,8 @@ fn background_fanout_refuses_a_keyless_member_before_writing_jobs() {
 //   3. happy path: a valid prompt returns `{is_error:false, result, ...}` parsed
 //      from `claude -p --output-format stream-json --verbose
 //      --include-partial-messages`, and the child inherits `CLAUTH_MCP_DEPTH=1`
-//      + `--strict-mcp-config`.
+//      + `--strict-mcp-config`, and every stream line's `session_id` equals the
+//      `--session-id` the spawn passed and `CLAUTH_DELEGATE_SESSION_ID` names.
 //   4. idle kill + salvage: the idle guard fires on stream SILENCE — no stdout
 //      line for `idle_secs`, counted per line by `read_stdout` — so a child stuck
 //      in a long tool call is NOT idle. Measured 2026-08-25: a foreground
@@ -1088,6 +1089,7 @@ fn delegate_env_strips_inherited_provider_routing() {
         &[],
         std::path::Path::new("/cfg"),
         0,
+        "sid-1",
     );
     let envs = crate::testutil::env_overrides(&cmd);
 
@@ -1107,6 +1109,11 @@ fn delegate_env_strips_inherited_provider_routing() {
     );
     assert_eq!(envs.get("CLAUTH_MCP_DEPTH"), Some(&Some("1".to_string())));
     assert_eq!(
+        envs.get("CLAUTH_DELEGATE_SESSION_ID"),
+        Some(&Some("sid-1".to_string())),
+        "the delegate's own session id is exported for hook exemptions",
+    );
+    assert_eq!(
         envs.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
         Some(&Some(DEFAULT_MAX_OUTPUT_TOKENS.to_string())),
     );
@@ -1124,6 +1131,7 @@ fn delegate_env_strips_active_profile_custom_env() {
         &["FOO".to_string(), "BAR".to_string()],
         std::path::Path::new("/cfg"),
         0,
+        "s",
     );
     let envs = crate::testutil::env_overrides(&cmd);
     assert_eq!(
@@ -1144,6 +1152,11 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
     );
     // must NOT be able to defeat the depth guard,
     caller.insert("CLAUTH_MCP_DEPTH".to_string(), "0".to_string());
+    // nor hijack the exemption marker onto another session,
+    caller.insert(
+        "CLAUTH_DELEGATE_SESSION_ID".to_string(),
+        "spoofed-session".to_string(),
+    );
     // and a caller-set max-tokens is respected, not overwritten by the default.
     caller.insert(
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS".to_string(),
@@ -1151,7 +1164,14 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
     );
 
     let mut cmd = Command::new("claude");
-    apply_delegate_env(&mut cmd, &caller, &[], std::path::Path::new("/cfg"), 0);
+    apply_delegate_env(
+        &mut cmd,
+        &caller,
+        &[],
+        std::path::Path::new("/cfg"),
+        0,
+        "sid-9",
+    );
     let envs = crate::testutil::env_overrides(&cmd);
 
     assert_eq!(
@@ -1168,6 +1188,36 @@ fn delegate_env_caller_reauthority_and_clauth_keys_win() {
         envs.get("CLAUDE_CODE_MAX_OUTPUT_TOKENS"),
         Some(&Some("999".to_string())),
         "a caller-set max-tokens is not clobbered by the default",
+    );
+    assert_eq!(
+        envs.get("CLAUTH_DELEGATE_SESSION_ID"),
+        Some(&Some("sid-9".to_string())),
+        "the session-id marker always wins over a caller value",
+    );
+}
+
+#[test]
+fn a_resume_keeps_its_session_id_and_a_fresh_run_pins_a_new_one() {
+    assert_eq!(
+        delegate_session_id(Some("0f0e0d0c-1111-4222-8333-444455556666")).as_deref(),
+        Ok("0f0e0d0c-1111-4222-8333-444455556666"),
+        "a resume runs under the id it continues, so an exemption keyed on the \
+         exported id keeps covering it",
+    );
+    let a = delegate_session_id(None).expect("fresh id");
+    let b = delegate_session_id(None).expect("fresh id");
+    assert_ne!(a, b, "two fresh runs pin two different ids");
+    assert_eq!(a.len(), 36, "uuid shape: {a}");
+    for (i, c) in a.chars().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => assert_eq!(c, '-', "hyphen at byte {i}: {a}"),
+            _ => assert!(c.is_ascii_hexdigit(), "hex digit at byte {i}: {a}"),
+        }
+    }
+    assert_eq!(a.as_bytes()[14], b'4', "uuid v4 version nibble: {a}");
+    assert!(
+        "89ab".contains(a.chars().nth(19).expect("byte 19")),
+        "RFC 4122 variant nibble: {a}"
     );
 }
 

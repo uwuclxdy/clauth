@@ -756,13 +756,16 @@ pub(crate) struct DelegateArgs {
     /// the reply inline.
     result: Option<String>,
     /// Additional environment variables passed to the delegate session. Values
-    /// you set for `CLAUDE_CONFIG_DIR` and `CLAUTH_MCP_DEPTH` are replaced by
-    /// clauth's own. Read `code.claude.com/docs/en/env-vars.md` to see what
+    /// you set for `CLAUDE_CONFIG_DIR`, `CLAUTH_MCP_DEPTH` and
+    /// `CLAUTH_DELEGATE_SESSION_ID` are replaced by clauth's own. Read
+    /// `code.claude.com/docs/en/env-vars.md` to see what
     /// Claude Code supports.
     env: Option<HashMap<String, String>>,
     /// Extra CLI arguments that go after the `claude -p` clauth invokes. Your
     /// arguments come last, so they win where a flag repeats (including
-    /// `--model` when `model` is set).
+    /// `--model` when `model` is set). `--session-id`, `--resume` and
+    /// `--fork-session` are refused: clauth pins the session id and exports it
+    /// as `CLAUTH_DELEGATE_SESSION_ID`; resume through `session_id`.
     ///
     /// A delegate that must write files needs
     /// `args: ["--dangerously-skip-permissions"]`; without it the session
@@ -1128,6 +1131,23 @@ across accounts."
         {
             return Ok(delegate_refusal(
                 "`permission_mode` cannot combine with `--permission-mode` in `args`: drop one",
+            ));
+        }
+        // clauth owns the session id: it pins the id the child runs under and
+        // exports it as `CLAUTH_DELEGATE_SESSION_ID`, which hook exemptions
+        // key on. A raw flag landing after the pin (caller `args` run last)
+        // would move the child off that id and silently break the equality,
+        // so refuse every spelling that can name or fork a session.
+        if args.as_ref().is_some_and(|a| {
+            args_carry_flag(a, "--session-id")
+                || args_carry_flag(a, "--resume")
+                || args_carry_flag(a, "-r")
+                || args_carry_flag(a, "--fork-session")
+        }) {
+            return Ok(delegate_refusal(
+                "`args` cannot carry `--session-id`, `--resume`/`-r` or `--fork-session`: \
+                 clauth pins the delegate's session id and exports it as \
+                 `CLAUTH_DELEGATE_SESSION_ID`; resume through the `session_id` argument",
             ));
         }
         // The result mode is a closed set: unset means inline, `"file"` means
@@ -1749,6 +1769,12 @@ listing is where you find its id."
 /// Env var carrying the MCP delegation depth; the child `claude` inherits
 /// `depth+1` so a delegate cannot itself delegate (hard cap at 1).
 const MCP_DEPTH_ENV: &str = "CLAUTH_MCP_DEPTH";
+
+/// Env var naming the session id the delegate's `claude` runs under. It
+/// inherits to every process the delegate starts, so a consumer keying an
+/// exemption on it must match the payload's `session_id`, never the value's
+/// presence — the objective-first hook is the consumer this exists for.
+const DELEGATE_SESSION_ENV: &str = "CLAUTH_DELEGATE_SESSION_ID";
 
 /// Poll interval mirroring `start.rs`'s `wait_for_child` cadence.
 const RUN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -3261,18 +3287,52 @@ fn check_resume_cwd(given: &str, workspace: &std::path::Path) -> std::result::Re
     Ok(())
 }
 
+/// A fresh session id for a delegate run: a random UUID v4, the shape
+/// `claude --session-id` takes and hook payloads echo back.
+fn fresh_session_id() -> std::result::Result<String, String> {
+    let mut b = [0u8; 16];
+    getrandom::fill(&mut b)
+        .map_err(|e| format!("CSPRNG failure pinning a delegate session id: {e}"))?;
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // RFC 4122 variant
+    let h = hex::encode(b);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    ))
+}
+
+/// The session id the delegate's `claude` runs under: a resume keeps the id it
+/// continues, a fresh run pins a generated one. One value feeds both
+/// [`DELEGATE_SESSION_ENV`] and the `--session-id`/`--resume` flag, so an
+/// exemption keyed on the env var matches exactly the session the flag created
+/// and nothing the delegate later starts, which inherits the var but runs
+/// under its own session id.
+fn delegate_session_id(resume: Option<&str>) -> std::result::Result<String, String> {
+    match resume {
+        Some(id) => Ok(id.to_string()),
+        None => fresh_session_id(),
+    }
+}
+
 /// Compose a delegate's environment on `command`: drop inherited provider
 /// routing + the outgoing activation's custom env keys
 /// ([`crate::runtime::scrub_profile_env`]), layer the caller's `env`, then
-/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR` and the depth guard
-/// can't be overridden, and `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when
-/// the caller didn't set it.
+/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
+/// and the delegate session id can't be overridden, and
+/// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when the caller didn't set
+/// it.
 fn apply_delegate_env(
     command: &mut Command,
     caller_env: &HashMap<String, String>,
     stale_env_keys: &[String],
     config_dir: &std::path::Path,
     depth: u32,
+    session_id: &str,
 ) {
     crate::runtime::scrub_profile_env(command, stale_env_keys);
     command.envs(caller_env);
@@ -3281,7 +3341,8 @@ fn apply_delegate_env(
     }
     command
         .env("CLAUDE_CONFIG_DIR", config_dir)
-        .env(MCP_DEPTH_ENV, (depth + 1).to_string());
+        .env(MCP_DEPTH_ENV, (depth + 1).to_string())
+        .env(DELEGATE_SESSION_ENV, session_id);
 }
 
 /// Blocking delegate: acquire the target profile's runtime, spawn a headless
@@ -3371,6 +3432,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         ));
     }
 
+    let session_id = delegate_session_id(opts.resume)?;
     let mut command = crate::runtime::claude_command();
     apply_delegate_env(
         &mut command,
@@ -3378,6 +3440,7 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
         &stale_env_keys,
         runtime.config_dir(),
         opts.depth,
+        &session_id,
     );
     // Stream the child's events as NDJSON instead of waiting for one terminal
     // blob: the terminal envelope is one event among many, and a run stopped or
@@ -3421,6 +3484,10 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     }
     if let Some(id) = opts.resume {
         command.args(["--resume", id]);
+    } else {
+        // the pinned id is what CLAUTH_DELEGATE_SESSION_ID names, so a hook
+        // exemption keyed on that var scopes to exactly this session
+        command.args(["--session-id", &session_id]);
     }
     // Resolve the cwd the spawned `claude` will actually run in: a resume's
     // recorded workspace, else the caller's override, else this process's own cwd

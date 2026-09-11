@@ -549,6 +549,63 @@ fn subagent_type_is_passed_as_the_agent_flag() {
     );
 }
 
+/// The session-identity flags are clauth-owned, not a typed-vs-raw duplicate:
+/// a raw spelling would land AFTER the pin (`args` run last) and move the
+/// child off the id `CLAUTH_DELEGATE_SESSION_ID` names. Every spelling that
+/// can name or fork a session is refused, typed twin or none.
+#[test]
+fn raw_session_flags_in_args_are_refused() {
+    let _home = HomeSandbox::new();
+    for raw in ["--session-id", "--resume", "-r", "--fork-session"] {
+        let result = call_delegate(DelegateArgs {
+            profiles: Some(vec!["solo".to_string()]),
+            prompt: Some("hi".to_string()),
+            args: Some(vec![raw.to_string(), "x".to_string()]),
+            background: Some(true),
+            ..base()
+        });
+        assert_refusal(
+            &result,
+            &["`CLAUTH_DELEGATE_SESSION_ID`", raw, "`session_id`"],
+        );
+    }
+}
+
+/// The wiring `CLAUTH_DELEGATE_SESSION_ID` exemptions key on: one binding
+/// feeds both the env var and the `--session-id`/`--resume` flag, so the
+/// exported id is always the id the child runs under. `run_delegate` cannot
+/// run without a real `claude` child, so the pin is a source scan, the same
+/// mechanism the agent-flag wiring pin uses.
+#[test]
+fn the_exported_session_id_is_the_id_the_child_runs_under() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("fn run_delegate(")
+        .expect("run_delegate is defined")
+        .1;
+    assert_eq!(
+        body.match_indices("delegate_session_id(").count(),
+        1,
+        "exactly one place mints the delegate's session id",
+    );
+    assert!(
+        body.contains("let session_id = delegate_session_id(opts.resume)?;"),
+        "the mint binds the name the env stamp and the flag both read",
+    );
+    let tail = body
+        .split_once("if let Some(id) = opts.resume {")
+        .expect("the resume arm exists")
+        .1;
+    assert!(
+        tail.contains(r#"["--resume", id]"#),
+        "a resume keeps the id it continues",
+    );
+    assert!(
+        tail.contains(r#"["--session-id", &session_id]"#),
+        "a fresh run pins the very binding the env var names",
+    );
+}
+
 // ── permissions passthrough + result mode ────────────────────────────────────
 
 #[test]
