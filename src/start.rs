@@ -62,9 +62,9 @@ pub(crate) fn rescue_teardown(
 }
 
 /// The refusal a `--with-fallback` start gets on a host that structurally cannot
-/// execute a per-session credential swap. Split from the gate so BOTH causes are
-/// exercised from a Linux run: `cfg!(target_os = "macos")` and [`LinkMode::Fake`]
-/// are each unreachable there.
+/// execute a per-session credential swap. Split from the gate so the render is
+/// exercisable from any run: [`LinkMode::Fake`] is unreachable on a real-symlink
+/// host.
 fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsupported) -> String {
     format!(
         "'{name}': --with-fallback needs a per-session credential swap, but {why}; start without it"
@@ -77,17 +77,13 @@ fn unsupported_host_refusal(name: &ProfileName, why: crate::runtime::SwapUnsuppo
 /// Claude Code probe exists to prevent, so none of these is a warning.
 ///
 /// Every gate that can answer WITHOUT the disk runs first, in unfixable-first
-/// order, and the transport probe runs last. That ordering is load-bearing twice
-/// over: a start refused for a cause the user can act on never materializes a
-/// profile dir for an account that never launched, and the compile-time macOS
-/// verdict never arrives as a state-lock timeout or an IO error from a probe it
-/// did not need. `is_macos` is the caller's `cfg!`, so the keychain arm is
-/// testable off a Mac.
+/// order, and the transport probe runs last. That ordering is load-bearing: a
+/// start refused for a cause the user can act on never materializes a profile
+/// dir for an account that never launched.
 fn refuse_unless_chain_eligible(
     config: &AppConfig,
     profile: &crate::profile::Profile,
     isolation: Isolation,
-    is_macos: bool,
 ) -> Result<()> {
     let name = &profile.name;
     // clap already refuses the flag pair, so this is for a caller that bypasses
@@ -98,9 +94,6 @@ fn refuse_unless_chain_eligible(
             "'{name}': --with-fallback cannot be combined with --isolated, since an \
              isolated session follows no chain"
         );
-    }
-    if let Some(why) = crate::runtime::unsupported_swap_platform(is_macos) {
-        anyhow::bail!("{}", unsupported_host_refusal(name, why));
     }
     // The decision leg's freshness gate reads only the OAuth status store. That
     // is sound because a third-party-launched session gets a chain the walk
@@ -164,7 +157,7 @@ pub(crate) fn run(
     crate::refuse_if_disabled(config, name)?;
     let profile = config.find(name).context("profile not found")?;
     if follows_chain {
-        refuse_unless_chain_eligible(config, profile, isolation, cfg!(target_os = "macos"))?;
+        refuse_unless_chain_eligible(config, profile, isolation)?;
     }
 
     // The plugin-migration pre-flight: heal a broken or divergent clauth

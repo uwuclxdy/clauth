@@ -1512,20 +1512,16 @@ pub(crate) fn open_pid_file(path: &Path) -> std::io::Result<File> {
     crate::profile::open_state_file(path)
 }
 
-/// Why this host cannot execute a per-session credential swap at all. Both arms
-/// are structural rather than unfinished work, and both must REFUSE loudly: a
-/// swap that silently leaves the session on its launch account is the one outcome
-/// the live-Claude-Code probe exists to prevent.
+/// Why this host cannot execute a per-session credential swap. The arm is
+/// structural rather than unfinished work, and must REFUSE loudly: a swap that
+/// silently leaves the session on its launch account is the one outcome the
+/// live-Claude-Code probe exists to prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SwapUnsupported {
     /// [`LinkMode::Fake`] shares ONE runtime tree across every SHARED session of
     /// the profile, so repointing its credential file would move every such
     /// session at once.
     SharedRuntimeTree,
-    /// macOS resolves credentials Keychain-FIRST and deletes the plaintext file
-    /// once it has migrated them, so a swapped-in file is inert until the
-    /// per-`CLAUDE_CONFIG_DIR` Keychain item is written alongside it.
-    KeychainFirst,
 }
 
 impl std::fmt::Display for SwapUnsupported {
@@ -1534,19 +1530,14 @@ impl std::fmt::Display for SwapUnsupported {
             Self::SharedRuntimeTree => {
                 f.write_str("this host shares one runtime tree across the profile's sessions")
             }
-            Self::KeychainFirst => f.write_str("this host resolves credentials keychain-first"),
         }
     }
 }
 
-/// The transport/platform gate, kept PURE so both refusals are exercised from a
-/// Linux test run — reading `cfg!(target_os = "macos")` is the caller's job.
-fn swap_support(mode: LinkMode, is_macos: bool) -> Result<(), SwapUnsupported> {
+/// The transport gate, kept PURE so the refusal is exercised from any test run.
+fn swap_support(mode: LinkMode) -> Result<(), SwapUnsupported> {
     if mode == LinkMode::Fake {
         return Err(SwapUnsupported::SharedRuntimeTree);
-    }
-    if is_macos {
-        return Err(SwapUnsupported::KeychainFirst);
     }
     Ok(())
 }
@@ -1562,27 +1553,8 @@ fn swap_support(mode: LinkMode, is_macos: bool) -> Result<(), SwapUnsupported> {
 /// row — so this is where the two are kept consistent. The USER-facing refusal is
 /// `start::run`'s, before a tree is built or `claude` is spawned; this is the
 /// floor under it, not a substitute for it.
-fn chain_opt_in_survives(
-    requested: bool,
-    isolation: Isolation,
-    mode: LinkMode,
-    is_macos: bool,
-) -> bool {
-    requested && isolation == Isolation::Shared && swap_support(mode, is_macos).is_ok()
-}
-
-/// [`swap_support`]'s PLATFORM arm alone, answerable with no disk: the mode is
-/// pinned to the supported transport, so only `is_macos` can fire. `start::run`
-/// asks this before anything fallible, because a verdict fixed at compile time
-/// must not reach the user as a state-lock timeout or an IO error from a probe it
-/// never needed.
-///
-/// Deliberate consequence: on a macOS host that ALSO runs [`LinkMode::Fake`] the
-/// user hears the keychain cause rather than the shared-tree one, inverting
-/// `swap_support`'s own arm precedence. Both arms are unfixable dead ends and the
-/// executor's arm order is untouched, so this only picks which of the two is named.
-pub(crate) fn unsupported_swap_platform(is_macos: bool) -> Option<SwapUnsupported> {
-    swap_support(LinkMode::Real, is_macos).err()
+fn chain_opt_in_survives(requested: bool, isolation: Isolation, mode: LinkMode) -> bool {
+    requested && isolation == Isolation::Shared && swap_support(mode).is_ok()
 }
 
 /// [`swap_support`]'s TRANSPORT arm, which is only knowable by probing. Run LAST
@@ -1592,8 +1564,7 @@ pub(crate) fn unsupported_swap_platform(is_macos: bool) -> Option<SwapUnsupporte
 ///
 /// Probes the profile dir exactly as [`ProfileRuntime::acquire`] does, under the
 /// same state lock, so two concurrent starts cannot interleave their probe
-/// dotfiles and read a spurious [`LinkMode::Fake`]. `is_macos` is pinned false
-/// because [`unsupported_swap_platform`] already owns that arm.
+/// dotfiles and read a spurious [`LinkMode::Fake`].
 ///
 /// `Ok(None)` is the supported host. An IO failure propagates rather than reading
 /// as either answer — a probe that could not run says nothing about the host.
@@ -1604,7 +1575,7 @@ pub(crate) fn unsupported_swap_transport(name: &ProfileName) -> Result<Option<Sw
             .with_context(|| format!("failed to create {}", profile_root.display()))?;
         detect_link_mode(&profile_root)
     })?;
-    Ok(swap_support(mode, false).err())
+    Ok(swap_support(mode).err())
 }
 
 /// Why a swap onto a named member did not happen. A VALUE rather than an error:
@@ -1824,7 +1795,7 @@ static COARSE_MTIME_OVERRIDE: std::sync::atomic::AtomicBool =
 // `swap_to`, refused at platform level on macOS, so an ungated setter there is a
 // dead-code error under clippy `-D warnings`. The static stays ungated —
 // `as_stored` reads it on every platform.
-#[cfg(all(test, not(target_os = "macos")))]
+#[cfg(test)]
 fn set_coarse_mtime_override(on: bool) {
     COARSE_MTIME_OVERRIDE.store(on, std::sync::atomic::Ordering::SeqCst);
 }
@@ -2121,7 +2092,7 @@ impl SessionSwap {
         if self.shutdown.is_begun() {
             return Err(SwapRefused::ShuttingDown);
         }
-        swap_support(self.mode, cfg!(target_os = "macos")).map_err(SwapRefused::Unsupported)?;
+        swap_support(self.mode).map_err(SwapRefused::Unsupported)?;
         // `--isolated` and fallback-following are mutually exclusive (a throwaway
         // tree versus swappable managed credentials). Enforced at the executor
         // because it is the one chokepoint every caller goes through, rather than
@@ -2658,8 +2629,7 @@ impl ProfileRuntime {
             // failure is reported and stepped over — the session itself is
             // already sound, and failing here would trade a missing row for a
             // dead session.
-            let opt_in =
-                chain_opt_in_survives(follows_chain, isolation, mode, cfg!(target_os = "macos"));
+            let opt_in = chain_opt_in_survives(follows_chain, isolation, mode);
             // A clamp here means the opt-in asked for something this host's probed
             // mode cannot support, so the session runs without the chain its caller
             // asked for — the silent non-switch the flag exists to prevent. Say so
@@ -2860,7 +2830,7 @@ impl ProfileRuntime {
     /// This session's swap executor. Production reaches it through the watchdog
     /// thread's own clone; this accessor exists so a test can drive one leg at a
     /// time instead of racing a 1 Hz tick.
-    #[cfg(all(test, not(target_os = "macos")))]
+    #[cfg(test)]
     fn swap(&self) -> &SessionSwap {
         &self.swap
     }

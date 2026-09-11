@@ -332,19 +332,11 @@ fn the_eligible_twin_clears_every_gate(verdict: Result<()>, name: &str) {
     }
 }
 
-/// Both unsupported-host arms' copy, as literals. `cfg!(target_os = "macos")`
-/// and `LinkMode::Fake` are each unreachable through the gate from a Linux run,
-/// so the render is pinned here and the wiring by the test below it.
+/// The unsupported-host refusal copy, as a literal. `LinkMode::Fake` is
+/// unreachable through the gate on a real-symlink host, so the render is pinned
+/// here and the wiring by the test below it.
 #[test]
 fn the_unsupported_host_refusal_names_each_cause() {
-    assert_eq!(
-        unsupported_host_refusal(
-            &crate::profile::ProfileName::from("acme"),
-            SwapUnsupported::KeychainFirst
-        ),
-        "'acme': --with-fallback needs a per-session credential swap, but this host \
-         resolves credentials keychain-first; start without it"
-    );
     assert_eq!(
         unsupported_host_refusal(
             &crate::profile::ProfileName::from("acme"),
@@ -352,33 +344,6 @@ fn the_unsupported_host_refusal_names_each_cause() {
         ),
         "'acme': --with-fallback needs a per-session credential swap, but this host \
          shares one runtime tree across the profile's sessions; start without it"
-    );
-}
-
-/// macOS reads credentials Keychain-first and DELETES the plaintext file once it
-/// has migrated them, so the swap the flag promises is inert there until the
-/// per-config-dir Keychain item is written alongside it. Refused before
-/// `acquire`, since the platform is known at compile time.
-#[test]
-fn with_fallback_refuses_a_keychain_first_host() {
-    let _sb = HomeSandbox::new();
-    let _daemon = crate::daemon::hold_daemon_lock();
-    let config = chain_ready_config("macish");
-    let profile = config
-        .find(&crate::profile::ProfileName::from("macish"))
-        .expect("fixture profile");
-
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
-        .expect_err("a keychain-first host must refuse");
-    assert_eq!(
-        err.to_string(),
-        "'macish': --with-fallback needs a per-session credential swap, but this host \
-         resolves credentials keychain-first; start without it"
-    );
-
-    the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
-        "macish",
     );
 }
 
@@ -396,7 +361,7 @@ fn with_fallback_refuses_a_non_oauth_profile() {
         .find(&crate::profile::ProfileName::from("thirdparty"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&third_party, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&third_party, profile, Isolation::Shared)
         .expect_err("a custom endpoint must refuse");
     assert_eq!(
         err.to_string(),
@@ -409,7 +374,7 @@ fn with_fallback_refuses_a_non_oauth_profile() {
         .find(&crate::profile::ProfileName::from("thirdparty"))
         .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&oauth, profile, Isolation::Shared),
         "thirdparty",
     );
 }
@@ -427,7 +392,7 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
         .find(&crate::profile::ProfileName::from("loner"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&loner, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&loner, profile, Isolation::Shared)
         .expect_err("a non-member must refuse");
     assert_eq!(
         err.to_string(),
@@ -440,7 +405,7 @@ fn with_fallback_refuses_a_profile_outside_the_fallback_chain() {
         .find(&crate::profile::ProfileName::from("loner"))
         .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&member, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&member, profile, Isolation::Shared),
         "loner",
     );
 }
@@ -457,7 +422,7 @@ fn with_fallback_refuses_when_no_daemon_is_running() {
         .find(&crate::profile::ProfileName::from("undaemoned"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared)
         .expect_err("no daemon must refuse");
     assert_eq!(
         err.to_string(),
@@ -467,7 +432,7 @@ fn with_fallback_refuses_when_no_daemon_is_running() {
 
     let _daemon = crate::daemon::hold_daemon_lock();
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared),
         "undaemoned",
     );
 }
@@ -488,7 +453,7 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
         .find(&crate::profile::ProfileName::from("unreadable"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared)
         .expect_err("an unreadable daemon lock must refuse");
     assert_eq!(
         err.to_string(),
@@ -499,7 +464,7 @@ fn with_fallback_refuses_when_the_daemon_lock_cannot_be_read() {
     fs::remove_dir(&lock_path).expect("clear the lock path");
     let _daemon = crate::daemon::hold_daemon_lock();
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared),
         "unreadable",
     );
 }
@@ -520,7 +485,7 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
         .find(&crate::profile::ProfileName::from("onlyone"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&lone, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&lone, profile, Isolation::Shared)
         .expect_err("a chain of one must refuse");
     assert_eq!(
         err.to_string(),
@@ -533,7 +498,7 @@ fn with_fallback_refuses_a_chain_with_nowhere_to_go() {
         .find(&crate::profile::ProfileName::from("onlyone"))
         .expect("fixture profile");
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&paired, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&paired, profile, Isolation::Shared),
         "onlyone",
     );
 }
@@ -551,7 +516,7 @@ fn with_fallback_refuses_an_isolated_session() {
         .find(&crate::profile::ProfileName::from("throwaway"))
         .expect("fixture profile");
 
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Isolated, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Isolated)
         .expect_err("an isolated session must refuse");
     assert_eq!(
         err.to_string(),
@@ -560,16 +525,14 @@ fn with_fallback_refuses_an_isolated_session() {
     );
 
     the_eligible_twin_clears_every_gate(
-        refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false),
+        refuse_unless_chain_eligible(&config, profile, Isolation::Shared),
         "throwaway",
     );
 }
 
 /// Every gate that can answer without the disk runs BEFORE the transport probe,
 /// which is the only leg that writes. So a start refused for a cause the user can
-/// act on never materializes a profile dir for an account that never launched —
-/// and the compile-time macOS verdict never arrives as a lock timeout or an IO
-/// error from a probe it did not need.
+/// act on never materializes a profile dir for an account that never launched.
 #[test]
 fn a_refused_with_fallback_start_never_probes_the_disk() {
     let _sb = HomeSandbox::new();
@@ -578,7 +541,7 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     let profile = config
         .find(&crate::profile::ProfileName::from("untouched"))
         .expect("fixture profile");
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false)
+    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared)
         .expect_err("no daemon must refuse");
     // WHICH gate refused is the whole subject here: a fixture that drifted into
     // refusing at the oauth or membership gate would leave the dir absent too and
@@ -593,20 +556,6 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
         "a refusal the user can act on must not create the profile dir"
     );
 
-    // macOS is known at compile time, so it must not reach the probe either.
-    let _daemon = crate::daemon::hold_daemon_lock();
-    let err = refuse_unless_chain_eligible(&config, profile, Isolation::Shared, true)
-        .expect_err("a keychain-first host must refuse");
-    assert_eq!(
-        err.to_string(),
-        "'untouched': --with-fallback needs a per-session credential swap, but this host \
-         resolves credentials keychain-first; start without it"
-    );
-    assert!(
-        !profile_dir_of("untouched").exists(),
-        "a statically-known verdict must not be gated behind a fallible probe"
-    );
-
     // The eligible path DOES probe — otherwise the assertions above pass for a
     // gate that simply never runs the probe at all. Read off
     // `refuse_unless_chain_eligible` alone: `the_eligible_twin_clears_every_gate`
@@ -614,7 +563,8 @@ fn a_refused_with_fallback_start_never_probes_the_disk() {
     // this control through it would assert against the helper's own side effect.
     // Past every pure gate the only refusal left is the probe's own, and it
     // materializes the dir before it refuses, so the dir is there either way.
-    match refuse_unless_chain_eligible(&config, profile, Isolation::Shared, false) {
+    let _daemon = crate::daemon::hold_daemon_lock();
+    match refuse_unless_chain_eligible(&config, profile, Isolation::Shared) {
         Ok(()) => {}
         Err(e) => assert_eq!(
             e.to_string(),
@@ -653,20 +603,10 @@ fn run_applies_the_chain_gate_only_to_an_opted_in_start() {
         true,
     )
     .expect_err("an opted-in start must be gated");
-    // WHICH gate answers is platform-decided, since `run` passes
-    // `cfg!(target_os = "macos")` in and the unsupported-host arm precedes the
-    // membership one. Each build sees one arm, so it is the ubuntu and macOS CI
-    // legs TOGETHER that reject a hardcoded value: a pinned `false` reds on macOS,
-    // a pinned `true` reds everywhere else.
     assert_eq!(
         err.to_string(),
-        if cfg!(target_os = "macos") {
-            "'wired': --with-fallback needs a per-session credential swap, but this host \
-             resolves credentials keychain-first; start without it"
-        } else {
-            "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
-             fallback tab, or start without it"
-        }
+        "'wired': --with-fallback needs a fallback-chain member; add 'wired' on the \
+         fallback tab, or start without it"
     );
 
     let err = run(
