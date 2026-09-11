@@ -4070,3 +4070,48 @@ fn a_publish_clears_a_read_only_destination() {
         "the live path resolves to the incoming store"
     );
 }
+
+/// The truth table for the per-session-item carry's ownership gate: same
+/// anchor adopts, differing anchors refuse, and anything less than a string
+/// anchor on BOTH sides reads as unproven, which the caller treats as not
+/// same. Pinned on every platform because the fn is pure; the gated carry
+/// that consults it is macOS-only.
+#[test]
+fn account_match_truth_table() {
+    let item = |uuid: Option<&str>| {
+        serde_json::json!({
+            "claudeAiOauth": {"accessToken": "a", "refreshToken": "r"},
+            "organizationUuid": uuid,
+        })
+    };
+    let some = serde_json::json!({"organizationUuid": "acct-1"});
+    let other = serde_json::json!({"organizationUuid": "acct-2"});
+    let none = serde_json::json!({});
+
+    assert_eq!(
+        account_match(&item(Some("acct-1")), Some(&some)),
+        AccountMatch::Same
+    );
+    assert_eq!(
+        account_match(&item(Some("acct-1")), Some(&other)),
+        AccountMatch::Different
+    );
+    // Missing or non-string anchors on either side never prove ownership.
+    assert_eq!(
+        account_match(&item(None), Some(&some)),
+        AccountMatch::Unproven
+    );
+    assert_eq!(
+        account_match(&item(Some("acct-1")), None),
+        AccountMatch::Unproven
+    );
+    assert_eq!(
+        account_match(&item(Some("acct-1")), Some(&none)),
+        AccountMatch::Unproven
+    );
+    let number_anchor = serde_json::json!({"organizationUuid": 7});
+    assert_eq!(
+        account_match(&item(Some("acct-1")), Some(&number_anchor)),
+        AccountMatch::Unproven
+    );
+}

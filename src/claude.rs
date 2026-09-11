@@ -1208,8 +1208,20 @@ pub(crate) fn keychain_mirror_source_for_config_dir(path: &Path, config_dir: &Pa
 /// write replaces the truncated bytes rather than skipping inertly.
 ///
 /// The read (a `security` subprocess) runs OUTSIDE the state flock.
+///
+/// Parameterised by [`CarryGate`]: the swap executor passes
+/// [`CarryGate::ByConstruction`] (it wrote the item it is carrying out of, so
+/// the login's owner needs no proof), while the session-start seed passes
+/// [`CarryGate::SameAccount`] — it finds the item where a PREVIOUS session on
+/// a recycled runtime dir left it, and a mid-session swap points that same
+/// item at another member, so ownership there must be proven by
+/// [`account_match`] or the carry skipped.
 #[cfg(target_os = "macos")]
-pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result<()> {
+pub(crate) fn carry_session_item_into(
+    store: &Path,
+    config_dir: &Path,
+    gate: CarryGate,
+) -> Result<()> {
     let blob = match crate::keychain::read_config_dir_item(config_dir) {
         Ok(Some(blob)) => blob,
         Ok(None) => return Ok(()),
@@ -1244,6 +1256,21 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
             );
             return Ok(());
         }
+        if gate == CarryGate::SameAccount {
+            let store_value = store_bytes
+                .as_deref()
+                .and_then(|sb| serde_json::from_slice::<serde_json::Value>(sb).ok());
+            if account_match(&blob, store_value.as_ref()) != AccountMatch::Same {
+                logline!(
+                    "clauth: skipped carrying the per-session Keychain item's pair into {}: its \
+                     login does not provably belong to the account this store holds (a previous \
+                     session on this runtime dir may have swapped onto another member). The \
+                     item is left for the install that follows to replace",
+                    store.display()
+                );
+                return Ok(());
+            }
+        }
         let item_exp = parsed
             .claude_ai_oauth
             .as_ref()
@@ -1263,6 +1290,91 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
         crate::profile::atomic_write_600(store, &bytes)
             .with_context(|| format!("failed to write {}", store.display()))
     })
+}
+
+/// What [`carry_session_item_into`] may assume about who owns the item's login.
+///
+/// [`CarryGate::ByConstruction`]: the caller is the session whose executor
+/// wrote the item (the swap repointing it), so the item holds the current
+/// member's login — possibly CC-refreshed since, but still that member's
+/// account, and the carry's target is exactly that member.
+///
+/// [`CarryGate::SameAccount`]: the caller found the item where a PREVIOUS
+/// session left it (the start-site seed on a recycled runtime dir; teardown
+/// removes the dir but never the item), so ownership is unproven — a
+/// mid-session swap points the same item at another member, and that member's
+/// CC-refreshed pair would corrupt the launch profile's store if carried. The
+/// carry then runs only when [`account_match`] proves the same account;
+/// anything less skips it, and the item write that follows replaces the
+/// orphaned login — a pair only a wrong-account session could ever have read,
+/// since the item's service name keys to that one dir.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only callers are the macOS session-item carries; the gate is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarryGate {
+    ByConstruction,
+    SameAccount,
+}
+
+/// Whether the login a per-session Keychain item holds belongs to the same
+/// Claude account as a credential store — the ownership question the
+/// [`CarryGate::SameAccount`] carry must answer before adopting the item's
+/// pair.
+///
+/// `organizationUuid` is the anchor: an account-scoped key of the credential
+/// store (see [`ACCOUNT_SCOPED_CREDENTIAL_KEYS`]) that CC preserves across its
+/// own token refreshes, so both the item and a clauth-written store carry it
+/// whenever the account does. Absent or non-string on either side the answer
+/// is [`AccountMatch::Unproven`], which the caller must treat as NOT same:
+/// adopting a foreign login writes a wrong-account pair into the store, which
+/// dwarfs the rescue an honest carry buys.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS session-item carry; the rule is pinned on every platform"
+    )
+)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountMatch {
+    /// Both sides carry the same account anchor: the item's pair is safe to
+    /// adopt into the store.
+    Same,
+    /// Both sides carry an anchor and they differ: a foreign login, never
+    /// adoptable.
+    Different,
+    /// At least one side carries no usable anchor: unproven, treated as not
+    /// same.
+    Unproven,
+}
+
+/// See [`AccountMatch`]. PURE so the truth table is pinned on every platform;
+/// the gated carry that consults it is macOS-only.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS session-item carry; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn account_match(
+    item: &serde_json::Value,
+    store: Option<&serde_json::Value>,
+) -> AccountMatch {
+    let item_uuid = item.get("organizationUuid").filter(|u| u.is_string());
+    let store_uuid = store
+        .and_then(|b| b.get("organizationUuid"))
+        .filter(|u| u.is_string());
+    match (item_uuid, store_uuid) {
+        (Some(item_uuid), Some(store_uuid)) if item_uuid == store_uuid => AccountMatch::Same,
+        (Some(_), Some(_)) => AccountMatch::Different,
+        _ => AccountMatch::Unproven,
+    }
 }
 
 /// Typed check at the boundary, then hand the untyped object to the installer:

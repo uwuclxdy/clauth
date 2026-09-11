@@ -4008,21 +4008,22 @@ fn a_timed_out_rotation_wait_leaves_no_rank_behind() {
     });
 }
 
-/// The FLOOR, pinned as a LITERAL rather than re-derived from the two constants it
+/// The FLOOR, pinned as a LITERAL rather than re-derived from the three constants it
 /// adds: an assertion keyed on those tracks any re-tune silently, and this number
 /// is a claim about how long a healthy holder spends — 19 s of the two deadlines a
 /// token call carries, plus 20 s for a macOS Keychain mirror's two `security`
-/// invocations. The token term bounds no phase of its call — the constant's own
-/// doc carries the measurement — while the keychain term does bound the mirror;
-/// both are what a HEALTHY holder fits inside, which is the floor's whole claim. Moving either term must red this and force the claim to be re-made
+/// invocations, plus 20 s for the session-start Keychain seed's shared budget.
+/// The token term bounds no phase of its call — the constant's own
+/// doc carries the measurement — while the keychain terms do bound their legs;
+/// all are what a HEALTHY holder fits inside, which is the floor's whole claim. Moving any term must red this and force the claim to be re-made
 /// against what that term now bounds.
 #[test]
 fn the_rotation_deadline_outlasts_a_healthy_holders_two_slow_legs() {
     assert_eq!(
         crate::runtime::ROTATION_LOCK_TIMEOUT,
-        Duration::from_secs(39),
-        "the session-start wait must outlast a healthy rotation's token call and \
-         its macOS Keychain mirror"
+        Duration::from_secs(59),
+        "the session-start wait must outlast a healthy rotation's token call, its \
+         macOS Keychain mirror, and a macOS session-start Keychain seed"
     );
 }
 
@@ -8243,4 +8244,45 @@ fn gc_finishes_a_stranded_rescue_tombstone() {
         "the sidecar must be rescued from the stranded tombstone"
     );
     assert!(!tombstone.exists(), "the tombstone must be collected");
+}
+
+/// The arm selection for the macOS session-start Keychain seed — pure, so
+/// the absent→sign-out / refreshless→skip / else→carry decision is pinned on
+/// every platform while the seeding itself only a Mac exercises. The
+/// unparseable arm is Carry (not Skip): a torn read is not evidence of
+/// refreshlessness, and the legs that follow fail loudly on the bytes.
+#[test]
+fn session_seed_arm_selection() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let rotatable = |refresh: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "a".to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+    let refreshless = rotatable(None);
+    let refreshable = rotatable(Some("r"));
+
+    // Absent install source signs the item out.
+    assert_eq!(session_seed_arm(false, None), SessionSeedArm::SignOut);
+    assert_eq!(
+        session_seed_arm(false, Some(&refreshable)),
+        SessionSeedArm::SignOut
+    );
+    // Refreshless sources (rolling sidecar, static mint) keep the file layer alone.
+    assert_eq!(
+        session_seed_arm(true, Some(&refreshless)),
+        SessionSeedArm::Skip
+    );
+    // Refreshable stores carry-then-write.
+    assert_eq!(
+        session_seed_arm(true, Some(&refreshable)),
+        SessionSeedArm::Carry
+    );
+    // Unparseable reads proceed, not skip.
+    assert_eq!(session_seed_arm(true, None), SessionSeedArm::Carry);
 }
