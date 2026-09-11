@@ -1885,9 +1885,6 @@ fn host_poses(probe_dir: &Path, subject: &str) -> bool {
 /// Linux/macOS run can reach keeps the exact value, so the guard is otherwise
 /// unreachable. Call INSIDE [`with_fake_home`], whose `HOME_TEST_LOCK` hold
 /// serializes this process-global override.
-///
-/// Gated with its caller, which drives a `swap_to` macOS refuses at platform
-/// level.
 fn with_coarse_mtime<T>(f: impl FnOnce() -> T) -> T {
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {

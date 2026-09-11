@@ -1791,10 +1791,9 @@ fn touch_store(plan: &SwapPlan, memoized: Option<SystemTime>) -> Result<()> {
 static COARSE_MTIME_OVERRIDE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-// Gated with its caller: the one test that poses a truncating filesystem drives
-// `swap_to`, refused at platform level on macOS, so an ungated setter there is a
-// dead-code error under clippy `-D warnings`. The static stays ungated —
-// `as_stored` reads it on every platform.
+// Gated with its caller: the one test that poses a truncating filesystem
+// drives `swap_to`, whose mtime-touch legs need the override. The static stays
+// ungated — `as_stored` reads it on every platform.
 #[cfg(test)]
 fn set_coarse_mtime_override(on: bool) {
     COARSE_MTIME_OVERRIDE.store(on, std::sync::atomic::Ordering::SeqCst);

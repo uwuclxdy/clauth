@@ -1197,18 +1197,30 @@ pub(crate) fn keychain_mirror_source_for_config_dir(path: &Path, config_dir: &Pa
 /// it has migrated, so the swap's item write would otherwise destroy the
 /// outgoing member's only live pair.
 ///
-/// The item can hold only what a swap wrote or what CC refreshed over it, so a
-/// byte difference from the store always means CC's write is the fresher one —
-/// no recency compare, unlike the file drain. The file drain's CLA-SPLIT guard
-/// carries over unchanged: a differing item over a static session token is a
-/// session-side re-login, never adopted over the token.
+/// The item is not unconditionally fresher: the STORE moves too (a `clauth
+/// login` recapture, a switch-away snapshot), so the winner is the side whose
+/// login expires later — CC's refresh and a recapture both advance expiry —
+/// and a tie keeps the store. The compare and the write share ONE state-flock
+/// hold, so a store write landing between them cannot be reverted. The file
+/// drain's CLA-SPLIT guard carries over unchanged: a differing item over a
+/// static session token is a session-side re-login, never adopted over the
+/// token. An unparseable item carries nothing and heals instead: the swap's
+/// write replaces the truncated bytes rather than skipping inertly.
 ///
-/// The read (a `security` subprocess) runs OUTSIDE the state flock; the store
-/// write it may produce runs under one.
+/// The read (a `security` subprocess) runs OUTSIDE the state flock.
 #[cfg(target_os = "macos")]
 pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result<()> {
-    let Some(blob) = crate::keychain::read_config_dir_item(config_dir)? else {
-        return Ok(());
+    let blob = match crate::keychain::read_config_dir_item(config_dir) {
+        Ok(Some(blob)) => blob,
+        Ok(None) => return Ok(()),
+        Err(e) if crate::keychain::read_failed_unparseable(&e) => {
+            logline!(
+                "clauth: the per-session Keychain item is not valid JSON; the swap's write \
+                 replaces it rather than carrying its bytes"
+            );
+            return Ok(());
+        }
+        Err(e) => return Err(e),
     };
     let bytes = serde_json::to_vec(&blob).context("failed to serialize the Keychain item")?;
     let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).with_context(|| {
@@ -1220,17 +1232,34 @@ pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result
     if parsed.claude_ai_oauth.is_none() {
         return Ok(());
     }
-    if std::fs::read(store).as_deref() == Ok(bytes.as_slice()) {
-        return Ok(());
-    }
-    if store.file_name().is_some_and(|f| f == "session-token.json") {
-        logline!(
-            "clauth: kept the static session token (a session-side re-login \
-             found in the per-session Keychain item is never adopted over it)"
-        );
-        return Ok(());
-    }
     crate::lock::with_state_lock(|_held| {
+        let store_bytes = std::fs::read(store).ok();
+        if store_bytes.as_deref() == Some(bytes.as_slice()) {
+            return Ok(());
+        }
+        if store.file_name().is_some_and(|f| f == "session-token.json") {
+            logline!(
+                "clauth: kept the static session token (a session-side re-login \
+                 found in the per-session Keychain item is never adopted over it)"
+            );
+            return Ok(());
+        }
+        let item_exp = parsed
+            .claude_ai_oauth
+            .as_ref()
+            .and_then(|o| o.expires_at)
+            .unwrap_or(0);
+        let store_exp = store_bytes
+            .as_deref()
+            .and_then(|sb| serde_json::from_slice::<ClaudeCredentials>(sb).ok())
+            .and_then(|c| c.claude_ai_oauth)
+            .and_then(|o| o.expires_at)
+            .unwrap_or(0);
+        if item_exp <= store_exp {
+            // The store moved after the item was last written (a recapture, a
+            // switch-away snapshot): keep it, the carry must not revert it.
+            return Ok(());
+        }
         crate::profile::atomic_write_600(store, &bytes)
             .with_context(|| format!("failed to write {}", store.display()))
     })

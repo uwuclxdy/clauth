@@ -1114,6 +1114,14 @@ pub(crate) fn read_config_dir_item(config_dir: &Path) -> Result<Option<Value>> {
     read_blob_at(&service, &account()?)
 }
 
+/// Whether a failed item read failed because the bytes were unparseable — the
+/// truncated-write class (`UnparseableItem`, #66/#76). The carry-back treats
+/// this as "nothing to carry" rather than an error, so the swap's item write
+/// can heal the corruption instead of skipping inertly.
+pub(crate) fn read_failed_unparseable(e: &anyhow::Error) -> bool {
+    carried_raw(e).is_some()
+}
+
 fn install_at(service: &str, store: &Value) -> Result<()> {
     anyhow::ensure!(
         store.is_object(),
