@@ -1361,6 +1361,17 @@ pub(crate) fn apply_rotated_tokens_locked(
     // across this function.
     #[cfg(target_os = "macos")]
     let mut mirror: Option<crate::profile::ClaudeCredentials> = None;
+    // The split-path mirror is decided under the lock but GATED after it: the
+    // gate reads the Keychain item, a `security` subprocess the flock must
+    // never span. `split_gate_prev`/`split_gate_old` carry the recognition
+    // candidates out of the locked section (both are fast disk reads inside
+    // it, the same class the section already performs).
+    #[cfg(target_os = "macos")]
+    let mut split_mirror: Option<crate::profile::ClaudeCredentials> = None;
+    #[cfg(target_os = "macos")]
+    let mut split_gate_prev: Option<String> = None;
+    #[cfg(target_os = "macos")]
+    let mut split_gate_old: Option<String> = None;
     with_state_lock(|held| {
         // The profile may have been deleted or renamed out-of-process since this
         // caller's config was loaded (the single-fetcher holds a stale config
@@ -1393,9 +1404,14 @@ pub(crate) fn apply_rotated_tokens_locked(
         };
         // Pre-rotation access token, kept for the Keychain-mirror gate below:
         // it tells "the live file is a stale mirror of OUR OWN chain" apart
-        // from a genuinely foreign CC re-login.
+        // from a genuinely foreign CC re-login, and feeds the split gate's
+        // recognition candidates after the lock closes.
         #[cfg(target_os = "macos")]
         let old_access = oauth.access_token.clone();
+        #[cfg(target_os = "macos")]
+        {
+            split_gate_old = Some(old_access.clone());
+        }
         write_token_fields(oauth, tok);
         // Stage the rotated pair durably before the structured save (see
         // `stage_rotated_credentials`): a failed save or crash is recovered on
@@ -1417,6 +1433,29 @@ pub(crate) fn apply_rotated_tokens_locked(
         // closes the race where a switch gate sees a comfortable chain before
         // any sidecar exists); only a NotLongLived mis-fill is left alone, so
         // the roll never destroys evidence of whatever wrote it.
+        // CLA-ROLL: the sidecar's PRE-stamp bearer, captured before the
+        // re-stamp below overwrites it — what the macOS split mirror's
+        // foreign gate recognizes the Keychain item against. A rolling bearer
+        // changes on every stamp, so recognition needs the token being
+        // REPLACED, never the one being written. When no sidecar exists yet
+        // (the arming rotation), this falls through to `credentials.json`,
+        // which by now holds the freshly rotated pair — harmless as a
+        // candidate (the item cannot already hold a token this rotation has
+        // not mirrored), and the pre-rotation chain token below covers the
+        // login the vanilla mirror actually wrote.
+        #[cfg(target_os = "macos")]
+        {
+            split_gate_prev = crate::claude::install_source_path(name)
+                .ok()
+                .and_then(|p| {
+                    crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&p).ok()
+                })
+                .and_then(|c| {
+                    c.access_token()
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                });
+        }
         let stamp_sidecar = cfg.find(name).is_some_and(|p| p.rolling_token)
             && !matches!(
                 crate::claude::session_token_status(name),
@@ -1456,7 +1495,12 @@ pub(crate) fn apply_rotated_tokens_locked(
                         crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path)
                     && creds.refresh_token().is_none()
                 {
-                    mirror = Some(creds);
+                    // CLA-SPLIT: the mirror is only DECIDED here; the foreign
+                    // gate that guards `Keep::Everything` runs AFTER the lock
+                    // closure (it reads the Keychain item, a subprocess the
+                    // flock must never span — same discipline as the write
+                    // itself). See the gate block below `with_state_lock`.
+                    split_mirror = Some(creds);
                 }
             } else if live_login_is_foreign(name, &old_access) {
                 logline!(
@@ -1494,6 +1538,51 @@ pub(crate) fn apply_rotated_tokens_locked(
              running claude signs out when its old token expires; run `clauth {name}` \
              to reinstall"
         );
+    }
+    // CLA-SPLIT foreign gate for the rolling mirror: `Keep::Everything`
+    // preserves the item's sibling blocks, so the item's login must be one
+    // clauth put there first — the file layer stops being evidence once CC
+    // migrates into the Keychain, and an out-of-band `/login` leaves B's
+    // blocks to ride under A's bearer. Runs here, beside the write it gates,
+    // because the read is a `security` subprocess the state flock must never
+    // span. Candidates: the sidecar's pre-stamp bearer, the pre-rotation
+    // chain token, and the bearer being written (the item may already hold
+    // it — the idempotent re-mirror).
+    #[cfg(target_os = "macos")]
+    if let Some(creds) = split_mirror {
+        let candidates: Vec<&str> = [
+            split_gate_prev.as_deref(),
+            split_gate_old.as_deref(),
+            creds.access_token(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match crate::keychain::item_login_state(&candidates) {
+            // Corrupt proceeds with the write: the mirror's own read leg
+            // quarantines the truncated bytes and the write heals the item,
+            // the pre-gate behavior for that state.
+            crate::keychain::ItemLoginState::Ours | crate::keychain::ItemLoginState::Corrupt => {
+                if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
+                    logline!(
+                        "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
+                         running claude signs out when its old token expires; run `clauth {name}` \
+                         to reinstall"
+                    );
+                }
+            }
+            crate::keychain::ItemLoginState::NotOurs => logline!(
+                "clauth: rotated '{name}' but the macOS Keychain login is not one clauth \
+                 recognizes (an out-of-band re-login, or a mirror write that failed a rotation \
+                 back). Keychain left untouched; {}",
+                crate::format::RESOLVE_IN_TUI
+            ),
+            crate::keychain::ItemLoginState::Unreadable(e) => logline!(
+                "clauth: rotated '{name}' but the macOS Keychain item could not be read to \
+                 check its login ({e}); mirror skipped, the previous rolling bearer keeps \
+                 serving until it expires. Run `clauth {name}` to reinstall"
+            ),
+        }
     }
     Ok(())
 }
@@ -2365,6 +2454,20 @@ pub(crate) fn restamp_rolling_token(
     name: &ProfileName,
     refresher: impl Fn(&str, Option<&str>) -> std::result::Result<TokenResponse, RefreshError>,
 ) -> AuthGate {
+    // The sidecar's PRE-re-stamp bearer, captured before the gate below
+    // overwrites it — what the macOS mirror's foreign gate recognizes the
+    // Keychain item against: a rolling bearer changes on every stamp, so
+    // recognition needs the token being replaced, never the one being
+    // written.
+    #[cfg(target_os = "macos")]
+    let previous_bearer = crate::claude::install_source_path(name)
+        .ok()
+        .and_then(|p| crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&p).ok())
+        .and_then(|c| {
+            c.access_token()
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+        });
     let gate = rolling_install_gate(
         config,
         name,
@@ -2399,9 +2502,37 @@ pub(crate) fn restamp_rolling_token(
         && let Ok(creds) =
             crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&path)
         && creds.refresh_token().is_none()
-        && let Err(e) = crate::keychain::keychain_mirror_rotation(&creds)
     {
-        logline!("clauth: re-stamped '{name}' but the Keychain mirror failed: {e:#}");
+        // CLA-SPLIT foreign gate, same rule as the rotation hook's split
+        // mirror: `Keep::Everything` preserves the item's sibling blocks, so
+        // the item's login must be one clauth put there first (the file
+        // layer is not evidence once CC migrates into the Keychain).
+        // Candidates: the pre-re-stamp bearer and the bearer being written.
+        let incoming = creds.access_token().map(str::to_string);
+        let candidates: Vec<&str> = [previous_bearer.as_deref(), incoming.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        match crate::keychain::item_login_state(&candidates) {
+            // Corrupt proceeds with the write: the mirror's own read leg
+            // quarantines the truncated bytes and the write heals the item.
+            crate::keychain::ItemLoginState::Ours | crate::keychain::ItemLoginState::Corrupt => {
+                if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
+                    logline!("clauth: re-stamped '{name}' but the Keychain mirror failed: {e:#}");
+                }
+            }
+            crate::keychain::ItemLoginState::NotOurs => logline!(
+                "clauth: re-stamped '{name}' but the macOS Keychain login is not one clauth \
+                 recognizes (an out-of-band re-login, or a mirror write that failed a rotation \
+                 back). Keychain left untouched; {}",
+                crate::format::RESOLVE_IN_TUI
+            ),
+            crate::keychain::ItemLoginState::Unreadable(e) => logline!(
+                "clauth: re-stamped '{name}' but the macOS Keychain item could not be read to \
+                 check its login ({e}); mirror skipped, the previous rolling bearer keeps \
+                 serving until it expires. Run `clauth {name}` to reinstall"
+            ),
+        }
     }
     gate
 }

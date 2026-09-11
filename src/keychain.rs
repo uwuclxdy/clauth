@@ -1102,6 +1102,83 @@ pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<()> 
     merge_and_put_at(SERVICE, &account()?, &login, Keep::Everything)
 }
 
+/// What a read of the real `Claude Code-credentials` item's login tells the
+/// split-path mirror gate ([`item_login_state`]). The two SPLIT callers of
+/// [`keychain_mirror_rotation`] (the rotation hook mirroring the freshly
+/// stamped sidecar, and the rolling re-stamp leg) write `Keep::Everything` —
+/// every sibling block in the item survives — so they must establish the
+/// item's login is clauth's own FIRST: once CC migrates into the Keychain and
+/// deletes the plaintext file, the file layer stops being evidence, and an
+/// out-of-band `/login` as another account leaves the item holding B while
+/// clauth still believes A is active — the next re-stamp would preserve B's
+/// `organizationUuid`/`trustedDeviceToken`/`enterpriseGateway` beside A's
+/// bearer, a mixed identity that never self-corrects.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ItemLoginState {
+    /// The item's login is one clauth put there, or the item is absent, or it
+    /// holds a blank (logged-out) shell. Proceed with the mirror.
+    Ours,
+    /// The item holds a non-empty login matching no bearer clauth knows it
+    /// wrote or replaced. Skip: leave the item intact rather than layer this
+    /// account's bearer under its blocks.
+    NotOurs,
+    /// The item answered with bytes that are not valid JSON — almost always a
+    /// TRUNCATED version of clauth's own write (#66/#76). PROCEED: the
+    /// mirror's own read leg quarantines the bytes and the write heals the
+    /// item, exactly the behavior this gate must not lose.
+    Corrupt,
+    /// The item could not be read at all (a locked keychain, a spent budget,
+    /// a headless refusal). Skip: a skipped mirror only delays the new bearer,
+    /// while preserving blocks nobody could read has no upside. Carries the
+    /// rendered cause for the event line.
+    Unreadable(String),
+}
+
+/// Read the real item and classify its login for the split-path mirror gate
+/// ([`ItemLoginState`]). "Ours" for a bearer that changes on every re-stamp
+/// is decided by RECOGNITION: the caller passes the bearers it knows clauth
+/// wrote or is replacing (the sidecar's pre-stamp bearer, the pre-rotation
+/// chain token, the bearer about to be written), and the item's login must
+/// match one of them.
+///
+/// This is a `security` SUBPROCESS: callers keep it out of any state-flock
+/// hold (`oauth.rs` runs it after the lock closure ends, beside the write it
+/// gates).
+pub(crate) fn item_login_state(ours: &[&str]) -> ItemLoginState {
+    let account = match account() {
+        Ok(a) => a,
+        Err(e) => return ItemLoginState::Unreadable(format!("{e:#}")),
+    };
+    match read_blob_at(SERVICE, &account) {
+        Ok(blob) => {
+            if login_blob_is_ours(blob.as_ref(), ours) {
+                ItemLoginState::Ours
+            } else {
+                ItemLoginState::NotOurs
+            }
+        }
+        Err(e) if carried_raw(&e).is_some() => ItemLoginState::Corrupt,
+        Err(e) => ItemLoginState::Unreadable(format!("{e:#}")),
+    }
+}
+
+/// The pure core of [`item_login_state`]: the recognition rule over an
+/// already-read item blob, so the truth table is pinned without a Keychain
+/// (the `put_transport` pattern). Blank means logged-out, the same line
+/// [`merged_blob`]'s `live_token` draws: two logged-out shells are equal to
+/// each other, so an empty token is never a match and never foreign.
+fn login_blob_is_ours(blob: Option<&Value>, ours: &[&str]) -> bool {
+    let Some(token) = blob
+        .and_then(|b| b.get("claudeAiOauth"))
+        .and_then(|l| l.get("accessToken"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    else {
+        return true;
+    };
+    ours.contains(&token)
+}
+
 /// Sign Claude Code out of the real `Claude Code-credentials` item:
 /// [`sign_out_at`] at [`SERVICE`], under the OS login account.
 ///

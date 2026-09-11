@@ -14,10 +14,10 @@
 use super::{
     Keep, PutTransport, SECURITY_ARGV_VALUE_MAX, SECURITY_BIN, SECURITY_STDIN_LINE_MAX, SecurityOp,
     UnparseableItem, VerifyOutcome, WriteDisposition, add_generic_password_line, carried_raw,
-    delete_at, disposition_verdict, keychain_service_for_config_dir, merge_and_put_at, merge_write,
-    merged_blob, put_blob_at, put_transport, quarantine_path, quarantine_tail, read_blob_at,
-    run_with_deadline, security_deadline, security_error, security_quote, sign_out_at,
-    verify_outcome, write_disposition,
+    delete_at, disposition_verdict, keychain_service_for_config_dir, login_blob_is_ours,
+    merge_and_put_at, merge_write, merged_blob, put_blob_at, put_transport, quarantine_path,
+    quarantine_tail, read_blob_at, run_with_deadline, security_deadline, security_error,
+    security_quote, sign_out_at, verify_outcome, write_disposition,
 };
 use crate::logline::LogLines;
 use crate::profile::{ClaudeCredentials, OAuthToken};
@@ -251,6 +251,42 @@ fn merged_blob_under_a_rotation_keeps_the_accounts_own_blocks() {
     assert_eq!(merged["claudeAiOauth"]["accessToken"], "rotated");
     assert_eq!(merged["organizationUuid"], "org-outgoing");
     assert_eq!(merged["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+}
+
+// The CLA-SPLIT foreign gate's recognition rule (the pure core of
+// `item_login_state`): `Keep::Everything` preserves the item's sibling
+// blocks, so the item's login must be one clauth put there BEFORE a split
+// mirror runs. A rolling bearer changes on every stamp, so "ours" is decided
+// by recognition against the bearers the caller wrote or is replacing — never
+// against the incoming login alone, which a re-stamp replaces by design.
+
+#[test]
+fn login_blob_is_ours_accepts_an_absent_item_and_a_blank_shell() {
+    assert!(login_blob_is_ours(None, &["previous"]));
+    let shell = serde_json::json!({ "claudeAiOauth": { "accessToken": "" } });
+    assert!(login_blob_is_ours(Some(&shell), &["previous"]));
+    let no_login = serde_json::json!({ "mcpOAuth": {} });
+    assert!(login_blob_is_ours(Some(&no_login), &["previous"]));
+}
+
+#[test]
+fn login_blob_is_ours_recognizes_the_bearer_being_replaced() {
+    assert!(login_blob_is_ours(
+        Some(&item("previous")),
+        &["previous", "incoming"]
+    ));
+}
+
+#[test]
+fn login_blob_is_ours_refuses_a_login_clauth_never_wrote() {
+    assert!(
+        !login_blob_is_ours(Some(&item("someone-elses")), &["previous", "incoming"]),
+        "an out-of-band `/login` as another account must never have its blocks preserved \
+         under this account's bearer"
+    );
+    // No candidates at all (the arming rotation over a fresh profile): any
+    // non-empty login in the item is foreign by recognition.
+    assert!(!login_blob_is_ours(Some(&item("whatever")), &[]));
 }
 
 #[test]
