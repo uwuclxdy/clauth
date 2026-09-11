@@ -2691,9 +2691,16 @@ impl ProfileRuntime {
             stamp_window_closing(&paths, &session);
             Ok::<_, anyhow::Error>((session, paths, file, legacy_lock, mode, fresh))
         })?;
+        // macOS: the Keychain half of the tree build. Before the guard drops,
+        // so a rotation queued behind it cannot land between the build and the
+        // item write — see `seed_session_keychain_item`.
+        #[cfg(target_os = "macos")]
+        seed_session_keychain_item(&canonical, &paths.runtime, name, &session);
         // Released at the end of the register-and-stamp window rather than at the
         // end of this function, so a queued peer waits out that window and not the
-        // watchdog arming behind it.
+        // watchdog arming behind it. On macOS the guard additionally spans
+        // `seed_session_keychain_item`'s `security` subprocesses, which sit past
+        // the state flock on purpose (a subprocess must never span it).
         //
         // What the hold must still cover, and does: the credential
         // materialization inside `build_runtime_dir_with_active_env` (which
@@ -3586,6 +3593,102 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
     match first_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+/// macOS: seed the NAMESPACED Keychain item a session's Claude Code reads
+/// (it sets `CLAUDE_CONFIG_DIR`, and CC resolves the Keychain before any
+/// file), from the same install source the runtime tree was just built
+/// from — the Keychain half of [`reconcile_credentials`]' file half.
+///
+/// Without a pre-written item, a session on a refreshable login falls
+/// through to the runtime file, migrates into the item on its first token
+/// write and DELETES that file: the store never advances, its refresh token
+/// goes stale, and the next clauth-side rotation dies into quarantine
+/// (reproduced 2026-09-11, `docs/todo.md`'s keychain-loss row). A
+/// pre-written item means CC reads clauth's pair from its first request and
+/// the runtime file keeps feeding the drain.
+///
+/// REFRESHLESS install sources skip both legs: a rolling sidecar or a
+/// static setup-token mint never refreshes, so CC never migrates it and the
+/// file layer stays authoritative for the session's whole life — writing
+/// the item anyway would strand the session on a snapshot the re-stamp leg
+/// can no longer reach, because CC does not go back to the file once the
+/// item exists.
+///
+/// An ABSENT install source signs the item out instead of carrying: the
+/// carry would resurrect a departed OAuth store out of a stale item (an
+/// endpoint recapture's leftover), and the session's CC must not keep
+/// serving that login — the same split the bare-item mirror makes
+/// (`keychain_mirror_source`'s `AbsentSource::SignOut`).
+///
+/// CARRY, then WRITE — the same pair, order and reasons as `swap_to`: the
+/// item may already hold this profile's only live pair (a live sibling on
+/// the shared fake-mode tree, or a previous session's orphaned item under a
+/// recycled sid), and writing first would destroy it. Runs AFTER the state
+/// flock (a `security` subprocess must never span it) while the caller
+/// still holds the rotation guard: the session's marker and registry row
+/// are stamped by then, so on macOS no rotation of a refreshable chain can
+/// start past this point, and the guard keeps a rotation that queued during
+/// the tree build from spending the refresh token between the build and the
+/// item write that installs it.
+///
+/// Loud-not-fatal on every arm: a failed write leaves the session on the
+/// file layer — the pre-fix behavior — and a headless box whose keychain
+/// refuses must still start sessions. Nothing retries the write for THIS
+/// session; the next start on the same tree, or a later swap onto another
+/// member, re-runs it.
+#[cfg(target_os = "macos")]
+fn seed_session_keychain_item(
+    canonical: &Path,
+    runtime: &Path,
+    name: &ProfileName,
+    session: &SessionId,
+) {
+    if !crate::keychain::enabled() {
+        return;
+    }
+    if !canonical.exists() {
+        if let Err(e) = crate::keychain::keychain_sign_out_for_config_dir(runtime) {
+            logline!(
+                "clauth: session {} started on {}, which stores no Claude login, but signing \
+                 its per-session Keychain item out failed: {e:#}. The session's Claude Code may \
+                 keep serving whatever login that item still holds",
+                session.as_str(),
+                name
+            );
+        }
+        return;
+    }
+    let refreshless =
+        crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(canonical)
+            .ok()
+            .is_some_and(|c| c.refresh_token().is_none());
+    if refreshless {
+        return;
+    }
+    match crate::claude::carry_session_item_into(canonical, runtime) {
+        Ok(()) => {
+            if let Err(e) = crate::claude::keychain_mirror_source_for_config_dir(canonical, runtime)
+            {
+                logline!(
+                    "clauth: session {} started on {} but writing its per-session Keychain item \
+                     failed: {e:#}. Its Claude Code falls back to the runtime credentials file, \
+                     where its next token refresh migrates into the item and strands the stored \
+                     refresh token; the next start on this tree re-runs the write",
+                    session.as_str(),
+                    name
+                );
+            }
+        }
+        Err(e) => logline!(
+            "clauth: session {} started on {} but carrying its per-session Keychain item's pair \
+             back into the store failed: {e:#}. The item was left untouched, so the session's \
+             Claude Code reads whatever login it holds and falls back to the runtime credentials \
+             file when it holds none",
+            session.as_str(),
+            name
+        ),
     }
 }
 

@@ -1231,6 +1231,16 @@ pub(crate) fn keychain_sign_out() -> Result<()> {
     sign_out_at(SERVICE, &account()?)
 }
 
+/// Sign out the NAMESPACED item for a config dir — the start-site twin of
+/// [`keychain_sign_out`], for a session whose profile stores no Claude login
+/// (an api-key or endpoint profile). Same strip-and-maybe-delete core: the
+/// session's Claude Code resolves this item before any file, so a departed
+/// account's login left in it (an endpoint recapture's leftover under a
+/// shared or recycled runtime dir) would keep serving that account.
+pub(crate) fn keychain_sign_out_for_config_dir(config_dir: &Path) -> Result<()> {
+    sign_out_at(&keychain_service_for_config_dir(config_dir)?, &account()?)
+}
+
 /// The sign-out core over an arbitrary `(service, account)`, parameterized the
 /// way [`read_blob_at`]/[`put_blob_at`]/[`delete_at`] are so the e2e leg
 /// (`tests/inline/keychain.rs`'s sign-out quarantine pin) drives a THROWAWAY
