@@ -70,7 +70,7 @@ Runs a headless `claude -p` under another profile and returns what it produced.
 | `model` | string | the profile's own default |
 | `cwd` | string | the server's working directory |
 | `env` | object | none |
-| `args` | array | none, appended to the `claude` invocation |
+| `args` | array | none, appended to the `claude` invocation; `--session-id`, `--resume` and `--fork-session` are refused — clauth pins the session id, resume via `session_id` |
 | `session_id` | string | none, a session id to resume |
 | `subagent_type` | string | none; runs the whole delegate as one of your agent types |
 | `allowed_tools` | array of strings | none; maps to `--allowedTools` |
