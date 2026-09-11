@@ -56,11 +56,33 @@ fn put_login(service: &str, account: &str, creds: &ClaudeCredentials, keep: Keep
     merge_and_put_at(service, account, &login, keep).expect("write");
 }
 
+/// Deletes `(service, account)` on drop — panic-safe cleanup for the
+/// `#[ignore]`d real-Keychain tests, whose trailing `delete_at` otherwise
+/// leaks the throwaway item when an assert panics mid-test. One guard covers
+/// both tests' services; idempotent, so it is a no-op after a clean run's own
+/// delete.
+struct ThrowawayItem {
+    service: String,
+    account: &'static str,
+}
+
+impl Drop for ThrowawayItem {
+    fn drop(&mut self) {
+        if let Err(e) = delete_at(&self.service, self.account) {
+            eprintln!("clauth-test: cleaning up {} failed: {e:#}", self.service);
+        }
+    }
+}
+
 #[test]
 #[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
 fn keychain_round_trip_on_temp_service() {
     let service = format!("clauth-test-{}", std::process::id());
     let account = "clauth-test-account";
+    let _throwaway = ThrowawayItem {
+        service: service.clone(),
+        account: "clauth-test-account",
+    };
 
     // Clean slate — delete is idempotent, read of an absent item is None.
     delete_at(&service, account).expect("pre-clean delete is idempotent");
@@ -118,6 +140,10 @@ fn keychain_round_trip_on_temp_service() {
 fn keychain_write_keeps_the_siblings_its_keep_allows() {
     let service = format!("clauth-test-merge-{}", std::process::id());
     let account = "clauth-test-account";
+    let _throwaway = ThrowawayItem {
+        service: service.clone(),
+        account: "clauth-test-account",
+    };
     delete_at(&service, account).expect("pre-clean delete is idempotent");
 
     // Claude Code's own item shape: one object, login plus siblings.

@@ -833,7 +833,8 @@ fn sidecar_write_failed(name: &ProfileName) -> crate::format::Transient {
 /// fault are different verdicts. The repair bodies run under
 /// `with_state_lock`, which fails on a bounded cross-process flock timeout
 /// ([`crate::lock::StateLockTimeout`]), and on macOS that flock is held
-/// across the `/usr/bin/security` shell-out for up to 20 seconds — so a slow
+/// across `/usr/bin/security` shell-outs sharing a 20 s aggregate budget
+/// (`lock::SUBPROCESS_BUDGET`, each invocation capped at 10 s) — so a slow
 /// Keychain in a SIBLING process surfaces here as a timeout, and rendering it
 /// through [`sidecar_write_failed`]'s "check permissions" copy sends the
 /// operator hunting a fault that does not exist. Same contention-vs-fault
@@ -2742,8 +2743,9 @@ fn adopt_disk_rotation(
 /// different verdicts, the same split `sidecar_repair_transient` makes for
 /// the repair leg. `with_state_lock` fails on a bounded cross-process flock
 /// timeout ([`crate::lock::StateLockTimeout`]) or an IO fault, and on macOS
-/// a sibling process can hold that flock across the `/usr/bin/security`
-/// shell-out for up to 20 seconds — a slow Keychain in ANOTHER process
+/// a sibling process can hold that flock across `/usr/bin/security`
+/// shell-outs sharing a 20 s aggregate budget (`lock::SUBPROCESS_BUDGET`,
+/// each invocation capped at 10 s) — a slow Keychain in ANOTHER process
 /// surfaces here as a timeout.
 fn adopt_lock_transient(name: &ProfileName, e: &anyhow::Error) -> crate::format::Transient {
     if e.chain()
