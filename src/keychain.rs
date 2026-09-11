@@ -1085,11 +1085,31 @@ fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Erro
 /// anything else would leave CC with a credential it cannot read and clauth with
 /// no signal that it happened.
 pub(crate) fn keychain_install(store: &Value) -> Result<()> {
+    install_at(SERVICE, store)
+}
+
+/// Install `store` as the login for a SPECIFIC config dir's item: the
+/// namespaced `Claude Code-credentials-<sha256(dir)[0:8]>` service a
+/// `clauth start` session's Claude Code reads (it sets `CLAUDE_CONFIG_DIR`,
+/// so CC namespaces its Keychain item per dir), rather than the bare item a
+/// global `claude` reads. The multi-session swap executor writes this item
+/// alongside the credential link it repoints — on macOS CC resolves the
+/// Keychain FIRST, so the file repoint alone moves nothing a session reads.
+///
+/// Same merge codepath, same [`Keep::CarriedOnly`] (the MCP-login carry needs
+/// no rule of its own), and the same non-object refusal as [`keychain_install`]:
+/// one Keychain path, two service names.
+pub(crate) fn keychain_install_for_config_dir(store: &Value, config_dir: &Path) -> Result<()> {
+    let service = keychain_service_for_config_dir(config_dir)?;
+    install_at(&service, store)
+}
+
+fn install_at(service: &str, store: &Value) -> Result<()> {
     anyhow::ensure!(
         store.is_object(),
         "refusing to install a credential store that is not a JSON object into the Keychain"
     );
-    merge_and_put_at(SERVICE, &account()?, store, Keep::CarriedOnly)
+    merge_and_put_at(service, &account()?, store, Keep::CarriedOnly)
 }
 
 /// Mirror `creds` after clauth rotated THIS account's own chain (`oauth.rs`).
@@ -1273,10 +1293,6 @@ fn sign_out_at(service: &str, account: &str) -> Result<()> {
 ///
 /// The suffix is the first 8 hex chars of the SHA-256 of the canonicalized
 /// directory path, matching CC's `sha256(configDir).toString('hex').slice(0, 8)`.
-#[allow(
-    dead_code,
-    reason = "caller lands with the macOS swap-executor Keychain write"
-)]
 pub(crate) fn keychain_service_for_config_dir(config_dir: &Path) -> Result<String> {
     // Canonicalize: CC resolves symlinks before hashing, and a relative path
     // would produce a different hash than the absolute one CC computes.

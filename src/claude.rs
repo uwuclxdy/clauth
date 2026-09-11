@@ -1166,13 +1166,37 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
             AbsentSource::Leave => Ok(()),
         };
     }
+    let store = checked_store_at(path)?;
+    crate::keychain::keychain_install(&store)
+}
+
+/// macOS: install the store `path` holds into the NAMESPACED Keychain item for
+/// `config_dir` — the multi-session swap executor's Keychain half. The executor
+/// repoints the session's credential link and this writes what a session's CC
+/// actually reads (it resolves the Keychain first, namespaced per
+/// `CLAUDE_CONFIG_DIR`). Same typed boundary check as the bare-item mirror
+/// ([`keychain_mirror_source`]); no absent-source arm, because the swap's own
+/// precondition already refused a member with no credential store.
+///
+/// Runs AFTER the state-flock hold that moved the link (a `security` subprocess
+/// must never span the flock) and is loud-not-fatal on failure: the file layer
+/// is swapped and the write is idempotent, so a retry re-runs it — the same
+/// posture the rotation mirror takes.
+#[cfg(target_os = "macos")]
+fn keychain_mirror_source_for_config_dir(path: &Path, config_dir: &Path) -> Result<()> {
+    let store = checked_store_at(path)?;
+    crate::keychain::keychain_install_for_config_dir(&store, config_dir)
+}
+
+/// Typed check at the boundary, then hand the untyped object to the installer:
+/// the login must be PRESENT and parse as a login, or CC is handed a credential
+/// it cannot read and nothing here would have said so. Presence is its own
+/// clause because the field is an `Option`, so `{}` and a store holding only
+/// `mcpOAuth` parse clean. The Value is what gets written, since the typed
+/// shape models the login alone and would drop the store's siblings.
+#[cfg(target_os = "macos")]
+fn checked_store_at(path: &Path) -> Result<serde_json::Value> {
     let store: serde_json::Value = read_json_file(path)?;
-    // Typed check at the boundary, then install the untyped object: the login
-    // must be PRESENT and parse as a login, or CC is handed a credential it
-    // cannot read and nothing here would have said so. Presence is its own
-    // clause because the field is an `Option`, so `{}` and a store holding only
-    // `mcpOAuth` parse clean. The Value is what gets written, since the typed
-    // shape models the login alone and would drop the store's siblings.
     let parsed = serde_json::from_value::<ClaudeCredentials>(store.clone()).with_context(|| {
         format!(
             "install source is not Claude credentials: {}",
@@ -1184,7 +1208,7 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
         "refusing to install a credential store that holds no login: {}",
         path.display()
     );
-    crate::keychain::keychain_install(&store)
+    Ok(store)
 }
 
 #[cfg(unix)]

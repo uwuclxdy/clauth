@@ -2206,7 +2206,7 @@ impl SessionSwap {
         };
         let _rotation = RotationGuard::acquire(&plan.member)?;
         let link = self.runtime.join(".credentials.json");
-        with_state_lock(|_held| {
+        let outcome = with_state_lock(|_held| {
             let current = self.canonical();
             // DRAIN. A Claude Code re-login sitting in the runtime file belongs to
             // the member the link STILL resolves to; once canonical moves, the
@@ -2253,7 +2253,31 @@ impl SessionSwap {
                 );
             }
             Ok(SwapOutcome::Swapped)
-        })
+        })?;
+        // macOS: the session's Claude Code reads the NAMESPACED Keychain item
+        // for this runtime dir (it sets `CLAUDE_CONFIG_DIR`, and CC resolves
+        // the Keychain first), so the link repoint above moved only the file
+        // layer — this write is what actually moves the session. Runs AFTER
+        // the flock (a `security` subprocess must never span it), loud-not-
+        // fatal: idempotent, and a later swap onto any member rewrites the
+        // item. A failure leaves the session authenticating as the member it
+        // was on before the swap while the cell names the new one, so the
+        // line says exactly that.
+        #[cfg(target_os = "macos")]
+        if matches!(outcome, SwapOutcome::Swapped)
+            && crate::keychain::enabled()
+            && let Err(e) =
+                crate::claude::keychain_mirror_source_for_config_dir(&plan.store, &self.runtime)
+        {
+            logline!(
+                "clauth: session {} swapped onto {} but writing its per-session Keychain item \
+                 failed: {e:#}. The session keeps authenticating as its previous member until a \
+                 later swap rewrites the item",
+                self.session.as_str(),
+                plan.member
+            );
+        }
+        Ok(outcome)
     }
 
     /// Release and unlink everything the swaps stamped. Called from `Drop`'s
