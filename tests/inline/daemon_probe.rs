@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 //! Probe contract (#27, #57):
 //!   * `claim_singleton` caps the daemon tree at one active instance plus one
 //!     standby: a third arrival is `Redundant` and exits instead of parking.
@@ -62,6 +64,48 @@ fn fresh_stale_and_garbage_stamps() {
     assert!(
         !status_is_fresh(r#"{"generated_at":12345}"#, now),
         "non-string stamp"
+    );
+}
+
+/// The staleness window sits strictly above the watchdog deadline
+/// (`DAEMON_STALE_MS`'s doc): the worst legal tick — a macOS keychain mirror
+/// spending all three `security` deadlines — lands AT the deadline and must
+/// read green, so amber means "wedged past what the watchdog tolerates", never
+/// "slowest legal tick". `now` is synthesized from the same second the stamps
+/// derive from, so both boundaries are exact with no clock race: the fresh
+/// half's stamp is exactly one second past the deadline (at the deadline itself
+/// a real `now_ms`'s sub-second remainder flips `<=` once in a while), the
+/// stale half's exactly one second past the window.
+#[test]
+fn the_staleness_window_sits_above_the_watchdog_deadline() {
+    // The owner-set margin (ruling 2026-09-10), pinned as a figure: a smaller
+    // margin survives the const assert and both boundary halves below, since
+    // any margin over ~1 s keeps the worst legal tick green.
+    assert_eq!(
+        super::DAEMON_STALE_MS,
+        super::super::WATCHDOG_DEADLINE.as_millis() as u64 + 5_000
+    );
+
+    let base = now_epoch_secs();
+    let now = base as u64 * 1000;
+
+    let worst_legal_tick = format!(
+        r#"{{"schema":1,"generated_at":"{}"}}"#,
+        epoch_secs_to_iso(base - super::super::WATCHDOG_DEADLINE.as_secs() as i64 - 1)
+    );
+    assert!(
+        status_is_fresh(&worst_legal_tick, now),
+        "a stamp past the watchdog deadline but inside the window is the worst \
+         legal tick and must read green"
+    );
+
+    let past_window = format!(
+        r#"{{"schema":1,"generated_at":"{}"}}"#,
+        epoch_secs_to_iso(base - (super::DAEMON_STALE_MS / 1000) as i64 - 1)
+    );
+    assert!(
+        !status_is_fresh(&past_window, now),
+        "a stamp past the window must read amber"
     );
 }
 
