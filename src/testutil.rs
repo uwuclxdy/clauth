@@ -462,9 +462,10 @@ pub(crate) fn rotation_fixture_config(
 /// fail `RotationGuard::acquire` outright, when the rotation lock still lived in
 /// that directory; the lock has since moved out of it.)
 ///
-/// Gated with its callers: an ungated helper with no caller is a dead-code error
-/// that reds that leg on clippy `-D warnings` before a test runs.
-#[cfg(test)]
+/// Gated with its callers: both are non-macOS tests, and an ungated helper with
+/// no macOS caller is a dead-code error that reds that leg on clippy
+/// `-D warnings` before a test runs.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn block_credentials_write(name: &crate::profile::ProfileName) {
     let path = crate::profile::profile_subpath(name, "credentials.json").expect("credentials path");
     if path.is_file() {

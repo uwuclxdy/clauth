@@ -1104,6 +1104,16 @@ pub(crate) fn keychain_install_for_config_dir(store: &Value, config_dir: &Path) 
     install_at(&service, store)
 }
 
+/// Read the whole JSON object the per-config-dir item for `config_dir` holds,
+/// or `None` when no such item exists. The swap executor's carry-back reads it
+/// before [`keychain_install_for_config_dir`] overwrites it: a session's CC
+/// keeps its refreshed pair only there. Same read discipline as
+/// [`read_blob_at`], over the derived service.
+pub(crate) fn read_config_dir_item(config_dir: &Path) -> Result<Option<Value>> {
+    let service = keychain_service_for_config_dir(config_dir)?;
+    read_blob_at(&service, &account()?)
+}
+
 fn install_at(service: &str, store: &Value) -> Result<()> {
     anyhow::ensure!(
         store.is_object(),

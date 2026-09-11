@@ -1180,12 +1180,60 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
 ///
 /// Runs AFTER the state-flock hold that moved the link (a `security` subprocess
 /// must never span the flock) and is loud-not-fatal on failure: the file layer
-/// is swapped and the write is idempotent, so a retry re-runs it — the same
-/// posture the rotation mirror takes.
+/// is swapped and the write is idempotent, and only a later swap onto ANOTHER
+/// member re-runs it — the executor refuses `AlreadyCurrent`, so there is no
+/// same-member retry. Callers pair it with [`carry_session_item_into`] first.
 #[cfg(target_os = "macos")]
-fn keychain_mirror_source_for_config_dir(path: &Path, config_dir: &Path) -> Result<()> {
+pub(crate) fn keychain_mirror_source_for_config_dir(path: &Path, config_dir: &Path) -> Result<()> {
     let store = checked_store_at(path)?;
     crate::keychain::keychain_install_for_config_dir(&store, config_dir)
+}
+
+/// macOS: carry the pair the session's Claude Code left in its per-config-dir
+/// Keychain item back into `store`, the install source of the member the
+/// session is leaving — the Keychain twin of the file drain
+/// (`sync_credentials_unlocked`), run before a swap overwrites that item. CC
+/// keeps its refreshed pair ONLY in the item: it deletes the runtime file once
+/// it has migrated, so the swap's item write would otherwise destroy the
+/// outgoing member's only live pair.
+///
+/// The item can hold only what a swap wrote or what CC refreshed over it, so a
+/// byte difference from the store always means CC's write is the fresher one —
+/// no recency compare, unlike the file drain. The file drain's CLA-SPLIT guard
+/// carries over unchanged: a differing item over a static session token is a
+/// session-side re-login, never adopted over the token.
+///
+/// The read (a `security` subprocess) runs OUTSIDE the state flock; the store
+/// write it may produce runs under one.
+#[cfg(target_os = "macos")]
+pub(crate) fn carry_session_item_into(store: &Path, config_dir: &Path) -> Result<()> {
+    let Some(blob) = crate::keychain::read_config_dir_item(config_dir)? else {
+        return Ok(());
+    };
+    let bytes = serde_json::to_vec(&blob).context("failed to serialize the Keychain item")?;
+    let parsed: ClaudeCredentials = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "the Keychain item for {} is not Claude credentials",
+            config_dir.display()
+        )
+    })?;
+    if parsed.claude_ai_oauth.is_none() {
+        return Ok(());
+    }
+    if std::fs::read(store).as_deref() == Ok(bytes.as_slice()) {
+        return Ok(());
+    }
+    if store.file_name().is_some_and(|f| f == "session-token.json") {
+        logline!(
+            "clauth: kept the static session token (a session-side re-login \
+             found in the per-session Keychain item is never adopted over it)"
+        );
+        return Ok(());
+    }
+    crate::lock::with_state_lock(|_held| {
+        crate::profile::atomic_write_600(store, &bytes)
+            .with_context(|| format!("failed to write {}", store.display()))
+    })
 }
 
 /// Typed check at the boundary, then hand the untyped object to the installer:

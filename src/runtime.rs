@@ -2177,8 +2177,17 @@ impl SessionSwap {
         };
         let _rotation = RotationGuard::acquire(&plan.member)?;
         let link = self.runtime.join(".credentials.json");
+        // The install source of the member being LEFT — what the macOS
+        // carry-back below writes the session's Keychain pair into. Captured
+        // inside the hold, spent after it (the carry's read is a subprocess).
+        #[cfg(target_os = "macos")]
+        let mut previous_store: Option<std::path::PathBuf> = None;
         let outcome = with_state_lock(|_held| {
             let current = self.canonical();
+            #[cfg(target_os = "macos")]
+            {
+                previous_store = Some(current.clone());
+            }
             // DRAIN. A Claude Code re-login sitting in the runtime file belongs to
             // the member the link STILL resolves to; once canonical moves, the
             // next tick would write those bytes into the new member's store and
@@ -2228,25 +2237,46 @@ impl SessionSwap {
         // macOS: the session's Claude Code reads the NAMESPACED Keychain item
         // for this runtime dir (it sets `CLAUDE_CONFIG_DIR`, and CC resolves
         // the Keychain first), so the link repoint above moved only the file
-        // layer — this write is what actually moves the session. Runs AFTER
-        // the flock (a `security` subprocess must never span it), loud-not-
-        // fatal: idempotent, and a later swap onto any member rewrites the
-        // item. A failure leaves the session authenticating as the member it
-        // was on before the swap while the cell names the new one, so the
-        // line says exactly that.
+        // layer. CARRY, then WRITE — in that order, and the write only runs if
+        // the carry could: the item holds the outgoing member's only live pair
+        // once CC has refreshed there (it deletes the runtime file on
+        // migration), so writing before carrying would brick that member, and
+        // skipping both on a failed carry leaves an inert swap — the session
+        // keeps its previous credentials — rather than a destroyed chain. Both
+        // legs run AFTER the flock (a `security` subprocess must never span
+        // it); loud-not-fatal, idempotent, and only a later swap onto ANOTHER
+        // member re-runs them (the executor refuses `AlreadyCurrent`).
         #[cfg(target_os = "macos")]
-        if matches!(outcome, SwapOutcome::Swapped)
-            && crate::keychain::enabled()
-            && let Err(e) =
-                crate::claude::keychain_mirror_source_for_config_dir(&plan.store, &self.runtime)
-        {
-            logline!(
-                "clauth: session {} swapped onto {} but writing its per-session Keychain item \
-                 failed: {e:#}. The session keeps authenticating as its previous member until a \
-                 later swap rewrites the item",
-                self.session.as_str(),
-                plan.member
-            );
+        if matches!(outcome, SwapOutcome::Swapped) && crate::keychain::enabled() {
+            let carried = previous_store
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("the outgoing member's install source is unknown"))
+                .and_then(|store| crate::claude::carry_session_item_into(store, &self.runtime));
+            match carried {
+                Ok(()) => {
+                    if let Err(e) = crate::claude::keychain_mirror_source_for_config_dir(
+                        &plan.store,
+                        &self.runtime,
+                    ) {
+                        logline!(
+                            "clauth: session {} swapped onto {} but writing its per-session \
+                             Keychain item failed: {e:#}. The session keeps authenticating as its \
+                             previous member; only a later swap onto another member re-runs the \
+                             write",
+                            self.session.as_str(),
+                            plan.member
+                        );
+                    }
+                }
+                Err(e) => logline!(
+                    "clauth: session {} swapped onto {} but carrying the previous member's \
+                     Keychain pair back into its store failed: {e:#}. The per-session Keychain \
+                     item was left untouched, so the session keeps authenticating as its \
+                     previous member; only a later swap onto another member re-runs both legs",
+                    self.session.as_str(),
+                    plan.member
+                ),
+            }
         }
         Ok(outcome)
     }
