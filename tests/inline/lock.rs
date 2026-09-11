@@ -146,6 +146,66 @@ fn the_subprocess_budget_binds_only_inside_a_hold() {
     );
 }
 
+/// The daemon's tick arms ONE budget its two sequential drains share. The
+/// pre-fix shape armed a fresh budget per acquisition, so a tick draining a
+/// queued switch and a queued switch-off got 20 s apiece against the daemon's
+/// 30 s watchdog. Every acquisition inside the shared scope must spend the
+/// SHARED window rather than a fresh one, and must not clear it on release —
+/// the second iteration is the drain the first one's budget must still bind.
+#[test]
+fn a_shared_budget_spans_sequential_acquisitions() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // Short enough that a fresh 20 s budget and the shared remnant differ by
+    // an assertable margin; long enough for two flock round-trips.
+    let shared = Duration::from_millis(500);
+
+    let wide = SharedSubprocessBudget::arm(shared);
+    for i in 0..2 {
+        with_state_lock(|_held| Ok(())).expect("hold");
+        let left = clamp_to_hold_budget(Duration::from_secs(20));
+        assert!(
+            left <= shared,
+            "acquisition {i} inside the shared scope must spend the shared window, got {left:?}"
+        );
+    }
+    drop(wide);
+
+    // The shared guard disarms what it armed, so an unscoped hold is back on
+    // a full budget of its own.
+    with_state_lock(|_held| {
+        let inside = clamp_to_hold_budget(Duration::from_secs(20));
+        assert!(
+            inside > Duration::from_secs(19),
+            "after the shared scope drops, a fresh hold arms its own full budget, got {inside:?}"
+        );
+        Ok(())
+    })
+    .expect("hold");
+}
+
+/// A `SharedSubprocessBudget` taken INSIDE an already-budgeted hold adopts
+/// that hold's budget and clears nothing: the ownership chain stays single
+/// however the scopes nest, so the inner guard's drop leaves the outer hold's
+/// budget armed for the rest of its body.
+#[test]
+fn a_shared_scope_inside_a_hold_adopts_its_budget() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    with_state_lock(|_held| {
+        {
+            let _inner = SharedSubprocessBudget::arm(Duration::from_millis(10));
+        }
+        // The inner guard did not arm, so its drop cleared nothing; the hold's
+        // own budget is still live.
+        let inside = clamp_to_hold_budget(Duration::from_secs(20));
+        assert!(
+            inside > Duration::from_secs(19),
+            "an adopting inner guard must not end the hold's own budget, got {inside:?}"
+        );
+        Ok(())
+    })
+    .expect("hold");
+}
 /// The budget is armed by the OUTERMOST acquisition alone. A reentrant hold that
 /// re-armed would hand each nested frame a full budget, which is exactly the
 /// shape this bounds: the two Keychain mirrors of a first-login-adopting switch

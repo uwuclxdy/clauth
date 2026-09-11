@@ -85,7 +85,7 @@ pub(crate) fn state_lock_timeout() -> Duration {
 /// Arming a second budget for a wider scope needs an arm-if-not-armed rule that
 /// [`StateLock::acquire_with_timeout`] does not have today, since it is the only
 /// armer.
-const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
+pub(crate) const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
 
 /// How often [`StateLock::acquire`] re-polls the flock while waiting. Small enough
 /// that a freed lock is taken promptly, large enough that the busy-wait costs
@@ -139,10 +139,13 @@ thread_local! {
 }
 
 // When this thread's [`SUBPROCESS_BUDGET`] runs out, or None when the thread
-// holds no state lock. Set by the OUTERMOST acquisition only, so a reentrant
-// hold keeps spending the budget it entered rather than resetting it — which is
-// the whole point, since the two mirrors of an adopting switch reach the
-// keychain through nested `with_state_lock` frames.
+// holds no state lock. Set by the WIDEST active scope on the thread — a
+// `SharedSubprocessBudget` when one is armed, else the OUTERMOST acquisition —
+// so a reentrant hold keeps spending the budget it entered rather than
+// resetting it, which is the whole point, since the two mirrors of an adopting
+// switch reach the keychain through nested `with_state_lock` frames. An
+// acquisition disarms only a budget it armed itself, so a wider scope's
+// budget spans the holds that spend it.
 thread_local! {
     static HOLD_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
@@ -214,6 +217,10 @@ pub(crate) struct StateLock {
     // outermost acquisition, popped on its drop. None for reentrant calls so
     // the rank is not double-pushed (it is already held by the outer frame).
     _rank: Option<crate::lockorder::RankGuard>,
+    // Whether the outermost acquisition armed `HOLD_DEADLINE` itself. False
+    // inside a `SharedSubprocessBudget` scope (that guard owns the budget) and
+    // for reentrant frames; only a holder that armed disarms on drop.
+    _armed_budget: bool,
 }
 
 impl StateLock {
@@ -243,6 +250,7 @@ impl StateLock {
             return Ok(Self {
                 _thread_guard: None,
                 _rank: None,
+                _armed_budget: false,
             });
         }
 
@@ -278,14 +286,22 @@ impl StateLock {
         // already be held — STATE sits inside it; `RankGuard::enter` asserts it.
         let rank = crate::lockorder::RankGuard::enter::<crate::lockorder::rank::State>();
 
-        // Arm the shared subprocess budget for this hold. After the rank guard,
-        // which panics on a rank violation: an arm before it would outlive the
-        // unwind with no `StateLock` left to disarm it.
-        HOLD_DEADLINE.set(Some(Instant::now() + SUBPROCESS_BUDGET));
+        // Arm the shared subprocess budget for this hold — ARM-IF-NOT-ARMED:
+        // a wider scope (`SharedSubprocessBudget`, the daemon's tick) may
+        // already hold one, and re-arming here would hand every sequential
+        // acquisition inside it a fresh budget, unbounding the very scope the
+        // wider armer exists to bound. After the rank guard, which panics on
+        // a rank violation: an arm before it would outlive the unwind with no
+        // `StateLock` left to disarm it.
+        let armed_budget = HOLD_DEADLINE.get().is_none();
+        if armed_budget {
+            HOLD_DEADLINE.set(Some(Instant::now() + SUBPROCESS_BUDGET));
+        }
 
         Ok(Self {
             _thread_guard: Some(guard),
             _rank: Some(rank),
+            _armed_budget: armed_budget,
         })
     }
 }
@@ -326,11 +342,16 @@ impl Drop for StateLock {
             if let Some(ref mut g) = self._thread_guard {
                 **g = None; // close the File → flock released
             }
-            // Nobody waits on this thread once the flock is free, so the next
-            // hold starts on a full budget. Cleared on a panic unwind too, since
-            // Drop runs there — a poisoned lock must not leave a spent budget
-            // behind to strangle the recovery path.
-            HOLD_DEADLINE.set(None);
+            // Disarm only the budget THIS hold armed — a wider scope's
+            // (`SharedSubprocessBudget`) budget outlives the inner holds that
+            // spent it and is cleared by its own guard. Nobody waits on this
+            // thread once the flock is free, so the next unscoped hold starts
+            // on a full budget. Cleared on a panic unwind too, since Drop runs
+            // there — a poisoned lock must not leave a spent budget behind to
+            // strangle the recovery path.
+            if self._armed_budget {
+                HOLD_DEADLINE.set(None);
+            }
         }
         // Reentrant calls have _thread_guard = None; nothing extra to do.
     }
@@ -342,6 +363,48 @@ impl Drop for StateLock {
 pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateLockHeld) -> Result<T>) -> Result<T> {
     let _guard = StateLock::acquire()?;
     f(&StateLockHeld(()))
+}
+
+/// One shared subprocess budget for a scope WIDER than any single state-lock
+/// hold. The daemon's tick needs this: its two drains
+/// (`daemon::tick`'s `drain_pending_switch` and `drain_pending_switch_off`)
+/// each take their own acquisition, and per-acquisition arming handed a tick
+/// draining both a fresh [`SUBPROCESS_BUDGET`] apiece — 40 s of stuck-keychain
+/// shell-outs against the daemon's 30 s watchdog, which aborts it mid-switch.
+/// Armed once at the top of the scope; every inner acquisition spends what is
+/// left of this one and disarms nothing on release ([`StateLock`] only clears
+/// a budget it armed itself).
+///
+/// Arming is ARM-IF-NOT-ARMED, so a guard taken inside an already-budgeted
+/// hold adopts that hold's budget and clears nothing — the ownership chain
+/// stays single however the scopes nest. Drop (including a panic unwind)
+/// clears the budget only when this guard armed it.
+#[must_use]
+pub(crate) struct SharedSubprocessBudget {
+    // Whether THIS guard armed `HOLD_DEADLINE`; false when a wider scope
+    // already held one, making this guard a no-op.
+    _armed: bool,
+}
+
+impl SharedSubprocessBudget {
+    /// Arm a shared budget of `budget`, or adopt the one already armed on
+    /// this thread. Production passes [`SUBPROCESS_BUDGET`]; tests pass a
+    /// short window so the span is assertable without real waits.
+    pub(crate) fn arm(budget: Duration) -> Self {
+        let armed = HOLD_DEADLINE.get().is_none();
+        if armed {
+            HOLD_DEADLINE.set(Some(Instant::now() + budget));
+        }
+        Self { _armed: armed }
+    }
+}
+
+impl Drop for SharedSubprocessBudget {
+    fn drop(&mut self) {
+        if self._armed {
+            HOLD_DEADLINE.set(None);
+        }
+    }
 }
 
 #[cfg(test)]

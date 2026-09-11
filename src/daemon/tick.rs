@@ -28,6 +28,13 @@ impl super::Daemon {
     /// tests). The initial `status.json` write and the watchdog heartbeat stay in
     /// `run`, so this method is exactly the observable per-tick work.
     pub(super) fn tick(&mut self) {
+        // One subprocess budget for the WHOLE tick: the two drains below each
+        // take their own state-lock acquisition, and per-acquisition arming
+        // handed a tick draining a queued switch AND a queued switch-off a
+        // fresh 20 s apiece — 40 s against the 30 s watchdog that aborts the
+        // daemon mid-switch. Inner holds spend what this leaves them and
+        // disarm nothing (`lock::SharedSubprocessBudget`).
+        let _tick_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
         self.reload_if_changed();
         self.drain_pending_switch();
         self.drain_pending_switch_off();
