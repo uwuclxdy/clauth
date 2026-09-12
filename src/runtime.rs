@@ -607,15 +607,18 @@ fn rotation_blocked_by_live_session(has_live_session: bool, is_macos: bool) -> b
     is_macos && has_live_session
 }
 
-/// Whether ANY live `clauth start` session for `name` launched on a credential
-/// that carries a refresh token — the only kind a rotation can strand.
+/// Whether ANY live `clauth start` session that has run on `name` HOLDS a
+/// credential that carries a refresh token — the only kind a rotation can
+/// strand. The holding is read off the row's `launch_store`, which every swap
+/// repoints at the member the session then reads, so the verdict follows the
+/// session's current member, never the one it launched on.
 ///
 /// [`rotation_blocked_by_live_session`] spells out why a live session blocks
 /// rotation on macOS: that session's Claude Code holds the pair in a Keychain
 /// item clauth cannot write, so a rotation leaves it spending a superseded
 /// refresh token, and the `invalid_grant` that follows blanks its item and
 /// signs the session out mid-task. Every step of that mechanism needs a refresh
-/// token to attempt. A session launched on a `session-token.json` sidecar has
+/// token to attempt. A session holding a `session-token.json` sidecar has
 /// none — CLA-SPLIT put it there exactly so sessions hold nothing rotatable —
 /// so there is nothing for it to spend and nothing for a rotation to strand.
 ///
@@ -2249,6 +2252,16 @@ impl SessionSwap {
                 crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
                     fields.set_current_member(plan.member.as_str());
                     fields.set_last_swap_at(crate::usage::now_ms());
+                    // Off macOS the link this hold just moved IS what the
+                    // session reads, so the row's rotation verdict follows it
+                    // here. macOS defers this write to past the keychain legs
+                    // below: the session's Claude Code resolves the item
+                    // first, so until those legs land it is still holding the
+                    // outgoing member's pair, and a row already naming the
+                    // incoming store would exempt a rotation of the member it
+                    // is still reading.
+                    #[cfg(not(target_os = "macos"))]
+                    fields.set_launch_store(plan.store.clone());
                 })
             {
                 logline!(
@@ -2273,6 +2286,18 @@ impl SessionSwap {
         // legs run AFTER the flock (a `security` subprocess must never span
         // it); loud-not-fatal, idempotent, and only a later swap onto ANOTHER
         // member re-runs them (the executor refuses `AlreadyCurrent`).
+        //
+        // The row's `launch_store` repoint rides the same ordering: until a leg
+        // succeeds the session is still reading the outgoing member's pair out
+        // of the item, so the row keeps naming that member's store and the
+        // rotation verdict keeps refusing for it — the fail-closed direction.
+        // No leg runs in a cfg(test) build (`keychain::enabled()` is false
+        // there), so the file layer is the whole truth and the row follows the
+        // link immediately, exactly as it does off macOS inside the hold.
+        #[cfg(target_os = "macos")]
+        if matches!(outcome, SwapOutcome::Swapped) && !crate::keychain::enabled() {
+            self.repoint_row_store(&plan);
+        }
         #[cfg(target_os = "macos")]
         if matches!(outcome, SwapOutcome::Swapped) && crate::keychain::enabled() {
             let carried = previous_store
@@ -2303,25 +2328,31 @@ impl SessionSwap {
                         .as_ref(),
                     ) {
                         SwapItemArm::Install => {
-                            if let Err(e) = crate::claude::keychain_mirror_source_for_config_dir(
+                            match crate::claude::keychain_mirror_source_for_config_dir(
                                 &plan.store,
                                 &self.runtime,
                             ) {
-                                logline!(
+                                // The item now holds the incoming member's pair,
+                                // so that is what the session reads: the row's
+                                // verdict follows.
+                                Ok(()) => self.repoint_row_store(&plan),
+                                Err(e) => logline!(
                                     "clauth: session {} swapped onto {} but writing its per-session \
                                      Keychain item failed: {e:#}. The session keeps authenticating as its \
                                      previous member; only a later swap onto another member re-runs the \
                                      write",
                                     self.session.as_str(),
                                     plan.member
-                                );
+                                ),
                             }
                         }
                         SwapItemArm::SignOut => {
-                            if let Err(e) =
-                                crate::keychain::keychain_sign_out_for_config_dir(&self.runtime)
-                            {
-                                logline!(
+                            match crate::keychain::keychain_sign_out_for_config_dir(&self.runtime) {
+                                // The item holds nothing now, so the session
+                                // falls back to the file layer this swap moved:
+                                // the row's verdict follows.
+                                Ok(()) => self.repoint_row_store(&plan),
+                                Err(e) => logline!(
                                     "clauth: session {} swapped onto {} but signing its per-session \
                                      Keychain item out failed: {e:#}. The session keeps authenticating as \
                                      its previous member, so the file layer this swap moved is not what \
@@ -2329,7 +2360,7 @@ impl SessionSwap {
                                      it",
                                     self.session.as_str(),
                                     plan.member
-                                );
+                                ),
                             }
                         }
                     }
@@ -2345,6 +2376,28 @@ impl SessionSwap {
             }
         }
         Ok(outcome)
+    }
+
+    /// Point the row's rotation verdict at the store the plan repointed the
+    /// link at. macOS only, and always AFTER the state flock (each call site
+    /// holds no lock, so `update_as_session` takes a FIRST-LEVEL acquisition
+    /// there, not a reentry): the write loads a fresh row inside that hold, so
+    /// it cannot revert a daemon-owned field, and a failed write leaves the row
+    /// naming the outgoing member's store — rotations stay refused for the
+    /// member the session may still be reading, never exempted for one it is
+    /// not.
+    #[cfg(target_os = "macos")]
+    fn repoint_row_store(&self, plan: &SwapPlan) {
+        if let Err(e) = crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
+            fields.set_launch_store(plan.store.clone())
+        }) {
+            logline!(
+                "clauth: session {} swapped onto {} but its row's store did not follow: {e:#}. \
+                 Rotations stay refused for the member it left",
+                self.session.as_str(),
+                plan.member
+            );
+        }
     }
 
     /// Release and unlink everything the swaps stamped. Called from `Drop`'s
@@ -2743,13 +2796,11 @@ impl ProfileRuntime {
                 opt_in,
                 // The SAME value the runtime tree is built from below, so the
                 // row cannot disagree with what this session actually reads —
-                // on macOS, which is the only place it is consulted. A
-                // session that swaps mid-run does NOT update this row's
-                // `launch_store` (`swap_to` moves `cell.canonical`, never the
-                // row), so `live_session_holds_rotatable` keeps reading the
-                // LAUNCH member's store after a swap: known gap, open on the
-                // swap surface — the fix is `swap_to` learning a row update
-                // it deliberately never had (it predates macOS swaps).
+                // on macOS, which is the only place it is consulted. Every
+                // later swap repoints it at the member the session lands on
+                // (`swap_to`'s row update; on macOS that waits for the
+                // keychain legs), so `live_session_holds_rotatable` reads the
+                // store of the member the session is ON, never the launch one.
                 Some(canonical.clone()),
             );
             if let Err(e) = crate::live_sessions::register(&row) {

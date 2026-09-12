@@ -5644,6 +5644,23 @@ fn member_store(profile: &Profile) -> PathBuf {
         .expect("install source")
 }
 
+/// [`member`] with no refresh token: what a swap onto a refreshless store looks
+/// like to `live_session_holds_rotatable`.
+fn refreshless_member(name: &str) -> Profile {
+    let mut profile = make_profile(name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: format!("at-{name}"),
+            refresh_token: None,
+            expires_at: Some(1_000),
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    profile
+}
+
 /// A live session with NO watchdog thread behind it, so every credential leg is
 /// driven explicitly: a test asserting which leg moved which bytes can never be
 /// won by a background tick landing first. `acquire` is used only where the
@@ -6723,6 +6740,100 @@ fn a_swap_preserves_a_daemon_written_intended_member() {
         assert_eq!(row.chain_cursor, Some(2));
         assert_eq!(row.current_member.as_deref(), Some("row-b"));
         assert!(row.last_swap_at.is_some());
+    });
+}
+
+/// The row's `launch_store` moves with the link. `live_session_holds_rotatable`
+/// reads it for the macOS refreshless verdict, so a row left naming the LAUNCH
+/// member's store keeps refusing that member's rotations after the session has
+/// moved onto a refreshless one — the verdict must answer for the member the
+/// session holds, not the one it launched on. Ungated like its fixture twin
+/// above: the row update is transport-independent.
+#[test]
+fn a_swap_onto_a_refreshless_member_lets_the_launch_member_rotate_again() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("verdict-a");
+        let intended = refreshless_member("verdict-b");
+        member_store(&launch);
+        let intended_store = member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let launch_name = crate::profile::ProfileName::from("verdict-a");
+
+        assert!(
+            live_session_holds_rotatable(&launch_name),
+            "fixture: the launch member's store is refreshable, so the refusal stands before the swap"
+        );
+
+        assert_eq!(
+            swap.swap_to("verdict-b").expect("swap"),
+            SwapOutcome::Swapped
+        );
+
+        assert_eq!(
+            crate::live_sessions::get(swap.session.as_str())
+                .expect("row")
+                .launch_store
+                .as_deref(),
+            Some(intended_store.as_path()),
+            "the row must name the store the session reads now"
+        );
+        assert!(
+            has_live_session(&launch_name),
+            "fixture: the launch member's marker survives the swap, so only the row's store can flip the verdict"
+        );
+        assert!(
+            !live_session_holds_rotatable(&launch_name),
+            "a session holding nothing rotatable strands nothing, so the launch member may rotate again"
+        );
+    });
+}
+
+/// The converse half of the same defect: after a swap back onto the refreshable
+/// launch member the row must drop the stale refreshless exemption, or the
+/// verdict allows a rotation that strands the chain the session is holding
+/// again. Gated like every swap-back fixture: the recovery hop's claim is only
+/// exercised where the transport can repoint.
+#[test]
+fn a_swap_back_onto_a_refreshable_member_refuses_rotation_again() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a real-symlink session for the swap to repoint") {
+            return;
+        }
+        let launch = member("back-verdict-a");
+        let intended = refreshless_member("back-verdict-b");
+        let launch_store = member_store(&launch);
+        member_store(&intended);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let launch_name = crate::profile::ProfileName::from("back-verdict-a");
+
+        assert_eq!(
+            swap.swap_to("back-verdict-b").expect("out"),
+            SwapOutcome::Swapped
+        );
+        assert!(
+            !live_session_holds_rotatable(&launch_name),
+            "fixture: the refreshless leg of the arc, as the ungated twin pins"
+        );
+
+        assert_eq!(
+            swap.swap_to("back-verdict-a").expect("back"),
+            SwapOutcome::Swapped
+        );
+
+        assert_eq!(
+            crate::live_sessions::get(swap.session.as_str())
+                .expect("row")
+                .launch_store
+                .as_deref(),
+            Some(launch_store.as_path()),
+            "the row must name the launch member's store again once the link resolves to it"
+        );
+        assert!(
+            live_session_holds_rotatable(&launch_name),
+            "back on a refreshable chain there is a refresh token to strand again"
+        );
     });
 }
 
