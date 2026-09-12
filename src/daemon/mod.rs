@@ -101,10 +101,10 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// longer per-call: `lock::SUBPROCESS_BUDGET` caps everything ONE state-lock
 /// hold spends in `security` at 20s in aggregate. If it ever false-aborts,
 /// shrink THAT (the real fix), do NOT loosen this deadline — the lease's
-/// wedged-daemon recovery depends on it. Known residual:
-/// the budget is per HOLD, and `tick.rs` drains `pending_switch` then
-/// `pending_switch_off` under two separate holds, so one tick doing both can
-/// still spend 2 × 20s here.
+/// wedged-daemon recovery depends on it. One `lock::SharedSubprocessBudget`
+/// spans the WHOLE tick (`tick.rs` arms it before both drains), so a tick
+/// doing both can spend 20s of `security` in aggregate against this
+/// deadline.
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)

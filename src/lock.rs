@@ -79,12 +79,12 @@ pub(crate) fn state_lock_timeout() -> Duration {
 /// both of which fail the switch anyway; the write path is idempotent, so the
 /// operator answers the dialog and retries.
 ///
-/// It bounds ONE hold, not one tick: the daemon drains `pending_switch` and
-/// `pending_switch_off` under two SEPARATE acquisitions, so a tick doing both can
-/// still spend 2 × this against `WATCHDOG_DEADLINE`.
-/// Arming a second budget for a wider scope needs an arm-if-not-armed rule that
-/// [`StateLock::acquire_with_timeout`] does not have today, since it is the only
-/// armer.
+/// It bounds ONE hold. A scope wider than one hold arms its own
+/// [`SharedSubprocessBudget`] instead — the daemon's tick, which drains
+/// `pending_switch` and `pending_switch_off` under two acquisitions, arms one
+/// there so a tick doing both spends at most 1 × this against
+/// `WATCHDOG_DEADLINE`. An acquisition adopts the wider scope's budget
+/// (arm-if-not-armed) rather than replacing it.
 pub(crate) const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
 
 /// How often [`StateLock::acquire`] re-polls the flock while waiting. Small enough

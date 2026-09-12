@@ -183,28 +183,36 @@ fn a_shared_budget_spans_sequential_acquisitions() {
     .expect("hold");
 }
 
-/// A `SharedSubprocessBudget` taken INSIDE an already-budgeted hold adopts
-/// that hold's budget and clears nothing: the ownership chain stays single
-/// however the scopes nest, so the inner guard's drop leaves the outer hold's
-/// budget armed for the rest of its body.
+/// A `SharedSubprocessBudget` taken INSIDE an already-budgeted scope adopts
+/// that scope's budget and clears nothing: the ownership chain stays single
+/// however the scopes nest, so the inner guard's drop leaves the wider
+/// scope's budget armed for the rest of its body. Pinned against BOTH
+/// failure directions with a SHORT outer budget: a full-budget assert cannot
+/// tell an adopted budget from a cleared one, since an unscoped clamp reads
+/// the full 20 s base either way.
 #[test]
 fn a_shared_scope_inside_a_hold_adopts_its_budget() {
     let _home = crate::testutil::HomeSandbox::new();
+    // Short enough that an adopted remnant and a cleared-then-rearmed full
+    // budget differ by an assertable margin.
+    let shared = Duration::from_millis(500);
 
+    let wide = SharedSubprocessBudget::arm(shared);
     with_state_lock(|_held| {
         {
             let _inner = SharedSubprocessBudget::arm(Duration::from_millis(10));
         }
-        // The inner guard did not arm, so its drop cleared nothing; the hold's
-        // own budget is still live.
+        // The inner guard did not arm, so its drop cleared nothing; the wide
+        // scope's budget is still live and the hold inside it keeps spending it.
         let inside = clamp_to_hold_budget(Duration::from_secs(20));
         assert!(
-            inside > Duration::from_secs(19),
-            "an adopting inner guard must not end the hold's own budget, got {inside:?}"
+            inside <= shared,
+            "an adopting inner guard must not end the wider scope's budget, got {inside:?}"
         );
         Ok(())
     })
     .expect("hold");
+    drop(wide);
 }
 /// The budget is armed by the OUTERMOST acquisition alone. A reentrant hold that
 /// re-armed would hand each nested frame a full budget, which is exactly the
