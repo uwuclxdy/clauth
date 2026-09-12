@@ -2,6 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::logline::logline;
@@ -1375,6 +1376,67 @@ pub(crate) fn account_match(
         (Some(_), Some(_)) => AccountMatch::Different,
         _ => AccountMatch::Unproven,
     }
+}
+
+/// The Keychain service name Claude Code reads its OAuth login from on macOS:
+/// the bare `Claude Code-credentials` item a global `claude` resolves, because
+/// its config dir IS `~/.claude`. The macOS keychain module aliases this as its
+/// `SERVICE` constant; the literal lives here so the pure naming rules beside
+/// it — which derive and recognize the per-config-dir twins from this name —
+/// stay cross-platform, where they can be pinned (the `account_match` split:
+/// the module that shells out against these names compiles on macOS alone).
+pub(crate) const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+
+/// The namespaced Keychain service Claude Code derives for a config dir it
+/// runs under (`CLAUDE_CONFIG_DIR`): [`CLAUDE_KEYCHAIN_SERVICE`], a `-`, then
+/// the first 8 hex chars of the SHA-256 of the dir's path — CC's own
+/// `sha256(configDir).toString('hex').slice(0, 8)`, which is why a `clauth
+/// start` session's CC reads this twin and never the bare item. The session
+/// seed, the swap executor and the stale-runtime GC all derive the same name
+/// for one runtime tree through this rule.
+///
+/// PURE over its input — no canonicalize, no subprocess — so the naming rule
+/// is pinned on every platform; the macOS derivation is canonicalize plus
+/// this fn, and its subprocess callers are unreachable under `cfg(test)`.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain layer; the naming rule is pinned on every platform"
+    )
+)]
+pub(crate) fn namespaced_keychain_service(canonical_config_dir: &Path) -> String {
+    let path_str = canonical_config_dir.to_string_lossy();
+    let hash = Sha256::digest(path_str.as_bytes());
+    format!(
+        "{CLAUDE_KEYCHAIN_SERVICE}-{:02x}{:02x}{:02x}{:02x}",
+        hash[0], hash[1], hash[2], hash[3]
+    )
+}
+
+/// Whether `service` names a per-config-dir twin: the bare service, a `-`,
+/// then EXACTLY eight LOWERCASE hex digits — the only shape
+/// [`namespaced_keychain_service`] produces (node's `toString('hex')` and
+/// Rust's `{:02x}` are both lowercase-only). The stale-runtime GC's delete
+/// refuses everything else, the bare item itself (the operator's global
+/// `claude` login, which no GC decision explains) most importantly, so a
+/// caller handing over a name it derived nowhere cannot reach an item it
+/// cannot account for. PURE so the guard is pinned on every platform.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain layer; the guard is pinned on every platform"
+    )
+)]
+pub(crate) fn is_namespaced_keychain_service(service: &str) -> bool {
+    let Some(suffix) = service.strip_prefix(CLAUDE_KEYCHAIN_SERVICE) else {
+        return false;
+    };
+    let Some(hex) = suffix.strip_prefix('-') else {
+        return false;
+    };
+    hex.len() == 8 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Typed check at the boundary, then hand the untyped object to the installer:

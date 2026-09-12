@@ -4115,3 +4115,73 @@ fn account_match_truth_table() {
         AccountMatch::Unproven
     );
 }
+
+/// The namespaced service name is exactly what Claude Code computes for a
+/// config dir — the bare service, a `-`, then the first 8 hex chars of the
+/// SHA-256 of the dir's path string — pinned against literal digests so the
+/// hashed INPUT (the path string, not its bytes-with-NUL or `Debug` form),
+/// the slice width, and the prefix literal cannot drift. Pure and
+/// cross-platform: the macOS module that shells out against the name compiles
+/// nowhere else, so this is the suite that pins the rule (the `account_match`
+/// split).
+#[test]
+fn namespaced_keychain_service_hashes_the_dir_path() {
+    assert_eq!(
+        namespaced_keychain_service(Path::new("/tmp/clauth-name-fixture")),
+        "Claude Code-credentials-c56fc9bd"
+    );
+    assert_eq!(
+        namespaced_keychain_service(Path::new("/tmp/second-fixture-dir")),
+        "Claude Code-credentials-761072a6"
+    );
+}
+
+/// Every config dir gets its own service, and none of them is the bare item a
+/// global `claude` reads: the stale-runtime GC's delete guard admits only that
+/// shape, so the naming rule must never produce anything else.
+#[test]
+fn namespaced_keychain_service_is_dir_specific_and_never_bare() {
+    let one = namespaced_keychain_service(Path::new("/one"));
+    let two = namespaced_keychain_service(Path::new("/two"));
+    assert_ne!(one, two);
+    for name in [&one, &two] {
+        assert_eq!(
+            name.strip_prefix("Claude Code-credentials-")
+                .expect("namespaced service")
+                .len(),
+            8,
+            "the suffix is the 8-hex sha256 slice: {name}"
+        );
+        assert_ne!(*name, "Claude Code-credentials", "never the bare item");
+    }
+}
+
+/// The delete-side guard: only the bare service plus a `-` and EXACTLY eight
+/// hex digits names a per-config-dir item. Everything else is refused — the
+/// bare item itself (the operator's global login, which no GC path may touch)
+/// most importantly, and a short, long or non-hex suffix beside it, so a
+/// caller passing a hand-built name cannot reach an item it cannot explain.
+#[test]
+fn is_namespaced_keychain_service_admits_only_suffixed_hex() {
+    assert!(is_namespaced_keychain_service(
+        "Claude Code-credentials-c56fc9bd"
+    ));
+    assert!(!is_namespaced_keychain_service("Claude Code-credentials"));
+    assert!(!is_namespaced_keychain_service("Claude Code-credentials-"));
+    assert!(!is_namespaced_keychain_service(
+        "Claude Code-credentials-c56fc9b"
+    ));
+    assert!(!is_namespaced_keychain_service(
+        "Claude Code-credentials-c56fc9bd0"
+    ));
+    assert!(!is_namespaced_keychain_service(
+        "Claude Code-credentials-c56fc9zz"
+    ));
+    // The naming rule emits lowercase only (node's toString('hex') and Rust's
+    // {:02x} alike), so an uppercase twin is a hand-built name, not one the
+    // rule produced — the delete-side guard refuses it.
+    assert!(!is_namespaced_keychain_service(
+        "Claude Code-credentials-C56FC9BD"
+    ));
+    assert!(!is_namespaced_keychain_service("something-else"));
+}

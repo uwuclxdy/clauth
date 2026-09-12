@@ -587,7 +587,10 @@ pub(crate) fn has_live_session(name: &ProfileName) -> bool {
 /// session's Claude Code actually reads. That child runs with
 /// `CLAUDE_CONFIG_DIR=<runtime>`, and CC namespaces its Keychain item per config
 /// dir (`Claude Code-credentials-<sha256(dir)[0:8]>`)
-/// while [`crate::keychain`] writes only the UNSUFFIXED `Claude Code-credentials`.
+/// while a rotation's only Keychain write is the UNSUFFIXED
+/// `Claude Code-credentials` mirror (`keychain.rs::keychain_mirror_rotation`); the
+/// namespaced items are written by the session-start seed and the swap
+/// executor, never by a rotation.
 /// So a rotation leaves that CC holding the old refresh token; its own
 /// re-read-and-compare sees its item unchanged and detects no race, and the
 /// `invalid_grant` that follows passes its CAS guard — which also compares
@@ -849,7 +852,29 @@ pub(crate) fn live_bare_sessions() -> Option<usize> {
 /// marker, or a conversation record, and folding them in would have skipped
 /// every one of them on that return.
 pub(crate) fn gc_stale_runtimes() {
-    gc_runtime_trees();
+    // macOS: one shared subprocess budget spans every Keychain item delete the
+    // tree sweep performs below — the daemon-tick shape, not a fresh budget per
+    // pair: a sweep collecting many stale trees must not multiply a stuck
+    // keychain's per-call ceiling across them on the `clauth start` / MCP-boot
+    // paths this runs on. Arm-if-not-armed, so a caller that already armed a
+    // wider one is adopted rather than replaced.
+    #[cfg(target_os = "macos")]
+    let _item_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
+    // The Plugin tab's boot probe kills its `clauth mcp` child within 3 s, so
+    // the tree sweep skips there WHOLE: on macOS it spends `security`
+    // subprocesses collecting the removed trees' Keychain items, and on every
+    // platform it takes the state flock per pair against the 25 s deadline a
+    // macOS switch legitimately holds (the same probe-budget rule
+    // `gc_bare_markers`' peek encodes). Gating the TREE half is what keeps
+    // tree and item paired — skipping only the item delete would make the
+    // probe a stranding producer, since the service is a one-way hash of the
+    // dir and no later walk explains an item whose tree the probe removed.
+    // The row/marker/record siblings still run: the split exists precisely so
+    // one sweep's skip is nobody else's. The next real sweep — any start,
+    // resume, TUI launch, mcp serve or daemon startup — collects both halves.
+    if std::env::var_os(crate::mcp::MCP_PROBE_ENV).is_none() {
+        gc_runtime_trees();
+    }
     gc_live_session_rows();
     gc_bare_markers();
     crate::hook_note::gc_conversation_records();
@@ -1014,6 +1039,14 @@ fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
         })
         .unwrap_or_else(|| runtime.to_path_buf());
 
+    // macOS: the tree's namespaced Keychain service, derived while the dir
+    // still exists — the derivation canonicalizes it, so it cannot run once
+    // the tree is removed. Collected after the closure below, where a
+    // `security` subprocess is legal; `orphaned_keychain_item` documents why
+    // the dir check sits on the far side of the closure too.
+    #[cfg(target_os = "macos")]
+    let item_service = tree_keychain_service(runtime);
+
     let renamed = with_state_lock(|_held| {
         // An unknown reads as live: this leg runs from the daemon's timer, in a
         // different process, against every profile, and under `LinkMode::Fake`
@@ -1051,10 +1084,97 @@ fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
         Ok(false)
     })?;
 
+    // macOS: collect the tree's Keychain item, before the rescue — the delete
+    // is one subprocess, the rescue is a tree-sized copy, and a crash during
+    // the copy must not strand an item whose dir is already gone.
+    #[cfg(target_os = "macos")]
+    if let Some(service) =
+        orphaned_keychain_item(item_service.as_deref(), runtime.symlink_metadata().is_ok())
+    {
+        collect_orphaned_keychain_item(service);
+    }
+
     if renamed {
         rescue_tombstone(&tombstone);
     }
     Ok(())
+}
+
+/// The namespaced Keychain item a collected runtime tree leaves behind, if
+/// any: the tree's derived service when the dir that explains the item is
+/// GONE, `None` when the dir survives or no service was derived. PURE (the
+/// `session_seed_arm` split) so the keep/delete rule is pinned on every
+/// platform; the `security` delete it feeds is macOS-only and unreachable
+/// under `cfg(test)`, where `keychain::enabled()` is false.
+///
+/// The rows, and why each keeps or collects:
+/// - a LIVE pair — the lock's liveness re-check spared it — keeps its dir, so
+///   its item stays: a live session's Claude Code reads that item (CC resolves
+///   the Keychain before any file, namespaced per `CLAUDE_CONFIG_DIR`).
+/// - a pair the sweep could not collect (a failed tombstone rename, an
+///   unreadable tree) keeps its dir, and its item with it.
+/// - a collected pair (the shared tree removed, the isolated tree renamed to
+///   its rescue tombstone) has no dir: its item is orphaned — only that dir's
+///   hash resolved it — and is collected.
+/// - a runtime dir that never existed (the orphaned-marker arm; a crash
+///   between minting the marker dir and building the tree) derived no service,
+///   and no tree ever hosted a session seed to write an item.
+///
+/// The dir check runs AFTER the state-flock closure on purpose: the delete is
+/// a subprocess and must never span the flock, and between the collection and
+/// the delete a session can re-mint the same sid (acquire wipes a stale tree
+/// at its own path and rebuilds), so the check is against the world the
+/// delete will run in — a dir that reappeared reads as live and keeps its
+/// item. The residual window (a re-minted session's whole acquire plus item
+/// seed landing between this check and the delete) is the same post-lock
+/// subprocess window the swap's keychain legs accept.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumer is the macOS stale-runtime GC's Keychain collection; the decision is pinned on every platform"
+    )
+)]
+fn orphaned_keychain_item(service: Option<&str>, dir_exists: bool) -> Option<&str> {
+    service.filter(|_| !dir_exists)
+}
+
+/// macOS: the namespaced Keychain service for a runtime dir the GC is walking,
+/// derived while the dir still exists — the derivation canonicalizes it, so it
+/// cannot run once the tree is removed. `None` when the dir is already gone
+/// (the orphaned-marker arm: no tree was ever built, so no session seed wrote
+/// an item), when it cannot be read, and under `cfg(test)`, where
+/// `keychain::enabled()` is false and no `security` call may run. The probe
+/// never reaches this fn: `gc_stale_runtimes` skips the whole tree sweep under
+/// `MCP_PROBE_ENV`, which is what keeps tree and item paired there.
+#[cfg(target_os = "macos")]
+fn tree_keychain_service(runtime: &Path) -> Option<String> {
+    if !crate::keychain::enabled() {
+        return None;
+    }
+    crate::keychain::keychain_service_for_config_dir(runtime).ok()
+}
+
+/// macOS: delete one orphaned namespaced Keychain item — the collector half of
+/// the m4 LEAVE ruling (`docs/decisions.md` 2026-09-12: a session's item is
+/// never cleared at teardown, so this sweep is what clears it). Runs after the
+/// state-flock closure (a `security` subprocess must never span it), inside
+/// the shared subprocess budget [`gc_stale_runtimes`] arms, and is
+/// loud-not-fatal: the item is inert without its dir, so a failed delete
+/// leaves stale clutter rather than breaking anything.
+#[cfg(target_os = "macos")]
+fn collect_orphaned_keychain_item(service: &str) {
+    match crate::keychain::delete_namespaced_item(service) {
+        Ok(()) => logline!(
+            "clauth: collected the orphaned per-session Keychain item {service} (its runtime tree \
+             is gone)"
+        ),
+        Err(e) => logline!(
+            "clauth: collecting the orphaned per-session Keychain item {service} failed: {e:#}. It \
+             holds a login only the removed tree's dir resolved, so it stays inert in the Keychain \
+             until a later sweep removes a tree at the same path"
+        ),
+    }
 }
 
 /// Every profile's SHARED runtime dirs: each live session's `runtime-<sid>` plus

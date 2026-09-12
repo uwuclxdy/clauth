@@ -73,7 +73,6 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 use crate::logline::logline;
 use crate::profile::ClaudeCredentials;
@@ -313,7 +312,9 @@ fn collect_drained(reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>) ->
 }
 
 /// Keychain generic-password service Claude Code reads/writes for its login.
-const SERVICE: &str = "Claude Code-credentials";
+/// The literal lives in `claude.rs` beside the pure rules that derive the
+/// per-config-dir twins from it, so one spelling serves both sides.
+const SERVICE: &str = crate::claude::CLAUDE_KEYCHAIN_SERVICE;
 
 /// Longest `security -i` command line this writer will send, trailing `\n`
 /// included. Measured on `mac-6` (macOS 26.5.2) 2026-09-01 against a throwaway
@@ -1021,6 +1022,28 @@ fn delete_at(service: &str, account: &str) -> Result<()> {
     }
 }
 
+/// Delete the NAMESPACED Keychain item at an already-derived `service` — the
+/// stale-runtime GC's collector for a runtime tree it just removed
+/// (`runtime::gc_one_pair`). The item holds a login only that tree's dir hash
+/// resolves, so once the dir is gone it is inert clutter; this is the
+/// collector half of the m4 LEAVE ruling (`docs/decisions.md` 2026-09-12:
+/// teardown pays no `security` subprocess, the GC pays it here instead).
+///
+/// Guarded on the service SHAPE (`claude::is_namespaced_keychain_service`):
+/// this deletes by name, and a caller handing it the bare item — or anything
+/// else the naming rule cannot have produced — would destroy a login no GC
+/// decision explains. Idempotent like [`delete_at`]: a missing item is `Ok`,
+/// so a re-run after a half-completed sweep costs one subprocess and nothing
+/// else.
+pub(crate) fn delete_namespaced_item(service: &str) -> Result<()> {
+    anyhow::ensure!(
+        crate::claude::is_namespaced_keychain_service(service),
+        "refusing to delete Keychain item `{service}` through the GC path: it is not a \
+         per-config-dir item name"
+    );
+    delete_at(service, &account()?)
+}
+
 /// Which `security` operation a failed invocation was running. WRITE is the
 /// only one that puts a credential on the command line at all, so the split —
 /// which failures may embed the tool's stderr and which must not — lives in
@@ -1318,6 +1341,11 @@ fn sign_out_at(service: &str, account: &str) -> Result<()> {
 /// This function returns the namespaced service name exactly as CC computes it.
 /// Callers that write credentials for a per-session config dir must write to
 /// THIS service, not the bare [`SERVICE`], or the session's CC never reads them.
+/// The naming rule itself is pure and lives in `claude.rs`
+/// (`namespaced_keychain_service`), pinned on every platform; this wrapper is
+/// the CANONICALIZE half, which needs the dir to exist — which is why the
+/// stale-runtime GC derives a doomed tree's service before it removes the
+/// tree, never after.
 ///
 /// The suffix is the first 8 hex chars of the SHA-256 of the canonicalized
 /// directory path, matching CC's `sha256(configDir).toString('hex').slice(0, 8)`.
@@ -1330,13 +1358,7 @@ pub(crate) fn keychain_service_for_config_dir(config_dir: &Path) -> Result<Strin
             config_dir.display()
         )
     })?;
-    let path_str = canonical.to_string_lossy();
-    let hash = Sha256::digest(path_str.as_bytes());
-    let suffix = format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        hash[0], hash[1], hash[2], hash[3]
-    );
-    Ok(format!("{SERVICE}-{suffix}"))
+    Ok(crate::claude::namespaced_keychain_service(&canonical))
 }
 
 #[cfg(test)]

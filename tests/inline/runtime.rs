@@ -5419,6 +5419,154 @@ fn gc_collects_an_orphaned_sessions_dir_with_no_runtime_sibling() {
     });
 }
 
+/// The Keychain-item half of the stale-runtime GC, in its pure decision: a
+/// collected tree's item goes with the tree, a live session's item never
+/// does, and a dir that was never built has no item to collect. The macOS
+/// executor that this decision feeds (derive the service while the dir
+/// exists, delete after the state-flock closure) is unreachable under
+/// `cfg(test)` (`keychain::enabled()` is false there), the same split the
+/// seed and swap arms record; what every platform CAN pin is the decision
+/// itself and that the sweep's own filesystem outcome feeds it the right
+/// inputs — the crashed tree below is collected, so the dir the delete keys
+/// on is gone, and the live one is spared, so its dir stands.
+#[test]
+fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        // Crashed: a per-session pair whose marker is dead. The sweep collects
+        // the tree, so the item's dir goes with it.
+        let crashed_runtime = profiles.join("crashed").join("runtime-4242-0");
+        let crashed_sessions = profiles.join("crashed").join("sessions-4242-0");
+        fs::create_dir_all(&crashed_runtime).expect("mkdir crashed runtime");
+        fs::create_dir_all(&crashed_sessions).expect("mkdir crashed sessions");
+        fs::write(crashed_runtime.join(".claude.json"), b"{}").expect("seed runtime");
+        fs::write(crashed_sessions.join("4242-0"), b"").expect("dead marker");
+
+        // Live: the same shape with a flock-held marker.
+        let live_runtime = profiles.join("live").join("runtime-777-3");
+        let live_sessions = profiles.join("live").join("sessions-777-3");
+        fs::create_dir_all(&live_runtime).expect("mkdir live runtime");
+        fs::create_dir_all(&live_sessions).expect("mkdir live sessions");
+        fs::write(live_runtime.join(".claude.json"), b"{}").expect("seed live runtime");
+        let held = open_pid_file(&live_sessions.join("777-3")).expect("open live marker");
+        held.lock().expect("lock live marker");
+
+        // Never built: an orphaned marker dir with no runtime sibling — the
+        // crash window between minting the marker dir and building the tree.
+        // No tree ever hosted a session seed, so no item exists for it.
+        let unbuilt_sessions = profiles.join("unbuilt").join("sessions-9999-0");
+        fs::create_dir_all(&unbuilt_sessions).expect("mkdir unbuilt sessions");
+        fs::write(unbuilt_sessions.join("9999-0"), b"").expect("dead unbuilt marker");
+
+        // Derive each tree's service the way the macOS executor does, while
+        // the dirs still exist (the derivation canonicalizes them).
+        let crashed_service = crate::claude::namespaced_keychain_service(
+            &crashed_runtime
+                .canonicalize()
+                .expect("canonicalize crashed"),
+        );
+        let live_service = crate::claude::namespaced_keychain_service(
+            &live_runtime.canonicalize().expect("canonicalize live"),
+        );
+
+        gc_stale_runtimes();
+
+        // The decision the macOS executor takes on the post-sweep state.
+        assert_eq!(
+            orphaned_keychain_item(
+                Some(crashed_service.as_str()),
+                crashed_runtime.symlink_metadata().is_ok()
+            ),
+            Some(crashed_service.as_str()),
+            "a crashed session's tree was collected, so its item is collected with it"
+        );
+        assert_eq!(
+            orphaned_keychain_item(
+                Some(live_service.as_str()),
+                live_runtime.symlink_metadata().is_ok()
+            ),
+            None,
+            "a live session's tree was spared, so its item never is collected"
+        );
+        assert!(
+            !unbuilt_sessions.exists(),
+            "the never-built marker dir is collected alongside"
+        );
+        assert_eq!(
+            orphaned_keychain_item(None, false),
+            None,
+            "no tree was ever built, so no service exists to collect"
+        );
+        drop(held);
+    });
+}
+
+/// The truth table for the item-collection decision on its own: the derived
+/// service survives only when the dir that explains it does not. Every other
+/// row keeps the item — a live or uncollectable tree keeps its dir, and a dir
+/// that never existed has no item to collect.
+#[test]
+fn orphaned_keychain_item_follows_the_dir() {
+    let service = Some("Claude Code-credentials-c56fc9bd");
+    assert_eq!(orphaned_keychain_item(service, false), service);
+    assert_eq!(orphaned_keychain_item(service, true), None);
+    assert_eq!(orphaned_keychain_item(None, false), None);
+    assert_eq!(orphaned_keychain_item(None, true), None);
+}
+
+/// The Plugin tab's boot probe must not collect trees: its 3 s kill budget
+/// buys neither a per-pair state-flock wait nor — on macOS — the `security`
+/// delete that collects a removed tree's Keychain item, and a probe that
+/// removed the tree while skipping the item would strand that item
+/// permanently (the service is a one-way hash of the dir; no later walk
+/// explains it). The gate is cross-platform, so the pin runs everywhere:
+/// under `MCP_PROBE_ENV` the tree survives the sweep, and the next real sweep
+/// collects it.
+#[test]
+fn gc_skips_the_tree_sweep_under_the_plugin_tab_probe() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let runtime = profiles.join("crashed").join("runtime-4242-0");
+        let sessions = profiles.join("crashed").join("sessions-4242-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed runtime");
+        fs::write(sessions.join("4242-0"), b"").expect("dead marker");
+
+        // The probe child's env. Set under `with_fake_home`'s HOME_TEST_LOCK
+        // so the process-global mutation is serialized against every other
+        // env-touching test, and restored on drop so a panicking assertion
+        // cannot leak it into a sibling.
+        struct ClearProbeEnv;
+        impl Drop for ClearProbeEnv {
+            fn drop(&mut self) {
+                // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored here.
+                unsafe { std::env::remove_var(crate::mcp::MCP_PROBE_ENV) };
+            }
+        }
+        // SAFETY: test-only, serialized by HOME_TEST_LOCK, restored on drop.
+        unsafe { std::env::set_var(crate::mcp::MCP_PROBE_ENV, "1") };
+        let _clear = ClearProbeEnv;
+
+        gc_stale_runtimes();
+        assert!(
+            runtime.exists(),
+            "the probe child must not collect the tree: its 3 s budget cannot pay the \
+             item delete that pairs with it"
+        );
+
+        drop(_clear);
+        gc_stale_runtimes();
+        assert!(
+            !runtime.exists(),
+            "the next real sweep collects both halves"
+        );
+    });
+}
+
 /// Registry rows ride the same sweep as the dirs, keyed off the marker their own
 /// fields name: a row whose marker is unlocked is dead, one whose marker is held
 /// is not.
