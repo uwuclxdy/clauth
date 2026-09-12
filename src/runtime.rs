@@ -1156,7 +1156,7 @@ fn tree_keychain_service(runtime: &Path) -> Option<String> {
 }
 
 /// macOS: delete one orphaned namespaced Keychain item — the collector half of
-/// the m4 LEAVE ruling (`docs/decisions.md` 2026-09-12: a session's item is
+/// the m4 LEAVE ruling (2026-09-12: a session's item is
 /// never cleared at teardown, so this sweep is what clears it). Runs after the
 /// state-flock closure (a `security` subprocess must never span it), inside
 /// the shared subprocess budget [`gc_stale_runtimes`] arms, and is

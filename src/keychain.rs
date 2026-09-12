@@ -1026,7 +1026,7 @@ fn delete_at(service: &str, account: &str) -> Result<()> {
 /// stale-runtime GC's collector for a runtime tree it just removed
 /// (`runtime::gc_one_pair`). The item holds a login only that tree's dir hash
 /// resolves, so once the dir is gone it is inert clutter; this is the
-/// collector half of the m4 LEAVE ruling (`docs/decisions.md` 2026-09-12:
+/// collector half of the m4 LEAVE ruling (2026-09-12:
 /// teardown pays no `security` subprocess, the GC pays it here instead).
 ///
 /// Guarded on the service SHAPE (`claude::is_namespaced_keychain_service`):
