@@ -427,9 +427,9 @@ pub(crate) struct StartArgs {
     /// a chain member is marked preferred (the home account), the session also
     /// returns to it once it reads clear and fresh again. Needs a running
     /// `clauth daemon` to decide the switches, and a profile that is already a
-    /// chain member. Not available with --isolated, on a non-OAuth account, on
-    /// macOS, or on a Windows host without symlink privilege — each of those is
-    /// refused by name at launch.
+    /// chain member. Not available with --isolated, on a non-OAuth account,
+    /// or on a Windows host without symlink privilege — each of those is refused
+    /// by name at launch.
     #[arg(long, conflicts_with = "isolated")]
     pub(crate) with_fallback: bool,
     /// Profile to launch under.
