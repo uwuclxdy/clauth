@@ -4071,49 +4071,109 @@ fn a_publish_clears_a_read_only_destination() {
     );
 }
 
-/// The truth table for the per-session-item carry's ownership gate: same
-/// anchor adopts, differing anchors refuse, and anything less than a string
-/// anchor on BOTH sides reads as unproven, which the caller treats as not
-/// same. Pinned on every platform because the fn is pure; the gated carry
-/// that consults it is macOS-only.
+/// The carry's deciding rule: the item's login is adopted when its expiry
+/// strictly beats the store's, whatever top-level keys either side carries —
+/// the org-scoped `organizationUuid` anchor the carry used to consult is
+/// dropped, since no real blob holds one and the gate answered the org
+/// question, never the account one. Pinned on every platform because the fn
+/// is pure; the gated carry that consults it is macOS-only.
 #[test]
-fn account_match_truth_table() {
-    let item = |uuid: Option<&str>| {
+fn the_carry_prefers_the_item_when_its_login_expires_later() {
+    let item = |expires: i64, org: Option<&str>| {
         serde_json::json!({
-            "claudeAiOauth": {"accessToken": "a", "refreshToken": "r"},
-            "organizationUuid": uuid,
+            "claudeAiOauth": {
+                "accessToken": "item-access",
+                "refreshToken": "item-refresh",
+                "expiresAt": expires,
+            },
+            "organizationUuid": org,
         })
     };
-    let some = serde_json::json!({"organizationUuid": "acct-1"});
-    let other = serde_json::json!({"organizationUuid": "acct-2"});
-    let none = serde_json::json!({});
+    let store = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "store-access",
+            "refreshToken": "store-refresh",
+            "expiresAt": 1000,
+        },
+        "organizationUuid": "org-store",
+    });
 
-    assert_eq!(
-        account_match(&item(Some("acct-1")), Some(&some)),
-        AccountMatch::Same
-    );
-    assert_eq!(
-        account_match(&item(Some("acct-1")), Some(&other)),
-        AccountMatch::Different
-    );
-    // Missing or non-string anchors on either side never prove ownership.
-    assert_eq!(
-        account_match(&item(None), Some(&some)),
-        AccountMatch::Unproven
-    );
-    assert_eq!(
-        account_match(&item(Some("acct-1")), None),
-        AccountMatch::Unproven
-    );
-    assert_eq!(
-        account_match(&item(Some("acct-1")), Some(&none)),
-        AccountMatch::Unproven
-    );
-    let number_anchor = serde_json::json!({"organizationUuid": 7});
-    assert_eq!(
-        account_match(&item(Some("acct-1")), Some(&number_anchor)),
-        AccountMatch::Unproven
-    );
+    // The real-blob shape the old gate never fired on: no anchor on the item.
+    assert!(item_login_outranks_store(&item(2000, None), Some(&store)));
+    // A differing anchor used to refuse; it is gone from the deciding path,
+    // so expiry alone admits this cross-member CC-refreshed item.
+    assert!(item_login_outranks_store(
+        &item(2000, Some("org-other")),
+        Some(&store)
+    ));
+    // The same-account rescue the carry exists for keeps working.
+    assert!(item_login_outranks_store(
+        &item(2000, Some("org-store")),
+        Some(&store)
+    ));
+}
+
+#[test]
+fn the_carry_keeps_the_store_when_the_item_is_stale_or_tied() {
+    let stale_item = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "item-access",
+            "refreshToken": "item-refresh",
+            "expiresAt": 500,
+        },
+    });
+    let tied_item = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "item-access",
+            "refreshToken": "item-refresh",
+            "expiresAt": 1000,
+        },
+    });
+    let store = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "store-access",
+            "refreshToken": "store-refresh",
+            "expiresAt": 1000,
+        },
+    });
+    assert!(!item_login_outranks_store(&stale_item, Some(&store)));
+    // The `<=` boundary: a tie keeps the store, the carry must not revert it.
+    assert!(!item_login_outranks_store(&tied_item, Some(&store)));
+}
+
+#[test]
+fn the_carry_adopts_the_item_when_the_store_holds_no_expiry() {
+    let item = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "item-access",
+            "refreshToken": "item-refresh",
+            "expiresAt": 2000,
+        },
+    });
+    // An absent or torn store reads as holding no expiry, which the item's
+    // live pair beats — the rescue direction, never a skip.
+    assert!(item_login_outranks_store(&item, None));
+    assert!(item_login_outranks_store(
+        &item,
+        Some(&serde_json::json!({"torn": true}))
+    ));
+}
+
+#[test]
+fn the_carry_never_adopts_an_item_holding_no_expiry() {
+    let store = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "store-access",
+            "refreshToken": "store-refresh",
+            "expiresAt": 1000,
+        },
+    });
+    let no_expiry = serde_json::json!({
+        "claudeAiOauth": {"accessToken": "item-access", "refreshToken": "item-refresh"},
+    });
+    assert!(!item_login_outranks_store(&no_expiry, Some(&store)));
+    let no_login = serde_json::json!({"mcpOAuth": {}});
+    assert!(!item_login_outranks_store(&no_login, Some(&store)));
 }
 
 /// The namespaced service name is exactly what Claude Code computes for a
@@ -4122,8 +4182,8 @@ fn account_match_truth_table() {
 /// hashed INPUT (the path string, not its bytes-with-NUL or `Debug` form),
 /// the slice width, and the prefix literal cannot drift. Pure and
 /// cross-platform: the macOS module that shells out against the name compiles
-/// nowhere else, so this is the suite that pins the rule (the `account_match`
-/// split).
+/// nowhere else, so this is the suite that pins the rule (the
+/// `item_login_outranks_store` split).
 #[test]
 fn namespaced_keychain_service_hashes_the_dir_path() {
     assert_eq!(

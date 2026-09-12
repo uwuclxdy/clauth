@@ -2423,13 +2423,7 @@ impl SessionSwap {
             let carried = previous_store
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("the outgoing member's install source is unknown"))
-                .and_then(|store| {
-                    crate::claude::carry_session_item_into(
-                        store,
-                        &self.runtime,
-                        crate::claude::CarryGate::ByConstruction,
-                    )
-                });
+                .and_then(|store| crate::claude::carry_session_item_into(store, &self.runtime));
             match carried {
                 Ok(()) => {
                     // The refreshless skip the start site carries, at the one
@@ -3863,12 +3857,12 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
 /// CARRY, then WRITE — the same pair and order as `swap_to`: the item may
 /// already hold a login (a live sibling on the shared fake-mode tree, or a
 /// previous session's orphaned item under a recycled sid), and writing first
-/// would destroy it. The carry is gated on proven ownership
-/// ([`CarryGate::SameAccount`]): a recycled dir's orphaned item holds whatever
-/// member a PREVIOUS session ended on (mid-session swaps repoint that same
-/// item), so the carry runs only when the item's `organizationUuid` matches
-/// the store's — otherwise it skips and the write that follows replaces the
-/// orphaned login.
+/// would destroy it. The carry adopts any item whose login expires later
+/// than the store's — a recycled dir's orphaned item holds whatever member a
+/// PREVIOUS session ended on (mid-session swaps repoint that same item), and
+/// ownership cannot be proven, since no real blob carries a top-level
+/// account anchor — and a tie keeps the store; otherwise the write that
+/// follows replaces the orphaned login.
 ///
 /// BUDGET: one [`SharedSubprocessBudget`] of [`SESSION_SEED_BUDGET`] spans
 /// both legs, so a stuck keychain cannot spend more than that under the
@@ -3903,7 +3897,8 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
 /// - unparseable store → [`SessionSeedArm::Carry`]: a torn read is not
 ///   evidence of refreshlessness, and the legs that follow fail loudly on
 ///   the bytes rather than silently skipping (`checked_store_at` refuses a
-///   non-login, the carry's store read yields no anchor and skips).
+///   non-login; the carry reads a torn store as holding no expiry, which the
+///   item's login beats and adopts).
 /// - refreshless store (no refresh token — a rolling sidecar, a static
 ///   setup-token mint) → [`SessionSeedArm::Skip`]: CC never migrates those,
 ///   so the file layer must stay authoritative for the session's whole life;
@@ -4032,11 +4027,7 @@ fn seed_session_keychain_item(
         SessionSeedArm::Skip => {}
         SessionSeedArm::Carry => {
             let _budget = crate::lock::SharedSubprocessBudget::arm(SESSION_SEED_BUDGET);
-            match crate::claude::carry_session_item_into(
-                canonical,
-                runtime,
-                crate::claude::CarryGate::SameAccount,
-            ) {
+            match crate::claude::carry_session_item_into(canonical, runtime) {
                 Ok(()) => {
                     if let Err(e) =
                         crate::claude::keychain_mirror_source_for_config_dir(canonical, runtime)
