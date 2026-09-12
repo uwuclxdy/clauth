@@ -1366,7 +1366,8 @@ pub(crate) fn apply_rotated_tokens_locked(
     // gate reads the Keychain item, a `security` subprocess the flock must
     // never span. `split_gate_prev`/`split_gate_old` carry the recognition
     // candidates out of the locked section (both are fast disk reads inside
-    // it, the same class the section already performs).
+    // it, the same class the section already performs); the vanilla mirror's
+    // gate below reads `split_gate_old` out of the same carrier.
     #[cfg(target_os = "macos")]
     let mut split_mirror: Option<crate::profile::ClaudeCredentials> = None;
     #[cfg(target_os = "macos")]
@@ -1405,8 +1406,8 @@ pub(crate) fn apply_rotated_tokens_locked(
         };
         // Pre-rotation access token, kept for the Keychain-mirror gate below:
         // it tells "the live file is a stale mirror of OUR OWN chain" apart
-        // from a genuinely foreign CC re-login, and feeds the split gate's
-        // recognition candidates after the lock closes.
+        // from a genuinely foreign CC re-login, and feeds both mirrors'
+        // recognition candidates after the lock closes (via `split_gate_old`).
         #[cfg(target_os = "macos")]
         let old_access = oauth.access_token.clone();
         #[cfg(target_os = "macos")]
@@ -1538,7 +1539,7 @@ pub(crate) fn apply_rotated_tokens_locked(
         // Candidates this path knows: the pre-rotation bearer (what an
         // earlier mirror wrote) and the bearer being written (the idempotent
         // re-mirror).
-        let candidates: Vec<&str> = [Some(old_access.as_str()), creds.access_token()]
+        let candidates: Vec<&str> = [split_gate_old.as_deref(), creds.access_token()]
             .into_iter()
             .flatten()
             .collect();
