@@ -8,6 +8,7 @@
 //! `tests/inline/daemon_mod.rs` pins each drain's behavior against this seam.
 
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::logline::logline;
@@ -28,16 +29,34 @@ impl super::Daemon {
     /// tests). The initial `status.json` write and the watchdog heartbeat stay in
     /// `run`, so this method is exactly the observable per-tick work.
     pub(super) fn tick(&mut self) {
-        // One subprocess budget for the WHOLE tick: the two drains below each
-        // take their own state-lock acquisition, and per-acquisition arming
-        // handed a tick draining a queued switch AND a queued switch-off a
-        // fresh 20 s apiece — 40 s against the 30 s watchdog that aborts the
-        // daemon mid-switch. Inner holds spend what this leaves them and
-        // disarm nothing (`lock::SharedSubprocessBudget`).
-        let _tick_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
+        // One shared window for the WHOLE tick: the two drains below each take
+        // their own state-lock acquisition, and per-acquisition arming handed
+        // a tick draining a queued switch AND a queued switch-off a fresh
+        // budget apiece — 40 s of stuck-keychain shell-outs, or two full
+        // flock waits (2 × `STATE_LOCK_TIMEOUT` = 50 s), against the 30 s
+        // watchdog that aborts the daemon mid-switch. The window bounds both:
+        // this clamped scope caps each drain's flock wait to what the window
+        // leaves, and once the window or the watchdog deadline is spent the
+        // next drain is SKIPPED rather than handed a wait — its queue is
+        // untouched, so the next tick retries with a fresh window. Inner holds
+        // spend what this leaves them and disarm nothing
+        // (`lock::SharedSubprocessBudget`).
+        let _tick_budget =
+            crate::lock::SharedSubprocessBudget::arm_clamped(crate::lock::subprocess_budget());
+        // The watchdog aborts once `now - heartbeat > WATCHDOG_DEADLINE`, and
+        // `run` stamps the heartbeat TICK before this tick began (right after
+        // the previous tick, then it sleeps TICK) — so a tick outliving
+        // WATCHDOG_DEADLINE - TICK past its own start cannot land its
+        // heartbeat in time. The gates below skip the next drain once the
+        // window or this deadline is spent.
+        let deadline = Instant::now() + super::WATCHDOG_DEADLINE.saturating_sub(super::TICK);
         self.reload_if_changed();
-        self.drain_pending_switch();
-        self.drain_pending_switch_off();
+        if !self.next_drain_skipped(deadline) {
+            self.drain_pending_switch();
+        }
+        if !self.next_drain_skipped(deadline) {
+            self.drain_pending_switch_off();
+        }
         self.write_status();
         // Converge a broken plugin registration in the background. The gate is two
         // registry reads inline and a needed heal runs detached (throttled inside
@@ -46,6 +65,28 @@ impl super::Daemon {
         // Same shape for the herdr plugin: update a stale install in the
         // background, throttled inside its own `heal_detached`.
         crate::herdr::heal_detached();
+    }
+
+    /// Whether the next drain must be skipped rather than handed a wait: the
+    /// tick's shared window (keychain shell-outs AND flock waits) is spent, or
+    /// the watchdog deadline is past. A skipped drain leaves its queue
+    /// untouched — the first drain's re-queued switch and the pending
+    /// switch-off retry on the next tick with a fresh window — and logs once
+    /// so the skip is visible on the event line.
+    fn next_drain_skipped(&self, deadline: Instant) -> bool {
+        if !super::drains_exhausted(
+            crate::lock::armed_budget_remaining(),
+            Instant::now(),
+            deadline,
+        ) {
+            return false;
+        }
+        let switch_pending = self.pending_switch.lock().is_ok_and(|g| !g.is_empty());
+        let off_pending = self.pending_switch_off.lock().is_ok_and(|g| *g);
+        if switch_pending || off_pending {
+            logline!("clauth daemon: skipping queued switch work: tick budget or deadline spent");
+        }
+        true
     }
 
     /// Rebuild the scheduler's token snapshots from the current config (after a

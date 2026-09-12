@@ -292,3 +292,108 @@ fn held_flock_times_out_then_recovers_on_release() {
     let ran = with_state_lock(|_held| Ok(1234u32)).expect("acquire after the holder releases");
     assert_eq!(ran, 1234, "closure runs once the flock is free");
 }
+
+/// Flock waits spend the armed budget like the shell-outs do: an acquisition
+/// inside a `SharedSubprocessBudget::arm_clamped` scope is clamped to what the
+/// window leaves, never handed a fresh full [`STATE_LOCK_TIMEOUT`]. The daemon's two
+/// drains take one acquisition each, so without the clamp a tick against a
+/// wedged holder waits 2 × `STATE_LOCK_TIMEOUT` (50 s) past the 30 s
+/// `WATCHDOG_DEADLINE`. The 1 s lock-timeout override keeps the broken wait
+/// observable in ~1 s instead of the real 25 s; the 300 ms budget is the bound
+/// that must win.
+#[test]
+fn an_armed_budget_clamps_the_flock_wait() {
+    let _home = crate::testutil::HomeSandbox::new();
+    set_state_lock_timeout_override(Some(std::time::Duration::from_secs(1)));
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir ~/.clauth");
+    let holder =
+        crate::profile::open_state_file(&dir.join(LOCK_FILENAME)).expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    let _wide = SharedSubprocessBudget::arm_clamped(std::time::Duration::from_millis(300));
+    let start = Instant::now();
+    let err = match StateLock::acquire() {
+        Ok(_) => panic!("acquisition must time out while the flock is held"),
+        Err(e) => e,
+    };
+    let waited = start.elapsed();
+    assert!(
+        err.downcast_ref::<StateLockTimeout>().is_some(),
+        "a held flock must surface as StateLockTimeout, got: {err:#}"
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(250),
+        "the clamped wait must still spend the window, not fail instantly, waited {waited:?}"
+    );
+    assert!(
+        waited < std::time::Duration::from_millis(500),
+        "the flock wait must be clamped to the armed budget (300 ms), not the full lock \
+         timeout, waited {waited:?}"
+    );
+
+    // The window the wait spent is gone: a second acquisition is handed no
+    // wait at all (immediate StateLockTimeout), never a fresh full one.
+    let second_start = Instant::now();
+    let err2 = match StateLock::acquire() {
+        Ok(_) => panic!("a spent window must hand the second acquisition no wait"),
+        Err(e) => e,
+    };
+    assert!(
+        err2.downcast_ref::<StateLockTimeout>().is_some(),
+        "the second acquisition must time out, got: {err2:#}"
+    );
+    assert!(
+        second_start.elapsed() < std::time::Duration::from_millis(100),
+        "a spent window hands the next acquisition no wait, waited {:?}",
+        second_start.elapsed()
+    );
+
+    // The window bounds the WAIT, never the hold: a freed flock still acquires
+    // instantly past a spent window.
+    drop(holder);
+    let ran = with_state_lock(|_held| Ok(1234u32)).expect("acquire after the holder releases");
+    assert_eq!(ran, 1234, "closure runs once the flock is free");
+
+    set_state_lock_timeout_override(None);
+}
+
+/// The negative twin of the clamp: a scope armed via the plain
+/// [`SharedSubprocessBudget::arm`] keeps the full [`STATE_LOCK_TIMEOUT`] for
+/// its flock wait, never clamping it to its own shorter budget. The macOS GC
+/// sweep and the session-seed carry arm a budget for their own shell-outs
+/// while a legit slow switch can hold the flock ~20 s; their waiter must
+/// survive that hold, not false-time-out at its own budget. A 300 ms lock
+/// timeout against a 50 ms budget makes the wrong clamp observable in ~50 ms
+/// instead of the real 25 s/20 s.
+#[test]
+fn a_plain_budget_does_not_clamp_the_flock_wait() {
+    let _home = crate::testutil::HomeSandbox::new();
+    set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir ~/.clauth");
+    let holder =
+        crate::profile::open_state_file(&dir.join(LOCK_FILENAME)).expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    // Budget shorter than the lock timeout: a clamped wait would time out at
+    // ~50 ms; the correct full wait sits at ~300 ms.
+    let _plain = SharedSubprocessBudget::arm(std::time::Duration::from_millis(50));
+    let start = Instant::now();
+    let err = match StateLock::acquire() {
+        Ok(_) => panic!("acquisition must time out while the flock is held"),
+        Err(e) => e,
+    };
+    assert!(
+        err.downcast_ref::<StateLockTimeout>().is_some(),
+        "a held flock must surface as StateLockTimeout, got: {err:#}"
+    );
+    assert!(
+        start.elapsed() >= std::time::Duration::from_millis(250),
+        "a plain budget must keep the full flock wait, not clamp it to the budget, waited {:?}",
+        start.elapsed()
+    );
+
+    drop(holder);
+    set_state_lock_timeout_override(None);
+}

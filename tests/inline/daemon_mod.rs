@@ -191,6 +191,162 @@ fn tick_heals_a_broken_plugin_registration() {
     );
 }
 
+// ── tick vs a wedged flock holder ─────────────────────────────────────────────
+
+/// A tick draining both queues against a wedged flock holder completes within
+/// the watchdog deadline: the first drain's wait spends the tick's shared
+/// window, and the second drain is SKIPPED rather than handed a fresh wait —
+/// pre-fix, two full waits (2 × 25 s) aborted the daemon mid-switch past the
+/// 30 s watchdog. The switch is re-queued and the switch-off stays pending, so
+/// the next tick retries both with a fresh window. Short seams pose the wedge:
+/// the budget override shrinks the tick's window to 300 ms and the lock-timeout
+/// override keeps a broken full wait observable in ~1 s instead of the real
+/// 25 s.
+#[test]
+fn tick_skips_the_second_drain_once_a_wedged_flock_spends_the_budget() {
+    let _home = HomeSandbox::new();
+    crate::lock::set_subprocess_budget_override(Some(Duration::from_millis(300)));
+    crate::lock::set_state_lock_timeout_override(Some(Duration::from_secs(1)));
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    // A second open file description holding the state flock — conflicts with
+    // the daemon's acquisition exactly as a wedged peer would.
+    let dir = clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+
+    let mut daemon = daemon_for(config);
+    stage_switch(&daemon, "beta");
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+
+    let start = std::time::Instant::now();
+    daemon.tick();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the tick must complete despite the wedge (within the seam-posed deadline), took {elapsed:?}"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        vec!["beta".to_string()],
+        "the wedged switch is re-queued for the next tick"
+    );
+    assert!(
+        *daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off"),
+        "the skipped switch-off stays queued for the next tick (the pre-fix drain consumed \
+         the flag before timing out)"
+    );
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        Some("alpha"),
+        "no switch landed"
+    );
+
+    crate::lock::set_subprocess_budget_override(None);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+}
+
+/// The healthy twin: with the flock free, a tick draining both queues runs
+/// BOTH drains exactly as before the bound — the switch lands, then the
+/// switch-off lands, and nothing is skipped or re-ordered. This pins the
+/// byte-identical healthy path the aggregate bound must not disturb.
+#[test]
+fn tick_drains_both_queues_when_the_flock_is_free() {
+    let _home = HomeSandbox::new();
+    crate::plugin_host::arm_heal_throttle_for_test();
+    crate::herdr::arm_heal_throttle_for_test();
+    let config = persist(
+        vec![
+            profile_with_creds("alpha", "at-alpha"),
+            profile_with_creds("beta", "at-beta"),
+        ],
+        Some("alpha"),
+        90_000,
+    );
+    link_active_clean("alpha");
+    let mut daemon = daemon_for(config);
+    stage_switch(&daemon, "beta");
+    *daemon
+        .pending_switch_off
+        .lock()
+        .expect("pending_switch_off") = true;
+
+    daemon.tick();
+
+    assert_eq!(
+        active_of(&daemon).as_deref(),
+        None,
+        "the switch AND the switch-off both landed"
+    );
+    assert_eq!(
+        queued_targets(&daemon),
+        Vec::<String>::new(),
+        "the executed switch leaves nothing queued"
+    );
+    assert!(
+        !*daemon
+            .pending_switch_off
+            .lock()
+            .expect("pending_switch_off"),
+        "the executed switch-off clears the flag"
+    );
+}
+
+// ── drains_exhausted: the pure skip predicate ─────────────────────────────────
+
+/// The pure skip predicate, both triggers: a spent tick window (`Some(0)`)
+/// skips the next drain, and so does a spent watchdog deadline — whatever the
+/// window holds. A tick with neither runs its next drain; `None` (no budget
+/// armed, as in a direct drain call from a test) never skips on the window.
+#[test]
+fn drains_exhausted_names_both_skip_triggers() {
+    let t = std::time::Instant::now();
+    let deadline = t + Duration::from_secs(29);
+    assert!(
+        super::drains_exhausted(Some(Duration::ZERO), t, deadline),
+        "a spent window skips the next drain"
+    );
+    assert!(
+        !super::drains_exhausted(Some(Duration::from_secs(5)), t, deadline),
+        "an unspent window before the deadline does not skip"
+    );
+    assert!(
+        !super::drains_exhausted(None, t, deadline),
+        "no budget armed (a direct drain call) does not skip"
+    );
+    assert!(
+        super::drains_exhausted(Some(Duration::from_secs(5)), deadline, deadline),
+        "a spent deadline skips whatever the window holds (now == deadline)"
+    );
+    assert!(
+        super::drains_exhausted(
+            Some(Duration::from_secs(5)),
+            deadline + Duration::from_secs(1),
+            deadline
+        ),
+        "a spent deadline skips whatever the window holds (now past the deadline)"
+    );
+}
+
 // ── drain_pending_switch ──────────────────────────────────────────────────────
 
 /// A queued auto-switch to an idle, installable target with a clean (non-diverged)

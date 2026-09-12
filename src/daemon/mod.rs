@@ -34,7 +34,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
@@ -85,11 +85,12 @@ const STANDBY_LOCK_FILE: &str = "clauthd-standby.lock";
 const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 
 /// Anti-wedge watchdog: abort if no tick completes within this window.
-/// `TICK` is 1s, so ~30 missed ticks. The blocking `StateLock` has no deadline
-/// and a switch runs a `/usr/bin/security` subprocess inside it, so a stuck
-/// keychain or a wedged flock holder can freeze the single-threaded run loop;
-/// `std::process::abort()` then lets launchd's `KeepAlive{SuccessfulExit=false}`
-/// restart the daemon (boot()'s relink + atomic writes make restart safe).
+/// `TICK` is 1s, so ~30 missed ticks. A `StateLock` flock wait bounds out at
+/// 25 s and a switch runs a `/usr/bin/security` subprocess inside the hold,
+/// so a stuck keychain or a wedged flock holder can freeze the single-threaded
+/// run loop past this window; `std::process::abort()` then lets launchd's
+/// `KeepAlive{SuccessfulExit=false}` restart the daemon (boot()'s relink +
+/// atomic writes make restart safe).
 ///
 /// Tightened 60s→30s for the single-fetcher lease (#27): a wedged-alive daemon
 /// keeps holding `usage-fetch.lock`, so no other instance can fetch until it
@@ -102,9 +103,11 @@ const FETCH_LOCK_FILE: &str = "usage-fetch.lock";
 /// hold spends in `security` at 20s in aggregate. If it ever false-aborts,
 /// shrink THAT (the real fix), do NOT loosen this deadline — the lease's
 /// wedged-daemon recovery depends on it. One `lock::SharedSubprocessBudget`
-/// spans the WHOLE tick (`tick.rs` arms it before both drains), so a tick
-/// doing both can spend 20s of `security` in aggregate against this
-/// deadline.
+/// spans the WHOLE tick (`tick.rs` arms it before both drains): its window
+/// also caps each drain's flock wait, and the tick skips its next drain once
+/// the window or this deadline is spent, so a tick's shell-outs and flock
+/// waits together stay under this deadline (pre-fix, two wedged drains
+/// waited 2 × `STATE_LOCK_TIMEOUT` = 50 s here).
 ///
 /// SCOPE: `heartbeat` is stamped by the MAIN loop only, so this covers a wedged
 /// main loop. A wedged SCHEDULER thread (which is what actually holds the lease)
@@ -124,6 +127,15 @@ fn watchdog_check(last_tick_ms: u64, now_ms: u64, deadline_ms: u64, on_stall: im
     if last_tick_ms != 0 && now_ms.saturating_sub(last_tick_ms) > deadline_ms {
         on_stall();
     }
+}
+
+/// Whether the next drain must be skipped this tick: the tick's shared window
+/// is spent (a `Some(0)` remainder — the window flock waits and keychain
+/// shell-outs share), or the watchdog deadline is reached. A drain handed a
+/// wait past either point can only time out or abort the daemon mid-switch.
+/// Pure, so both triggers pin without posing real waits.
+fn drains_exhausted(remaining: Option<Duration>, now: Instant, deadline: Instant) -> bool {
+    remaining.is_some_and(|r| r.is_zero()) || now >= deadline
 }
 
 /// Tighten an existing `~/.clauth` tree on boot, before `load_config` runs its

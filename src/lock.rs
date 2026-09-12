@@ -37,11 +37,13 @@ pub(crate) const LOCK_FILENAME: &str = ".lock";
 /// path holds this flock across the `/usr/bin/security` shell-outs (`keychain.rs`),
 /// so a shorter deadline would false-timeout a waiter during a legit slow switch;
 /// the daemon's 30 s `WATCHDOG_DEADLINE` caps it from above, so a main-loop drain
-/// waiting on the flock returns before the watchdog false-aborts. What keeps the
-/// first bound from moving is [`SUBPROCESS_BUDGET`], which caps the shell-outs of
-/// one hold in aggregate rather than one at a time. On Linux the flock is only
-/// ever held across sub-millisecond disk writes, so only a genuine wedge ever
-/// reaches this deadline.
+/// waiting on the flock returns before the watchdog false-aborts. The tick's
+/// clamped window bounds its two drains' waits to what that window leaves, so
+/// they can never spend 2 × this on waits. What
+/// keeps the first bound from moving is [`SUBPROCESS_BUDGET`], which caps the
+/// shell-outs of one hold in aggregate rather than one at a time. On Linux the
+/// flock is only ever held across sub-millisecond disk writes, so only a
+/// genuine wedge ever reaches this deadline.
 const STATE_LOCK_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// The flock deadline [`StateLock::acquire`] waits out: [`STATE_LOCK_TIMEOUT`],
@@ -55,6 +57,29 @@ pub(crate) fn state_lock_timeout() -> Duration {
         return t;
     }
     STATE_LOCK_TIMEOUT
+}
+
+/// The flock deadline one acquisition waits out: [`state_lock_timeout()`],
+/// clamped to what the armed window leaves ONLY when the arming scope opted in
+/// via [`SharedSubprocessBudget::arm_clamped`] — the daemon's tick, whose two
+/// drains must not spend 2 × [`STATE_LOCK_TIMEOUT`] on waits. Flock waits spend
+/// that window exactly like the keychain shell-outs do, so the second drain is
+/// never handed a fresh full timeout once the window is gone. Every other
+/// scope (the macOS GC sweep, the session-seed carry) arms a budget for its
+/// own shell-outs and keeps the full [`state_lock_timeout()`]: a waiter there
+/// must survive a legit slow switch's hold, never clamp to its own budget. A
+/// clamped acquisition past a spent window is handed zero and fails
+/// immediately rather than waiting.
+fn flock_wait_deadline() -> Duration {
+    if !CLAMP_FLOCK_WAIT.get() {
+        return state_lock_timeout();
+    }
+    match HOLD_DEADLINE.get() {
+        Some(deadline) => deadline
+            .saturating_duration_since(Instant::now())
+            .min(state_lock_timeout()),
+        None => state_lock_timeout(),
+    }
 }
 
 /// Wall-clock ceiling on everything ONE state-lock hold may spend in
@@ -83,8 +108,13 @@ pub(crate) fn state_lock_timeout() -> Duration {
 /// [`SharedSubprocessBudget`] instead — the daemon's tick, which drains
 /// `pending_switch` and `pending_switch_off` under two acquisitions, arms one
 /// there so a tick doing both spends at most 1 × this against
-/// `WATCHDOG_DEADLINE`. An acquisition adopts the wider scope's budget
-/// (arm-if-not-armed) rather than replacing it.
+/// `WATCHDOG_DEADLINE`. The tick's window bounds its flock waits too, not just
+/// the shell-outs: each drain's acquisition clamps its wait to what the window
+/// leaves (via [`SharedSubprocessBudget::arm_clamped`]), so two wedged drains
+/// cannot spend 2 × [`STATE_LOCK_TIMEOUT`] on waits in one tick. A budget
+/// armed for shell-outs alone (the macOS GC sweep, the session-seed carry)
+/// leaves flock waits at the full [`STATE_LOCK_TIMEOUT`]. An acquisition adopts
+/// the wider scope's budget (arm-if-not-armed) rather than replacing it.
 pub(crate) const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
 
 /// How often [`StateLock::acquire`] re-polls the flock while waiting. Small enough
@@ -150,6 +180,16 @@ thread_local! {
     static HOLD_DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
 }
 
+// Whether this thread's flock waits are clamped to the armed window
+// (`HOLD_DEADLINE`). Set only by [`SharedSubprocessBudget::arm_clamped`] — the
+// daemon's tick is the one scope whose two drains must spend the window on
+// waits; every other budget scope (the macOS GC sweep, the session-seed carry)
+// arms a budget for its own shell-outs and keeps the full
+// `STATE_LOCK_TIMEOUT` for its flock waits. Arm-if-not-armed like the budget.
+thread_local! {
+    static CLAMP_FLOCK_WAIT: Cell<bool> = const { Cell::new(false) };
+}
+
 /// `base`, clamped to what is left of this thread's [`SUBPROCESS_BUDGET`].
 /// Returns `base` untouched when the thread holds no state lock, which is the
 /// right answer rather than a fallback: a caller outside the lock (`oauth.rs`
@@ -170,6 +210,16 @@ pub(crate) fn clamp_to_hold_budget(base: Duration) -> Duration {
         Some(deadline) => base.min(deadline.saturating_duration_since(Instant::now())),
         None => base,
     }
+}
+
+/// What the widest budget armed on this thread leaves to spend — the window
+/// the daemon's tick shares between flock waits and keychain shell-outs.
+/// `None` when no budget is armed (an unscoped acquisition has yet to arm its
+/// own).
+pub(crate) fn armed_budget_remaining() -> Option<Duration> {
+    HOLD_DEADLINE
+        .get()
+        .map(|d| d.saturating_duration_since(Instant::now()))
 }
 
 // Test-only per-thread counter: increments once per OUTERMOST acquisition, i.e.
@@ -195,6 +245,33 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_state_lock_timeout_override(timeout: Option<Duration>) {
     STATE_LOCK_TIMEOUT_OVERRIDE.with(|c| c.set(timeout));
+}
+
+// Test seam shortening the shared window so a spent-window skip is drivable
+// without a real 20 s wait. Thread-local, like the lock-timeout override;
+// `None` is the production window.
+#[cfg(test)]
+thread_local! {
+    static SUBPROCESS_BUDGET_OVERRIDE: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+/// The window the daemon's tick arms via
+/// [`SharedSubprocessBudget::arm_clamped`] in production: [`SUBPROCESS_BUDGET`],
+/// or a shorter value a test poses a spent window under. The one source, so
+/// the tick and its pins read the same number.
+pub(crate) fn subprocess_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(b) = SUBPROCESS_BUDGET_OVERRIDE.with(|c| c.get()) {
+        return b;
+    }
+    SUBPROCESS_BUDGET
+}
+
+/// Set or clear the test-only window override. `None` restores
+/// [`SUBPROCESS_BUDGET`].
+#[cfg(test)]
+pub(crate) fn set_subprocess_budget_override(budget: Option<Duration>) {
+    SUBPROCESS_BUDGET_OVERRIDE.with(|c| c.set(budget));
 }
 
 /// Zero-sized proof that the current thread holds the cross-process state
@@ -227,7 +304,7 @@ impl StateLock {
     /// Acquire the state lock, bounding the cross-process flock wait by
     /// [`STATE_LOCK_TIMEOUT`]. A timeout surfaces as a [`StateLockTimeout`].
     pub(crate) fn acquire() -> Result<Self> {
-        Self::acquire_with_timeout(state_lock_timeout())
+        Self::acquire_with_timeout(flock_wait_deadline())
     }
 
     /// [`acquire`](Self::acquire) with an explicit flock deadline. Split out so
@@ -365,44 +442,90 @@ pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateLockHeld) -> Result<T>) ->
     f(&StateLockHeld(()))
 }
 
-/// One shared subprocess budget for a scope WIDER than any single state-lock
-/// hold. The daemon's tick needs this: its two drains
+/// One shared budget for a scope WIDER than any single state-lock hold. The
+/// daemon's tick needs this: its two drains
 /// (`daemon::tick`'s `drain_pending_switch` and `drain_pending_switch_off`)
 /// each take their own acquisition, and per-acquisition arming handed a tick
 /// draining both a fresh [`SUBPROCESS_BUDGET`] apiece — 40 s of stuck-keychain
-/// shell-outs against the daemon's 30 s watchdog, which aborts it mid-switch.
-/// Armed once at the top of the scope; every inner acquisition spends what is
-/// left of this one and disarms nothing on release ([`StateLock`] only clears
-/// a budget it armed itself).
+/// shell-outs, or two flock waits of 2 × [`STATE_LOCK_TIMEOUT`] (50 s), against
+/// the daemon's 30 s watchdog, which aborts it mid-switch. Armed once at the
+/// top of the scope; every inner acquisition spends what is left of this one
+/// and disarms nothing on release ([`StateLock`] only clears a budget it armed
+/// itself). The tick also arms via [`SharedSubprocessBudget::arm_clamped`], so
+/// its flock waits spend the same window — a spent window hands the next
+/// acquisition no wait at all. A scope armed via [`arm`](Self::arm) alone (the
+/// macOS GC sweep, the session-seed carry) keeps flock waits at the full
+/// [`STATE_LOCK_TIMEOUT`].
 ///
 /// Arming is ARM-IF-NOT-ARMED, so a guard taken inside an already-budgeted
 /// hold adopts that hold's budget and clears nothing — the ownership chain
 /// stays single however the scopes nest. Drop (including a panic unwind)
-/// clears the budget only when this guard armed it.
+/// clears what this guard armed, only when this guard armed it.
 #[must_use]
 pub(crate) struct SharedSubprocessBudget {
     // Whether THIS guard armed `HOLD_DEADLINE`; false when a wider scope
     // already held one, making this guard a no-op.
-    _armed: bool,
+    _armed_budget: bool,
+    // Whether THIS guard armed the flock-wait clamp; false when a wider scope
+    // already opted in, or when this scope armed via [`Self::arm`].
+    _armed_clamp: bool,
 }
 
 impl SharedSubprocessBudget {
     /// Arm a shared budget of `budget`, or adopt the one already armed on
-    /// this thread. Production passes [`SUBPROCESS_BUDGET`]; tests pass a
-    /// short window so the span is assertable without real waits.
+    /// this thread. Flock waits stay at the full [`STATE_LOCK_TIMEOUT`]: a
+    /// scope whose shell-outs the budget bounds (the macOS GC sweep, the
+    /// session-seed carry) must not also shrink its own flock wait, which a
+    /// legit slow switch's hold can outlast. Production passes
+    /// [`SUBPROCESS_BUDGET`]; tests pass a short window so the span is
+    /// assertable without real waits.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "its production callers (the macOS GC sweep and session-seed carry) are macOS-gated; the tick arms via arm_clamped"
+        )
+    )]
     pub(crate) fn arm(budget: Duration) -> Self {
-        let armed = HOLD_DEADLINE.get().is_none();
-        if armed {
+        let armed_budget = HOLD_DEADLINE.get().is_none();
+        if armed_budget {
             HOLD_DEADLINE.set(Some(Instant::now() + budget));
         }
-        Self { _armed: armed }
+        Self {
+            _armed_budget: armed_budget,
+            _armed_clamp: false,
+        }
+    }
+
+    /// [`arm`](Self::arm), plus clamp flock waits on this thread to what the
+    /// window leaves. The daemon's tick is the one caller: its two drains each
+    /// take an acquisition, so unclamped they could spend 2 ×
+    /// [`STATE_LOCK_TIMEOUT`] (50 s) against the 30 s `WATCHDOG_DEADLINE`. The
+    /// clamp is arm-if-not-armed like the budget, so a nested guard adopts a
+    /// wider clamped scope instead of re-arming it.
+    pub(crate) fn arm_clamped(budget: Duration) -> Self {
+        let armed_budget = HOLD_DEADLINE.get().is_none();
+        let armed_clamp = !CLAMP_FLOCK_WAIT.get();
+        if armed_budget {
+            HOLD_DEADLINE.set(Some(Instant::now() + budget));
+        }
+        if armed_clamp {
+            CLAMP_FLOCK_WAIT.set(true);
+        }
+        Self {
+            _armed_budget: armed_budget,
+            _armed_clamp: armed_clamp,
+        }
     }
 }
 
 impl Drop for SharedSubprocessBudget {
     fn drop(&mut self) {
-        if self._armed {
+        if self._armed_budget {
             HOLD_DEADLINE.set(None);
+        }
+        if self._armed_clamp {
+            CLAMP_FLOCK_WAIT.set(false);
         }
     }
 }
