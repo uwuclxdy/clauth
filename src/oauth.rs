@@ -1531,14 +1531,39 @@ pub(crate) fn apply_rotated_tokens_locked(
     // A mirror failure is loud but non-fatal: the rotation itself is durable,
     // and the next rotation or switch retries the write.
     #[cfg(target_os = "macos")]
-    if let Some(creds) = mirror
-        && let Err(e) = crate::keychain::keychain_mirror_rotation(&creds)
-    {
-        logline!(
-            "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
-             running claude signs out when its old token expires; run `clauth {name}` \
-             to reinstall"
-        );
+    if let Some(creds) = mirror {
+        // The vanilla mirror writes `Keep::Everything` too, so the item's
+        // login must be one clauth put there first — the same foreign gate
+        // the split mirror runs (the reasons sit on its block below).
+        // Candidates this path knows: the pre-rotation bearer (what an
+        // earlier mirror wrote) and the bearer being written (the idempotent
+        // re-mirror).
+        let candidates: Vec<&str> = [Some(old_access.as_str()), creds.access_token()]
+            .into_iter()
+            .flatten()
+            .collect();
+        match crate::keychain::item_login_state(&candidates) {
+            crate::keychain::ItemLoginState::Ours | crate::keychain::ItemLoginState::Corrupt => {
+                if let Err(e) = crate::keychain::keychain_mirror_rotation(&creds) {
+                    logline!(
+                        "clauth: rotated '{name}' but the Keychain mirror failed: {e:#}. A \
+                         running claude signs out when its old token expires; run `clauth {name}` \
+                         to reinstall"
+                    );
+                }
+            }
+            crate::keychain::ItemLoginState::NotOurs => logline!(
+                "clauth: rotated '{name}' but the macOS Keychain login is not one clauth \
+                 recognizes (an out-of-band re-login, or a mirror write that failed a rotation \
+                 back). Keychain left untouched; {}",
+                crate::format::RESOLVE_IN_TUI
+            ),
+            crate::keychain::ItemLoginState::Unreadable(e) => logline!(
+                "clauth: rotated '{name}' but the macOS Keychain item could not be read to \
+                 check its login ({e}); mirror skipped, the previous bearer keeps serving until \
+                 it expires. Run `clauth {name}` to reinstall"
+            ),
+        }
     }
     // CLA-SPLIT foreign gate for the rolling mirror: `Keep::Everything`
     // preserves the item's sibling blocks, so the item's login must be one

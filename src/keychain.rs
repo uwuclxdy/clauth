@@ -1164,14 +1164,15 @@ pub(crate) fn keychain_mirror_rotation(creds: &ClaudeCredentials) -> Result<()> 
 }
 
 /// What a read of the real `Claude Code-credentials` item's login tells the
-/// split-path mirror gate ([`item_login_state`]). The two SPLIT callers of
-/// [`keychain_mirror_rotation`] (the rotation hook mirroring the freshly
-/// stamped sidecar, and the rolling re-stamp leg) write `Keep::Everything` —
-/// every sibling block in the item survives — so they must establish the
-/// item's login is clauth's own FIRST: once CC migrates into the Keychain and
-/// deletes the plaintext file, the file layer stops being evidence, and an
-/// out-of-band `/login` as another account leaves the item holding B while
-/// clauth still believes A is active — the next re-stamp would preserve B's
+/// rotation-mirror gate ([`item_login_state`]). Every caller of
+/// [`keychain_mirror_rotation`] — the vanilla rotation mirror, the rotation
+/// hook mirroring the freshly stamped sidecar, and the rolling re-stamp leg —
+/// writes `Keep::Everything` — every sibling block in the item survives — so
+/// they must establish the item's login is clauth's own FIRST: once CC
+/// migrates into the Keychain and deletes the plaintext file, the file layer
+/// stops being evidence, and an out-of-band `/login` as another account
+/// leaves the item holding B while clauth still believes A is active — the
+/// next mirror would preserve B's
 /// `organizationUuid`/`trustedDeviceToken`/`enterpriseGateway` beside A's
 /// bearer, a mixed identity that never self-corrects.
 #[derive(Debug, PartialEq, Eq)]
@@ -1195,7 +1196,7 @@ pub(crate) enum ItemLoginState {
     Unreadable(String),
 }
 
-/// Read the real item and classify its login for the split-path mirror gate
+/// Read the real item and classify its login for the rotation-mirror gate
 /// ([`ItemLoginState`]). "Ours" for a bearer that changes on every re-stamp
 /// is decided by RECOGNITION: the caller passes the bearers it knows clauth
 /// wrote or is replacing (the sidecar's pre-stamp bearer, the pre-rotation
