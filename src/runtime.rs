@@ -2262,8 +2262,10 @@ impl SessionSwap {
         // macOS: the session's Claude Code reads the NAMESPACED Keychain item
         // for this runtime dir (it sets `CLAUDE_CONFIG_DIR`, and CC resolves
         // the Keychain first), so the link repoint above moved only the file
-        // layer. CARRY, then WRITE — in that order, and the write only runs if
-        // the carry could: the item holds the outgoing member's only live pair
+        // layer. CARRY, then WRITE — or, when the incoming member's store is
+        // refreshless, SIGN OUT (see [`swap_item_arm`]) — in that order, and
+        // the second leg only runs if the carry could: the item holds the
+        // outgoing member's only live pair
         // once CC has refreshed there (it deletes the runtime file on
         // migration), so writing before carrying would brick that member, and
         // skipping both on a failed carry leaves an inert swap — the session
@@ -2285,18 +2287,51 @@ impl SessionSwap {
                 });
             match carried {
                 Ok(()) => {
-                    if let Err(e) = crate::claude::keychain_mirror_source_for_config_dir(
-                        &plan.store,
-                        &self.runtime,
+                    // The refreshless skip the start site carries, at the one
+                    // site where the item already exists: a rolling sidecar or
+                    // static mint swapped in mid-session must never be
+                    // INSTALLED into the item (CC would read that snapshot
+                    // forever and never return to the file the re-stamp leg
+                    // writes), and the outgoing member's login it still holds
+                    // must go too, or CC keeps serving the member the chain
+                    // just moved the session off of. Sign-out does both.
+                    match swap_item_arm(
+                        crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(
+                            &plan.store,
+                        )
+                        .ok()
+                        .as_ref(),
                     ) {
-                        logline!(
-                            "clauth: session {} swapped onto {} but writing its per-session \
-                             Keychain item failed: {e:#}. The session keeps authenticating as its \
-                             previous member; only a later swap onto another member re-runs the \
-                             write",
-                            self.session.as_str(),
-                            plan.member
-                        );
+                        SwapItemArm::Install => {
+                            if let Err(e) = crate::claude::keychain_mirror_source_for_config_dir(
+                                &plan.store,
+                                &self.runtime,
+                            ) {
+                                logline!(
+                                    "clauth: session {} swapped onto {} but writing its per-session \
+                                     Keychain item failed: {e:#}. The session keeps authenticating as its \
+                                     previous member; only a later swap onto another member re-runs the \
+                                     write",
+                                    self.session.as_str(),
+                                    plan.member
+                                );
+                            }
+                        }
+                        SwapItemArm::SignOut => {
+                            if let Err(e) =
+                                crate::keychain::keychain_sign_out_for_config_dir(&self.runtime)
+                            {
+                                logline!(
+                                    "clauth: session {} swapped onto {} but signing its per-session \
+                                     Keychain item out failed: {e:#}. The session keeps authenticating as \
+                                     its previous member, so the file layer this swap moved is not what \
+                                     its Claude Code reads; only a later swap onto another member re-runs \
+                                     it",
+                                    self.session.as_str(),
+                                    plan.member
+                                );
+                            }
+                        }
                     }
                 }
                 Err(e) => logline!(
@@ -3742,6 +3777,56 @@ fn session_seed_arm(
         None => SessionSeedArm::Carry,
         Some(creds) if creds.refresh_token().is_none() => SessionSeedArm::Skip,
         Some(_) => SessionSeedArm::Carry,
+    }
+}
+
+/// Which Keychain arm the swap executor's item-write takes for the member being
+/// swapped ONTO, derived from that member's install source alone. PURE so the
+/// arm selection is pinned on every platform: the write itself is macOS-only
+/// and unreachable by `cfg(test)` (`keychain::enabled()` is false there), the
+/// same split [`SessionSeedArm`] records — this is the swap-site twin of the
+/// start site's refreshless arm.
+///
+/// - refreshless store (no refresh token — a rolling sidecar, a static
+///   setup-token mint) → [`SwapItemArm::SignOut`]: CC never migrates those
+///   into an item, so the file layer must stay authoritative for the re-stamp
+///   leg to reach the session. The action is a sign-out rather than the start
+///   site's bare skip because the swap's item already EXISTS and holds the
+///   OUTGOING member's login — merely skipping the write would leave the
+///   session authenticating as the member the chain just moved it off of (CC
+///   resolves the Keychain first), an inert swap; signing the login out (the
+///   same tool the seed's absent-source arm uses to make an item stop serving
+///   what it holds) is what drops CC back onto the file.
+/// - otherwise → [`SwapItemArm::Install`]: install the incoming store into the
+///   item after the carry-back. An unparseable read lands here too: a torn
+///   read is not evidence of refreshlessness, and the install leg that follows
+///   fails loudly on the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumer is the macOS swap executor's Keychain item-write; the arm selection is pinned on every platform"
+    )
+)]
+enum SwapItemArm {
+    Install,
+    SignOut,
+}
+
+/// See [`SwapItemArm`]. `store` is the incoming member's install source parsed;
+/// `None` (absent or unparseable) takes [`SwapItemArm::Install`], never a skip.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumer is the macOS swap executor's Keychain item-write; the arm selection is pinned on every platform"
+    )
+)]
+fn swap_item_arm(store: Option<&crate::profile::ClaudeCredentials>) -> SwapItemArm {
+    match store {
+        Some(creds) if creds.refresh_token().is_none() => SwapItemArm::SignOut,
+        _ => SwapItemArm::Install,
     }
 }
 

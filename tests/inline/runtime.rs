@@ -8286,3 +8286,32 @@ fn session_seed_arm_selection() {
     // Unparseable reads proceed, not skip.
     assert_eq!(session_seed_arm(true, None), SessionSeedArm::Carry);
 }
+
+/// The arm selection for the swap executor's per-session Keychain item-write —
+/// pure, so the refreshless→sign-out / else→install decision is pinned on
+/// every platform while the write itself only a Mac exercises. The unparseable
+/// arm is Install (not SignOut): a torn read is not evidence of
+/// refreshlessness, and the install leg that follows fails loudly on the
+/// bytes.
+#[test]
+fn swap_item_arm_selection() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let store = |refresh: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "a".to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+
+    // Refreshless members (rolling sidecar, static mint) are signed out of the
+    // item, never installed into it: the file layer must stay authoritative.
+    assert_eq!(swap_item_arm(Some(&store(None))), SwapItemArm::SignOut);
+    // Refreshable stores install.
+    assert_eq!(swap_item_arm(Some(&store(Some("r")))), SwapItemArm::Install);
+    // An unparseable read proceeds, not signs out.
+    assert_eq!(swap_item_arm(None), SwapItemArm::Install);
+}
