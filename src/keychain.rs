@@ -1044,6 +1044,110 @@ pub(crate) fn delete_namespaced_item(service: &str) -> Result<()> {
     delete_at(service, &account()?)
 }
 
+/// The census half of the m4 LEAVE ruling's collector (2026-09-12): collect
+/// the orphaned namespaced items the walk-derived sweep cannot reach — a clean
+/// teardown's `Drop` removes the tree and pays no `security` subprocess, a
+/// profile deletion takes every tree without a sweep, and the sweep's own
+/// stranding inputs (a canonicalize failure, a crash between the tombstone
+/// rename and the post-closure delete, a stuck-keychain delete failure) leave
+/// items no walked dir explains. `security dump-keychain` lists everything,
+/// the historical orphans included; the pure decision
+/// ([`crate::claude::census_orphan_keychain_services`]) deletes only a
+/// NAMESPACED service outside `live` — the set
+/// [`crate::runtime::live_namespaced_keychain_services`] derives from the dirs
+/// it enumerates — so a live dir's item is never touched and a live foreign
+/// `CLAUDE_CONFIG_DIR` item is accepted collateral (ruled 2026-09-12).
+///
+/// Runs on every `clauth mcp` boot (accepted with the ruling). Skipped whole
+/// under the Plugin tab's boot probe ([`crate::mcp::MCP_PROBE_ENV`]), whose 3 s
+/// kill budget pays no `security` subprocess — the same gate `gc_stale_runtimes`
+/// reads for the tree sweep. Outside any state lock, under one
+/// [`crate::lock::SharedSubprocessBudget`] so a stuck keychain cannot multiply
+/// its per-call ceiling across the dump and the deletes. Loud-not-fatal
+/// throughout: a failed dump or delete logs and leaves the item for a later
+/// census. The dump's stdout — the whole keychain listing, item data included
+/// on some macOS versions — never reaches a log line: only the pure parser
+/// sees it, and it keeps service names alone; the text is dropped before the
+/// delete loop, so only parsed names outlive the parse.
+///
+/// `live` is derived AFTER the dump — the dump is the long pole, so a session
+/// seeded while it ran must land in the spare set — and fail-closed: an
+/// underivable set (an unreadable root or profile) deletes nothing rather than
+/// treating the world as orphaned. Each delete re-derives the set immediately
+/// beforehand, the census's analogue of `gc_one_pair`'s dir re-check, so a
+/// session seeded since the dump is spared too.
+pub(crate) fn census_namespaced_items() {
+    if std::env::var_os(crate::mcp::MCP_PROBE_ENV).is_some() {
+        return;
+    }
+    let _budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
+    let dump = match dump_keychain() {
+        Ok(dump) => dump,
+        Err(e) => {
+            logline!(
+                "clauth: the Keychain census failed ({e:#}); orphaned per-session items stay in \
+                 the Keychain until a later census"
+            );
+            return;
+        }
+    };
+    let orphans = match crate::runtime::live_namespaced_keychain_services() {
+        Ok(live) => crate::claude::census_orphan_keychain_services(&dump, &live),
+        Err(e) => {
+            logline!(
+                "clauth: the Keychain census cannot derive the live set ({e:#}); deleting nothing \
+                 — an underivable set must never read as every item orphaned"
+            );
+            return;
+        }
+    };
+    // Only parsed names outlive the parse: the whole-keychain text is gone
+    // before the delete loop's subprocesses.
+    drop(dump);
+    for service in orphans {
+        // Re-derive immediately before the delete, like `gc_one_pair`'s dir
+        // re-check: a session seeded since the dump must be spared.
+        let live = match crate::runtime::live_namespaced_keychain_services() {
+            Ok(live) => live,
+            Err(e) => {
+                logline!(
+                    "clauth: the Keychain census cannot re-derive the live set ({e:#}); stopping \
+                     the census, the remaining items stay for a later one"
+                );
+                return;
+            }
+        };
+        if live.contains(&service) {
+            continue;
+        }
+        match delete_namespaced_item(&service) {
+            Ok(()) => logline!(
+                "clauth: collected the orphaned per-session Keychain item {service} (no existing \
+                 config dir explains it)"
+            ),
+            Err(e) => logline!(
+                "clauth: collecting the orphaned per-session Keychain item {service} failed: \
+                 {e:#}. It stays inert in the Keychain until a later census removes it"
+            ),
+        }
+    }
+}
+
+/// Run `security dump-keychain` and return its whole stdout. The text is the
+/// keychain listing — service and account names, and item data depending on
+/// the macOS version — so it is held only long enough for the pure parser to
+/// read the service attributes and is never logged or carried on an error.
+fn dump_keychain() -> Result<String> {
+    let mut cmd = Command::new(SECURITY_BIN);
+    cmd.arg("dump-keychain");
+    let output = run_with_deadline(cmd, security_deadline(), None)
+        .with_context(|| format!("failed to run {SECURITY_BIN} dump-keychain"))?;
+    if !output.status.success() {
+        return Err(security_error(SecurityOp::Census, &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// Which `security` operation a failed invocation was running. WRITE is the
 /// only one that puts a credential on the command line at all, so the split —
 /// which failures may embed the tool's stderr and which must not — lives in
@@ -1053,6 +1157,7 @@ enum SecurityOp {
     Read,
     Write,
     Delete,
+    Census,
 }
 
 impl SecurityOp {
@@ -1061,14 +1166,15 @@ impl SecurityOp {
             SecurityOp::Read => "read",
             SecurityOp::Write => "write",
             SecurityOp::Delete => "delete",
+            SecurityOp::Census => "census",
         }
     }
 }
 
 /// Build an error from a failed `security` invocation, including its exit code.
-/// READ and DELETE embed the tool's stderr verbatim: no credential is ever sent
-/// on those calls, so the text cannot be one, and it is diagnostic (an ACL
-/// refusal reads differently from a usage error). WRITE does not — BY
+/// READ, DELETE and CENSUS embed the tool's stderr verbatim: no credential is
+/// ever sent on those calls, so the text cannot be one, and it is diagnostic
+/// (an ACL refusal reads differently from a usage error). WRITE does not — BY
 /// CONSTRUCTION rather than by measurement: `security` HAS echoed an escaped
 /// fragment of the written value into exactly this builder (`unknown command
 /// "<tail>"`, observed in the field, GH #66), and this text rides event lines
@@ -1086,7 +1192,7 @@ fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Erro
             op.as_str(),
             output.stderr.len()
         ),
-        SecurityOp::Read | SecurityOp::Delete => {
+        SecurityOp::Read | SecurityOp::Delete | SecurityOp::Census => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::anyhow!(
                 "Keychain {} failed (security exit {code}): {}",

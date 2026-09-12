@@ -56,7 +56,7 @@
 //! profile has left; [`gc_stale_runtimes`] collects what a crashed session left
 //! behind, of either flavor and in either layout.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -926,6 +926,68 @@ fn gc_runtime_trees() {
             }
         }
     }
+}
+
+/// Every namespaced Keychain service an EXISTING runtime dir explains — the
+/// live set the macOS census (`keychain::census_namespaced_items`) spares.
+/// Derived through the same naming rule the session seed writes under
+/// (`claude::namespaced_keychain_service`, over the canonicalized dir), from
+/// the same universe the tree sweep walks: every `runtime*` dir under
+/// `profiles/`. A dir the sweep has not collected yet is live here; one it
+/// collects on THIS pass loses its item to the sweep's own collector, and one
+/// it cannot collect keeps both. Sessions dirs and unrelated names contribute
+/// nothing — no CC config dir exists there to derive a service from.
+///
+/// FAIL-CLOSED: an enumeration or canonicalize failure that is not a dir
+/// vanishing mid-walk is an error, and the census reads an underivable live
+/// set as "cannot rule out a live session" — it deletes nothing. An unreadable
+/// root or profile must never shrink the set to empty and hand the census a
+/// delete-everything pass (the same "unknown reads live" rule the sweep's
+/// marker enumeration follows). A dir that vanished between the read and the
+/// canonicalize (`NotFound`) contributes nothing instead: its item is an
+/// orphan and correctly collectible.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain census; the derivation is pinned on every platform"
+    )
+)]
+pub(crate) fn live_namespaced_keychain_services() -> Result<BTreeSet<String>> {
+    let mut live = BTreeSet::new();
+    let root = profiles_root_dir()?;
+    let entries = std::fs::read_dir(&root)
+        .with_context(|| format!("cannot enumerate the profiles dir {}", root.display()))?;
+    for profile in entries {
+        let profile =
+            profile.with_context(|| format!("cannot read an entry under {}", root.display()))?;
+        let children = std::fs::read_dir(profile.path())
+            .with_context(|| format!("cannot enumerate {}", profile.path().display()))?;
+        for child in children {
+            let child = child.with_context(|| {
+                format!("cannot read an entry under {}", profile.path().display())
+            })?;
+            let file_name = child.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !is_runtime_dir_name(name) {
+                continue;
+            }
+            match child.path().canonicalize() {
+                Ok(canonical) => {
+                    live.insert(crate::claude::namespaced_keychain_service(&canonical));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("cannot canonicalize {}", child.path().display())
+                    });
+                }
+            }
+        }
+    }
+    Ok(live)
 }
 
 /// Drop the markers of bare `claude` sessions that have exited — the ordinary

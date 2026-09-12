@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -1349,6 +1350,50 @@ pub(crate) fn is_namespaced_keychain_service(service: &str) -> bool {
         return false;
     };
     hex.len() == 8 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The census decision over one `security dump-keychain` text: the NAMESPACED
+/// services it lists that no live dir explains. Fed the live set
+/// [`crate::runtime::live_namespaced_keychain_services`] derives from the dirs
+/// it enumerates, it collects exactly the orphans the walk-derived sweep
+/// cannot reach — a clean teardown's `Drop`, a profile deletion, the sweep's
+/// own stranding inputs — and never a service an existing dir derives. A live
+/// foreign `CLAUDE_CONFIG_DIR` item elsewhere in the dump is accepted
+/// collateral (ruled 2026-09-12): the service is a one-way hash of the dir, so
+/// a census cannot tell it apart.
+///
+/// The only lines it reads are the generic-password service attribute, the
+/// shape `security dump-keychain` prints as `0x00000007 <blob>="<name>"` for a
+/// printable value and `0x00000007 <blob>=0x<hex>  "<name>"` when the tool
+/// adds the hex form; the first quoted span is the service either way. A
+/// `<NULL>` value, the account attribute (`0x00000008`) and every other line
+/// contribute nothing. PURE over text so the decision is pinned on every
+/// platform; the `security` I/O it feeds is macOS-only
+/// (`keychain::census_namespaced_items`).
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS Keychain census; the decision is pinned on every platform"
+    )
+)]
+pub(crate) fn census_orphan_keychain_services(dump: &str, live: &BTreeSet<String>) -> Vec<String> {
+    let mut orphans = BTreeSet::new();
+    for line in dump.lines() {
+        let Some(value) = line.trim_start().strip_prefix("0x00000007 <blob>=") else {
+            continue;
+        };
+        let Some(service) = value
+            .split_once('"')
+            .and_then(|(_, rest)| rest.split_once('"').map(|(name, _)| name))
+        else {
+            continue;
+        };
+        if is_namespaced_keychain_service(service) && !live.contains(service) {
+            orphans.insert(service.to_string());
+        }
+    }
+    orphans.into_iter().collect()
 }
 
 /// Typed check at the boundary, then hand the untyped object to the installer:

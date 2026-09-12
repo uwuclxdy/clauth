@@ -4245,3 +4245,54 @@ fn is_namespaced_keychain_service_admits_only_suffixed_hex() {
     ));
     assert!(!is_namespaced_keychain_service("something-else"));
 }
+
+/// The census decision over one `security dump-keychain`-shaped text: only a
+/// NAMESPACED service that no live dir explains is collected. The bare item a
+/// global `claude` reads, a non-namespaced name, a `<NULL>` value and the
+/// account attribute (0x08) never are — and neither is a service a live dir
+/// derives. PURE over text so the decision is pinned on every platform; the
+/// `security` I/O it feeds is macOS-only (`keychain::census_namespaced_items`).
+#[test]
+fn the_census_collects_only_namespaced_services_no_live_dir_explains() {
+    let live = std::collections::BTreeSet::from(["Claude Code-credentials-c56fc9bd".to_string()]);
+    let dump = "\
+keychain: \"/Users/u/Library/Keychains/login.keychain-db\"
+version: 512
+class: \"genp\"
+attributes:
+    0x00000007 <blob>=\"Claude Code-credentials-c56fc9bd\"
+    0x00000008 <blob>=0x757775636C78786479  \"uwuclxdy\"
+class: \"genp\"
+attributes:
+    0x00000007 <blob>=\"Claude Code-credentials-deadbeef\"
+class: \"genp\"
+attributes:
+    0x00000007 <blob>=\"Claude Code-credentials\"
+class: \"genp\"
+attributes:
+    0x00000007 <blob>=<NULL>
+class: \"genp\"
+attributes:
+    0x00000007 <blob>=\"clauth-test-1234\"
+";
+    assert_eq!(
+        census_orphan_keychain_services(dump, &live),
+        vec!["Claude Code-credentials-deadbeef".to_string()],
+        "exactly the one namespaced service no live dir explains"
+    );
+    // With nothing live both namespaced services are orphans; the bare item
+    // and the non-namespaced name still never are.
+    assert_eq!(
+        census_orphan_keychain_services(dump, &std::collections::BTreeSet::new()).len(),
+        2,
+        "an empty live set collects every namespaced service in the dump"
+    );
+    assert!(
+        census_orphan_keychain_services(
+            "    0x00000007 <blob>=\"Claude Code-credentials-c56fc9bd\"\n",
+            &live
+        )
+        .is_empty(),
+        "a dump naming only a live dir's service collects nothing"
+    );
+}

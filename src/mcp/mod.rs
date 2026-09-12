@@ -5053,6 +5053,17 @@ fn hold_bare_session_marker() -> Option<std::fs::File> {
 /// hold it across `block_on`.
 fn startup() -> Option<std::fs::File> {
     crate::runtime::gc_stale_runtimes();
+    // macOS: the walk-derived sweep collects the item of every tree it
+    // removes; the census collects the orphans no walked dir explains — clean
+    // teardowns (Drop removes the tree, paying no `security` subprocess
+    // there), profile deletions, the pre-sweep items, and the sweep's own
+    // stranding inputs. Probe-gated inside the census itself (the probe
+    // child's 3 s budget pays no subprocess), and `enabled()`-gated here so a
+    // cfg(test) boot never touches the real Keychain.
+    #[cfg(target_os = "macos")]
+    if crate::keychain::enabled() {
+        crate::keychain::census_namespaced_items();
+    }
     jobs::gc(now_ms());
     // Converge a broken plugin registration without ever blocking the stdio
     // handshake: the gate is two registry reads inline, and a needed heal runs

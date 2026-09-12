@@ -1,7 +1,8 @@
 //! KC-1 — Keychain read/write/delete round-trip. Uses a **throwaway service name**
 //! unique to this process; it never touches the real `Claude Code-credentials`
-//! item. The nine `#[ignore]`d tests in this file (KC-1's round-trip and
-//! siblings legs, KC-3, KC-4, KC-5, KC-9, KC-10, KC-11, KC-12) are the only ones
+//! item. The ten `#[ignore]`d tests in this file (KC-1's round-trip and
+//! siblings legs, KC-3, KC-4, KC-5, KC-9, KC-10, KC-11, KC-12, KC-13 the census
+//! round-trip) are the only ones
 //! that drive the real macOS Keychain (via the `/usr/bin/security` CLI the
 //! shipped write/delete path uses), so each is `#[ignore]`d: they still mutate
 //! the login Keychain (create + delete throwaway items) as a side effect. Run
@@ -13,15 +14,17 @@
 
 use super::{
     Keep, PutTransport, SECURITY_ARGV_VALUE_MAX, SECURITY_BIN, SECURITY_STDIN_LINE_MAX, SecurityOp,
-    UnparseableItem, VerifyOutcome, WriteDisposition, add_generic_password_line, carried_raw,
-    delete_at, disposition_verdict, keychain_service_for_config_dir, login_blob_is_ours,
-    merge_and_put_at, merge_write, merged_blob, put_blob_at, put_transport, quarantine_path,
-    quarantine_tail, read_blob_at, run_with_deadline, security_deadline, security_error,
-    security_quote, sign_out_at, verify_outcome, write_disposition,
+    UnparseableItem, VerifyOutcome, WriteDisposition, account, add_generic_password_line,
+    carried_raw, census_namespaced_items, delete_at, delete_namespaced_item, disposition_verdict,
+    dump_keychain, keychain_service_for_config_dir, login_blob_is_ours, merge_and_put_at,
+    merge_write, merged_blob, put_blob_at, put_transport, quarantine_path, quarantine_tail,
+    read_blob_at, run_with_deadline, security_deadline, security_error, security_quote,
+    sign_out_at, verify_outcome, write_disposition,
 };
 use crate::logline::LogLines;
 use crate::profile::{ClaudeCredentials, OAuthToken};
-use crate::testutil::HomeSandbox;
+use crate::testutil::{EnvPin, HomeSandbox};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 fn sample_creds(access: &str, refresh: &str) -> ClaudeCredentials {
@@ -1626,4 +1629,130 @@ fn an_item_past_the_pipe_buffer_round_trips_and_verifies() {
     );
 
     delete_at(&service, account).expect("cleanup");
+}
+
+/// KC-13 — the census decision + delete leg against the real Keychain, without
+/// ever running the production census loop against the operator's real items:
+/// two throwaway namespaced items under the operator's own account — one whose
+/// dir still exists (live), one whose dir was removed after minting (the
+/// clean-teardown orphan the walk-derived sweep cannot reach) — are judged over
+/// the real `security dump-keychain` text. The live set fed to the pure
+/// decision is every namespaced service the dump lists EXCEPT the throwaway
+/// orphan, so the decision returns exactly that orphan and never a service the
+/// operator still owns (the historical orphans and any live twin included).
+/// The delete leg then removes only the throwaway orphan. The production loop
+/// (`census_namespaced_items`) is not called here: it dumps the whole login
+/// Keychain and would delete every genuinely orphaned service it found, none of
+/// which this test owns.
+#[test]
+#[ignore = "touches the real login Keychain (throwaway service); macOS re-prompts each rebuild — run explicitly with --ignored"]
+fn the_census_collects_unexplained_items_and_spares_live_dirs() {
+    let home = HomeSandbox::new();
+    // Live: the dir still exists, so it explains its item.
+    let live_dir = home.home().join("census-live");
+    std::fs::create_dir_all(&live_dir).expect("mkdir live dir");
+    let live_service = keychain_service_for_config_dir(&live_dir).expect("derive live service");
+    // Orphan: the clean-teardown shape — the dir existed while the item was
+    // minted, then vanished, so no walked dir can explain the item.
+    let orphan_dir = home.home().join("census-orphan");
+    std::fs::create_dir_all(&orphan_dir).expect("mkdir orphan dir");
+    let orphan_service =
+        keychain_service_for_config_dir(&orphan_dir).expect("derive orphan service");
+    std::fs::remove_dir(&orphan_dir).expect("teardown removes the dir");
+
+    let account = account().expect("macOS login name");
+    let _cleanup = CensusItems(vec![
+        (live_service.clone(), account.clone()),
+        (orphan_service.clone(), account.clone()),
+    ]);
+    let creds = serde_json::to_value(sample_creds(
+        "sk-ant-oat01-CENSUS-LIVE",
+        "sk-ant-ort01-CENSUS-LIVE",
+    ))
+    .expect("serialize");
+    put_blob_at(&live_service, &account, &creds).expect("mint live item");
+    put_blob_at(&orphan_service, &account, &creds).expect("mint orphan item");
+
+    // The real dump, read-only: this is the text the production census parses.
+    let dump = dump_keychain().expect("dump the real Keychain");
+    // Spare every namespaced service the dump lists except the throwaway
+    // orphan, so the decision selects exactly the orphan and nothing the
+    // operator owns.
+    let every_namespaced: BTreeSet<String> =
+        crate::claude::census_orphan_keychain_services(&dump, &BTreeSet::new())
+            .into_iter()
+            .collect();
+    assert!(
+        every_namespaced.contains(&orphan_service),
+        "the dump lists the throwaway orphan: {every_namespaced:?}"
+    );
+    assert!(
+        every_namespaced.contains(&live_service),
+        "the dump lists the throwaway live item: {every_namespaced:?}"
+    );
+    let live: BTreeSet<String> = every_namespaced
+        .iter()
+        .filter(|service| *service != &orphan_service)
+        .cloned()
+        .collect();
+    assert_eq!(
+        crate::claude::census_orphan_keychain_services(&dump, &live),
+        vec![orphan_service.clone()],
+        "exactly the one namespaced service no live dir explains is collected"
+    );
+
+    // The delete leg the production census drives, on the throwaway only.
+    delete_namespaced_item(&orphan_service).expect("collect the orphan");
+    assert!(
+        read_blob_at(&orphan_service, &account)
+            .expect("read orphan")
+            .is_none(),
+        "the census collects the item no existing dir explains"
+    );
+    assert!(
+        read_blob_at(&live_service, &account)
+            .expect("read live")
+            .is_some(),
+        "the census never touches a live dir's item"
+    );
+}
+
+/// The probe-context pin, macOS-only like the census it gates (`mod keychain`
+/// is `#[cfg(target_os = "macos")]`): under `MCP_PROBE_ENV` the census returns
+/// before its first `security` subprocess, so the probe's 3 s kill budget pays
+/// no census. Without the gate, the census reaches the dump and then fails to
+/// derive the live set against this test's empty sandboxed home — a fail-closed
+/// error that logs — so the empty snapshot here is the observable that the gate
+/// short-circuited the whole call.
+#[test]
+fn the_census_pays_no_subprocess_under_the_probe() {
+    let home = HomeSandbox::new();
+    let lines = LogLines::new();
+    let _capture = lines.capture_here();
+    let _probe = EnvPin::new(
+        &home,
+        &[(crate::mcp::MCP_PROBE_ENV, Some(std::ffi::OsStr::new("1")))],
+    );
+    census_namespaced_items();
+    assert!(
+        lines.snapshot().is_empty(),
+        "the probe census must not log, hence not reach the dump: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// Panic-safe cleanup for the census round-trip: each minted item is deleted
+/// on drop, so an assertion failure cannot leak a throwaway item into the
+/// operator's Keychain (the `ThrowawayItem` pattern, extended to a
+/// runtime-derived service name only this test knows).
+struct CensusItems(Vec<(String, String)>);
+
+impl Drop for CensusItems {
+    fn drop(&mut self) {
+        for (service, account) in &self.0 {
+            if let Err(e) = delete_at(service, account) {
+                eprintln!("clauth-test: cleaning up {service} failed: {e:#}");
+            }
+        }
+    }
 }

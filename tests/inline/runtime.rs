@@ -5567,6 +5567,78 @@ fn gc_skips_the_tree_sweep_under_the_plugin_tab_probe() {
     });
 }
 
+/// The census input: every EXISTING runtime dir under `profiles/` contributes
+/// its derived service, so the census spares its item; a sessions dir and an
+/// unrelated name contribute nothing, since no CC config dir exists there to
+/// derive a service from.
+#[test]
+fn live_namespaced_keychain_services_derives_every_runtime_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        let shared = profiles.join("p1").join("runtime-4242-0");
+        let isolated = profiles.join("p2").join("runtime-isolated-777-3");
+        let sessions = profiles.join("p1").join("sessions-4242-0");
+        fs::create_dir_all(&shared).expect("mkdir shared runtime");
+        fs::create_dir_all(&isolated).expect("mkdir isolated runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(profiles.join("p1").join("runtime_state.json"), b"{}").expect("unrelated file");
+
+        let live = live_namespaced_keychain_services().expect("derive the live set");
+        assert_eq!(live.len(), 2, "exactly the two runtime dirs: {live:?}");
+        for dir in [&shared, &isolated] {
+            let expected = crate::claude::namespaced_keychain_service(
+                &dir.canonicalize().expect("canonicalize"),
+            );
+            assert!(
+                live.contains(&expected),
+                "every runtime dir explains its item: {expected}"
+            );
+        }
+        let sessions_service = crate::claude::namespaced_keychain_service(
+            &sessions.canonicalize().expect("canonicalize"),
+        );
+        assert!(
+            !live.contains(&sessions_service),
+            "a sessions dir hosts no CC config dir, so it explains no item"
+        );
+    });
+}
+
+/// The fail-closed half of F1: an unreadable `profiles` root (here, a FILE
+/// where the dir belongs) must be an error the census reads as "cannot rule
+/// out a live session", never an empty live set that deletes every item.
+#[test]
+fn live_namespaced_keychain_services_fails_closed_when_the_profiles_root_is_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let clauth = tmp.path().join(".clauth");
+        fs::create_dir_all(&clauth).expect("mkdir .clauth");
+        fs::write(clauth.join("profiles"), b"not a dir").expect("profiles as a file");
+        assert!(
+            live_namespaced_keychain_services().is_err(),
+            "an unreadable profiles root must fail the derivation, not read as empty"
+        );
+    });
+}
+
+/// The fail-closed half of F1, per profile: an unreadable profile dir (a FILE
+/// under `profiles/`) must fail the derivation too — skipping it would shrink
+/// the live set and let the census delete that profile's live items.
+#[test]
+fn live_namespaced_keychain_services_fails_closed_when_a_profile_dir_is_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+        fs::create_dir_all(&profiles).expect("mkdir profiles");
+        fs::write(profiles.join("p1"), b"not a dir").expect("profile as a file");
+        assert!(
+            live_namespaced_keychain_services().is_err(),
+            "an unreadable profile dir must fail the derivation, not read as empty"
+        );
+    });
+}
+
 /// Registry rows ride the same sweep as the dirs, keyed off the marker their own
 /// fields name: a row whose marker is unlocked is dead, one whose marker is held
 /// is not.
