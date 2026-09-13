@@ -1793,16 +1793,17 @@ pub(crate) struct App {
     /// file itself belongs to the scheduler's fetch path (`apply_outcome`),
     /// which may be running in another process, so this side is read-only.
     pub(crate) history_cache: HashMap<String, Vec<(u64, UsageInfo)>>,
-    /// Last-known mtime per profile history file, for cache invalidation.
-    pub(crate) history_mtimes: HashMap<String, std::time::SystemTime>,
+    /// Last-seen content fingerprint (byte length, tail hash) per profile
+    /// history file, for cache invalidation.
+    pub(crate) history_fp: HashMap<String, (u64, u64)>,
 
     /// Cached parsed wallet series per profile from wallet_history.jsonl —
     /// the balance readings the wallet-burn rate replays. Same discipline as
     /// [`Self::history_cache`]: the third-party fetch leg is the only writer,
-    /// this side is read-only and re-reads on an mtime bump.
+    /// this side is read-only and re-reads on a fingerprint change.
     pub(crate) wallet_cache: HashMap<String, Vec<crate::usage::WalletSample>>,
-    /// Last-known mtime per profile wallet-history file.
-    wallet_mtimes: HashMap<String, std::time::SystemTime>,
+    /// Last-seen content fingerprint per profile wallet-history file.
+    wallet_fp: HashMap<String, (u64, u64)>,
 
     /// Cached long-lived-token status per profile, keyed by name (absent when a
     /// profile has no sidecar). Read by the Overview render for the `⊘` danger
@@ -1907,6 +1908,29 @@ impl WorkerHandles {
     }
 }
 
+/// A cheap content fingerprint of a series log: its byte length folded with a
+/// hash of its last 256 bytes. The re-read gates key on this instead of the
+/// mtime, because NTFS quantizes file times on windows — an append can land
+/// with a byte-identical `LastWriteTime` (measured 2026-09-13: 4/10 real-box
+/// runs) — and the writer is whichever process holds the fetch lease, so the
+/// mtime is the wrong signal. `None` when the file cannot be read, which
+/// skips the re-read exactly like the old unreadable-mtime path did.
+fn series_fingerprint(path: &std::path::Path) -> Option<(u64, u64)> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    use std::hash::Hasher;
+    use std::io::{Read, Seek, SeekFrom};
+    // Clamped to the file's own start: End(-256) on a file under 256 bytes
+    // seeks before position 0 and errors (measured: EINVAL), which would read
+    // as "unreadable" and silently skip the re-read.
+    file.seek(SeekFrom::Start(len.saturating_sub(256))).ok()?;
+    let mut tail = Vec::with_capacity(256);
+    file.read_to_end(&mut tail).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&tail, &mut hasher);
+    Some((len, hasher.finish()))
+}
+
 impl App {
     pub(crate) fn new(config: AppConfig) -> Self {
         let usage_store: UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
@@ -1934,27 +1958,26 @@ impl App {
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
-        let mut history_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
+        let mut history_fp: HashMap<String, (u64, u64)> = HashMap::new();
         for profile in &config.profiles {
             let name = &profile.name;
             let data = crate::profile::load_usage_history(name);
             if !data.is_empty() {
                 if let Ok(path) = crate::profile::profile_history_path(name)
-                    && let Ok(meta) = std::fs::metadata(&path)
-                    && let Ok(mtime) = meta.modified()
+                    && let Some(fp) = series_fingerprint(&path)
                 {
-                    history_mtimes.insert(name.to_string(), mtime);
+                    history_fp.insert(name.to_string(), fp);
                 }
                 history_cache.insert(name.to_string(), data);
             }
         }
 
-        // The wallet series mirrors it: same read-only discipline, same mtime
-        // invalidation, only the file and the type differ — and only
-        // third-party profiles carry one, so the loop stats no OAuth
+        // The wallet series mirrors it: same read-only discipline, same
+        // fingerprint invalidation, only the file and the type differ — and
+        // only third-party profiles carry one, so the loop stats no OAuth
         // profile's absent file.
         let mut wallet_cache: HashMap<String, Vec<crate::usage::WalletSample>> = HashMap::new();
-        let mut wallet_mtimes: HashMap<String, std::time::SystemTime> = HashMap::new();
+        let mut wallet_fp: HashMap<String, (u64, u64)> = HashMap::new();
         for profile in config
             .profiles
             .iter()
@@ -1964,10 +1987,9 @@ impl App {
             let data = crate::profile::load_wallet_history(name);
             if !data.is_empty() {
                 if let Ok(path) = crate::profile::profile_wallet_history_path(name)
-                    && let Ok(meta) = std::fs::metadata(&path)
-                    && let Ok(mtime) = meta.modified()
+                    && let Some(fp) = series_fingerprint(&path)
                 {
-                    wallet_mtimes.insert(name.to_string(), mtime);
+                    wallet_fp.insert(name.to_string(), fp);
                 }
                 wallet_cache.insert(name.to_string(), data);
             }
@@ -2130,9 +2152,9 @@ impl App {
             tab_activity: [None; Tab::ALL.len()],
             bell_fired: HashMap::new(),
             history_cache,
-            history_mtimes,
+            history_fp,
             wallet_cache,
-            wallet_mtimes,
+            wallet_fp,
             session_tokens,
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
@@ -2567,31 +2589,34 @@ impl App {
 
         // Re-read any history log that changed on disk. The file is written by
         // whichever process holds the fetch lease — this one or a headless
-        // daemon — so an mtime bump is the only signal that new samples landed.
+        // daemon — so its CONTENT is the only reliable signal that new samples
+        // landed: NTFS quantizes file times on windows and a rapid append can
+        // land with a byte-identical mtime (measured 2026-09-13: 4/10 real-box
+        // runs), so an mtime gate silently serves a stale series there.
         for name in &history_names {
             if let Ok(path) = crate::profile::profile_history_path(&ProfileName::from(name.clone()))
-                && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
-                && self.history_mtimes.get(name) != Some(&mtime)
+                && let Some(fp) = series_fingerprint(&path)
+                && self.history_fp.get(name) != Some(&fp)
             {
                 self.history_cache.insert(
                     name.clone(),
                     crate::profile::load_usage_history(&ProfileName::from(name.clone())),
                 );
-                self.history_mtimes.insert(name.clone(), mtime);
+                self.history_fp.insert(name.clone(), fp);
             }
         }
         // The wallet series re-reads the same way.
         for name in &wallet_names {
             if let Ok(path) =
                 crate::profile::profile_wallet_history_path(&ProfileName::from(name.clone()))
-                && let Ok(mtime) = path.metadata().and_then(|m| m.modified())
-                && self.wallet_mtimes.get(name) != Some(&mtime)
+                && let Some(fp) = series_fingerprint(&path)
+                && self.wallet_fp.get(name) != Some(&fp)
             {
                 self.wallet_cache.insert(
                     name.clone(),
                     crate::profile::load_wallet_history(&ProfileName::from(name.clone())),
                 );
-                self.wallet_mtimes.insert(name.clone(), mtime);
+                self.wallet_fp.insert(name.clone(), fp);
             }
         }
     }

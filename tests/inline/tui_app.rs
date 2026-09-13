@@ -7467,8 +7467,8 @@ fn parse_weekly_pct_pins_the_band_edges() {
 // The burn-rate history log is asserted here from the other side: this process
 // must never WRITE it. It belongs to the fetch path (`apply_outcome`), whose
 // single-fetcher lease may be held by a headless daemon, so a UI-tick writer
-// would be a second one racing it. The TUI only re-reads the file on an mtime
-// change, which is also covered below.
+// would be a second one racing it. The TUI re-reads the file when its content
+// fingerprint (byte length + tail hash) changes, which is also covered below.
 //
 // The seam: `apply_usage` reads each profile's status out of the shared
 // `usage_status` map (`Arc<RankedMutex<HashMap<String, FetchStatus>>>`), so
@@ -7578,11 +7578,12 @@ fn apply_usage_fresh_status_fires_bell_and_never_writes_history() {
 }
 
 /// The wallet series' TUI wiring, end to end on disk: `App::new` loads it at
-/// bootstrap, and `apply_usage` re-reads it when the file's mtime moves — the
-/// carrier the usage tab's balance-row clause and the overview's drains line
-/// read, so a regression here silences both surfaces with no other signal.
+/// bootstrap, and `apply_usage` re-reads it when the file's content moves —
+/// the carrier the usage tab's balance-row clause and the overview's drains
+/// line read, so a regression here silences both surfaces with no other
+/// signal.
 #[test]
-fn wallet_series_loads_at_bootstrap_and_reloads_on_mtime() {
+fn wallet_series_loads_at_bootstrap_and_reloads_on_change() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["ds-wire"]);
     let name = crate::profile::ProfileName::from("ds-wire");
@@ -7610,13 +7611,179 @@ fn wallet_series_loads_at_bootstrap_and_reloads_on_mtime() {
         "bootstrap loads the series: first reading + two bridge pairs",
     );
 
-    // A landing fetch appends; the mtime bump is the reload signal.
+    // A landing fetch appends; the content change is the reload signal.
     drain(70.0, 0);
     app.apply_usage();
     assert_eq!(
         app.wallet_cache.get("ds-wire").map(Vec::len),
         Some(7),
         "apply_usage re-reads a moved wallet history file",
+    );
+}
+
+/// The reload signal is the file's CONTENT, not its mtime: on windows NTFS
+/// quantizes file times, so a rapid append can land with a byte-identical
+/// LastWriteTime (measured 2026-09-13: 4/10 real-box runs) and an mtime-only
+/// gate serves a stale series. This pin restores the recorded mtime after the
+/// append — the exact collision — and still requires the re-read.
+#[test]
+fn wallet_series_reloads_when_an_append_keeps_the_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-wire"]);
+    let name = crate::profile::ProfileName::from("ds-wire");
+    let now = crate::usage::now_ms();
+    let drain = |amount: f64, hours_ago: u64| {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &wire_wallet_stats(amount),
+            now - hours_ago * 3_600_000,
+        );
+    };
+    drain(100.0, 12);
+    drain(90.0, 11);
+    drain(80.0, 1);
+
+    let profile = crate::profile::Profile::new(
+        "ds-wire".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let mut app = app_with(vec![profile]);
+    assert_eq!(
+        app.wallet_cache.get("ds-wire").map(Vec::len),
+        Some(5),
+        "bootstrap loads the series: first reading + two bridge pairs",
+    );
+    let path = crate::profile::profile_wallet_history_path(&name).expect("wallet path");
+    let recorded = std::fs::metadata(&path)
+        .expect("wallet file stats")
+        .modified()
+        .expect("wallet mtime");
+
+    // A landing fetch appends two lines; the gate must flip on the content,
+    // even when the quantized mtime comes back exactly as recorded.
+    drain(70.0, 0);
+    crate::testutil::set_mtime(&path, recorded);
+    app.apply_usage();
+    assert_eq!(
+        app.wallet_cache.get("ds-wire").map(Vec::len),
+        Some(7),
+        "apply_usage re-reads a wallet series whose append kept the mtime",
+    );
+}
+
+/// The hash half: a rewrite that lands the SAME byte length with the recorded
+/// mtime must still flip the gate — a length-only signal cannot see it.
+#[test]
+fn wallet_series_reloads_when_a_same_length_rewrite_keeps_the_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-wire"]);
+    let name = crate::profile::ProfileName::from("ds-wire");
+    let now = crate::usage::now_ms();
+    let drain = |amount: f64, hours_ago: u64| {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &wire_wallet_stats(amount),
+            now - hours_ago * 3_600_000,
+        );
+    };
+    drain(100.0, 12);
+    drain(90.0, 11);
+    drain(80.0, 1);
+
+    let profile = crate::profile::Profile::new(
+        "ds-wire".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let mut app = app_with(vec![profile]);
+    assert_eq!(app.wallet_cache.get("ds-wire").map(Vec::len), Some(5));
+    let path = crate::profile::profile_wallet_history_path(&name).expect("wallet path");
+    let recorded = std::fs::metadata(&path)
+        .expect("wallet file stats")
+        .modified()
+        .expect("wallet mtime");
+
+    // The newest line's amount moves 80.0 -> 81.0: bytes swapped, byte length
+    // kept, mtime restored to what the bootstrap recorded.
+    let body = std::fs::read_to_string(&path).expect("wallet body");
+    assert_eq!(
+        body.matches("\"amount\":80.0").count(),
+        1,
+        "the fixture amount must be unique for a single-line swap"
+    );
+    let rewritten = body.replace("\"amount\":80.0", "\"amount\":81.0");
+    assert_eq!(
+        rewritten.len(),
+        body.len(),
+        "the swap must keep the byte length"
+    );
+    std::fs::write(&path, &rewritten).expect("rewrite wallet body");
+    crate::testutil::set_mtime(&path, recorded);
+    app.apply_usage();
+    assert_eq!(
+        app.wallet_cache
+            .get("ds-wire")
+            .and_then(|v| v.last())
+            .map(|s| s.amount),
+        Some(81.0),
+        "apply_usage re-reads a same-length rewrite that kept the mtime",
+    );
+}
+
+/// The length half: a retention trim removes old lines from the HEAD (the
+/// real prune shape), so the tail-window hash can stay byte-identical while
+/// the length shrinks — the gate must still flip.
+#[test]
+fn wallet_series_reloads_when_a_head_trim_keeps_the_tail_and_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["ds-wire"]);
+    let name = crate::profile::ProfileName::from("ds-wire");
+    let now = crate::usage::now_ms();
+    for i in 0..40u64 {
+        crate::profile::append_wallet_readings_at(
+            &name,
+            &wire_wallet_stats(100.0 + i as f64),
+            now - (40 - i) * 3_600_000,
+        );
+    }
+
+    let profile = crate::profile::Profile::new(
+        "ds-wire".to_string(),
+        Some("https://api.deepseek.com/anthropic".to_string()),
+        Some("sk-fixture".to_string()),
+    );
+    let mut app = app_with(vec![profile]);
+    // 40 changed readings: the first writes one line, each later one a bridge
+    // pair — 79 lines, far past the 256-byte tail window.
+    assert_eq!(app.wallet_cache.get("ds-wire").map(Vec::len), Some(79));
+    let path = crate::profile::profile_wallet_history_path(&name).expect("wallet path");
+    let recorded = std::fs::metadata(&path)
+        .expect("wallet file stats")
+        .modified()
+        .expect("wallet mtime");
+
+    let body = std::fs::read_to_string(&path).expect("wallet body");
+    assert!(
+        body.len() > 256,
+        "the series must exceed the tail window for this pin"
+    );
+    let first_end = body.find('\n').expect("at least one line");
+    let trimmed = body[first_end + 1..].to_string();
+    assert_eq!(
+        &trimmed[trimmed.len() - 256..],
+        &body[body.len() - 256..],
+        "the trim must leave the tail window byte-identical, or the pin \
+         stops pinning the length half"
+    );
+    std::fs::write(&path, &trimmed).expect("rewrite wallet body");
+    crate::testutil::set_mtime(&path, recorded);
+    app.apply_usage();
+    assert_eq!(
+        app.wallet_cache.get("ds-wire").map(Vec::len),
+        Some(78),
+        "apply_usage re-reads a head-trimmed wallet series whose tail and \
+         mtime kept their values",
     );
 }
 
@@ -7744,9 +7911,9 @@ fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
 }
 
 /// The read half: the log is written by whichever process holds the fetch lease,
-/// so a file that appeared or grew since the last look must be picked up off its
-/// mtime. Written here AFTER the `App` is built, standing in for the daemon
-/// landing a sample while the TUI is open.
+/// so a file that appeared or changed since the last look must be picked up off
+/// its content. Written here AFTER the `App` is built, standing in for the
+/// daemon landing a sample while the TUI is open.
 #[test]
 fn apply_usage_reloads_history_written_by_another_process() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -7793,13 +7960,7 @@ fn apply_usage_reloads_history_written_by_another_process() {
         })
         .expect("sample serializes"),
     );
-    // The mtime watch compares `SystemTime`s, which on a coarse-granularity fs
-    // can repeat within a test; push it forward explicitly rather than sleeping.
     std::fs::write(&history_path, grown).expect("append as the other process");
-    crate::testutil::set_mtime(
-        &history_path,
-        std::time::SystemTime::now() + std::time::Duration::from_secs(2),
-    );
     app.apply_usage();
 
     let regrown = app
@@ -7811,6 +7972,60 @@ fn apply_usage_reloads_history_written_by_another_process() {
         first_read + 1,
         "a log that GREW since the last read must be re-read, not held at the \
          first parse (got {regrown:?})",
+    );
+    assert_eq!(
+        regrown
+            .last()
+            .and_then(|(_, info)| info.five_hour.as_ref())
+            .map(|w| w.utilization),
+        Some(65.0),
+        "and the newest sample must be the one just appended",
+    );
+}
+
+/// The history leg's quantized-mtime pin: an external writer appends while
+/// the file's mtime stays at the value the last read recorded — the exact
+/// windows NTFS collision the wallet pins reproduce for the wallet leg.
+#[test]
+fn apply_usage_reloads_history_when_an_append_keeps_the_mtime() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (mut app, history_path) = gate_app(&_home, FetchStatus::Fresh);
+    let prior = seed_prior_history_entry();
+    app.apply_usage();
+    let first_read = app
+        .history_cache
+        .get(GATE_PROFILE)
+        .expect("the seeded log must be read")
+        .len();
+    let recorded = std::fs::metadata(&history_path)
+        .expect("history file stats")
+        .modified()
+        .expect("history mtime");
+
+    let grown = format!(
+        "{prior}{{\"ts\":{},\"name\":\"{GATE_PROFILE}\",\"usage\":{}}}\n",
+        crate::usage::now_ms(),
+        serde_json::to_string(&UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 65.0,
+                resets_at: None,
+            }),
+            ..UsageInfo::default()
+        })
+        .expect("sample serializes"),
+    );
+    std::fs::write(&history_path, grown).expect("append as the other process");
+    crate::testutil::set_mtime(&history_path, recorded);
+    app.apply_usage();
+
+    let regrown = app
+        .history_cache
+        .get(GATE_PROFILE)
+        .expect("the log must still be cached");
+    assert_eq!(
+        regrown.len(),
+        first_read + 1,
+        "an append that kept the mtime must still re-read (got {regrown:?})",
     );
     assert_eq!(
         regrown
