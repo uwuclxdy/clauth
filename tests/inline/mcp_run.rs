@@ -3049,7 +3049,11 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
         );
     };
 
-    seed(240);
+    // 300 lands the figure on a 60s plateau: `humanize_duration` spells `5m` for
+    // 300..=359s, so the pin holds whatever the real gap between this stamp
+    // and the render's own `now` does to the floored second. 300 is well
+    // under `STALE_AFTER_MS` (2h), so this is still the fresh arm.
+    seed(300);
     let fresh = render::delegate_prose(&fold_delegate_live_usage(
         serde_json::json!({"is_error": false, "result": "ok"}),
         &crate::profile::ProfileName::from("work"),
@@ -3059,7 +3063,7 @@ fn a_folded_live_usage_clause_dates_the_figure_it_carries() {
         DigestMode::Skip,
     ));
     assert!(
-        fresh.contains("target `work`: 5h 12% used, 7d unknown (cached 4m ago)"),
+        fresh.contains("target `work`: 5h 12% used, 7d unknown (cached 5m ago)"),
         "the figure names the age of the cache it came from: {fresh}",
     );
 
@@ -7227,20 +7231,32 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
             .to_string()
     };
 
-    // A live run is dated by how long it has been GOING.
-    assert_eq!(
-        line("d-blk-0").trim(),
-        "job `d-blk-0` blocking on `acct` (its own caller takes the result), elapsed 2m 5s",
+    // A live run is dated by how long it has been GOING; a finished one by how
+    // long its result has been sitting there; an orphan by when anything last
+    // wrote to it. Each line is pinned to its state's age-clause opener — the
+    // whole-second figure is floored between one real clock read and another,
+    // so the figures themselves are pinned at the producer below, where the
+    // clock is the seed's own `now`.
+    assert!(
+        line("d-blk-0").trim().starts_with(
+            "job `d-blk-0` blocking on `acct` (its own caller takes the result), elapsed "
+        ),
+        "{}",
+        line("d-blk-0")
     );
-    // A finished one by how long its result has been sitting there.
-    assert_eq!(
-        line("d-fin-0").trim(),
-        "job `d-fin-0` done on `acct`, finished 1m 30s ago",
+    assert!(
+        line("d-fin-0")
+            .trim()
+            .starts_with("job `d-fin-0` done on `acct`, finished "),
+        "{}",
+        line("d-fin-0")
     );
-    // An orphan by when anything last wrote to it.
-    assert_eq!(
-        line("d-dead-0").trim(),
-        "job `d-dead-0` orphaned on `acct`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen 1d 0h ago",
+    assert!(
+        line("d-dead-0").trim().starts_with(
+            "job `d-dead-0` orphaned on `acct`; resume with session id `6cc9c767-1cc3-4e77-a787-a7f8a6d41515`, last seen "
+        ),
+        "{}",
+        line("d-dead-0")
     );
     // And the two dead ones carry no elapsed figure — asserted per LINE, so the
     // live row's own `elapsed` cannot satisfy it.
@@ -7272,6 +7288,19 @@ fn the_listing_dates_every_state_by_the_stamp_that_state_makes_worth_reading() {
             row.get("session_id").is_none(),
             "seeds that carry no session id keep the key absent"
         );
+    }
+    // The figures the prose can only pin as a range: exact here, at the
+    // seed's own `now`.
+    for (id, key, want) in [
+        ("d-blk-0", "elapsed_secs", 125_u64),
+        ("d-fin-0", "since_secs", 90_u64),
+        ("d-dead-0", "since_secs", jobs::RUNNING_TTL_MS / 1000 + 200),
+    ] {
+        let row = rows
+            .iter()
+            .find(|r| r["job_id"].as_str() == Some(id))
+            .unwrap();
+        assert_eq!(row[key], serde_json::json!(want), "{id} {key}: {payload}");
     }
 }
 
@@ -7318,8 +7347,6 @@ fn the_state_mode_lists_a_handed_off_jobs_id() {
         &jobs::RunningSpec {
             // The crossing is what separates these two on a handed-off record.
             recorded_at: now - 30_000,
-            // Half a second off a whole second, so the ms that pass between
-            // this stamp and the handler's own `now` cannot move the figure.
             ..running_spec("d-handedoff-0", "acct", now - 250_500)
         },
         now - 4_000,
@@ -7339,12 +7366,24 @@ fn the_state_mode_lists_a_handed_off_jobs_id() {
         "the abandoned run's id is what the caller came for: {text}"
     );
     assert!(
-        text.contains("running on `acct`"),
-        "with the account it is spending: {text}"
+        text.contains("running on `acct`, elapsed "),
+        "with the account it is spending, dated as the running row it is: {text}"
     );
-    assert!(
-        text.contains("elapsed 4m 10s"),
-        "and how long it has been going: {text}"
+    // The figure is pinned at the producer, where the clock is the seed's own
+    // `now`: the prose's whole-second render is floored between one real clock
+    // read and another, so over there it can only be pinned as a range.
+    let mut payload = serde_json::json!({});
+    fold_jobs_listing(&mut payload, now);
+    let row = payload["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["job_id"].as_str() == Some("d-handedoff-0"))
+        .unwrap();
+    assert_eq!(
+        row["elapsed_secs"],
+        serde_json::json!(250),
+        "4m 10s off the run's birth: {payload}"
     );
 }
 
