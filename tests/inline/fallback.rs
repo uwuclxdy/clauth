@@ -19,6 +19,7 @@ use crate::usage::{
     PlanInfo, PlanTier, SpendInfo, UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso,
     now_epoch_secs,
 };
+use chrono::Weekday;
 
 /// ISO reset an hour ahead — a live 5h window.
 fn live_reset() -> String {
@@ -72,6 +73,7 @@ fn profile_with_usage(name: &str, threshold: Option<f64>, usage: Option<UsageInf
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -5967,6 +5969,51 @@ fn start_walk_scoped_clear(
         }),
         None => true,
     }
+}
+
+// The chain is what the daemon switches on, so the day list has to reach it:
+// resolving `preferred` at load would leave this member stale until the next
+// config write. Every weekday is named so the assertion holds whatever day the
+// suite runs on, and the flag is left off so only the list can be answering.
+#[test]
+fn a_day_list_reaches_the_chain_member_with_the_flag_off() {
+    let mut listed = start_walk_profile("p");
+    listed.preferred = false;
+    listed.preferred_days = vec![
+        Weekday::Mon,
+        Weekday::Tue,
+        Weekday::Wed,
+        Weekday::Thu,
+        Weekday::Fri,
+        Weekday::Sat,
+        Weekday::Sun,
+    ];
+    let config = config_with_chain(vec![listed], "p");
+    let member = chain_member(
+        &config,
+        &ProfileName::from("p"),
+        config.state.weekly_switch_threshold_pct(),
+    );
+    assert!(
+        member.preferred,
+        "every day is named, so today is one of them"
+    );
+}
+
+// The mirror: a list that names no day at all can never be today, so the
+// member reads ordinary even with the flag on. Together the two pin the
+// replacement in both directions at the chain boundary, not just on `Profile`.
+#[test]
+fn an_empty_day_list_leaves_the_flag_in_charge_at_the_chain() {
+    let mut flagged = start_walk_profile("p");
+    flagged.preferred = true;
+    let config = config_with_chain(vec![flagged], "p");
+    let member = chain_member(
+        &config,
+        &ProfileName::from("p"),
+        config.state.weekly_switch_threshold_pct(),
+    );
+    assert!(member.preferred, "no list, so the flag decides");
 }
 
 #[test]

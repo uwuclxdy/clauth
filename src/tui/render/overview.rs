@@ -1131,7 +1131,7 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
             // The `⌂` glyph therefore marks an exhaustion hop that LANDS on the
             // home account, telling it apart from the plain `↩` of a hop onto any
             // other member; it is keyed on the destination, not on the cause.
-            let glyph = if cfg.find(name).is_some_and(|p| p.preferred) {
+            let glyph = if cfg.is_home_today(name) {
                 "⌂"
             } else {
                 "↩"

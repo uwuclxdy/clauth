@@ -1707,7 +1707,10 @@ pub(crate) fn create_blank_profile(
 /// - `preferred` and `last_resort`, which are radios across the whole profile
 ///   list (`toggle_preferred` clears every sibling): copying either would put
 ///   two profiles in a slot only one may hold, and `fallback.rs` picks the
-///   first it finds, so the loser would just vanish silently.
+///   first it finds, so the loser would just vanish silently;
+/// - `preferred_days`, for the same reason one day at a time: a copied list
+///   would leave two profiles claiming the same weekday, decided by that same
+///   first-match.
 ///
 /// The api key IS copied: it is a per-endpoint setting the Setup tab edits like
 /// any other field, and a duplicate of an api account with no key cannot talk

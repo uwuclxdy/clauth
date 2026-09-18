@@ -62,6 +62,8 @@ Two radio toggles on a member's Fallback card. Marking one clears it on every ot
 - **`last resort`** is the parking spot: chosen only once every other member is past its line, and never switched away from. Claude Code then surfaces its own out-of-limit message when that account runs dry too.
 - **`preferred`** is the home account. Once it reads clear and fresh, clauth walks back to it on its own, from wherever the chain left you.
 
+Which account is home can also depend on the day. A `preferred_days` list in a profile's `config.toml` ([Configuration](Configuration#configtoml)) names the weekdays that account is home, in local time, and those days are claimed against every account: a plain `preferred` elsewhere stands down on them and holds the rest. One line on the weekend account is the whole weekday / weekend split, and the rollover needs no restart.
+
 ## When everyone is out
 
 With no `last resort` member, the chain-global `quota spent` setting decides:

@@ -25,6 +25,7 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
@@ -249,6 +250,39 @@ fn last_resort_hint_names_the_currently_marked_member() {
         .find(|t| t.contains("└"))
         .expect("hint renders");
     assert!(hint.contains("instead of 'b'"), "{hint}");
+}
+
+// A day list outranks the toggle, so the hint has to name the days rather than
+// the toggle's state: read the stock wording with a list set and an operator
+// would take the toggle for the answer.
+#[test]
+fn preferred_hint_names_the_day_list_when_one_is_set() {
+    let mut a = profile("a", 95.0, 20.0, 3600);
+    a.preferred = false;
+    a.preferred_days = vec![chrono::Weekday::Sat, chrono::Weekday::Sun];
+    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Preferred)
+        .unwrap();
+
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: row,
+            width: 80,
+            ..Default::default()
+        },
+    )
+    .0;
+    let hint = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("└"))
+        .expect("hint renders");
+    assert!(hint.contains("home on sat, sun"), "{hint}");
 }
 
 // The per-account usage-gate rows render as toggles whose hint states the

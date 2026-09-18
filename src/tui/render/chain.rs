@@ -766,8 +766,32 @@ fn last_resort_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: boo
 /// describes the standing return behavior; off → what turning it on does,
 /// naming the member the (exclusive) mark would move away from.
 fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool) -> String {
+    // A day list decides the days it names, for every account — so the hint
+    // reads off the lists before the toggle, on both sides of one. With a list
+    // here the toggle answers nothing; with a list elsewhere the toggle still
+    // holds, but only on the days that list leaves alone.
+    if let Some(days) = cfg
+        .find(name)
+        .map(|p| p.preferred_days.clone())
+        .filter(|d| !d.is_empty())
+    {
+        let named = days
+            .iter()
+            .map(|d| d.to_string().to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("home on {named}, by the day list in this profile's config.toml");
+    }
+    let claimed_elsewhere = cfg
+        .profiles
+        .iter()
+        .any(|p| p.name != *name && !p.preferred_days.is_empty());
     if on {
-        return "work returns to this account once it's free again".to_string();
+        return if claimed_elsewhere {
+            "work returns to this account on the days no day list claims".to_string()
+        } else {
+            "work returns to this account once it's free again".to_string()
+        };
     }
     match cfg.profiles.iter().find(|p| p.preferred && p.name != *name) {
         Some(marked) => format!("make this the home account instead of '{}'", marked.name),

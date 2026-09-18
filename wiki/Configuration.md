@@ -193,6 +193,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `check_scoped` | bool | `true` | count per-model weekly windows against this account |
 | `last_resort` | bool | `false` | the chain's parking spot |
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
+| `preferred_days` | string array | `[]` | weekdays this account is home, in local time; replaces `preferred` on this account when set |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % that fires a bell toast |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
@@ -202,6 +203,17 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `hooks_json` | bool | `false` | codex profiles only: link your `~/.codex/hooks.json` into that profile's shared session homes, so those hooks run inside `clauth start` sessions too. Off, the file is left out of every session home ([Codex](Codex#run)) |
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
+
+`preferred_days` is hand-edited; there is no TUI toggle for it, though the Fallback card's `preferred` row names the days once a list is set, and the Overview's `⌂` follows whichever account is home today. Full names and three-letter forms parse in any case (`["sat", "Sunday"]`), an entry that does not parse is dropped on the next rewrite, and the list is re-read per chain build, so the rollover at midnight needs no restart.
+
+**A named day is claimed against every account.** On a day some list names, only the accounts naming it are home; a bare `preferred = true` elsewhere stands down for that day and takes charge again on the days no list claims. So the usual split is one line in one profile:
+
+```toml
+# ~/.clauth/profiles/personal/config.toml — work keeps plain `preferred = true`
+preferred_days = ["sat", "sun"]
+```
+
+Two accounts naming the same day is not rejected, and the earlier chain member wins it — the same first-match rule a hand-edited double `preferred = true` already hits.
 
 ## Storage layout
 

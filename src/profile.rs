@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use chrono::{Datelike, Local, Weekday};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -350,6 +351,13 @@ pub(crate) struct Profile {
     /// here" are contradictory verdicts. Default off. See
     /// `fallback::next_auto_switch_target`'s return-to-preferred pass.
     pub(crate) preferred: bool,
+    /// Weekdays on which this profile is the home account, read in the
+    /// machine's local zone. Empty — the default — leaves `preferred` in
+    /// charge. A named day is claimed against the whole profile list, not just
+    /// this one: see [`AppConfig::is_home_on`], which is where the question is
+    /// actually answered. Lets one account own the weekend without an external
+    /// job rewriting `config.toml` twice a day.
+    pub(crate) preferred_days: Vec<Weekday>,
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
     /// usage chain's current access token on every rotation (full scopes +
     /// `subscriptionType`, no refresh token — sessions get plan-gated-model
@@ -418,6 +426,7 @@ impl Profile {
             weekly_threshold: None,
             last_resort: false,
             preferred: false,
+            preferred_days: Vec::new(),
             rolling_token: false,
             max_auto_spend: None,
             check_weekly: true,
@@ -1113,6 +1122,39 @@ impl AppConfig {
         self.state.active_profile.as_ref() == Some(name)
     }
 
+    /// Whether `name` is the home account on `day`, decided across the whole
+    /// profile list rather than per profile.
+    ///
+    /// A day list claims its days EXCLUSIVELY: on a day some profile names,
+    /// only the profiles naming it are home, and a bare `preferred = true`
+    /// elsewhere stands down for that day. Resolving this per profile instead
+    /// would leave the flag claiming all seven, so the two-account split an
+    /// operator actually wants — weekdays here, weekends there — would need a
+    /// list on both sides, and getting one wrong reads as first-match luck in
+    /// `fallback.rs` rather than as a mistake.
+    ///
+    /// On a day nobody names, `preferred` decides exactly as before.
+    pub(crate) fn is_home_on(&self, name: &ProfileName, day: Weekday) -> bool {
+        let claimed = self
+            .profiles
+            .iter()
+            .any(|p| p.preferred_days.contains(&day));
+        self.find(name).is_some_and(|p| {
+            if claimed {
+                p.preferred_days.contains(&day)
+            } else {
+                p.preferred
+            }
+        })
+    }
+
+    /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
+    /// per chain build rather than at load: the fingerprint that drives a hot
+    /// reload is built from `config.toml` mtimes, and midnight moves no file.
+    pub(crate) fn is_home_today(&self, name: &ProfileName) -> bool {
+        self.is_home_on(name, Local::now().weekday())
+    }
+
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
     /// (AUTH-1). Such a profile is skipped by the fallback chain walk.
     pub(crate) fn is_auth_broken(&self, name: &ProfileName) -> bool {
@@ -1335,6 +1377,12 @@ struct ProfileConfig {
     rolling_token: bool,
     #[serde(default)]
     preferred: bool,
+    /// Weekday names behind [`Profile::preferred_days`]. Strings rather than a
+    /// typed enum so a typo costs one entry instead of the whole profile —
+    /// `load_profile` drops what it cannot read, and the canonical rewrite then
+    /// drops it from disk, which is the visible signal it was not understood.
+    #[serde(default)]
+    preferred_days: Vec<String>,
     #[serde(default)]
     max_auto_spend: Option<f64>,
     /// `Option` (not `bool`) so the derived `Default` and an absent key agree:
@@ -2729,6 +2777,7 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
             .filter(|v| (MIN_WEEKLY_SWITCH_PCT..=MAX_WEEKLY_SWITCH_PCT).contains(v)),
         last_resort: config.last_resort,
         preferred: config.preferred,
+        preferred_days: parse_preferred_days(&config.preferred_days),
         rolling_token: config.rolling_token,
         // Normalize at the LOAD boundary so the on-disk value is never a live
         // trap for a direct reader (the 2026-07-14 weekly-line lesson). `inf`
@@ -2774,6 +2823,7 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 weekly_threshold: profile.weekly_threshold,
                 last_resort: profile.last_resort,
                 preferred: profile.preferred,
+                preferred_days: render_preferred_days(&profile.preferred_days),
                 rolling_token: profile.rolling_token,
                 max_auto_spend: profile.max_auto_spend,
                 // Default-on booleans render as commented examples when on, so
@@ -3027,6 +3077,32 @@ pub(crate) fn load_config() -> Result<AppConfig> {
     Ok(AppConfig { state, profiles })
 }
 
+/// `preferred_days` entries → weekdays, keeping the written order and dropping
+/// duplicates. Parsing is chrono's, which takes full names and three-letter
+/// forms in any case (`Sat`, `saturday`). An entry that does not parse is
+/// DROPPED rather than failing the load: one typo in a day list must not take
+/// the profile with it, and the canonical rewrite then drops it from disk,
+/// which is the visible signal that it was not understood.
+fn parse_preferred_days(raw: &[String]) -> Vec<Weekday> {
+    let mut out: Vec<Weekday> = Vec::new();
+    for entry in raw {
+        if let Ok(day) = entry.trim().parse::<Weekday>()
+            && !out.contains(&day)
+        {
+            out.push(day);
+        }
+    }
+    out
+}
+
+/// The canonical on-disk spelling: lowercase three-letter names, so a rewrite
+/// of a hand-written `["Saturday", "SUN"]` settles instead of alternating.
+fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
+    days.iter()
+        .map(|d| d.to_string().to_ascii_lowercase())
+        .collect()
+}
+
 /// Renders config.toml with set values uncommented and unset ones as commented examples.
 fn render_config_toml(profile: &Profile) -> String {
     fn toml_str(s: &str) -> String {
@@ -3101,6 +3177,30 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("preferred = true\n");
     } else {
         out.push_str("# preferred = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Weekdays this profile is the home account, in local time. Empty (the\n");
+    out.push_str("# default) leaves `preferred` above in charge every day; a non-empty list\n");
+    out.push_str("# replaces it for this profile, so one account can own the work week and\n");
+    out.push_str("# another the weekend. Full names and three-letter forms both parse, and\n");
+    out.push_str("# an entry that does not is dropped on the next rewrite.\n");
+    if profile.preferred_days.is_empty() {
+        out.push_str("# preferred_days = [\"sat\", \"sun\"]\n");
+    } else {
+        out.push_str("preferred_days = [");
+        for (i, day) in render_preferred_days(&profile.preferred_days)
+            .iter()
+            .enumerate()
+        {
+            if i > 0 {
+                out.push_str(", ");
+            }
+            out.push('"');
+            out.push_str(day);
+            out.push('"');
+        }
+        out.push_str("]\n");
     }
     out.push('\n');
 

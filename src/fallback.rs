@@ -1090,7 +1090,7 @@ fn chain_member(config: &AppConfig, name: &ProfileName, weekly_pct: f64) -> Chai
         name: name.clone(),
         threshold: profile.map(threshold_for).unwrap_or(DEFAULT_THRESHOLD),
         last_resort: profile.is_some_and(|p| p.last_resort),
-        preferred: profile.is_some_and(|p| p.preferred),
+        preferred: config.is_home_today(name),
         max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
         weekly_line: profile
             .map(|p| member_weekly_line(p, weekly_pct))

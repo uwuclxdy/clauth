@@ -9031,6 +9031,7 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,

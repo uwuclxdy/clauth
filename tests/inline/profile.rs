@@ -54,6 +54,102 @@ fn last_resort_round_trips_through_config_toml() {
     assert!(parsed.last_resort);
 }
 
+// `preferred_days` must default to empty so every config.toml written before
+// the field existed keeps loading with `preferred` alone in charge.
+#[test]
+fn profile_config_preferred_days_defaults_empty() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert!(cfg.preferred_days.is_empty());
+}
+
+// Full names, short forms and mixed case name the same day, and a typo costs
+// its own entry instead of the whole profile.
+#[test]
+fn preferred_days_parse_drops_only_what_it_cannot_read() {
+    let raw = vec![
+        "Saturday".to_string(),
+        "sun".to_string(),
+        "funday".to_string(),
+        "SAT".to_string(),
+    ];
+    assert_eq!(
+        parse_preferred_days(&raw),
+        vec![Weekday::Sat, Weekday::Sun],
+        "duplicates collapse and an unparseable entry drops"
+    );
+}
+
+// The rewrite settles on one spelling instead of alternating with whatever the
+// operator typed.
+#[test]
+fn preferred_days_round_trip_through_config_toml() {
+    let mut profile = Profile::new("p".to_string(), None, None);
+    profile.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let rendered = render_config_toml(&profile);
+    assert!(
+        rendered.contains("preferred_days = [\"sat\", \"sun\"]"),
+        "rendered config: {rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert_eq!(
+        parse_preferred_days(&parsed.preferred_days),
+        vec![Weekday::Sat, Weekday::Sun]
+    );
+}
+
+// Chain membership does not matter to `is_home_on` — it reads the profile
+// list — so the fixture only has to hold the profiles themselves.
+fn config_of(profiles: Vec<Profile>) -> AppConfig {
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    AppConfig {
+        state: AppState {
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles,
+    }
+}
+
+// A day nobody names leaves `preferred` in charge, so a config that never
+// grew a list behaves exactly as it did before the key existed.
+#[test]
+fn an_unclaimed_day_leaves_the_flag_in_charge() {
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged]);
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+}
+
+// A claimed day is claimed against everyone: the weekend account is home on
+// Saturday and the flagged one stands down, which is the split an operator
+// gets from one line in one profile. Resolving this per profile would leave
+// the flag claiming Saturday too, and which of the two won would come down to
+// chain order.
+#[test]
+fn a_listed_day_stands_the_flag_down_elsewhere() {
+    let mut weekend = Profile::new("personal".to_string(), None, None);
+    weekend.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged, weekend]);
+
+    let work = ProfileName::from("work");
+    let personal = ProfileName::from("personal");
+
+    assert!(
+        cfg.is_home_on(&personal, Weekday::Sat),
+        "the list claims sat"
+    );
+    assert!(
+        !cfg.is_home_on(&work, Weekday::Sat),
+        "the flag stands down on a claimed day"
+    );
+    assert!(cfg.is_home_on(&work, Weekday::Mon), "monday is unclaimed");
+    assert!(!cfg.is_home_on(&personal, Weekday::Mon));
+}
+
 // `disabled` (the per-account exclusion toggle) must default to `false` so
 // every existing config.toml written before this field existed keeps loading
 // unchanged, matching `last_resort`'s guarantee above.
@@ -1580,6 +1676,7 @@ fn credential_and_cache_files_have_restricted_permissions() {
         weekly_threshold: None,
         last_resort: false,
         preferred: false,
+        preferred_days: Vec::new(),
         rolling_token: false,
         max_auto_spend: None,
         check_weekly: true,
