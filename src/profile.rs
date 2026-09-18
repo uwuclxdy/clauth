@@ -296,7 +296,28 @@ pub(crate) struct OAuthToken {
     pub(crate) extra: serde_json::Map<String, serde_json::Value>,
 }
 
+/// Claude Code's own key for the account's rate-limit tier inside `claudeAiOauth`
+/// (`default_claude_max_5x` on a Team Premium seat). Claude Code stamps it from
+/// `/profile` at login and reads it back as a feature-flag targeting attribute,
+/// so a login block without it evaluates the server's plan-gated flags as an
+/// untiered account. Lives in [`OAuthToken::extra`]: the field is Claude Code's,
+/// not part of the model clauth owns.
+pub(crate) const RATE_LIMIT_TIER_KEY: &str = "rateLimitTier";
+
 impl OAuthToken {
+    /// The stamped rate-limit tier, when the login block carries one.
+    pub(crate) fn rate_limit_tier(&self) -> Option<&str> {
+        self.extra.get(RATE_LIMIT_TIER_KEY).and_then(|v| v.as_str())
+    }
+
+    /// Stamp the rate-limit tier Claude Code would have written itself.
+    pub(crate) fn set_rate_limit_tier(&mut self, tier: String) {
+        self.extra.insert(
+            RATE_LIMIT_TIER_KEY.to_string(),
+            serde_json::Value::String(tier),
+        );
+    }
+
     /// `..Self::default_extra()` — the struct-update tail for every constructor
     /// minting a login from clauth's own flow, where no outside writer has put
     /// anything into the block yet. `Default` is deliberately not derived: the
@@ -351,10 +372,11 @@ pub(crate) struct Profile {
     /// `fallback::next_auto_switch_target`'s return-to-preferred pass.
     pub(crate) preferred: bool,
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
-    /// usage chain's current access token on every rotation (full scopes +
-    /// `subscriptionType`, no refresh token — sessions get plan-gated-model
-    /// bearers while the refresh chain stays clauth-private). Off — the
-    /// default — keeps the sidecar exactly what was captured (static mint).
+    /// usage chain's current access token on every rotation (full scopes,
+    /// `subscriptionType` and `rateLimitTier`, no refresh token — sessions get
+    /// plan-gated-model bearers while the refresh chain stays clauth-private).
+    /// Off — the default — keeps the sidecar exactly what was captured (static
+    /// mint).
     pub(crate) rolling_token: bool,
     /// Ceiling in US dollars on what the auto-switch chain may spend of this
     /// account's pay-as-you-go budget on its own (fallback chain only, and only

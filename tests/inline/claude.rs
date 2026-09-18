@@ -2475,6 +2475,58 @@ fn stamp_rolling_token_writes_a_refreshless_long_lived_shape() {
     );
 }
 
+/// The rolling bearer is what a `clauth start` session's Claude Code reads at
+/// startup, so the chain's `rateLimitTier` must ride along (#78) — and only
+/// that key: the projection still starts from an empty extras map otherwise.
+#[test]
+fn stamp_rolling_token_carries_the_chains_rate_limit_tier() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("feed-tier");
+    std::fs::create_dir_all(crate::profile::profile_dir(&name).expect("dir")).expect("mkdir");
+    let exp = crate::usage::now_ms() as i64 + 8 * 3_600_000;
+    let mut chain = OAuthToken {
+        access_token: "at-chain".to_string(),
+        refresh_token: Some("rt-chain".to_string()),
+        expires_at: Some(exp),
+        scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+        subscription_type: Some("team".into()),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    chain.set_rate_limit_tier("default_claude_max_5x".to_string());
+    chain
+        .extra
+        .insert("clientId".to_string(), serde_json::json!("not-carried"));
+
+    stamp_rolling_token(&name, &chain).expect("feed");
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("session-token.json")).expect("read"))
+            .expect("parse");
+    let oauth = &sidecar["claudeAiOauth"];
+    assert_eq!(
+        oauth["rateLimitTier"], "default_claude_max_5x",
+        "the tier lands under Claude Code's own key"
+    );
+    assert!(
+        oauth.get("clientId").is_none(),
+        "no other chain extra crosses into the sidecar"
+    );
+    assert!(oauth.get("refreshToken").is_none(), "still refresh-less");
+
+    let untiered = OAuthToken {
+        access_token: "at-chain".to_string(),
+        refresh_token: Some("rt-chain".to_string()),
+        expires_at: Some(exp),
+        scopes: Some(vec!["user:profile".into(), "user:inference".into()]),
+        subscription_type: Some("team".into()),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    assert!(
+        rolling_projection(&untiered).rate_limit_tier().is_none(),
+        "a chain without a tier projects none — nothing is invented"
+    );
+}
+
 /// First feed preserves a genuine mint exactly once; later feeds leave the
 /// backup alone, and a fed (hours-horizon) sidecar is never mistaken for one.
 #[test]

@@ -1292,29 +1292,36 @@ fn seed_identity_anchor(name: &ProfileName, profile: &RawProfile) {
 
 /// Everything a login needs from one `/profile` body: the subscription-type
 /// string Claude Code stores (`"max"`/`"pro"`/`"team"`/`"enterprise"`/`"free"`;
-/// `None` for an unrecognized tier) and the account uuid the token authenticates
-/// as. Either field is independently `None` — a body carrying one but not the
-/// other still yields what it has.
+/// `None` for an unrecognized tier), the organization's raw `rate_limit_tier`
+/// (Claude Code stamps it verbatim as `claudeAiOauth.rateLimitTier`), and the
+/// account uuid the token authenticates as. Every field is independently `None`
+/// — a body carrying some but not the others still yields what it has.
 pub(crate) struct LoginProfile {
     pub(crate) subscription_type: Option<String>,
+    pub(crate) rate_limit_tier: Option<String>,
     pub(crate) account_uuid: Option<AccountId>,
 }
 
-/// Pull both login values out of an already-parsed `/profile` response. Split
+/// Pull the login values out of an already-parsed `/profile` response. Split
 /// from the HTTP leg so the mapping is testable against literal bodies.
 /// A present-but-blank uuid is shape drift, never an identity (same contract as
-/// [`fetch_account_uuid`]).
+/// [`fetch_account_uuid`]); a blank or whitespace-only `rate_limit_tier` reads
+/// `None` the same way.
 fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
-    let tier = {
-        let org = p.organization.as_ref();
-        PlanTier::from_profile(
-            org.and_then(|o| o.organization_type.as_deref()),
-            p.account.as_ref().is_some_and(|a| a.has_claude_max),
-            p.account.as_ref().is_some_and(|a| a.has_claude_pro),
-            org.and_then(|o| o.rate_limit_tier.as_deref()),
-        )
-    };
+    let org = p.organization.as_ref();
+    let tier = PlanTier::from_profile(
+        org.and_then(|o| o.organization_type.as_deref()),
+        p.account.as_ref().is_some_and(|a| a.has_claude_max),
+        p.account.as_ref().is_some_and(|a| a.has_claude_pro),
+        org.and_then(|o| o.rate_limit_tier.as_deref()),
+    );
+    let rate_limit_tier = org
+        .and_then(|o| o.rate_limit_tier.as_deref())
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
     LoginProfile {
+        rate_limit_tier,
         subscription_type: match tier {
             PlanTier::Max(_) => Some("max".to_string()),
             PlanTier::Pro => Some("pro".to_string()),
@@ -1336,7 +1343,8 @@ fn login_profile_from_raw(p: RawProfile) -> LoginProfile {
 /// (`oauth_login`) to (a) confirm the minted token actually works against the API
 /// — a `401` here means the login produced a dud token — (b) stamp the new
 /// profile's tier so it shows the real plan immediately instead of the
-/// unknown-tier "Pro" fallback, and (c) seed the identity anchor
+/// unknown-tier "Pro" fallback, (c) stamp the rate-limit tier Claude Code reads
+/// at startup before any save (#78), and (d) seed the identity anchor
 /// ([`seed_login_anchor`]) without a second round trip. Goes through the shared
 /// `/profile` fetch ([`AuthClient::Profile`]). Returns the HTTP error text so the
 /// caller can surface it.

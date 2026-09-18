@@ -614,7 +614,7 @@ fn pending_login_run_completes_the_paste_door_against_the_manual_redirect() {
         } else {
             (
                 200,
-                r#"{"account":{"uuid":"uuid-manual","has_claude_max":true},"organization":{"organization_type":"claude_max"}}"#
+                r#"{"account":{"uuid":"uuid-manual","has_claude_max":true},"organization":{"organization_type":"claude_max","rate_limit_tier":"default_claude_max_5x"}}"#
                     .to_string(),
             )
         }
@@ -665,6 +665,11 @@ fn pending_login_run_completes_the_paste_door_against_the_manual_redirect() {
     assert!(
         oauth.subscription_type.is_some(),
         "tier stamped from the probe"
+    );
+    assert_eq!(
+        oauth.rate_limit_tier(),
+        Some("default_claude_max_5x"),
+        "rate-limit tier stamped from the same probe (#78)"
     );
     assert_eq!(outcome.account_uuid.as_deref(), Some("uuid-manual"));
     assert_eq!(

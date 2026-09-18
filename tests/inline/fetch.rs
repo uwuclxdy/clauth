@@ -283,6 +283,40 @@ fn a_login_bodys_blank_uuid_reads_as_no_identity() {
     );
 }
 
+/// The organization's raw `rate_limit_tier` rides the same body. Claude Code
+/// stamps it verbatim as `claudeAiOauth.rateLimitTier` and reads it back at
+/// startup as a flag-targeting attribute (#78), so the login must carry it
+/// exactly as served — no mapping, no normalization beyond a trim-then-blank
+/// check.
+#[test]
+fn a_login_body_yields_the_organizations_rate_limit_tier_verbatim() {
+    let body = |json: &str| -> LoginProfile {
+        let raw: RawProfile = serde_json::from_str(json).expect("fixture profile parses");
+        login_profile_from_raw(raw)
+    };
+    let probe = body(
+        r#"{"account":{"uuid":"uuid-live"},"organization":{"organization_type":"claude_team","rate_limit_tier":"default_claude_max_5x"}}"#,
+    );
+    assert_eq!(probe.subscription_type.as_deref(), Some("team"));
+    assert_eq!(
+        probe.rate_limit_tier.as_deref(),
+        Some("default_claude_max_5x"),
+        "the tier is the org's raw string, exactly as Claude Code would store it"
+    );
+    assert_eq!(probe.account_uuid.as_deref(), Some("uuid-live"));
+    assert_eq!(
+        body(r#"{"organization":{"organization_type":"claude_team"}}"#).rate_limit_tier,
+        None,
+        "an absent tier stamps nothing"
+    );
+    assert_eq!(
+        body(r#"{"organization":{"organization_type":"claude_team","rate_limit_tier":"  "}}"#)
+            .rate_limit_tier,
+        None,
+        "a blank tier is shape drift, not a tier"
+    );
+}
+
 #[test]
 fn a_login_anchor_overwrites_the_previous_account() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};

@@ -357,12 +357,12 @@ pub(crate) fn stamp_rolling_token(
 }
 
 /// The refresh-less projection of a usage chain — the EXACT content a rolling
-/// stamp writes: the chain's bearer, scopes, and plan stamp with the refresh
-/// token dropped. One constructor, so the pre-stamp classification
-/// (`roll_from_stored_chain`'s `GrantUnusable` verdict) and the stamp itself
-/// can never drift apart on what "rolled" means.
+/// stamp writes: the chain's bearer, scopes, plan stamp, and rate-limit tier
+/// with the refresh token dropped. One constructor, so the pre-stamp
+/// classification (`roll_from_stored_chain`'s `GrantUnusable` verdict) and the
+/// stamp itself can never drift apart on what "rolled" means.
 pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::profile::OAuthToken {
-    crate::profile::OAuthToken {
+    let mut rolled = crate::profile::OAuthToken {
         access_token: chain.access_token.clone(),
         refresh_token: None,
         expires_at: chain.expires_at,
@@ -371,9 +371,15 @@ pub(crate) fn rolling_projection(chain: &crate::profile::OAuthToken) -> crate::p
         // A fresh mint from clauth's own chain, not a rewrite over a prior
         // store, so it starts with no outside-written keys to keep. Claude
         // Code adds its own on its first save into the sidecar, and the
-        // rolling re-stamp replaces them until that next save.
+        // rolling re-stamp replaces them until that next save. The one key
+        // carried over is the rate-limit tier: Claude Code reads it at startup
+        // (#78), so a bearer without it runs as an untiered account.
         ..crate::profile::OAuthToken::default_extra()
+    };
+    if let Some(tier) = chain.rate_limit_tier() {
+        rolled.set_rate_limit_tier(tier.to_string());
     }
+    rolled
 }
 
 /// Copy a genuine static mint aside to `session-token.static.json` before the

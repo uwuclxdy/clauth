@@ -546,9 +546,12 @@ fn credentials_from_token(token: crate::oauth::TokenResponse) -> ClaudeCredentia
             expires_at: Some((now_ms() + token.expires_in * 1000) as i64),
             scopes,
             subscription_type: None,
-            // A login clauth mints itself has no outside-written keys to keep;
-            // Claude Code adds its own (`rateLimitTier`, `clientId`) on its
-            // first token save, and the catch-all holds them from then on.
+            // A login clauth mints itself has no outside-written keys to keep.
+            // Claude Code adds its own on its first token save (measured:
+            // `refreshTokenExpiresAt`, `rateLimitTier`), and the catch-all
+            // holds them from then on. The tier is stamped HERE too instead of
+            // waiting for that save: Claude Code reads it at STARTUP, before
+            // any save, to evaluate plan-gated flags (#78).
             ..OAuthToken::default_extra()
         }),
     }
@@ -659,8 +662,11 @@ fn finish_login(
     progress(LoginProgress::Verifying);
     // One `/profile` round trip carries all of it: confirm the minted token works
     // against the API, stamp the real plan tier so the captured profile shows e.g.
-    // "Claude Max" immediately instead of the unknown-tier "Pro" fallback, and
-    // carry out the account uuid so the caller can anchor the profile without a
+    // "Claude Max" immediately instead of the unknown-tier "Pro" fallback, stamp
+    // the rate-limit tier Claude Code would have written itself (#78: it feeds
+    // the flag targeting that decides whether Fable is plan-included or
+    // credits-only, and a login block without it reads as untiered), and carry
+    // out the account uuid so the caller can anchor the profile without a
     // second identical request. Best-effort: a probe failure never fails the login
     // — clauth's usage poll re-derives the tier within a cycle and the anchor
     // backfills on the hourly ride-along.
@@ -669,6 +675,9 @@ fn finish_login(
         && let Ok(probe) = crate::usage::probe_login_profile(&oauth.access_token)
     {
         oauth.subscription_type = probe.subscription_type;
+        if let Some(tier) = probe.rate_limit_tier {
+            oauth.set_rate_limit_tier(tier);
+        }
         account_uuid = probe.account_uuid;
     }
     Ok(LoginOutcome {

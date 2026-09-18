@@ -2879,6 +2879,35 @@ fn a_round_trip_through_the_typed_model_keeps_the_extras() {
     assert_eq!(round["claudeAiOauth"]["clientId"], "client-abc");
 }
 
+/// The stamp lands under Claude Code's own key and reads back through the
+/// accessor, from a freshly minted block and from a parsed store alike (#78).
+#[test]
+fn the_rate_limit_tier_stamp_uses_claude_codes_key() {
+    let mut login = pair("access", "refresh");
+    let oauth = login.claude_ai_oauth.as_mut().expect("oauth");
+    assert_eq!(
+        oauth.rate_limit_tier(),
+        None,
+        "a fresh mint carries no tier"
+    );
+    oauth.set_rate_limit_tier("default_claude_max_5x".to_string());
+    assert_eq!(oauth.rate_limit_tier(), Some("default_claude_max_5x"));
+    let round: serde_json::Value = serde_json::to_value(&login).expect("serialize");
+    assert_eq!(
+        round["claudeAiOauth"][RATE_LIMIT_TIER_KEY], "default_claude_max_5x",
+        "serialized as a sibling of accessToken, the shape Claude Code writes"
+    );
+
+    let parsed: ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": {"accessToken": "a", "rateLimitTier": "default_claude_max_20x"}
+    }))
+    .expect("parse");
+    assert_eq!(
+        parsed.claude_ai_oauth.expect("oauth").rate_limit_tier(),
+        Some("default_claude_max_20x")
+    );
+}
+
 /// A login minted by clauth's own browser flow carries no extras, and the
 /// serialized store must not grow an empty catch-all key for it.
 #[test]
