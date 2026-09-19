@@ -65,15 +65,16 @@ description = "clauth accounts"
 
 ## The pane tag
 
-Every herdr pane running Claude Code spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection, publishes the answer as pane metadata under the name `clauth`, and starts a per-pane watcher that re-publishes it every few seconds until the pane closes.
+Every herdr pane running Claude Code or codex spends some account, and which one is invisible from the pane itself. The plugin hooks agent detection, publishes the answer as pane metadata under the name `clauth`, and starts a per-pane watcher that re-publishes it every few seconds until the pane closes.
 
-The watcher is what keeps the tag right across an account swap, which fires no herdr event. A `clauth start --with-fallback` session that moves onto the next chain member, or a bare `claude` that follows a `clauth switch`, both repoint the account invisibly. herdr detects other agents too, and a pane running one of those is left untagged rather than labelled with an account it never touches.
+The watcher is what keeps the tag right across an account swap, which fires no herdr event. A `clauth start --with-fallback` session that moves onto the next chain member, or a bare `claude` that follows a `clauth switch`, both repoint the account invisibly. A codex pane answers the profile its `clauth start` session runs under, else the profile its own login is adopted into (`clauth login <name> --codex` leaves `~/.codex/auth.json` a link onto that profile's store). A codex login that is not adopted spends no clauth account, so that pane stays untagged — as does a pane running any other agent herdr detects, rather than labelled with an account it never touches.
 
-herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until `$clauth` is in a row**. `clauth herdr install` adds this one; Claude Code panes take the `rows_by_agent` template rather than the generic `rows`:
+herdr renders a reported value only where your own agent-row template asks for it, so **the tag stays invisible until `$clauth` is in a row**. `clauth herdr install` adds the `claude` one; Claude Code and codex panes take the `rows_by_agent` template rather than the generic `rows`, so add the `codex` row yourself until the installer writes it too:
 
 ```toml
 [ui.sidebar.agents.rows_by_agent]
 claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]
+codex = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]
 ```
 
 That reads `claude · D1` in the sidebar for a pane started as `clauth start D1`. A pane running Claude Code some other way reports whichever account owns the global credentials. Point `CLAUDE_CONFIG_DIR` somewhere else yourself and the tag stops matching what that pane spends.

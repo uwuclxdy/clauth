@@ -52,6 +52,30 @@ session_row() {
     return 1
 }
 
+# The profile the operator's own codex login is adopted into, or nothing.
+# `clauth login <name> --codex` leaves `$CODEX_HOME/auth.json` (default
+# `~/.codex/auth.json`) a symlink onto `~/.clauth/profiles/<name>/auth.json`,
+# so the link target names the profile; a login that was never adopted, or a
+# host that could not repoint (a separate copy), spends no clauth account.
+adopted_codex_profile() {
+    _home="${CODEX_HOME:-$HOME/.codex}"
+    _link=$(readlink "$_home/auth.json" 2>/dev/null) || return 0
+    case "$_link" in
+        /*) ;;
+        *) _link="$_home/$_link" ;;
+    esac
+    case "$_link" in
+        "$HOME/.clauth/profiles/"*/auth.json)
+            _p=${_link#"$HOME/.clauth/profiles/"}
+            _p=${_p%/auth.json}
+            case "$_p" in
+                '' | */*) return 0 ;;
+            esac
+            printf '%s\n' "$_p"
+            ;;
+    esac
+}
+
 # The account a row names: the member a --with-fallback session swapped onto,
 # else its launch member.
 row_profile() {
@@ -61,20 +85,23 @@ row_profile() {
     printf '%s\n' "$_p"
 }
 
-# The agent hooks fire for every agent herdr detects, codex and cursor
-# included, and those panes spend no clauth account. Both hooked events carry
-# `agent`; the `clauth.which` action carries `focused_pane_agent` in its
-# context instead, and that fallback is consulted ONLY when no pane id is set
-# (actions have none) — an event hook reading the context's focused pane would
-# answer for whichever pane holds focus, not the pane the event fired for.
-# Neither is set for a plain shell pane, which is the one case that still gets
-# an answer.
+# The agent hooks fire for every agent herdr detects. Claude Code and codex
+# panes spend a clauth account; cursor and the rest do not. Both hooked events
+# carry `agent`; the watcher's re-report empties the event JSON on purpose and
+# names the harness it was spawned for in CLAUTH_PANE_AGENT instead, so a codex
+# pane's re-run cannot fall to the Claude Code answer; the `clauth.which`
+# action carries `focused_pane_agent` in its context, and that fallback is
+# consulted ONLY when no pane id is set (actions have none) — an event hook
+# reading the context's focused pane would answer for whichever pane holds
+# focus, not the pane the event fired for. Nothing is set for a plain shell
+# pane, which is the one case that still gets an answer.
 agent=$(printf '%s' "${HERDR_PLUGIN_EVENT_JSON:-}" | sed -n 's/.*"agent":"\([^"]*\)".*/\1/p')
+[ -n "$agent" ] || agent="${CLAUTH_PANE_AGENT:-}"
 if [ -z "$agent" ] && [ -z "$pane" ]; then
     agent=$(printf '%s' "${HERDR_PLUGIN_CONTEXT_JSON:-}" | sed -n 's/.*"focused_pane_agent":"\([^"]*\)".*/\1/p')
 fi
 case "$agent" in
-    "" | claude) ;;
+    "" | claude | codex) ;;
     *) exit 0 ;;
 esac
 
@@ -112,9 +139,18 @@ if [ -n "$pane" ]; then
     fi
 fi
 
-# No clauth-managed session in this pane: a bare `claude` there burns whatever
-# owns the global credentials, so that answer is right rather than a guess.
-[ -n "$profile" ] || profile=$(clauth which 2>/dev/null) || profile=""
+# No clauth-managed session in this pane. A bare `claude` burns whatever owns
+# the global credentials, so that answer is right rather than a guess. A bare
+# `codex` burns the operator's own login, which is a clauth account only once
+# adopted — and `clauth which` is never asked for it: a caller holding no
+# CODEX_HOME gets the Claude Code answer there, a different harness's account.
+if [ -z "$profile" ]; then
+    if [ "$agent" = codex ]; then
+        profile=$(adopted_codex_profile)
+    else
+        profile=$(clauth which 2>/dev/null) || profile=""
+    fi
+fi
 [ -n "$profile" ] || exit 0
 
 printf '%s\n' "$profile"
@@ -150,10 +186,13 @@ fi
 # A --with-fallback session moves onto another account mid-run with no herdr
 # event, so the one-shot report above goes stale until the next status change.
 # Spawn a detached per-pane watcher to re-report on a timer instead. Only
-# claude panes spend a clauth account; a plain shell pane resolves `agent`
-# empty and is left alone. The pidfile makes later invocations skip the spawn
+# claude and codex panes spend a clauth account; a plain shell pane resolves
+# `agent` empty and is left alone. The pidfile makes later invocations skip the spawn
 # while that watch lives, and the watcher removes it when the pane closes.
-[ "$agent" = claude ] || exit 0
+case "$agent" in
+    claude | codex) ;;
+    *) exit 0 ;;
+esac
 [ -n "$pane" ] || exit 0
 state_dir="${HERDR_PLUGIN_STATE_DIR:-${TMPDIR:-/tmp}/clauth}"
 mkdir -p "$state_dir" 2>/dev/null || exit 0
@@ -166,4 +205,4 @@ if ! ( umask 077; set -C; echo "$$" > "$pidfile" ) 2>/dev/null; then
     [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null && exit 0
 fi
 dir=$(dirname "$0")
-"$dir/watch-profile.sh" "$pane" "$pidfile" </dev/null >/dev/null 2>&1 &
+"$dir/watch-profile.sh" "$pane" "$pidfile" "$agent" </dev/null >/dev/null 2>&1 &

@@ -1,14 +1,17 @@
 #!/bin/sh
 # Detached per-pane watcher, spawned by `report-profile.sh` for Claude Code
-# panes. Re-publishes the pane's account on a timer, so the sidebar tag follows
+# and codex panes. Re-publishes the pane's account on a timer, so the sidebar tag follows
 # an account swap that fires no herdr event: a `--with-fallback` session moving
 # onto the next chain member, or a bare `claude` following a `clauth switch`.
 # Exits once the pane is gone; `report-profile.sh` spawns a fresh watcher for
-# any claude pane it sees without a live one.
+# any claude or codex pane it sees without a live one.
 set -u
 
-pane="${1:?usage: watch-profile.sh <pane-id> <pidfile>}"
-pidfile="${2:?usage: watch-profile.sh <pane-id> <pidfile>}"
+pane="${1:?usage: watch-profile.sh <pane-id> <pidfile> [agent]}"
+pidfile="${2:?usage: watch-profile.sh <pane-id> <pidfile> [agent]}"
+# The harness this pane runs, carried into every re-report (see below); a
+# spawner predating the argument means a claude pane, the only kind it watched.
+agent="${3:-claude}"
 herdr_bin="${HERDR_BIN_PATH:-herdr}"
 # The tag_watch_secs knob wins over the env, which wins over the 5s default;
 # a predating clauth answers nothing, so the env/default chain still holds.
@@ -43,8 +46,11 @@ while :; do
     fi
     fails=0
     # Empty the event/context JSON so the report resolves `agent` from nothing
-    # instead of inheriting the spawn hook's stale value.
+    # instead of inheriting the spawn hook's stale value, and name the harness
+    # explicitly: a codex pane resolving to nothing would fall to the Claude
+    # Code account.
     HERDR_PANE_ID="$pane" HERDR_PLUGIN_EVENT_JSON='' HERDR_PLUGIN_CONTEXT_JSON='' \
+        CLAUTH_PANE_AGENT="$agent" \
         "$dir/report-profile.sh" >/dev/null 2>&1 || true
     sleep "$interval"
 done

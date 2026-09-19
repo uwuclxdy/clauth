@@ -23,9 +23,9 @@ That runs herdr's installer, then writes the two things a herdr plugin cannot de
 Two actions and two event hooks, all of them one of the two shell scripts below, plus a per-pane background watcher:
 
 - `clauth.open` opens the dashboard in a popup.
-- `clauth.which` re-reads the account the focused pane burns and publishes it as pane metadata, and the same script runs on herdr's `pane.agent_detected` and `pane.agent_status_changed` events. Reporting a Claude Code pane starts the watcher for that pane.
+- `clauth.which` re-reads the account the focused pane burns and publishes it as pane metadata, and the same script runs on herdr's `pane.agent_detected` and `pane.agent_status_changed` events. Reporting a Claude Code or codex pane starts the watcher for that pane.
 
-The watcher re-publishes the account every few seconds until the pane closes. An account swap fires no herdr event, so the timer is what keeps the tag from going stale. The scripts write only herdr's own pane metadata plus one pidfile per watched pane in the plugin state directory.
+The watcher re-publishes the account every few seconds until the pane closes. An account swap fires no herdr event, so the timer is what keeps the tag from going stale. A codex pane names the profile its `clauth start` session runs under, else the profile its own login is adopted into (`clauth login <name> --codex` leaves `~/.codex/auth.json` a link onto that profile's store); a codex login that is not adopted spends no clauth account, so that pane stays untagged. The scripts write only herdr's own pane metadata plus one pidfile per watched pane in the plugin state directory.
 
 The six knobs live in `~/.clauth/profiles.toml` under `[herdr]` and edit from the dashboard's Plugin tab (herdr row, options). The scripts read them through `clauth herdr config get <key>` and fall back to the shipped defaults when the binary predates the subcommand. The delegate state token (`clauth_delegate`) reports on the pane JSON and, with the `delegate_row_text` knob on, beside the row.
 
@@ -44,6 +44,7 @@ description = "clauth accounts"
 ```toml
 [ui.sidebar.agents.rows_by_agent]
 claude = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]
+codex = [["state_icon", "workspace", "tab"], ["terminal_title_stripped"], ["agent", "$clauth"]]
 ```
 
 ## Files

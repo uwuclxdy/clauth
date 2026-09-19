@@ -2717,9 +2717,47 @@ fn report_profile_resolve_run(
     rows: &[(&str, &str, u32)],
     stale_row: Option<&str>,
 ) -> Vec<String> {
+    report_profile_resolve_run_as(
+        r#"{"agent":"claude"}"#,
+        None,
+        info_json,
+        ps_body,
+        rows,
+        stale_row,
+    )
+    .0
+}
+
+/// [`report_profile_resolve_run`] with the event hook's `agent` field spelled
+/// by the caller, plus an optional ADOPTED codex login: `adopted_codex =
+/// Some(name)` lays `~/.codex/auth.json` as a symlink onto
+/// `~/.clauth/profiles/<name>/auth.json` in the sandbox, the shape
+/// `clauth login <name> --codex` leaves behind. `CODEX_HOME` is scrubbed from
+/// the script's env so the sandbox's `~/.codex` is the operator home it reads.
+/// Returns the report lines and whether the watcher pidfile appeared: it is
+/// created synchronously before the detached spawn, so it exists here exactly
+/// when the script's watcher path ran.
+#[cfg(unix)]
+fn report_profile_resolve_run_as(
+    agent_json: &str,
+    adopted_codex: Option<&str>,
+    info_json: &str,
+    ps_body: &str,
+    rows: &[(&str, &str, u32)],
+    stale_row: Option<&str>,
+) -> (Vec<String>, bool) {
     let home = crate::testutil::HomeSandbox::new();
     let sessions = home.home().join(".clauth/live_sessions");
     std::fs::create_dir_all(&sessions).expect("sessions dir");
+    if let Some(name) = adopted_codex {
+        let store = home.home().join(".clauth/profiles").join(name);
+        std::fs::create_dir_all(&store).expect("profile store");
+        std::fs::write(store.join("auth.json"), "{}").expect("chain written");
+        let codex = home.home().join(".codex");
+        std::fs::create_dir_all(&codex).expect("codex home");
+        std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
+            .expect("adopted link");
+    }
     for (sid, start, pid) in rows {
         let path = sessions.join(format!("{sid}.json"));
         let body = format!(
@@ -2754,7 +2792,8 @@ fn report_profile_resolve_run(
     .env("HERDR_BIN_PATH", home.home().join("herdr"))
     .env("HERDR_PLUGIN_ID", "clauth")
     .env("HERDR_PANE_ID", "p1")
-    .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"claude"}"#)
+    .env("HERDR_PLUGIN_EVENT_JSON", agent_json)
+    .env_remove("CODEX_HOME")
     .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
     .env("HOME", home.home())
     .env(
@@ -2771,11 +2810,13 @@ fn report_profile_resolve_run(
         "the script exits 0: stderr {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    std::fs::read_to_string(home.home().join("report.log"))
+    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
         .unwrap_or_default()
         .lines()
         .map(str::to_string)
-        .collect()
+        .collect();
+    let pidfile = home.home().join("state/watch-p1.pid");
+    (lines, pidfile.exists())
 }
 
 /// The token the resolve published; the four resolution tests below pin the
@@ -2869,6 +2910,153 @@ fn two_rows_on_one_pid_resolve_to_the_newest() {
     assert!(
         token_line(&lines).contains("--token clauth=DS4"),
         "the newest row wins over the stale one: {}",
+        lines[0]
+    );
+}
+
+/// A codex pane running `clauth start <name>` names that profile. The registry
+/// walk is harness-blind (a codex row is keyed on its `clauth start` supervisor
+/// like a claude one), so the only thing that kept codex panes untagged was the
+/// agent gate; and a codex pane gets a watcher like a claude pane, because a
+/// codex chain rotates between sessions with no herdr event either.
+#[cfg(unix)]
+#[test]
+fn a_codex_pane_running_a_clauth_session_names_its_profile() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1000,"ppid":1,"command":"codex"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1000') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, watcher_spawned) = report_profile_resolve_run_as(
+        r#"{"agent":"codex"}"#,
+        None,
+        info,
+        ps,
+        &[("1000-0", "work", 1000)],
+        None,
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=work"),
+        "the codex session's profile is published: {}",
+        lines[0]
+    );
+    assert!(watcher_spawned, "a codex pane gets a watcher too");
+}
+
+/// A bare codex pane (foreground present, no registered session) answers the
+/// ADOPTED login — the profile `~/.codex/auth.json` links into — and never
+/// `clauth which`, which answers the Claude Code side (`fit` here) for a caller
+/// holding no `CODEX_HOME`: that is a different harness's account painted on
+/// a codex pane.
+#[cfg(unix)]
+#[test]
+fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, _) = report_profile_resolve_run_as(
+        r#"{"agent":"codex"}"#,
+        Some("work"),
+        info,
+        ps,
+        &[],
+        None,
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=work"),
+        "the adopted profile is published, not the claude account: {}",
+        lines[0]
+    );
+}
+
+/// A bare codex pane whose login is NOT adopted spends no clauth account:
+/// nothing is published and no watcher is spawned. The Claude Code fallback
+/// (`clauth which` → `fit`) must not leak onto it.
+#[cfg(unix)]
+#[test]
+fn a_bare_codex_pane_without_an_adopted_login_publishes_nothing() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, watcher_spawned) =
+        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, info, ps, &[], None);
+    assert!(
+        lines.is_empty(),
+        "an unadopted codex login publishes nothing: {lines:?}"
+    );
+    assert!(!watcher_spawned, "and spawns no watcher");
+}
+
+/// The watcher's re-report carries the harness it was spawned for. It empties
+/// the event JSON on purpose (the spawn hook's value goes stale), so without a
+/// passthrough a codex pane's re-run resolves `agent` to nothing, falls to
+/// `clauth which`, and paints the Claude Code account (`fit`) on the pane every
+/// tick. Drives the real `watch-profile.sh` → `report-profile.sh` chain: the
+/// herdr shim answers `process-info` once, then fails until the watcher's
+/// retry budget ends it.
+#[cfg(unix)]
+#[test]
+fn the_watcher_rereport_keeps_the_codex_harness() {
+    let home = crate::testutil::HomeSandbox::new();
+    let store = home.home().join(".clauth/profiles/work");
+    std::fs::create_dir_all(&store).expect("profile store");
+    std::fs::write(store.join("auth.json"), "{}").expect("chain written");
+    std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
+    let codex = home.home().join(".codex");
+    std::fs::create_dir_all(&codex).expect("codex home");
+    std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
+        .expect("adopted link");
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    write_shim(
+        home.home(),
+        "herdr",
+        &format!(
+            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info}'; exit 0; fi\nexit 0\n"
+        ),
+    );
+    write_shim(
+        home.home(),
+        "ps",
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n",
+    );
+    write_shim(
+        home.home(),
+        "clauth",
+        "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+    );
+    let state = home.home().join("state");
+    std::fs::create_dir_all(&state).expect("state dir");
+    let out = std::process::Command::new("sh")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/herdr-plugin/watch-profile.sh"
+        ))
+        .arg("p1")
+        .arg(state.join("watch-p1.pid"))
+        .arg("codex")
+        .env("HERDR_BIN_PATH", home.home().join("herdr"))
+        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PLUGIN_STATE_DIR", &state)
+        .env("HOME", home.home())
+        .env_remove("CODEX_HOME")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.home().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("watch-profile.sh runs");
+    assert!(
+        out.status.success(),
+        "the watcher ends itself once herdr stops answering: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        token_line(&lines).contains("--token clauth=work"),
+        "the re-report keeps the codex harness and names the adopted profile: {}",
         lines[0]
     );
 }
