@@ -87,7 +87,8 @@ jobs:
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - uses: taiki-e/install-action@cargo-llvm-cov
+      - if: runner.os == 'Linux'
+        uses: taiki-e/install-action@cargo-llvm-cov
       # `every_completion_script_parses_in_its_own_shell` runs each shipped
       # completion script through its OWN parser, and skips a dialect whose
       # shell is absent. nextest discards a passing test's output, so without
