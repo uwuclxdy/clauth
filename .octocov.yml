@@ -1,0 +1,35 @@
+repository: uwuclxdy/clauth
+coverage:
+  paths:
+    - lcov.info
+  exclude:
+    - "target/**"
+    - "vendor/**"
+  acceptable: patch >= 70%
+  if: true
+codeToTestRatio:
+  code:
+    - "src/**/*.rs"
+  test:
+    - "tests/**/*.rs"
+  if: true
+testExecutionTime:
+  steps:
+    - test
+  if: true
+comment:
+  if: is_pull_request && !github.event.pull_request.head.repo.fork
+  updatePrevious: true
+  expandDetails: true
+  hideFooterLink: true
+  hideCoverageLink: true
+summary:
+  if: true
+report:
+  if: is_default_branch
+  datastores:
+    - github://uwuclxdy/clauth@coverage/reports
+diff:
+  if: is_pull_request
+  datastores:
+    - github://uwuclxdy/clauth@coverage/reports

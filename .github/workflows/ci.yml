@@ -64,6 +64,10 @@ jobs:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     name: check / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -72,7 +76,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, llvm-tools
       # mold is the fast linker on linux; self-gates so the mac/windows legs
       # fall back to the platform default. Runs before rust-cache so RUSTFLAGS
       # is part of the cache key.
@@ -83,6 +87,7 @@ jobs:
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
       # `every_completion_script_parses_in_its_own_shell` runs each shipped
       # completion script through its OWN parser, and skips a dialect whose
       # shell is absent. nextest discards a passing test's output, so without
@@ -114,6 +119,7 @@ jobs:
       # cancels at the first one, so you fix what you were shown, push, and are handed
       # more — which reads like a regression your own fix caused, at a build per round.
       - name: test
+        shell: bash
         env:
           # The TLS tests build their certificates with `openssl`, and skip
           # themselves when it is absent — a skip that reads exactly like a pass
@@ -121,7 +127,12 @@ jobs:
           # macOS images carry openssl, so require it there; Windows images do
           # not reliably, and a hard requirement would red on that alone.
           CLAUTH_REQUIRE_TLS_FIXTURE: ${{ runner.os == 'Windows' && '0' || '1' }}
-        run: cargo nextest run --locked --release --all-targets --all-features --no-fail-fast
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            cargo llvm-cov nextest --lcov --output-path lcov.info --locked --release --all-targets --all-features --no-fail-fast
+          else
+            cargo nextest run --locked --release --all-targets --all-features --no-fail-fast
+          fi
       # Every leg above is --release, where debug_assertions is off and
       # `#[cfg(debug_assertions)]` code is not merely unlinted but absent: a test
       # gated on it cannot run at all, so the local gate was catching regressions
@@ -153,6 +164,11 @@ jobs:
           else
             echo "no doctest targets; skipping"
           fi
+      - name: coverage report
+        if: runner.os == 'Linux'
+        uses: k1LoW/octocov-action@a167dc0dee441b7ffc45e1b862ab55ec0d87f278 # v1.5.2
+        with:
+          version: v0.79.0
       - name: build release binary
         run: cargo build --locked --release
       - name: upload binary
