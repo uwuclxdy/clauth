@@ -4,9 +4,11 @@
 
 <h1 align="center">Claude Code multi-account manager & MCP Plugin</h1>
 
-![](https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/coverage.svg)
-![](https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/ratio.svg)
-![](https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/time.svg)
+<p align="center">
+  <img src="https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/coverage.svg" alt="coverage" />
+  <img src="https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/ratio.svg" alt="code to test ratio" />
+  <img src="https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/time.svg" alt="test execution time" />
+</p>
 
 <p align="center">
   <a href="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml"><img src="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg" alt="Release build status" /></a>
