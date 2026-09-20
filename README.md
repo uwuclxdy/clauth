@@ -4,6 +4,10 @@
 
 <h1 align="center">Claude Code multi-account manager & MCP Plugin</h1>
 
+![](https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/coverage.svg)
+![](https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/ratio.svg)
+![](https://coverage.uwuclxdy.dev/badges/uwuclxdy/clauth/time.svg)
+
 <p align="center">
   <a href="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml"><img src="https://github.com/uwuclxdy/clauth/actions/workflows/release.yml/badge.svg" alt="Release build status" /></a>
   <a href="https://crates.io/crates/clauth"><img src="https://shields.uwuclxdy.dev/github/v/release/uwuclxdy/clauth?sort=semver&logo=rust&label=version&color=orange" alt="latest version" /></a>
