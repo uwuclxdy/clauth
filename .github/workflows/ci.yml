@@ -65,7 +65,7 @@ jobs:
     name: check / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
       actions: read
     strategy:
