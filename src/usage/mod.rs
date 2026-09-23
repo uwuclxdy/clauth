@@ -1,6 +1,9 @@
 mod auto_start_queue;
 mod burn;
 mod codex;
+// `clauth use-reset`: the list/consume pair, its selection rule and its text.
+// One caller (`main.rs`), so reached by path rather than re-exported item by item.
+pub(crate) mod codex_reset;
 mod fetch;
 mod scheduler;
 
