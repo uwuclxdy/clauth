@@ -81,7 +81,7 @@ clauth work
 # clauth: switched codex to 'work'
 ```
 
-A codex switch moves the active marker in `codex-profiles.toml` and nothing else: no file under `~/.claude` moves, no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `clauth start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `clauth: note — 'work' also names a codex profile; switching the CLAUDE one`.
+A codex switch moves the active marker in `codex-profiles.toml`. When your own `~/.codex/auth.json` is the link clauth installed into a profile's store, the link follows the switch (`clauth: ~/.codex/auth.json now follows 'work'`), so the codex you run yourself uses the account the marker names; a plain file, or a link clauth did not install, is left alone. Nothing under `~/.claude` moves, and no running session changes account. The marker is what the codex chain anchors on, what the Overview marks, and what `status.json` publishes as `active_codex_profile`; `clauth start` runs any codex profile whether or not it is the active one. A name held on both rosters switches the Claude Code one and says so: `clauth: note — 'work' also names a codex profile; switching the CLAUDE one`.
 
 ## Remove
 

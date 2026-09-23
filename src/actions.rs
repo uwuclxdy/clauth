@@ -1159,20 +1159,74 @@ pub(crate) fn delete_profile(
 /// under the lock, so a concurrent delete can't be switched onto. A
 /// quarantined chain refuses the way a disabled claude account does: the
 /// slot would name an account no session can authenticate as.
-pub(crate) fn switch_codex_profile(name: &str) -> Result<()> {
+/// Move the codex active slot to `name` — and, when the operator's own
+/// `~/.codex/auth.json` is a link clauth installed, move that link with it.
+///
+/// Returns the operator slot it repointed, if any.
+///
+/// The marker alone is not a switch for anyone who runs bare `codex`: that
+/// reads the operator slot, which the capture linked onto ONE profile's store
+/// and nothing ever moved again. So a switch changed the panel and the feed
+/// while every codex the operator started kept spending the old account. The
+/// slot follows only when it is clauth's own link (the ownership rule
+/// [`detach_operator_auth_slot`] already uses); a regular file is the
+/// operator's own login and an absent slot is a login they never gave us —
+/// both are left exactly as found.
+///
+/// The link moves BEFORE the marker, inside the same state lock: if the link
+/// cannot move, the switch fails whole instead of reporting a switch that did
+/// not happen. And it is checked on the already-active path too, so switching
+/// to the account the marker already names REPAIRS a slot that drifted.
+pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathBuf>> {
     crate::codex_profiles::CodexState::update(|state| {
         if !state.holds(name) {
             bail!("codex profile '{name}' not found");
         }
         crate::codex_auth::refuse_if_quarantined(name)?;
+        let repointed = follow_operator_auth_slot(name)?;
         // Same early return the claude switch takes on `is_active` — nothing
         // to move, and `update`'s dirty check then leaves the file untouched.
-        if state.active_profile().map(ProfileName::as_str) == Some(name) {
-            return Ok(());
+        if state.active_profile().map(ProfileName::as_str) != Some(name) {
+            state.set_active(Some(name));
         }
-        state.set_active(Some(name));
-        Ok(())
+        Ok(repointed)
     })
+}
+
+/// Repoint the operator's `auth.json` at `name`'s store when it is a link into
+/// a DIFFERENT clauth profile's store; `None` when there is nothing of ours to
+/// move (a regular file, no slot, a foreign link, or already pointing here).
+fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
+    // Resolved the way the capture and the delete resolve it: inside a
+    // `clauth start` session CODEX_HOME names the session home, and the
+    // operator's real slot is still the default one.
+    let operator = codex_operator_home().or_else(|_| default_codex_operator_home())?;
+    let slot = operator.join("auth.json");
+    let Ok(target) = std::fs::read_link(&slot) else {
+        return Ok(None);
+    };
+    let Some(holder) = clauth_auth_store_owner(&target) else {
+        return Ok(None);
+    };
+    if holder.eq_ignore_ascii_case(name) {
+        return Ok(None);
+    }
+    let store = crate::profile::profile_subpath(&ProfileName::from(name), "auth.json")?;
+    if !store.exists() {
+        bail!(
+            "'{name}' has no stored codex login, so {} cannot follow it — log it in \
+             with `clauth login {name} --codex --browser`",
+            slot.display()
+        );
+    }
+    if !adopt_operator_auth_slot(&slot, &store) {
+        bail!(
+            "could not repoint {} at '{name}' — your codex would have stayed on \
+             '{holder}', so the switch was not made",
+            slot.display()
+        );
+    }
+    Ok(Some(slot))
 }
 
 /// `clauth delete <name>` for a codex profile. Same shape as the claude

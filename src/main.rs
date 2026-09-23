@@ -1699,8 +1699,11 @@ fn cmd_switch(name: &str) -> Result<()> {
         // Not a claude name — a codex profile switches its own harness's
         // active slot, with no live install to perform (session-boundary).
         if let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) {
-            actions::switch_codex_profile(&canonical)?;
+            let repointed = actions::switch_codex_profile(&canonical)?;
             outln!("clauth: switched codex to '{canonical}'");
+            if let Some(slot) = repointed {
+                outln!("clauth: {} now follows '{canonical}'", slot.display());
+            }
             return Ok(());
         }
         return Err(unknown_profile_error(&config, name));
