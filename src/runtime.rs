@@ -3484,7 +3484,10 @@ impl SessionSwap {
                                 // The item now holds the incoming member's pair,
                                 // so that is what the session reads: the row's
                                 // verdict follows.
-                                Ok(()) => self.repoint_row_store(&plan),
+                                Ok(()) => {
+                                    self.repoint_row_store(&plan);
+                                    self.retouch_after_item_leg(&plan);
+                                }
                                 Err(e) => logline!(
                                     "clauth: session {} swapped onto {} but writing its per-session \
                                      Keychain item failed: {e:#}. The session keeps authenticating as its \
@@ -3512,7 +3515,8 @@ impl SessionSwap {
                                 // falls back to the file layer this swap moved:
                                 // the row's verdict follows.
                                 Ok(crate::keychain::SignOutOutcome::SignedOut) => {
-                                    self.repoint_row_store(&plan)
+                                    self.repoint_row_store(&plan);
+                                    self.retouch_after_item_leg(&plan);
                                 }
                                 // The locked keychain left the item untouched,
                                 // so the session still reads the outgoing
@@ -3777,6 +3781,29 @@ impl SessionSwap {
             logline!(
                 "clauth: session {} swapped onto {} but its row's store did not follow: {e:#}. \
                  Rotations stay refused for the member it left",
+                self.session.as_str(),
+                plan.member
+            );
+        }
+    }
+
+    /// Move the store's mtime once more after the item leg landed.
+    ///
+    /// The swap stamps the store and repoints the link inside the hold, but the
+    /// item leg runs after it. A request the session sent in between saw the
+    /// stamped mtime, re-read the item while it still held the OUTGOING member,
+    /// and memoized that mtime; Claude Code re-reads only when the mtime moves
+    /// again, so the session would stay on the member the swap left. A second
+    /// stamp makes every session that read in the gap re-read the item, which
+    /// now holds the incoming login (or nothing, falling back to the file).
+    /// Loud-not-fatal like the legs themselves: the swap already happened.
+    #[cfg(target_os = "macos")]
+    fn retouch_after_item_leg(&self, plan: &SwapPlan) {
+        if let Err(e) = with_state_lock(|_held| touch_store(plan, file_mtime(&plan.store))) {
+            logline!(
+                "clauth: session {} swapped onto {} but re-stamping its store after the \
+                 Keychain leg failed: {e:#}. A request sent during the swap may keep the \
+                 session on its previous member until the store is next written",
                 self.session.as_str(),
                 plan.member
             );
