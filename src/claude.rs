@@ -1169,13 +1169,14 @@ enum AbsentSource {
 /// where Claude Code actually reads its login. `path` is the install source the
 /// swap resolved: its whole JSON object becomes the item, so the incoming
 /// account's own blocks travel with its login and the outgoing account's do not
-/// (`keychain::keychain_install` carries the MCP-server logins across).
+/// (`keychain::keychain_install` carries the MCP-server logins and the other
+/// keys in `carried` across).
 ///
 /// Runs after the symlink swap and is `?`-fatal: a failure leaves the file layer
 /// switched while CC still reads the old Keychain login. Loud and recoverable,
 /// since every write here is idempotent, so retrying the switch re-runs it.
 #[cfg(target_os = "macos")]
-fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
+fn keychain_mirror_source(path: &Path, absent: AbsentSource, carried: &CarriedKeys) -> Result<()> {
     // CLA-SPLIT: callers pass the already-resolved install source so the
     // symlink target and the Keychain content come from ONE resolution: a
     // session-token.json vanishing between two stats can't split them. This
@@ -1189,12 +1190,12 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
             // already raised — the item keeps serving the departed account
             // until the switch is re-run on an unlocked keychain, which is
             // recoverable where the pre-fix blind delete was not.
-            AbsentSource::SignOut => crate::keychain::keychain_sign_out().map(|_| ()),
+            AbsentSource::SignOut => crate::keychain::keychain_sign_out(carried).map(|_| ()),
             AbsentSource::Leave => Ok(()),
         };
     }
     let store = checked_store_at(path)?;
-    crate::keychain::keychain_install(&store)
+    crate::keychain::keychain_install(&store, carried)
 }
 
 /// macOS: install the store `path` holds into the NAMESPACED Keychain item for
@@ -1894,9 +1895,12 @@ pub(crate) enum SignOut {
 /// A blob that is not an object carries nothing worth preserving.
 ///
 /// A key the operator carries (`carried`) is kept even when Claude Code scopes
-/// it to the account: the list says it belongs to no account on this host, and
-/// the switch that signs out is the same switch that would otherwise have
-/// carried it. The login goes whatever the list says ([`CarriedKeys::keys`]).
+/// it to the account: the list says it belongs to no account on this host, the
+/// same claim that keeps `mcpOAuth`. That holds for every sign-out, not only a
+/// switch onto an account storing no login: a wrap-off, a delete of the active
+/// profile and a logout keep a listed design login in the item too, which on
+/// macOS is its only copy. The login goes whatever the list says
+/// ([`CarriedKeys::keys`]).
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -2115,8 +2119,13 @@ pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
     }
 }
 
-fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) {
-    if let Err(e) = carry_live_extra_into(link, target, name, &CarriedKeys::load()) {
+fn carry_live_extra_best_effort(
+    link: &Path,
+    target: &Path,
+    name: &ProfileName,
+    carried: &CarriedKeys,
+) {
+    if let Err(e) = carry_live_extra_into(link, target, name, carried) {
         logline!(
             "clauth: switched to '{name}' but could not carry its MCP server logins or other \
              carried keys: {e:#}. Re-authenticate any MCP server or design login that reports \
@@ -2132,6 +2141,10 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // Loaded once for the file carry and the Keychain mirror alike, so one
+        // relink cannot carry two different lists across an edit landing
+        // between two reads.
+        let carried = CarriedKeys::load();
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
@@ -2165,7 +2178,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             }
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name);
+            carry_live_extra_best_effort(&link, &target, name, &carried);
         }
 
         if target.exists() {
@@ -2179,7 +2192,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
         // none of which is changing accounts.
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::Leave)?;
+            keychain_mirror_source(&target, AbsentSource::Leave, &carried)?;
         }
 
         Ok(())
@@ -2197,10 +2210,15 @@ pub(crate) fn clear_claude_credentials() -> Result<()> {
         // item held goes, possibly a chain CC rotated after our last capture,
         // which is lost and needs a re-login. What survives is the MCP-server
         // logins, which belong to no account and would otherwise be collateral
-        // of every wrap-off; an item left holding nothing else is deleted.
+        // of every wrap-off, and every key the operator lists in
+        // `carried_credential_keys` for the same reason; an item left holding
+        // nothing else is deleted. Not full parity with the file layer here: a
+        // listed design login stays in the item across a wrap-off, a delete of
+        // the active profile and a logout, because on macOS the item is its only
+        // copy (the snapshot reads the file, never the item).
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            crate::keychain::keychain_sign_out()?;
+            crate::keychain::keychain_sign_out(&CarriedKeys::load())?;
         }
         Ok(())
     })
@@ -2749,10 +2767,12 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // One load for both layers, as in `link_profile_credentials`.
+        let carried = CarriedKeys::load();
         if link.symlink_metadata().is_ok() {
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name);
+            carry_live_extra_best_effort(&link, &target, name, &carried);
         }
         if target.exists() {
             publish_credential_link(&link, &target)?;
@@ -2766,7 +2786,7 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
         // the account the switch just left.
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::SignOut)?;
+            keychain_mirror_source(&target, AbsentSource::SignOut, &carried)?;
         }
         Ok(())
     })

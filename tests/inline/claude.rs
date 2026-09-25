@@ -1971,6 +1971,25 @@ fn a_sign_out_keeps_the_keys_the_operator_carries() {
     assert_eq!(blob["designOauth"]["accessToken"], "design-1");
 }
 
+/// Once signed out, an item holding only what the list keeps is already
+/// signed out, and says so instead of asking for a rewrite of identical bytes:
+/// the daemon and the TUI relink on a tick, and on macOS every write costs a
+/// `security` subprocess.
+#[test]
+fn a_signed_out_item_holding_only_carried_keys_needs_no_write() {
+    let listed = CarriedKeys::Configured(vec!["mcpOAuth".into(), "designOauth".into()]);
+    let mut kept_only = serde_json::json!({
+        "mcpOAuth": { "linear": { "accessToken": "mock-linear" } },
+        "designOauth": { "accessToken": "design-1" }
+    });
+
+    assert_eq!(
+        strip_account_credentials(&mut kept_only, &listed),
+        SignOut::Nothing
+    );
+    assert_eq!(kept_only["designOauth"]["accessToken"], "design-1");
+}
+
 /// An item holding nothing but the login has nothing left to keep, and the
 /// caller deletes it rather than leaving an empty husk where a clean absence was.
 #[test]
