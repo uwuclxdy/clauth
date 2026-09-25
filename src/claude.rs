@@ -1841,10 +1841,12 @@ const ACCOUNT_SCOPED_CREDENTIAL_KEYS: [&str; 5] = [
 /// A key `live` holds overwrites `target`'s copy; one it lacks leaves
 /// `target`'s alone; the login is never touched.
 ///
-/// The value-level core of [`carry_live_extra_into`] and of the sidecar
-/// writers' [`keep_carried_in_sidecar`]. Its callers import from ANOTHER
-/// account's blob, which is why this takes an allowlist where
-/// `profile::preserve_extra_blocks` keeps everything.
+/// The value-level core of [`carry_live_extra_into`], of the sidecar writers'
+/// [`keep_carried_in_sidecar`], and of the macOS Keychain mirror's merge
+/// (`keychain::merged_blob`), whose live slot is a Keychain item rather than a
+/// file. Its callers import from ANOTHER account's blob, which is why this
+/// takes an allowlist where `profile::preserve_extra_blocks` keeps everything.
+/// PURE: the list arrives loaded, so the tests driving it need no home.
 pub(crate) fn carry_keys_over(
     target: &mut serde_json::Map<String, serde_json::Value>,
     live: &serde_json::Map<String, serde_json::Value>,
@@ -1861,28 +1863,6 @@ pub(crate) fn carry_keys_over(
         }
     }
     changed
-}
-
-/// [`carry_keys_over`] on the built-in list, for the macOS Keychain mirror,
-/// whose live slot is a Keychain item rather than a file.
-///
-/// Known gap: `carried_credential_keys` does not reach the Keychain item, so on
-/// macOS, where Claude Code reads the item first, the list does not carry
-/// anything a session sees. Kept pure on purpose: its callers' tests run with
-/// no home sandbox, and threading the list through `keychain.rs` is macOS-only
-/// code that the change adding the list could not compile or run.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the only production caller is the macOS Keychain mirror; pinned on every platform"
-    )
-)]
-pub(crate) fn carry_live_extra_over(
-    target: &mut serde_json::Map<String, serde_json::Value>,
-    live: &serde_json::Map<String, serde_json::Value>,
-) -> bool {
-    carry_keys_over(target, live, &CarriedKeys::Builtin)
 }
 
 /// What a sign-out found in a credential store, and so what its caller owes the
@@ -1912,6 +1892,11 @@ pub(crate) enum SignOut {
 /// Drop every [`ACCOUNT_SCOPED_CREDENTIAL_KEYS`] entry from `blob`, keeping what
 /// belongs to no Claude account, and report what the caller owes its store.
 /// A blob that is not an object carries nothing worth preserving.
+///
+/// A key the operator carries (`carried`) is kept even when Claude Code scopes
+/// it to the account: the list says it belongs to no account on this host, and
+/// the switch that signs out is the same switch that would otherwise have
+/// carried it. The login goes whatever the list says ([`CarriedKeys::keys`]).
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -1919,12 +1904,19 @@ pub(crate) enum SignOut {
         reason = "the only caller is the macOS Keychain sign-out; the rule is pinned on every platform"
     )
 )]
-pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value) -> SignOut {
+pub(crate) fn strip_account_credentials(
+    blob: &mut serde_json::Value,
+    carried: &CarriedKeys,
+) -> SignOut {
     let Some(obj) = blob.as_object_mut() else {
         return SignOut::Delete;
     };
+    let kept = carried.keys();
     let mut dropped = false;
     for key in ACCOUNT_SCOPED_CREDENTIAL_KEYS {
+        if kept.contains(&key) {
+            continue;
+        }
         dropped |= obj.remove(key).is_some();
     }
     match (dropped, obj.is_empty()) {

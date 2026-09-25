@@ -21,6 +21,7 @@ use super::{
     read_blob_at, run_with_deadline, salvage_delete_namespaced_item, security_deadline,
     security_error, security_quote, sign_out_at, verify_outcome, write_disposition,
 };
+use crate::claude::CarriedKeys;
 use crate::logline::LogLines;
 use crate::profile::{ClaudeCredentials, OAuthToken};
 use crate::testutil::{EnvPin, HomeSandbox};
@@ -54,7 +55,7 @@ fn read_login(service: &str, account: &str) -> Option<OAuthToken> {
 }
 
 /// Write `creds` as the whole item, the way a store file with no siblings would.
-fn put_login(service: &str, account: &str, creds: &ClaudeCredentials, keep: Keep) {
+fn put_login(service: &str, account: &str, creds: &ClaudeCredentials, keep: Keep<'_>) {
     let login = serde_json::to_value(creds).expect("serialize");
     merge_and_put_at(service, account, &login, keep).expect("write");
 }
@@ -98,7 +99,12 @@ fn keychain_round_trip_on_temp_service() {
 
     // Write, then read back the same tokens.
     let creds = sample_creds("sk-ant-oat01-TESTACCESS", "sk-ant-ort01-TESTREFRESH");
-    put_login(&service, account, &creds, Keep::CarriedOnly);
+    put_login(
+        &service,
+        account,
+        &creds,
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    );
     let oauth = read_login(&service, account).expect("oauth block round-trips");
     assert_eq!(oauth.access_token, "sk-ant-oat01-TESTACCESS");
     assert_eq!(
@@ -109,7 +115,12 @@ fn keychain_round_trip_on_temp_service() {
 
     // add-generic-password -U is add-or-update: a second write replaces in place.
     let updated = sample_creds("sk-ant-oat01-ROTATED", "sk-ant-ort01-ROTATED");
-    put_login(&service, account, &updated, Keep::CarriedOnly);
+    put_login(
+        &service,
+        account,
+        &updated,
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    );
     let rotated = read_login(&service, account).expect("oauth");
     assert_eq!(rotated.access_token, "sk-ant-oat01-ROTATED");
 
@@ -118,7 +129,12 @@ fn keychain_round_trip_on_temp_service() {
     // security_quote escaping (no real token looks like this; the point is
     // that the -i tokenizer can never mangle one that does).
     let hostile = sample_creds(r#"sk with spaces "quoted" back\slash"#, "rt-plain");
-    put_login(&service, account, &hostile, Keep::CarriedOnly);
+    put_login(
+        &service,
+        account,
+        &hostile,
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    );
     let echoed = read_login(&service, account).expect("oauth");
     assert_eq!(echoed.access_token, r#"sk with spaces "quoted" back\slash"#);
 
@@ -163,7 +179,7 @@ fn keychain_write_keeps_the_siblings_its_keep_allows() {
         &service,
         account,
         &sample_creds("sk-ant-oat01-INCOMING", "sk-ant-ort01-INCOMING"),
-        Keep::CarriedOnly,
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
     );
     let after_switch = read_blob_at(&service, account)
         .expect("read")
@@ -207,7 +223,7 @@ fn keychain_write_keeps_the_siblings_its_keep_allows() {
 // ── The merge itself (pure, no Keychain touched) ──────────────────────────────
 //
 // These pin WHICH rule each `Keep` routes to. The rules are pinned where they
-// live (`claude::carry_live_extra_over`, `profile::preserve_extra_blocks`, both
+// live (`claude::carry_keys_over`, `profile::preserve_extra_blocks`, both
 // covered on every platform), but nothing there can catch the two arms being
 // swapped here — and swapping them is exactly the defect this module exists to
 // prevent, since `Keep::Everything` on a switch carries the outgoing account's
@@ -225,7 +241,11 @@ fn item(login: &str) -> serde_json::Value {
 fn merged_blob_carries_only_the_allowlist_onto_a_different_login() {
     let incoming = serde_json::json!({ "claudeAiOauth": { "accessToken": "incoming" } });
 
-    let merged = merged_blob(&incoming, Some(&item("outgoing")), Keep::CarriedOnly);
+    let merged = merged_blob(
+        &incoming,
+        Some(&item("outgoing")),
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    );
 
     assert_eq!(merged["claudeAiOauth"]["accessToken"], "incoming");
     assert_eq!(merged["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
@@ -239,7 +259,11 @@ fn merged_blob_carries_only_the_allowlist_onto_a_different_login() {
 fn merged_blob_keeps_everything_when_the_login_is_unchanged() {
     let incoming = serde_json::json!({ "claudeAiOauth": { "accessToken": "same" } });
 
-    let merged = merged_blob(&incoming, Some(&item("same")), Keep::CarriedOnly);
+    let merged = merged_blob(
+        &incoming,
+        Some(&item("same")),
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    );
 
     assert_eq!(
         merged["organizationUuid"], "org-outgoing",
@@ -263,7 +287,11 @@ fn merged_blob_treats_two_logged_out_shells_as_different_logins() {
         "organizationUuid": "org-someone-else"
     });
 
-    let merged = merged_blob(&incoming, Some(&existing), Keep::CarriedOnly);
+    let merged = merged_blob(
+        &incoming,
+        Some(&existing),
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    );
 
     assert!(
         merged.get("organizationUuid").is_none(),
@@ -279,6 +307,54 @@ fn merged_blob_under_a_rotation_keeps_the_accounts_own_blocks() {
 
     assert_eq!(merged["claudeAiOauth"]["accessToken"], "rotated");
     assert_eq!(merged["organizationUuid"], "org-outgoing");
+    assert_eq!(merged["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+}
+
+/// The item a `/design-login` leaves: the outgoing login, its MCP logins, its
+/// org id, and the design login Claude Code stores beside them.
+fn item_with_design_login(login: &str) -> serde_json::Value {
+    let mut item = item(login);
+    item["designOauth"] = serde_json::json!({ "accessToken": "mock-design" });
+    item
+}
+
+/// `carried_credential_keys` on macOS: a switch writes the incoming login into
+/// the item, and a key the operator lists crosses from the item it replaces
+/// like `mcpOAuth` does. The org id, which the list does not name, still stays
+/// with its account.
+#[test]
+fn merged_blob_carries_a_listed_design_login_onto_a_different_login() {
+    let incoming = serde_json::json!({ "claudeAiOauth": { "accessToken": "incoming" } });
+    let listed = CarriedKeys::Configured(vec!["mcpOAuth".into(), "designOauth".into()]);
+
+    let merged = merged_blob(
+        &incoming,
+        Some(&item_with_design_login("outgoing")),
+        Keep::CarriedOnly(&listed),
+    );
+
+    assert_eq!(merged["claudeAiOauth"]["accessToken"], "incoming");
+    assert_eq!(merged["designOauth"]["accessToken"], "mock-design");
+    assert_eq!(merged["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+    assert!(merged.get("organizationUuid").is_none());
+}
+
+/// Without the list nothing changes: the design login is account-scoped to
+/// Claude Code and stays with the account that made it, as in 0.16.0.
+#[test]
+fn merged_blob_without_the_list_leaves_the_design_login_behind() {
+    let incoming = serde_json::json!({ "claudeAiOauth": { "accessToken": "incoming" } });
+
+    let merged = merged_blob(
+        &incoming,
+        Some(&item_with_design_login("outgoing")),
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    );
+
+    assert!(
+        merged.get("designOauth").is_none(),
+        "without carried_credential_keys the design login does not cross accounts"
+    );
     assert_eq!(merged["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
 }
 
@@ -322,7 +398,7 @@ fn login_blob_is_ours_refuses_a_login_clauth_never_wrote() {
 fn merged_blob_over_an_absent_item_is_the_incoming_store() {
     let incoming = serde_json::json!({ "claudeAiOauth": { "accessToken": "first" } });
 
-    for keep in [Keep::CarriedOnly, Keep::Everything] {
+    for keep in [Keep::CarriedOnly(&CarriedKeys::Builtin), Keep::Everything] {
         assert_eq!(
             merged_blob(&incoming, None, keep),
             incoming,
@@ -346,7 +422,11 @@ fn merge_write_skips_a_relink_that_reproduces_the_item() {
     let installed = item("live");
 
     assert_eq!(
-        merge_write(&installed, Some(&installed), Keep::CarriedOnly),
+        merge_write(
+            &installed,
+            Some(&installed),
+            Keep::CarriedOnly(&CarriedKeys::Builtin)
+        ),
         None,
         "a relink installing exactly what the item holds must not spend a write"
     );
@@ -366,7 +446,11 @@ fn merge_write_skips_when_only_the_carry_closes_the_difference() {
     let login_only = serde_json::json!({ "claudeAiOauth": { "accessToken": "live" } });
 
     assert_eq!(
-        merge_write(&login_only, Some(&item("live")), Keep::CarriedOnly),
+        merge_write(
+            &login_only,
+            Some(&item("live")),
+            Keep::CarriedOnly(&CarriedKeys::Builtin)
+        ),
         None,
         "the item's own siblings are carried back onto an identical login, so \
          the merge reproduces it"
@@ -385,8 +469,12 @@ fn merge_write_writes_whenever_the_merge_changes_the_item() {
     // A switch: a different login, and the outgoing account's org id has to GO.
     // The write is needed for a removal here, which is the case an
     // additions-only assertion would miss.
-    let merged =
-        merge_write(&rotated, Some(&item("outgoing")), Keep::CarriedOnly).expect("a switch writes");
+    let merged = merge_write(
+        &rotated,
+        Some(&item("outgoing")),
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    )
+    .expect("a switch writes");
     assert!(
         merged.get("organizationUuid").is_none(),
         "the write exists to drop the outgoing account's blocks, not only to add"
@@ -401,7 +489,7 @@ fn merge_write_writes_whenever_the_merge_changes_the_item() {
 fn merge_write_always_writes_when_it_could_not_read_the_item() {
     let installed = item("live");
 
-    for keep in [Keep::CarriedOnly, Keep::Everything] {
+    for keep in [Keep::CarriedOnly(&CarriedKeys::Builtin), Keep::Everything] {
         assert_eq!(
             merge_write(&installed, None, keep),
             Some(installed.clone()),
@@ -1400,8 +1488,13 @@ fn a_merge_over_unparseable_bytes_quarantines_them_and_still_writes() {
     let incoming = serde_json::json!({
         "claudeAiOauth": { "accessToken": "sk-ant-oat01-INCOMING" }
     });
-    merge_and_put_at(&service, account, &incoming, Keep::CarriedOnly)
-        .expect("the switch still completes over a corrupted item");
+    merge_and_put_at(
+        &service,
+        account,
+        &incoming,
+        Keep::CarriedOnly(&CarriedKeys::Builtin),
+    )
+    .expect("the switch still completes over a corrupted item");
     drop(_capture);
 
     // The event line: current shape plus the salvage, and the path it names is

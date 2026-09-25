@@ -1886,9 +1886,10 @@ fn carrying_a_key_the_target_already_holds_reports_no_change() {
         "mcpOAuth": { "linear": { "accessToken": "same" } }
     });
 
-    let changed = carry_live_extra_over(
+    let changed = carry_keys_over(
         target.as_object_mut().expect("target object"),
         live.as_object().expect("live object"),
+        &CarriedKeys::Builtin,
     );
 
     assert!(!changed, "an identical block is not a change to write back");
@@ -1914,7 +1915,7 @@ fn a_sign_out_drops_the_account_keys_and_keeps_the_mcp_logins() {
     });
 
     assert_eq!(
-        strip_account_credentials(&mut blob),
+        strip_account_credentials(&mut blob, &CarriedKeys::Builtin),
         SignOut::Write,
         "an item still holding MCP logins is written back stripped"
     );
@@ -1937,16 +1938,52 @@ fn a_sign_out_drops_the_account_keys_and_keeps_the_mcp_logins() {
     );
 }
 
+/// A key the operator carries survives a sign-out even when Claude Code scopes
+/// it to the account: the list says it belongs to no account on this host, and
+/// the switch that signs out is the one that would otherwise have carried it.
+/// The login and the keys the list does not name still go.
+#[test]
+fn a_sign_out_keeps_the_keys_the_operator_carries() {
+    let listed = CarriedKeys::Configured(vec![
+        "mcpOAuth".into(),
+        "designOauth".into(),
+        "claudeAiOauth".into(),
+    ]);
+    let mut blob = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "outgoing-login" },
+        "organizationUuid": "org-1",
+        "trustedDeviceToken": "device-1",
+        "designOauth": { "accessToken": "design-1" }
+    });
+
+    assert_eq!(
+        strip_account_credentials(&mut blob, &listed),
+        SignOut::Write,
+        "an item still holding a carried design login is written back stripped"
+    );
+
+    for key in ["claudeAiOauth", "organizationUuid", "trustedDeviceToken"] {
+        assert!(
+            blob.get(key).is_none(),
+            "'{key}' goes: the login whatever the list says, the rest because it is not listed"
+        );
+    }
+    assert_eq!(blob["designOauth"]["accessToken"], "design-1");
+}
+
 /// An item holding nothing but the login has nothing left to keep, and the
 /// caller deletes it rather than leaving an empty husk where a clean absence was.
 #[test]
 fn a_sign_out_over_a_login_only_item_leaves_nothing_to_keep() {
     let mut login_only = serde_json::json!({ "claudeAiOauth": { "accessToken": "outgoing" } });
-    assert_eq!(strip_account_credentials(&mut login_only), SignOut::Delete);
+    assert_eq!(
+        strip_account_credentials(&mut login_only, &CarriedKeys::Builtin),
+        SignOut::Delete
+    );
 
     let mut not_an_object = serde_json::json!("torn");
     assert_eq!(
-        strip_account_credentials(&mut not_an_object),
+        strip_account_credentials(&mut not_an_object, &CarriedKeys::Builtin),
         SignOut::Delete,
         "an item that is not an object carries nothing worth preserving"
     );
@@ -1961,7 +1998,10 @@ fn a_store_with_no_account_keys_is_already_signed_out() {
     let mut mcp_only =
         serde_json::json!({ "mcpOAuth": { "linear": { "accessToken": "mock-linear" } } });
 
-    assert_eq!(strip_account_credentials(&mut mcp_only), SignOut::Nothing);
+    assert_eq!(
+        strip_account_credentials(&mut mcp_only, &CarriedKeys::Builtin),
+        SignOut::Nothing
+    );
     assert_eq!(
         mcp_only["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
         "and it is left exactly as it was"
