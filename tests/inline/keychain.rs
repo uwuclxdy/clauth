@@ -1676,7 +1676,8 @@ fn a_sign_out_over_unparseable_bytes_quarantines_them_and_still_deletes() {
 
     // The sign-out over the corrupted item: the read comes back unparseable,
     // the bytes are quarantined, and the delete still runs.
-    sign_out_at(&service, account).expect("the sign-out still completes over a corrupted item");
+    sign_out_at(&service, account, &CarriedKeys::Builtin)
+        .expect("the sign-out still completes over a corrupted item");
     drop(_capture);
 
     // The event line: current shape plus the salvage, and the path it names is
