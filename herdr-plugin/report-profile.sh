@@ -21,6 +21,38 @@ herdr_bin="${HERDR_BIN_PATH:-herdr}"
 sessions_dir="$HOME/.clauth/live_sessions"
 pane="${HERDR_PANE_ID:-}"
 
+# The parent pid and the argv line of process $1, from /proc where there is
+# one. `ps -o … -p <pid>` reads the whole process table to answer for a single
+# pid: ~57 ms of CPU a call on a Linux host running ~1,200 processes, against
+# ~2 ms for the /proc read (measured 2026-09-25), and every watcher tick of
+# every pane makes several. macOS has no /proc, so ps answers there. The tests
+# point CLAUTH_PROC_ROOT at a faked tree.
+proc_root="${CLAUTH_PROC_ROOT:-/proc}"
+proc_ppid() {
+    if [ -d "$proc_root" ]; then
+        # comm sits in parentheses and may itself hold ") ", so cut after the
+        # LAST one: the state letter is then the first field, the ppid the
+        # second.
+        _stat=
+        read -r _stat 2>/dev/null <"$proc_root/$1/stat" || return 0
+        _stat=${_stat##*") "}
+        # Unquoted on purpose: the split into fields is the point.
+        set -- $_stat
+        printf '%s\n' "${2:-}"
+    else
+        ps -o ppid= -p "$1" 2>/dev/null | tr -d ' '
+    fi
+}
+proc_args() {
+    if [ -d "$proc_root" ]; then
+        # NUL-separated argv, joined by spaces the way ps prints it.
+        _cmd=$(tr '\0\n' '  ' 2>/dev/null <"$proc_root/$1/cmdline") || return 0
+        printf '%s\n' "${_cmd% }"
+    else
+        ps -o args= -p "$1" 2>/dev/null
+    fi
+}
+
 # Prints the registry row owning $1 or one of its ancestors, empty if none.
 # A `clauth mcp` hop is never matched: rows keyed on it belong to delegate runs
 # the pane hosts, and matching one would name a delegate's account for the
@@ -29,7 +61,7 @@ session_row() {
     _pid=$1
     _depth=0
     while [ "${_pid:-0}" -gt 1 ] && [ "$_depth" -lt 8 ]; do
-        _args=$(ps -o args= -p "$_pid" 2>/dev/null)
+        _args=$(proc_args "$_pid")
         case "$_args" in
             'clauth mcp '* | 'clauth mcp') : ;;
             *)
@@ -46,7 +78,7 @@ session_row() {
                 fi
                 ;;
         esac
-        _pid=$(ps -o ppid= -p "$_pid" 2>/dev/null | tr -d ' ')
+        _pid=$(proc_ppid "$_pid")
         _depth=$((_depth + 1))
     done
     return 1
@@ -135,8 +167,8 @@ if [ -n "$pane" ]; then
     if [ -z "$profile" ] && [ -z "$fg_pid" ]; then
         pids=$(printf '%s' "$info" | grep -o '"pid":[0-9]*' | cut -d: -f2)
         for pid in $pids; do
-            _pp=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-            _pargs=$(ps -o args= -p "$_pp" 2>/dev/null)
+            _pp=$(proc_ppid "$pid")
+            _pargs=$(proc_args "$_pp")
             case "$_pargs" in 'clauth mcp '* | 'clauth mcp') continue ;; esac
             row=$(session_row "$pid") || continue
             profile=$(row_profile "$row")

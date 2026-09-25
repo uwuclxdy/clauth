@@ -2621,6 +2621,8 @@ fn report_profile_run(
     .env("HERDR_PLUGIN_ID", "clauth")
     .env("HERDR_PANE_ID", "p1")
     .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+    // Never the host's /proc: see `report_profile_resolve_run_in`.
+    .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
     .env("HOME", home.home())
     .env(
         "PATH",
@@ -2820,7 +2822,76 @@ fn report_profile_resolve_run_as(
     rows: &[(&str, &str, u32)],
     stale_row: Option<&str>,
 ) -> (Vec<String>, bool) {
+    let (lines, watcher, _) = report_profile_resolve_run_in(
+        agent_json,
+        adopted_codex,
+        info_json,
+        ps_body,
+        None,
+        rows,
+        stale_row,
+    );
+    (lines, watcher)
+}
+
+/// A faked `/proc`: one `(pid, ppid, argv)` per process, `argv` space-joined
+/// the way `ps -o args=` prints it.
+#[cfg(unix)]
+type ProcTree<'a> = &'a [(u32, u32, &'a str)];
+
+/// [`report_profile_resolve_run`] on the Linux path: the script reads the
+/// process tree from a faked `/proc` instead of asking `ps`. The `ps` shim
+/// only logs its argv and fails, so a `ps` call both shows up and breaks the
+/// resolve. Returns the report lines and every logged `ps` call.
+#[cfg(unix)]
+fn report_profile_resolve_run_proc(
+    info_json: &str,
+    tree: ProcTree<'_>,
+    rows: &[(&str, &str, u32)],
+) -> (Vec<String>, Vec<String>) {
+    let (lines, _, ps_calls) = report_profile_resolve_run_in(
+        r#"{"agent":"claude"}"#,
+        None,
+        info_json,
+        "echo \"$*\" >> \"$(dirname \"$0\")/ps.log\"\nexit 1\n",
+        Some(tree),
+        rows,
+        None,
+    );
+    (lines, ps_calls)
+}
+
+/// The shared body of the resolve runs above. `proc_tree = None` points
+/// `CLAUTH_PROC_ROOT` at a directory that does not exist, so the script takes
+/// its `ps` path (the one macOS runs) and the scripted `ps` shim answers.
+/// Either way the variable is set: left unset, the script would read the
+/// HOST's `/proc`, where the fake pids these tests use may be real processes.
+#[cfg(unix)]
+fn report_profile_resolve_run_in(
+    agent_json: &str,
+    adopted_codex: Option<&str>,
+    info_json: &str,
+    ps_body: &str,
+    proc_tree: Option<ProcTree<'_>>,
+    rows: &[(&str, &str, u32)],
+    stale_row: Option<&str>,
+) -> (Vec<String>, bool, Vec<String>) {
     let home = crate::testutil::HomeSandbox::new();
+    let proc_root = home.home().join("proc");
+    for (pid, ppid, argv) in proc_tree.unwrap_or_default() {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).expect("proc dir");
+        // The comm field holds ") " itself, as a real one may: a parser that
+        // cuts at the FIRST ") " reads the state letter as the ppid.
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (a) b) S {ppid} {pid} {pid} 0 -1\n"),
+        )
+        .expect("stat written");
+        let mut cmdline = argv.replace(' ', "\0");
+        cmdline.push('\0');
+        std::fs::write(dir.join("cmdline"), cmdline).expect("cmdline written");
+    }
     let sessions = home.home().join(".clauth/live_sessions");
     std::fs::create_dir_all(&sessions).expect("sessions dir");
     if let Some(name) = adopted_codex {
@@ -2869,6 +2940,7 @@ fn report_profile_resolve_run_as(
     .env("HERDR_PLUGIN_EVENT_JSON", agent_json)
     .env_remove("CODEX_HOME")
     .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+    .env("CLAUTH_PROC_ROOT", &proc_root)
     .env("HOME", home.home())
     .env(
         "PATH",
@@ -2884,13 +2956,19 @@ fn report_profile_resolve_run_as(
         "the script exits 0: stderr {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let read_lines = |name: &str| -> Vec<String> {
+        std::fs::read_to_string(home.home().join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
     let pidfile = home.home().join("state/watch-p1.pid");
-    (lines, pidfile.exists())
+    (
+        read_lines("report.log"),
+        pidfile.exists(),
+        read_lines("ps.log"),
+    )
 }
 
 /// The token the resolve published; the four resolution tests below pin the
@@ -2957,6 +3035,92 @@ fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
         ps,
         &[("1000-0", "uwuclxdy", 1000), ("1003-0", "D3", 1003)],
         None,
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the sweep climbs past the mcp to the pane's supervisor: {}",
+        lines[0]
+    );
+}
+
+/// On Linux the walk reads `/proc` and never runs `ps`: each `ps -o … -p` scans
+/// every process on the host to answer for one, and every watcher tick of every
+/// pane makes several. This is the foreground case above, answered from a faked
+/// `/proc` whose `ps` shim fails on any call.
+#[cfg(unix)]
+#[test]
+fn the_proc_walk_resolves_the_foreground_chain_without_ps() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"clauth"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let (lines, ps_calls) = report_profile_resolve_run_proc(
+        info,
+        &[
+            (1000, 1, "clauth start uwuclxdy"),
+            (1001, 1002, "claude"),
+            (1002, 1000, "clauth mcp"),
+        ],
+        &[("1000-0", "uwuclxdy", 1000), ("1002-0", "D3", 1002)],
+    );
+    assert!(
+        ps_calls.is_empty(),
+        "no ps call on the /proc path: {ps_calls:?}"
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the pane's own session wins over the delegate row: {}",
+        lines[0]
+    );
+}
+
+/// The `/proc` ppid read decides the answer here: the foreground pid has no
+/// row of its own, so only the climb to its parent reaches one. A ppid parse
+/// that cuts `stat` at the FIRST ") " (the faked comm holds one) reads the
+/// state letter as the parent, stops the climb, and falls to `clauth which`.
+#[cfg(unix)]
+#[test]
+fn the_proc_walk_climbs_to_the_parent_row() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1000,"command":"claude"}]}}"#;
+    let (lines, ps_calls) = report_profile_resolve_run_proc(
+        info,
+        &[(1000, 1, "clauth start uwuclxdy"), (1001, 1000, "claude")],
+        &[("1000-0", "uwuclxdy", 1000)],
+    );
+    assert!(
+        ps_calls.is_empty(),
+        "no ps call on the /proc path: {ps_calls:?}"
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the climb reaches the parent's row, not the global account: {}",
+        lines[0]
+    );
+}
+
+/// The compat sweep on the `/proc` path: the parent check and the climb both
+/// read `/proc`, and an mcp carrying arguments (`clauth mcp --stdio`, the
+/// `'clauth mcp '*` arm) is still recognised and climbed through. The delegate
+/// child 1002 carries a row of its own, so the sweep's parent check is what
+/// keeps its account off the pane.
+#[cfg(unix)]
+#[test]
+fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let (lines, ps_calls) = report_profile_resolve_run_proc(
+        info,
+        &[
+            (1000, 1, "clauth start uwuclxdy"),
+            (1001, 1000, "claude"),
+            (1002, 1003, "claude"),
+            (1003, 1001, "clauth mcp --stdio"),
+        ],
+        &[
+            ("1000-0", "uwuclxdy", 1000),
+            ("1002-0", "D3", 1002),
+            ("1003-0", "D3", 1003),
+        ],
+    );
+    assert!(
+        ps_calls.is_empty(),
+        "no ps call on the /proc path: {ps_calls:?}"
     );
     assert!(
         token_line(&lines).contains("--token clauth=uwuclxdy"),
@@ -3100,6 +3264,8 @@ fn the_watcher_rereport_keeps_the_codex_harness() {
         .env("HERDR_BIN_PATH", home.home().join("herdr"))
         .env("HERDR_PLUGIN_ID", "clauth")
         .env("HERDR_PLUGIN_STATE_DIR", &state)
+        // Never the host's /proc: see `report_profile_resolve_run_in`.
+        .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
         .env("HOME", home.home())
         .env_remove("CODEX_HOME")
         .env(
@@ -3182,6 +3348,8 @@ fn the_spawned_codex_watcher_keeps_the_harness() {
         .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"codex"}"#)
         .env("HERDR_PLUGIN_CONTEXT_JSON", "")
         .env("HERDR_PLUGIN_STATE_DIR", &state)
+        // Never the host's /proc: see `report_profile_resolve_run_in`.
+        .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
         .env("HOME", home.home())
         .env_remove("CODEX_HOME")
         .env(
