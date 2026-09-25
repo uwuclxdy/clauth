@@ -503,9 +503,11 @@ pub(crate) fn write_session_token_with_backup(
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let dir = profile_dir(name)?;
     with_state_lock(|_held| {
-        // The mint is the same in both files. Only the sidecar keeps the
-        // carried keys: it is what a session reads, and the backup is the mint
-        // a restore puts back, which re-attaches them from the sidecar then.
+        // The mint is the same in both files. Only the sidecar re-attaches the
+        // carried keys here; the backup gets the plain mint. It is not always
+        // the mint alone: a roll's `preserve_static_mint` copies the sidecar
+        // raw, carried keys included, which is why a restore prefers the
+        // sidecar's current copy over the backup's.
         let sidecar = dir.join("session-token.json");
         atomic_write_600(&sidecar, keep_carried_in_sidecar(&bytes, &sidecar))
             .context("write session-token.json")?;
@@ -1755,9 +1757,8 @@ fn clear_readonly(_path: &Path) -> bool {
 /// Claude Design with the same login wants it to follow the switch.
 const CARRIED_CREDENTIAL_KEYS: [&str; 1] = ["mcpOAuth"];
 
-/// The login's own key in the credential store. No carried-key list may name
-/// it: the load of profiles.toml refuses such a list, and [`CarriedKeys::keys`]
-/// drops it again for any path that got past that.
+/// The login's own key in the credential store. No carried-key list moves it:
+/// [`CarriedKeys::keys`] drops it whatever the list says.
 pub(crate) const LOGIN_CREDENTIAL_KEY: &str = "claudeAiOauth";
 
 /// Which credential-store keys cross accounts, and whether the operator chose
@@ -1771,28 +1772,43 @@ pub(crate) enum CarriedKeys {
     Builtin,
     /// The operator's `carried_credential_keys`, replacing the built-in list.
     Configured(Vec<String>),
+    /// profiles.toml exists but does not load, so whether a list is set is not
+    /// known. Carries the built-in list, but a sidecar writer keeps every
+    /// non-login key the current sidecar holds: reading this as "unset" there
+    /// would delete what an operator's list carried in, and a broken hand-edit
+    /// must not cost the logins it was meant to keep.
+    Unreadable,
 }
 
 impl CarriedKeys {
     /// The operator's choice, read off disk at the moment of the carry, the way
     /// every persist leg re-reads the record: a daemon holding a config loaded
-    /// before an edit still carries what the file says now. Anything that keeps
-    /// profiles.toml from loading, a list naming the login included, reads as
-    /// [`Self::Builtin`]: carrying is a convenience that must never be what
-    /// fails a switch, and that load failure is loud on every other path.
+    /// before an edit still carries what the file says now. A list naming the
+    /// login loads with that entry dropped and says so on the event line; the
+    /// file is not refused over it, because every persist leg reads it.
     pub(crate) fn load() -> Self {
         match crate::profile::load_app_state() {
-            Ok(state) => state
-                .carried_credential_keys
-                .map_or(Self::Builtin, Self::Configured),
-            Err(_) => Self::Builtin,
+            Ok(state) => match state.carried_credential_keys {
+                None => Self::Builtin,
+                Some(keys) => {
+                    if keys.iter().any(|key| key == LOGIN_CREDENTIAL_KEY) {
+                        logline!(
+                            "clauth: profiles.toml `carried_credential_keys` names \
+                             `{LOGIN_CREDENTIAL_KEY}`, the account's own login, which no switch \
+                             carries; that entry is ignored, remove it from the list"
+                        );
+                    }
+                    Self::Configured(keys)
+                }
+            },
+            Err(_) => Self::Unreadable,
         }
     }
 
     /// The keys to carry, never the login whatever the list says.
     pub(crate) fn keys(&self) -> Vec<&str> {
         match self {
-            Self::Builtin => CARRIED_CREDENTIAL_KEYS.to_vec(),
+            Self::Builtin | Self::Unreadable => CARRIED_CREDENTIAL_KEYS.to_vec(),
             Self::Configured(keys) => keys
                 .iter()
                 .map(String::as_str)
@@ -1808,7 +1824,8 @@ impl CarriedKeys {
 }
 
 /// The credential-store keys that belong to ONE Claude account, so a sign-out
-/// drops them and nothing carries them onto another account's login. Claude Code
+/// drops them and nothing carries them onto another account's login unless the
+/// operator lists one in `carried_credential_keys` ([`CarriedKeys`]). Claude Code
 /// deletes exactly these five on logout and preserves everything else
 /// (read out of its own logout path), which is the
 /// other side of the line [`CARRIED_CREDENTIAL_KEYS`] draws.
@@ -1846,22 +1863,26 @@ pub(crate) fn carry_keys_over(
     changed
 }
 
-/// [`carry_keys_over`] with the operator's list loaded here, for the macOS
-/// Keychain mirror, whose live slot is a Keychain item rather than a file and
-/// whose call site stays as it was. Loads profiles.toml, so it is no pure
-/// function: a test drives [`carry_keys_over`] instead.
+/// [`carry_keys_over`] on the built-in list, for the macOS Keychain mirror,
+/// whose live slot is a Keychain item rather than a file.
+///
+/// Known gap: `carried_credential_keys` does not reach the Keychain item, so on
+/// macOS, where Claude Code reads the item first, the list does not carry
+/// anything a session sees. Kept pure on purpose: its callers' tests run with
+/// no home sandbox, and threading the list through `keychain.rs` is macOS-only
+/// code that the change adding the list could not compile or run.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
         dead_code,
-        reason = "the only caller is the macOS Keychain mirror; kept compiling on every platform"
+        reason = "the only production caller is the macOS Keychain mirror; pinned on every platform"
     )
 )]
 pub(crate) fn carry_live_extra_over(
     target: &mut serde_json::Map<String, serde_json::Value>,
     live: &serde_json::Map<String, serde_json::Value>,
 ) -> bool {
-    carry_keys_over(target, live, &CarriedKeys::load())
+    carry_keys_over(target, live, &CarriedKeys::Builtin)
 }
 
 /// What a sign-out found in a credential store, and so what its caller owes the
@@ -1913,9 +1934,9 @@ pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value) -> SignOut
     }
 }
 
-/// Copy [`CARRIED_CREDENTIAL_KEYS`] from the live credential onto `target`
-/// before it becomes the live credential, so an account switch keeps MCP-server
-/// auth. A key the live file holds overwrites the target's copy; one the live
+/// Copy the carried keys ([`CarriedKeys`]) from the live credential onto
+/// `target` before it becomes the live credential, so an account switch keeps
+/// MCP-server auth and whatever else the operator listed. A key the live file holds overwrites the target's copy; one the live
 /// file lacks is left as the target has it. The login is never touched.
 ///
 /// Accepted ceiling: this can add and overwrite, never delete. A stale block in
@@ -1965,8 +1986,9 @@ fn carry_live_extra_into(
         return Ok(());
     };
     if carry_keys_over(stored_obj, live_obj, keys) {
-        atomic_write_600(target, serde_json::to_string_pretty(&stored)?)
-            .context("failed to carry MCP server logins into profile credentials")?;
+        atomic_write_600(target, serde_json::to_string_pretty(&stored)?).context(
+            "failed to carry MCP server logins and other carried keys into profile credentials",
+        )?;
     }
     Ok(())
 }
@@ -1980,11 +2002,12 @@ fn carry_live_extra_into(
 ///
 /// `fresh` unchanged for the built-in list, which never reaches the sidecar,
 /// and on any read or parse failure: keeping carried keys is a convenience, and
-/// the write it rides on is not. Callers hold the state flock, so the read and
-/// their write see the same file.
+/// the write it rides on is not. An unreadable profiles.toml keeps every
+/// non-login key instead ([`CarriedKeys::Unreadable`]). Callers hold the state
+/// flock, so the read and their write see the same file.
 fn keep_carried_in_sidecar(fresh: &[u8], sidecar: &Path) -> Vec<u8> {
     let keys = CarriedKeys::load();
-    if !keys.reaches_the_sidecar() {
+    if matches!(keys, CarriedKeys::Builtin) {
         return fresh.to_vec();
     }
     let Ok(current) = read_json_file::<serde_json::Value>(sidecar) else {
@@ -1997,7 +2020,19 @@ fn keep_carried_in_sidecar(fresh: &[u8], sidecar: &Path) -> Vec<u8> {
     else {
         return fresh.to_vec();
     };
-    if !carry_keys_over(rebuilt_obj, current_obj, &keys) {
+    let changed = if matches!(keys, CarriedKeys::Unreadable) {
+        let mut changed = false;
+        for (key, value) in current_obj {
+            if key != LOGIN_CREDENTIAL_KEY && rebuilt_obj.get(key) != Some(value) {
+                rebuilt_obj.insert(key.clone(), value.clone());
+                changed = true;
+            }
+        }
+        changed
+    } else {
+        carry_keys_over(rebuilt_obj, current_obj, &keys)
+    };
+    if !changed {
         return fresh.to_vec();
     }
     serde_json::to_vec_pretty(&rebuilt).unwrap_or_else(|_| fresh.to_vec())
@@ -2091,8 +2126,9 @@ pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
 fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) {
     if let Err(e) = carry_live_extra_into(link, target, name, &CarriedKeys::load()) {
         logline!(
-            "clauth: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
-             Re-authenticate any MCP server that reports a signed-out session"
+            "clauth: switched to '{name}' but could not carry its MCP server logins or other \
+             carried keys: {e:#}. Re-authenticate any MCP server or design login that reports \
+             a signed-out session"
         );
     }
 }

@@ -986,9 +986,11 @@ pub(crate) struct AppState {
     /// into a setup-token sidecar and keeps them across its re-mint, which the
     /// built-in list does not do. Opt-in because the store is one object Claude
     /// Code rewrites wholesale: which of its keys belong to no account is the
-    /// operator's call, not a guess made for everyone. `claudeAiOauth` is
-    /// refused at load ([`load_app_state`]): the login itself never crosses.
-    /// Read through `claude::CarriedKeys::load`.
+    /// operator's call, not a guess made for everyone. `claudeAiOauth` never
+    /// crosses: an entry naming it is ignored with a log line. Not refused at
+    /// load, because every persist leg re-reads this file under the flock, and a
+    /// running daemon whose rotation fails that read has already spent the
+    /// single-use refresh token. Read through `claude::CarriedKeys::load`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) carried_credential_keys: Option<Vec<String>>,
     /// Chain-wide weekly (7d) exhaustion line, percent — past it an account
@@ -2427,21 +2429,6 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     }
     if state.context_nudge_threshold_tokens.is_some() {
         state.context_nudge_threshold_tokens = state.context_nudge_threshold_tokens();
-    }
-    // Refused rather than normalized away: a list naming the login is an
-    // operator asking for the one thing no switch may do, and dropping the
-    // entry silently would leave them believing it happens.
-    if let Some(keys) = &state.carried_credential_keys
-        && keys
-            .iter()
-            .any(|k| k == crate::claude::LOGIN_CREDENTIAL_KEY)
-    {
-        anyhow::bail!(
-            "{}: `carried_credential_keys` names `{}`, the account's own login, which no switch \
-             may carry onto another account; remove it from the list",
-            path.display(),
-            crate::claude::LOGIN_CREDENTIAL_KEY
-        );
     }
     Ok(state)
 }

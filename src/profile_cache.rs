@@ -99,6 +99,8 @@ pub(crate) fn auth_expired_matches(name: &ProfileName, credential: u64) -> bool 
 /// them. Carries none of the account's own credential material: the blocks
 /// inside are minted per (MCP server, endpoint) and belong to no Claude account,
 /// which is why a profile that stops storing a login still has to keep them.
+/// With `carried_credential_keys` set it parks the listed keys instead, which
+/// can include one Claude Code treats as account-scoped (`designOauth`).
 pub(crate) const MCP_LOGINS_FILE: &str = "mcp-logins.json";
 
 pub(crate) const TOUCH_RECEIPT_FILE: &str = "touch-receipt.json";

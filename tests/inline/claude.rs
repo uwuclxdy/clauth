@@ -1886,10 +1886,9 @@ fn carrying_a_key_the_target_already_holds_reports_no_change() {
         "mcpOAuth": { "linear": { "accessToken": "same" } }
     });
 
-    let changed = carry_keys_over(
+    let changed = carry_live_extra_over(
         target.as_object_mut().expect("target object"),
         live.as_object().expect("live object"),
-        &CarriedKeys::Builtin,
     );
 
     assert!(!changed, "an identical block is not a change to write back");
@@ -4711,8 +4710,9 @@ fn the_boot_relink_keeps_a_design_login_only_the_live_file_holds() {
 
 /// Every sidecar writer rebuilds the file from its token, so a re-mint must put
 /// the carried keys back or the next `clauth login <name> --setup-token` drops
-/// what the switch carried in. The static backup is the mint alone: it is what a
-/// restore reinstalls, and the restore takes the keys from the sidecar then.
+/// what the switch carried in. Pinned here for the two re-mint writers; the
+/// restore has its own test below. The re-mint with backup writes the plain
+/// mint into the static backup.
 #[test]
 fn a_re_mint_keeps_the_carried_keys_its_sidecar_holds() {
     let _home = HomeSandbox::new();
@@ -4753,7 +4753,7 @@ fn a_re_mint_keeps_the_carried_keys_its_sidecar_holds() {
     let backup = read_value(&sidecar.with_file_name("session-token.static.json"));
     assert!(
         backup.get("designOauth").is_none(),
-        "the static backup stays the mint alone"
+        "this writer puts the plain mint into the static backup"
     );
 }
 
@@ -4806,35 +4806,113 @@ fn without_the_key_static_tokens_behave_as_in_0_16_0() {
     );
 }
 
-/// A list naming the login asks for the one thing no switch may do, so the
-/// load refuses it by name instead of dropping the entry quietly. The carry
-/// then falls back to the built-in list rather than failing a switch.
+/// A list naming the login never carries it, and the file still loads: every
+/// persist leg re-reads profiles.toml under the flock, and a running daemon's
+/// rotation that failed that read would already have spent the single-use
+/// refresh token. The rest of the list keeps working.
 #[test]
-fn a_carried_key_list_naming_the_login_is_refused_at_load() {
+fn a_carried_key_list_naming_the_login_never_carries_it() {
     let home = HomeSandbox::new();
     let clauth = home.home().join(".clauth");
     fs::create_dir_all(&clauth).expect("mkdir");
     fs::write(
         clauth.join("profiles.toml"),
-        "profiles = [\"a\"]\ncarried_credential_keys = [\"mcpOAuth\", \"claudeAiOauth\"]\n",
+        "profiles = [\"a\"]\ncarried_credential_keys = [\"claudeAiOauth\", \"designOauth\"]\n",
     )
     .expect("write state");
 
-    let err = crate::profile::load_app_state().expect_err("a list naming the login must not load");
-    assert!(
-        format!("{err:#}").contains("`claudeAiOauth`"),
-        "the refusal names the key, got: {err:#}"
+    crate::profile::load_app_state().expect("a list naming the login must not break the file");
+    let keys = CarriedKeys::load();
+    assert_eq!(keys.keys(), ["designOauth"], "the login entry is dropped");
+
+    let live = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "live-login" },
+        "designOauth": design_login()
+    });
+    let mut target = serde_json::json!({ "claudeAiOauth": { "accessToken": "target-login" } });
+    carry_keys_over(
+        target.as_object_mut().expect("target object"),
+        live.as_object().expect("live object"),
+        &keys,
     );
-    assert_eq!(CarriedKeys::load(), CarriedKeys::Builtin);
-
-    fs::write(
-        clauth.join("profiles.toml"),
-        "profiles = [\"a\"]\ncarried_credential_keys = [\"mcpOAuth\", \"designOauth\"]\n",
-    )
-    .expect("write state");
     assert_eq!(
-        CarriedKeys::load(),
-        CarriedKeys::Configured(vec!["mcpOAuth".into(), "designOauth".into()]),
-        "a list without the login loads as written"
+        target["claudeAiOauth"]["accessToken"], "target-login",
+        "the incoming account keeps its own login whatever the list says"
+    );
+    assert_eq!(target["designOauth"], design_login());
+}
+
+/// A profiles.toml that does not load says nothing about whether a list is
+/// set. Reading that as "unset" would let the next re-mint strip what the list
+/// carried into the sidecar, so a broken hand-edit would cost the very logins
+/// it was meant to keep. The sidecar writers keep every non-login key instead.
+#[test]
+fn an_unreadable_profiles_toml_never_strips_a_sidecar() {
+    let home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", Some(&["mcpOAuth", "designOauth"]));
+    let sidecar = sidecar_of("a");
+    let mut held = read_value(&sidecar);
+    held["designOauth"] = design_login();
+    fs::write(&sidecar, serde_json::to_vec_pretty(&held).expect("ser")).expect("seed");
+    fs::write(
+        home.home().join(".clauth").join("profiles.toml"),
+        "profiles = [\"a\"\n",
+    )
+    .expect("break the state file");
+    assert_eq!(CarriedKeys::load(), CarriedKeys::Unreadable);
+
+    write_session_token(
+        &crate::profile::ProfileName::from("a"),
+        &mint_for("a2"),
+        crate::usage::now_ms() as i64,
+    )
+    .expect("re-mint");
+
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "an unreadable state file keeps the sidecar's carried login"
+    );
+}
+
+/// The static restore reinstalls the backup's mint over the sidecar. A roll's
+/// `preserve_static_mint` copies the sidecar raw, so the backup can hold an
+/// older copy of a carried login than the sidecar does; the sidecar's current
+/// copy wins.
+#[test]
+fn a_static_restore_keeps_the_sidecars_current_carried_copy() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", Some(&["mcpOAuth", "designOauth"]));
+    let name = crate::profile::ProfileName::from("a");
+    write_session_token_with_backup(&name, &mint_for("a"), crate::usage::now_ms() as i64)
+        .expect("mint with backup");
+    let sidecar = sidecar_of("a");
+    let backup = sidecar.with_file_name("session-token.static.json");
+    let mut older = design_login();
+    older["accessToken"] = serde_json::json!("mock-design-access-older");
+    let mut in_backup = read_value(&backup);
+    in_backup["designOauth"] = older;
+    fs::write(&backup, serde_json::to_vec_pretty(&in_backup).expect("ser")).expect("seed backup");
+    let mut in_sidecar = read_value(&sidecar);
+    in_sidecar["designOauth"] = design_login();
+    fs::write(
+        &sidecar,
+        serde_json::to_vec_pretty(&in_sidecar).expect("ser"),
+    )
+    .expect("seed sidecar");
+
+    assert!(
+        restore_static_mint(&name).expect("restore"),
+        "a live backup restores"
+    );
+
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "the sidecar's current carried login wins over the backup's older copy"
     );
 }

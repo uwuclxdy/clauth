@@ -5813,7 +5813,10 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     // listed (Claude Code's first credential write, `/design-login` among them,
     // replaces the link with a regular file), and it goes with the file. The
     // switch and the boot relink carry those keys; a `clauth start` session
-    // over a static token does not yet.
+    // over a static token does not yet. Worse than a missed carry once the
+    // list is set: the sidecar then HOLDS the carried login, so the session
+    // reads it, and a refresh the session makes of it (a rotating refresh
+    // token) is discarded here after the old token was spent.
     if differs
         && canonical
             .file_name()
