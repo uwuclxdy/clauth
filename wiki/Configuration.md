@@ -147,6 +147,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
 | `default_divergence` | string | none | auto-resolve a credential mismatch: `Overwrite`, `NewProfile`, `Discard` |
+| `carried_credential_keys` | list | `["mcpOAuth"]` | the keys of Claude Code's credential store a switch copies from the live login onto the incoming account, e.g. `["mcpOAuth", "designOauth"]` to keep a `/design-login` across accounts. Replaces the built-in list, and unlike it also reaches a setup-token sidecar and survives its re-mint. `claudeAiOauth` is refused. Not yet honored inside `clauth start` sessions |
 | `theme` | string | auto | `full` or `compatible` |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |

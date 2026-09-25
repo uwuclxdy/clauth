@@ -978,6 +978,19 @@ pub(crate) struct AppState {
     /// Divergence modal (current behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) default_divergence: Option<DivergenceChoice>,
+    /// The credential-store keys a switch copies from the live login onto the
+    /// incoming account, REPLACING the built-in list (`mcpOAuth` alone, see
+    /// `claude::CARRIED_CREDENTIAL_KEYS`). `None` = the built-in list with its
+    /// 0.16.0 behavior byte for byte, so an untouched profiles.toml carries
+    /// neither this key nor any change. Setting it also lets the listed keys
+    /// into a setup-token sidecar and keeps them across its re-mint, which the
+    /// built-in list does not do. Opt-in because the store is one object Claude
+    /// Code rewrites wholesale: which of its keys belong to no account is the
+    /// operator's call, not a guess made for everyone. `claudeAiOauth` is
+    /// refused at load ([`load_app_state`]): the login itself never crosses.
+    /// Read through `claude::CarriedKeys::load`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) carried_credential_keys: Option<Vec<String>>,
     /// Chain-wide weekly (7d) exhaustion line, percent — past it an account
     /// counts as exhausted in BOTH walk directions (switch trigger + candidate
     /// acceptance); the wrap-off `Off` decision ignores it and keys on the
@@ -1223,6 +1236,7 @@ impl Default for AppState {
             refresh_interval_ms: default_refresh_interval(),
             context_nudge_threshold_tokens: None,
             default_divergence: None,
+            carried_credential_keys: None,
             weekly_switch_threshold: None,
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
@@ -2413,6 +2427,21 @@ pub(crate) fn load_app_state() -> Result<AppState> {
     }
     if state.context_nudge_threshold_tokens.is_some() {
         state.context_nudge_threshold_tokens = state.context_nudge_threshold_tokens();
+    }
+    // Refused rather than normalized away: a list naming the login is an
+    // operator asking for the one thing no switch may do, and dropping the
+    // entry silently would leave them believing it happens.
+    if let Some(keys) = &state.carried_credential_keys
+        && keys
+            .iter()
+            .any(|k| k == crate::claude::LOGIN_CREDENTIAL_KEY)
+    {
+        anyhow::bail!(
+            "{}: `carried_credential_keys` names `{}`, the account's own login, which no switch \
+             may carry onto another account; remove it from the list",
+            path.display(),
+            crate::claude::LOGIN_CREDENTIAL_KEY
+        );
     }
     Ok(state)
 }

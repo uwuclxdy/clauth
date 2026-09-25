@@ -1729,6 +1729,7 @@ fn carry_copies_mcp_oauth_and_leaves_the_target_login_untouched() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        &CarriedKeys::Builtin,
     )
     .expect("carry");
 
@@ -1817,6 +1818,7 @@ fn carry_skips_the_static_token_sidecar() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        &CarriedKeys::Builtin,
     )
     .expect("carry");
 
@@ -1857,6 +1859,7 @@ fn carry_moves_only_the_allowlisted_key() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        &CarriedKeys::Builtin,
     )
     .expect("carry");
 
@@ -1883,9 +1886,10 @@ fn carrying_a_key_the_target_already_holds_reports_no_change() {
         "mcpOAuth": { "linear": { "accessToken": "same" } }
     });
 
-    let changed = carry_live_extra_over(
+    let changed = carry_keys_over(
         target.as_object_mut().expect("target object"),
         live.as_object().expect("live object"),
+        &CarriedKeys::Builtin,
     );
 
     assert!(!changed, "an identical block is not a change to write back");
@@ -1993,6 +1997,7 @@ fn carry_keeps_the_store_at_0600() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        &CarriedKeys::Builtin,
     )
     .expect("carry");
 
@@ -2116,8 +2121,13 @@ fn a_carry_with_no_store_to_land_in_parks_instead() {
 
     // The park the carry falls back to is a cache write, gated on the record.
     crate::testutil::register_names(&["apikey"]);
-    carry_live_extra_into(&live, &absent, &crate::profile::ProfileName::from("apikey"))
-        .expect("carry");
+    carry_live_extra_into(
+        &live,
+        &absent,
+        &crate::profile::ProfileName::from("apikey"),
+        &CarriedKeys::Builtin,
+    )
+    .expect("carry");
 
     let parked: serde_json::Value = crate::profile_cache::load_profile_cache(
         &crate::profile::ProfileName::from("apikey"),
@@ -4537,4 +4547,294 @@ fn claude_settings_models_reads_model_fallbacks_and_the_subagent_key() {
 
     fs::write(dir.join("settings.json"), r#"{"fallbackModel":"sonnet"}"#).unwrap();
     assert!(claude_settings_models().unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// `carried_credential_keys`: an operator's list of credential-store keys a
+// switch carries, replacing the built-in `mcpOAuth`. Driven on the host shape
+// that motivated it: every account a static-token profile (a sidecar and no
+// `credentials.json`), and Claude Code's credential write renaming a staged
+// file over clauth's symlink, so a `/design-login` lives in the live file alone.
+// Every token below is synthetic.
+// ---------------------------------------------------------------------------
+
+/// A mint-shaped token of `name`'s own, so each account's login is told apart.
+fn mint_for(name: &str) -> String {
+    format!("sk-ant-oat01-{name}-{}", "m".repeat(40))
+}
+
+/// A synthetic design login, the shape Claude Code stores under `designOauth`.
+fn design_login() -> serde_json::Value {
+    serde_json::json!({
+        "accessToken": "mock-design-access",
+        "refreshToken": "mock-design-refresh",
+        "expiresAt": 4_102_444_800_000_i64,
+        "scopes": ["user:design"],
+        "clientId": "mock-design-client"
+    })
+}
+
+/// Seed static-token accounts: a sidecar each and no `credentials.json`, the
+/// roster on disk with `active` active, and profiles.toml's
+/// `carried_credential_keys` as given (`None` leaves the key out of the file).
+fn seed_static_token_accounts(names: &[&str], active: &str, carried: Option<&[&str]>) {
+    let state = crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        active_profile: Some(active.into()),
+        carried_credential_keys: carried.map(|keys| keys.iter().map(|k| k.to_string()).collect()),
+        ..crate::profile::AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    for name in names {
+        crate::profile::save_profile(&crate::profile::Profile::new(name.to_string(), None, None))
+            .expect("save profile");
+        write_session_token(
+            &crate::profile::ProfileName::from(*name),
+            &mint_for(name),
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+    }
+}
+
+fn sidecar_of(name: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("session-token.json")
+}
+
+fn read_value(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
+}
+
+/// Claude Code saving its credential store the way 2.1.282 does: a staged file
+/// renamed over the path, which replaces clauth's symlink with a regular file.
+fn claude_code_saves(live: &serde_json::Value) {
+    let path = claude_credentials_path().expect("creds path");
+    let staged = path.with_extension("staged");
+    fs::write(&staged, serde_json::to_vec_pretty(live).expect("ser")).expect("stage");
+    fs::rename(&staged, &path).expect("rename over the link");
+    assert!(
+        !path
+            .symlink_metadata()
+            .expect("stat")
+            .file_type()
+            .is_symlink(),
+        "the fixture must leave the regular file Claude Code leaves"
+    );
+}
+
+/// Link `active` live, then run `/design-login` on it: Claude Code adds
+/// `designOauth` (and here an MCP login) beside the login it read.
+fn design_login_on_the_live_slot(active: &str) {
+    force_link_profile_credentials(&crate::profile::ProfileName::from(active))
+        .expect("link active");
+    let mut live = read_value(&claude_credentials_path().expect("creds path"));
+    live["designOauth"] = design_login();
+    live["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    claude_code_saves(&live);
+}
+
+fn switch_to(name: &str) {
+    let handle = std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ));
+    crate::actions::switch_profile(&handle, &name.into()).expect("switch");
+}
+
+/// The switch itself, through the path the CLI, the TUI and the daemon take:
+/// the design login a relink onto a sidecar used to discard follows the switch,
+/// and the incoming account keeps its own login.
+#[cfg(unix)]
+#[test]
+fn a_switch_between_static_tokens_carries_a_configured_design_login() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", Some(&["mcpOAuth", "designOauth"]));
+    design_login_on_the_live_slot("a");
+
+    switch_to("b");
+
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert_eq!(
+        live["claudeAiOauth"]["accessToken"],
+        mint_for("b"),
+        "the switch installed account b's own login"
+    );
+    assert_eq!(
+        live["designOauth"],
+        design_login(),
+        "the design login followed the switch onto b's sidecar"
+    );
+    assert_eq!(
+        live["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "a listed MCP login follows it as well"
+    );
+}
+
+/// The state grace and maggie are in on obelix today: the live slot is a
+/// regular file holding the active sidecar's own login plus `designOauth`,
+/// which no store holds. The daemon's and the TUI's boot relink
+/// (`link_profile_credentials` on the active profile) used to replace that file
+/// with the symlink and lose the design login with no switch at all.
+#[cfg(unix)]
+#[test]
+fn the_boot_relink_keeps_a_design_login_only_the_live_file_holds() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", Some(&["mcpOAuth", "designOauth"]));
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    let mut live = read_value(&sidecar_of("a"));
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+    assert!(
+        read_value(&sidecar_of("a")).get("designOauth").is_none(),
+        "the fixture starts with the design login in the live file alone"
+    );
+
+    link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("boot relink");
+
+    let path = claude_credentials_path().expect("creds path");
+    assert!(
+        path.symlink_metadata()
+            .expect("stat")
+            .file_type()
+            .is_symlink(),
+        "the relink still puts clauth's link back"
+    );
+    let after = read_value(&path);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "the design login survives the boot relink, now in a's sidecar"
+    );
+}
+
+/// Every sidecar writer rebuilds the file from its token, so a re-mint must put
+/// the carried keys back or the next `clauth login <name> --setup-token` drops
+/// what the switch carried in. The static backup is the mint alone: it is what a
+/// restore reinstalls, and the restore takes the keys from the sidecar then.
+#[test]
+fn a_re_mint_keeps_the_carried_keys_its_sidecar_holds() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", Some(&["mcpOAuth", "designOauth"]));
+    let sidecar = sidecar_of("a");
+    let mut held = read_value(&sidecar);
+    held["designOauth"] = design_login();
+    fs::write(&sidecar, serde_json::to_vec_pretty(&held).expect("ser")).expect("seed");
+    let now = crate::usage::now_ms() as i64;
+
+    write_session_token(
+        &crate::profile::ProfileName::from("a"),
+        &mint_for("a2"),
+        now,
+    )
+    .expect("re-mint");
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "a re-mint keeps the design login its sidecar held"
+    );
+
+    write_session_token_with_backup(
+        &crate::profile::ProfileName::from("a"),
+        &mint_for("a3"),
+        now,
+    )
+    .expect("re-mint with backup");
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a3"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "so does the rolling profile's re-mint"
+    );
+    let backup = read_value(&sidecar.with_file_name("session-token.static.json"));
+    assert!(
+        backup.get("designOauth").is_none(),
+        "the static backup stays the mint alone"
+    );
+}
+
+/// No `carried_credential_keys`, no change: the 0.16.0 behavior, pinned on
+/// purpose. The carry skips the sidecar, so the switch writes nothing into it
+/// and the design and MCP logins the live file held are gone after it, and a
+/// re-mint rebuilds the sidecar from the mint alone.
+#[cfg(unix)]
+#[test]
+fn without_the_key_static_tokens_behave_as_in_0_16_0() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", None);
+    design_login_on_the_live_slot("a");
+    let b_before = fs::read(sidecar_of("b")).expect("read b");
+
+    switch_to("b");
+
+    assert_eq!(
+        fs::read(sidecar_of("b")).expect("read b"),
+        b_before,
+        "nothing is carried into a sidecar without the operator's list"
+    );
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert!(live.get("designOauth").is_none());
+    assert!(live.get("mcpOAuth").is_none());
+
+    let mut held = read_value(&sidecar_of("b"));
+    held["designOauth"] = design_login();
+    fs::write(
+        sidecar_of("b"),
+        serde_json::to_vec_pretty(&held).expect("ser"),
+    )
+    .expect("seed");
+    write_session_token(
+        &crate::profile::ProfileName::from("b"),
+        &mint_for("b2"),
+        crate::usage::now_ms() as i64,
+    )
+    .expect("re-mint");
+    let keys: Vec<String> = read_value(&sidecar_of("b"))
+        .as_object()
+        .expect("object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        ["claudeAiOauth"],
+        "a re-mint without the list rebuilds the sidecar from the mint alone"
+    );
+}
+
+/// A list naming the login asks for the one thing no switch may do, so the
+/// load refuses it by name instead of dropping the entry quietly. The carry
+/// then falls back to the built-in list rather than failing a switch.
+#[test]
+fn a_carried_key_list_naming_the_login_is_refused_at_load() {
+    let home = HomeSandbox::new();
+    let clauth = home.home().join(".clauth");
+    fs::create_dir_all(&clauth).expect("mkdir");
+    fs::write(
+        clauth.join("profiles.toml"),
+        "profiles = [\"a\"]\ncarried_credential_keys = [\"mcpOAuth\", \"claudeAiOauth\"]\n",
+    )
+    .expect("write state");
+
+    let err = crate::profile::load_app_state().expect_err("a list naming the login must not load");
+    assert!(
+        format!("{err:#}").contains("`claudeAiOauth`"),
+        "the refusal names the key, got: {err:#}"
+    );
+    assert_eq!(CarriedKeys::load(), CarriedKeys::Builtin);
+
+    fs::write(
+        clauth.join("profiles.toml"),
+        "profiles = [\"a\"]\ncarried_credential_keys = [\"mcpOAuth\", \"designOauth\"]\n",
+    )
+    .expect("write state");
+    assert_eq!(
+        CarriedKeys::load(),
+        CarriedKeys::Configured(vec!["mcpOAuth".into(), "designOauth".into()]),
+        "a list without the login loads as written"
+    );
 }
