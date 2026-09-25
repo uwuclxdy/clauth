@@ -3370,6 +3370,11 @@ impl SessionSwap {
                 return Ok(SwapOutcome::Refused(SwapRefused::NoCredentialStore));
             }
             touch_store(&plan, file_mtime(&current))?;
+            // Known gap: nothing is carried onto the incoming member's store
+            // here, neither the built-in `mcpOAuth` nor an operator's
+            // `carried_credential_keys` (`claude::CarriedKeys`). The global
+            // switch carries them; a swap inside a `clauth start` session does
+            // not yet.
             relink_to_canonical(&link, &plan.store)?;
 
             // Past here the session IS on the new member, so nothing may report
@@ -5802,6 +5807,16 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     // canonical and relink; the re-login stays recoverable in the runtime
     // file's lineage, and `clauth login` is the supported way to refresh the
     // profile's usage OAuth pair.
+    //
+    // Known gap: `carried_credential_keys` (`claude::CarriedKeys`) is not
+    // honored here. The runtime file this discards can hold a key the operator
+    // listed (Claude Code's first credential write, `/design-login` among them,
+    // replaces the link with a regular file), and it goes with the file. The
+    // switch and the boot relink carry those keys; a `clauth start` session
+    // over a static token does not yet. Worse than a missed carry once the
+    // list is set: the sidecar then HOLDS the carried login, so the session
+    // reads it, and a refresh the session makes of it (a rotating refresh
+    // token) is discarded here after the old token was spent.
     if differs
         && canonical
             .file_name()

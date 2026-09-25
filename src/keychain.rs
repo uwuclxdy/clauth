@@ -14,8 +14,9 @@
 //! operator out of every MCP server on every switch. Which siblings survive is
 //! [`Keep`]'s decision, and it mirrors the two rules the file path already has:
 //! a switch imports from another account's store and takes an allowlist
-//! (`claude::carry_live_extra_over`), a rotation rewrites this account's own item
-//! and keeps everything (`profile::preserve_extra_blocks`).
+//! (`claude::carry_keys_over`, over the operator's `carried_credential_keys` when
+//! profiles.toml sets it), a rotation rewrites this account's own item and keeps
+//! everything (`profile::preserve_extra_blocks`).
 //!
 //! **The read costs ONE access prompt, ever.** macOS gates a read on the ITEM's
 //! own ACL and binds the grant to the CALLING binary, so an "Always Allow"
@@ -462,10 +463,13 @@ fn account() -> Result<String> {
 }
 
 /// What a write may keep from the item it replaces. The incoming blob always
-/// wins on the keys it carries; this decides what of the OLD one survives beside
-/// it, and the two arms are the file path's own two rules.
+/// wins on its login; this decides what of the OLD one survives beside it, and
+/// the two arms are the file path's own two rules. What survives OVERWRITES the
+/// incoming copy of the same key: the item's is the one Claude Code refreshed
+/// last, which is what keeps a rotated refresh token (an MCP or design login)
+/// alive across the switch.
 #[derive(Clone, Copy)]
-enum Keep {
+enum Keep<'a> {
     /// The incoming login belongs to THIS account, rotated by clauth
     /// (`oauth.rs`'s mirror, which fires only for the active profile and only
     /// once the live login is known not to be foreign). Nothing in the item is
@@ -476,8 +480,10 @@ enum Keep {
     /// device token and gateway blocks do not, for the reason
     /// `strip_home_oauth_account` deletes the cached identity in
     /// `~/.claude.json` on every switch: a present-but-wrong one never
-    /// self-corrects.
-    CarriedOnly,
+    /// self-corrects. Which keys count as account-independent is the list the
+    /// variant carries, loaded by the entry point ([`keychain_install`]) and
+    /// handed down, so the merge below stays pure and its tests need no home.
+    CarriedOnly(&'a crate::claude::CarriedKeys),
 }
 
 /// Read the item's password at `(service, account)` RAW — exactly the bytes
@@ -668,15 +674,17 @@ fn blob_to_merge_with(service: &str, account: &str) -> Option<Value> {
             match carried_raw(&e) {
                 Some(raw) => logline!(
                     "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
-                     The MCP server logins it held are replaced by whatever this profile last \
-                     stored, which on macOS is older than the item's own set — their {}",
+                     The MCP server logins and carried keys it held are replaced by whatever \
+                     this profile last stored, which on macOS is older than the item's own set — \
+                     their {}",
                     quarantine_tail(&quarantine_item_bytes(service, raw))
                 ),
                 None => logline!(
                     "clauth: could not read the macOS Keychain login before replacing it ({e:#}). \
-                     The MCP server logins it held are replaced by whatever this profile last \
-                     stored, which on macOS is older than the item's own set: re-authenticate \
-                     any MCP server that reports a signed-out session, and any that starts failing"
+                     The MCP server logins and carried keys it held are replaced by whatever \
+                     this profile last stored, which on macOS is older than the item's own set: \
+                     re-authenticate any MCP server or design login that reports a signed-out \
+                     session, and any that starts failing"
                 ),
             }
             None
@@ -697,7 +705,7 @@ fn blob_to_merge_with(service: &str, account: &str) -> Option<Value> {
 /// DIFFERS still takes the allowlist, including a rotation of the same account,
 /// which this cannot recognise (`oauth.rs`'s mirror passes `Everything`
 /// explicitly because only it holds that knowledge).
-fn merged_blob(incoming: &Value, existing: Option<&Value>, keep: Keep) -> Value {
+fn merged_blob(incoming: &Value, existing: Option<&Value>, keep: Keep<'_>) -> Value {
     const LOGIN: &str = "claudeAiOauth";
     let mut out = incoming.clone();
     // A NON-EMPTY access token on both sides, never mere key presence: Claude
@@ -718,14 +726,14 @@ fn merged_blob(incoming: &Value, existing: Option<&Value>, keep: Keep) -> Value 
         && existing.and_then(|e| e.get(LOGIN)) == out.get(LOGIN);
     match keep {
         Keep::Everything => crate::profile::preserve_extra_blocks(&mut out, existing),
-        Keep::CarriedOnly if same_login => {
+        Keep::CarriedOnly(_) if same_login => {
             crate::profile::preserve_extra_blocks(&mut out, existing);
         }
-        Keep::CarriedOnly => {
+        Keep::CarriedOnly(carried) => {
             if let (Some(out_obj), Some(existing_obj)) =
                 (out.as_object_mut(), existing.and_then(Value::as_object))
             {
-                crate::claude::carry_live_extra_over(out_obj, existing_obj);
+                crate::claude::carry_keys_over(out_obj, existing_obj, carried);
             }
         }
     }
@@ -756,7 +764,7 @@ fn security_quote(s: &str) -> Result<String> {
 ///
 /// Whether a write happens at all is [`merge_write`]'s call, which is where the
 /// skip and its reasons live.
-fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
+fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep<'_>) -> Result<()> {
     let existing = blob_to_merge_with(service, account);
     match merge_write(incoming, existing.as_ref(), keep) {
         Some(blob) => put_blob_at(service, account, &blob),
@@ -771,7 +779,7 @@ fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) 
 /// decision in this module that costs nothing when wrong in the cheap direction
 /// and a subprocess per tick when wrong in the other, and it had no test at all.
 /// The rules it composes are pinned on every platform where they live
-/// (`claude::carry_live_extra_over`, `profile::preserve_extra_blocks`); this and
+/// (`claude::carry_keys_over`, `profile::preserve_extra_blocks`); this and
 /// [`merged_blob`] are pinned in the ordinary macOS suite, which is as wide as a
 /// `#[cfg(target_os = "macos")]` module reaches.
 ///
@@ -782,7 +790,7 @@ fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) 
 /// merges as `None` (`blob_to_merge_with`), which compares equal to no blob, so
 /// that path always writes — losing the item's siblings is the accepted cost of
 /// completing the switch, and skipping the write would lose the LOGIN too.
-fn merge_write(incoming: &Value, existing: Option<&Value>, keep: Keep) -> Option<Value> {
+fn merge_write(incoming: &Value, existing: Option<&Value>, keep: Keep<'_>) -> Option<Value> {
     let blob = merged_blob(incoming, existing, keep);
     if existing == Some(&blob) {
         return None;
@@ -1353,15 +1361,20 @@ pub(crate) fn classified_exit(e: &anyhow::Error) -> crate::claude::SecurityExitC
 /// Install `store`, the whole JSON object the file layer put in the live slot,
 /// as Claude Code's login. This is what makes an account switch real on macOS:
 /// Claude Code reads this on next launch. The MCP-server logins in the item being
-/// replaced come across ([`Keep::CarriedOnly`]); the outgoing account's own
+/// replaced come across, and so does every other key in `carried`, the operator's
+/// `carried_credential_keys` ([`Keep::CarriedOnly`]); the outgoing account's own
 /// blocks do not.
 ///
 /// Refuses a non-object blob rather than writing it. A store file is external
 /// input to this layer, and CC parses the item's password as one JSON object, so
 /// anything else would leave CC with a credential it cannot read and clauth with
 /// no signal that it happened.
-pub(crate) fn keychain_install(store: &Value) -> Result<()> {
-    install_at(SERVICE, store)
+///
+/// `carried` arrives loaded (`claude::keychain_mirror_source`), the same list
+/// the file layer's carry used within the same relink, so this module never
+/// reads profiles.toml and its tests need no home.
+pub(crate) fn keychain_install(store: &Value, carried: &crate::claude::CarriedKeys) -> Result<()> {
+    install_at(SERVICE, store, carried)
 }
 
 /// Install `store` as the login for a SPECIFIC config dir's item: the
@@ -1372,9 +1385,9 @@ pub(crate) fn keychain_install(store: &Value) -> Result<()> {
 /// alongside the credential link it repoints — on macOS CC resolves the
 /// Keychain FIRST, so the file repoint alone moves nothing a session reads.
 ///
-/// Same merge codepath, same [`Keep::CarriedOnly`] (the MCP-login carry needs
-/// no rule of its own), and the same non-object refusal as [`keychain_install`]:
-/// one Keychain path, two service names.
+/// Same merge codepath, same [`Keep::CarriedOnly`] on the built-in list (the
+/// MCP-login carry needs no rule of its own), and the same non-object refusal as
+/// [`keychain_install`]: one Keychain path, two service names.
 pub(crate) fn keychain_install_for_config_dir(
     store: &Value,
     config_dir: &Path,
@@ -1387,7 +1400,11 @@ pub(crate) fn keychain_install_for_config_dir(
          `{}`",
         owned.service()
     );
-    install_at(&service, store)
+    // Known gap: a `clauth start` session's item keeps the built-in list, not
+    // the operator's `carried_credential_keys`, like the session's file-layer
+    // watchdog and swap (runtime.rs). Honoring the list here alone would carry a
+    // login the session's other legs still drop.
+    install_at(&service, store, &crate::claude::CarriedKeys::Builtin)
 }
 
 /// Read the whole JSON object the per-config-dir item for `config_dir` holds,
@@ -1408,12 +1425,12 @@ pub(crate) fn read_failed_unparseable(e: &anyhow::Error) -> bool {
     carried_raw(e).is_some()
 }
 
-fn install_at(service: &str, store: &Value) -> Result<()> {
+fn install_at(service: &str, store: &Value, carried: &crate::claude::CarriedKeys) -> Result<()> {
     anyhow::ensure!(
         store.is_object(),
         "refusing to install a credential store that is not a JSON object into the Keychain"
     );
-    merge_and_put_at(service, &account()?, store, Keep::CarriedOnly)
+    merge_and_put_at(service, &account()?, store, Keep::CarriedOnly(carried))
 }
 
 /// Mirror `creds` after clauth rotated THIS account's own chain (`oauth.rs`).
@@ -1514,8 +1531,9 @@ fn login_blob_is_ours(blob: Option<&Value>, ours: &[&str]) -> bool {
 /// `force_link_profile_credentials` and `clear_claude_credentials` reach it,
 /// never the guarded relink, so a path that never meant to change accounts
 /// cannot destroy a login clauth does not hold (`claude::keychain_mirror_source`).
-pub(crate) fn keychain_sign_out() -> Result<SignOutOutcome> {
-    sign_out_at(SERVICE, &account()?)
+/// The keys in `carried` stay in the item, like the MCP-server logins.
+pub(crate) fn keychain_sign_out(carried: &crate::claude::CarriedKeys) -> Result<SignOutOutcome> {
+    sign_out_at(SERVICE, &account()?, carried)
 }
 
 /// Sign out the NAMESPACED item for a config dir — the start-site twin of
@@ -1535,7 +1553,8 @@ pub(crate) fn keychain_sign_out_for_config_dir(
          `{}`",
         owned.service()
     );
-    sign_out_at(&service, &account()?)
+    // Built-in list, for the reason `keychain_install_for_config_dir` gives.
+    sign_out_at(&service, &account()?, &crate::claude::CarriedKeys::Builtin)
 }
 
 /// What a sign-out actually did, so a caller whose downstream state follows
@@ -1561,9 +1580,10 @@ pub(crate) enum SignOutOutcome {
 /// item — the hardwired [`SERVICE`] could only be driven against the
 /// operator's real one.
 ///
-/// Drop the account-scoped keys and keep what belongs to no account, so a
-/// wrap-off or a forced relink onto a login-less profile stops the item serving
-/// an account without taking every MCP-server login with it. An item left
+/// Drop the account-scoped keys and keep what belongs to no account (the
+/// MCP-server logins, and every key in `carried`), so a wrap-off or a forced
+/// relink onto a login-less profile stops the item serving an account without
+/// taking every MCP-server login with it. An item left
 /// holding nothing else is deleted outright, which keeps the clean-absence
 /// state this had before the strip. Idempotent, and an absent item is success.
 ///
@@ -1579,7 +1599,11 @@ pub(crate) enum SignOutOutcome {
 /// where the delete is not. A read that failed WITH BYTES quarantines them
 /// first ([`quarantine_item_bytes`]) — the delete still removes the login, but
 /// the evidence survives it, and the event line says where.
-fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
+fn sign_out_at(
+    service: &str,
+    account: &str,
+    carried: &crate::claude::CarriedKeys,
+) -> Result<SignOutOutcome> {
     // The two `None` cases part here rather than sharing an early return: an
     // absent item is already signed out and says nothing, while a read that
     // FAILED takes the most destructive branch there is, deleting the item
@@ -1600,32 +1624,39 @@ fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
             match carried_raw(&e) {
                 Some(raw) => logline!(
                     "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
-                     it could not be read first ({e:#}), so the MCP server logins stored beside \
-                     the login went with it — their {}",
+                     it could not be read first ({e:#}), so the MCP server logins and any \
+                     carried keys stored beside the login went with it — their {}",
                     quarantine_tail(&quarantine_item_bytes(service, raw))
                 ),
                 None => logline!(
                     "clauth: signed Claude Code out of the macOS Keychain by deleting the item: it \
-                     could not be read first ({e:#}), so the MCP server logins stored beside the \
-                     login went with it. Re-authenticate any MCP server that reports a signed-out \
-                     session"
+                     could not be read first ({e:#}), so the MCP server logins and any carried keys \
+                     stored beside the login went with it. Re-authenticate any MCP server or design \
+                     login that reports a signed-out session"
                 ),
             }
             return delete_at(service, account).map(|_| SignOutOutcome::SignedOut);
         }
     };
-    match crate::claude::strip_account_credentials(&mut blob) {
+    match crate::claude::strip_account_credentials(&mut blob, carried) {
         crate::claude::SignOut::Delete => {
             logline!(
-                "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
-                 stores no Claude login). Run `clauth <name>` to put one back"
+                "clauth: signed Claude Code out of the macOS Keychain (no Claude login is live \
+                 now). Run `clauth <name>` to put one back"
             );
             delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
         }
         crate::claude::SignOut::Write => {
+            // Key names only, never a value: which logins survived is what the
+            // operator needs, and a design login is kept here only because a
+            // list asked for it.
+            let kept = blob
+                .as_object()
+                .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_default();
             logline!(
-                "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
-                 stores no Claude login); its MCP server logins were kept"
+                "clauth: signed Claude Code out of the macOS Keychain (no Claude login is live \
+                 now); kept in the item: {kept}"
             );
             put_blob_at(service, account, &blob).map(|_| SignOutOutcome::SignedOut)
         }
