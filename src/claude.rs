@@ -1157,9 +1157,17 @@ enum AbsentSource {
 /// account's own blocks travel with its login and the outgoing account's do not
 /// (`keychain::keychain_install` carries the MCP-server logins across).
 ///
-/// Runs after the symlink swap and is `?`-fatal: a failure leaves the file layer
-/// switched while CC still reads the old Keychain login. Loud and recoverable,
-/// since every write here is idempotent, so retrying the switch re-runs it.
+/// Runs BEFORE the symlink swap. A running Claude Code notices a switch by the
+/// link target's mtime changing, then re-reads the Keychain and memoizes the
+/// new mtime; it never looks again until the mtime moves once more. Swapping
+/// the link first opened a window (seconds, for a switch under load) in which a
+/// session that sent a request saw the new mtime, read the OLD login out of the
+/// item, and stayed on the account the switch left for the rest of its life
+/// (2026-09-24: two busy sessions kept spending a 5h-spent account). With the
+/// item written first, any reload the link triggers reads the new login.
+///
+/// `?`-fatal: a failure here leaves both layers on the old account, and every
+/// write is idempotent, so retrying the switch re-runs it.
 #[cfg(target_os = "macos")]
 fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
     // CLA-SPLIT: callers pass the already-resolved install source so the
@@ -2004,18 +2012,19 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
             carry_live_extra_best_effort(&link, &target, name);
         }
 
+        // macOS: make the switch real, since Claude Code reads the Keychain.
+        // `Leave` because this is the GUARDED relink: it is also what a rename,
+        // a first-ever capture, and the daemon's and TUI's boot reconcile call,
+        // none of which is changing accounts. Before the link, never after: see
+        // [`keychain_mirror_source`].
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() {
+            keychain_mirror_source(&target, AbsentSource::Leave)?;
+        }
         if target.exists() {
             publish_credential_link(&link, &target)?;
         } else if link.symlink_metadata().is_ok() {
             std::fs::remove_file(&link).context("failed to remove old .credentials.json")?;
-        }
-        // macOS: make the switch real, since Claude Code reads the Keychain.
-        // `Leave` because this is the GUARDED relink: it is also what a rename,
-        // a first-ever capture, and the daemon's and TUI's boot reconcile call,
-        // none of which is changing accounts.
-        #[cfg(target_os = "macos")]
-        if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::Leave)?;
         }
 
         Ok(())
@@ -2590,19 +2599,20 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
             // before the swap, so switching accounts keeps them intact.
             carry_live_extra_best_effort(&link, &target, name);
         }
-        if target.exists() {
-            publish_credential_link(&link, &target)?;
-        } else if link.symlink_metadata().is_ok() {
-            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
-        }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `SignOut` because this is the FORCING relink, which every switch path
         // takes: the caller has decided this profile's credentials are what the
         // live slot holds, so a profile storing none must stop the item serving
-        // the account the switch just left.
+        // the account the switch just left. Before the link, never after: see
+        // [`keychain_mirror_source`].
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
             keychain_mirror_source(&target, AbsentSource::SignOut)?;
+        }
+        if target.exists() {
+            publish_credential_link(&link, &target)?;
+        } else if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(&link).context("failed to remove .credentials.json")?;
         }
         Ok(())
     })
