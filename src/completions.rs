@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable use-reset rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -31,6 +31,8 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
         COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "use-reset" ]; then
+        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "which" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
@@ -68,6 +70,8 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--clear --yes" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "disable" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--yes -y" -- "${cur}") )
+    elif [ "${COMP_WORDS[1]}" = "use-reset" ] && [ "${cur:0:2}" = "--" ]; then
+        COMPREPLY=( $(compgen -W "--list --yes -y" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "status" ] && [ "${cur:0:2}" = "--" ]; then
         COMPREPLY=( $(compgen -W "--json --all --disabled" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "list" ] && [ "${cur:0:2}" = "--" ]; then
@@ -91,6 +95,7 @@ _clauth() {
             'delete[remove a profile and its credentials]' \
             'disable[hide a profile from auto-switch and usage polling]' \
             'enable[restore a disabled profile]' \
+            'use-reset[spend a banked usage-limit reset on a codex account]' \
             'rolling-token[serve a profile a rolling token from its usage chain]' \
             'static-token[restore the static setup-token mint, or --clear the long-lived token]' \
             'which[print profile owning the loaded credentials]' \
@@ -117,6 +122,10 @@ _clauth() {
             '--with-fallback[follow the fallback chain; needs a running daemon]' \
             '--auto[pick the account by the models this session may run]' \
             '--explain[print the account that would be launched, without launching]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == use-reset ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")
+        _describe 'profile' profiles
     elif (( CURRENT == 4 )) && [[ "${words[2]}" == start && "${words[3]}" == (--isolated|--with-fallback|--explain) ]]; then
         local -a profiles
         profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
@@ -173,6 +182,8 @@ _clauth() {
         _values 'flag' '--clear[remove the long-lived token]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == disable ]]; then
         _values 'flag' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
+    elif (( CURRENT >= 4 )) && [[ "${words[2]}" == use-reset ]]; then
+        _values 'flag' '--list[show the resets and which one would be used; spend none]' '--yes[skip the confirm prompt]' '-y[skip the confirm prompt]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == daemon ]]; then
         _values 'flag' \
             '--standby[wait and take over when the running daemon exits]' \
@@ -206,6 +217,7 @@ complete -c clauth -f -n __fish_is_first_token -a capture -d "Save the login Cla
 complete -c clauth -f -n __fish_is_first_token -a delete -d "Remove a profile and its credentials"
 complete -c clauth -f -n __fish_is_first_token -a disable -d "Hide a profile from auto-switch and usage polling"
 complete -c clauth -f -n __fish_is_first_token -a enable -d "Restore a disabled profile"
+complete -c clauth -f -n __fish_is_first_token -a use-reset -d "Spend a banked usage-limit reset on a codex account"
 complete -c clauth -f -n __fish_is_first_token -a rolling-token -d "Serve a profile a rolling token from its usage chain"
 complete -c clauth -f -n __fish_is_first_token -a static-token -d "Restore the static setup-token mint, or --clear the long-lived token"
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
@@ -234,6 +246,7 @@ complete -c clauth -f -n "__fish_seen_subcommand_from herdr; and __fish_seen_sub
 complete -c clauth -f -n __fish_is_first_token -a --theme -d "Force a color depth instead of auto-detecting"
 complete -c clauth -f -n 'set -l t (commandline -opc); and test "$t[-1]" = "--theme"' -a "full compatible"
 complete -c clauth -f -n "__fish_seen_subcommand_from start login capture delete disable enable rolling-token static-token" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --isolated -d "Clean isolated runtime; drops operator config"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --with-fallback -d "Follow the fallback chain; needs a running daemon"
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick the account by the models this session may run"
@@ -255,6 +268,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a --yes -d 
 complete -c clauth -f -n "__fish_seen_subcommand_from static-token" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a --yes -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from disable" -a -y -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a --list -d "Show the resets and which one would be used; spend none"
+complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a --yes -d "Skip the confirm prompt"
+complete -c clauth -f -n "__fish_seen_subcommand_from use-reset" -a -y -d "Skip the confirm prompt"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --json -d "Print the status snapshot as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --all -d "Also list disabled profiles"
 complete -c clauth -f -n "__fish_seen_subcommand_from status" -a --disabled -d "Also list disabled profiles"
@@ -413,6 +429,22 @@ pub(crate) fn print_session_stems() {
     for stem in live_session_stems() {
         outln!("{stem}");
     }
+}
+
+/// `__complete --codex`: the codex roster, for the codex-only verbs
+/// (`use-reset`), whose names the claude roster above never holds.
+pub(crate) fn print_codex_profile_names() {
+    for name in codex_profile_names() {
+        outln!("{name}");
+    }
+}
+
+/// The codex roster as completion words; empty when it can't be read, the
+/// way `print_profile_names` stays silent.
+pub(crate) fn codex_profile_names() -> Vec<String> {
+    crate::codex_profiles::CodexState::load()
+        .map(|state| state.profiles().iter().map(|n| n.to_string()).collect())
+        .unwrap_or_default()
 }
 
 pub(crate) fn install(shell: Option<&str>) -> Result<()> {

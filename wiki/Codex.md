@@ -135,6 +135,42 @@ A verdict the server calls final quarantines the chain. From then on the Overvie
 
 No refresh revives a dead chain; a new login is the only exit, and the browser form is the one that works for every profile (a re-capture finds `~/.codex/auth.json` already pointing at the profile and captures nothing). The verdict is bound to the token it judged, so a fresh chain clears it however it lands. A refusal the server does not spell out about the chain itself (an unrecognized 4xx) never quarantines: those keep the no-replay memo and the two forced retries and nothing more.
 
+## Use a usage-limit reset
+
+A ChatGPT account can hold banked usage-limit resets, the ones codex's own `/usage` menu offers: spending one reopens the account's 5h and weekly windows at once. The usage poll reads how many an account holds (`codex_reset_credits` in `status.json`); spending one is a command you run:
+
+```sh
+clauth use-reset work --list   # the account's resets; spends nothing
+clauth use-reset work          # spend one, after a [y/N]
+```
+
+`--list` prints the count and every reset with its status, expiry and grant time in local time, `*` marking the one a spend would use:
+
+```
+clauth: 'work' has 2 usage-limit resets available.
+  * Full reset (Weekly + 5 hr) — available, expires 2026-10-01 09:00:00, granted 2026-09-01 09:00:00  (used next)
+    usage-limit reset — available, no expiry, granted 2026-09-10 09:00:00
+```
+
+A spend uses a codex usage-limit (`codex_rate_limits`) reset before any other kind, and among those the one that expires first (one with no expiry waits until the dated ones are gone), and asks before it sends anything that spends:
+
+```
+clauth: use a usage-limit reset on 'work'? Full reset (Weekly + 5 hr) · expires 2026-10-01 09:00:00 · 1 of 2 available. It reopens the account's usage windows now and cannot be undone. [y/N]
+```
+
+`--yes` (`-y`) skips the question and is required on a non-TTY stdin, where the command otherwise stops before any request with `refusing to use a reset on 'work' without confirmation; pass --yes`. Anything but `y` or `yes` leaves the resets alone: `clauth: aborted. no reset was used on 'work'.`
+
+| Outcome | What it prints | Exit |
+|---------|----------------|------|
+| used | `clauth: used a usage-limit reset on 'work': 2 windows reopened, 1 left.`, then `clauth: the daemon shows the new usage at its next poll.` | 0 |
+| nothing to reset | `there is nothing to reset on 'work' right now, so no reset was used` | 1 |
+| none held | `no usage-limit resets available on 'work'` (`--list` prints it as `clauth: no usage-limit resets available on 'work'.` and exits 0) | 1 |
+| taken meanwhile | ``that reset on 'work' is no longer available (used or expired meanwhile); run `clauth use-reset work --list` to see what is left`` | 1 |
+| token refused | `codex rejected the stored access token for 'work' — the daemon refreshes it for a parked account and codex does for the one in use; try again after that; no reset was used` | 1 |
+| no answer, or an answer clauth cannot read | ``the reset request for 'work' got no answer, so the reset may or may not have gone through; check `clauth use-reset work --list` before retrying`` | 1 |
+
+Nothing is retried on its own, since a lost answer may still have spent the reset. The command reads the profile's stored login as it stands and never refreshes it (the chain has one writer), and it refuses a quarantined chain the way a start does.
+
 ## Managed config
 
 Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file codex lets an administrator use to outrank a session's own flags. A `cli_auth_credentials_store` there other than `"file"` refuses the start, because codex would ignore the session's linked `auth.json`; a `debug.config_lockfile.load_path` refuses it, because codex would replay that lockfile as its whole config and drop the file store; a `sqlite_home` starts the session with a warning, since every profile's state databases then land in that one directory. Both refusals say what to do (`ask whoever manages this machine to remove the key`) and why (`clauth cannot override a managed config`). On macOS codex can also take a managed config from an MDM profile; clauth does not read that one, so a key delivered that way is not caught before the spawn. On Windows codex reads its managed config from inside `CODEX_HOME`, which the session home never holds.
@@ -154,6 +190,8 @@ Before every codex start clauth reads `/etc/codex/managed_config.toml`, the file
 | `'<name>' has a live codex session — close it before re-authenticating` | the browser form's spelling of the same |
 | ``'<name>': codex chain is broken (<kind> since <time>), run `clauth login <name> --codex --browser` `` | the browser login |
 | `'<name>' is a codex profile; <verb> is claude-only` | `disable`, `enable`, `rolling-token` and `static-token` take Claude Code profiles alone |
+| `'<name>' is a claude profile; use-reset is codex-only` | the reverse: `use-reset` takes codex profiles alone |
+| ``'<name>' has no stored codex login to use a reset with; run `clauth login <name> --codex --browser` `` | the profile's `auth.json` is missing, unreadable, or holds no access token |
 | `clauth: could not repoint <path> (no symlink support?) — it is now a SEPARATE copy of a single-use rotating chain` | a host without symlinks: run codex only through `clauth start <name>` from then on, or `codex login` again for your own use |
 
 ## Files

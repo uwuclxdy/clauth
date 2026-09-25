@@ -1293,12 +1293,21 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     assert!(matches!(
         command(&["__complete"]),
         Command::Complete {
+            codex: false,
+            live_sessions: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--codex"]),
+        Command::Complete {
+            codex: true,
             live_sessions: false
         }
     ));
     assert!(matches!(
         command(&["__complete", "--live-sessions"]),
         Command::Complete {
+            codex: false,
             live_sessions: true
         }
     ));
@@ -3842,4 +3851,192 @@ fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
     let claude =
         resolve_or_bail(&config, "CL1", "disable").expect("a claude name never loads the roster");
     assert_eq!(claude.as_str(), "cl1");
+}
+
+// ── use-reset ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn use_reset_takes_list_or_yes_but_not_both() {
+    let Command::UseReset { profile, list, yes } = command(&["use-reset", "cx"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((profile.as_str(), list, yes), ("cx", false, false));
+    let Command::UseReset { list, yes, .. } = command(&["use-reset", "-y", "cx"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((list, yes), (false, true));
+    let Command::UseReset { list, yes, .. } = command(&["use-reset", "cx", "--list"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((list, yes), (true, false));
+
+    assert_eq!(
+        parse_exit_code(&["use-reset", "cx", "--list", "--yes"]),
+        2,
+        "--list spends nothing, so there is nothing for --yes to confirm"
+    );
+    assert_eq!(parse_exit_code(&["use-reset"]), 2);
+    assert_eq!(parse_exit_code(&["use-reset", "cx", "other"]), 2);
+}
+
+/// A claude profile `cl1`, a codex profile `cx` with a stored login, and a
+/// codex profile `cy` with none.
+fn seed_use_reset_rosters() {
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl1".into()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("claude state");
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::write(
+        clauth.join("codex-profiles.toml"),
+        "profiles = [\"cx\", \"cy\"]\n",
+    )
+    .expect("codex state");
+    crate::testutil::write_codex_store("cx", &crate::testutil::codex_auth_body("at.cx", "rt.cx"));
+}
+
+/// Endpoints on a listener that is bound but never accepted: a request would
+/// queue a connection on it, so `accept` answering `WouldBlock` afterwards
+/// proves nothing was sent — at once, with no stub deadline to wait out.
+fn untouched_reset_urls() -> (std::net::TcpListener, usage::codex_reset::ResetUrls) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let urls = usage::codex_reset::ResetUrls::under(&format!("http://127.0.0.1:{port}"));
+    (listener, urls)
+}
+
+fn assert_nothing_sent(listener: &std::net::TcpListener) {
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a request reached the endpoint: {other:?}"),
+    }
+}
+
+fn no_prompt(prompt: &str) -> Result<bool> {
+    panic!("this path must not prompt, asked: {prompt}")
+}
+
+/// `use-reset` takes codex names alone: a claude name is refused as one (the
+/// codex-side twin of the claude-only verbs' refusal), an unknown name lists
+/// both rosters, and a codex name with no stored login or a dead chain is
+/// refused by name — all before any request.
+#[test]
+fn use_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_request() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_use_reset_rosters();
+    let (listener, urls) = untouched_reset_urls();
+
+    let err = use_reset_with("CL1", false, true, false, &urls, no_prompt).expect_err("claude");
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "'cl1' is a claude profile; use-reset is codex-only"
+    );
+
+    let err = use_reset_with("zz", false, true, false, &urls, no_prompt).expect_err("unknown");
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "profile 'zz' not found\navailable: cl1 · codex: cx, cy"
+    );
+
+    let err = use_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
+    assert_eq!(
+        err.to_string(),
+        "'cy' has no stored codex login to use a reset with; run `clauth login cy --codex --browser`"
+    );
+
+    crate::codex_auth::quarantine_for_test("cx", "reused", "rt.cx");
+    let err = use_reset_with("CX", true, false, false, &urls, no_prompt).expect_err("dead chain");
+    assert!(
+        err.to_string()
+            .starts_with("'cx': codex chain is broken (reused since "),
+        "{err}"
+    );
+    crate::codex_auth::clear_quarantine("cx");
+
+    assert_nothing_sent(&listener);
+}
+
+/// Off a terminal the spend needs `--yes`, and the refusal lands before any
+/// request leaves: the delete/disable confirm policy, for a spend that cannot
+/// be given back. Exit 1, like theirs.
+#[test]
+fn use_reset_off_a_terminal_without_yes_refuses_before_any_request() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_use_reset_rosters();
+    let (listener, urls) = untouched_reset_urls();
+
+    let err = use_reset_with("cx", false, false, false, &urls, no_prompt).expect_err("refused");
+    assert_eq!(
+        err.to_string(),
+        "refusing to use a reset on 'cx' without confirmation; pass --yes"
+    );
+    assert_nothing_sent(&listener);
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// End to end against a stub: `--list` only lists (and needs no terminal), a
+/// declined prompt sends nothing, a confirmed one consumes the credit the
+/// prompt named — the one expiring first — under a fresh v4 key, and an
+/// account with nothing available fails without a consume. The request order
+/// is the proof: exactly one POST, right after the confirmed GET.
+#[test]
+fn use_reset_spends_the_credit_it_named_and_only_after_a_yes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_use_reset_rosters();
+    let two = r#"{"credits": [
+        {"id": "later", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-01T00:00:00Z", "expires_at": "2027-06-01T00:00:00Z"},
+        {"id": "soon", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-02T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"}
+    ], "available_count": 2}"#;
+    let none = r#"{"credits": [{"id": "soon", "reset_type": "codex_rate_limits", "status": "redeemed", "granted_at": "2026-01-02T00:00:00Z"}], "available_count": 0}"#;
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |_path, i| match i {
+        3 => (200, r#"{"code": "reset", "windows_reset": 2}"#.to_string()),
+        4 => (200, none.to_string()),
+        _ => (200, two.to_string()),
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    use_reset_with("cx", true, false, false, &urls, no_prompt).expect("--list lists");
+
+    let mut asked = String::new();
+    use_reset_with("cx", false, false, true, &urls, |prompt| {
+        asked = prompt.to_string();
+        Ok(false)
+    })
+    .expect("a declined prompt is a clean abort");
+    assert!(
+        asked.contains("'cx'? Full reset · expires ") && asked.contains("1 of 2 available"),
+        "the prompt names the credit it will spend: {asked}"
+    );
+
+    use_reset_with("cx", false, false, true, &urls, |_| Ok(true)).expect("confirmed spend");
+
+    let err = use_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("none left");
+    assert_eq!(err.to_string(), "no usage-limit resets available on 'cx'");
+
+    let seen = handle.join().expect("join stub");
+    let lines: Vec<&str> = seen
+        .iter()
+        .map(|r| r.lines().next().unwrap_or(""))
+        .collect();
+    let list = "GET /backend-api/wham/rate-limit-reset-credits HTTP/1.1";
+    let consume = "POST /backend-api/wham/rate-limit-reset-credits/consume HTTP/1.1";
+    assert_eq!(lines, [list, list, list, consume, list]);
+    let body: serde_json::Value =
+        serde_json::from_str(&crate::testutil::request_body(&seen[3])).expect("json body");
+    assert_eq!(body["credit_id"], "soon", "the earliest-expiring credit");
+    let key = body["redeem_request_id"].as_str().expect("a key");
+    assert_eq!(
+        (key.len(), key.chars().nth(14)),
+        (36, Some('4')),
+        "a v4 UUID: {key}"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&seen[3], "chatgpt-account-id").as_deref(),
+        Some("acc"),
+        "the store's account id rides along"
+    );
 }

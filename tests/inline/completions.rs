@@ -1098,3 +1098,59 @@ fn every_shell_drops_the_manual_login_flag() {
     assert!(ZSH.contains("'login[log in via browser OAuth or an API key]'"));
     assert!(FISH.contains("-a login -d \"Log in via browser OAuth or an API key\""));
 }
+
+/// `use-reset` takes codex names only, so every shell completes its profile from
+/// `__complete --codex` and none offers it the claude roster (whose names the
+/// verb always refuses).
+#[test]
+fn every_shell_completes_use_reset_from_the_codex_roster_only() {
+    assert!(BASH.contains(
+        r#"[ "$prev" = "use-reset" ]; then
+        COMPREPLY=( $(compgen -W "$(clauth __complete --codex 2>/dev/null)" -- "${cur}") )"#
+    ));
+    assert!(ZSH.contains(
+        r#"[[ "${words[2]}" == use-reset ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete --codex 2>/dev/null)}")"#
+    ));
+    assert!(FISH.contains(
+        r#"-n "__fish_seen_subcommand_from use-reset" -a "(clauth __complete --codex 2>/dev/null)" -d Profile"#
+    ));
+    for (shell, script) in [("bash", &BASH), ("zsh", &ZSH), ("fish", &FISH)] {
+        // The shared claude-roster group line in each shell.
+        let group = script
+            .lines()
+            .find(|l| {
+                l.contains(r#"[ "$prev" = "start" ] || [ "$prev" = "login" ]"#)
+                    || l.contains("(start|login|capture|")
+                    || l.contains(r#"from start login capture"#)
+            })
+            .unwrap_or_else(|| panic!("{shell}: no claude-roster profile group"));
+        assert!(
+            !group.contains("use-reset"),
+            "{shell} completes use-reset from the claude roster: {group}"
+        );
+    }
+}
+
+/// `__complete --codex` lists the codex roster and none of the claude names.
+#[cfg(unix)]
+#[test]
+fn codex_completion_names_are_the_codex_roster() {
+    let _home = HomeSandbox::new();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl1".into()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("claude state");
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::write(
+        clauth.join("codex-profiles.toml"),
+        "profiles = [\"cx\", \"cy\"]\n",
+    )
+    .expect("codex state");
+    assert_eq!(
+        codex_profile_names(),
+        vec!["cx".to_string(), "cy".to_string()]
+    );
+}
