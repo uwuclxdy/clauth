@@ -3269,3 +3269,29 @@ fn the_fg_sed_reads_the_real_process_info_shape() {
         "the fg sed resolves the real shape"
     );
 }
+
+#[test]
+fn snapshot_rects_read_herdr_091_layouts() {
+    // herdr 0.9.1 (measured 2026-09-26): `panes[]` carries no rect, each pane's
+    // rect lives under `layouts[].panes[]`. Without the fallback every pane
+    // reads as rect-less and the terminal stream route answers 404.
+    let real = r#"{"id":"cli:api:snapshot","result":{"snapshot":{"layouts":[{"panes":[{"focused":true,"pane_id":"w1:p2","rect":{"height":40,"width":120,"x":0,"y":0}}]}],"panes":[{"agent":"claude","agent_status":"blocked","pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"},{"pane_id":"w1:p9"}]}}}"#;
+    let rects = parse_snapshot_rects(real.as_bytes()).expect("the envelope parses");
+    let rect = |id: &str| {
+        rects
+            .iter()
+            .find(|(pane, _)| pane == id)
+            .and_then(|(_, rect)| rect.as_ref())
+            .map(|r| (r.width, r.height))
+    };
+    assert_eq!(rect("w1:p2"), Some((120, 40)), "the layout rect is found");
+    assert_eq!(rect("w1:p9"), None, "a pane with no layout stays rect-less");
+
+    // The older shape, a rect on the pane itself, still wins.
+    let older = r#"{"result":{"snapshot":{"panes":[{"pane_id":"w1:p1","rect":{"width":80,"height":24}}]}}}"#;
+    let rects = parse_snapshot_rects(older.as_bytes()).expect("the older envelope parses");
+    assert_eq!(
+        rects[0].1.as_ref().map(|r| (r.width, r.height)),
+        Some((80, 24))
+    );
+}
