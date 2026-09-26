@@ -496,7 +496,7 @@ pub(crate) fn daemon_bounded_output_deadline(
 /// attach without an explicit geometry imposes herdr's 120x40 default on the
 /// real pane (measured 2026-08-13; the no-flag observe render reports the same
 /// default on 0.9.0), so the bridge reads both dimensions from here.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct PaneRect {
     pub(crate) width: u16,
     pub(crate) height: u16,
@@ -515,6 +515,15 @@ struct SnapshotResult {
 #[derive(Deserialize)]
 struct SnapshotBody {
     panes: Vec<SnapshotPane>,
+    /// herdr 0.9.1 carries each pane's rect here rather than on `panes[]`.
+    #[serde(default)]
+    layouts: Vec<SnapshotLayout>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotLayout {
+    #[serde(default)]
+    panes: Vec<SnapshotPane>,
 }
 
 #[derive(Deserialize)]
@@ -531,12 +540,20 @@ pub(crate) fn parse_snapshot_rects(stdout: &[u8]) -> Option<Vec<(String, Option<
     serde_json::from_slice::<SnapshotEnvelope>(stdout)
         .ok()
         .map(|envelope| {
-            envelope
-                .result
-                .snapshot
-                .panes
+            let SnapshotBody { panes, layouts } = envelope.result.snapshot;
+            let layout_rect = |id: &str| {
+                layouts
+                    .iter()
+                    .flat_map(|layout| &layout.panes)
+                    .find(|pane| pane.pane_id == id)
+                    .and_then(|pane| pane.rect.clone())
+            };
+            panes
                 .into_iter()
-                .map(|pane| (pane.pane_id, pane.rect))
+                .map(|pane| {
+                    let rect = pane.rect.or_else(|| layout_rect(&pane.pane_id));
+                    (pane.pane_id, rect)
+                })
                 .collect()
         })
 }
