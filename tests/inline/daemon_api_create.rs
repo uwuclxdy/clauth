@@ -1055,3 +1055,21 @@ fn the_cwd_is_sanitized_in_the_audit_line() {
         )]
     );
 }
+
+#[test]
+fn agent_name_fits_herdrs_rule_past_p9() {
+    // herdr 0.9.1 (measured 2026-09-26) names the tenth pane `w1:pA`, and
+    // `agent start` refuses any uppercase name with `invalid_agent_name`.
+    assert_eq!(agent_name("w1:p2"), "clauth-w1-p2");
+    assert_eq!(agent_name("w1:pD"), "clauth-w1-p_d");
+    assert_ne!(agent_name("w1:pD"), agent_name("w1:pd"));
+    let ok = |n: &str| {
+        n.len() <= 32
+            && n.starts_with(|c: char| c.is_ascii_lowercase())
+            && n.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    };
+    for id in ["w1:p1", "w1:pD", "w1N:p19", "wZ:pAB"] {
+        assert!(ok(&agent_name(id)), "{id} -> {}", agent_name(id));
+    }
+}
