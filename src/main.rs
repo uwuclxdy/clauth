@@ -4,6 +4,7 @@ mod claude;
 mod claude_json;
 mod cli;
 mod codex_auth;
+mod codex_daemon;
 mod codex_login;
 mod codex_profiles;
 mod completions;
@@ -1703,6 +1704,9 @@ fn cmd_switch(name: &str) -> Result<()> {
             outln!("clauth: switched codex to '{canonical}'");
             if let Some(slot) = repointed {
                 outln!("clauth: {} now follows '{canonical}'", slot.display());
+            }
+            if let Some(note) = crate::codex_daemon::switch_note() {
+                outln!("{note}");
             }
             return Ok(());
         }

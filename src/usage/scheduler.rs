@@ -3720,6 +3720,14 @@ fn apply_codex_switch(
                 logline!(
                     "clauth: codex auto-switched to '{target}' — live at the next codex session"
                 );
+                // The chain moves off a spent account, so every task in codex's
+                // shared app-server daemon is stalled on it anyway: restarting
+                // it costs their stalled turn and lets them resume on `target`.
+                if crate::codex_daemon::stale_daemon().is_some() {
+                    crate::codex_daemon::restart_in_background(
+                        "codex auto-switch off a spent account",
+                    );
+                }
             }
         }
         crate::fallback::SwitchAction::Off => {
