@@ -16,10 +16,10 @@ Per-profile state lives under `~/.clauth/`. On Unix that whole tree is owner-onl
 
 | Path | Contents | Unix mode |
 |------|----------|-----------|
-| `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/credentials.json` | OAuth token snapshot, plus the keys Claude Code keeps beside that login (MCP-server logins, a design login) | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/mcp-logins.json` | Claude Code's MCP-server OAuth logins, parked here whenever the profile stores no Claude login of its own and merged back once it regains one. Live bearer credentials, minted against each server and belonging to no Claude account | file `0600`, dirs `0700` |
-| `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token) | file `0600`, dirs `0700` |
-| `~/.clauth/profiles/<name>/session-token.static.json` | the `claude setup-token` mint a rolling token superseded, kept so `clauth static-token <p>` (or a dead chain) can restore it | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/session-token.json` | long-lived `claude setup-token` login, if captured (sessions run on this; no refresh token), plus the keys Claude Code saved beside it while `preserve_non_login_keys` is on (a design login, which does carry its own refresh token) | file `0600`, dirs `0700` |
+| `~/.clauth/profiles/<name>/session-token.static.json` | the `claude setup-token` mint a rolling token superseded, kept so `clauth static-token <p>` (or a dead chain) can restore it, with the keys the sidecar held beside it at that point (a design login, MCP-server logins, each with its own refresh token) | file `0600`, dirs `0700` |
 | `~/.clauth/profiles/<name>/quarantine/<ts>-<seq>.<basename>` | credential files moved aside before repair, kept as evidence — a mis-filled sidecar (`….session-token.json`, which by definition carries a refresh token: that is what made it a mis-fill) or a backup slot whose content was not a mint (`….session-token.static.json`). Evidence can hold live credentials, which is why the dir is `0700`, why nothing prunes it automatically, and why it lives under the profile so `clauth delete` removes it with everything else that account owns | file `0600`, dir `0700` |
 | `~/.clauth/profiles/<name>/config.toml` | base URL, API key (endpoint profiles), env block | `0600` |
 | `~/.clauth/codex-profiles.toml` | the codex roster: profile names, the active codex slot, the codex fallback chain and its settings; no credentials | `0600` |
@@ -51,6 +51,7 @@ clauth reads that item before every write (to carry your MCP-server logins acros
   - The repair never follows a symlink out of the tree, so it can't touch a file clauth doesn't own. On Windows, access falls to the default user-profile ACLs, which clauth does not loosen.
 - A switch rewrites three files: `~/.claude/.credentials.json`, parts of `~/.claude/settings.json` (the `env` block, the top-level `model` key, `apiKeyHelper`), and `~/.claude.json`, whose stale account-identity block is dropped so Claude Code re-derives identity from the new token.
   - The rest of `~/.claude/` is left alone. On macOS the switch writes the Keychain item above as well, because Claude Code reads the Keychain before the file there.
+  - Inside `~/.clauth/` a switch writes the incoming profile's store (the MCP-server logins it carries) and, with `preserve_non_login_keys` on, the outgoing profile's store, which takes what Claude Code saved beside that account's login. The daemon's and the TUI's start relink save into the active profile's store the same way.
 - `clauth login <name> --codex` is the one write into codex's own tree: it replaces `~/.codex/auth.json` with a symlink onto that profile's store (staged beside it and renamed over), so your codex and every clauth session share one chain; deleting the profile removes that link and says so. On a host without symlinks the file is copied instead and your codex keeps a second live copy of the chain, which clauth tells you at capture time.
 
 ## Network activity
@@ -186,6 +187,7 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 |--------|--------|
 | auto-update off (the Config tab row, `[update] auto_update = false`) | disables all background update checks, self-replacement, and the herdr-plugin reinstall |
 | `CLAUTH_NO_UPDATE=1` | the same, even when auto-update is on |
+| `non-login keys` off (the Config tab row, `preserve_non_login_keys = false`) | clauth stops saving what Claude Code keeps beside a login (a design login) into that account's store and stops carrying MCP-server logins into a setup token's `session-token.json`, and a macOS sign-out drops a design login from the Keychain item again |
 | `CLAUTH_NO_COMPLETIONS=1` | skips the first-run completion-install prompt |
 | `CLAUTH_NO_API=1` | stops `clauth daemon --listen` from opening its socket, whatever the flags say |
 | an empty `fallback_chain` (the default) | clauth never switches accounts on its own |

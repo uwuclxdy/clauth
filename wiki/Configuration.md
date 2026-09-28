@@ -138,6 +138,7 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `refresh_spent_accounts` | bool | `true` | keep polling accounts at 100% |
 | `auto_start_queue` | bool | `false` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |
+| `preserve_non_login_keys` | bool | `true` | keep what Claude Code stores beside each account's login (a `/design-login`) with that account across switches and relinks, and carry MCP-server logins into a setup token's sidecar too ([Security](Security#design-logins-and-other-keys-beside-the-login)); `false` is the behavior before the key existed. An unreadable profiles.toml counts as `true` |
 | `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100; the codex chain has its own copy of this key in `codex-profiles.toml` ([below](Configuration#codex-profilestoml)) |
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
