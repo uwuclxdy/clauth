@@ -108,10 +108,19 @@ pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
 /// success, not an error: the requested end state already holds.
 pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|_held| match std::fs::remove_file(&path) {
-        Ok(()) => Ok(true),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(anyhow::Error::new(e).context("remove session-token.json")),
+    with_state_lock(|_held| {
+        // The sidecar can hold the account's design login; `credentials.json`
+        // becomes the install source once it goes, so the keys move there first,
+        // and a design login the live file alone holds is saved into the
+        // install source before that: the sidecar, while its token is still
+        // the live one.
+        sync_live_extra_into_install_source(name);
+        hand_sidecar_keys_to_store(&path);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow::Error::new(e).context("remove session-token.json")),
+        }
     })
 }
 
@@ -308,7 +317,15 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|_held| atomic_write_600(&path, &bytes).context("write session-token.json"))?;
+    with_state_lock(|_held| {
+        // A re-mint relinks nothing, so a live file Claude Code wrote beside
+        // the mint this replaces stops matching any store; saved first, the
+        // keep below carries it onto the new mint. Over a mis-fill, whose keys
+        // the keep never takes, it waits in `credentials.json` instead.
+        sync_live_extra_into_install_source(name);
+        let bytes = keep_non_login_in_sidecar(&bytes, &path);
+        atomic_write_600(&path, bytes).context("write session-token.json")
+    })?;
     Ok(expires_at)
 }
 
@@ -351,8 +368,15 @@ pub(crate) fn stamp_rolling_token(
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize rolling session token")?;
     let path = profile_dir(name)?.join("session-token.json");
     with_state_lock(|_held| {
+        // While the sidecar still holds the bearer this stamp replaces, a live
+        // file Claude Code wrote beside that bearer (a `/design-login`) is still
+        // recognisably this account's; after the stamp no sync matches it again.
+        // Saved first into the install source (`credentials.json` before the
+        // first roll), the keep below carries it onto the new bearer.
+        sync_live_extra_into_install_source(name);
         preserve_static_mint(name)?;
-        atomic_write_600(&path, &bytes).context("write rolling session-token.json")
+        let bytes = keep_non_login_in_sidecar(&bytes, &path);
+        atomic_write_600(&path, bytes).context("write rolling session-token.json")
     })
 }
 
@@ -499,8 +523,15 @@ pub(crate) fn write_session_token_with_backup(
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let dir = profile_dir(name)?;
     with_state_lock(|_held| {
-        atomic_write_600(&dir.join("session-token.json"), &bytes)
-            .context("write session-token.json")?;
+        // As in `write_session_token`: what the live file holds beside the
+        // bearer this replaces is saved before it stops matching.
+        sync_live_extra_into_install_source(name);
+        // Both files from the SAME bytes, the sidecar's non-login keys
+        // included: the backup is this account's own file too, and the roll's
+        // `preserve_static_mint` already copies the sidecar into it raw.
+        let sidecar = dir.join("session-token.json");
+        let bytes = keep_non_login_in_sidecar(&bytes, &sidecar);
+        atomic_write_600(&sidecar, &bytes).context("write session-token.json")?;
         atomic_write_600(&dir.join("session-token.static.json"), &bytes)
             .context("write session-token.static.json")
     })?;
@@ -547,6 +578,13 @@ pub(crate) fn heal_misfilled_sidecar(name: &ProfileName) -> Result<HealOutcome> 
         let Some(bytes) = live_backup_bytes(name, &backup)? else {
             return Ok(HealOutcome::NoLiveBackup);
         };
+        // A mis-fill is never installed, so the live file holds the login of
+        // `credentials.json`, which stops being installed once the mint is
+        // back: what the live file holds beside it is saved there first.
+        sync_live_extra_into_install_source(name);
+        // The backup goes back whole and nothing of the mis-fill joins it: the
+        // keys beside a mis-filled login can be another account's (its org id,
+        // device token, gateway), and they are evidence, quarantined with it.
         quarantine_file_locked(name, &sidecar, "session-token.json")?;
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
@@ -847,6 +885,12 @@ pub(crate) fn restore_static_mint(name: &ProfileName) -> Result<bool> {
         let Some(bytes) = live_backup_bytes(name, &backup)? else {
             return Ok(false);
         };
+        // What the live file holds beside the login this replaces stops
+        // matching once the mint is back, so it is saved first, into the
+        // install source: the sidecar's bearer, or over a mis-fill (quarantined
+        // below, never written into) `credentials.json`, where it waits, since
+        // the keep takes nothing there.
+        sync_live_extra_into_install_source(name);
         // A mis-filled sidecar about to be overwritten is EVIDENCE, exactly
         // as it is on the heal and CLI pre-clear paths — this was the one
         // repair that destroyed the rotating pair silently instead of moving
@@ -857,6 +901,16 @@ pub(crate) fn restore_static_mint(name: &ProfileName) -> Result<bool> {
         ) {
             quarantine_file_locked(name, &sidecar, "session-token.json")?;
         }
+        // Over a mis-fill this keeps nothing, like the heal. A mis-fill is a
+        // login that parses as a rotating pair; a sidecar whose login does not
+        // parse is not recognised as one, here or by the quarantine above, and
+        // its keys are kept like the account's own. Over this account's
+        // own rolling bearer it keeps the bearer's non-login keys over the
+        // backup's: the backup is the sidecar as the first roll or the last
+        // re-mint found it, and every sync since landed in the sidecar, so the
+        // sidecar's copy is the newer one. Ceiling: a key the backup holds and
+        // the sidecar lost comes back with the backup.
+        let bytes = keep_non_login_in_sidecar(&bytes, &sidecar);
         atomic_write_600(&sidecar, bytes).context("restore session-token.json")?;
         std::fs::remove_file(&backup).context("remove consumed static backup")?;
         Ok(true)
@@ -1172,7 +1226,7 @@ enum AbsentSource {
 /// while the link is not: live sessions never re-read (no mtime moved), fresh
 /// ones resolve the item, and a retry completes the switch.
 #[cfg(target_os = "macos")]
-fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
+fn keychain_mirror_source(path: &Path, absent: AbsentSource, preserve: bool) -> Result<()> {
     // CLA-SPLIT: callers pass the already-resolved install source so the
     // symlink target and the Keychain content come from ONE resolution: a
     // session-token.json vanishing between two stats can't split them. This
@@ -1186,7 +1240,7 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource) -> Result<()> {
             // already raised — the item keeps serving the departed account
             // until the switch is re-run on an unlocked keychain, which is
             // recoverable where the pre-fix blind delete was not.
-            AbsentSource::SignOut => crate::keychain::keychain_sign_out().map(|_| ()),
+            AbsentSource::SignOut => crate::keychain::keychain_sign_out(preserve).map(|_| ()),
             AbsentSource::Leave => Ok(()),
         };
     }
@@ -1752,13 +1806,37 @@ const CARRIED_CREDENTIAL_KEYS: [&str; 1] = ["mcpOAuth"];
 /// drops them and nothing carries them onto another account's login. Claude Code
 /// deletes exactly these five on logout and preserves everything else
 /// (read out of its own logout path), which is the
-/// other side of the line [`CARRIED_CREDENTIAL_KEYS`] draws.
+/// other side of the line [`CARRIED_CREDENTIAL_KEYS`] draws. What a sign-out
+/// drops with `preserve_non_login_keys` off; on, it drops
+/// [`LOGIN_CREDENTIAL_KEYS`].
 const ACCOUNT_SCOPED_CREDENTIAL_KEYS: [&str; 5] = [
     "claudeAiOauth",
     "organizationUuid",
     "trustedDeviceToken",
     "enterpriseGateway",
     "designOauth",
+];
+
+/// The login and the keys that authenticate or identify its account: what
+/// `preserve_non_login_keys` never preserves, because they are the login's own
+/// and are only right beside the exact login they came with. Every other key is
+/// a non-login key. `enterpriseGateway` is a credential of its own (a gateway
+/// JWT beside an IdP refresh token, read out of Claude Code 2.1.283's gateway
+/// refresh and logout paths), so a store keeping it after a sign-out would go on
+/// authenticating the departed account through the gateway;
+/// `organizationUuid` and `trustedDeviceToken` name that account and its device
+/// trust, so one kept beside a later login of another account is a mixed
+/// identity that never self-corrects. Preservation therefore never syncs, keeps
+/// or leaves these behind: a store gains them only with the login they belong
+/// to. The one key [`ACCOUNT_SCOPED_CREDENTIAL_KEYS`] adds is `designOauth`,
+/// Claude Design's own login, which serves no inference and is the key
+/// preservation exists for. Ceiling: a key Claude Code adds later that
+/// identifies the account is preserved like any other until it is named here.
+const LOGIN_CREDENTIAL_KEYS: [&str; 4] = [
+    "claudeAiOauth",
+    "organizationUuid",
+    "trustedDeviceToken",
+    "enterpriseGateway",
 ];
 
 /// Copy [`CARRIED_CREDENTIAL_KEYS`] from `live` onto `target`, reporting whether
@@ -1812,6 +1890,14 @@ pub(crate) enum SignOut {
 
 /// Drop every [`ACCOUNT_SCOPED_CREDENTIAL_KEYS`] entry from `blob`, keeping what
 /// belongs to no Claude account, and report what the caller owes its store.
+/// With `preserve` (`preserve_non_login_keys`, which reads on over an
+/// unreadable profiles.toml) only [`LOGIN_CREDENTIAL_KEYS`] go, so a design
+/// login stays in the store and a store holding it is written back rather than
+/// deleted: on macOS the Keychain item can be that login's only copy. That
+/// holds for every sign-out, not only a switch onto an account that stores no
+/// login: a wrap-off, the Setup tab's `log out` on the active account,
+/// deleting the active profile, and clearing a long-lived token onto an
+/// account that stores no login keep it too.
 /// A blob that is not an object carries nothing worth preserving.
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1820,13 +1906,18 @@ pub(crate) enum SignOut {
         reason = "the only caller is the macOS Keychain sign-out; the rule is pinned on every platform"
     )
 )]
-pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value) -> SignOut {
+pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value, preserve: bool) -> SignOut {
     let Some(obj) = blob.as_object_mut() else {
         return SignOut::Delete;
     };
+    let dropped_keys: &[&str] = if preserve {
+        &LOGIN_CREDENTIAL_KEYS
+    } else {
+        &ACCOUNT_SCOPED_CREDENTIAL_KEYS
+    };
     let mut dropped = false;
-    for key in ACCOUNT_SCOPED_CREDENTIAL_KEYS {
-        dropped |= obj.remove(key).is_some();
+    for key in dropped_keys {
+        dropped |= obj.remove(*key).is_some();
     }
     match (dropped, obj.is_empty()) {
         (_, true) => SignOut::Delete,
@@ -1849,14 +1940,25 @@ pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value) -> SignOut
 /// upgrade path is a clauth-owned canonical copy the per-store copies reconcile
 /// against, which is only worth its moving parts once revocation is a surface.
 ///
-/// A no-op when either file is unreadable or `target` is the static-token
-/// sidecar: [`write_session_token`] rebuilds that file from the mint alone, so a
-/// block carried there is dropped at the next re-mint and sits on disk for
-/// nothing until then.
-fn carry_live_extra_into(link: &Path, target: &Path, name: &ProfileName) -> Result<()> {
-    if target
-        .file_name()
-        .is_some_and(|n| n == "session-token.json")
+/// A no-op when either file is unreadable. With `preserve_non_login_keys` off
+/// also a no-op when `target` is the static-token sidecar: every sidecar writer
+/// then rebuilds that file from its token alone, so a block carried there is
+/// dropped at the next re-mint and sits on disk for nothing until then. With it
+/// on the writers keep it ([`keep_non_login_in_sidecar`]), and the carry has to
+/// reach the sidecar: the per-account sync puts the outgoing account's MCP
+/// logins into its own sidecar, and without the carry refreshing them there a
+/// switch back would put a copy live whose refresh token another account's
+/// session has since spent.
+fn carry_live_extra_into(
+    link: &Path,
+    target: &Path,
+    name: &ProfileName,
+    preserve: bool,
+) -> Result<()> {
+    if !preserve
+        && target
+            .file_name()
+            .is_some_and(|n| n == "session-token.json")
     {
         return Ok(());
     }
@@ -1963,12 +2065,401 @@ pub(crate) fn restore_parked_mcp_logins(name: &ProfileName, store: &Path) {
     }
 }
 
-fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName) {
-    if let Err(e) = carry_live_extra_into(link, target, name) {
+fn carry_live_extra_best_effort(link: &Path, target: &Path, name: &ProfileName, preserve: bool) {
+    if let Err(e) = carry_live_extra_into(link, target, name, preserve) {
         logline!(
             "clauth: switched to '{name}' but could not carry its MCP server logins: {e:#}. \
              Re-authenticate any MCP server that reports a signed-out session"
         );
+    }
+}
+
+/// Whether every key of a credential store other than the login stays with the
+/// account whose store it is (`preserve_non_login_keys` in profiles.toml,
+/// default on). Read off disk at the moment it matters, the way every persist
+/// leg re-reads the record, so a daemon holding a config from before an edit
+/// acts on what the file says now. A profiles.toml that does not load reads ON:
+/// a broken hand-edit then keeps keys rather than stripping them, on every side
+/// that reads this (the sidecar writers, the syncs, the Keychain sign-out).
+pub(crate) fn preserve_non_login_keys() -> bool {
+    crate::profile::load_app_state().map_or(true, |state| state.preserve_non_login_keys)
+}
+
+/// The non-empty access token of `store`'s login, the line [`classify_link_at`]
+/// and the link guard draw: two blank logins are two logged-out shells, never
+/// the same account.
+fn login_access_token(store: &serde_json::Value) -> Option<&str> {
+    store
+        .get("claudeAiOauth")?
+        .get("accessToken")?
+        .as_str()
+        .filter(|token| !token.is_empty())
+}
+
+/// Read a credential store for a merge, `None` when there is nothing to merge
+/// with. An absent file is silent; one that is present but unreadable or not
+/// JSON says so on the event line, `purpose` naming what the skip costs, so a
+/// merge skipped over it does not let its keys die unlogged with the next write.
+fn read_store_for_merge(path: &Path, purpose: &str) -> Option<serde_json::Value> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            logline!(
+                "clauth: could not read {} ({e}), so {purpose}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Some(value),
+        Err(e) => {
+            logline!(
+                "clauth: {} is not valid JSON ({e}), so {purpose}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Copy every non-login key of `source` onto `target` (every key but
+/// [`LOGIN_CREDENTIAL_KEYS`]), reporting whether anything changed. A key only
+/// `source` holds is added; one it lacks is left as `target` has it; where both
+/// hold one, [`fresher_copy`] decides what stays. A refresh moves a login's
+/// expiry forward, so an older copy (a live file a `clauth start` session's
+/// refresh has since overtaken, a backup's) never lands over a newer one, whose
+/// refresh token the older one's may already have been spent for. Nothing is
+/// ever deleted, and the login and its identity keys are never touched, on
+/// either side.
+fn copy_non_login_keys(target: &mut serde_json::Value, source: &serde_json::Value) -> bool {
+    let (Some(target), Some(source)) = (target.as_object_mut(), source.as_object()) else {
+        return false;
+    };
+    let mut changed = false;
+    for (key, value) in source {
+        if LOGIN_CREDENTIAL_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        let merged = match target.get(key) {
+            Some(held) => fresher_copy(held, value),
+            None => value.clone(),
+        };
+        if target.get(key) != Some(&merged) {
+            target.insert(key.clone(), merged);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// What stays of a key both sides hold: `held`, the target's copy, and
+/// `source`'s. A token (an object with `expiresAt`, `accessToken` or
+/// `refreshToken`, a design login) is one value and never mixed: the copy
+/// that expires later stays, `source`'s on a tie, and one without an expiry
+/// never replaces one that has one. A map of tokens (the MCP logins, one per
+/// server) is merged one level deep, server by server under the same rule,
+/// keeping every server either side holds: a server only the target holds
+/// stays, so a per-server logout reaches the store with the next switch-in's
+/// carry, not through this. Anything else takes `source`'s copy whole.
+fn fresher_copy(held: &serde_json::Value, source: &serde_json::Value) -> serde_json::Value {
+    if let Some(kept) = fresher_token(held, source) {
+        return kept;
+    }
+    match (held.as_object(), source.as_object()) {
+        (Some(held_map), Some(source_map)) => {
+            let mut merged = held_map.clone();
+            for (entry, value) in source_map {
+                let kept = held_map
+                    .get(entry)
+                    .and_then(|held_entry| fresher_token(held_entry, value))
+                    .unwrap_or_else(|| value.clone());
+                merged.insert(entry.clone(), kept);
+            }
+            serde_json::Value::Object(merged)
+        }
+        _ => source.clone(),
+    }
+}
+
+/// [`fresher_copy`]'s token rule, `None` when neither side is a token.
+fn fresher_token(
+    held: &serde_json::Value,
+    source: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let is_token = |value: &serde_json::Value| {
+        value.as_object().is_some_and(|obj| {
+            ["expiresAt", "accessToken", "refreshToken"]
+                .iter()
+                .any(|field| obj.contains_key(*field))
+        })
+    };
+    match (is_token(held), is_token(source)) {
+        (false, false) => return None,
+        // A token is never replaced by something that is none (an emptied
+        // object), which would drop a login no copy replaced.
+        (true, false) => return Some(held.clone()),
+        _ => {}
+    }
+    let expiry = |value: &serde_json::Value| {
+        value.get("expiresAt").and_then(|at| {
+            at.as_i64()
+                .or_else(|| at.as_f64().map(|at| at.trunc() as i64))
+        })
+    };
+    Some(match (expiry(held), expiry(source)) {
+        (Some(held_at), Some(source_at)) if held_at > source_at => held.clone(),
+        (Some(_), None) => held.clone(),
+        _ => source.clone(),
+    })
+}
+
+/// The names of `value`'s non-login keys, for an event line (names only).
+fn non_login_key_names(value: &serde_json::Value) -> Vec<&str> {
+    value
+        .as_object()
+        .map(|obj| {
+            obj.keys()
+                .map(String::as_str)
+                .filter(|key| !LOGIN_CREDENTIAL_KEYS.contains(key))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The bytes a static-token sidecar writer publishes at `sidecar`: `fresh`, the
+/// file rebuilt from a token, plus every non-login key the current sidecar
+/// holds, a `/design-login` a sync put there among them. Every sidecar writer
+/// rebuilds the file from its token alone, so without this a re-mint, a rolling
+/// re-stamp or a restore drops what the account kept beside its login. The
+/// keep-everything rule an account's own `credentials.json` gets on every token
+/// write ([`crate::profile::preserve_extra_blocks`]), minus the login's identity
+/// keys ([`LOGIN_CREDENTIAL_KEYS`]): those belong to the login being replaced,
+/// and a re-mint can be another account's token.
+///
+/// With no sidecar yet (the first mint on this profile, or the first roll) the
+/// keys come from the profile's `credentials.json`, the same account's other
+/// store, so a design login saved while the profile ran on its OAuth login is
+/// installed with the new token too. Every caller first saves the live file
+/// into the install source ([`sync_live_extra_into_install_source`]), that
+/// `credentials.json` on this path, so what only the live file held beside the
+/// login being replaced is read here too.
+///
+/// `fresh` unchanged when `preserve_non_login_keys` is off, and when the
+/// current sidecar is a mis-fill: the keys beside a mis-filled login can be
+/// another account's, and a mis-fill's contents are evidence, not this
+/// account's data. A present file that does not read or parse is skipped with
+/// an event line ([`read_store_for_merge`]); keeping keys is a convenience, and
+/// the write it rides on is not. Callers hold the state flock, so the read and
+/// their write see the same file.
+fn keep_non_login_in_sidecar(fresh: &[u8], sidecar: &Path) -> Vec<u8> {
+    if !preserve_non_login_keys() {
+        return fresh.to_vec();
+    }
+    let source = if sidecar.symlink_metadata().is_ok() {
+        sidecar.to_path_buf()
+    } else {
+        sidecar.with_file_name("credentials.json")
+    };
+    let Some(current) = read_store_for_merge(
+        &source,
+        "this write goes ahead without the non-login keys it may hold (a design login, MCP \
+         logins)",
+    ) else {
+        return fresh.to_vec();
+    };
+    let misfilled = serde_json::from_value::<ClaudeCredentials>(current.clone())
+        .ok()
+        .and_then(|creds| creds.claude_ai_oauth)
+        .is_some_and(|oauth| sidecar_kind_of(&oauth) == SidecarKind::Misfilled);
+    if source == sidecar && misfilled {
+        return fresh.to_vec();
+    }
+    let Ok(mut rebuilt) = serde_json::from_slice::<serde_json::Value>(fresh) else {
+        return fresh.to_vec();
+    };
+    if !copy_non_login_keys(&mut rebuilt, &current) {
+        return fresh.to_vec();
+    }
+    serde_json::to_vec_pretty(&rebuilt).unwrap_or_else(|_| fresh.to_vec())
+}
+
+/// `store` with `source`'s non-login keys merged over it, or `None` when
+/// nothing is to be written: `source`'s login is not `store`'s (the same
+/// non-empty access token), or the merge changes nothing. The rule every
+/// per-account sync applies ([`sync_live_extra_into`]). PURE, so it is pinned
+/// on every platform.
+pub(crate) fn non_login_keys_onto_own_store(
+    source: &serde_json::Value,
+    store: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    non_login_keys_for_login(source, store, login_access_token(store)?)
+}
+
+/// `store` with `source`'s non-login keys merged over it when `source`'s login
+/// is `login`, `None` when it is not or nothing changes. The store's own login
+/// for every sync but the one after a rotation, which matches the live file
+/// against the login the rotation just replaced.
+fn non_login_keys_for_login(
+    source: &serde_json::Value,
+    store: &serde_json::Value,
+    login: &str,
+) -> Option<serde_json::Value> {
+    if login_access_token(source) != Some(login) {
+        return None;
+    }
+    let mut synced = store.clone();
+    copy_non_login_keys(&mut synced, source).then_some(synced)
+}
+
+/// Sync the live credential's non-login keys into `store`, the store of the
+/// account the live login belongs to, reporting whether it wrote. The
+/// per-account half of preservation: Claude Code saves a `/design-login` (and
+/// anything else it adds beside the login) into the live file, and on Linux its
+/// staged write replaces clauth's symlink with a regular file, so without this
+/// the next relink onto the store, a switch's or the daemon's and TUI's boot
+/// reconcile's, discards what only that file held.
+///
+/// Only when the live login IS `store`'s ([`non_login_keys_onto_own_store`]): a
+/// live file carrying another account's login is not this account's data, and
+/// what crosses accounts is the carry's decision alone
+/// ([`CARRIED_CREDENTIAL_KEYS`]). A no-op when the live slot resolves to
+/// `store` itself, and when either side is absent; a present side that does
+/// not parse is skipped with an event line. Stands down while a rotation is
+/// staged beside a `credentials.json` store
+/// ([`crate::profile::rotation_staged_beside`]): a store written after the
+/// stage reads as the newer commit, and the load would discard the staged pair.
+/// The next relink retries.
+///
+/// Accepted ceiling, the carry's own: this adds and overwrites, never deletes,
+/// so a key Claude Code removed from the live file stays in the store. Where
+/// both hold a copy, the fresher stays ([`copy_non_login_keys`]).
+pub(crate) fn sync_live_extra_into(link: &Path, store: &Path) -> Result<bool> {
+    sync_live_extra_matching(link, store, None)
+}
+
+/// [`sync_live_extra_into`] with the live login it must match: `None` for the
+/// store's own, `Some` for the login a rotation just replaced in the store.
+fn sync_live_extra_matching(link: &Path, store: &Path, login: Option<&str>) -> Result<bool> {
+    if paths_equivalent(link, store) {
+        return Ok(false);
+    }
+    let purpose = "the live credential's non-login keys (a design login, MCP logins) were not \
+                   saved into the account's store";
+    let (Some(live), Some(stored)) = (
+        read_store_for_merge(link, purpose),
+        read_store_for_merge(store, purpose),
+    ) else {
+        return Ok(false);
+    };
+    let synced = match login {
+        Some(login) => non_login_keys_for_login(&live, &stored, login),
+        None => non_login_keys_onto_own_store(&live, &stored),
+    };
+    let Some(synced) = synced else {
+        return Ok(false);
+    };
+    if crate::profile::rotation_staged_beside(store) {
+        logline!(
+            "clauth: a rotation is staged beside {}, so {purpose} this time; the next relink \
+             retries",
+            store.display()
+        );
+        return Ok(false);
+    }
+    atomic_write_600(store, serde_json::to_string_pretty(&synced)?)
+        .context("failed to save the live credential's non-login keys into its store")?;
+    Ok(true)
+}
+
+/// After clauth rotated `name`'s chain: the live file Claude Code wrote beside
+/// the login the rotation replaced (`previous_login`, a `/design-login`) is
+/// still this account's, but its login no longer matches the store's, so no
+/// later sync would recognise it. Matched against the replaced login instead,
+/// and saved beside the rotated pair. Runs after the rotation's stage is
+/// resolved (the stage exists to make the rotated pair durable before anything
+/// else writes), under the rotation's state-flock hold. Best-effort, logged.
+pub(crate) fn sync_live_extra_after_rotation(name: &ProfileName, previous_login: &str) {
+    if !preserve_non_login_keys() {
+        return;
+    }
+    let (Ok(link), Ok(store)) = (claude_credentials_path(), install_source_path(name)) else {
+        return;
+    };
+    if let Err(e) = sync_live_extra_matching(&link, &store, Some(previous_login)) {
+        logline!(
+            "clauth: could not save the live credential's non-login keys into {} after \
+             rotating '{name}': {e:#}",
+            store.display()
+        );
+    }
+}
+
+/// Run [`sync_live_extra_into`], reporting a failure instead of raising it:
+/// keeping a design login is a convenience, and completing the relink, switch
+/// or rotation it rides on is not.
+pub(crate) fn sync_live_extra_best_effort(link: &Path, store: &Path) {
+    if let Err(e) = sync_live_extra_into(link, store) {
+        logline!(
+            "clauth: could not save the live credential's non-login keys into {}: {e:#}. A design \
+             login or MCP login made since the last relink may need signing in again",
+            store.display()
+        );
+    }
+}
+
+/// Move the sidecar's non-login keys into the profile's `credentials.json`
+/// before the sidecar goes (a cleared long-lived token), so a design login the
+/// account kept there stays installed once `credentials.json` is the install
+/// source again. The same account's other store, so no login check, but never
+/// out of a mis-fill, whose keys are evidence; the staged-rotation stand-down
+/// holds as for every write of that file. Callers hold the state flock.
+/// Best-effort, logged.
+fn hand_sidecar_keys_to_store(sidecar: &Path) {
+    if !preserve_non_login_keys() {
+        return;
+    }
+    let store = sidecar.with_file_name("credentials.json");
+    let purpose = "the cleared token's non-login keys (a design login, MCP logins) were not \
+                   moved into credentials.json";
+    let Some(held) = read_store_for_merge(sidecar, purpose) else {
+        return;
+    };
+    let misfilled = serde_json::from_value::<ClaudeCredentials>(held.clone())
+        .ok()
+        .and_then(|creds| creds.claude_ai_oauth)
+        .is_some_and(|oauth| sidecar_kind_of(&oauth) == SidecarKind::Misfilled);
+    if misfilled {
+        return;
+    }
+    let Some(mut stored) = read_store_for_merge(&store, purpose) else {
+        let held_keys = non_login_key_names(&held);
+        if !held_keys.is_empty() {
+            logline!(
+                "clauth: {} held {} beside the cleared token and the profile stores no \
+                 credentials.json to take them, so they go with the token",
+                sidecar.display(),
+                held_keys.join(", ")
+            );
+        }
+        return;
+    };
+    if !copy_non_login_keys(&mut stored, &held) {
+        return;
+    }
+    if crate::profile::rotation_staged_beside(&store) {
+        logline!(
+            "clauth: a rotation is staged beside {}, so {purpose}",
+            store.display()
+        );
+        return;
+    }
+    let written = serde_json::to_string_pretty(&stored)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| atomic_write_600(&store, bytes).map_err(anyhow::Error::from));
+    if let Err(e) = written {
+        logline!("clauth: {purpose}: {e:#}");
     }
 }
 
@@ -1979,6 +2470,10 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // Loaded once for the file sync and the Keychain mirror alike, so one
+        // relink cannot act on two different answers across an edit landing
+        // between two reads.
+        let preserve = preserve_non_login_keys();
 
         if let Ok(meta) = link.symlink_metadata() {
             if !meta.file_type().is_symlink() {
@@ -2010,9 +2505,17 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
                     );
                 }
             }
+            // The live file is this account's when its login is the target's,
+            // which is the daemon's and the TUI's boot reconcile: keep what
+            // Claude Code saved beside the login (a `/design-login`) in the
+            // account's own store, the static-token sidecar included, before
+            // the relink below replaces the file.
+            if preserve {
+                sync_live_extra_best_effort(&link, &target);
+            }
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name);
+            carry_live_extra_best_effort(&link, &target, name, preserve);
         }
 
         // macOS: make the switch real, since Claude Code reads the Keychain.
@@ -2022,7 +2525,7 @@ pub(crate) fn link_profile_credentials(name: &ProfileName) -> Result<()> {
         // [`keychain_mirror_source`].
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::Leave)?;
+            keychain_mirror_source(&target, AbsentSource::Leave, preserve)?;
         }
         if target.exists() {
             publish_credential_link(&link, &target)?;
@@ -2045,10 +2548,12 @@ pub(crate) fn clear_claude_credentials() -> Result<()> {
         // item held goes, possibly a chain CC rotated after our last capture,
         // which is lost and needs a re-login. What survives is the MCP-server
         // logins, which belong to no account and would otherwise be collateral
-        // of every wrap-off; an item left holding nothing else is deleted.
+        // of every wrap-off, and with `preserve_non_login_keys` on a design
+        // login as well; an item left holding nothing else is deleted.
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            crate::keychain::keychain_sign_out()?;
+            let preserve = preserve_non_login_keys();
+            crate::keychain::keychain_sign_out(preserve)?;
         }
         Ok(())
     })
@@ -2544,7 +3049,14 @@ fn snapshot_active_credentials_unchecked(
     // `force_snapshot_active_credentials`. `adopt_first_login` never hits it for
     // a session-token profile (the install source exists, so `is_first_login` is
     // false), so the guard is a safe no-op on that path.
+    //
+    // The login stays out, but the keys beside it are this account's: with
+    // `preserve_non_login_keys` on, whatever Claude Code saved beside the static
+    // token in the live file (a `/design-login`) is synced into the sidecar,
+    // which is the switch-away half of per-account preservation. Only when the
+    // live login IS the sidecar's ([`sync_live_extra_into`]).
     if has_session_token(active) {
+        sync_live_extra_into_install_source(active);
         return Ok(());
     }
     // Fresh, not just the in-memory active marker: the active profile may have
@@ -2573,8 +3085,32 @@ fn snapshot_active_credentials_unchecked(
     if let Some(profile) = config.find_mut(active) {
         profile.set_credentials(Some(credentials), held);
         save_profile(profile)?;
+        // The capture above models the login alone, so a key only the live
+        // file holds (a `/design-login`) would be dropped here and gone with
+        // the relink that follows: sync it into the store the login was just
+        // captured into.
+        sync_live_extra_into_install_source(active);
     }
     Ok(())
+}
+
+/// With `preserve_non_login_keys` on, sync the live file's non-login keys into
+/// `name`'s install source ([`sync_live_extra_into`]): the store the live login
+/// is `name`'s own in, the sidecar while it holds a long-lived login and
+/// `credentials.json` otherwise. A mis-filled sidecar is never the install
+/// source, so nothing is written into that evidence. The snapshot sink's sync,
+/// and the save every sidecar writer makes under the state flock before it
+/// replaces or removes the login the live file was written beside (a re-mint,
+/// a rolling stamp, a restore, a heal, a clear), after which no sync matches
+/// that file again. Infallible like the rest of the preservation, so a path
+/// that cannot resolve costs the keys, never the switch or write it runs for.
+pub(crate) fn sync_live_extra_into_install_source(name: &ProfileName) {
+    if !preserve_non_login_keys() {
+        return;
+    }
+    if let (Ok(link), Ok(store)) = (claude_credentials_path(), install_source_path(name)) {
+        sync_live_extra_best_effort(&link, &store);
+    }
 }
 
 /// Snapshot the live `.credentials.json` into the active profile unconditionally.
@@ -2592,10 +3128,19 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
     with_state_lock(|_held| {
         let link = claude_credentials_path()?;
         let target = install_source_path(name)?;
+        // One load for both layers, as in `link_profile_credentials`.
+        let preserve = preserve_non_login_keys();
         if link.symlink_metadata().is_ok() {
+            // A relink of the account the live login already belongs to (an
+            // adopt, a re-capture of the active profile) keeps what the live
+            // file holds beside the login; a switch's live login is the
+            // outgoing account's, which the snapshot sink synced before this.
+            if preserve {
+                sync_live_extra_best_effort(&link, &target);
+            }
             // Preserve the live MCP-server logins onto the incoming profile
             // before the swap, so switching accounts keeps them intact.
-            carry_live_extra_best_effort(&link, &target, name);
+            carry_live_extra_best_effort(&link, &target, name, preserve);
         }
         // macOS: make the switch real, since Claude Code reads the Keychain.
         // `SignOut` because this is the FORCING relink, which every switch path
@@ -2605,7 +3150,7 @@ pub(crate) fn force_link_profile_credentials(name: &ProfileName) -> Result<()> {
         // [`keychain_mirror_source`].
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
-            keychain_mirror_source(&target, AbsentSource::SignOut)?;
+            keychain_mirror_source(&target, AbsentSource::SignOut, preserve)?;
         }
         if target.exists() {
             publish_credential_link(&link, &target)?;

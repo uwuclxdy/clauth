@@ -7161,6 +7161,52 @@ fn auto_start_queue_space_noops_until_an_account_opts_in() {
     assert!(reloaded.auto_start_queue, "the toggle persists to disk");
 }
 
+// ── non-login keys (preserve_non_login_keys) ─────────────────────────────────
+
+/// The row flips the persisted `preserve_non_login_keys` through the real
+/// Config router: space off writes `preserve_non_login_keys = false`
+/// explicitly, ⏎ back on omits the key again (on is the default), and the
+/// reader every relink consults follows the file.
+#[test]
+fn non_login_keys_row_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::PreserveNonLoginKeys)
+        .unwrap();
+    assert!(app.config().state.preserve_non_login_keys, "on by default");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.preserve_non_login_keys,
+        "space toggles it off"
+    );
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        on_disk.contains("preserve_non_login_keys = false"),
+        "an explicit off must render or the next load reverts it to on:\n{on_disk}"
+    );
+    assert!(
+        !crate::claude::preserve_non_login_keys(),
+        "the reader the relinks consult follows the file"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config().state.preserve_non_login_keys,
+        "⏎ mirrors space"
+    );
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !on_disk.contains("preserve_non_login_keys"),
+        "on (default) omits the key:\n{on_disk}"
+    );
+    assert!(crate::claude::preserve_non_login_keys());
+}
+
 // ── auto-update (the [update] toggle) ────────────────────────────────────────
 
 /// The row flips the persisted `[update]` table through the real Config

@@ -1417,8 +1417,11 @@ pub(crate) fn apply_rotated_tokens_locked(
         // it tells "the live file is a stale mirror of OUR OWN chain" apart
         // from a genuinely foreign CC re-login, and feeds both mirrors'
         // recognition candidates after the lock closes (via `split_gate_old`).
+        // Also what the live file's non-login keys are matched against once
+        // the rotated pair is durable (`sync_live_extra_after_rotation` below).
+        let pre_rotation_access = oauth.access_token.clone();
         #[cfg(target_os = "macos")]
-        let old_access = oauth.access_token.clone();
+        let old_access = pre_rotation_access.clone();
         #[cfg(target_os = "macos")]
         {
             split_gate_old = Some(old_access.clone());
@@ -1435,6 +1438,11 @@ pub(crate) fn apply_rotated_tokens_locked(
             return Err(anyhow::anyhow!("failed to persist rotated tokens"));
         }
         clear_staged_credentials(name);
+        // A live file Claude Code wrote beside the login just replaced (a
+        // `/design-login`) no longer matches the store's login, so no later
+        // sync would recognise it as this account's: saved now, matched
+        // against the replaced token, after the stage above is resolved.
+        crate::claude::sync_live_extra_after_rotation(name, &pre_rotation_access);
         // CLA-ROLL: a rolling-token split profile re-stamps its session token
         // from the freshly rotated chain on EVERY rotation, active or parked —
         // a fast disk write inside the locked section, same durability class

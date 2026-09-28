@@ -2,9 +2,10 @@
 //! the per-account Setup tab. Rows back real persisted state in `AppState` and
 //! run in the concern bands `GlobalConfigRow::band` names, each opened by an
 //! eyebrow header: appearance (`theme`, `reset display`, the `clock`
-//! notation it gates, and `home tab`), scheduler (`on mismatch`, `refresh`
-//! cadence, `refresh spent` toggle, `context nudge`, `auto-start queue`,
-//! `rotation`, `auto-update`), auto-switch (`weekly limit`,
+//! notation it gates, and `home tab`), scheduler (`on mismatch`,
+//! `non-login keys`, `refresh` cadence, `refresh spent` toggle, `context
+//! nudge`, `auto-start queue`, `rotation`, `auto-update`), auto-switch
+//! (`weekly limit`,
 //! `switch mode` = burn-aware, `walk order` (issue #86), the burn-aware
 //! `burn floor`/`burn horizon`
 //! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
@@ -61,6 +62,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spend_budget: state.spend_budget_switching,
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
+            preserve_non_login_keys: state.preserve_non_login_keys,
             auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
@@ -215,6 +217,7 @@ struct RowState {
     spend_budget: bool,
     switch_off_when_budget_spent: bool,
     preemptive: bool,
+    preserve_non_login_keys: bool,
     auto_update: bool,
     refresh_spent: bool,
     auto_start_queue: bool,
@@ -278,6 +281,13 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             Some(DivergenceChoice::Discard) => {
                 "restore the previous credentials and drop the new login"
             }
+        }),
+        // On names the one login everybody meets; off names what the loss
+        // costs, since off is the pre-toggle behavior an operator opts back to.
+        GlobalConfigRow::PreserveNonLoginKeys => String::from(if rows.preserve_non_login_keys {
+            "keep a /design-login with the account it was made on"
+        } else {
+            "a /design-login is dropped at the next switch, and outside macOS at any relink"
         }),
         GlobalConfigRow::RefreshInterval => {
             format!(
@@ -523,6 +533,12 @@ fn detail_row(
         // while `CLAUTH_NO_UPDATE=1` overrides it (the env var stays
         // authoritative until it goes, and the row renders what is saved).
         GlobalConfigRow::AutoUpdate => toggle_row(arrow, "auto-update", rows.auto_update, selected),
+        GlobalConfigRow::PreserveNonLoginKeys => toggle_row(
+            arrow,
+            "non-login keys",
+            rows.preserve_non_login_keys,
+            selected,
+        ),
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
         }

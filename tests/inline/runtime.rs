@@ -10846,3 +10846,49 @@ fn seed_degrade_disposition_retries_only_the_classified_transient() {
         SeedDegradeDisposition::LogAndDegrade
     );
 }
+
+/// The watchdog keeps a static token over a differing runtime file, and what
+/// the session's Claude Code saved beside that same token (a `/design-login`)
+/// went with the file. It is synced into the sidecar first. A runtime file
+/// holding another login (a session-side re-login) syncs nothing.
+#[test]
+fn the_watchdog_keeps_what_a_session_saved_beside_a_static_token() {
+    let _home = HomeSandbox::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("session-token.json");
+    let link_path = tmp.path().join(".credentials.json");
+    let token =
+        br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-static","expiresAt":4102444800000}}"#;
+    fs::write(&canonical, token).expect("write sidecar");
+    fs::write(
+        &link_path,
+        br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-static","expiresAt":4102444800000},"designOauth":{"accessToken":"design-1"}}"#,
+    )
+    .expect("write runtime file");
+
+    assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
+
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&canonical).expect("read")).expect("parse");
+    assert_eq!(
+        sidecar["claudeAiOauth"]["accessToken"],
+        "sk-ant-oat01-static"
+    );
+    assert_eq!(sidecar["designOauth"]["accessToken"], "design-1");
+
+    fs::write(&canonical, token).expect("reset sidecar");
+    // The watchdog relinked the slot onto the sidecar; a write through that link
+    // would land in the sidecar itself, so the re-login replaces the link.
+    fs::remove_file(&link_path).expect("drop the relinked slot");
+    fs::write(
+        &link_path,
+        br#"{"claudeAiOauth":{"accessToken":"relogin","refreshToken":"r"},"designOauth":{"accessToken":"design-2"}}"#,
+    )
+    .expect("write re-login");
+    assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
+    assert_eq!(
+        fs::read(&canonical).expect("read"),
+        token.to_vec(),
+        "a re-login syncs nothing"
+    );
+}

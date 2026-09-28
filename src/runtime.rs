@@ -3293,6 +3293,14 @@ impl SessionSwap {
                 return Ok(SwapOutcome::Refused(SwapRefused::NoCredentialStore));
             }
             touch_store(&plan, file_mtime(&current))?;
+            // Known gap: nothing is carried onto the incoming member's store
+            // here (the global switch's `mcpOAuth` carry). The outgoing member
+            // keeps the runtime file's non-login keys only where the drain above
+            // saves them: a static-token member's sidecar through its sync, a
+            // `credentials.json` member when the runtime file wins the drain.
+            // On macOS the session's store is its per-session Keychain item, and
+            // the swap's install replaces it without saving what sat beside the
+            // outgoing member's login (`keychain::keychain_install_for_config_dir`).
             relink_to_canonical(&link, &plan.store)?;
 
             // Past here the session IS on the new member, so nothing may report
@@ -5680,11 +5688,19 @@ fn sync_credentials_unlocked(link_path: &Path, canonical: &Path) -> Result<bool>
     // canonical and relink; the re-login stays recoverable in the runtime
     // file's lineage, and `clauth login` is the supported way to refresh the
     // profile's usage OAuth pair.
+    //
+    // What the session's Claude Code saved beside the static token (a
+    // `/design-login`, an MCP login, a refresh of either) is the member's own:
+    // with `preserve_non_login_keys` on it is synced into the sidecar before
+    // the file goes, only when the runtime login still IS the token.
     if differs
         && canonical
             .file_name()
             .is_some_and(|f| f == "session-token.json")
     {
+        if crate::claude::preserve_non_login_keys() {
+            crate::claude::sync_live_extra_best_effort(link_path, canonical);
+        }
         logline!(
             "clauth: watchdog kept the static session token \
              (a session-side re-login is never adopted over it)"

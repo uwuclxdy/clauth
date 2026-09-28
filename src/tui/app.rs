@@ -615,6 +615,13 @@ pub(crate) enum GlobalConfigRow {
     ContextNudge,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
     DivergenceDefault,
+    /// Keep every key of a credential store other than the login and its
+    /// identity keys with the account whose store it is
+    /// (`AppState.preserve_non_login_keys`) — ON by default. A `/design-login`
+    /// then stays with the account it was made on across switches and relinks.
+    /// Read off disk where it is used, so a flip applies to the next relink.
+    /// ENUMERATED on/off, ⏎ mirrors space.
+    PreserveNonLoginKeys,
     /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
@@ -5889,12 +5896,13 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 9] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 19] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 20] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::HomeTab,
     GlobalConfigRow::DivergenceDefault,
+    GlobalConfigRow::PreserveNonLoginKeys,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
     GlobalConfigRow::ContextNudge,
@@ -5923,6 +5931,7 @@ impl GlobalConfigRow {
             | GlobalConfigRow::ClockNotation
             | GlobalConfigRow::HomeTab => "appearance",
             GlobalConfigRow::DivergenceDefault
+            | GlobalConfigRow::PreserveNonLoginKeys
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
             | GlobalConfigRow::ContextNudge
@@ -6029,6 +6038,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
+        GlobalConfigRow::PreserveNonLoginKeys => toggle_preserve_non_login_keys(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
         // Inert while no account has `auto_start` on (rendered dimmed): a
         // queue with no possible member spaces nothing, so it stays a true
@@ -6448,6 +6458,20 @@ fn toggle_auto_update(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.update.auto_update = !cfg.state.update.auto_update;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip whether non-login keys stay with their account
+/// (`preserve_non_login_keys`, default on). Same persistence shape as
+/// `toggle_preemptive_rotation`; every reader loads the flag off disk at the
+/// moment it relinks or rewrites a store (`claude::preserve_non_login_keys`),
+/// so the next relink in any process acts on the flip.
+fn toggle_preserve_non_login_keys(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();

@@ -1729,6 +1729,7 @@ fn carry_copies_mcp_oauth_and_leaves_the_target_login_untouched() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        true,
     )
     .expect("carry");
 
@@ -1782,11 +1783,11 @@ fn a_block_the_live_file_lacks_survives_onto_the_live_slot() {
     );
 }
 
-/// The static-token sidecar is built by [`write_session_token`] from the mint
-/// alone, so anything carried into it is dropped at the next re-mint. Driven
-/// through the production writer on purpose: the sidecar DOES carry a
-/// `claudeAiOauth` block, so a content-shaped guard reads it as an OAuth store
-/// and writes MCP secrets into it.
+/// With `preserve_non_login_keys` off the static-token sidecar is built by
+/// [`write_session_token`] from the mint alone, so anything carried into it is
+/// dropped at the next re-mint. Driven through the production writer on
+/// purpose: the sidecar DOES carry a `claudeAiOauth` block, so a content-shaped
+/// guard reads it as an OAuth store and writes MCP secrets into it.
 #[test]
 fn carry_skips_the_static_token_sidecar() {
     let _home = HomeSandbox::new();
@@ -1817,6 +1818,7 @@ fn carry_skips_the_static_token_sidecar() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        false,
     )
     .expect("carry");
 
@@ -1857,6 +1859,7 @@ fn carry_moves_only_the_allowlisted_key() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        true,
     )
     .expect("carry");
 
@@ -1895,9 +1898,9 @@ fn carrying_a_key_the_target_already_holds_reports_no_change() {
     );
 }
 
-/// A sign-out drops exactly what belongs to one Claude account and keeps what
-/// belongs to none, which is the line Claude Code's own logout draws. Every key
-/// is asserted by name: dropping one from
+/// With `preserve_non_login_keys` off, a sign-out drops exactly what belongs to
+/// one Claude account and keeps what belongs to none, which is the line Claude
+/// Code's own logout draws. Every key is asserted by name: dropping one from
 /// the list would otherwise leave the outgoing account's block serving the next.
 #[test]
 fn a_sign_out_drops_the_account_keys_and_keeps_the_mcp_logins() {
@@ -1911,7 +1914,7 @@ fn a_sign_out_drops_the_account_keys_and_keeps_the_mcp_logins() {
     });
 
     assert_eq!(
-        strip_account_credentials(&mut blob),
+        strip_account_credentials(&mut blob, false),
         SignOut::Write,
         "an item still holding MCP logins is written back stripped"
     );
@@ -1939,11 +1942,20 @@ fn a_sign_out_drops_the_account_keys_and_keeps_the_mcp_logins() {
 #[test]
 fn a_sign_out_over_a_login_only_item_leaves_nothing_to_keep() {
     let mut login_only = serde_json::json!({ "claudeAiOauth": { "accessToken": "outgoing" } });
-    assert_eq!(strip_account_credentials(&mut login_only), SignOut::Delete);
+    assert_eq!(
+        strip_account_credentials(&mut login_only, false),
+        SignOut::Delete
+    );
+    let mut login_only = serde_json::json!({ "claudeAiOauth": { "accessToken": "outgoing" } });
+    assert_eq!(
+        strip_account_credentials(&mut login_only, true),
+        SignOut::Delete,
+        "preservation keeps no login, so a login-only item still goes"
+    );
 
     let mut not_an_object = serde_json::json!("torn");
     assert_eq!(
-        strip_account_credentials(&mut not_an_object),
+        strip_account_credentials(&mut not_an_object, true),
         SignOut::Delete,
         "an item that is not an object carries nothing worth preserving"
     );
@@ -1958,7 +1970,10 @@ fn a_store_with_no_account_keys_is_already_signed_out() {
     let mut mcp_only =
         serde_json::json!({ "mcpOAuth": { "linear": { "accessToken": "mock-linear" } } });
 
-    assert_eq!(strip_account_credentials(&mut mcp_only), SignOut::Nothing);
+    assert_eq!(
+        strip_account_credentials(&mut mcp_only, false),
+        SignOut::Nothing
+    );
     assert_eq!(
         mcp_only["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
         "and it is left exactly as it was"
@@ -1993,6 +2008,7 @@ fn carry_keeps_the_store_at_0600() {
         &live,
         &target,
         &crate::profile::ProfileName::from("carrytest"),
+        true,
     )
     .expect("carry");
 
@@ -2116,8 +2132,13 @@ fn a_carry_with_no_store_to_land_in_parks_instead() {
 
     // The park the carry falls back to is a cache write, gated on the record.
     crate::testutil::register_names(&["apikey"]);
-    carry_live_extra_into(&live, &absent, &crate::profile::ProfileName::from("apikey"))
-        .expect("carry");
+    carry_live_extra_into(
+        &live,
+        &absent,
+        &crate::profile::ProfileName::from("apikey"),
+        true,
+    )
+    .expect("carry");
 
     let parked: serde_json::Value = crate::profile_cache::load_profile_cache(
         &crate::profile::ProfileName::from("apikey"),
@@ -4537,4 +4558,1312 @@ fn claude_settings_models_reads_model_fallbacks_and_the_subagent_key() {
 
     fs::write(dir.join("settings.json"), r#"{"fallbackModel":"sonnet"}"#).unwrap();
     assert!(claude_settings_models().unwrap().is_empty());
+}
+
+// ── preserve_non_login_keys: every non-login key stays with its account ─────
+
+fn mint_for(name: &str) -> String {
+    format!("sk-ant-oat01-{name}-{}", "m".repeat(40))
+}
+
+/// A synthetic design login, the shape Claude Code stores under `designOauth`.
+fn design_login() -> serde_json::Value {
+    serde_json::json!({
+        "accessToken": "mock-design-access",
+        "refreshToken": "mock-design-refresh",
+        "expiresAt": 4_102_444_800_000_i64,
+        "scopes": ["user:design"],
+        "clientId": "mock-design-client"
+    })
+}
+
+/// Seed static-token accounts: a sidecar each and no `credentials.json`, the
+/// roster on disk with `active` active, and profiles.toml's
+/// `preserve_non_login_keys` as given (`None` leaves the key out of the file,
+/// which reads as on).
+fn seed_static_token_accounts(names: &[&str], active: &str, preserve: Option<bool>) {
+    let state = crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        active_profile: Some(active.into()),
+        preserve_non_login_keys: preserve.unwrap_or(true),
+        ..crate::profile::AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    for name in names {
+        crate::profile::save_profile(&crate::profile::Profile::new(name.to_string(), None, None))
+            .expect("save profile");
+        write_session_token(
+            &crate::profile::ProfileName::from(*name),
+            &mint_for(name),
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+    }
+}
+
+fn sidecar_of(name: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("session-token.json")
+}
+
+fn store_of(name: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json")
+}
+
+fn read_value(path: &std::path::Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(path).expect("read")).expect("parse")
+}
+
+fn write_value(path: &std::path::Path, value: &serde_json::Value) {
+    fs::write(path, serde_json::to_vec_pretty(value).expect("ser")).expect("write");
+}
+
+/// Claude Code saving its credential store the way 2.1.28x does: a staged file
+/// renamed over the path, which replaces clauth's symlink with a regular file.
+fn claude_code_saves(live: &serde_json::Value) {
+    let path = claude_credentials_path().expect("creds path");
+    let staged = path.with_extension("staged");
+    write_value(&staged, live);
+    fs::rename(&staged, &path).expect("rename over the link");
+    assert!(
+        !path
+            .symlink_metadata()
+            .expect("stat")
+            .file_type()
+            .is_symlink(),
+        "the fixture must leave the regular file Claude Code leaves"
+    );
+}
+
+/// Link `active` live, then run `/design-login` on it: Claude Code adds
+/// `designOauth` (and here an MCP login) beside the login it read.
+fn design_login_on_the_live_slot(active: &str) {
+    force_link_profile_credentials(&crate::profile::ProfileName::from(active))
+        .expect("link active");
+    let mut live = read_value(&claude_credentials_path().expect("creds path"));
+    live["designOauth"] = design_login();
+    live["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    claude_code_saves(&live);
+}
+
+fn switch_to(name: &str) {
+    let handle = std::sync::Arc::new(crate::lockorder::RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ));
+    crate::actions::switch_profile(&handle, &name.into()).expect("switch");
+}
+
+/// A rotating pair of ANOTHER account landed in the sidecar, with that account's
+/// identity keys and a design login beside it: the shape heal and restore
+/// quarantine as evidence.
+fn misfill_of_another_account() -> serde_json::Value {
+    serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": "other-account-access",
+            "refreshToken": "other-account-refresh",
+            "scopes": ["user:inference", "user:profile"]
+        },
+        "organizationUuid": "other-org",
+        "trustedDeviceToken": "other-device",
+        "enterpriseGateway": { "url": "https://gw.example", "jwt": "other-jwt" },
+        // Fresher than `design_login()`, and an MCP login no store holds: only
+        // the mis-fill exclusion keeps these out, not the freshness rule.
+        "designOauth": { "accessToken": "other-design", "expiresAt": 4_102_444_900_000_i64 },
+        "mcpOAuth": { "other-server": { "accessToken": "other-mcp" } }
+    })
+}
+
+/// The switch itself, through the path the CLI, the TUI and the daemon take, on
+/// a host where every account is a static token: the design login stays with
+/// the account it was made on, in that account's own sidecar, and comes back
+/// when the operator switches back. Only the MCP logins cross, as the carry
+/// always had them.
+#[cfg(unix)]
+#[test]
+fn a_switch_keeps_the_design_login_with_the_account_it_was_made_on() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", None);
+    design_login_on_the_live_slot("a");
+
+    switch_to("b");
+
+    assert_eq!(
+        read_value(&sidecar_of("a"))["designOauth"],
+        design_login(),
+        "the switch-away synced a's design login into a's own sidecar"
+    );
+    assert_eq!(
+        read_value(&sidecar_of("a"))["claudeAiOauth"]["accessToken"],
+        mint_for("a"),
+        "and left a's static token as it was"
+    );
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert_eq!(live["claudeAiOauth"]["accessToken"], mint_for("b"));
+    assert!(
+        live.get("designOauth").is_none(),
+        "a design login does not follow the switch"
+    );
+    assert_eq!(
+        live["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP logins do, into b's sidecar too"
+    );
+
+    switch_to("a");
+
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert_eq!(live["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(
+        live["designOauth"],
+        design_login(),
+        "switching back puts a's design login live again"
+    );
+    assert_eq!(
+        live["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "and a's MCP login with it"
+    );
+}
+
+/// The state #95 reports: the live slot is a regular file holding the active
+/// sidecar's own login plus `designOauth`, which no store holds. The daemon's and the TUI's boot relink
+/// (`link_profile_credentials` on the active profile) replaced that file with
+/// the symlink and lost the design login with no switch at all.
+#[cfg(unix)]
+#[test]
+fn the_boot_relink_keeps_a_design_login_only_the_live_file_holds() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", None);
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    let mut live = read_value(&sidecar_of("a"));
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+    assert!(
+        read_value(&sidecar_of("a")).get("designOauth").is_none(),
+        "the fixture starts with the design login in the live file alone"
+    );
+
+    link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("boot relink");
+
+    let path = claude_credentials_path().expect("creds path");
+    assert!(
+        path.symlink_metadata()
+            .expect("stat")
+            .file_type()
+            .is_symlink(),
+        "the relink still puts clauth's link back"
+    );
+    let after = read_value(&path);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "the design login survives the boot relink, now in a's sidecar"
+    );
+}
+
+/// An account whose store is `credentials.json`: the switch-away snapshot
+/// captured the login alone, so a key only the live file held was dropped with
+/// it. Now every non-login key lands in the account's store, an unknown one
+/// included, and none of it reaches the incoming account.
+#[cfg(unix)]
+#[test]
+fn a_switch_away_keeps_every_key_only_the_live_file_holds_in_an_oauth_store() {
+    let _home = HomeSandbox::new();
+    for (name, access) in [("a", "a-access"), ("b", "b-access")] {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(creds(access, Some(&format!("{name}-refresh"))));
+        crate::profile::save_profile(&profile).expect("save profile");
+    }
+    let state = crate::profile::AppState {
+        profiles: vec!["a".into(), "b".into()],
+        active_profile: Some("a".into()),
+        ..crate::profile::AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    let mut live = read_value(&store_of("a"));
+    live["designOauth"] = design_login();
+    live["aKeyClaudeCodeAddsLater"] = serde_json::json!({ "v": 1 });
+    claude_code_saves(&live);
+
+    switch_to("b");
+
+    let a = read_value(&store_of("a"));
+    assert_eq!(a["claudeAiOauth"]["accessToken"], "a-access");
+    assert_eq!(a["designOauth"], design_login());
+    assert_eq!(
+        a["aKeyClaudeCodeAddsLater"]["v"], 1,
+        "an unmodelled key the live file alone held is kept with its account"
+    );
+    let b = read_value(&store_of("b"));
+    assert!(
+        b.get("designOauth").is_none(),
+        "nothing of a's crosses to b"
+    );
+    assert!(b.get("aKeyClaudeCodeAddsLater").is_none());
+}
+
+/// The sync's one precondition: the live login must be the store's. A live
+/// file holding another login (a `/login` the operator has not resolved) is not
+/// this account's data, even when the operator force-captures it onto a static
+/// token profile, whose login the capture never touches.
+#[cfg(unix)]
+#[test]
+fn a_live_file_holding_another_login_syncs_nothing_into_the_sidecar() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let before = fs::read(sidecar_of("a")).expect("read a");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    claude_code_saves(&serde_json::json!({
+        "claudeAiOauth": { "accessToken": "someone-else", "refreshToken": "r" },
+        "designOauth": design_login()
+    }));
+
+    let mut config = crate::profile::load_config().expect("load config");
+    force_snapshot_active_credentials(&mut config).expect("force snapshot");
+
+    assert_eq!(
+        fs::read(sidecar_of("a")).expect("read a"),
+        before,
+        "a foreign live login's design login is not synced into a's sidecar"
+    );
+}
+
+/// Every sidecar writer rebuilds the file from its token, so a re-mint must put
+/// the sidecar's non-login keys back or the next `clauth login <name>
+/// --setup-token` drops what the account kept there. The re-mint with backup
+/// writes the same bytes into the static backup, the account's own file too.
+#[test]
+fn a_re_mint_keeps_every_non_login_key_its_sidecar_holds() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let sidecar = sidecar_of("a");
+    let mut held = read_value(&sidecar);
+    held["designOauth"] = design_login();
+    held["organizationUuid"] = serde_json::json!("a-org");
+    write_value(&sidecar, &held);
+    let name = crate::profile::ProfileName::from("a");
+    let now = crate::usage::now_ms() as i64;
+
+    write_session_token(&name, &mint_for("a2"), now).expect("re-mint");
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert_eq!(after["designOauth"], design_login());
+    assert!(
+        after.get("organizationUuid").is_none(),
+        "the login's identity keys go with the login they came with: a re-mint can be \
+         another account's token"
+    );
+
+    write_session_token_with_backup(&name, &mint_for("a3"), now).expect("re-mint with backup");
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a3"));
+    assert_eq!(after["designOauth"], design_login());
+    assert_eq!(
+        fs::read(sidecar.with_file_name("session-token.static.json")).expect("read backup"),
+        fs::read(&sidecar).expect("read sidecar"),
+        "the backup gets the same bytes, non-login keys included"
+    );
+}
+
+/// The rolling re-stamp is a sidecar writer too, and runs every few hours on a
+/// rolling profile: without the keep it would drop a design login within one
+/// rotation.
+#[test]
+fn a_rolling_stamp_keeps_the_sidecars_non_login_keys() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let sidecar = sidecar_of("a");
+    let mut held = read_value(&sidecar);
+    held["designOauth"] = design_login();
+    write_value(&sidecar, &held);
+    let chain = crate::profile::OAuthToken {
+        access_token: "a-chain-access".to_string(),
+        refresh_token: Some("a-chain-refresh".to_string()),
+        expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+        scopes: Some(vec![
+            "user:inference".to_string(),
+            "user:profile".to_string(),
+        ]),
+        subscription_type: Some("max".to_string()),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+
+    stamp_rolling_token(&crate::profile::ProfileName::from("a"), &chain).expect("stamp");
+
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], "a-chain-access");
+    assert_eq!(after["designOauth"], design_login());
+}
+
+/// A mis-filled sidecar holds another account's login and keys, and a writer
+/// over it keeps none of them: the org id, device token and gateway beside a
+/// mis-fill are evidence, and kept they would sit beside this account's login
+/// as a mixed identity that never self-corrects.
+#[test]
+fn a_sidecar_writer_over_a_misfill_keeps_nothing_of_it() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let sidecar = sidecar_of("a");
+    write_value(&sidecar, &misfill_of_another_account());
+
+    write_session_token(
+        &crate::profile::ProfileName::from("a"),
+        &mint_for("a2"),
+        crate::usage::now_ms() as i64,
+    )
+    .expect("re-mint");
+
+    let keys: Vec<String> = read_value(&sidecar)
+        .as_object()
+        .expect("object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(keys, ["claudeAiOauth"], "nothing of the mis-fill survives");
+}
+
+/// Heal and restore put the preserved mint back over a mis-fill and keep
+/// nothing of the mis-fill beside it (#96 review): the backup comes back whole,
+/// its own design login included, and the mis-fill's goes to quarantine with
+/// the rest of the evidence.
+#[test]
+fn heal_and_restore_over_a_misfill_keep_nothing_of_it() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let name = crate::profile::ProfileName::from("a");
+    let now = crate::usage::now_ms() as i64;
+    let sidecar = sidecar_of("a");
+    let backup = sidecar.with_file_name("session-token.static.json");
+
+    for repair in ["heal", "restore"] {
+        write_session_token_with_backup(&name, &mint_for("a"), now).expect("mint with backup");
+        let mut in_backup = read_value(&backup);
+        in_backup["designOauth"] = design_login();
+        write_value(&backup, &in_backup);
+        let backup_bytes = fs::read(&backup).expect("read backup");
+        write_value(&sidecar, &misfill_of_another_account());
+
+        match repair {
+            "heal" => assert_eq!(
+                heal_misfilled_sidecar(&name).expect("heal"),
+                HealOutcome::Healed
+            ),
+            _ => assert!(restore_static_mint(&name).expect("restore")),
+        }
+
+        assert_eq!(
+            fs::read(&sidecar).expect("read sidecar"),
+            backup_bytes,
+            "{repair}: the backup comes back byte for byte, nothing of the mis-fill beside it"
+        );
+    }
+}
+
+/// Restore over this account's own sidecar (a rolling bearer or a mint) keeps
+/// the sidecar's non-login keys over the backup's older copies: every sync since
+/// the backup was written landed in the sidecar, and the consumed backup is gone
+/// once this returns.
+#[test]
+fn a_restore_over_the_accounts_own_sidecar_keeps_its_newer_copy() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let name = crate::profile::ProfileName::from("a");
+    write_session_token_with_backup(&name, &mint_for("a"), crate::usage::now_ms() as i64)
+        .expect("mint with backup");
+    let sidecar = sidecar_of("a");
+    let backup = sidecar.with_file_name("session-token.static.json");
+    let mut older = design_login();
+    older["accessToken"] = serde_json::json!("mock-design-access-older");
+    let mut in_backup = read_value(&backup);
+    in_backup["designOauth"] = older;
+    in_backup["onlyInTheBackup"] = serde_json::json!(true);
+    write_value(&backup, &in_backup);
+    let mut in_sidecar = read_value(&sidecar);
+    in_sidecar["designOauth"] = design_login();
+    write_value(&sidecar, &in_sidecar);
+
+    assert!(restore_static_mint(&name).expect("restore"));
+
+    let after = read_value(&sidecar);
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "the sidecar's newer design login wins over the backup's"
+    );
+    assert_eq!(
+        after["onlyInTheBackup"], true,
+        "and a key only the backup holds comes back with it"
+    );
+}
+
+/// `preserve_non_login_keys = false` is the behavior before the key existed,
+/// pinned on purpose: the switch-away and the boot relink drop what the live
+/// file alone held, and a re-mint rebuilds the sidecar from the mint alone.
+#[cfg(unix)]
+#[test]
+fn with_preservation_off_static_tokens_behave_as_before() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", Some(false));
+    let a_before = fs::read(sidecar_of("a")).expect("read a");
+    let b_before = fs::read(sidecar_of("b")).expect("read b");
+    design_login_on_the_live_slot("a");
+
+    switch_to("b");
+
+    assert_eq!(fs::read(sidecar_of("a")).expect("read a"), a_before);
+    assert_eq!(fs::read(sidecar_of("b")).expect("read b"), b_before);
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert!(live.get("designOauth").is_none());
+    assert!(live.get("mcpOAuth").is_none());
+
+    let mut live = read_value(&sidecar_of("b"));
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+    link_profile_credentials(&crate::profile::ProfileName::from("b")).expect("boot relink");
+    assert_eq!(
+        fs::read(sidecar_of("b")).expect("read b"),
+        b_before,
+        "the boot relink syncs nothing either"
+    );
+
+    let mut held = read_value(&sidecar_of("b"));
+    held["designOauth"] = design_login();
+    write_value(&sidecar_of("b"), &held);
+    write_session_token(
+        &crate::profile::ProfileName::from("b"),
+        &mint_for("b2"),
+        crate::usage::now_ms() as i64,
+    )
+    .expect("re-mint");
+    let keys: Vec<String> = read_value(&sidecar_of("b"))
+        .as_object()
+        .expect("object")
+        .keys()
+        .cloned()
+        .collect();
+    assert_eq!(
+        keys,
+        ["claudeAiOauth"],
+        "a re-mint with preservation off rebuilds the sidecar from the mint alone"
+    );
+}
+
+/// A profiles.toml that does not load reads as preservation ON, on every side:
+/// a broken hand-edit must not cost the design login the default kept.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_profiles_toml_preserves() {
+    let home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    fs::write(
+        home.home().join(".clauth").join("profiles.toml"),
+        "profiles = [\"a\"\n",
+    )
+    .expect("break the state file");
+    assert!(
+        crate::profile::load_app_state().is_err(),
+        "the fixture breaks the file"
+    );
+    assert!(preserve_non_login_keys());
+
+    let mut live = read_value(&sidecar_of("a"));
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+    link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("boot relink");
+    assert_eq!(read_value(&sidecar_of("a"))["designOauth"], design_login());
+
+    write_session_token(
+        &crate::profile::ProfileName::from("a"),
+        &mint_for("a2"),
+        crate::usage::now_ms() as i64,
+    )
+    .expect("re-mint");
+    assert_eq!(
+        read_value(&sidecar_of("a"))["designOauth"],
+        design_login(),
+        "the re-mint keeps it too"
+    );
+}
+
+/// A present sidecar that does not parse cannot hand its keys to the write that
+/// replaces it, and says so on the event line instead of dropping them unlogged
+/// (#96 review).
+#[test]
+fn a_sidecar_that_does_not_parse_says_its_keys_were_not_kept() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let sidecar = sidecar_of("a");
+    fs::write(&sidecar, b"{ \"claudeAiOauth\": { \"accessToken\": \"torn").expect("tear");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    write_session_token(
+        &crate::profile::ProfileName::from("a"),
+        &mint_for("a2"),
+        crate::usage::now_ms() as i64,
+    )
+    .expect("the re-mint still lands");
+    drop(capture);
+
+    assert_eq!(
+        read_value(&sidecar)["claudeAiOauth"]["accessToken"],
+        mint_for("a2")
+    );
+    let snapshot = lines.snapshot();
+    assert!(
+        snapshot
+            .iter()
+            .any(|line| line.contains("is not valid JSON")
+                && line.contains("session-token.json")
+                && line.contains("non-login keys")),
+        "the skip is on the event line: {snapshot:?}"
+    );
+}
+
+/// With preservation on, a sign-out drops the login and the keys that
+/// authenticate or identify its account, and keeps the design login and every
+/// key no account owns. `enterpriseGateway` goes: it is a gateway credential,
+/// and a signed-out store keeping it would go on serving the departed account.
+#[test]
+fn a_preserving_sign_out_keeps_the_design_login_and_drops_the_identity() {
+    let mut blob = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "outgoing-login" },
+        "organizationUuid": "org-1",
+        "trustedDeviceToken": "device-1",
+        "enterpriseGateway": { "url": "https://gw.example" },
+        "designOauth": { "accessToken": "design-1" },
+        "mcpOAuth": { "linear": { "accessToken": "mock-linear" } },
+        "aKeyClaudeCodeAddsLater": true
+    });
+
+    assert_eq!(strip_account_credentials(&mut blob, true), SignOut::Write);
+
+    for key in [
+        "claudeAiOauth",
+        "organizationUuid",
+        "trustedDeviceToken",
+        "enterpriseGateway",
+    ] {
+        assert!(
+            blob.get(key).is_none(),
+            "'{key}' must not survive a sign-out"
+        );
+    }
+    assert_eq!(blob["designOauth"]["accessToken"], "design-1");
+    assert_eq!(blob["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+    assert_eq!(blob["aKeyClaudeCodeAddsLater"], true);
+}
+
+/// The #96 review's major: an item holding a login and a design login was
+/// deleted whole by a sign-out, and on macOS the item can be that design
+/// login's only copy. With preservation on it is written back holding the
+/// design login; an item already down to it needs no write at all.
+#[test]
+fn a_preserving_sign_out_never_deletes_an_item_holding_a_design_login() {
+    let mut item = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "outgoing-login" },
+        "designOauth": { "accessToken": "design-1" }
+    });
+    assert_eq!(strip_account_credentials(&mut item, true), SignOut::Write);
+    assert_eq!(
+        item,
+        serde_json::json!({ "designOauth": { "accessToken": "design-1" } })
+    );
+    assert_eq!(
+        strip_account_credentials(&mut item, true),
+        SignOut::Nothing,
+        "signed out already, so no rewrite of identical bytes"
+    );
+
+    let mut item = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "outgoing-login" },
+        "designOauth": { "accessToken": "design-1" }
+    });
+    assert_eq!(
+        strip_account_credentials(&mut item, false),
+        SignOut::Delete,
+        "preservation off deletes it, as before"
+    );
+}
+
+/// The per-account sync puts a static-token account's MCP logins into its own
+/// sidecar, so the carry has to keep them fresh there. A setup-token account
+/// left for an OAuth one, whose session then rotates an MCP login, must get the
+/// rotated copy back on the switch home, never its own older copy whose refresh
+/// token the other session has spent.
+#[cfg(unix)]
+#[test]
+fn a_switch_home_to_a_setup_token_account_brings_the_rotated_mcp_login() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let mut c = crate::profile::Profile::new("c".to_string(), None, None);
+    c.credentials = Some(creds("c-access", Some("c-refresh")));
+    crate::profile::save_profile(&c).expect("save c");
+    crate::testutil::register_names(&["c"]);
+    design_login_on_the_live_slot("a");
+
+    switch_to("c");
+    let mut live = read_value(&claude_credentials_path().expect("creds path"));
+    live["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear-v2" } });
+    claude_code_saves(&live);
+    switch_to("a");
+
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert_eq!(live["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(
+        live["mcpOAuth"]["linear"]["accessToken"], "mock-linear-v2",
+        "the rotated MCP login came home, not a's older copy"
+    );
+    assert_eq!(
+        live["designOauth"],
+        design_login(),
+        "and a's design login with it"
+    );
+}
+
+/// The keys that identify the login's account never enter a store through
+/// preservation, so a later login of another account cannot end up beside them.
+/// The live file's `organizationUuid`, `trustedDeviceToken` and
+/// `enterpriseGateway` stay out of the account's store while its design login
+/// goes in, and a capture of another login onto that store (the divergence
+/// overwrite) finds none of the old account's identity there.
+#[cfg(unix)]
+#[test]
+fn the_identity_keys_never_enter_a_store_through_preservation() {
+    let _home = HomeSandbox::new();
+    for (name, access) in [("a", "a-access"), ("b", "b-access")] {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.credentials = Some(creds(access, Some(&format!("{name}-refresh"))));
+        crate::profile::save_profile(&profile).expect("save profile");
+    }
+    let state = crate::profile::AppState {
+        profiles: vec!["a".into(), "b".into()],
+        active_profile: Some("a".into()),
+        ..crate::profile::AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    let mut live = read_value(&store_of("a"));
+    live["designOauth"] = design_login();
+    live["organizationUuid"] = serde_json::json!("a-org");
+    live["trustedDeviceToken"] = serde_json::json!("a-device");
+    live["enterpriseGateway"] = serde_json::json!({ "jwt": "a-jwt" });
+    claude_code_saves(&live);
+
+    switch_to("b");
+
+    let a = read_value(&store_of("a"));
+    assert_eq!(a["designOauth"], design_login());
+    for key in [
+        "organizationUuid",
+        "trustedDeviceToken",
+        "enterpriseGateway",
+    ] {
+        assert!(
+            a.get(key).is_none(),
+            "'{key}' belongs to the login and stays out"
+        );
+    }
+
+    switch_to("a");
+    claude_code_saves(&serde_json::json!({
+        "claudeAiOauth": { "accessToken": "d-access", "refreshToken": "d-refresh" },
+        "organizationUuid": "d-org"
+    }));
+    let mut config = crate::profile::load_config().expect("load config");
+    force_snapshot_active_credentials(&mut config).expect("overwrite capture");
+
+    let a = read_value(&store_of("a"));
+    assert_eq!(a["claudeAiOauth"]["accessToken"], "d-access");
+    assert!(
+        a.get("enterpriseGateway").is_none(),
+        "no gateway of the old account"
+    );
+    assert!(
+        a.get("organizationUuid").is_none(),
+        "and no org id beside the new login"
+    );
+}
+
+/// A rolling profile re-stamps its sidecar every rotation, after which the live
+/// file Claude Code wrote beside the old bearer is no longer recognisably this
+/// account's. The stamp saves it first.
+#[cfg(unix)]
+#[test]
+fn a_rolling_restamp_keeps_a_design_login_the_live_file_held() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let name = crate::profile::ProfileName::from("a");
+    let chain = |access: &str| crate::profile::OAuthToken {
+        access_token: access.to_string(),
+        refresh_token: Some("a-chain-refresh".to_string()),
+        expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+        scopes: Some(vec![
+            "user:inference".to_string(),
+            "user:profile".to_string(),
+        ]),
+        subscription_type: Some("max".to_string()),
+        ..crate::profile::OAuthToken::default_extra()
+    };
+    stamp_rolling_token(&name, &chain("r1")).expect("first stamp");
+    force_link_profile_credentials(&name).expect("link a");
+    let mut live = read_value(&sidecar_of("a"));
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+
+    stamp_rolling_token(&name, &chain("r2")).expect("re-stamp");
+
+    let after = read_value(&sidecar_of("a"));
+    assert_eq!(after["claudeAiOauth"]["accessToken"], "r2");
+    assert_eq!(after["designOauth"], design_login());
+}
+
+/// A usage chain for a rolling stamp in the tests below.
+fn rolling_chain(access: &str) -> crate::profile::OAuthToken {
+    crate::profile::OAuthToken {
+        access_token: access.to_string(),
+        refresh_token: Some("a-chain-refresh".to_string()),
+        expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+        scopes: Some(vec![
+            "user:inference".to_string(),
+            "user:profile".to_string(),
+        ]),
+        subscription_type: Some("max".to_string()),
+        ..crate::profile::OAuthToken::default_extra()
+    }
+}
+
+/// `clauth login <p> --setup-token` on the active profile rewrites the sidecar
+/// and relinks nothing, so once the new mint lands the live file Claude Code
+/// wrote beside the old one is no longer recognisably this account's, and the
+/// next relink drops what it alone held. The re-mint saves it first, as the
+/// rolling re-stamp does.
+#[cfg(unix)]
+#[test]
+fn a_re_mint_keeps_a_design_login_only_the_live_file_holds() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    design_login_on_the_live_slot("a");
+    let name = crate::profile::ProfileName::from("a");
+
+    write_session_token(&name, &mint_for("a2"), crate::usage::now_ms() as i64).expect("re-mint");
+
+    let after = read_value(&sidecar_of("a"));
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "the re-mint saved the live file's design login into the sidecar first"
+    );
+    force_link_profile_credentials(&name).expect("relink");
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert_eq!(live["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert_eq!(
+        live["designOauth"],
+        design_login(),
+        "and it goes live with the new mint"
+    );
+}
+
+/// The re-mint on a rolling profile writes the sidecar and the static backup
+/// from the same bytes, over the rolling bearer the live file holds: the design
+/// login Claude Code saved beside that bearer lands in both.
+#[cfg(unix)]
+#[test]
+fn a_re_mint_with_backup_keeps_a_design_login_only_the_live_file_holds() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let name = crate::profile::ProfileName::from("a");
+    stamp_rolling_token(&name, &rolling_chain("r1")).expect("stamp");
+    design_login_on_the_live_slot("a");
+
+    write_session_token_with_backup(&name, &mint_for("a2"), crate::usage::now_ms() as i64)
+        .expect("re-mint with backup");
+
+    let after = read_value(&sidecar_of("a"));
+    assert_eq!(after["claudeAiOauth"]["accessToken"], mint_for("a2"));
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "the design login the live file held beside the rolling bearer is kept"
+    );
+    assert_eq!(
+        fs::read(sidecar_of("a").with_file_name("session-token.static.json")).expect("read backup"),
+        fs::read(sidecar_of("a")).expect("read sidecar"),
+        "and the backup gets the same bytes"
+    );
+}
+
+/// `clauth static-token <p>` on the active rolling profile restores the mint
+/// over the rolling bearer, whose bearer the live file holds, and relinks: the
+/// design login Claude Code saved beside that bearer comes along.
+#[cfg(unix)]
+#[test]
+fn a_restore_keeps_a_design_login_the_live_file_held_beside_the_rolling_bearer() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let name = crate::profile::ProfileName::from("a");
+    stamp_rolling_token(&name, &rolling_chain("r1")).expect("stamp");
+    design_login_on_the_live_slot("a");
+
+    assert!(restore_static_mint(&name).expect("restore"));
+    force_link_profile_credentials(&name).expect("relink");
+
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert_eq!(live["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(
+        live["designOauth"],
+        design_login(),
+        "the design login the live file held beside the bearer survives the restore"
+    );
+}
+
+/// The restore whose mint the live file already holds (the sidecar was never
+/// rolled): the relink's own sync recognises the live file, so this case never
+/// lost the design login, and must not start to.
+#[cfg(unix)]
+#[test]
+fn a_restore_onto_the_live_mint_keeps_the_design_login() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    let name = crate::profile::ProfileName::from("a");
+    write_session_token_with_backup(&name, &mint_for("a"), crate::usage::now_ms() as i64)
+        .expect("mint with backup");
+    design_login_on_the_live_slot("a");
+
+    assert!(restore_static_mint(&name).expect("restore"));
+    force_link_profile_credentials(&name).expect("relink");
+
+    let live = read_value(&claude_credentials_path().expect("creds path"));
+    assert_eq!(live["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert_eq!(live["designOauth"], design_login());
+}
+
+/// A mis-filled sidecar is never installed, so the live file holds the login of
+/// the account's `credentials.json`, and the save before a heal or a restore
+/// goes there. The mis-fill is quarantined as it was found: nothing is synced
+/// into the evidence, even when it is a copy of the account's own login.
+#[cfg(unix)]
+#[test]
+fn heal_and_restore_over_a_misfill_save_the_live_keys_beside_the_login_not_into_the_evidence() {
+    for repair in ["heal", "restore"] {
+        let _home = HomeSandbox::new();
+        seed_static_token_accounts(&["a"], "a", None);
+        let name = crate::profile::ProfileName::from("a");
+        write_session_token_with_backup(&name, &mint_for("a"), crate::usage::now_ms() as i64)
+            .expect("mint with backup");
+        let mut profile = crate::profile::load_profile(&name).expect("load a");
+        profile.credentials = Some(creds("a-access", Some("a-refresh")));
+        crate::profile::save_profile(&profile).expect("save a");
+        let own_pair = read_value(&store_of("a"));
+        write_value(&sidecar_of("a"), &own_pair);
+        let misfill_bytes = fs::read(sidecar_of("a")).expect("read mis-fill");
+        force_link_profile_credentials(&name).expect("link the OAuth store");
+        let mut live = own_pair.clone();
+        live["designOauth"] = design_login();
+        claude_code_saves(&live);
+
+        match repair {
+            "heal" => assert_eq!(
+                heal_misfilled_sidecar(&name).expect("heal"),
+                HealOutcome::Healed
+            ),
+            _ => assert!(restore_static_mint(&name).expect("restore")),
+        }
+
+        let quarantine = sidecar_of("a").with_file_name("quarantine");
+        let quarantined: Vec<Vec<u8>> = fs::read_dir(&quarantine)
+            .expect("read quarantine")
+            .map(|entry| fs::read(entry.expect("entry").path()).expect("read quarantined"))
+            .collect();
+        assert_eq!(
+            quarantined,
+            [misfill_bytes],
+            "{repair}: the mis-fill is quarantined exactly as it was found"
+        );
+        assert_eq!(
+            read_value(&store_of("a"))["designOauth"],
+            design_login(),
+            "{repair}: the live file's design login went into the store holding its login"
+        );
+    }
+}
+
+/// The rolling stamp and the clear save under the same rule: into the install
+/// source, which a mis-filled sidecar never is. Their callers heal, skip or
+/// quarantine a mis-fill first, so this pins each function's own rule: over a
+/// mis-fill, the live file's design login goes into the store holding its
+/// login, not into the mis-fill the write replaces or removes.
+#[cfg(unix)]
+#[test]
+fn a_stamp_or_clear_over_a_misfill_saves_the_live_keys_beside_the_login() {
+    for write in ["stamp", "clear"] {
+        let _home = HomeSandbox::new();
+        seed_static_token_accounts(&["a"], "a", None);
+        let name = crate::profile::ProfileName::from("a");
+        let mut profile = crate::profile::load_profile(&name).expect("load a");
+        profile.credentials = Some(creds("a-access", Some("a-refresh")));
+        crate::profile::save_profile(&profile).expect("save a");
+        let own_pair = read_value(&store_of("a"));
+        write_value(&sidecar_of("a"), &own_pair);
+        force_link_profile_credentials(&name).expect("link the OAuth store");
+        let mut live = own_pair.clone();
+        live["designOauth"] = design_login();
+        claude_code_saves(&live);
+
+        match write {
+            "stamp" => stamp_rolling_token(&name, &rolling_chain("r1")).expect("stamp"),
+            _ => assert!(clear_session_token(&name).expect("clear")),
+        }
+
+        assert_eq!(
+            read_value(&store_of("a"))["designOauth"],
+            design_login(),
+            "{write}: the live file's design login went into the store holding its login"
+        );
+    }
+}
+
+/// Clearing a long-lived token makes `credentials.json` the install source
+/// again, and the design login the sidecar held moves there instead of going
+/// with the file. The reverse holds too: a first setup token on an account
+/// running on its OAuth login takes that login's design login along.
+#[test]
+fn a_design_login_survives_the_install_source_flipping_either_way() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("a".to_string(), None, None);
+    profile.credentials = Some(creds("a-access", Some("a-refresh")));
+    crate::profile::save_profile(&profile).expect("save a");
+    let mut stored = read_value(&store_of("a"));
+    stored["designOauth"] = design_login();
+    write_value(&store_of("a"), &stored);
+    let name = crate::profile::ProfileName::from("a");
+
+    write_session_token(&name, &mint_for("a"), crate::usage::now_ms() as i64).expect("mint");
+    assert_eq!(
+        read_value(&sidecar_of("a"))["designOauth"],
+        design_login(),
+        "the first setup token takes the OAuth store's design login"
+    );
+
+    let mut held = read_value(&sidecar_of("a"));
+    let mut newer = design_login();
+    newer["accessToken"] = serde_json::json!("mock-design-access-newer");
+    held["designOauth"] = newer.clone();
+    write_value(&sidecar_of("a"), &held);
+    assert!(clear_session_token(&name).expect("clear"));
+
+    let stored = read_value(&store_of("a"));
+    assert_eq!(stored["claudeAiOauth"]["accessToken"], "a-access");
+    assert_eq!(
+        stored["designOauth"], newer,
+        "clearing the token hands its newer design login to credentials.json"
+    );
+}
+
+/// Where both sides hold a differing copy of a key, the one that expires later
+/// stays. A `clauth start` session's refresh of an MCP login lands in the store
+/// while the global live file still holds the older copy, and a sync must not
+/// put that older copy, whose refresh token the session has spent, back over
+/// it. A newer live copy does go in.
+#[cfg(unix)]
+#[test]
+fn an_older_live_copy_never_lands_over_a_newer_one() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a"], "a", None);
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    let mcp = |token: &str, expires: i64| serde_json::json!({ "linear": { "accessToken": token, "expiresAt": expires } });
+    let mut stored = read_value(&sidecar_of("a"));
+    stored["mcpOAuth"] = mcp("v2", 2_000);
+    write_value(&sidecar_of("a"), &stored);
+    let mut live = stored.clone();
+    live["mcpOAuth"] = mcp("v1", 1_000);
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+    let link = claude_credentials_path().expect("creds path");
+
+    assert!(sync_live_extra_into(&link, &sidecar_of("a")).expect("sync"));
+    let after = read_value(&sidecar_of("a"));
+    assert_eq!(
+        after["mcpOAuth"],
+        mcp("v2", 2_000),
+        "the newer store copy stays"
+    );
+    assert_eq!(
+        after["designOauth"],
+        design_login(),
+        "a key the store lacked is added"
+    );
+
+    live["mcpOAuth"] = mcp("v3", 3_000);
+    claude_code_saves(&live);
+    assert!(sync_live_extra_into(&link, &sidecar_of("a")).expect("sync"));
+    assert_eq!(
+        read_value(&sidecar_of("a"))["mcpOAuth"],
+        mcp("v3", 3_000),
+        "a newer live copy replaces it"
+    );
+}
+
+/// The MCP logins are one key holding a login per server, and a sync merges
+/// them server by server. Each server keeps its fresher copy, a server only the
+/// store holds stays, and an empty live map wipes nothing. Judged as one value,
+/// a session's refresh of one server would be overwritten whenever the global
+/// live file had refreshed another.
+#[test]
+fn the_mcp_logins_merge_server_by_server() {
+    let store = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "a-access" },
+        "mcpOAuth": {
+            "linear": { "accessToken": "v2", "expiresAt": 300 },
+            "notion": { "accessToken": "n1", "expiresAt": 150 }
+        }
+    });
+    let live = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "a-access" },
+        "mcpOAuth": {
+            "linear": { "accessToken": "v1", "expiresAt": 200 },
+            "github": { "accessToken": "g2", "expiresAt": 400 }
+        }
+    });
+
+    let synced = non_login_keys_onto_own_store(&live, &store).expect("github is new");
+    assert_eq!(
+        synced["mcpOAuth"]["linear"]["accessToken"], "v2",
+        "the newer copy stays"
+    );
+    assert_eq!(
+        synced["mcpOAuth"]["github"]["accessToken"], "g2",
+        "a new server is added"
+    );
+    assert_eq!(
+        synced["mcpOAuth"]["notion"]["accessToken"], "n1",
+        "no server is dropped"
+    );
+
+    let empty = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "a-access" },
+        "mcpOAuth": {}
+    });
+    assert_eq!(
+        non_login_keys_onto_own_store(&empty, &store),
+        None,
+        "an empty live map changes nothing"
+    );
+}
+
+/// A token keeps the copy that expires later however the expiry is written: a
+/// float millisecond count compares like an integer, and a copy with no expiry
+/// never replaces one that has one.
+#[test]
+fn a_token_keeps_the_copy_that_expires_later() {
+    let held = serde_json::json!({ "accessToken": "newer", "expiresAt": 4.1e12 });
+    let older = serde_json::json!({ "accessToken": "older", "expiresAt": 100 });
+    assert_eq!(fresher_copy(&held, &older), held);
+    assert_eq!(fresher_copy(&older, &held), held);
+    let no_expiry = serde_json::json!({ "accessToken": "unknown" });
+    assert_eq!(fresher_copy(&held, &no_expiry), held);
+    assert_eq!(fresher_copy(&no_expiry, &held), held);
+    assert_eq!(
+        fresher_copy(&no_expiry, &serde_json::json!({})),
+        no_expiry,
+        "an emptied object never replaces a token"
+    );
+    assert_eq!(
+        fresher_copy(&serde_json::json!("old"), &serde_json::json!("new")),
+        serde_json::json!("new"),
+        "a value that is no token takes the source's copy"
+    );
+}
+
+/// A token is one value. Two copies of a token without an expiry are never
+/// mixed field by field (an access token beside another version's refresh token
+/// neither side held together), and a server entry without one is replaced
+/// whole, nested fields included: the merge goes one level deep, into the map
+/// of servers, and no further.
+#[test]
+fn a_token_is_never_mixed_field_by_field() {
+    let held = serde_json::json!({ "accessToken": "A1", "refreshToken": "R1" });
+    let source = serde_json::json!({ "accessToken": "A2" });
+    assert_eq!(fresher_copy(&held, &source), source);
+
+    let held = serde_json::json!({
+        "linear": { "clientId": "c1", "clientSecret": "s1", "discoveryState": { "a": 1 } }
+    });
+    let source = serde_json::json!({
+        "linear": { "clientId": "c2", "discoveryState": { "b": 2 } }
+    });
+    assert_eq!(
+        fresher_copy(&held, &source),
+        source,
+        "the re-registered entry replaces the old one whole, no stale secret beside it"
+    );
+}
+
+/// A design login the live file alone holds survives the install source
+/// flipping. Clearing a long-lived token saves it into the sidecar while the
+/// sidecar's token is still live, then hands it on; a first setup token saves
+/// it into `credentials.json` while the OAuth login is still live, then seeds
+/// the sidecar from there.
+#[cfg(unix)]
+#[test]
+fn a_design_login_the_live_file_alone_holds_survives_the_flip() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("a".to_string(), None, None);
+    profile.credentials = Some(creds("a-access", Some("a-refresh")));
+    crate::profile::save_profile(&profile).expect("save a");
+    let name = crate::profile::ProfileName::from("a");
+    force_link_profile_credentials(&name).expect("link a");
+    let mut live = read_value(&store_of("a"));
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+
+    write_session_token(&name, &mint_for("a"), crate::usage::now_ms() as i64).expect("mint");
+    assert_eq!(read_value(&sidecar_of("a"))["designOauth"], design_login());
+
+    force_link_profile_credentials(&name).expect("link the sidecar");
+    let mut live = read_value(&sidecar_of("a"));
+    let mut newer = design_login();
+    newer["accessToken"] = serde_json::json!("mock-design-access-newer");
+    newer["expiresAt"] = serde_json::json!(4_102_444_900_000_i64);
+    live["designOauth"] = newer.clone();
+    claude_code_saves(&live);
+
+    assert!(clear_session_token(&name).expect("clear"));
+    assert_eq!(read_value(&store_of("a"))["designOauth"], newer);
+}
+
+/// A rotation staged at `credentials.json.pending` is adopted on the next load
+/// only while the store is not newer than the stage. A sync writing the store
+/// in that window would get the rotated pair discarded, so it stands down until
+/// the stage is resolved.
+#[cfg(unix)]
+#[test]
+fn a_sync_stands_down_while_a_rotation_is_staged() {
+    let _home = HomeSandbox::new();
+    let mut profile = crate::profile::Profile::new("a".to_string(), None, None);
+    profile.credentials = Some(creds("a-access", Some("a-refresh")));
+    crate::profile::save_profile(&profile).expect("save a");
+    let store = store_of("a");
+    force_link_profile_credentials(&crate::profile::ProfileName::from("a")).expect("link a");
+    let mut live = read_value(&store);
+    live["designOauth"] = design_login();
+    claude_code_saves(&live);
+    fs::write(store.with_file_name("credentials.json.pending"), b"{}").expect("stage");
+    let before = fs::read(&store).expect("read store");
+
+    let link = claude_credentials_path().expect("creds path");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+    assert!(!sync_live_extra_into(&link, &store).expect("sync"));
+    drop(capture);
+    assert_eq!(fs::read(&store).expect("read store"), before);
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("a rotation is staged")),
+        "the stand-down says so: {:?}",
+        lines.snapshot()
+    );
+
+    fs::remove_file(store.with_file_name("credentials.json.pending")).expect("resolve stage");
+    assert!(
+        sync_live_extra_into(&link, &store).expect("sync"),
+        "and goes ahead after it"
+    );
+}
+
+/// The rule every per-account sync applies: a source's non-login keys land on a
+/// store only when the source's login is that store's, the login's identity
+/// keys never move, and a merge that changes nothing writes nothing.
+#[test]
+fn a_sync_lands_only_on_the_store_holding_the_same_login() {
+    let source = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "a-access" },
+        "designOauth": { "accessToken": "design-1" },
+        "mcpOAuth": { "linear": { "accessToken": "mock-linear" } },
+        "organizationUuid": "a-org"
+    });
+    let own = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "a-access", "refreshToken": "kept" },
+        "onlyInTheStore": 1
+    });
+
+    let synced = non_login_keys_onto_own_store(&source, &own).expect("same login syncs");
+    assert_eq!(synced["designOauth"]["accessToken"], "design-1");
+    assert_eq!(synced["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
+    assert_eq!(
+        synced["claudeAiOauth"]["refreshToken"], "kept",
+        "the store's own login is never touched"
+    );
+    assert_eq!(synced["onlyInTheStore"], 1, "and nothing is deleted");
+    assert!(
+        synced.get("organizationUuid").is_none(),
+        "the login's identity keys stay with the login they came with"
+    );
+
+    assert_eq!(
+        non_login_keys_onto_own_store(&source, &synced),
+        None,
+        "a store already holding the keys needs no write"
+    );
+    let other = serde_json::json!({ "claudeAiOauth": { "accessToken": "b-access" } });
+    assert_eq!(
+        non_login_keys_onto_own_store(&source, &other),
+        None,
+        "another account's store takes nothing"
+    );
+    let blank = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "" },
+        "designOauth": { "accessToken": "design-1" }
+    });
+    let blank_store = serde_json::json!({ "claudeAiOauth": { "accessToken": "" } });
+    assert_eq!(
+        non_login_keys_onto_own_store(&blank, &blank_store),
+        None,
+        "two logged-out shells are never the same account"
+    );
+}
+
+/// The Keychain side of the #96 review's major cannot run on Linux, and no test
+/// can reach the real item, so its wiring is pinned in the source: both sign-out
+/// call sites hand the preservation reading to the strip.
+#[test]
+fn the_keychain_sign_outs_pass_the_preservation_reading() {
+    let src = include_str!("../../src/claude.rs");
+    let body = |start: &str| {
+        let from = src.split_once(start).expect("fn defined").1;
+        from.split_once("\n}\n")
+            .expect("fn body closes")
+            .0
+            .to_string()
+    };
+    assert!(
+        body("fn keychain_mirror_source(").contains("keychain_sign_out(preserve"),
+        "the relink's sign-out takes the relink's preservation reading"
+    );
+    let clear = body("pub(crate) fn clear_claude_credentials(");
+    assert!(
+        clear.contains("let preserve = preserve_non_login_keys();")
+            && clear.contains("keychain_sign_out(preserve"),
+        "the wrap-off sign-out reads it off disk"
+    );
+    // The per-session items keep the strip preservation off gives: nothing
+    // saves what they hold beside a login, and keeping it would hand it to the
+    // session's next member.
+    let keychain = include_str!("../../src/keychain.rs");
+    let per_session = keychain
+        .split_once("pub(crate) fn keychain_sign_out_for_config_dir(")
+        .expect("fn defined")
+        .1
+        .split_once("\n}\n")
+        .expect("fn body closes")
+        .0;
+    assert!(per_session.contains("sign_out_at(&service, &account()?, false)"));
 }

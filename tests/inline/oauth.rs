@@ -5660,3 +5660,93 @@ fn dead_chain_copy_alibaba_without_a_console_keeps_the_dead_chain_sentence() {
         Some(crate::format::third_party_dead_chain(&profile.name))
     );
 }
+
+/// clauth's own rotation of the ACTIVE account's chain moves the store's login
+/// past the live file Claude Code wrote beside the old one (a `/design-login`),
+/// after which no sync recognises that file as this account's again. The
+/// persist saves it first, while both still hold the old token, and the rotated
+/// store keeps it beside the new pair.
+#[cfg(unix)]
+#[test]
+fn a_rotation_keeps_a_design_login_the_live_file_held() {
+    let _home = HomeSandbox::new();
+    let name = "rot-design";
+    let mut config = oauth_config(name, Some("rt-old"), Some(4_102_444_800_000));
+    config.state.active_profile = Some(name.into());
+    crate::profile::save_app_state(&config.state).expect("persist active");
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let profile = crate::profile::ProfileName::from(name);
+    crate::claude::force_link_profile_credentials(&profile).expect("link");
+    let store = profile_dir(&profile).expect("dir").join("credentials.json");
+    let live_path = crate::claude::claude_credentials_path().expect("live path");
+    let mut live: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).expect("read store")).expect("parse");
+    live["designOauth"] = serde_json::json!({ "accessToken": "design-1" });
+    let staged = live_path.with_extension("staged");
+    std::fs::write(&staged, serde_json::to_vec_pretty(&live).expect("ser")).expect("stage");
+    std::fs::rename(&staged, &live_path).expect("Claude Code's rename over the link");
+    let handle = Arc::new(RankedMutex::new(config));
+
+    apply_rotated_tokens_locked(
+        &handle,
+        &profile,
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).expect("read store")).expect("parse");
+    assert_eq!(stored["claudeAiOauth"]["accessToken"], "at-rotated");
+    assert_eq!(stored["designOauth"]["accessToken"], "design-1");
+}
+
+/// The rotation's sync keeps the fresher copy. A store holding a newer MCP
+/// login (a `clauth start` session refreshed it) keeps it over the older one
+/// the global live file still holds.
+#[cfg(unix)]
+#[test]
+fn a_rotation_never_puts_an_older_live_copy_over_the_stores() {
+    let _home = HomeSandbox::new();
+    let name = "rot-fresh";
+    let mut config = oauth_config(name, Some("rt-old"), Some(4_102_444_800_000));
+    config.state.active_profile = Some(name.into());
+    crate::profile::save_app_state(&config.state).expect("persist active");
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let profile = crate::profile::ProfileName::from(name);
+    crate::claude::force_link_profile_credentials(&profile).expect("link");
+    let store = profile_dir(&profile).expect("dir").join("credentials.json");
+    let live_path = crate::claude::claude_credentials_path().expect("live path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).expect("read store")).expect("parse");
+    let mut live = stored.clone();
+    stored["mcpOAuth"] =
+        serde_json::json!({ "linear": { "refreshToken": "v2", "expiresAt": 2000 } });
+    std::fs::write(&store, serde_json::to_vec_pretty(&stored).expect("ser")).expect("seed store");
+    live["mcpOAuth"] = serde_json::json!({ "linear": { "refreshToken": "v1", "expiresAt": 1000 } });
+    let staged = live_path.with_extension("staged");
+    std::fs::write(&staged, serde_json::to_vec_pretty(&live).expect("ser")).expect("stage");
+    std::fs::rename(&staged, &live_path).expect("Claude Code's rename over the link");
+    let handle = Arc::new(RankedMutex::new(config));
+
+    apply_rotated_tokens_locked(
+        &handle,
+        &profile,
+        TokenResponse {
+            access_token: "at-rotated".to_string(),
+            refresh_token: "rt-rotated".to_string(),
+            expires_in: 3600,
+            scope: None,
+        },
+    )
+    .expect("persist");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&store).expect("read store")).expect("parse");
+    assert_eq!(after["claudeAiOauth"]["accessToken"], "at-rotated");
+    assert_eq!(after["mcpOAuth"]["linear"]["refreshToken"], "v2");
+}

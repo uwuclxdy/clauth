@@ -654,6 +654,38 @@ fn preemptive_rotation_defaults_true_and_an_explicit_off_survives_a_round_trip()
     );
 }
 
+// `preserve_non_login_keys` defaults ON with the same serde contract: a state
+// file written before the key existed reads as on, which is what makes the
+// preservation reach every host with no config, and an explicit off renders so
+// the next load does not turn it back on.
+#[test]
+fn preserve_non_login_keys_defaults_true_and_an_explicit_off_survives_a_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(
+        state.preserve_non_login_keys,
+        "a state file predating the key must read as on"
+    );
+    assert!(AppState::default().preserve_non_login_keys);
+
+    let off = AppState {
+        preserve_non_login_keys: false,
+        ..AppState::default()
+    };
+    let rendered_off = toml::to_string_pretty(&off).expect("render off state");
+    assert!(
+        rendered_off.contains("preserve_non_login_keys = false"),
+        "off must render explicitly, got:\n{rendered_off}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_off).expect("reparse off state");
+    assert!(!reparsed.preserve_non_login_keys);
+
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_on.contains("preserve_non_login_keys"),
+        "on (default) must be omitted, got:\n{rendered_on}"
+    );
+}
+
 // `auto_rescue` was the opt-in behind the isolated-transcript rescue, which every
 // isolated run now gets unconditionally. `AppState` carries no
 // `deny_unknown_fields`, so a profiles.toml written while the key existed still

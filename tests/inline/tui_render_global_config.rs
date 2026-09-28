@@ -31,6 +31,7 @@ fn toggles() -> RowState {
         spend_budget: false,
         switch_off_when_budget_spent: true,
         preemptive: false,
+        preserve_non_login_keys: true,
         auto_update: true,
         refresh_spent: true,
         auto_start_queue: true,
@@ -732,6 +733,80 @@ fn auto_update_renders_the_toggle_glyphs_and_exact_hints() {
     );
     let hint_off = row_hint(GlobalConfigRow::AutoUpdate, off_state, tunables()).expect("hint");
     assert_eq!(hint_off, "no update checks");
+}
+
+/// The row sits right after `on mismatch`, the other row about what clauth
+/// does with the live credential, at the head of the scheduler band.
+#[test]
+fn non_login_keys_sits_after_on_mismatch() {
+    assert_eq!(GlobalConfigRow::PreserveNonLoginKeys.band(), "scheduler");
+    let pos = |row: GlobalConfigRow| {
+        GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("row in the config list")
+    };
+    assert_eq!(
+        pos(GlobalConfigRow::PreserveNonLoginKeys),
+        pos(GlobalConfigRow::DivergenceDefault) + 1
+    );
+}
+
+/// A plain toggle on both tiers, never dimmed, and its hints name what on
+/// keeps and what off drops, exact copy.
+#[test]
+fn non_login_keys_renders_the_toggle_and_exact_hints() {
+    let mut off_state = toggles();
+    off_state.preserve_non_login_keys = false;
+    {
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        let on = line_text(&detail_row(
+            GlobalConfigRow::PreserveNonLoginKeys,
+            false,
+            toggles(),
+            tunables(),
+            None,
+        ));
+        assert!(on.contains("non-login keys"), "the key reads: {on}");
+        assert!(
+            on.contains("─●"),
+            "full-tier on renders the slide switch: {on}"
+        );
+        let off = line_text(&detail_row(
+            GlobalConfigRow::PreserveNonLoginKeys,
+            false,
+            off_state,
+            tunables(),
+            None,
+        ));
+        assert!(
+            off.contains("○─"),
+            "full-tier off renders the hollow knob: {off}"
+        );
+    }
+    {
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+        let off = line_text(&detail_row(
+            GlobalConfigRow::PreserveNonLoginKeys,
+            false,
+            off_state,
+            tunables(),
+            None,
+        ));
+        assert!(
+            off.contains("[off]"),
+            "compatible-tier off renders the bracket: {off}"
+        );
+    }
+
+    assert_eq!(
+        row_hint(GlobalConfigRow::PreserveNonLoginKeys, toggles(), tunables()).expect("hint"),
+        "keep a /design-login with the account it was made on"
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::PreserveNonLoginKeys, off_state, tunables()).expect("hint"),
+        "a /design-login is dropped at the next switch, and outside macOS at any relink"
+    );
 }
 
 /// Value rows fold the live value into their hint, so cycling a row re-explains

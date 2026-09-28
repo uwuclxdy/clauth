@@ -929,6 +929,22 @@ pub(crate) struct AppState {
         skip_serializing_if = "is_true"
     )]
     pub(crate) preemptive_rotation: bool,
+    /// Keep every key of a Claude credential store other than the login and
+    /// its identity keys (`claude::LOGIN_CREDENTIAL_KEYS`) with the account
+    /// whose store it is: a `/design-login`, the MCP-server logins, whatever
+    /// Claude Code adds beside the login. Default ON. The live file's copy is
+    /// synced into the account's own store on every relink and at the
+    /// switch-away snapshot, and a static token's writers keep what the sidecar
+    /// holds. Nothing crosses to another account through this: the switch carry
+    /// stays `mcpOAuth` alone (`claude::CARRIED_CREDENTIAL_KEYS`).
+    /// Off is the behavior before the key existed. Read off disk where it is
+    /// used (`claude::preserve_non_login_keys`), where an unreadable file counts
+    /// as on.
+    #[serde(
+        default = "default_preserve_non_login_keys",
+        skip_serializing_if = "is_true"
+    )]
+    pub(crate) preserve_non_login_keys: bool,
     /// When false, the background usage fetch skips accounts already pinned at
     /// their 100% window cap (spent) until the window resets — a spent window
     /// can't change until then, so re-polling only burns quota + poll load.
@@ -1166,6 +1182,10 @@ fn default_preemptive_rotation() -> bool {
     true
 }
 
+fn default_preserve_non_login_keys() -> bool {
+    true
+}
+
 fn is_true(b: &bool) -> bool {
     *b
 }
@@ -1243,6 +1263,7 @@ impl Default for AppState {
             spend_budget_switching: false,
             switch_off_when_budget_spent: default_switch_off_when_budget_spent(),
             preemptive_rotation: default_preemptive_rotation(),
+            preserve_non_login_keys: default_preserve_non_login_keys(),
             refresh_spent_accounts: true,
             auto_start_queue: false,
             theme: None,
@@ -2230,6 +2251,20 @@ pub(crate) fn prune_wallet_history(name: &ProfileName) {
 
 fn profile_credentials_pending_path(name: &ProfileName) -> Result<PathBuf> {
     profile_subpath(name, "credentials.json.pending")
+}
+
+/// Whether `store` is a profile's `credentials.json` with a rotation staged
+/// beside it that no load has resolved yet. A writer of that file outside the
+/// rotation stands down while this holds, as the tier backfill does: a store
+/// written after the stage reads as the newer commit, and
+/// `recover_pending_credentials` then discards a rotated pair that may never
+/// have landed.
+pub(crate) fn rotation_staged_beside(store: &Path) -> bool {
+    store.file_name().is_some_and(|f| f == "credentials.json")
+        && store
+            .with_file_name("credentials.json.pending")
+            .symlink_metadata()
+            .is_ok()
 }
 
 /// Tempfile + rename write; readers always see old or new, never partial.
@@ -3715,9 +3750,13 @@ fn recover_pending_credentials(
         }
         // Through the preserving serializer, not the staged bytes: staging holds
         // the rotated login alone, so writing it raw would drop every non-login
-        // block the store carries. One of the two writes that reach the store
-        // without going through `save_profile` (the tier backfill above is the
-        // other).
+        // block the store carries. One of the writes that reach the store
+        // without going through `save_profile`. Of the others, the tier
+        // backfill above (through its own pending check) and the non-login-key
+        // syncs in `claude.rs` (through `rotation_staged_beside`) stand down
+        // while a rotation is staged; the MCP-login carry, the restore of
+        // parked MCP logins, the `clauth start` watchdog's adopt and the macOS
+        // session-item carry predate that and write without it.
         let _ = with_state_lock(|_held| {
             let body = serialize_credentials_preserving_extra(&pending, &cred_path)?;
             atomic_write_600(&cred_path, body).map_err(Into::into)
