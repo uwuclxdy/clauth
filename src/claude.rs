@@ -1240,12 +1240,22 @@ fn keychain_mirror_source(path: &Path, absent: AbsentSource, preserve: bool) -> 
             // already raised — the item keeps serving the departed account
             // until the switch is re-run on an unlocked keychain, which is
             // recoverable where the pre-fix blind delete was not.
-            AbsentSource::SignOut => crate::keychain::keychain_sign_out(preserve).map(|_| ()),
+            AbsentSource::SignOut => crate::keychain::keychain_sign_out(preserve, |item| {
+                preserve && sync_item_into_its_store(item, None)
+            })
+            .map(|_| ()),
             AbsentSource::Leave => Ok(()),
         };
     }
     let store = checked_store_at(path)?;
-    crate::keychain::keychain_install(&store)
+    // What the install replaces belongs to the account whose login it holds:
+    // the outgoing one on a switch, this one on a relink. Its non-login keys
+    // are saved there before the write, whether or not the write then lands.
+    crate::keychain::keychain_install(&store, |item| {
+        if preserve {
+            sync_item_into_its_store(item, Some(path));
+        }
+    })
 }
 
 /// macOS: install the store `path` holds into the NAMESPACED Keychain item for
@@ -1926,6 +1936,22 @@ pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value, preserve: 
     }
 }
 
+/// Whether a sign-out keeps the design login in the store it strips: with
+/// `preserve_non_login_keys` on, unless its account's own store already took
+/// it (`saved_elsewhere`), which leaves one copy of a rotating chain rather
+/// than two. PURE, so the rule is pinned on every platform; the macOS Keychain
+/// sign-out is its caller.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only caller is the macOS Keychain sign-out; the rule is pinned on every platform"
+    )
+)]
+pub(crate) fn sign_out_keeps_non_login_keys(preserve: bool, saved_elsewhere: bool) -> bool {
+    preserve && !saved_elsewhere
+}
+
 /// Copy [`CARRIED_CREDENTIAL_KEYS`] from the live credential onto `target`
 /// before it becomes the live credential, so an account switch keeps MCP-server
 /// auth. A key the live file holds overwrites the target's copy; one the live
@@ -2288,7 +2314,8 @@ fn keep_non_login_in_sidecar(fresh: &[u8], sidecar: &Path) -> Vec<u8> {
 /// `store` with `source`'s non-login keys merged over it, or `None` when
 /// nothing is to be written: `source`'s login is not `store`'s (the same
 /// non-empty access token), or the merge changes nothing. The rule every
-/// per-account sync applies ([`sync_live_extra_into`]). PURE, so it is pinned
+/// per-account sync applies, the live file's ([`sync_live_extra_into`]) and the
+/// macOS Keychain item's ([`sync_item_into_its_store`]). PURE, so it is pinned
 /// on every platform.
 pub(crate) fn non_login_keys_onto_own_store(
     source: &serde_json::Value,
@@ -2406,6 +2433,114 @@ pub(crate) fn sync_live_extra_best_effort(link: &Path, store: &Path) {
              login or MCP login made since the last relink may need signing in again",
             store.display()
         );
+    }
+}
+
+/// Save the non-login keys of a Keychain item a relink or sign-out is replacing
+/// into the store of the account whose login it holds, reporting whether that
+/// store now holds them: the Keychain half of the switch-away sync. On macOS
+/// Claude Code keeps its credential store in the item rather than the file
+/// (measured on 2.1.283 against a `security` stand-in: it read its login from
+/// the item and neither read nor created `.credentials.json`; the regular-file
+/// mirror `classify_link_at` describes is not what that build did), so a
+/// `/design-login` lives there alone, and a switch's install writes the
+/// incoming store over it with only the MCP-server logins carried.
+///
+/// The owner is the store holding the item's login (the same non-empty access
+/// token), looked for in this order: `relinked`, the store a relink installs;
+/// the on-disk active profile's, still the outgoing account while a switch
+/// relinks; the one roster profile whose store does. A profiles.toml that does
+/// not load falls back to every profile directory on disk. No owner, or two
+/// stores claiming one login, saves nothing and says so; so does an item that
+/// holds a design login and no login at all, which the install is about to
+/// drop. clauth rotates the chain it mirrors into the item and writes the store
+/// first, so the two agree in the normal state; after a refresh Claude Code
+/// made inside the item no store matches (not measured). Callers hold the state
+/// flock and pass the item as read before the write, so this spends no
+/// `security` call of its own. Best-effort: a failure costs the keys, never the
+/// switch.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS Keychain relink and sign-out; the owner search is pinned on every platform"
+    )
+)]
+pub(crate) fn sync_item_into_its_store(item: &serde_json::Value, relinked: Option<&Path>) -> bool {
+    let unsaved: Vec<&str> = non_login_key_names(item)
+        .into_iter()
+        .filter(|key| !CARRIED_CREDENTIAL_KEYS.contains(key))
+        .collect();
+    let Some(login) = login_access_token(item) else {
+        if relinked.is_some() && !unsaved.is_empty() {
+            logline!(
+                "clauth: the macOS Keychain item held {} with no login beside it, so no \
+                 account's store takes it and the install replaces it",
+                unsaved.join(", ")
+            );
+        }
+        return false;
+    };
+    let purpose = "the macOS Keychain item's non-login keys (a design login) were not saved \
+                   into its account's store";
+    let owns = |store: &Path| {
+        read_store_for_merge(store, purpose)
+            .filter(|value| login_access_token(value) == Some(login))
+            .map(|value| (store.to_path_buf(), value))
+    };
+    let owner = relinked.and_then(&owns).or_else(|| {
+        let names = match crate::profile::load_app_state() {
+            Ok(state) => {
+                let active = state
+                    .active_profile
+                    .as_ref()
+                    .and_then(|name| install_source_path(name).ok())
+                    .and_then(|store| owns(&store));
+                if active.is_some() {
+                    return active;
+                }
+                state.profiles
+            }
+            Err(_) => crate::profile::profile_names_on_disk(),
+        };
+        let mut owners = names
+            .iter()
+            .filter_map(|name| install_source_path(name).ok())
+            .filter_map(|store| owns(&store));
+        match (owners.next(), owners.next()) {
+            (Some(one), None) => Some(one),
+            _ => None,
+        }
+    });
+    let Some((store, value)) = owner else {
+        if !unsaved.is_empty() {
+            logline!(
+                "clauth: no single profile holds the macOS Keychain item's login, so {} it held \
+                 beside the login was not saved into an account's store",
+                unsaved.join(", ")
+            );
+        }
+        return false;
+    };
+    let Some(synced) = non_login_keys_onto_own_store(item, &value) else {
+        return true;
+    };
+    if crate::profile::rotation_staged_beside(&store) {
+        logline!(
+            "clauth: a rotation is staged beside {}, so {purpose}",
+            store.display()
+        );
+        return false;
+    }
+    let written = serde_json::to_string_pretty(&synced)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| atomic_write_600(&store, bytes).map_err(anyhow::Error::from));
+    match written {
+        Ok(()) => true,
+        Err(e) => {
+            logline!("clauth: {purpose}: {e:#}");
+            false
+        }
     }
 }
 
@@ -2553,7 +2688,9 @@ pub(crate) fn clear_claude_credentials() -> Result<()> {
         #[cfg(target_os = "macos")]
         if crate::keychain::enabled() {
             let preserve = preserve_non_login_keys();
-            crate::keychain::keychain_sign_out(preserve)?;
+            crate::keychain::keychain_sign_out(preserve, |item| {
+                preserve && sync_item_into_its_store(item, None)
+            })?;
         }
         Ok(())
     })

@@ -757,7 +757,25 @@ fn security_quote(s: &str) -> Result<String> {
 /// Whether a write happens at all is [`merge_write`]'s call, which is where the
 /// skip and its reasons live.
 fn merge_and_put_at(service: &str, account: &str, incoming: &Value, keep: Keep) -> Result<()> {
+    merge_and_put_reporting_at(service, account, incoming, keep, |_| {})
+}
+
+/// [`merge_and_put_at`] that hands the item as read to `on_read` before
+/// anything is written, so a caller can save what the write is about to replace
+/// into the store of the account it belongs to (`claude::sync_item_into_its_store`)
+/// whether or not the write then lands. Not called over an item that is absent
+/// or could not be read.
+fn merge_and_put_reporting_at(
+    service: &str,
+    account: &str,
+    incoming: &Value,
+    keep: Keep,
+    on_read: impl FnOnce(&Value),
+) -> Result<()> {
     let existing = blob_to_merge_with(service, account);
+    if let Some(item) = existing.as_ref() {
+        on_read(item);
+    }
     match merge_write(incoming, existing.as_ref(), keep) {
         Some(blob) => put_blob_at(service, account, &blob),
         None => Ok(()),
@@ -1360,8 +1378,11 @@ pub(crate) fn classified_exit(e: &anyhow::Error) -> crate::claude::SecurityExitC
 /// input to this layer, and CC parses the item's password as one JSON object, so
 /// anything else would leave CC with a credential it cannot read and clauth with
 /// no signal that it happened.
-pub(crate) fn keychain_install(store: &Value) -> Result<()> {
-    install_at(SERVICE, store)
+///
+/// `on_replaced` gets the item this is about to replace, as read, before the
+/// write ([`merge_and_put_reporting_at`]).
+pub(crate) fn keychain_install(store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
+    install_at(SERVICE, store, on_replaced)
 }
 
 /// Install `store` as the login for a SPECIFIC config dir's item: the
@@ -1392,7 +1413,7 @@ pub(crate) fn keychain_install_for_config_dir(
          `{}`",
         owned.service()
     );
-    install_at(&service, store)
+    install_at(&service, store, |_| {})
 }
 
 /// Read the whole JSON object the per-config-dir item for `config_dir` holds,
@@ -1413,12 +1434,12 @@ pub(crate) fn read_failed_unparseable(e: &anyhow::Error) -> bool {
     carried_raw(e).is_some()
 }
 
-fn install_at(service: &str, store: &Value) -> Result<()> {
+fn install_at(service: &str, store: &Value, on_replaced: impl FnOnce(&Value)) -> Result<()> {
     anyhow::ensure!(
         store.is_object(),
         "refusing to install a credential store that is not a JSON object into the Keychain"
     );
-    merge_and_put_at(service, &account()?, store, Keep::CarriedOnly)
+    merge_and_put_reporting_at(service, &account()?, store, Keep::CarriedOnly, on_replaced)
 }
 
 /// Mirror `creds` after clauth rotated THIS account's own chain (`oauth.rs`).
@@ -1522,8 +1543,15 @@ fn login_blob_is_ours(blob: Option<&Value>, ours: &[&str]) -> bool {
 ///
 /// `preserve` is the caller's `preserve_non_login_keys` reading, handed in so
 /// this module never reads profiles.toml itself and its tests stay pure.
-pub(crate) fn keychain_sign_out(preserve: bool) -> Result<SignOutOutcome> {
-    sign_out_at(SERVICE, &account()?, preserve)
+/// `saved_elsewhere` gets the item as read, before the strip, and reports
+/// whether its non-login keys now sit in their account's store; the strip then
+/// drops the design login too ([`crate::claude::sign_out_keeps_non_login_keys`]).
+/// Not called over an item that is absent or could not be read.
+pub(crate) fn keychain_sign_out(
+    preserve: bool,
+    saved_elsewhere: impl FnOnce(&Value) -> bool,
+) -> Result<SignOutOutcome> {
+    sign_out_saving_at(SERVICE, &account()?, preserve, saved_elsewhere)
 }
 
 /// Sign out the NAMESPACED item for a config dir — the start-site twin of
@@ -1550,6 +1578,12 @@ pub(crate) fn keychain_sign_out_for_config_dir(
     // keeping a design login here would only hand the member the swap left to
     // the next one, a login-less member of the same runtime dir included.
     sign_out_at(&service, &account()?, false)
+}
+
+/// [`sign_out_saving_at`] with nothing saved elsewhere: the per-session items
+/// and the e2e leg, whose items no account store takes over.
+fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOutcome> {
+    sign_out_saving_at(service, account, preserve, |_| false)
 }
 
 /// What a sign-out actually did, so a caller whose downstream state follows
@@ -1594,7 +1628,12 @@ pub(crate) enum SignOutOutcome {
 /// where the delete is not. A read that failed WITH BYTES quarantines them
 /// first ([`quarantine_item_bytes`]) — the delete still removes the login, but
 /// the evidence survives it, and the event line says where.
-fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOutcome> {
+fn sign_out_saving_at(
+    service: &str,
+    account: &str,
+    preserve: bool,
+    saved_elsewhere: impl FnOnce(&Value) -> bool,
+) -> Result<SignOutOutcome> {
     // The two `None` cases part here rather than sharing an early return: an
     // absent item is already signed out and says nothing, while a read that
     // FAILED takes the most destructive branch there is, deleting the item
@@ -1629,7 +1668,9 @@ fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOu
             return delete_at(service, account).map(|_| SignOutOutcome::SignedOut);
         }
     };
-    match crate::claude::strip_account_credentials(&mut blob, preserve) {
+    let saved = preserve && saved_elsewhere(&blob);
+    let keep = crate::claude::sign_out_keeps_non_login_keys(preserve, saved);
+    match crate::claude::strip_account_credentials(&mut blob, keep) {
         crate::claude::SignOut::Delete => {
             logline!(
                 "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
@@ -1638,7 +1679,7 @@ fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOu
             delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
         }
         crate::claude::SignOut::Write => {
-            if preserve {
+            if keep {
                 // Names only, never values: the event line says which logins
                 // the item still holds, a design login among them.
                 let kept = blob
@@ -1653,6 +1694,12 @@ fn sign_out_at(service: &str, account: &str, preserve: bool) -> Result<SignOutOu
                 logline!(
                     "clauth: signed Claude Code out of the macOS Keychain (the profile now \
                      active stores no Claude login); kept in the item: {kept}"
+                );
+            } else if saved {
+                logline!(
+                    "clauth: signed Claude Code out of the macOS Keychain (the profile now \
+                     active stores no Claude login); its MCP server logins were kept and what \
+                     else it held beside the login was saved into the account's store"
                 );
             } else {
                 logline!(

@@ -1889,6 +1889,22 @@ pub(crate) fn profile_dir(name: &ProfileName) -> Result<PathBuf> {
     Ok(profiles_root()?.join(name.as_str()))
 }
 
+/// Every profile directory on disk, by name: the roster a reader falls back to
+/// when profiles.toml does not load and it still has to attribute a credential
+/// to its account (the macOS Keychain owner search). An unreadable profiles
+/// root reads as no profiles.
+pub(crate) fn profile_names_on_disk() -> Vec<ProfileName> {
+    let Ok(entries) = profiles_root().and_then(|root| Ok(std::fs::read_dir(root)?)) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .map(ProfileName::from)
+        .collect()
+}
+
 pub(crate) fn profile_subpath(name: &ProfileName, sub: &str) -> Result<PathBuf> {
     Ok(profile_dir(name)?.join(sub))
 }

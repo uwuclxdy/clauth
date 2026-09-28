@@ -5854,6 +5854,16 @@ fn the_keychain_sign_outs_pass_the_preservation_reading() {
             && clear.contains("keychain_sign_out(preserve"),
         "the wrap-off sign-out reads it off disk"
     );
+    assert!(
+        body("fn keychain_mirror_source(").contains("sync_item_into_its_store(item, Some(path))"),
+        "the install hands the item it replaces to the owner search"
+    );
+    assert!(
+        body("fn keychain_mirror_source(")
+            .contains("preserve && sync_item_into_its_store(item, None)")
+            && clear.contains("preserve && sync_item_into_its_store(item, None)"),
+        "both sign-outs let the owner search take the item's keys first"
+    );
     // The per-session items keep the strip preservation off gives: nothing
     // saves what they hold beside a login, and keeping it would hand it to the
     // session's next member.
@@ -5866,4 +5876,138 @@ fn the_keychain_sign_outs_pass_the_preservation_reading() {
         .expect("fn body closes")
         .0;
     assert!(per_session.contains("sign_out_at(&service, &account()?, false)"));
+}
+
+/// A sign-out keeps the design login in the item only while preservation is on
+/// and no store of its account took it: one copy of a rotating chain, never two.
+#[test]
+fn a_sign_out_keeps_the_design_login_only_where_no_store_took_it() {
+    assert!(sign_out_keeps_non_login_keys(true, false));
+    assert!(!sign_out_keeps_non_login_keys(true, true));
+    assert!(!sign_out_keeps_non_login_keys(false, false));
+    assert!(!sign_out_keeps_non_login_keys(false, true));
+}
+
+/// macOS: what a switch's Keychain write replaces goes into the store of the
+/// account whose login the item holds, the outgoing one, which is still the
+/// on-disk active profile while the switch relinks, and nowhere else. The
+/// login's identity keys stay out, as for the file sync. The owner search runs
+/// on every platform; only its callers are macOS-gated.
+#[test]
+fn a_replaced_keychain_item_saves_its_keys_into_the_store_holding_its_login() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", None);
+    let b_before = fs::read(sidecar_of("b")).expect("read b");
+    let mut item = read_value(&sidecar_of("a"));
+    item["designOauth"] = design_login();
+    item["organizationUuid"] = serde_json::json!("a-org");
+
+    assert!(sync_item_into_its_store(&item, Some(&sidecar_of("b"))));
+
+    let a = read_value(&sidecar_of("a"));
+    assert_eq!(a["designOauth"], design_login());
+    assert_eq!(a["claudeAiOauth"]["accessToken"], mint_for("a"));
+    assert!(a.get("organizationUuid").is_none());
+    assert_eq!(fs::read(sidecar_of("b")).expect("read b"), b_before);
+    assert!(
+        sync_item_into_its_store(&item, Some(&sidecar_of("a"))),
+        "a relink of the owner finds it directly, and a store already holding the keys counts"
+    );
+}
+
+/// Off the active profile the roster finds the owner, and a profiles.toml that
+/// does not load falls back to the profile directories: the brief's "an
+/// unreadable profiles.toml preserves too" on the Keychain install side.
+#[test]
+fn the_keychain_owner_search_finds_the_owner_off_the_active_profile() {
+    let home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "b", None);
+    let mut item = read_value(&sidecar_of("a"));
+    item["designOauth"] = design_login();
+
+    assert!(sync_item_into_its_store(&item, None), "the roster finds a");
+    assert_eq!(read_value(&sidecar_of("a"))["designOauth"], design_login());
+
+    let mut newer = design_login();
+    newer["expiresAt"] = serde_json::json!(4_102_444_900_000_i64);
+    item["designOauth"] = newer.clone();
+    fs::write(
+        home.home().join(".clauth").join("profiles.toml"),
+        "profiles = [\"a\"\n",
+    )
+    .expect("break the state file");
+    assert!(
+        sync_item_into_its_store(&item, None),
+        "the directories find a"
+    );
+    assert_eq!(read_value(&sidecar_of("a"))["designOauth"], newer);
+}
+
+/// No owner, or two stores claiming the item's login, saves nothing and says
+/// so; so does an item holding a design login and no login, which the install
+/// is about to drop. A guess could hand one account's design login to another.
+#[test]
+fn a_keychain_item_no_single_store_owns_saves_nothing_and_says_so() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b", "c"], "c", None);
+    let mut item = read_value(&sidecar_of("a"));
+    item["designOauth"] = design_login();
+    item["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    write_value(&sidecar_of("b"), &read_value(&sidecar_of("a")));
+    let a_before = fs::read(sidecar_of("a")).expect("read a");
+    let lines = crate::logline::LogLines::new();
+    let capture = lines.capture_here();
+
+    assert!(
+        !sync_item_into_its_store(&item, None),
+        "two stores claim the login"
+    );
+    let foreign = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "nobody-here" },
+        "designOauth": design_login()
+    });
+    assert!(
+        !sync_item_into_its_store(&foreign, None),
+        "no store claims it"
+    );
+    let signed_out = serde_json::json!({ "designOauth": design_login() });
+    assert!(!sync_item_into_its_store(
+        &signed_out,
+        Some(&sidecar_of("c"))
+    ));
+    drop(capture);
+
+    assert_eq!(fs::read(sidecar_of("a")).expect("read a"), a_before);
+    assert!(read_value(&sidecar_of("b")).get("designOauth").is_none());
+    let snapshot = lines.snapshot();
+    let skips: Vec<&String> = snapshot
+        .iter()
+        .filter(|line| line.contains("designOauth"))
+        .collect();
+    assert_eq!(
+        skips.len(),
+        3,
+        "every skip is on the event line: {snapshot:?}"
+    );
+    assert!(
+        skips.iter().all(|line| !line.contains("mcpOAuth")),
+        "the MCP logins are carried or kept either way and never named as lost: {snapshot:?}"
+    );
+}
+
+/// The on-disk active profile is asked first: during a switch it is still the
+/// outgoing account, whose login the item holds, so its store takes the keys
+/// even where another store holds the same login and the roster alone could not
+/// tell them apart.
+#[test]
+fn the_keychain_owner_search_asks_the_active_profile_first() {
+    let _home = HomeSandbox::new();
+    seed_static_token_accounts(&["a", "b"], "a", None);
+    write_value(&sidecar_of("b"), &read_value(&sidecar_of("a")));
+    let mut item = read_value(&sidecar_of("a"));
+    item["designOauth"] = design_login();
+
+    assert!(sync_item_into_its_store(&item, None));
+    assert_eq!(read_value(&sidecar_of("a"))["designOauth"], design_login());
+    assert!(read_value(&sidecar_of("b")).get("designOauth").is_none());
 }
