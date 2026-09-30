@@ -1743,9 +1743,11 @@ fn cmd_switch(name: &str) -> Result<()> {
             outln!("clauth: switched codex to '{canonical}'");
             if let Some(slot) = repointed {
                 outln!("clauth: {} now follows '{canonical}'", slot.display());
-            }
-            if let Some(note) = crate::codex_daemon::switch_note() {
-                outln!("{note}");
+                // Only a moved link can leave codex's daemon behind: an
+                // operator's own login file is not ours to call stale.
+                if let Some(note) = crate::codex_daemon::switch_note() {
+                    outln!("{note}");
+                }
             }
             return Ok(());
         }

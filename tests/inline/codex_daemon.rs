@@ -44,7 +44,7 @@ fn listener(tag: &str) -> (std::os::unix::net::UnixListener, PathBuf) {
 fn a_daemon_started_before_the_switch_is_stale() {
     let (_l, sock) = listener("before");
     let home = home_with(&["daemon", "login"], &sock);
-    assert!(stale_daemon_at(home.path()).is_some());
+    assert!(is_stale_at(home.path()));
     let _ = std::fs::remove_file(sock);
 }
 
@@ -52,7 +52,7 @@ fn a_daemon_started_before_the_switch_is_stale() {
 fn a_daemon_started_after_the_switch_is_current() {
     let (_l, sock) = listener("after");
     let home = home_with(&["login", "daemon"], &sock);
-    assert_eq!(stale_daemon_at(home.path()), None);
+    assert!(!is_stale_at(home.path()));
     let _ = std::fs::remove_file(sock);
 }
 
@@ -61,13 +61,13 @@ fn a_daemon_started_after_the_switch_is_current() {
 fn a_leftover_link_with_no_daemon_is_not_reported() {
     let gone = PathBuf::from(format!("/tmp/clauth-cdx-{}-gone.sock", std::process::id()));
     let home = home_with(&["daemon", "login"], &gone);
-    assert_eq!(stale_daemon_at(home.path()), None);
+    assert!(!is_stale_at(home.path()));
 }
 
 #[test]
 fn no_daemon_no_answer() {
     let home = tempfile::tempdir().unwrap();
-    assert_eq!(stale_daemon_at(home.path()), None);
+    assert!(!is_stale_at(home.path()));
 }
 
 /// A home deep enough that the control link's own path is past sun_path's
@@ -85,6 +85,101 @@ fn a_long_home_still_finds_its_daemon() {
     std::thread::sleep(Duration::from_millis(20));
     std::os::unix::fs::symlink("profiles/x/auth.json", deep.join("auth.json")).unwrap();
     assert!(deep.join(CONTROL_SOCKET).as_os_str().len() > 104);
-    assert!(stale_daemon_at(&deep).is_some());
+    assert!(is_stale_at(&deep));
     let _ = std::fs::remove_file(sock);
+}
+
+/// Building the restart spawns nothing, so its shape is checked directly:
+/// codex's own managed binary when installed, else `codex` from PATH.
+#[test]
+fn the_restart_runs_codexs_managed_binary_else_path() {
+    let home = tempfile::tempdir().unwrap();
+    let args = |c: &Command| {
+        c.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let bare = restart_command(home.path());
+    assert_eq!(bare.get_program(), "codex");
+    assert_eq!(args(&bare), ["app-server", "daemon", "restart"]);
+
+    let managed = home.path().join(MANAGED_BIN);
+    std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
+    std::fs::write(&managed, "").unwrap();
+    let cmd = restart_command(home.path());
+    assert_eq!(cmd.get_program(), managed.as_os_str());
+    assert_eq!(args(&cmd), ["app-server", "daemon", "restart"]);
+}
+
+/// The CLI note reads the operator's own codex home: present only while a
+/// daemon there predates the login's last move.
+#[test]
+fn the_switch_note_follows_the_operators_daemon() {
+    let home = crate::testutil::HomeSandbox::new();
+    assert_eq!(switch_note(), None, "no daemon, no note");
+
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(operator.join("app-server-control")).unwrap();
+    let (_l, sock) = listener("note");
+    std::os::unix::fs::symlink(&sock, operator.join(CONTROL_SOCKET)).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    std::os::unix::fs::symlink("profiles/x/auth.json", operator.join("auth.json")).unwrap();
+
+    let note = switch_note().expect("a daemon older than the login");
+    assert!(note.contains("codex app-server daemon restart"), "{note}");
+    let _ = std::fs::remove_file(sock);
+}
+
+/// A hung `codex` must not keep the restart thread forever: the waiter kills a
+/// child past its deadline, and reports a clean exit and a failed one apart.
+#[test]
+fn the_restart_wait_is_bounded_and_reports_each_outcome() {
+    let spawn = |cmd: &str| std::process::Command::new(cmd).spawn().unwrap();
+    let limit = Duration::from_secs(5);
+    assert!(matches!(
+        wait_with_deadline(&mut spawn("true"), limit),
+        Waited::Exited { ok: true, .. }
+    ));
+    assert!(matches!(
+        wait_with_deadline(&mut spawn("false"), limit),
+        Waited::Exited { ok: false, .. }
+    ));
+    let mut hung = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let began = std::time::Instant::now();
+    assert_eq!(
+        wait_with_deadline(&mut hung, Duration::from_millis(200)),
+        Waited::Killed
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "killed at the deadline, not waited out"
+    );
+}
+
+#[test]
+fn each_restart_outcome_reads_as_what_happened() {
+    let limit = Duration::from_secs(60);
+    let ok = Waited::Exited {
+        ok: true,
+        status: "exit status: 0".into(),
+    };
+    assert!(
+        restart_log_line("auto", &ok, limit).contains("restarted codex's app-server daemon (auto)")
+    );
+    let failed = Waited::Exited {
+        ok: false,
+        status: "exit status: 3".into(),
+    };
+    assert!(restart_log_line("auto", &failed, limit).ends_with("exited exit status: 3"));
+    assert!(
+        restart_log_line("auto", &Waited::Killed, limit).contains("ran past 60s and was killed")
+    );
+    assert!(
+        restart_log_line("auto", &Waited::Unwaitable("EINTR".into()), limit)
+            .contains("could not be waited on: EINTR")
+    );
 }
