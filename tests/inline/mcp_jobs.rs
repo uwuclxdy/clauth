@@ -29,6 +29,8 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         endpoint: None,
         provider: None,
         isolated: false,
+        cwd: None,
+        spawned_by: None,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
         // The legacy shape: a record an older server wrote carries no owner, so
@@ -76,7 +78,7 @@ fn the_isolation_flag_rides_the_mint_through_heartbeats_and_the_finish() {
         read(&id).unwrap().isolated,
         "a heartbeat rewrites the record and keeps it"
     );
-    write_done(
+    write_done_parts(
         &id,
         "work",
         1000,
@@ -99,6 +101,47 @@ fn the_isolation_flag_rides_the_mint_through_heartbeats_and_the_finish() {
     );
 }
 
+/// The run's cwd and spawning account ride the mint like the isolation flag:
+/// kept by every heartbeat and by the finish. A spec without them writes
+/// neither key, the shape an older server's record has on disk.
+#[test]
+fn the_cwd_and_spawner_ride_the_mint_through_heartbeats_and_the_finish() {
+    let _home = HomeSandbox::new();
+    let id = new_job_id(1000);
+    let origin = RunningSpec {
+        cwd: Some("/home/u/repos/app".to_string()),
+        spawned_by: Some("kerry".to_string()),
+        ..spec(&id, "work", 1000)
+    };
+    let carried = |id: &str| {
+        let r = read(id).unwrap();
+        (r.cwd, r.spawned_by)
+    };
+    let want = (
+        Some("/home/u/repos/app".to_string()),
+        Some("kerry".to_string()),
+    );
+    write_running(&origin).unwrap();
+    assert_eq!(carried(&id), want, "the mint stamps both");
+    write_heartbeat_with_session(&origin, 41_000, "mid-run", Some("sess-1")).unwrap();
+    assert_eq!(
+        carried(&id),
+        want,
+        "a heartbeat rewrites the record and keeps both"
+    );
+    write_done(&origin, serde_json::json!({"result": "ok"})).unwrap();
+    assert_eq!(carried(&id), want, "the finalized record keeps both");
+
+    let bare = new_job_id(2000);
+    write_running(&spec(&bare, "work", 2000)).unwrap();
+    let bytes = std::fs::read_to_string(jobs_dir().unwrap().join(format!("{bare}.json"))).unwrap();
+    assert!(
+        !bytes.contains("\"cwd\"") && !bytes.contains("\"spawned_by\""),
+        "an unknown origin writes no key: {bytes}"
+    );
+    assert_eq!(carried(&bare), (None, None), "and reads back as unknown");
+}
+
 #[test]
 fn write_read_roundtrip_running_then_done() {
     let _home = HomeSandbox::new();
@@ -111,7 +154,7 @@ fn write_read_roundtrip_running_then_done() {
     assert!(r.envelope.is_none());
 
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
-    write_done(&id, "work", 1000, None, None, false, env.clone()).unwrap();
+    write_done_parts(&id, "work", 1000, None, None, false, env.clone()).unwrap();
     let r = read(&id).expect("done record");
     assert_eq!(r.state, JobState::Done);
     assert_eq!(r.envelope, Some(env));
@@ -135,7 +178,7 @@ fn write_read_roundtrip_running_then_done() {
 fn a_done_record_carries_the_envelopes_session_id() {
     let _home = HomeSandbox::new();
     let with = new_job_id(1_000);
-    write_done(
+    write_done_parts(
         &with,
         "work",
         1_000,
@@ -152,7 +195,7 @@ fn a_done_record_carries_the_envelopes_session_id() {
     );
 
     let without = new_job_id(2_000);
-    write_done(
+    write_done_parts(
         &without,
         "work",
         2_000,
@@ -173,7 +216,7 @@ fn a_done_record_is_claimable_once_and_the_claim_evicts_it() {
     let _home = HomeSandbox::new();
     let id = new_job_id(1000);
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
-    write_done(&id, "work", 1000, None, None, false, env.clone()).unwrap();
+    write_done_parts(&id, "work", 1000, None, None, false, env.clone()).unwrap();
 
     let Claim::Owned(claimed) = claim(&id, Claimant::Monitor) else {
         panic!("the first claimant owns the record");
@@ -241,7 +284,7 @@ fn claim_refuses_a_record_whose_self_report_disagrees_and_leaves_it_readable() {
 fn a_leftover_claimed_file_is_invisible_to_list_and_reaped_only_by_the_full_sweep() {
     let _home = HomeSandbox::new();
     let id = new_job_id(1000);
-    write_done(
+    write_done_parts(
         &id,
         "work",
         1000,
@@ -283,7 +326,7 @@ fn a_leftover_claimed_file_is_invisible_to_list_and_reaped_only_by_the_full_swee
 fn a_stale_claimed_spelling_does_not_block_the_claim() {
     let _home = HomeSandbox::new();
     let id = new_job_id(1000);
-    write_done(
+    write_done_parts(
         &id,
         "work",
         1000,
@@ -556,7 +599,7 @@ fn the_conversion_never_overwrites_a_finished_result() {
         Some("sess-stale-1"),
     )
     .unwrap();
-    write_done(
+    write_done_parts(
         &id,
         "work",
         ancient,
@@ -881,7 +924,7 @@ fn the_delivery_ledger_names_who_delivered_and_when() {
     let _home = HomeSandbox::new();
     let id = new_job_id(1_000);
     let env = serde_json::json!({ "is_error": false, "result": "ok" });
-    write_done(&id, "work", 1_000, None, None, false, env).unwrap();
+    write_done_parts(&id, "work", 1_000, None, None, false, env).unwrap();
     let before = crate::usage::now_ms();
 
     let Claim::Owned(_) = claim(&id, Claimant::Hook) else {
@@ -1452,7 +1495,7 @@ fn job_files_and_dir_are_owner_only() {
 
     let _home = HomeSandbox::new();
     let id = new_job_id(1000);
-    write_done(
+    write_done_parts(
         &id,
         "work",
         1000,

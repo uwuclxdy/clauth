@@ -416,6 +416,10 @@ fn total_card_groups_kv_rows_and_carries_the_range_meta() {
         out.contains("jan 18 → jun 21"),
         "lifetime date range rides the title-right meta"
     );
+    assert!(
+        out.contains("jun 21 ─╮"),
+        "the badge closes with a border cell before the corner"
+    );
     assert!(out.contains("sessions"), "sessions is a spelled-out kv key");
     assert!(out.contains("1,000"), "session count is comma-grouped");
 }

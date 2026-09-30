@@ -2719,7 +2719,7 @@ fn delegate_prose_shrinks_the_finished_envelope() {
                 "tool_name": "Bash",
                 "tool_use_id": "call_00_001bgZEkvreKaAsIiZ9R2184",
                 "tool_input": {
-                    "command": "rtk read /tmp/m5_gate.log",
+                    "command": "cat /tmp/gate.log",
                     "description": "Read the gate log"
                 }
             }

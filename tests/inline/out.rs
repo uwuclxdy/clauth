@@ -119,6 +119,10 @@ fn a_reachable_reader_gets_the_bytes() {
 /// Two known limits, neither reachable today: the strip cuts at the first
 /// `//`, so a `//` inside a string literal hides a real call later on that same
 /// line, and a banned name inside a block comment or a string reds.
+///
+/// A third limit is reachable: it cannot see a hand-rolled `write!` or
+/// `writeln!` to `std::io::stdout()` or `std::io::stderr()`, so which write
+/// policy such a site takes stays a review call.
 #[test]
 fn no_bare_print_macro_under_src() {
     const BANNED: [&str; 4] = ["println!", "print!", "eprintln!", "eprint!"];

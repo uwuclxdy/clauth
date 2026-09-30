@@ -18,6 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use chrono::Weekday;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{
@@ -36,6 +37,7 @@ use crate::claude::{
     force_snapshot_active_credentials, is_first_login, link_profile_credentials,
     live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
 };
+use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
     DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
     parse_threshold, threshold_for,
@@ -59,12 +61,13 @@ use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
     ActivityStore, FetchLeg, FetchStatus, KickBlocks, LastFetchedAt, NextRefreshPerProfile,
-    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff, PollStreaks,
-    ProfileActivity, RefetchQueue, StartupReceiver, StartupSender, StartupSignal, StatusStore,
-    SuppressedAuthExpiredStore, ThirdPartyList, ThirdPartyStatusStore, ThirdPartyUsageStore,
-    TokenList, UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party,
-    clear_activity, collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle,
-    mark_activity, now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
+    OpResult, OpResultReceiver, OpResultSender, PendingSwitch, PendingSwitchOff,
+    PendingSwitchTarget, PollStreaks, ProfileActivity, RefetchQueue, StartupReceiver,
+    StartupSender, StartupSignal, StatusStore, SuppressedAuthExpiredStore, ThirdPartyBroken,
+    ThirdPartyList, ThirdPartyStatusStore, ThirdPartyStreaks, ThirdPartyUsageStore, TokenList,
+    UsageInfo, UsageStore, any_busy, bootstrap_fetch, bootstrap_third_party, clear_activity,
+    collect_oauth_seed_names, collect_third_party_entries, collect_tokens, is_idle, mark_activity,
+    now_ms, spawn_refresher, switch_gate_in_flight, windows_maxed,
 };
 
 // ── Shared input field ────────────────────────────────────────────────────────
@@ -167,6 +170,215 @@ impl InputState {
     }
 }
 
+// ── Note editor ───────────────────────────────────────────────────────────────
+
+/// The note editor's multi-line draft. The stored text is `lines` joined by
+/// `\n`; the caret is `(row, col)` in char columns, converted to display cells
+/// at render (a wide char takes two cells).
+#[derive(Debug, Clone)]
+pub(crate) struct NoteBuffer {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+impl NoteBuffer {
+    pub(crate) fn new(text: &str) -> Self {
+        let lines: Vec<String> = if text.is_empty() {
+            vec![String::new()]
+        } else {
+            text.split('\n').map(str::to_string).collect()
+        };
+        let row = lines.len() - 1;
+        let col = lines[row].chars().count();
+        Self { lines, row, col }
+    }
+
+    pub(crate) fn text(&self) -> String {
+        self.lines.join("\n")
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub(crate) fn line(&self, index: usize) -> &str {
+        &self.lines[index]
+    }
+
+    /// Caret row and DISPLAY column (wide chars count two cells), for the
+    /// native cursor position.
+    pub(crate) fn cursor_pos(&self) -> (usize, usize) {
+        (self.row, display_col(&self.lines[self.row], self.col))
+    }
+
+    fn line_len(&self) -> usize {
+        self.lines[self.row].chars().count()
+    }
+
+    fn clamp_col(&mut self) {
+        self.col = self.col.min(self.line_len());
+    }
+
+    fn cursor_byte(&self) -> usize {
+        let line = &self.lines[self.row];
+        line.char_indices()
+            .nth(self.col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len())
+    }
+
+    pub(crate) fn insert_char(&mut self, ch: char) {
+        let at = self.cursor_byte();
+        self.lines[self.row].insert(at, ch);
+        self.col += 1;
+    }
+
+    pub(crate) fn insert_newline(&mut self) {
+        let at = self.cursor_byte();
+        let rest = self.lines[self.row].split_off(at);
+        self.lines.insert(self.row + 1, rest);
+        self.row += 1;
+        self.col = 0;
+    }
+
+    pub(crate) fn backspace(&mut self) {
+        if self.col > 0 {
+            let prev = self.lines[self.row]
+                .char_indices()
+                .nth(self.col - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let at = self.cursor_byte();
+            self.lines[self.row].replace_range(prev..at, "");
+            self.col -= 1;
+        } else if self.row > 0 {
+            let line = self.lines.remove(self.row);
+            self.row -= 1;
+            self.col = self.line_len();
+            self.lines[self.row].push_str(&line);
+        }
+    }
+
+    pub(crate) fn delete(&mut self) {
+        if self.col < self.line_len() {
+            let at = self.cursor_byte();
+            let line = &self.lines[self.row];
+            let next = line[at..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| at + i)
+                .unwrap_or(line.len());
+            self.lines[self.row].replace_range(at..next, "");
+        } else if self.row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.row + 1);
+            self.lines[self.row].push_str(&next);
+        }
+    }
+
+    pub(crate) fn left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.line_len();
+        }
+    }
+
+    pub(crate) fn right(&mut self) {
+        if self.col < self.line_len() {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    pub(crate) fn up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            self.clamp_col();
+        }
+    }
+
+    pub(crate) fn down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.clamp_col();
+        }
+    }
+
+    pub(crate) fn home(&mut self) {
+        self.col = 0;
+    }
+
+    pub(crate) fn end(&mut self) {
+        self.col = self.line_len();
+    }
+
+    /// Delete the word (run of non-spaces, plus any preceding spaces) left of
+    /// the caret within the line; at a line start, joins the line up.
+    pub(crate) fn delete_word(&mut self) {
+        if self.col == 0 {
+            self.backspace();
+            return;
+        }
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let mut start = self.col;
+        while start > 0 && chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        let from_byte = chars[..start].iter().map(|c| c.len_utf8()).sum::<usize>();
+        let at = self.cursor_byte();
+        self.lines[self.row].replace_range(from_byte..at, "");
+        self.col = start;
+    }
+}
+
+/// Display width of the first `cols` chars of a line: wide (CJK/fullwidth/
+/// emoji-range) chars take two cells, everything else one. The usage pane's
+/// rows are ASCII-bound; the editor's caret is what must land right on the
+/// lines that are not.
+fn display_col(line: &str, cols: usize) -> usize {
+    line.chars().take(cols).map(char_display_width).sum()
+}
+
+fn char_display_width(c: char) -> usize {
+    let u = c as u32;
+    if matches!(u,
+        0x1100..=0x115F
+            | 0x2E80..=0x303E
+            | 0x3041..=0x33FF
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xA000..=0xA4CF
+            | 0xAC00..=0xD7A3
+            | 0xF900..=0xFAFF
+            | 0xFE10..=0xFE19
+            | 0xFE30..=0xFE6F
+            | 0xFF00..=0xFF60
+            | 0xFFE0..=0xFFE6
+            | 0x1F300..=0x1F64F
+            | 0x1F900..=0x1F9FF
+            | 0x20000..=0x3FFFD,
+    ) {
+        2
+    } else {
+        1
+    }
+}
+
+/// The usage tab's note editor state. The account is captured at open, so a
+/// config reload mid-edit can never retarget the draft.
+#[derive(Debug, Clone)]
+pub(crate) struct NoteEditor {
+    pub(crate) profile: crate::profile::ProfileName,
+    pub(crate) buf: NoteBuffer,
+}
+
 // ── Modals ────────────────────────────────────────────────────────────────────
 
 /// One interactive line in the Fallback tab's detail pane for a chain member.
@@ -199,6 +411,12 @@ pub(crate) enum FallbackRow {
     /// it. Marking it opts the chain into returning here once it reads clear and
     /// fresh again.
     Preferred,
+    /// The weekdays this member is home (`Profile::preferred_days`): a cycle row
+    /// over `PREFERRED_DAY_PRESETS` at rest, a multi-select chip row once ⏎
+    /// descends into it (`CardEdit::Days`). A list matching no preset trails the
+    /// run in its canonical spelling and is one more stop in the cycle while the
+    /// card stays open (`App::fallback_day_stop`).
+    PreferredDays,
     /// Dollar ceiling on what the chain may spend of this member's
     /// pay-as-you-go budget unattended (`Profile::max_auto_spend`, $0 default).
     /// Inert unless `AppState::spend_budget_switching` is also on — see
@@ -218,12 +436,6 @@ pub(crate) enum ConfigRow {
     /// OAuth-only auto-start toggle. `config_rows` renders it in the second
     /// slot (right below `Name`); declared here so the enum tracks that order.
     AutoStart,
-    /// `Profile::preferred_days` as a typed list (`sat, sun`). Sits with
-    /// `AutoStart` because both change how the chain treats this account,
-    /// rather than what it talks to. ⏎ opens an inline editor;
-    /// `profile::parse_day_list` reads what is typed, and the commit reseeds
-    /// the buffer from the canonical spelling.
-    PreferredDays,
     BaseUrl,
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
@@ -242,9 +454,9 @@ pub(crate) enum ConfigRow {
     /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/fable/subagent inline.
     ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
-    /// snapshot. ⏎ edits its VALUE. There is no removal action: an emptied value
-    /// saves as an empty string, so the key stays in `settings.json` until the
-    /// account's `config.toml` is edited by hand.
+    /// snapshot. ⏎ edits its VALUE. An emptied value REMOVES the key — the
+    /// unset, never a blank string — so the entry drops from `settings.json`
+    /// on the next settings apply (`commit_env_value`).
     EnvEntry(usize),
     /// The `+ add env` row — ⏎ opens a key editor that runs the collision check.
     EnvAdd,
@@ -288,7 +500,6 @@ impl ConfigRow {
         matches!(
             self,
             ConfigRow::Name
-                | ConfigRow::PreferredDays
                 | ConfigRow::BaseUrl
                 | ConfigRow::ApiKey
                 | ConfigRow::OpusModel
@@ -308,6 +519,54 @@ pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opuspla
 /// control AND `step_weekly_threshold`'s cycle. 100 reproduces the old
 /// hard-cap behavior (switch only once the API already refuses).
 pub(crate) const WEEKLY_PRESETS: [f64; 4] = [90.0, 95.0, 98.0, 100.0];
+
+/// `Weekday::Mon..=Sun`: the order the day picker lays out its chips and
+/// writes a toggled list in.
+pub(crate) const WEEKDAYS_ALL: [Weekday; 7] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+    Weekday::Sat,
+    Weekday::Sun,
+];
+
+const DAYS_WEEKDAYS: [Weekday; 5] = [
+    Weekday::Mon,
+    Weekday::Tue,
+    Weekday::Wed,
+    Weekday::Thu,
+    Weekday::Fri,
+];
+const DAYS_WEEKENDS: [Weekday; 2] = [Weekday::Sat, Weekday::Sun];
+
+/// The `preferred days` preset ladder: one source for the row's display AND
+/// `step_preferred_days`' cycle, in cycle order. Space walks it forward and
+/// wraps past the last rung onto the card's remembered custom list, else back
+/// to `never`; a set matching no rung steps to `never`.
+pub(crate) const PREFERRED_DAY_PRESETS: [(&str, &[Weekday]); 4] = [
+    ("never", &[]),
+    ("weekdays", &DAYS_WEEKDAYS),
+    ("weekends", &DAYS_WEEKENDS),
+    ("every day", &WEEKDAYS_ALL),
+];
+
+/// The preset rung a day set matches, or `None` for a custom set. Order-blind:
+/// `["sun", "sat"]` is the `weekends` rung whatever the file wrote.
+pub(crate) fn preferred_days_preset(days: &[Weekday]) -> Option<usize> {
+    PREFERRED_DAY_PRESETS.iter().position(|(_, preset)| {
+        preset.len() == days.len() && days.iter().all(|d| preset.contains(d))
+    })
+}
+
+/// The preset rung's days at `index`, or the empty set — the `never` value.
+pub(crate) fn preferred_days_at(index: usize) -> Vec<Weekday> {
+    PREFERRED_DAY_PRESETS
+        .get(index)
+        .map(|(_, days)| days.to_vec())
+        .unwrap_or_default()
+}
 
 /// Presets for the burn-aware early-switch floor (percent). The projection may
 /// not switch below the chosen value, so wasted headroom is capped at
@@ -335,7 +594,7 @@ pub(crate) enum GlobalConfigRow {
     ClockNotation,
     /// The tab every launch opens on (`AppState.home_tab`): space/⏎
     /// cycles the eight tabs in [`Tab::ALL`] order. The first herdr launch
-    /// overrides it — that one landing opens the Plugin tab with the herdr
+    /// overrides it — that one landing opens the Services tab with the herdr
     /// row's detail descended.
     HomeTab,
     /// Chain-wide "when spent" behavior (`AppState.switch_off_when_spent`) — surfaced here as
@@ -395,6 +654,13 @@ pub(crate) enum GlobalConfigRow {
     /// spent account until its window resets — a fetch-leg optimization only,
     /// never a switch/fallback input. ENUMERATED on/off, ⏎ mirrors space.
     RefreshSpentAccounts,
+    /// Background self-update (`AppState.update.auto_update`) — ON by default.
+    /// The binary updater reads it at next launch, the daemon's herdr leg on
+    /// its next reload, a new MCP server at startup (`check on launch`; no
+    /// live process is cancelled). The row renders the persisted value and
+    /// stays editable even under `CLAUTH_NO_UPDATE=1`, which still disables
+    /// every leg until the env var goes. ENUMERATED on/off, ⏎ mirrors space.
+    AutoUpdate,
     /// Whether the `auto_start` auto-start kick is interleaved across accounts, so
     /// their 5h windows open `5h / N` apart instead of all at once
     /// (`AppState.auto_start_queue`, default OFF — for one account the queue is
@@ -410,9 +676,6 @@ pub(crate) struct ConfigDraft {
     /// commit per-field on ⏎; new drafts buffer until the `create` row fires.
     pub(crate) editing_name: Option<String>,
     pub(crate) name: InputState,
-    /// The day list as typed (`sat, sun`), seeded from and reseeded to
-    /// `profile::render_preferred_days`' canonical spelling.
-    pub(crate) preferred_days: InputState,
     pub(crate) base_url: InputState,
     pub(crate) api_key: InputState,
     pub(crate) model: InputState,
@@ -462,7 +725,6 @@ impl ConfigDraft {
     pub(crate) fn field(&self, row: ConfigRow) -> Option<&InputState> {
         Some(match row {
             ConfigRow::Name => &self.name,
-            ConfigRow::PreferredDays => &self.preferred_days,
             ConfigRow::BaseUrl => &self.base_url,
             ConfigRow::ApiKey => &self.api_key,
             ConfigRow::Model => &self.model,
@@ -490,7 +752,6 @@ impl ConfigDraft {
     pub(crate) fn field_mut(&mut self, row: ConfigRow) -> Option<&mut InputState> {
         Some(match row {
             ConfigRow::Name => &mut self.name,
-            ConfigRow::PreferredDays => &mut self.preferred_days,
             ConfigRow::BaseUrl => &mut self.base_url,
             ConfigRow::ApiKey => &mut self.api_key,
             ConfigRow::Model => &mut self.model,
@@ -561,13 +822,9 @@ pub(crate) enum ConfirmAction {
     /// Disable one account (action-menu "disable account" off the Setup pane,
     /// standing in for the row's arm-then-confirm).
     DisableOne(String),
-    /// Plugin tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
+    /// Services tab: write the `mcpServers.clauth` entry into `~/.claude.json`.
     /// Reversible local write — non-destructive, so it keeps the plain button.
     WireMcpServers,
-    /// Plugin tab: relink `~/.claude/.credentials.json` to the active profile's
-    /// own stored credentials (repair a `missing` link). Spends no token — it only
-    /// re-points at creds the profile already holds — so it keeps the plain button.
-    RelinkCredentials(String),
     /// Setup tab: drop a profile's stored OAuth credentials, keeping the shell.
     BlankCredentials(String),
     /// Setup `+ new` draft: a login already stashed a mint (the `✓ logged in`
@@ -599,13 +856,13 @@ pub(crate) enum ConfirmAction {
     /// its login in a Keychain entry clauth cannot write). Confirming just
     /// dismisses; `run_confirm_action` does nothing.
     Acknowledge,
-    /// Plugin tab: run `crate::herdr::heal` on the named config file.
+    /// Services tab: run `crate::herdr::heal` on the named config file.
     HealHerdrConfig(std::path::PathBuf),
-    /// Plugin tab herdr options: flip the `delegate row text` knob, persist it,
+    /// Services tab herdr options: flip the `delegate row text` knob, persist it,
     /// then heal herdr's config so the sidebar row matches the new knob. The
     /// heal is what the confirm gates — it rewrites herdr's own file.
     HerdrDelegateRowText(std::path::PathBuf),
-    /// Plugin tab: install the clauth plugin through agentgear at user scope.
+    /// Services tab: install the clauth plugin through agentgear at user scope.
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
     InstallPlugin,
@@ -705,7 +962,7 @@ pub(crate) struct DivergenceNotice {
 impl DivergenceNotice {
     /// Banner copy for the one system banner: names the live login's owner when
     /// known, else the generic mismatch, ending in the `d` affordance. Lowercase
-    /// fragments, mid-dot separators (cloudy-tui banner copy).
+    /// fragments, mid-dot separators.
     pub(crate) fn banner_message(&self) -> String {
         match &self.sibling {
             Some(owner) => format!(
@@ -822,6 +1079,10 @@ pub(crate) enum ActionMenuAction {
     /// minted. Offered only for a recognised third-party endpoint, since that
     /// is the only case clauth knows a page for.
     OpenProviderConsole,
+    /// `clauth daemon`, detached from the TUI, offered while none runs.
+    StartDaemon,
+    /// `--replace`'s termination with no successor, offered while one runs.
+    StopDaemon,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -848,6 +1109,13 @@ pub(crate) enum ActionMenuAction {
     TokensShowOthers,
     ToggleCountCache,
     ReloadTokenStats,
+}
+
+/// What a `start daemon` / `stop daemon` worker reports, once.
+#[derive(Debug)]
+pub(crate) enum DaemonControlResult {
+    Start(std::result::Result<crate::daemon::StartOutcome, String>),
+    Stop(std::result::Result<crate::daemon::DaemonStop, String>),
 }
 
 /// State for the action-menu modal.
@@ -952,6 +1220,8 @@ impl ActionMenuAction {
             Self::DisableProfile => "disable account",
             Self::EnableProfile => "enable account",
             Self::OpenProviderConsole => "open provider console",
+            Self::StartDaemon => "start daemon",
+            Self::StopDaemon => "stop daemon",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -1061,8 +1331,8 @@ pub(crate) enum Tab {
     Config,
     /// Claude service status feed (incidents from status.claude.com).
     Status,
-    /// Claude Code integration health: MCP wiring, plugin install, per-profile runtime.
-    Plugin,
+    /// Services: the shunt gateway, delegates, the Claude Code plugin and herdr.
+    Services,
 }
 
 impl Tab {
@@ -1074,7 +1344,7 @@ impl Tab {
         Tab::Fallback,
         Tab::Config,
         Tab::Status,
-        Tab::Plugin,
+        Tab::Services,
     ];
 
     pub(crate) fn title(self) -> &'static str {
@@ -1086,7 +1356,7 @@ impl Tab {
             Tab::Fallback => "Fallback",
             Tab::Config => "Config",
             Tab::Status => "Status",
-            Tab::Plugin => "Plugin",
+            Tab::Services => "Services",
         }
     }
 
@@ -1113,7 +1383,7 @@ impl From<Tab> for HomeTab {
             Tab::Fallback => HomeTab::Fallback,
             Tab::Config => HomeTab::Config,
             Tab::Status => HomeTab::Status,
-            Tab::Plugin => HomeTab::Plugin,
+            Tab::Services => HomeTab::Services,
         }
     }
 }
@@ -1128,7 +1398,7 @@ impl From<HomeTab> for Tab {
             HomeTab::Fallback => Tab::Fallback,
             HomeTab::Config => Tab::Config,
             HomeTab::Status => Tab::Status,
-            HomeTab::Plugin => Tab::Plugin,
+            HomeTab::Services => Tab::Services,
         }
     }
 }
@@ -1323,19 +1593,20 @@ pub(crate) fn incident_is_active(incident: &Incident) -> bool {
     incident.is_active()
 }
 
-// ── Plugin tab ─────────────────────────────────────────────────────────────────
+// ── Services tab ───────────────────────────────────────────────────────────────
 
-/// Which Plugin pane has focus. `List`: the checks + profiles selector (↑↓ moves,
-/// ⏎ descends, `f` fixes). `Detail`: the selected row's readout (↑↓ scrolls).
+/// Which Services pane has focus. `List`: the row selector (↑↓ moves, ⏎
+/// descends, `f` fixes). `Detail`: the selected row's readout (↑↓ scrolls, or
+/// walks the plugin problems / herdr options).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PluginFocus {
+pub(crate) enum ServicesFocus {
     List,
     Detail,
 }
 
 /// Health bucket for a row's status dot — the same success / warning / danger
 /// buckets as the header `● status.claude.ai` dot, plus a neutral `Idle` for a
-/// profile that is neither linked nor running a live session.
+/// row that is neither running nor healthy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Health {
     Ok,
@@ -1344,42 +1615,138 @@ pub(crate) enum Health {
     Idle,
 }
 
-/// A one-key fix offered on the selected row. `WireMcpServers` writes the manual
-/// entry (a [`ConfirmAction`]); `RepairDivergence` re-raises the existing
-/// divergence resolver for the named (active) profile.
+/// A one-key fix offered on a service row. `WireMcpServers` writes the manual
+/// entry (a [`ConfirmAction`]); the verb `f` renders in the footer and under the
+/// problem it fixes is [`fix_verb`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PluginFix {
+pub(crate) enum ServiceFix {
     WireMcpServers,
-    RepairDivergence(String),
-    /// Relink a `missing` active-profile credential link to its own stored creds.
-    RelinkCredentials(String),
     /// Append the keybinding + sidebar row to herdr's config (the config half of
     /// `clauth herdr install`). `PathBuf` = the resolved config file.
     HealHerdrConfig(std::path::PathBuf),
     /// Install the clauth plugin through agentgear (user scope, embedded tree).
-    /// Replaces the copy-paste `/plugin` hint the row used to show.
     InstallPlugin,
 }
 
-/// A computed integration-check row (global, profile-independent).
+/// One focusable fix problem inside a service row's detail. When the detail pane
+/// is descended, ↑↓ walks these problems and `f` applies the focused one; the
+/// footer's `f <verb>` and the dim `f  <verb>` detail line follow the focus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Problem {
+    /// The detail-line index of this problem's `f  <verb>` line.
+    pub(crate) line: usize,
+    pub(crate) fix: ServiceFix,
+}
+
+/// A computed service row. `fix` is the list-focus `f` (the first fixable
+/// problem); `problems` is the detail-pane focus walk (empty on rows whose
+/// detail has no per-problem focus).
 #[derive(Debug, Clone)]
 pub(crate) struct Check {
     pub(crate) label: &'static str,
     pub(crate) health: Health,
-    /// Full readout for the detail pane, one entry per line. (Checks are
+    /// Full readout for the detail pane, one entry per line. (Rows are
     /// dot-only in the list — the dot color carries the verdict, the readout
     /// lives here — so there is no separate terse value.)
     pub(crate) detail: Vec<String>,
-    pub(crate) fix: Option<PluginFix>,
+    pub(crate) fix: Option<ServiceFix>,
+    pub(crate) problems: Vec<Problem>,
 }
 
-/// UI-thread-only state for the Plugin tab. Recomputed synchronously on tab focus
-/// and on `r`; there is no background thread (all reads are local FS/`PATH`;
-/// `claude --version` is one cached subprocess gated by [`PluginState::cc_version`]).
+/// The one verb per fix, used identically in the detail's dim `f  <verb>` line
+/// and the footer's `f <verb>` hint. One verb per fix, never the bracketed
+/// `[f] repair credentials` anti-pattern.
+pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
+    match fix {
+        ServiceFix::WireMcpServers => "wire mcp server",
+        ServiceFix::InstallPlugin => "install plugin",
+        ServiceFix::HealHerdrConfig(_) => "heal herdr config",
+    }
+}
+
+/// The `f  <verb>` detail line for a fix.
+pub(crate) fn fix_line(fix: &ServiceFix) -> String {
+    format!("f  {}", fix_verb(fix))
+}
+
+/// One Services probe that must never hold a frame: at most one run in
+/// flight, its result landing through [`Self::drain`] on the tick.
 #[derive(Debug)]
-pub(crate) struct PluginState {
-    pub(crate) focus: PluginFocus,
-    /// Cursor over the integration checks (`0..checks.len()`).
+pub(crate) struct ProbeWorker<T> {
+    /// What the worker runs, or `None` under test, so no test spawns the real
+    /// probe unless it opts in with a stub (the `App::clipboard` seam's shape).
+    pub(crate) prober: Option<fn() -> T>,
+    /// A run is in flight; a second never starts beside it.
+    pub(crate) running: bool,
+    /// A re-probe asked for while a run was in flight: one follow-up run
+    /// starts when that run's result drains, since the in-flight run may
+    /// predate the change the re-probe was asked to see.
+    rerun: bool,
+    pub(crate) tx: std::sync::mpsc::Sender<T>,
+    rx: std::sync::mpsc::Receiver<T>,
+}
+
+impl<T: Default + Send + 'static> ProbeWorker<T> {
+    fn new(prober: fn() -> T) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            prober: (!cfg!(test)).then_some(prober),
+            running: false,
+            rerun: false,
+            tx,
+            rx,
+        }
+    }
+
+    /// Start a run, or queue one follow-up behind the run in flight: the
+    /// explicit re-probe (`r`), whose result must postdate the call.
+    fn restart(&mut self) {
+        if self.running && self.prober.is_some() {
+            self.rerun = true;
+        } else {
+            self.start();
+        }
+    }
+
+    /// Start a run unless one is in flight. A prober that panics lands as
+    /// `T::default()`, so `running` never sticks.
+    fn start(&mut self) {
+        let Some(prober) = self.prober else {
+            return;
+        };
+        if self.running {
+            return;
+        }
+        self.running = true;
+        let tx = self.tx.clone();
+        spawn_worker(move || {
+            let _ = tx.send(catch_unwind(prober).unwrap_or_default());
+        });
+    }
+
+    /// The newest result that landed since the last drain, if any. A landing
+    /// starts the follow-up run a [`Self::restart`] queued.
+    fn drain(&mut self) -> Option<T> {
+        let mut landed = None;
+        while let Ok(result) = self.rx.try_recv() {
+            landed = Some(result);
+            self.running = false;
+        }
+        if landed.is_some() && std::mem::take(&mut self.rerun) {
+            self.start();
+        }
+        landed
+    }
+}
+
+/// UI-thread-only state for the Services tab. Recomputed synchronously on tab
+/// focus and on `r` (the reads are local FS/`PATH`; `claude --version` is one
+/// cached subprocess gated by [`ServicesState::cc_version`]); the herdr and
+/// standalone-shunt probes run on workers ([`ProbeWorker`]).
+#[derive(Debug)]
+pub(crate) struct ServicesState {
+    pub(crate) focus: ServicesFocus,
+    /// Cursor over the service rows (`0..checks.len()`).
     pub(crate) cursor: usize,
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
@@ -1400,13 +1767,25 @@ pub(crate) struct PluginState {
     /// switch or the per-tick refresh.
     pub(crate) mcp_boot: Option<crate::plugin_probe::McpProbe>,
     /// Cached herdr probe: `None` = unprobed, `Some(None)` = herdr does not
-    /// resolve (no row), `Some(Some(p))` = the probe. Probed at construction in
-    /// herdr mode (`HERDR_ENV=1` proves herdr is present) and re-probed on `r`;
-    /// it spawns three subprocesses, so a tab switch and the per-tick refresh
-    /// reuse the cached value.
+    /// resolve (no row), `Some(Some(p))` = the probe. The first recompute
+    /// (entering the tab, or construction on the first herdr landing) starts
+    /// it on a worker, since it spawns three subprocesses, and every `r`
+    /// starts it or queues one follow-up behind the run in flight;
+    /// the result lands through `drain_service_probes`, and until then the cached
+    /// value renders. A tab switch and the per-tick refresh reuse it.
     pub(crate) herdr: Option<Option<crate::herdr::HerdrProbe>>,
+    /// The worker running [`crate::herdr::probe`].
+    pub(crate) herdr_probe: ProbeWorker<Option<crate::herdr::HerdrProbe>>,
+    /// Cached standalone-shunt readout, for the `shunt` row while no gateway
+    /// is adopted: `None` = unprobed. Probed on a worker (config discovery plus
+    /// one `/health` round trip) the first time the row reads `absent`; every
+    /// `r` starts it or queues one follow-up behind the run in flight; a tab
+    /// switch and the per-tick refresh reuse it.
+    pub(crate) standalone: Option<StandaloneShunt>,
+    /// The worker running [`standalone_probe`].
+    pub(crate) standalone_probe: ProbeWorker<StandaloneShunt>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
-    /// delegates pane draws. Re-read on the same cadence as the checks, because
+    /// delegates detail draws. Re-read on the same cadence as the checks, because
     /// the server writing it is a DIFFERENT process, so there is nothing to
     /// subscribe to and no event to wait for. Read-only: the TUI never writes
     /// this store, and never sweeps it.
@@ -1425,6 +1804,10 @@ pub(crate) struct PluginState {
     /// who re-derives it and misses by half. What binds is the order: single-
     /// digit ms in release, roughly ten times that in debug.
     pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
+    /// Cursor over the plugin detail's fixable problems ([`Check::problems`]).
+    /// While the plugin detail is descended, ↑↓ walks these instead of
+    /// scrolling the prose; `f` applies the focused one.
+    pub(crate) problem_cursor: usize,
     /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
     /// herdr detail is the one detail pane that takes per-row focus: while it
     /// is descended, ↑↓ walks these rows instead of scrolling the prose.
@@ -1438,19 +1821,17 @@ pub(crate) struct PluginState {
     /// config path. The options section reads it to decide whether the
     /// `delegate row text` row can write.
     pub(crate) herdr_config: Option<crate::herdr::ConfigStatus>,
+    /// A pending first-herdr-launch landing: the cursor lands on the `herdr` row
+    /// in the recompute that adopts its probe, or never. Cleared there, or
+    /// earlier when a modal opens, the tab changes, or the user moves the
+    /// cursor, descends or fixes.
+    pub(crate) land_on_herdr: bool,
 }
 
-/// Selector index the `herdr` check occupies once it renders: `about`,
-/// `mcp servers`, `plugin`, `herdr`, `runtime`. The landing row in herdr mode;
-/// when the construction probe does not resolve herdr, the same index rests
-/// on `runtime`, the last row — the cursor clamp in
-/// `recompute_plugin_checks` keeps it valid either way.
-const HERDR_SELECTOR_ROW: usize = 3;
-
-impl Default for PluginState {
+impl Default for ServicesState {
     fn default() -> Self {
         Self {
-            focus: PluginFocus::List,
+            focus: ServicesFocus::List,
             cursor: 0,
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
@@ -1460,16 +1841,21 @@ impl Default for PluginState {
             cc_version: None,
             mcp_boot: None,
             herdr: None,
+            herdr_probe: ProbeWorker::new(crate::herdr::probe),
+            standalone: None,
+            standalone_probe: ProbeWorker::new(standalone_probe),
             delegates: Vec::new(),
+            problem_cursor: 0,
             herdr_options_cursor: 0,
             herdr_tag_draft: None,
             herdr_config: None,
+            land_on_herdr: false,
         }
     }
 }
 
-impl PluginState {
-    /// Total selectable rows (the integration checks).
+impl ServicesState {
+    /// Total selectable rows (the service rows).
     pub(crate) fn row_count(&self) -> usize {
         self.checks.len()
     }
@@ -1480,8 +1866,25 @@ impl PluginState {
     }
 
     /// The fix offered by the row under the cursor, if any.
-    pub(crate) fn selected_fix(&self) -> Option<&PluginFix> {
+    pub(crate) fn selected_fix(&self) -> Option<&ServiceFix> {
         self.selected_check().and_then(|check| check.fix.as_ref())
+    }
+
+    /// The fix `f` applies this frame: the list-focus fix, or — on the plugin
+    /// detail, whose problems walk — the focused problem's fix. The footer's
+    /// `f <verb>` and the dim `f  <verb>` detail line follow this.
+    pub(crate) fn focused_fix(&self) -> Option<&ServiceFix> {
+        match self.focus {
+            ServicesFocus::List => self.selected_fix(),
+            ServicesFocus::Detail => {
+                let check = self.selected_check()?;
+                if check.label == "plugin" {
+                    check.problems.get(self.problem_cursor).map(|p| &p.fix)
+                } else {
+                    self.selected_fix()
+                }
+            }
+        }
     }
 }
 
@@ -1590,13 +1993,13 @@ impl HarnessFilter {
     pub(crate) fn shows_codex(self) -> bool {
         !matches!(self, HarnessFilter::Claude)
     }
-    /// Header chip text; `None` while both harnesses show, so the default view
-    /// carries no badge at all.
-    pub(crate) fn chip(self) -> Option<&'static str> {
+    /// Harness name for the accounts panel's left meta slot; `None` while both
+    /// harnesses show, so the unfiltered panel renders no left slot.
+    pub(crate) fn label_name(self) -> Option<&'static str> {
         match self {
             HarnessFilter::All => None,
-            HarnessFilter::Claude => Some("claude only"),
-            HarnessFilter::Codex => Some("codex only"),
+            HarnessFilter::Claude => Some("claude"),
+            HarnessFilter::Codex => Some("codex"),
         }
     }
 }
@@ -1615,6 +2018,9 @@ pub(crate) struct CodexRow {
     pub(crate) plan: Option<String>,
     pub(crate) five_hour: Option<crate::usage::UsageWindow>,
     pub(crate) seven_day: Option<crate::usage::UsageWindow>,
+    /// Banked usage-limit resets off the same cache, floored at one
+    /// available: `None` (or zero) renders no chip on the row.
+    pub(crate) resets: Option<i64>,
 }
 
 /// Read the codex roster into the [`App::codex_rows`] snapshot. Lock-free: the
@@ -1648,6 +2054,10 @@ pub(crate) fn codex_rows() -> Vec<CodexRow> {
                 ),
                 five_hour: cached.as_ref().and_then(|u| u.five_hour.clone()),
                 seven_day: cached.as_ref().and_then(|u| u.seven_day.clone()),
+                resets: cached
+                    .as_ref()
+                    .and_then(|u| u.codex_reset_credits)
+                    .filter(|count| *count > 0),
             }
         })
         .collect()
@@ -1793,9 +2203,19 @@ pub(crate) struct App {
     pub(crate) third_party_tokens: ThirdPartyList,
     pub(crate) third_party_usage_store: ThirdPartyUsageStore,
     pub(crate) third_party_status: ThirdPartyStatusStore,
+    pub(crate) third_party_streaks: ThirdPartyStreaks,
+    pub(crate) third_party_broken: ThirdPartyBroken,
+    /// Per-name stat of the durable key-rejection record the last time
+    /// [`sync_broken_verdicts`] checked it (`None` = the record was absent).
+    /// The stat is the read gate: a per-second stat per profile is cheap, a
+    /// per-second read of every record is not.
+    pub(crate) broken_verdict_mtimes: HashMap<String, Option<std::time::SystemTime>>,
+    /// [`sync_broken_verdicts`]'s once-per-second gate (`None` = run on the
+    /// first tick).
+    pub(crate) last_broken_verdict_sync: Option<Instant>,
     pub(crate) tab: Tab,
     /// Running inside a herdr pane (`HERDR_ENV=1` at `cmd_tui`): the header
-    /// carries a `[ herdr ]` tag and the TUI lands on the Plugin tab's herdr
+    /// carries a `[ herdr ]` tag and the TUI lands on the Services tab's herdr
     /// row. Read-only after construction — the mode is decided once at launch.
     pub(crate) herdr_mode: bool,
     pub(crate) modals: Vec<Modal>,
@@ -1824,18 +2244,13 @@ pub(crate) struct App {
     pub(crate) fallback_focus: FallbackFocus,
     /// Cursor into the Fallback right pane (member rows or add-candidate list).
     pub(crate) fallback_detail_cursor: usize,
-    /// First ⏎ on remove arms it; second confirms. Cursor move or focus change disarms.
-    pub(crate) fallback_armed_remove: bool,
-    /// `Some` while the threshold field is open (⏎ opens, owns keyboard).
-    /// `+`/`-` still step the value when `None`.
-    pub(crate) fallback_threshold_draft: Option<InputState>,
-    /// In-flight value for the member's `max auto-spend` field (`None` = not
-    /// editing). Same lifecycle as `fallback_threshold_draft`.
-    pub(crate) fallback_max_spend_draft: Option<InputState>,
-    /// The `weekly at` override editor's buffer, or None (not editing). Same
-    /// lifecycle as `fallback_threshold_draft`; an EMPTY commit clears the
-    /// member's override.
-    pub(crate) fallback_weekly_draft: Option<InputState>,
+    /// The member card's one open edit, pinned to the member it opened on, or
+    /// `None` at rest.
+    pub(crate) fallback_edit: Option<MemberEdit<CardEdit>>,
+    /// The custom day list `space` last stepped past on the open card, kept as
+    /// one more stop in the preset cycle until the card closes. UI state only:
+    /// never saved, dropped with the card.
+    pub(crate) fallback_day_stop: Option<MemberEdit<Vec<Weekday>>>,
     /// Cursor into [`GLOBAL_CONFIG_ROWS`] on the program-wide Config tab.
     pub(crate) global_config_cursor: usize,
     /// `Some` while the refresh-interval custom-value field is open (⏎ opens,
@@ -1847,6 +2262,12 @@ pub(crate) struct App {
     /// In-flight custom value for the Config tab's weekly-threshold editor
     /// (`None` = not editing). Same lifecycle as `refresh_interval_draft`.
     pub(crate) weekly_threshold_draft: Option<InputState>,
+    /// The selected account's note (the usage tab's `notes:` row). Loaded on
+    /// cursor moves, tab switches with a clamped cursor, and saves — never per
+    /// frame.
+    pub(crate) note_text: Option<String>,
+    /// The open note editor, while `n` has one open on the usage tab.
+    pub(crate) note_editor: Option<NoteEditor>,
 
     pub(crate) toasts: VecDeque<Toast>,
     /// Whether the terminal is currently too short for the normal layout (< 14 rows).
@@ -1881,7 +2302,7 @@ pub(crate) struct App {
     /// Manual-refresh signal to the status thread; a `()` triggers a refetch.
     pub(crate) status_refresh: std::sync::mpsc::Sender<()>,
 
-    /// `● daemon` header-dot state: daemon presence + `status.json` health,
+    /// `[ daemon ]` header-chip state: daemon presence + `status.json` health,
     /// re-probed on a throttled cadence in `on_tick`. UI-thread-only.
     pub(crate) daemon_health: crate::daemon::DaemonHealth,
     /// Throttle for the `daemon_health` flock probe; construct probes once
@@ -1889,12 +2310,19 @@ pub(crate) struct App {
     /// instead would render `Absent` — "no daemon runs" — as fact for the whole
     /// first interval, and the first paint happens before any `on_tick`.
     pub(crate) last_daemon_probe: Instant,
+    /// A `start daemon` / `stop daemon` worker is running; the action menu
+    /// offers neither verb until its outcome lands. UI-thread-only.
+    pub(crate) daemon_control_busy: bool,
+    /// Those workers' outcomes; drained in `on_tick`.
+    pub(crate) daemon_control_rx: std::sync::mpsc::Receiver<DaemonControlResult>,
+    /// Sender side; cloned into each worker.
+    pub(crate) daemon_control_tx: std::sync::mpsc::Sender<DaemonControlResult>,
     /// Single-fetcher lease (#27), shared with the scheduler tick. The bootstrap
     /// switch one-shot runs only if THIS instance holds it.
     pub(crate) fetch_lease: Arc<crate::daemon::FetchLease>,
 
-    /// Plugin tab state; UI-thread-only, recomputed on focus + `r` (no thread).
-    pub(crate) plugin: PluginState,
+    /// Services tab state; UI-thread-only, recomputed on focus + `r` (no thread).
+    pub(crate) services: ServicesState,
 
     /// Global token-usage stats read from `~/.claude` (stats-cache + recent
     /// transcript top-up); `None` until the loader posts its first result.
@@ -1982,9 +2410,10 @@ pub(crate) struct App {
     /// reconcile; <kbd>d</kbd> opens the resolver from it. In-memory only — a
     /// restart re-evaluates.
     pub(crate) divergence_pending: Option<DivergenceNotice>,
-    /// Throttle for the Plugin tab's per-tick live refresh (session counts + link
-    /// state); recompute fires at most once per `PLUGIN_REFRESH_INTERVAL`.
-    pub(crate) last_plugin_refresh: Instant,
+    /// Throttle for the Services tab's per-tick live refresh (job store +
+    /// wiring + herdr config); recompute fires at most once per
+    /// `SERVICES_REFRESH_INTERVAL`.
+    pub(crate) last_services_refresh: Instant,
     /// Set once reconcile reports back; gates bootstrap spawn.
     pub(crate) reconcile_done: bool,
     /// Set once `spawn_bootstrap` is dispatched; prevents double-dispatch.
@@ -2030,10 +2459,10 @@ pub(crate) struct App {
     /// ticking past expiry never needs a re-read — only an add / delete /
     /// re-mint does, which `reload_fingerprint` now catches.
     pub(crate) session_tokens: HashMap<String, crate::claude::SessionTokenStatus>,
-    /// Live `clauth start` sessions per account, for the Overview `active`
-    /// column and the Fallback tab's compact equivalent. Cached because
-    /// collecting it is a readdir plus an `open` + `try_lock` per row per marker
-    /// layout, and both surfaces read it every frame. Refreshed by
+    /// Live sessions per account, for the Overview `live` column, the Fallback
+    /// member card and the header's fleet count. Cached because collecting it
+    /// is a readdir plus an `open` + `try_lock` per row per marker layout, and
+    /// every one of those surfaces reads it every frame. Refreshed by
     /// [`poll_live_sessions`] rather than on a config reload: sessions come and
     /// go without touching config.
     pub(crate) live_sessions: crate::live_sessions::LiveTally,
@@ -2099,6 +2528,8 @@ struct WorkerHandles {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    third_party_streaks: ThirdPartyStreaks,
+    third_party_broken: ThirdPartyBroken,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
     bootstrap_active: Arc<AtomicBool>,
@@ -2127,6 +2558,8 @@ impl WorkerHandles {
             third_party_tokens: Arc::clone(&app.third_party_tokens),
             third_party_usage_store: Arc::clone(&app.third_party_usage_store),
             third_party_status: Arc::clone(&app.third_party_status),
+            third_party_streaks: Arc::clone(&app.third_party_streaks),
+            third_party_broken: Arc::clone(&app.third_party_broken),
             shutting_down: Arc::clone(&app.shutting_down),
             fetch_lease: Arc::clone(&app.fetch_lease),
             bootstrap_active: Arc::clone(&app.bootstrap_active),
@@ -2182,6 +2615,13 @@ impl App {
         let third_party_usage_store: ThirdPartyUsageStore =
             Arc::new(RankedMutex::new(HashMap::new()));
         let third_party_status: ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let third_party_streaks: ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+        let third_party_broken: ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::new()));
+        // Seed the live mirror from the durable verdict so a fingerprint-bound
+        // key rejection survives a restart (see `durable_key_rejected_seed`).
+        if let Ok(mut broken) = third_party_broken.lock() {
+            broken.extend(Self::durable_key_rejected_seed(&config));
+        }
         let refresh_interval = Arc::new(AtomicU64::new(config.state.refresh_interval_ms));
 
         let mut history_cache: HashMap<String, Vec<(u64, UsageInfo)>> = HashMap::new();
@@ -2224,7 +2664,7 @@ impl App {
 
         // Kick the best-effort update check; verdict lands in `update_results`, toasted from `on_tick`.
         let (update_sender, update_results) = std::sync::mpsc::channel::<UpdateEvent>();
-        let update_handle = update::spawn(update_sender);
+        let update_handle = update::spawn(update_sender, config.state.update.auto_update);
 
         // Status feed worker: streams incidents over `status_events`; a `()` on
         // `status_refresh` triggers a manual refetch. The channels are always
@@ -2271,6 +2711,7 @@ impl App {
             crate::pricing::spawn(pricing_sender, pricing_refresh_rx);
         }
 
+        let (daemon_control_tx, daemon_control_rx) = std::sync::mpsc::channel();
         let (login_event_tx, login_event_rx) = std::sync::mpsc::channel();
         let (login_result_tx, login_result_rx) = std::sync::mpsc::channel();
 
@@ -2284,6 +2725,10 @@ impl App {
                 .map(|p| p.name.to_string())
                 .collect::<Vec<_>>(),
         );
+        let initial_note = config
+            .profiles
+            .first()
+            .and_then(|p| crate::profile_notes::load_note(&p.name));
 
         let mut app = Self {
             config: Arc::new(RankedMutex::new(config)),
@@ -2308,6 +2753,10 @@ impl App {
             third_party_tokens,
             third_party_usage_store,
             third_party_status,
+            third_party_streaks,
+            third_party_broken,
+            broken_verdict_mtimes: HashMap::new(),
+            last_broken_verdict_sync: None,
             tab: Tab::Overview,
             harness_filter: HarnessFilter::default(),
             herdr_mode: false,
@@ -2319,14 +2768,14 @@ impl App {
             config_action_cursor: 0,
             fallback_focus: FallbackFocus::Chain,
             fallback_detail_cursor: 0,
-            fallback_armed_remove: false,
-            fallback_threshold_draft: None,
-            fallback_max_spend_draft: None,
-            fallback_weekly_draft: None,
+            fallback_edit: None,
+            fallback_day_stop: None,
             global_config_cursor: 0,
             refresh_interval_draft: None,
             context_nudge_draft: None,
             weekly_threshold_draft: None,
+            note_text: initial_note,
+            note_editor: None,
             config_draft: None,
             chain_cursor: 0,
             toasts: VecDeque::new(),
@@ -2345,8 +2794,11 @@ impl App {
             status_refresh,
             daemon_health: crate::daemon::daemon_health(),
             last_daemon_probe: Instant::now(),
+            daemon_control_busy: false,
+            daemon_control_rx,
+            daemon_control_tx,
             fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
-            plugin: PluginState::default(),
+            services: ServicesState::default(),
             token_stats: None,
             tokens_failed: false,
             tokens_topping_up: false,
@@ -2374,7 +2826,7 @@ impl App {
             banner: None,
             last_divergence_check: Some(Instant::now()),
             divergence_pending: None,
-            last_plugin_refresh: Instant::now(),
+            last_services_refresh: Instant::now(),
             reconcile_done: false,
             bootstrap_started: false,
             refresh_interval,
@@ -2396,36 +2848,64 @@ impl App {
         app
     }
 
-    /// Landing, applied at construction (before the first paint). The FIRST
-    /// herdr launch opens the Plugin tab with the herdr selector row under the
-    /// cursor and its detail pane descended, then marks the landing done in
-    /// `[herdr] first_landing_done` — once, forever. Every other launch — a
-    /// plain TUI, and herdr after the first — opens the top-level `home_tab`
-    /// (default overview); the herdr header tag is unaffected. The first
-    /// landing's probe runs here — `HERDR_ENV=1` proves herdr is present, and
-    /// each of its three subprocesses is bounded at `herdr::PROBE_TIMEOUT`
-    /// (2 s, worst case 6 s total) — so the landing row is real at first paint
-    /// instead of waiting for `r`; later launches skip it like plain ones (the
-    /// probe stays `r`-gated), and the cursor clamp inside the recompute
-    /// below keeps the landing row valid when herdr does not resolve. The
-    /// `claude --version` probe stays `r`-gated: construction must not block
-    /// the first paint on a spawn. Nothing else changes — no key handling, no
-    /// focus stealing after construction.
+    /// The `ThirdPartyBroken` seed read off the durable per-credential verdict:
+    /// one `(name, fingerprint)` per profile whose record matches the
+    /// credential it holds right now (`fallback::third_party_key_rejected` —
+    /// never a lapsed Alibaba console session, which stays usage-only). This
+    /// is what keeps a fingerprint-bound key rejection visible after a TUI
+    /// restart or in a stood-down TUI until a fetch recreates it; the
+    /// intersection in [`App::key_rejected_names`] still drops the name the
+    /// moment the credential changes.
+    fn durable_key_rejected_seed(config: &AppConfig) -> HashMap<String, u64> {
+        config
+            .profiles
+            .iter()
+            .filter(|p| crate::fallback::third_party_key_rejected(p, &p.name))
+            .filter_map(|p| {
+                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.name.to_string(), fp))
+            })
+            .collect()
+    }
+
+    /// The live key-rejected member set, read once per render (never per walk
+    /// candidate): the broken fingerprint map intersected with the CURRENT
+    /// config profiles (the same `profile_credential_fingerprint` the scheduler
+    /// scans use), so a repair that landed in the config drops the name the
+    /// moment the render reads it — never gated on the separately refreshed
+    /// `ThirdPartyList`.
+    pub(crate) fn key_rejected_names(&self) -> HashSet<ProfileName> {
+        let broken = self
+            .third_party_broken
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
+        let cfg = self.config();
+        crate::usage::current_key_rejected_names(&broken, &cfg.profiles)
+            .into_iter()
+            .collect()
+    }
+
+    /// Landing, armed at construction. The FIRST herdr launch opens the
+    /// Services tab and, once the herdr probe lands, puts the herdr selector row
+    /// under the cursor with its detail pane descended; construction marks the
+    /// landing done in `[herdr] first_landing_done` — once, forever. Every other
+    /// launch — a plain TUI, and herdr after the first — opens the top-level
+    /// `home_tab` (default overview); the herdr header tag is unaffected. The
+    /// first landing's recompute starts the herdr probe on its worker, so the
+    /// first paint never waits on its three subprocesses; the pending intent
+    /// lands on the herdr row by label in the recompute that adopts the probe,
+    /// or never. The `claude --version` probe stays `r`-gated: construction
+    /// must not block the first paint on a spawn. A modal opening, an ↑↓
+    /// cursor move, ↵, `f` on the list, or a tab switch clears the pending
+    /// intent, so focus is never stolen once the user has acted.
     pub(crate) fn with_herdr_mode(mut self, herdr_mode: bool) -> Self {
         self.herdr_mode = herdr_mode;
         let first_landing = herdr_mode && !self.config().state.herdr.first_landing_done;
         if first_landing {
-            self.tab = Tab::Plugin;
-            self.plugin.cursor = HERDR_SELECTOR_ROW;
-            self.plugin.focus = PluginFocus::Detail;
-            // Skipped under test (a spawned probe would read the real
-            // registry); the landing test injects the probe instead.
-            self.plugin.herdr = Some(if cfg!(test) {
-                None
-            } else {
-                crate::herdr::probe()
-            });
-            recompute_plugin_checks(&mut self, false);
+            self.tab = Tab::Services;
+            // Land on the herdr row by label once its probe resolves.
+            self.services.land_on_herdr = true;
+            recompute_services_checks(&mut self, false);
             {
                 let mut cfg = self.config();
                 cfg.state.herdr.first_landing_done = true;
@@ -2659,9 +3139,10 @@ impl App {
                 // Destination-based, as in the pending-switch drain: landing on
                 // the home account reads as a return whether the return pass or
                 // an exhaustion walk onto a clear preferred put us there.
+                let key_rejected = self.key_rejected_names();
                 let returned = self
                     .config()
-                    .is_home_today(&ProfileName::from(target.clone()));
+                    .is_home_today(&ProfileName::from(target.clone()), &key_rejected);
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
@@ -2706,6 +3187,8 @@ impl App {
             h.third_party_tokens,
             h.third_party_usage_store,
             h.third_party_status,
+            h.third_party_streaks,
+            h.third_party_broken,
             suppressed_auth_expired,
             h.shutting_down,
             // Single-fetcher lease (#27): the TUI competes for `usage-fetch.lock`
@@ -2908,12 +3391,13 @@ impl App {
             // token mutexes — TOKENS/THIRD_PARTY rank OUTSIDE CONFIG, so writing
             // them while config is held inverts the global lock order (same shape
             // as `refresh_tokens`).
-            let (tokens, third_party, names) = {
+            let (tokens, third_party, names, broken_seed) = {
                 let cfg = self.config();
                 let tokens = collect_tokens(&cfg);
                 let third_party = collect_third_party_entries(&cfg.profiles);
                 let names: Vec<String> = cfg.profiles.iter().map(|p| p.name.to_string()).collect();
-                (tokens, third_party, names)
+                let broken_seed = Self::durable_key_rejected_seed(&cfg);
+                (tokens, third_party, names, broken_seed)
             };
             #[expect(clippy::expect_used, reason = "mutex poisoning is unrecoverable")]
             {
@@ -2925,9 +3409,21 @@ impl App {
                     .third_party_tokens
                     .lock()
                     .expect("third_party_tokens mutex poisoned") = third_party;
+                // Union-add the durable seed: it can only ADD names whose record
+                // matches the CURRENT fingerprint, and a re-keyed name still
+                // drops at the intersection in `key_rejected_names`. A recovered
+                // name can flicker back in for at most one sync interval — the
+                // fetcher's error arm updates the live map before it clears the
+                // durable record, so a sync landing in that gap re-reads the
+                // still-standing record — and the next `sync_broken_verdicts`
+                // pass drops it again.
+                if let Ok(mut broken) = self.third_party_broken.lock() {
+                    broken.extend(broken_seed);
+                }
             }
             self.session_tokens = collect_session_tokens(&names);
             self.refresh_unsaved_live_login();
+            repin_member_edit(self);
             true
         } else {
             false
@@ -2998,6 +3494,15 @@ impl App {
         if let Ok(mut q) = self.refetch_queue.lock() {
             q.insert(name.to_string());
         }
+    }
+
+    /// Every modal opens here. Opening one drops a still-pending first herdr
+    /// landing: the landing happens on the tick its probe drains or never, so
+    /// it can neither move the view behind a modal nor after the user's own
+    /// action closed one.
+    pub(crate) fn open_modal(&mut self, modal: Modal) {
+        self.services.land_on_herdr = false;
+        self.modals.push(modal);
     }
 
     pub(crate) fn toast(&mut self, kind: ToastKind, body: impl Into<String>) {
@@ -3082,6 +3587,16 @@ impl App {
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
         self.profile_cursor = self.profile_cursor.min(max);
+        // Every reload path lands here (a roster change can move or remove the
+        // selected account), so the note tracks the selection for free.
+        self.reload_selected_note();
+    }
+
+    /// Re-read the selected account's note from disk.
+    pub(crate) fn reload_selected_note(&mut self) {
+        self.note_text = self
+            .profile_name_at(self.profile_cursor)
+            .and_then(|name| crate::profile_notes::load_note(&name));
     }
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
@@ -3137,7 +3652,7 @@ pub(super) fn reconcile_startup(app: &mut App) {
 // ── Event handling ────────────────────────────────────────────────────────────
 
 /// True while `app.tab`'s descend/ascend sub-focus screen is active (Setup's
-/// Actions pane, Fallback's Detail pane, Status/Plugin's Detail pane, Tokens'
+/// Actions pane, Fallback's Detail pane, Status/Services' Detail pane, Tokens'
 /// Models view) — the state where `q`/`esc` ascend instead of arming quit /
 /// no-op. Single source of truth shared by the `q` handler and the footer's
 /// `q back` / `q quit` label; the help-modal esc-row test iterates it too, so
@@ -3146,8 +3661,88 @@ pub(crate) fn has_sub_focus(app: &App) -> bool {
     (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
         || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
-        || (app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail)
+        || (app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail)
         || (app.tab == Tab::Tokens && app.token_view == TokenView::Models)
+}
+
+/// What owns the keyboard this frame: every key it claims ([`KeyOwner::claims`]),
+/// `←`/`→` included, reaches it before any tab switch or global binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyOwner {
+    /// The modal stack: its top modal takes every key.
+    Modal,
+    /// A Setup detail row's inline field on an existing account.
+    SetupField,
+    /// A Setup detail row's inline field on the `+ new` form, where esc keeps
+    /// the typed value (`cancel_config_edit` only reverts a saved account).
+    NewAccountField,
+    /// A typed field on the Fallback member card: `rotate at`, `weekly at`
+    /// or `max spend`.
+    MemberField,
+    /// The Fallback card's `preferred days` chip picker.
+    DayPicker,
+    /// The Config tab's `refresh` custom-value field.
+    RefreshInterval,
+    /// The Config tab's `context nudge` custom-value field.
+    ContextNudge,
+    /// The Config tab's `weekly limit` custom-value field.
+    WeeklyThreshold,
+    /// The Services tab's herdr tag-refresh field.
+    HerdrTag,
+    /// The usage tab's note editor (the `n`-opened draft on the selected
+    /// account).
+    NoteEditor,
+}
+
+impl KeyOwner {
+    /// Whether this owner takes `code`, or lets it through to the global keys.
+    /// The chip picker binds neither `?` nor `x`, so help and toast dismissal
+    /// work mid-pick; a typed field takes both, since they are data there.
+    pub(crate) fn claims(self, code: KeyCode) -> bool {
+        !(self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')))
+    }
+}
+
+/// What owns the keyboard this frame, or `None` when keys take their tab and
+/// global senses. The one answer both [`handle_key`] routes by and the footer
+/// draws from, so the two cannot disagree about who holds `←`/`→`.
+pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
+    if !app.modals.is_empty() {
+        return Some(KeyOwner::Modal);
+    }
+    match app.tab {
+        Tab::Setup => {
+            let draft = app
+                .config_draft
+                .as_ref()
+                .filter(|d| app.config_focus == ConfigFocus::Actions && d.active.is_some())?;
+            Some(match draft.editing_name {
+                Some(_) => KeyOwner::SetupField,
+                None => KeyOwner::NewAccountField,
+            })
+        }
+        Tab::Fallback if app.fallback_focus == FallbackFocus::Detail => {
+            match app.fallback_edit.as_ref().map(|e| &e.state) {
+                Some(CardEdit::Threshold(_) | CardEdit::Weekly(_) | CardEdit::MaxSpend(_)) => {
+                    Some(KeyOwner::MemberField)
+                }
+                Some(CardEdit::Days(_)) => Some(KeyOwner::DayPicker),
+                Some(CardEdit::ArmedRemove) | None => None,
+            }
+        }
+        Tab::Config if app.refresh_interval_draft.is_some() => Some(KeyOwner::RefreshInterval),
+        Tab::Config if app.context_nudge_draft.is_some() => Some(KeyOwner::ContextNudge),
+        Tab::Config if app.weekly_threshold_draft.is_some() => Some(KeyOwner::WeeklyThreshold),
+        Tab::Services if app.services.herdr_tag_draft.is_some() => Some(KeyOwner::HerdrTag),
+        Tab::Usage if app.note_editor.is_some() => Some(KeyOwner::NoteEditor),
+        Tab::Overview
+        | Tab::Usage
+        | Tab::Tokens
+        | Tab::Fallback
+        | Tab::Config
+        | Tab::Status
+        | Tab::Services => None,
+    }
 }
 
 pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
@@ -3161,73 +3756,21 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    if !app.modals.is_empty() {
-        handle_modal_key(app, key);
-        return;
-    }
-
-    // Config text field capturing keystrokes owns keyboard (like a modal)
-    // so typing into a name can't fire global shortcuts.
-    if app.tab == Tab::Setup
-        && app.config_focus == ConfigFocus::Actions
-        && app
-            .config_draft
-            .as_ref()
-            .is_some_and(|d| d.active.is_some())
-    {
-        handle_config_edit_key(app, key);
-        return;
-    }
-
-    // Same for the threshold editor: owns keyboard so digits can't trip globals.
-    if app.tab == Tab::Fallback
-        && app.fallback_focus == FallbackFocus::Detail
-        && app.fallback_threshold_draft.is_some()
-    {
-        handle_fallback_threshold_edit_key(app, key);
-        return;
-    }
-
-    // Same for the `max auto-spend` editor.
-    if app.tab == Tab::Fallback
-        && app.fallback_focus == FallbackFocus::Detail
-        && app.fallback_max_spend_draft.is_some()
-    {
-        handle_fallback_max_spend_edit_key(app, key);
-        return;
-    }
-
-    // Same for the per-member `weekly at` override editor.
-    if app.tab == Tab::Fallback
-        && app.fallback_focus == FallbackFocus::Detail
-        && app.fallback_weekly_draft.is_some()
-    {
-        handle_fallback_weekly_edit_key(app, key);
-        return;
-    }
-
-    // Same for the Config-tab refresh-interval custom-value editor.
-    if app.tab == Tab::Config && app.refresh_interval_draft.is_some() {
-        handle_refresh_interval_edit_key(app, key);
-        return;
-    }
-
-    // Same for the Config-tab context-nudge custom-value editor.
-    if app.tab == Tab::Config && app.context_nudge_draft.is_some() {
-        handle_context_nudge_edit_key(app, key);
-        return;
-    }
-
-    // And the Config-tab weekly-threshold custom-value editor.
-    if app.tab == Tab::Config && app.weekly_threshold_draft.is_some() {
-        handle_weekly_threshold_edit_key(app, key);
-        return;
-    }
-
-    // And the Plugin-tab herdr tag-refresh editor (same capture shape: typing
-    // owns the keyboard so digits can't trip global shortcuts).
-    if app.tab == Tab::Plugin && app.plugin.herdr_tag_draft.is_some() {
-        handle_herdr_tag_edit_key(app, key);
+    // A modal, then an open editor, owns the keyboard: typed digits and
+    // letters can't trip global shortcuts, and ←/→ never switch the tab. A key
+    // the owner does not claim falls through to the global senses below.
+    if let Some(owner) = keyboard_owner(app).filter(|owner| owner.claims(key.code)) {
+        match owner {
+            KeyOwner::Modal => handle_modal_key(app, key),
+            KeyOwner::SetupField | KeyOwner::NewAccountField => handle_config_edit_key(app, key),
+            KeyOwner::MemberField => handle_member_field_key(app, key),
+            KeyOwner::DayPicker => handle_day_picker_key(app, key),
+            KeyOwner::RefreshInterval => handle_refresh_interval_edit_key(app, key),
+            KeyOwner::ContextNudge => handle_context_nudge_edit_key(app, key),
+            KeyOwner::WeeklyThreshold => handle_weekly_threshold_edit_key(app, key),
+            KeyOwner::HerdrTag => handle_herdr_tag_edit_key(app, key),
+            KeyOwner::NoteEditor => handle_note_editor_key(app, key),
+        }
         return;
     }
 
@@ -3257,7 +3800,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('?') => {
             app.disarm_quit();
             app.help_scroll = 0;
-            app.modals.push(Modal::Help);
+            app.open_modal(Modal::Help);
             return;
         }
         KeyCode::Char('d') => {
@@ -3279,12 +3822,9 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('a') => {
             app.disarm_quit();
-            if app.tab == Tab::Overview && claude_rows_hidden(app) {
-                return;
-            }
             let state = build_action_menu(app);
             if !state.items.is_empty() {
-                app.modals.push(Modal::ActionMenu(state));
+                app.open_modal(Modal::ActionMenu(state));
             }
             return;
         }
@@ -3294,10 +3834,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 trigger_status_refresh(app);
                 return;
             }
-            // Plugin checks re-run synchronously; `r` also re-probes `claude --version`.
-            if app.tab == Tab::Plugin {
-                recompute_plugin_checks(app, true);
-                app.toast(ToastKind::Info, "re-running plugin checks");
+            // Service checks re-run synchronously; `r` also re-probes `claude --version`.
+            if app.tab == Tab::Services {
+                recompute_services_checks(app, true);
+                app.toast(ToastKind::Info, "re-running service checks");
                 return;
             }
             if app.tab == Tab::Tokens {
@@ -3320,7 +3860,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 set_token_period(app, app.token_period.next());
                 return;
             }
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
                 choice: false,
@@ -3330,7 +3870,14 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('n') => {
             app.disarm_quit();
-            start_new_account(app);
+            // The usage tab claims `n` for the account's note editor (footer +
+            // help modal advertise it there); the empty roster keeps the empty
+            // state's `n to create one` promise. Everywhere else: new account.
+            if app.tab == Tab::Usage && app.profile_count() > 0 {
+                open_note_editor(app);
+            } else {
+                start_new_account(app);
+            }
             return;
         }
         // Esc backs out of sub-focus; no-op at the top level.
@@ -3342,8 +3889,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 leave_fallback_detail(app);
             } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
                 app.status.focus = StatusFocus::List;
-            } else if app.tab == Tab::Plugin && app.plugin.focus == PluginFocus::Detail {
-                app.plugin.focus = PluginFocus::List;
+            } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
+                app.services.focus = ServicesFocus::List;
             } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
                 app.token_view = TokenView::Dashboard;
             }
@@ -3361,8 +3908,8 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                     leave_fallback_detail(app);
                 } else if app.tab == Tab::Tokens {
                     app.token_view = TokenView::Dashboard;
-                } else if app.tab == Tab::Plugin {
-                    app.plugin.focus = PluginFocus::List;
+                } else if app.tab == Tab::Services {
+                    app.services.focus = ServicesFocus::List;
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
@@ -3402,7 +3949,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         Tab::Fallback => handle_fallback_key(app, key),
         Tab::Config => handle_global_config_key(app, key),
         Tab::Status => handle_status_key(app, key),
-        Tab::Plugin => handle_plugin_key(app, key),
+        Tab::Services => handle_services_key(app, key),
     }
 }
 
@@ -3516,6 +4063,9 @@ fn switch_tab(app: &mut App, tab: Tab) {
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     app.config_draft = None;
+    // Leaving the Services tab cancels a still-pending herdr landing: the user
+    // has moved on, so a later recompute must not yank the cursor back.
+    app.services.land_on_herdr = false;
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
@@ -3536,10 +4086,7 @@ fn switch_tab(app: &mut App, tab: Tab) {
         Tab::Fallback => {
             app.chain_cursor = chain_cursor_for_profile(app);
             sync_profile_from_chain(app);
-            app.fallback_focus = FallbackFocus::Chain;
-            app.fallback_detail_cursor = 0;
-            app.fallback_armed_remove = false;
-            app.fallback_threshold_draft = None;
+            leave_fallback_detail(app);
         }
         Tab::Config => {
             app.global_config_cursor = 0;
@@ -3551,16 +4098,16 @@ fn switch_tab(app: &mut App, tab: Tab) {
             // Keep the incident cursor; reset focus to the list per the contract.
             app.status.focus = StatusFocus::List;
         }
-        Tab::Plugin => {
-            app.plugin.focus = PluginFocus::List;
-            app.plugin.cursor = 0;
-            app.plugin.detail_scroll = 0;
+        Tab::Services => {
+            app.services.focus = ServicesFocus::List;
+            app.services.cursor = 0;
+            app.services.detail_scroll = 0;
             // Entering the tab clears an open tag editor the same way the
             // Config tab clears its drafts; `switch_tab` matches the
             // destination, so the clear runs on entry, not on exit.
-            app.plugin.herdr_tag_draft = None;
+            app.services.herdr_tag_draft = None;
             // Recompute on focus; the cached `claude --version` is not re-probed.
-            recompute_plugin_checks(app, false);
+            recompute_services_checks(app, false);
         }
     }
 }
@@ -3571,6 +4118,9 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
         return;
     }
     app.profile_cursor = (app.profile_cursor as i32 + delta).rem_euclid(len as i32) as usize;
+    // The note belongs to the selection: the row must never show the previous
+    // account's note under the newly selected header.
+    app.reload_selected_note();
 }
 
 /// True, with a toast saying so, while the Overview's `Codex` filter hides the
@@ -3607,6 +4157,98 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('e') => toggle_show_estimates(app),
         KeyCode::Char('p') => toggle_show_pace(app),
         _ => {}
+    }
+}
+
+/// Open the note editor on the selected account, seeded from disk.
+fn open_note_editor(app: &mut App) {
+    let Some(name) = app.profile_name_at(app.profile_cursor) else {
+        return;
+    };
+    let text = crate::profile_notes::load_note(&name).unwrap_or_default();
+    app.note_editor = Some(NoteEditor {
+        profile: name,
+        buf: NoteBuffer::new(&text),
+    });
+}
+
+/// `⏎` in the note editor: persist the draft (an empty draft clears the note).
+/// A failed save keeps the editor open — the draft is the only copy.
+fn commit_note(app: &mut App) {
+    let Some(editor) = app.note_editor.take() else {
+        return;
+    };
+    let text = editor.buf.text();
+    match crate::profile_notes::save_note(&editor.profile, &text) {
+        Ok(()) => {
+            app.note_text = crate::profile_notes::load_note(&editor.profile);
+            app.toast(ToastKind::Success, "note saved");
+        }
+        Err(e) => {
+            app.note_editor = Some(editor);
+            app.toast(ToastKind::Danger, format!("couldn't save the note: {e}"));
+        }
+    }
+}
+
+/// The note editor's keymap: text edits, ⌃j newline, ⏎ save, esc cancel. Every
+/// printable is data (a note may contain `q`, `?`, `x`), so the owner claims
+/// all keys bar ctrl+c.
+fn handle_note_editor_key(app: &mut App, key: KeyEvent) {
+    enum NoteKey {
+        Commit,
+        Cancel,
+        Char(char),
+        Newline,
+        Word,
+        Backspace,
+        Delete,
+        Left,
+        Right,
+        Up,
+        Down,
+        Home,
+        End,
+    }
+    let action = match key.code {
+        KeyCode::Enter => NoteKey::Commit,
+        KeyCode::Esc => NoteKey::Cancel,
+        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Newline,
+        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => NoteKey::Word,
+        KeyCode::Char(ch) => NoteKey::Char(ch),
+        KeyCode::Backspace => NoteKey::Backspace,
+        KeyCode::Delete => NoteKey::Delete,
+        KeyCode::Left => NoteKey::Left,
+        KeyCode::Right => NoteKey::Right,
+        KeyCode::Up => NoteKey::Up,
+        KeyCode::Down => NoteKey::Down,
+        KeyCode::Home => NoteKey::Home,
+        KeyCode::End => NoteKey::End,
+        _ => return,
+    };
+    match action {
+        NoteKey::Commit => commit_note(app),
+        NoteKey::Cancel => app.note_editor = None,
+        _ => {
+            let Some(editor) = app.note_editor.as_mut() else {
+                return;
+            };
+            let buf = &mut editor.buf;
+            match action {
+                NoteKey::Char(ch) => buf.insert_char(ch),
+                NoteKey::Newline => buf.insert_newline(),
+                NoteKey::Word => buf.delete_word(),
+                NoteKey::Backspace => buf.backspace(),
+                NoteKey::Delete => buf.delete(),
+                NoteKey::Left => buf.left(),
+                NoteKey::Right => buf.right(),
+                NoteKey::Up => buf.up(),
+                NoteKey::Down => buf.down(),
+                NoteKey::Home => buf.home(),
+                NoteKey::End => buf.end(),
+                _ => {}
+            }
+        }
     }
 }
 
@@ -3661,52 +4303,74 @@ fn trigger_status_refresh(app: &mut App) {
     app.toast(ToastKind::Info, "refreshing status");
 }
 
-/// Plugin tab keymap. List focus: ↑↓ moves the cursor (wrapping over both
-/// groups), ⏎ descends to the detail pane, `f` applies the selected row's fix.
-/// Detail focus: the herdr detail walks its focusable options rows, every
-/// other detail scrolls (clamped by the render pass); `f` still fixes.
-fn handle_plugin_key(app: &mut App, key: KeyEvent) {
-    match app.plugin.focus {
-        PluginFocus::List => {
-            let len = app.plugin.row_count();
+/// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
+/// to the detail pane (the `delegates` detail binds no key, so ⏎ does not
+/// descend into it), `f` applies the selected row's fix. Detail focus: the
+/// plugin detail walks its fixable problems, the herdr detail walks its
+/// options rows, every other detail scrolls (clamped by the render pass);
+/// `f` still fixes the focused problem.
+fn handle_services_key(app: &mut App, key: KeyEvent) {
+    match app.services.focus {
+        ServicesFocus::List => {
+            let len = app.services.row_count();
             match key.code {
                 KeyCode::Up if len > 0 => {
-                    app.plugin.cursor = (app.plugin.cursor + len - 1) % len;
-                    app.plugin.detail_scroll = 0;
+                    app.services.cursor = (app.services.cursor + len - 1) % len;
+                    app.services.detail_scroll = 0;
+                    app.services.land_on_herdr = false;
                 }
                 KeyCode::Down if len > 0 => {
-                    app.plugin.cursor = (app.plugin.cursor + 1) % len;
-                    app.plugin.detail_scroll = 0;
+                    app.services.cursor = (app.services.cursor + 1) % len;
+                    app.services.detail_scroll = 0;
+                    app.services.land_on_herdr = false;
                 }
                 KeyCode::Enter if len > 0 => {
-                    app.plugin.focus = PluginFocus::Detail;
-                    app.plugin.detail_scroll = 0;
+                    // The user has acted: any still-pending herdr landing is
+                    // cancelled, whether or not this descends.
+                    app.services.land_on_herdr = false;
+                    // The delegates detail binds no key, so it never takes
+                    // pane focus.
+                    if !app
+                        .services
+                        .selected_check()
+                        .is_some_and(|c| c.label == "delegates")
+                    {
+                        app.services.focus = ServicesFocus::Detail;
+                        app.services.detail_scroll = 0;
+                    }
                 }
-                KeyCode::Char('f') => apply_plugin_fix(app),
+                KeyCode::Char('f') => {
+                    app.services.land_on_herdr = false;
+                    apply_service_fix(app);
+                }
                 _ => {}
             }
         }
-        PluginFocus::Detail => {
-            if app
-                .plugin
-                .selected_check()
-                .is_some_and(|c| c.label == "herdr")
-            {
+        ServicesFocus::Detail => {
+            let label = app.services.selected_check().map(|c| c.label);
+            if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
+            } else if label == Some("plugin")
+                && app
+                    .services
+                    .selected_check()
+                    .is_some_and(|c| !c.problems.is_empty())
+            {
+                handle_plugin_problems_key(app, key);
             } else {
                 match key.code {
                     KeyCode::Up => {
                         // Clamp before stepping — see the Status detail pane's ↑ arm.
-                        let max = app.plugin.detail_max_scroll.get();
-                        app.plugin.detail_scroll =
-                            app.plugin.detail_scroll.min(max).saturating_sub(1);
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll =
+                            app.services.detail_scroll.min(max).saturating_sub(1);
                     }
                     KeyCode::Down => {
-                        let max = app.plugin.detail_max_scroll.get();
-                        app.plugin.detail_scroll =
-                            app.plugin.detail_scroll.saturating_add(1).min(max);
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll =
+                            app.services.detail_scroll.saturating_add(1).min(max);
                     }
-                    KeyCode::Char('f') => apply_plugin_fix(app),
+                    KeyCode::Char('f') => apply_service_fix(app),
                     _ => {}
                 }
             }
@@ -3714,16 +4378,38 @@ fn handle_plugin_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Apply the selected row's fix. `WireMcpServers` opens a confirm modal; a
-/// diverged active profile re-raises the existing 3-way divergence resolver.
-fn apply_plugin_fix(app: &mut App) {
-    let Some(fix) = app.plugin.selected_fix().cloned() else {
+/// The plugin detail's problem walk: ↑↓ moves over the fixable problems
+/// (wrapping), `f` applies the focused one. The render keeps the focused line
+/// on screen; there is no manual scroll offset to maintain here.
+fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
+    let len = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0);
+    match key.code {
+        KeyCode::Up if len > 0 => {
+            app.services.problem_cursor = (app.services.problem_cursor + len - 1) % len;
+        }
+        KeyCode::Down if len > 0 => {
+            app.services.problem_cursor = (app.services.problem_cursor + 1) % len;
+        }
+        KeyCode::Char('f') => apply_service_fix(app),
+        _ => {}
+    }
+}
+
+/// Apply the focused fix. `WireMcpServers` opens a confirm modal; a diverged
+/// active profile's repair lives on the divergence resolver's own `d` prompt,
+/// never on this tab.
+fn apply_service_fix(app: &mut App) {
+    let Some(fix) = app.services.focused_fix().cloned() else {
         return;
     };
     match fix {
-        PluginFix::WireMcpServers => {
+        ServiceFix::WireMcpServers => {
             app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: "wire clauth into claude code's mcpServers?".to_string(),
                 detail: Some(
                     "writes the clauth entry into ~/.claude.json; other fields are preserved."
@@ -3733,24 +4419,9 @@ fn apply_plugin_fix(app: &mut App) {
                 on_confirm: ConfirmAction::WireMcpServers,
             }));
         }
-        PluginFix::RepairDivergence(name) => {
+        ServiceFix::HealHerdrConfig(path) => {
             app.disarm_quit();
-            open_divergence_modal(app, &name);
-        }
-        PluginFix::RelinkCredentials(name) => {
-            app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
-                message: format!("relink ~/.claude credentials to '{name}'?"),
-                detail: Some(
-                    "re-points .credentials.json at the account's own stored tokens; spends nothing.".to_string(),
-                ),
-                choice: false,
-                on_confirm: ConfirmAction::RelinkCredentials(name),
-            }));
-        }
-        PluginFix::HealHerdrConfig(path) => {
-            app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: "add the keybinding and sidebar row to herdr's config?".to_string(),
                 detail: Some(
                     "writes them into herdr's config.toml and validates the result with `herdr config check`.".to_string(),
@@ -3759,9 +4430,9 @@ fn apply_plugin_fix(app: &mut App) {
                 on_confirm: ConfirmAction::HealHerdrConfig(path),
             }));
         }
-        PluginFix::InstallPlugin => {
+        ServiceFix::InstallPlugin => {
             app.disarm_quit();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: "install the clauth plugin into claude code?".to_string(),
                 detail: Some(
                     "runs claude's own plugin installer at user scope; your other plugins and settings are untouched."
@@ -3779,12 +4450,12 @@ fn apply_plugin_fix(app: &mut App) {
 /// still applies the check's fix. Only the herdr detail routes here — every
 /// other detail keeps the scroll-only keymap.
 fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
-    let cursor = app.plugin.herdr_options_cursor;
+    let cursor = app.services.herdr_options_cursor;
     let rows = HERDR_OPTIONS.len();
     match key.code {
-        KeyCode::Up => app.plugin.herdr_options_cursor = (cursor + rows - 1) % rows,
-        KeyCode::Down => app.plugin.herdr_options_cursor = (cursor + 1) % rows,
-        KeyCode::Char('f') => apply_plugin_fix(app),
+        KeyCode::Up => app.services.herdr_options_cursor = (cursor + rows - 1) % rows,
+        KeyCode::Down => app.services.herdr_options_cursor = (cursor + 1) % rows,
+        KeyCode::Char('f') => apply_service_fix(app),
         KeyCode::Enter | KeyCode::Char(' ') => activate_herdr_option(app, HERDR_OPTIONS[cursor]),
         KeyCode::Char('+') => step_herdr_tag_refresh(app, 1),
         KeyCode::Char('-') => step_herdr_tag_refresh(app, -1),
@@ -3824,13 +4495,13 @@ fn activate_herdr_option(app: &mut App, row: HerdrOption) {
 /// no config path) and `parsed == false` both read as not writable. Shared by
 /// the key handler and the render so the inert row and the no-op key agree.
 pub(crate) fn herdr_config_writable(app: &App) -> bool {
-    app.plugin.herdr_config.as_ref().is_some_and(|c| c.parsed)
+    app.services.herdr_config.as_ref().is_some_and(|c| c.parsed)
 }
 
 /// `+`/`-` on the tag-refresh stepper: ±1 second, floored at 1. A no-op on
 /// every other row.
 fn step_herdr_tag_refresh(app: &mut App, delta: i64) {
-    if HERDR_OPTIONS[app.plugin.herdr_options_cursor] != HerdrOption::TagRefresh {
+    if HERDR_OPTIONS[app.services.herdr_options_cursor] != HerdrOption::TagRefresh {
         return;
     }
     {
@@ -3912,9 +4583,9 @@ fn herdr_pane_ids(bin: &str) -> Option<Vec<String>> {
 }
 
 /// Re-run `report-profile.sh` for one pane with the pane id set and the
-/// event/context JSON cleared — the exact `watch-profile.sh` invocation. The
-/// script's pidfile gate skips the watcher spawn while a live watch exists,
-/// so re-running it alongside the live watchers is safe.
+/// event/context JSON cleared, so the script reads the pane's live agent
+/// itself. The script's pidfile gate skips the watcher spawn while a live
+/// watch exists, so re-running it alongside the live watchers is safe.
 fn rerun_pane_report(script: &str, pane: &str) {
     let _ = crate::herdr::bounded_output(
         script,
@@ -3948,16 +4619,16 @@ fn cycle_herdr_popup_width(app: &mut App) {
 /// refresh-interval editor's mechanism.
 fn begin_herdr_tag_edit(app: &mut App) {
     let secs = app.config().state.herdr.tag_watch_secs;
-    app.plugin.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
+    app.services.herdr_tag_draft = Some(InputState::new(&secs.to_string()));
 }
 
 /// Keystrokes while the herdr tag-refresh editor is open: ⏎ saves, ⎋ discards.
 fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.plugin.herdr_tag_draft = None,
+        KeyCode::Esc => app.services.herdr_tag_draft = None,
         KeyCode::Enter => commit_herdr_tag_edit(app),
         _ => {
-            if let Some(input) = app.plugin.herdr_tag_draft.as_mut() {
+            if let Some(input) = app.services.herdr_tag_draft.as_mut() {
                 apply_input_edit(input, key);
             }
         }
@@ -3967,7 +4638,7 @@ fn handle_herdr_tag_edit_key(app: &mut App, key: KeyEvent) {
 /// Parse and persist the typed tag-refresh seconds. A value under 1s keeps the
 /// draft open so the inline Invalid-input treatment stays on screen — no toast.
 fn commit_herdr_tag_edit(app: &mut App) {
-    let Some(raw) = app.plugin.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
+    let Some(raw) = app.services.herdr_tag_draft.as_ref().map(|i| i.trimmed()) else {
         return;
     };
     let Some(secs) = parse_herdr_tag_secs(raw) else {
@@ -3979,7 +4650,7 @@ fn commit_herdr_tag_edit(app: &mut App) {
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
-    app.plugin.herdr_tag_draft = None;
+    app.services.herdr_tag_draft = None;
 }
 
 /// A typed tag-refresh value is valid only as a whole number of seconds, at
@@ -3991,11 +4662,11 @@ pub(crate) fn parse_herdr_tag_secs(raw: &str) -> Option<u64> {
 
 /// Open the confirm before flipping `delegate row text`: the flip rewrites
 /// herdr's own config (the row `clauth herdr install` appended), so it carries
-/// the same confirm gate as the `[f]` heal. The copy names the delegate token
+/// the same confirm gate as the heal fix. The copy names the delegate token
 /// so the confirm says what it will write; cancel is the default choice.
 fn open_herdr_row_text_confirm(app: &mut App) {
     let Some(path) = app
-        .plugin
+        .services
         .herdr
         .as_ref()
         .and_then(|probe| probe.as_ref())
@@ -4005,7 +4676,7 @@ fn open_herdr_row_text_confirm(app: &mut App) {
     };
     let turning_on = !app.config().state.herdr.delegate_row_text;
     app.disarm_quit();
-    app.modals.push(Modal::Confirm(ConfirmState {
+    app.open_modal(Modal::Confirm(ConfirmState {
         message: if turning_on {
             "add the delegate token to herdr's sidebar row?".to_string()
         } else {
@@ -4047,8 +4718,9 @@ fn version_satisfies(probed: Option<&str>, min: Option<&str>) -> bool {
     }
 }
 
-/// The Plugin tab's `herdr` row: the installed herdr's clauth plugin plus the
-/// keybinding/sidebar config `clauth herdr install` adds. Pure so the verdict
+/// The Services tab's `herdr` row: the installed herdr's clauth plugin plus the
+/// keybinding/sidebar config `clauth herdr install` adds, read root, plugin,
+/// herdr version, key, sidebar, then the fix. Pure so the verdict
 /// logic unit-tests without an `App`; the caller supplies the probe and the
 /// config readout (`None` when the config file could not be read at all).
 pub(crate) fn herdr_check(
@@ -4056,19 +4728,20 @@ pub(crate) fn herdr_check(
     config: Option<&crate::herdr::ConfigStatus>,
 ) -> Check {
     let mut detail = Vec::new();
-    detail.push(match &probe.version {
+    let herdr_line = match &probe.version {
         Some(version) => format!("herdr: {version}"),
         None => "herdr: unknown".to_string(),
-    });
+    };
 
     let mut danger = false;
     let mut warn = false;
-    let mut fix = None;
+    let mut fixed = None;
+    let mut problems: Vec<Problem> = Vec::new();
 
     // Indented, because herdr's own prose carries colons ("manifest unavailable: No such file or directory") and `detail_line` splits the first `": "` into a key column: left flush, a warning renders as a field named after its first clause and widens that column for every real field above it.
-    if let Some(error) = &probe.error {
+    let error_line = probe.error.as_ref().map(|error| format!("  {error}"));
+    if error_line.is_some() {
         danger = true;
-        detail.push(format!("  {error}"));
     }
 
     if let Some(entry) = &probe.entry {
@@ -4078,6 +4751,9 @@ pub(crate) fn herdr_check(
         if !entry.warnings.is_empty() {
             danger = true;
         }
+        if local && let Some(root) = &entry.plugin_root {
+            detail.push(format!("root: {root}"));
+        }
         if !entry.enabled {
             warn = true;
             detail.push("plugin: disabled".to_string());
@@ -4086,12 +4762,11 @@ pub(crate) fn herdr_check(
         } else {
             detail.push("plugin: installed (github)".to_string());
         }
-        if local && let Some(root) = &entry.plugin_root {
-            detail.push(format!("root: {root}"));
-        }
         for warning in &entry.warnings {
             detail.push(format!("  {warning}"));
         }
+        detail.push(herdr_line);
+        detail.extend(error_line);
         if !version_satisfies(probe.version.as_deref(), entry.min_herdr_version.as_deref()) {
             warn = true;
             detail.push(format!(
@@ -4129,13 +4804,25 @@ pub(crate) fn herdr_check(
         }
 
         if parsed && (config.and_then(|c| c.bound_key.as_deref()).is_none() || !templated) {
-            detail.push(String::new());
-            detail.push("[f] add the keybinding and sidebar row to herdr's config".to_string());
-            fix = probe.config_path.clone().map(PluginFix::HealHerdrConfig);
+            detail.push("adds the keybinding and sidebar row to herdr's config".to_string());
+            let line = detail.len();
+            let fix = probe.config_path.clone().map(ServiceFix::HealHerdrConfig);
+            if let Some(f) = &fix {
+                detail.push(fix_line(f));
+                problems.push(Problem {
+                    line,
+                    fix: f.clone(),
+                });
+            }
+            fixed = fix;
         }
-    } else if probe.error.is_none() {
+    } else if let Some(error_line) = error_line {
+        detail.push(herdr_line);
+        detail.push(error_line);
+    } else {
         warn = true;
         detail.push("plugin: not installed".to_string());
+        detail.push(herdr_line);
         detail.push(String::new());
         detail.push("  clauth herdr install".to_string());
     }
@@ -4152,88 +4839,43 @@ pub(crate) fn herdr_check(
         label: "herdr",
         health,
         detail,
-        fix,
+        fix: fixed,
+        problems,
     }
 }
 
-/// Recompute the Plugin tab's integration checks; the last (`runtime`) folds every
-/// profile into one summary. Every read is a local FS/`PATH` check; `claude
-/// --version` runs only when `refresh_version` is set or the cached result is
-/// absent. Synchronous — no background thread.
-fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
+/// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
+/// `delegates` (its detail is the job list), `plugin` (the four integration
+/// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
+/// `claude --version` and the `clauth mcp` boot probe run only when
+/// `refresh_version` is set. Synchronous, except the herdr probe, which it
+/// starts on a worker when none is cached or on `r`.
+fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     use crate::plugin_probe as probe;
 
-    app.plugin.error = None;
+    app.services.error = None;
 
     // CC version is cached; only `r` probes. Construction and a tab switch
     // leave it unprobed rather than spawning `claude --version` synchronously
     // — construction must not block the first paint. Skipped under test so
     // the suite never spawns the real `claude` binary.
     if refresh_version {
-        app.plugin.fetching = true;
-        app.plugin.cc_version = Some(if cfg!(test) {
+        app.services.fetching = true;
+        app.services.cc_version = Some(if cfg!(test) {
             None
         } else {
             probe::cc_version()
         });
-        app.plugin.fetching = false;
+        app.services.fetching = false;
     }
-
-    let mut checks: Vec<Check> = Vec::with_capacity(4);
-
-    // about — clauth's data dir + PATH resolution (CC spawns `clauth mcp` by
-    // name, so resolution is load-bearing) and the Claude Code version. Combined
-    // health: clauth missing is danger (server can't start), CC missing is warn.
-    let clauth_path = probe::on_path("clauth");
-    let mut about_detail = vec![format!(
-        "data: {}",
-        crate::profile::clauth_dir()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "\u{2014}".to_string())
-    )];
-    match &clauth_path {
-        Some(path) => about_detail.push(format!("path: {}", path.display())),
-        None => {
-            about_detail.push("path: not on PATH".to_string());
-            about_detail.push(
-                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
-            );
-            about_detail.push("install clauth so its bin directory is on PATH".to_string());
-        }
-    }
-    match &app.plugin.cc_version {
-        Some(Some(version)) => about_detail.push(format!("claude: {version}")),
-        Some(None) => {
-            about_detail.push("claude: not found".to_string());
-            about_detail.push("claude --version failed or claude is not on PATH".to_string());
-            about_detail.push("install claude code so the claude binary resolves".to_string());
-        }
-        // Unprobed is not missing: the probe is `r`-gated, so before the first
-        // `r` the row names the key that fills the line in instead of claiming
-        // a binary is absent.
-        None => about_detail.push("claude: press r to probe".to_string()),
-    }
-    checks.push(Check {
-        label: "about",
-        health: if clauth_path.is_none() {
-            Health::Danger
-        } else if matches!(app.plugin.cc_version, Some(None)) {
-            // Probed and missing is the only version verdict that warns; an
-            // unprobed version is not evidence of anything.
-            Health::Warn
-        } else {
-            Health::Ok
-        },
-        detail: about_detail,
-        fix: None,
-    });
 
     // `clauth mcp` boot self-probe — `r`-gated only (heavier than the other reads:
     // it spawns the real server). Cleared when clauth no longer resolves so a stale
-    // "boots" can't linger. Skipped under test so the suite never boots the server.
+    // "ok" can't linger. Skipped under test so the suite never boots the server.
+    let clauth_path = probe::on_path("clauth");
     if refresh_version {
-        app.plugin.fetching = true;
-        app.plugin.mcp_boot = if clauth_path.is_some() {
+        app.services.fetching = true;
+        app.services.mcp_boot = if clauth_path.is_some() {
             Some(if cfg!(test) {
                 probe::McpProbe::Ok
             } else {
@@ -4242,16 +4884,456 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         } else {
             None
         };
-        app.plugin.fetching = false;
+        app.services.fetching = false;
     }
-    let mcp_boot = app.plugin.mcp_boot.clone();
 
-    // herdr probe — three subprocesses, so it is `r`-gated like `mcp_boot`.
-    // Skipped under test rather than set to a fixed value, so a test that
-    // injected a probe keeps it.
-    if refresh_version && !cfg!(test) {
-        app.plugin.herdr = Some(crate::herdr::probe());
+    // herdr probe — three subprocesses, so it runs on a worker: the first
+    // recompute with nothing cached starts it (the row appears with no key),
+    // `r` re-probes.
+    if refresh_version {
+        app.services.herdr_probe.restart();
+    } else if app.services.herdr.is_none() {
+        app.services.herdr_probe.start();
     }
+
+    let mut checks: Vec<Check> = Vec::with_capacity(4);
+
+    // shunt row — read-only gateway status: the daemon's feed when one is
+    // fresh, else the record-only verdict. The "the daemon runs the gateway"
+    // note names the daemon only for a record the gateway WOULD run on with no
+    // daemon to run it (the `unobserved` verdict) — never for absent/disabled/
+    // no_config, where no gateway would run at all. With no gateway adopted,
+    // the standalone probe says what shunt would load and what answers.
+    let (gateway_slot, gateway_supervised) = crate::daemon::gateway_slot(app.daemon_health);
+    if gateway_slot.state == GatewayState::Absent {
+        if refresh_version {
+            app.services.standalone_probe.restart();
+        } else if app.services.standalone.is_none() {
+            app.services.standalone_probe.start();
+        }
+    }
+    let mut shunt = shunt_check(
+        &gateway_slot,
+        gateway_supervised,
+        app.services.standalone.as_ref(),
+    );
+    if !gateway_supervised && gateway_slot.state == GatewayState::Unobserved {
+        shunt.detail.push("the daemon runs the gateway".to_string());
+    }
+    checks.push(shunt);
+
+    // The delegates detail names the profiles whose delegate traffic is
+    // rate-limited. Snapshot the names under the config lock, then read each
+    // profile's throughput cache outside it.
+    let now_secs = (crate::usage::now_ms() / 1000) as i64;
+    let profile_names: Vec<crate::profile::ProfileName> = {
+        let cfg = app.config();
+        cfg.profiles.iter().map(|p| p.name.clone()).collect()
+    };
+    let rate_limited: Vec<String> = profile_names
+        .iter()
+        .filter(|name| {
+            crate::throughput::summary(name, now_secs)
+                .iter()
+                .any(|t| t.rate_limited_recent)
+        })
+        .map(|name| name.to_string())
+        .collect();
+
+    // delegates row — the job store is also its detail, so read it first and
+    // derive the dot from what it holds now, not the previous tick's.
+    app.services.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
+    checks.push(delegates_check(&app.services.delegates, &rate_limited));
+
+    // plugin row — the folded readout, over the cached probes + the PATH read.
+    checks.push(plugin_check(
+        clauth_path.as_deref(),
+        app.services.cc_version.clone(),
+        app.services.mcp_boot.clone(),
+    ));
+
+    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
+    // The probe is cached (its worker lands it, above); the config read is a
+    // cheap `fs::read_to_string` that rides the tick, using the path the probe
+    // already resolved. No row when herdr does not resolve or its probe has not
+    // landed yet.
+    if let Some(Some(probe)) = &app.services.herdr {
+        let config = probe
+            .config_path
+            .as_deref()
+            .map(crate::herdr::read_config)
+            .and_then(Result::ok)
+            .map(|text| crate::herdr::config_status(&text));
+        checks.push(herdr_check(probe, config.as_ref()));
+        // The options section reads this verdict (writable vs inert) off the
+        // cache — recompute already paid for the file read, so neither the
+        // render nor the key handler re-reads per frame.
+        app.services.herdr_config = config;
+    } else {
+        // No herdr row renders without a probe, so its verdict must not
+        // outlive the probe (a stale writable verdict would arm the
+        // delegate-row confirm against a file that no longer resolves).
+        app.services.herdr_config = None;
+    }
+
+    app.services.checks = checks;
+
+    // Keep the cursors in range after the row/problem sets change.
+    let max = app.services.row_count().saturating_sub(1);
+    if app.services.cursor > max {
+        app.services.cursor = max;
+    }
+    let problems = app
+        .services
+        .selected_check()
+        .map(|c| c.problems.len())
+        .unwrap_or(0)
+        .saturating_sub(1);
+    if app.services.problem_cursor > problems {
+        app.services.problem_cursor = problems;
+    }
+
+    // A pending herdr landing (the first herdr launch; its probe lands on a
+    // worker) selects the herdr row the moment it appears — by label, not by a
+    // stale index — and descends into its detail. The intent clears on
+    // landing; until the probe resolves, the cursor parks on the last row, and
+    // the drained probe settles it (`drain_service_probes`). Opening a modal
+    // drops it (`App::open_modal`), so no modal is ever open here with it set.
+    if app.services.land_on_herdr {
+        if let Some(idx) = app.services.checks.iter().position(|c| c.label == "herdr") {
+            app.services.cursor = idx;
+            app.services.focus = ServicesFocus::Detail;
+            app.services.land_on_herdr = false;
+        } else {
+            app.services.cursor = app.services.row_count().saturating_sub(1);
+        }
+    }
+}
+
+/// Adopt every finished Services probe and recompute once, so a row appears
+/// (or changes) with no key. A pending first-herdr landing lands in that
+/// recompute or never: a herdr probe that resolved without landing it (herdr
+/// absent) drops the intent, so no later refresh can move the view.
+fn drain_service_probes(app: &mut App) {
+    let herdr = app.services.herdr_probe.drain();
+    let standalone = app.services.standalone_probe.drain();
+    if herdr.is_none() && standalone.is_none() {
+        return;
+    }
+    let herdr_landed = herdr.is_some();
+    if let Some(probe) = herdr {
+        app.services.herdr = Some(probe);
+    }
+    if let Some(readout) = standalone {
+        app.services.standalone = Some(readout);
+    }
+    recompute_services_checks(app, false);
+    if herdr_landed {
+        app.services.land_on_herdr = false;
+    }
+}
+
+/// The `delegates` row: a selector whose detail is the job list. Green while a
+/// job runs (running or blocking), dim when none — finished and orphaned rows
+/// are not a running job. A profile's rate-limited delegate traffic names
+/// itself in the detail; it never moves the dot (the dot is the two-state
+/// running/none signal).
+pub(crate) fn delegates_check(
+    stored: &[crate::mcp::jobs::StoredJob],
+    rate_limited: &[String],
+) -> Check {
+    use crate::mcp::jobs::JobPhase;
+    let running = stored
+        .iter()
+        .any(|j| matches!(j.phase(), JobPhase::Running | JobPhase::Blocking));
+    let mut detail = Vec::new();
+    if !rate_limited.is_empty() {
+        detail.push(format!(
+            "delegate: rate-limited ({})",
+            rate_limited.join(", ")
+        ));
+    }
+    Check {
+        label: "delegates",
+        health: if running { Health::Ok } else { Health::Idle },
+        detail,
+        fix: None,
+        problems: Vec::new(),
+    }
+}
+
+/// What runs without clauth while no gateway is adopted: the config shunt's
+/// own discovery would load, and the shunt answering `/health` on its bind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct StandaloneShunt {
+    /// The first config shunt would load from the TUI's cwd and env, TOML or
+    /// YAML; `None` when discovery finds none.
+    pub(crate) found: Option<std::path::PathBuf>,
+    /// Why clauth could not read the bind shunt would listen on; `None` when
+    /// it read one, or when no config and no env override set one.
+    pub(crate) unread_bind: Option<UnreadBind>,
+    /// The version a shunt-shaped `/health` answer reported, and the address
+    /// that answered; `None` when nothing shunt-shaped answered.
+    pub(crate) answer: Option<(String, std::net::SocketAddr)>,
+}
+
+/// Why clauth could not read a standalone shunt's bind. The row names it, so
+/// a shunt on that bind going unnamed has a stated reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnreadBind {
+    /// The config is YAML, which clauth does not parse.
+    Yaml,
+    /// The config file could not be read.
+    Unreadable,
+    /// The config is not valid TOML.
+    Unparsed,
+    /// The value clauth refused, as written: a `${…}` reference, port 0, or
+    /// something that is not an address; an env value leads with its name.
+    Value(String),
+}
+
+impl UnreadBind {
+    fn label(&self) -> String {
+        match self {
+            UnreadBind::Yaml => "yaml".to_string(),
+            UnreadBind::Unreadable => "config unreadable".to_string(),
+            UnreadBind::Unparsed => "config does not parse".to_string(),
+            UnreadBind::Value(value) if value.is_empty() => "empty".to_string(),
+            UnreadBind::Value(value) => value.clone(),
+        }
+    }
+}
+
+/// The standalone readout from a discovery result, the `SHUNT_SERVER__BIND`
+/// value and one `/health` probe: of the bind clauth reads off the found TOML
+/// config and the env, else of shunt's default. A bind clauth cannot read
+/// falls back to the default and is named in `unread_bind`, so the answer
+/// line only ever states what answered where.
+pub(crate) fn standalone_readout_from(
+    discovered: anyhow::Result<Option<std::path::PathBuf>>,
+    env_bind: Option<&str>,
+    probe: impl Fn(std::net::SocketAddr) -> anyhow::Result<crate::gateway::Health>,
+) -> StandaloneShunt {
+    let (found, config_text, unread_config) = match discovered {
+        Ok(Some(path)) => match std::fs::read_to_string(&path) {
+            Ok(text) => (Some(path), text, None),
+            Err(_) => (Some(path), String::new(), Some(UnreadBind::Unreadable)),
+        },
+        Ok(None) => (None, String::new(), None),
+        Err(e) => match e.downcast_ref::<crate::gateway::YamlConfig>() {
+            Some(yaml) => (
+                Some(yaml.path.clone()),
+                String::new(),
+                Some(UnreadBind::Yaml),
+            ),
+            None => (None, String::new(), None),
+        },
+    };
+    let (addr, unread_bind) = match crate::gateway::resolve_bind(&config_text, env_bind) {
+        // An env override is the bind shunt uses whatever the config says.
+        Ok(bind) => (bind.probe, unread_config.filter(|_| env_bind.is_none())),
+        Err(e) => {
+            let reason = match env_bind {
+                Some(value) => UnreadBind::Value(format!("{}={value}", crate::gateway::BIND_ENV)),
+                None => match e.downcast_ref::<crate::gateway::ConfigBindRefused>() {
+                    Some(refused) => UnreadBind::Value(refused.written.clone()),
+                    None => UnreadBind::Unparsed,
+                },
+            };
+            (crate::gateway::SHUNT_DEFAULT_BIND, Some(reason))
+        }
+    };
+    let answer = match probe(addr) {
+        Ok(crate::gateway::Health::Shunt { version }) => Some((version, addr)),
+        Ok(crate::gateway::Health::Silent(_) | crate::gateway::Health::NotShunt { .. })
+        | Err(_) => None,
+    };
+    StandaloneShunt {
+        found,
+        unread_bind,
+        answer,
+    }
+}
+
+/// [`standalone_readout_from`] over this process's cwd and env: the Services
+/// worker's prober.
+fn standalone_probe() -> StandaloneShunt {
+    standalone_readout_from(
+        crate::gateway::discover_config(),
+        std::env::var(crate::gateway::BIND_ENV).ok().as_deref(),
+        crate::gateway::probe_health,
+    )
+}
+
+/// The `shunt` row: the managed gateway's status dot + readout, from the slot
+/// `gateway_slot` resolves (the daemon's feed, or the record-only verdict).
+/// Read-only — no actions — so no fix and no problems. Pure over the slot plus
+/// the `supervised` flag (whether the slot came from a fresh daemon's feed) so
+/// the verdict logic unit-tests without touching `status.json`. With no
+/// gateway adopted (`absent`) the state reads `not adopted` and the
+/// `standalone` readout, once probed, names what runs without clauth.
+pub(crate) fn shunt_check(
+    slot: &crate::daemon::gateway::GatewaySlot,
+    supervised: bool,
+    standalone: Option<&StandaloneShunt>,
+) -> Check {
+    let mut detail = Vec::new();
+    if let Some(binary) = &slot.binary {
+        detail.push(format!("binary: {}", escape_control(binary)));
+    }
+    if let Some(config) = &slot.config {
+        detail.push(format!("config: {}", escape_control(config)));
+    }
+    if let Some(version) = &slot.version {
+        detail.push(format!("version: {}", escape_control(version)));
+    }
+    if slot.state == GatewayState::Absent {
+        // The feed keeps `absent`; the row says what it means for the user.
+        detail.push("state: not adopted".to_string());
+        if let Some(path) = standalone.and_then(|s| s.found.as_ref()) {
+            detail.push(format!(
+                "found: {}",
+                escape_control(&path.to_string_lossy())
+            ));
+        }
+        if let Some(unread) = standalone.and_then(|s| s.unread_bind.as_ref()) {
+            detail.push(format!(
+                "bind: not read ({})",
+                escape_control(&unread.label())
+            ));
+        }
+        if let Some((version, addr)) = standalone.and_then(|s| s.answer.as_ref()) {
+            // A `:` in the version, followed by a space of its own or the one
+            // after it, would make the detail renderer split this prose line
+            // into a key and a value.
+            detail.push(format!(
+                "standalone shunt {} answers on {addr}",
+                escape_control(version).replace(':', "\\u{3a}")
+            ));
+        }
+    } else {
+        detail.push(format!("state: {}", gateway_state_word(slot.state)));
+    }
+    if let Some(reason) = &slot.reason {
+        // A multi-line reason (a TOML parse error with its snippet) splits onto
+        // one indented sub-line per further line instead of one garbled row; the
+        // detail renderer truncates each line to the pane.
+        let mut lines = reason.split('\n');
+        if let Some(first) = lines.next() {
+            detail.push(format!("reason: {}", escape_control(first)));
+        }
+        for line in lines {
+            detail.push(format!("  {}", escape_control(line)));
+        }
+    }
+    // A foreign answerer names what holds the port, so a red `foreign` dot
+    // states its cause instead of leaving it to the state word alone.
+    if slot.state == GatewayState::Foreign
+        && let Some(answerer) = &slot.answerer
+    {
+        let word = match answerer {
+            Answerer::Shunt => "shunt",
+            Answerer::NotShunt => "not shunt",
+            Answerer::NoAnswer => "no answer",
+        };
+        detail.push(format!("answerer: {word}"));
+    }
+    if let Some(pid) = slot.pid {
+        detail.push(format!("pid: {pid}"));
+    }
+    if let Some(port) = slot.port {
+        detail.push(format!("port: {port}"));
+    }
+    // `restarts` and `last exit` are figures only the daemon observed: on a
+    // record-only slot they are literals nobody read, so they do not show.
+    if supervised {
+        detail.push(format!("restarts: {}", slot.restarts));
+    }
+    if supervised && let Some(exit) = &slot.last_exit {
+        detail.push(format!("last exit: {exit}"));
+    }
+    Check {
+        label: "shunt",
+        health: gateway_health(slot.state),
+        detail,
+        fix: None,
+        problems: Vec::new(),
+    }
+}
+
+/// The gateway state's word — the same spelling `status.json` publishes.
+fn gateway_state_word(state: GatewayState) -> &'static str {
+    match state {
+        GatewayState::Absent => "absent",
+        GatewayState::Disabled => "disabled",
+        GatewayState::NoConfig => "no_config",
+        GatewayState::YamlRefused => "yaml_refused",
+        GatewayState::Misconfigured => "misconfigured",
+        GatewayState::BinaryMissing => "binary_missing",
+        GatewayState::Foreign => "foreign",
+        GatewayState::Starting => "starting",
+        GatewayState::Healthy => "healthy",
+        GatewayState::Unhealthy => "unhealthy",
+        GatewayState::BelowFloor => "below_floor",
+        GatewayState::Restarting => "restarting",
+        GatewayState::Stopping => "stopping",
+        GatewayState::Unobserved => "unobserved",
+    }
+}
+
+/// The gateway state's dot bucket: green healthy; amber starting/unhealthy/
+/// restarting/stopping; red the refusal states; dim absent/disabled/unobserved.
+fn gateway_health(state: GatewayState) -> Health {
+    match state {
+        GatewayState::Healthy => Health::Ok,
+        GatewayState::Starting
+        | GatewayState::Unhealthy
+        | GatewayState::Restarting
+        | GatewayState::Stopping => Health::Warn,
+        GatewayState::Misconfigured
+        | GatewayState::BinaryMissing
+        | GatewayState::Foreign
+        | GatewayState::YamlRefused
+        | GatewayState::BelowFloor
+        | GatewayState::NoConfig => Health::Danger,
+        GatewayState::Absent | GatewayState::Disabled | GatewayState::Unobserved => Health::Idle,
+    }
+}
+
+/// Every slot string the detail renders goes through here. A control character
+/// or a bidi formatting character is spelled as its visible `\u{…}` form so an
+/// untrusted string off the feed or the record can neither inject into the
+/// terminal nor reorder a line; every other character passes through unchanged.
+pub(crate) fn escape_control(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || crate::jobs_cli::reorders_display(c) {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+/// The `plugin` row: one detail holding the plugin install, the mcpServers
+/// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
+/// on PATH and the data dir, a blank line between the three groups. The
+/// install leads because installing is the fix a fresh box needs, and it also
+/// registers the server. Health is the worst of the four; the fixable problems
+/// walk in detail order, so list-level `f` installs first. `clauth_path` is
+/// passed in (the recompute also gates the start probe on it) so the verdict
+/// logic unit-tests without a live `PATH`.
+fn plugin_check(
+    clauth_path: Option<&std::path::Path>,
+    cc_version: Option<Option<String>>,
+    mcp_boot: Option<crate::plugin_probe::McpProbe>,
+) -> Check {
+    use crate::plugin_probe as probe;
+
+    let mut detail: Vec<String> = Vec::new();
+    let mut health = Health::Ok;
+    let mut problems: Vec<Problem> = Vec::new();
 
     // "global" == active in every project: a CC `user`-scope plugin install. A
     // `local`/`project` install (or a `./.mcp.json`) binds clauth to one repo.
@@ -4259,68 +5341,9 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
     let installed = !records.is_empty();
     let plugin_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
 
-    // mcpServers wiring — a plugin install OR a manual `mcpServers.clauth` entry.
-    // Globally wired = a `user`-scope plugin or the `~/.claude.json` entry; a
-    // project-scope plugin or a `./.mcp.json` wires this repo only, so it warns and
-    // offers the same global write fix as a missing wiring does.
-    let wiring = probe::manual_mcp_wiring();
-    let wired = installed || wiring != probe::McpWiring::None;
-    let manual_global = wiring == probe::McpWiring::GlobalConfig;
-    // A manual `~/.claude.json` entry whose command/args no longer match the
-    // canonical launch line reads as wired but won't start the current server.
-    // Only the operative manual entry matters — a `user`-scope plugin install
-    // supersedes it, so drift under one is moot.
-    let drifted = manual_global && !plugin_global && probe::global_entry_drifted() == Some(true);
-    let globally_wired = plugin_global || (manual_global && !drifted);
-    let project_only = wired && !globally_wired && !drifted;
-    let source = if plugin_global {
-        "source: plugin install (user)"
-    } else if manual_global {
-        "source: ~/.claude.json (manual)"
-    } else if installed {
-        "source: plugin install (project)"
-    } else if wiring == probe::McpWiring::ProjectFile {
-        "source: ./.mcp.json (manual)"
-    } else {
-        "source: none"
-    };
-    let mut mcp_detail = vec![
-        format!("present: {}", if wired { "yes" } else { "no" }),
-        source.to_string(),
-    ];
-    match &mcp_boot {
-        Some(probe::McpProbe::Ok) => mcp_detail.push("server: boots".to_string()),
-        Some(probe::McpProbe::Failed(reason)) => {
-            mcp_detail.push(format!("server: failed ({reason})"));
-        }
-        None => {}
-    }
-    let needs_wire = !globally_wired || drifted;
-    if needs_wire {
-        mcp_detail.push(String::new());
-        if drifted {
-            mcp_detail.push("entry doesn't match the current launch line".to_string());
-        } else if project_only {
-            mcp_detail.push("wired for this project only, not global".to_string());
-        }
-        mcp_detail.push("[f] wire mcpServers into ~/.claude.json".to_string());
-    }
-    let boot_failed = matches!(mcp_boot, Some(probe::McpProbe::Failed(_)));
-    checks.push(Check {
-        label: "mcp servers",
-        health: if boot_failed {
-            Health::Danger
-        } else if needs_wire {
-            Health::Warn
-        } else {
-            Health::Ok
-        },
-        detail: mcp_detail,
-        fix: needs_wire.then_some(PluginFix::WireMcpServers),
-    });
-
-    // plugin install record — installed-only verdict (CC exposes no clean per-scope
-    // "enabled" boolean, so v1 reports presence + scope, not enabled/disabled).
+    // plugin install record — installed-only verdict (CC exposes no clean
+    // per-scope "enabled" boolean, so the row reports presence + scope, not
+    // enabled/disabled).
     let marketplace = probe::marketplace_known();
     // The operative record is the `user`-scope install when one exists; a stale
     // project/local row that sorts first must not name the install beside a
@@ -4329,9 +5352,9 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
         .iter()
         .find(|r| r.scope.as_deref() == Some("user"))
         .or_else(|| records.first());
-    let plugin_check = if let Some(record) = record_for_check {
+    if let Some(record) = record_for_check {
         let scope = record.scope.as_deref();
-        let mut detail = vec![format!("installed: yes ({})", scope.unwrap_or("?"))];
+        detail.push(format!("installed: yes ({})", scope.unwrap_or("?")));
         if let Some(version) = &record.version {
             detail.push(format!("version: {version}"));
         }
@@ -4354,279 +5377,166 @@ fn recompute_plugin_checks(app: &mut App, refresh_version: bool) {
             detail.push(format!("marketplace: {repo}"));
         }
         if plugin_global {
-            Check {
-                label: "plugin",
-                health: Health::Ok,
-                detail,
-                fix: None,
-            }
+            health = worst(health, Health::Ok);
         } else {
-            detail.push(String::new());
             detail.push("installed for this project only, not global".to_string());
-            detail.push("[f] install globally (user scope)".to_string());
-            Check {
-                label: "plugin",
-                health: Health::Warn,
-                detail,
-                fix: Some(PluginFix::InstallPlugin),
-            }
+            detail.push("installs at user scope".to_string());
+            let line = detail.len();
+            detail.push(fix_line(&ServiceFix::InstallPlugin));
+            problems.push(Problem {
+                line,
+                fix: ServiceFix::InstallPlugin,
+            });
+            health = worst(health, Health::Warn);
         }
     } else {
         let known = marketplace.is_some();
-        let mut detail = vec![format!(
+        detail.push(format!(
             "installed: no ({})",
             if known {
                 "marketplace known"
             } else {
                 "marketplace unknown"
             }
-        )];
+        ));
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
             detail.push(format!("marketplace: {repo}"));
         }
-        detail.push(String::new());
-        detail.push("[f] install the clauth plugin".to_string());
-        Check {
-            label: "plugin",
-            health: Health::Warn,
-            detail,
-            fix: Some(PluginFix::InstallPlugin),
-        }
-    };
-    checks.push(plugin_check);
-
-    // herdr — the installed herdr's clauth plugin + keybinding/sidebar config.
-    // The probe is cached (`r`-gated, three subprocesses); the config read is a
-    // cheap `fs::read_to_string` that rides the tick, using the path the probe
-    // already resolved. No row when herdr does not resolve or was never probed.
-    if let Some(Some(probe)) = &app.plugin.herdr {
-        let config = probe
-            .config_path
-            .as_deref()
-            .map(crate::herdr::read_config)
-            .and_then(Result::ok)
-            .map(|text| crate::herdr::config_status(&text));
-        checks.push(herdr_check(probe, config.as_ref()));
-        // The options section reads this verdict (writable vs inert) off the
-        // cache — recompute already paid for the file read, so neither the
-        // render nor the key handler re-reads per frame.
-        app.plugin.herdr_config = config;
-    } else {
-        // No herdr row renders without a probe, so its verdict must not
-        // outlive the probe (a stale writable verdict would arm the
-        // delegate-row confirm against a file that no longer resolves).
-        app.plugin.herdr_config = None;
+        detail.push("installs at user scope".to_string());
+        let line = detail.len();
+        detail.push(fix_line(&ServiceFix::InstallPlugin));
+        problems.push(Problem {
+            line,
+            fix: ServiceFix::InstallPlugin,
+        });
+        health = worst(health, Health::Warn);
     }
 
-    // runtime — fold every profile's live sessions / credential link / token
-    // freshness into one summary row. Snapshot the names under the config lock,
-    // then drop it before the FS reads (`classify_credentials_link`) so no lock
-    // is held across I/O.
-    struct Snap {
-        name: ProfileName,
-        active: bool,
-        expires_at: Option<i64>,
-    }
-    let snaps: Vec<Snap> = {
-        let cfg = app.config();
-        cfg.profiles
-            .iter()
-            .map(|p| Snap {
-                name: p.name.clone(),
-                active: cfg.is_active(&p.name),
-                expires_at: p.access_token_expires_at(),
-            })
-            .collect()
-    };
-
-    let now_secs = (crate::usage::now_ms() / 1000) as i64;
-    let total = snaps.len();
-    let mut live_sessions: usize = 0;
-    let mut live_profiles: usize = 0;
-    let mut live_names: Vec<String> = Vec::new();
-    let mut rate_limited_names: Vec<String> = Vec::new();
-    // The active profile's link readout plus the one fix it can offer. Divergence
-    // and missing-link are meaningful only for the active profile — its creds are
-    // the ones linked into ~/.claude — so non-active profiles only contribute
-    // their live-session and rate-limit signal.
-    let mut active_name: Option<String> = None;
-    let mut active_link = "\u{2014}";
-    let mut active_expires = "\u{2014}".to_string();
-    let mut active_fix: Option<PluginFix> = None;
-    let mut active_bad = false; // diverged / missing / unknown link
-
-    // `r` means re-probe everything, so it re-collects rather than rendering the
-    // age the tick left. Sited next to the read, not at the top: the version
-    // probe above spawns `claude`, and a tally taken before that is already as
-    // stale as the subprocess is slow.
-    if refresh_version {
-        app.last_live_sessions_refresh = None;
-        poll_live_sessions(app);
-    }
-
-    // Otherwise the tick's fleet tally, never a second sweep: this row and the
-    // Overview's `live` column answer one question, and two independent reads of
-    // it can disagree inside a frame.
-    let tally = &app.live_sessions;
-    for snap in snaps {
-        let instances = tally.member(&snap.name).sessions;
-        live_sessions += instances;
-        if instances > 0 {
-            live_profiles += 1;
-            live_names.push(if instances > 1 {
-                format!("{} · {instances}", snap.name)
-            } else {
-                snap.name.to_string()
-            });
-        }
-        // Observed delegate throughput (MCP `delegate`); a recent rate-limit on any
-        // exercised model warns even when the credential link is healthy.
-        let throughput = crate::throughput::summary(&snap.name, now_secs);
-        if throughput.iter().any(|t| t.rate_limited_recent) {
-            rate_limited_names.push(snap.name.to_string());
-        }
-
-        if !snap.active {
-            continue;
-        }
-        active_name = Some(snap.name.to_string());
-
-        // A classify error (broken symlink mid-read, perms) must not read as
-        // healthy: surface it as a warn with an `unknown` link label rather than
-        // silently dropping to idle/ok.
-        let link_result = classify_credentials_link(&snap.name);
-        let link = link_result.as_ref().ok().copied();
-        let link_err = link_result.is_err();
-        let diverged = matches!(link, Some(LinkState::Diverged));
-        let missing = matches!(link, Some(LinkState::Missing));
-        // A `missing` link is repairable only when the profile still holds stored
-        // creds to relink to; with none it needs a fresh login, not a relink.
-        let stored_creds = crate::claude::install_source_path(&snap.name)
-            .map(|p| p.exists())
-            .unwrap_or(false);
-
-        active_link = if link_err {
-            "unknown"
+    // mcpServers entry + start probe.
+    detail.push(String::new());
+    let wiring = probe::manual_mcp_wiring();
+    let wired = installed || wiring != probe::McpWiring::None;
+    let manual_global = wiring == probe::McpWiring::GlobalConfig;
+    // A manual `~/.claude.json` entry whose command/args no longer match the
+    // canonical launch line reads as registered but won't start the current
+    // server. Only the operative manual entry matters — a `user`-scope plugin
+    // install supersedes it, so drift under one is moot.
+    let drifted = manual_global && !plugin_global && probe::global_entry_drifted() == Some(true);
+    let globally_wired = plugin_global || (manual_global && !drifted);
+    let project_only = wired && !globally_wired && !drifted;
+    detail.push(format!(
+        "mcp entry: {}",
+        if wired {
+            "registered"
         } else {
-            match link {
-                Some(LinkState::LinkedTo) => "linked",
-                Some(LinkState::Diverged) => "diverged",
-                Some(LinkState::Missing) => "missing",
-                None => "\u{2014}",
-            }
-        };
-        active_bad = link_err || diverged || missing;
-        active_fix = if diverged {
-            Some(PluginFix::RepairDivergence(snap.name.to_string()))
-        } else if missing && stored_creds {
-            Some(PluginFix::RelinkCredentials(snap.name.to_string()))
-        } else {
-            None
-        };
-        // Access-token freshness as a relative span; `—` when no OAuth expiry is
-        // known (third-party / api-key profiles).
-        active_expires = match snap.expires_at {
-            Some(ms) => {
-                let secs = ms / 1000 - (crate::usage::now_ms() / 1000) as i64;
-                if secs <= 0 {
-                    "expired".to_string()
-                } else {
-                    crate::usage::humanize_duration(secs)
-                }
-            }
-            None => "\u{2014}".to_string(),
-        };
-    }
-
-    // Health: a bad active link (diverged/missing/unknown) or any recent delegate
-    // rate-limit warns; an active `linked` creds link or any live session is ok;
-    // otherwise the fleet is idle (neutral, not green).
-    let runtime_health = if active_bad || !rate_limited_names.is_empty() {
-        Health::Warn
-    } else if active_link == "linked" || live_sessions > 0 {
-        Health::Ok
-    } else {
-        Health::Idle
-    };
-
-    let link_line = match &active_name {
-        Some(_) if active_expires != "\u{2014}" => format!("{active_link} · {active_expires}"),
-        Some(_) => active_link.to_string(),
-        None => "\u{2014}".to_string(),
-    };
-    // Runtime health only — config (type / model / overrides) lives on the Setup
-    // tab. This row answers "how many live sessions, is the active credential link
-    // healthy, and how fresh is its token?".
-    let mut runtime_detail = vec![format!("accounts: {total}")];
-    // A zero is hidden rather than printed, matching the Overview cell and the
-    // Fallback card — the row says nothing when there is nothing to say. `live`
-    // is the one noun every session-counting surface uses (the Overview column
-    // header, the Fallback card's key), so the figure reads the same everywhere.
-    if live_sessions > 0 {
-        runtime_detail.push(format!(
-            "live: {live_sessions} across {live_profiles} account{}",
-            crate::format::plural(live_profiles)
-        ));
-    }
-    // Name each account carrying a live session as an indented sub-line, so the
-    // spread is concrete rather than just a tally.
-    for name in &live_names {
-        runtime_detail.push(format!("  {name}"));
-    }
-    runtime_detail.push(format!(
-        "active: {}",
-        active_name.as_deref().unwrap_or("\u{2014}")
+            "not registered"
+        }
     ));
-    runtime_detail.push(format!("link: {link_line}"));
-    if !rate_limited_names.is_empty() {
-        // "rate-limited" sits in the value so `value_tone` warns on it (the key is
-        // a plain label).
-        runtime_detail.push(format!(
-            "delegate: rate-limited ({})",
-            rate_limited_names.join(", ")
-        ));
-    }
-    match &active_fix {
-        Some(PluginFix::RepairDivergence(_)) => {
-            runtime_detail.push(String::new());
-            runtime_detail.push("[f] repair credentials".to_string());
+    match &mcp_boot {
+        Some(probe::McpProbe::Ok) => detail.push("mcp server: ok".to_string()),
+        Some(probe::McpProbe::Failed(reason)) => {
+            detail.push(format!("mcp server: won't start ({reason})"));
         }
-        Some(PluginFix::RelinkCredentials(_)) => {
-            runtime_detail.push(String::new());
-            runtime_detail.push("[f] relink credentials".to_string());
-        }
-        // The other fixes are produced on their own check rows (wire / herdr /
-        // install), never on this one; `None` is a healthy or inactive link.
-        // Named, so a new `PluginFix` variant fails the build instead of a
-        // silent no-op.
-        Some(
-            PluginFix::WireMcpServers | PluginFix::HealHerdrConfig(_) | PluginFix::InstallPlugin,
-        ) => {}
         None => {}
     }
-    checks.push(Check {
-        label: "runtime",
-        health: runtime_health,
-        detail: runtime_detail,
-        fix: active_fix,
-    });
+    detail.push(
+        if plugin_global {
+            "mcp source: plugin install (user)"
+        } else if manual_global {
+            "mcp source: ~/.claude.json (manual)"
+        } else if installed {
+            "mcp source: plugin install (project)"
+        } else if wiring == probe::McpWiring::ProjectFile {
+            "mcp source: ./.mcp.json (manual)"
+        } else {
+            "mcp source: none"
+        }
+        .to_string(),
+    );
+    let needs_wire = !globally_wired || drifted;
+    let boot_failed = matches!(mcp_boot, Some(probe::McpProbe::Failed(_)));
+    health = worst(
+        health,
+        if boot_failed {
+            Health::Danger
+        } else if needs_wire {
+            Health::Warn
+        } else {
+            Health::Ok
+        },
+    );
+    if needs_wire {
+        if drifted {
+            detail.push("entry doesn't match the current launch line".to_string());
+        } else if project_only {
+            detail.push("registered for this project only, not global".to_string());
+        }
+        detail.push("writes the clauth entry into ~/.claude.json".to_string());
+        let line = detail.len();
+        detail.push(fix_line(&ServiceFix::WireMcpServers));
+        problems.push(Problem {
+            line,
+            fix: ServiceFix::WireMcpServers,
+        });
+    }
 
-    app.plugin.checks = checks;
+    // Claude Code version, then clauth on PATH + the data dir.
+    detail.push(String::new());
+    match &cc_version {
+        Some(Some(version)) => detail.push(format!("claude: {version}")),
+        Some(None) => {
+            detail.push("claude: not found".to_string());
+            detail.push("claude --version failed or claude is not on PATH".to_string());
+            detail.push("install claude code so the claude binary resolves".to_string());
+            health = worst(health, Health::Warn);
+        }
+        // Unprobed is not missing: the probe is `r`-gated, so before the first
+        // `r` the row names the key that fills the line in instead of claiming
+        // a binary is absent.
+        None => detail.push("claude: press r to probe".to_string()),
+    }
+    match &clauth_path {
+        Some(path) => detail.push(format!("path: {}", path.display())),
+        None => {
+            detail.push("path: not on PATH".to_string());
+            detail.push(
+                "claude code spawns clauth mcp by name, so the server won't start".to_string(),
+            );
+            detail.push("install clauth so its bin directory is on PATH".to_string());
+            health = worst(health, Health::Danger);
+        }
+    }
+    detail.push(format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    ));
 
-    // The delegates pane's data. Read here rather than on its own timer so it
-    // rides the cadence this tab already documents (tab focus, `r`, and the 1 s
-    // tick while focused) — a `clauth mcp` run is a different process, so a
-    // watcher would buy freshness this tab has never promised.
-    //
-    // `list_banded`, the same call `clauth jobs` and `monitor`'s listing make,
-    // so the pane's row order is not a second derivation of one. It arrives
-    // banded and the renderer sorts nothing.
-    app.plugin.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
+    // List-focus `f` fixes the first fixable problem shown, in the same order
+    // the detail walk presents them (install, then wire).
+    let fix = problems.first().map(|p| p.fix.clone());
 
-    // Keep the cursor in range after the check set changes.
-    let max = app.plugin.row_count().saturating_sub(1);
-    if app.plugin.cursor > max {
-        app.plugin.cursor = max;
+    Check {
+        label: "plugin",
+        health,
+        detail,
+        fix,
+        problems,
+    }
+}
+
+/// The more severe of two health buckets (Ok < Warn < Danger), for folding the
+/// plugin row's four sub-checks into one dot. `Idle` is neutral and never
+/// outranks a verdict.
+fn worst(a: Health, b: Health) -> Health {
+    use Health::{Danger, Warn};
+    if a == Danger || b == Danger {
+        Danger
+    } else if a == Warn || b == Warn {
+        Warn
+    } else {
+        Health::Ok
     }
 }
 
@@ -4659,7 +5569,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         return;
     }
     drop(cfg);
-    app.modals.push(Modal::Confirm(ConfirmState {
+    app.open_modal(Modal::Confirm(ConfirmState {
         message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
@@ -4774,7 +5684,7 @@ fn open_divergence_modal(app: &mut App, active: &str) {
         let cfg = app.config();
         crate::actions::identify_live_login_owner(&cfg).filter(|owner| owner != active)
     };
-    app.modals.push(Modal::Divergence(DivergenceForm {
+    app.open_modal(Modal::Divergence(DivergenceForm {
         active: active.to_string(),
         sibling,
         cursor: 0,
@@ -4873,7 +5783,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
         find_matching_oauth_profile(&cfg, snapshot.credentials.as_ref())
     };
     if let Some(existing) = existing_match {
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: format!("these credentials already belong to '{existing}'."),
             detail: Some("capture anyway?".to_string()),
             choice: false,
@@ -4881,7 +5791,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
         }));
         return;
     }
-    app.modals.push(Modal::CaptureName(CaptureNameForm {
+    app.open_modal(Modal::CaptureName(CaptureNameForm {
         snapshot: Box::new(snapshot),
         input: InputState::new(""),
         from_divergence,
@@ -4945,14 +5855,15 @@ pub(crate) fn chain_items(app: &App) -> Vec<ChainItemKind> {
 }
 
 /// Detail rows for a chain member: threshold stepper, last-resort/preferred
-/// toggles, remove.
-pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
+/// toggles, preferred-days presets + day picker, remove.
+pub(crate) const FALLBACK_ROWS: [FallbackRow; 9] = [
     FallbackRow::Threshold,
     FallbackRow::WeeklyAt,
     FallbackRow::CheckWeekly,
     FallbackRow::CheckScoped,
     FallbackRow::LastResort,
     FallbackRow::Preferred,
+    FallbackRow::PreferredDays,
     FallbackRow::MaxSpend,
     FallbackRow::Remove,
 ];
@@ -4960,7 +5871,7 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 8] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 18] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 19] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
@@ -4971,6 +5882,7 @@ pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 18] = [
     GlobalConfigRow::ContextNudge,
     GlobalConfigRow::AutoStartQueue,
     GlobalConfigRow::PreemptiveRotation,
+    GlobalConfigRow::AutoUpdate,
     GlobalConfigRow::WeeklyThreshold,
     GlobalConfigRow::BurnAware,
     GlobalConfigRow::WalkOrder,
@@ -4997,7 +5909,8 @@ impl GlobalConfigRow {
             | GlobalConfigRow::RefreshSpentAccounts
             | GlobalConfigRow::ContextNudge
             | GlobalConfigRow::AutoStartQueue
-            | GlobalConfigRow::PreemptiveRotation => "scheduler",
+            | GlobalConfigRow::PreemptiveRotation
+            | GlobalConfigRow::AutoUpdate => "scheduler",
             GlobalConfigRow::WeeklyThreshold
             | GlobalConfigRow::BurnAware
             | GlobalConfigRow::WalkOrder
@@ -5097,6 +6010,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
             }
         }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
+        GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
         // Inert while no account has `auto_start` on (rendered dimmed): a
         // queue with no possible member spaces nothing, so it stays a true
@@ -5129,6 +6043,71 @@ fn cycle_theme(app: &mut App) {
     theme::set_tier(next);
 }
 
+/// An open edit on the Fallback member card, pinned to the member it opened on
+/// by NAME. A reload can reorder or shrink the chain under an open editor, so a
+/// write resolved through `chain_cursor` lands on whichever member took the
+/// slot; every write goes to `member` instead, and [`repin_member_edit`] moves
+/// `chain_cursor` after it, or closes the edit and returns focus to the chain
+/// list once it left the chain or its account left the roster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemberEdit<T> {
+    pub(crate) member: ProfileName,
+    pub(crate) state: T,
+}
+
+/// What is open on the member card. One at a time: every typed field and the
+/// picker own the keyboard, and the armed remove disarms on any row move.
+#[derive(Debug, Clone)]
+pub(crate) enum CardEdit {
+    /// The `rotate at` field. `+`/`-` still step the value while closed.
+    Threshold(InputState),
+    /// The `weekly at` override field; an EMPTY commit clears the override.
+    Weekly(InputState),
+    /// The `max spend` ceiling field.
+    MaxSpend(InputState),
+    /// The `preferred days` chip picker. No draft: each space saves at once.
+    Days(DayPicker),
+    /// The first ⏎ on `remove`; the second removes this member.
+    ArmedRemove,
+}
+
+impl CardEdit {
+    /// The row this edit is open on.
+    pub(crate) fn row(&self) -> FallbackRow {
+        match self {
+            Self::Threshold(_) => FallbackRow::Threshold,
+            Self::Weekly(_) => FallbackRow::WeeklyAt,
+            Self::MaxSpend(_) => FallbackRow::MaxSpend,
+            Self::Days(_) => FallbackRow::PreferredDays,
+            Self::ArmedRemove => FallbackRow::Remove,
+        }
+    }
+
+    /// The typed buffer, when this edit is a typed field.
+    pub(crate) fn input(&self) -> Option<&InputState> {
+        match self {
+            Self::Threshold(input) | Self::Weekly(input) | Self::MaxSpend(input) => Some(input),
+            Self::Days(_) | Self::ArmedRemove => None,
+        }
+    }
+
+    fn input_mut(&mut self) -> Option<&mut InputState> {
+        match self {
+            Self::Threshold(input) | Self::Weekly(input) | Self::MaxSpend(input) => Some(input),
+            Self::Days(_) | Self::ArmedRemove => None,
+        }
+    }
+}
+
+/// The `preferred days` chip picker: the chip under the caret (a
+/// `WEEKDAYS_ALL` index), and whether this descend already raised the
+/// claims-nothing warning, which it raises once rather than once per toggle.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DayPicker {
+    pub(crate) cursor: usize,
+    pub(crate) warned: bool,
+}
+
 /// Fallback footer hint derived from current focus + selection + edit state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FallbackHint {
@@ -5136,21 +6115,20 @@ pub(crate) enum FallbackHint {
     ChainMember,
     ChainAdd,
     DetailThreshold,
-    DetailThresholdEdit,
     DetailWeeklyAt,
-    DetailWeeklyAtEdit,
     DetailCheckWeekly,
     DetailCheckScoped,
     DetailLastResort,
     DetailPreferred,
+    DetailPreferredDays,
     DetailMaxSpend,
-    DetailMaxSpendEdit,
     DetailRemove,
     DetailRemoveArmed,
     DetailAdd,
 }
 
-/// Resolve the Fallback tab's footer hint.
+/// Resolve the Fallback tab's footer hint while no editor owns the keyboard
+/// ([`keyboard_owner`]); an open editor's hints are its own.
 pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
     if chain_items(app).is_empty() {
         return FallbackHint::Empty;
@@ -5164,15 +6142,6 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
             if selected_chain_member(app).is_none() {
                 return FallbackHint::DetailAdd;
             }
-            if app.fallback_threshold_draft.is_some() {
-                return FallbackHint::DetailThresholdEdit;
-            }
-            if app.fallback_max_spend_draft.is_some() {
-                return FallbackHint::DetailMaxSpendEdit;
-            }
-            if app.fallback_weekly_draft.is_some() {
-                return FallbackHint::DetailWeeklyAtEdit;
-            }
             let cursor = app.fallback_detail_cursor.min(FALLBACK_ROWS.len() - 1);
             match FALLBACK_ROWS[cursor] {
                 FallbackRow::Threshold => FallbackHint::DetailThreshold,
@@ -5181,8 +6150,16 @@ pub(crate) fn fallback_hint(app: &App) -> FallbackHint {
                 FallbackRow::CheckScoped => FallbackHint::DetailCheckScoped,
                 FallbackRow::LastResort => FallbackHint::DetailLastResort,
                 FallbackRow::Preferred => FallbackHint::DetailPreferred,
+                FallbackRow::PreferredDays => FallbackHint::DetailPreferredDays,
                 FallbackRow::MaxSpend => FallbackHint::DetailMaxSpend,
-                FallbackRow::Remove if app.fallback_armed_remove => FallbackHint::DetailRemoveArmed,
+                FallbackRow::Remove
+                    if app
+                        .fallback_edit
+                        .as_ref()
+                        .is_some_and(|e| matches!(e.state, CardEdit::ArmedRemove)) =>
+                {
+                    FallbackHint::DetailRemoveArmed
+                }
                 FallbackRow::Remove => FallbackHint::DetailRemove,
             }
         }
@@ -5438,6 +6415,21 @@ fn toggle_preemptive_rotation(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.preemptive_rotation = !cfg.state.preemptive_rotation;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip the background self-update (`[update].auto_update`, default on). Same
+/// persistence shape as `toggle_preemptive_rotation`; `check on launch` timing
+/// — the binary updater reads the flag at next launch, the daemon's herdr leg
+/// on its next reload, a new MCP server at startup. The row stays live under
+/// `CLAUTH_NO_UPDATE=1`: the persisted value is what the row edits, and the
+/// env var keeps overriding it until it goes.
+fn toggle_auto_update(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.update.auto_update = !cfg.state.update.auto_update;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
@@ -5736,7 +6728,7 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
     let row = FALLBACK_ROWS[app.fallback_detail_cursor];
     match key.code {
         KeyCode::Up => {
-            app.fallback_armed_remove = false;
+            app.fallback_edit = None;
             app.fallback_detail_cursor = if app.fallback_detail_cursor == 0 {
                 last
             } else {
@@ -5744,7 +6736,7 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
             };
         }
         KeyCode::Down => {
-            app.fallback_armed_remove = false;
+            app.fallback_edit = None;
             app.fallback_detail_cursor = if app.fallback_detail_cursor >= last {
                 0
             } else {
@@ -5757,6 +6749,11 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('-' | '_') if row == FallbackRow::Threshold => adjust_threshold(app, -5.0),
         KeyCode::Char('+' | '=') if row == FallbackRow::WeeklyAt => adjust_weekly(app, 5.0),
         KeyCode::Char('-' | '_') if row == FallbackRow::WeeklyAt => adjust_weekly(app, -5.0),
+        // The day row is a cycle row at rest and a chip row once descended:
+        // space walks the preset ladder (the `weekly limit` row's grammar), ⏎
+        // opens the chip picker. Split here so `run_fallback_row` keeps its
+        // single meaning for every other row.
+        KeyCode::Char(' ') if row == FallbackRow::PreferredDays => step_preferred_days(app),
         KeyCode::Enter | KeyCode::Char(' ') => {
             run_fallback_row(app, row);
         }
@@ -5795,7 +6792,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 chain_would_mix(&cfg, &name)
             };
             if would_mix {
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: "mixing api-key and oauth accounts can leave sessions stuck on the \
                               api account."
                         .into(),
@@ -5878,17 +6875,17 @@ fn enter_fallback_detail(app: &mut App) {
         _ => return,
     }
     app.fallback_detail_cursor = 0;
-    app.fallback_armed_remove = false;
+    app.fallback_edit = None;
     app.fallback_focus = FallbackFocus::Detail;
 }
 
-/// Return focus to the chain list, clearing any armed remove or live edit.
+/// Return focus to the chain list, clearing any armed remove or live edit and
+/// the card's remembered day-list stop.
 fn leave_fallback_detail(app: &mut App) {
     app.fallback_focus = FallbackFocus::Chain;
-    app.fallback_armed_remove = false;
     app.fallback_detail_cursor = 0;
-    app.fallback_threshold_draft = None;
-    app.fallback_weekly_draft = None;
+    app.fallback_edit = None;
+    app.fallback_day_stop = None;
 }
 
 /// ⇧↑↓: move the selected member up/down, cursor follows. No-op on `+ add`
@@ -5920,13 +6917,15 @@ fn reorder_chain_member(app: &mut App, delta: i32) {
     }
 }
 
-/// ⏎/space on a member detail row: threshold opens inline editor; remove arms
-/// then deletes on second press.
+/// ⏎/space on a member detail row: a typed row opens its field and `preferred
+/// days` its picker; remove arms, then removes on the second press. Each one
+/// pins the member under the cursor.
 fn run_fallback_row(app: &mut App, row: FallbackRow) {
     match row {
         FallbackRow::Threshold => {
             if let Some(current) = selected_threshold(app) {
-                app.fallback_threshold_draft = Some(InputState::new(&format!("{current:.0}")));
+                let field = InputState::new(&format!("{current:.0}"));
+                open_card_edit(app, CardEdit::Threshold(field));
             }
         }
         FallbackRow::WeeklyAt => {
@@ -5937,83 +6936,86 @@ fn run_fallback_row(app: &mut App, row: FallbackRow) {
                 && check_weekly
             {
                 let seed = override_pct.map(|v| format!("{v:.0}")).unwrap_or_default();
-                app.fallback_weekly_draft = Some(InputState::new(&seed));
+                open_card_edit(app, CardEdit::Weekly(InputState::new(&seed)));
             }
         }
         FallbackRow::CheckWeekly => toggle_member_flag(app, MemberFlag::CheckWeekly),
         FallbackRow::CheckScoped => toggle_member_flag(app, MemberFlag::CheckScoped),
         FallbackRow::LastResort => toggle_last_resort(app),
         FallbackRow::Preferred => toggle_preferred(app),
+        // ⏎ only: space is the preset stepper and never reaches here for this row.
+        FallbackRow::PreferredDays => open_day_picker(app),
         FallbackRow::MaxSpend => {
             // Inert while spend budget is off (rendered dimmed): opening the editor
             // would let a ceiling be typed that does nothing, so no-op.
             let armed = app.config().state.spend_budget_switching;
             if armed && let Some(current) = selected_max_spend(app) {
-                app.fallback_max_spend_draft = Some(InputState::new(&format!("{current:.2}")));
+                let field = InputState::new(&format!("{current:.2}"));
+                open_card_edit(app, CardEdit::MaxSpend(field));
             }
         }
-        FallbackRow::Remove => {
-            if app.fallback_armed_remove {
-                remove_chain_member(app);
-            } else {
-                app.fallback_armed_remove = true;
-            }
-        }
+        FallbackRow::Remove => match app.fallback_edit.take() {
+            Some(MemberEdit {
+                member,
+                state: CardEdit::ArmedRemove,
+            }) => remove_chain_member(app, &member),
+            _ => open_card_edit(app, CardEdit::ArmedRemove),
+        },
     }
 }
 
-/// Keystrokes while the threshold field is open: ⏎ saves, ⎋ discards.
-fn handle_fallback_threshold_edit_key(app: &mut App, key: KeyEvent) {
+/// Open `edit` on the card, pinned to the member under the cursor.
+fn open_card_edit(app: &mut App, edit: CardEdit) {
+    app.fallback_edit = selected_member_name(app).map(|member| MemberEdit {
+        member,
+        state: edit,
+    });
+}
+
+/// Keystrokes while a typed card field is open: ⏎ saves, ⎋ discards.
+fn handle_member_field_key(app: &mut App, key: KeyEvent) {
     match key.code {
-        KeyCode::Esc => app.fallback_threshold_draft = None,
-        KeyCode::Enter => commit_threshold_edit(app),
+        KeyCode::Esc => app.fallback_edit = None,
+        KeyCode::Enter => commit_member_field(app),
         _ => {
-            if let Some(input) = app.fallback_threshold_draft.as_mut() {
+            if let Some(input) = app.fallback_edit.as_mut().and_then(|e| e.state.input_mut()) {
                 apply_input_edit(input, key);
             }
         }
     }
 }
 
-/// Parse and persist the typed threshold (0..=100). Invalid input keeps the
-/// draft open so the inline Invalid-input treatment (DANGER value + `└ max is N`
-/// tooltip, rendered by the detail card) stays on screen until corrected — no toast.
-fn commit_threshold_edit(app: &mut App) {
-    let Some(raw) = app.fallback_threshold_draft.as_ref().map(|i| i.trimmed()) else {
+/// Parse the open field and persist it on the member it is pinned to, whatever
+/// sits under the cursor now. Invalid input keeps the field open so the card's
+/// inline Invalid-input treatment (DANGER value + range tooltip) stays on
+/// screen until corrected — no toast.
+fn commit_member_field(app: &mut App) {
+    let Some(MemberEdit { member, state }) = app.fallback_edit.clone() else {
         return;
     };
-    let Some(value) = parse_threshold(raw) else {
-        return;
-    };
-    write_threshold(app, value);
-    app.fallback_threshold_draft = None;
-}
-
-/// Keystrokes while the `weekly at` override field is open: ⏎ saves, ⎋ discards.
-fn handle_fallback_weekly_edit_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => app.fallback_weekly_draft = None,
-        KeyCode::Enter => commit_weekly_edit(app),
-        _ => {
-            if let Some(input) = app.fallback_weekly_draft.as_mut() {
-                apply_input_edit(input, key);
-            }
+    match state {
+        CardEdit::Threshold(input) => {
+            let Some(value) = parse_threshold(input.trimmed()) else {
+                return;
+            };
+            write_threshold(app, &member, value);
         }
+        // An EMPTY commit clears the override back to the chain-wide default.
+        CardEdit::Weekly(input) => {
+            let Some(value) = parse_weekly_override(input.trimmed()) else {
+                return;
+            };
+            write_weekly_override(app, &member, value);
+        }
+        CardEdit::MaxSpend(input) => {
+            let Some(value) = parse_max_spend(input.trimmed()) else {
+                return;
+            };
+            write_max_spend(app, &member, value);
+        }
+        CardEdit::Days(_) | CardEdit::ArmedRemove => return,
     }
-}
-
-/// Parse and persist the typed override. Invalid input keeps the draft open
-/// (same no-toast treatment as the threshold editor); an EMPTY commit clears
-/// the override back to the chain-wide default.
-fn commit_weekly_edit(app: &mut App) {
-    let Some(raw) = app.fallback_weekly_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
-    };
-    let Some(value) = parse_weekly_override(raw) else {
-        return;
-    };
-    write_weekly_override(app, value);
-    app.fallback_weekly_draft = None;
+    app.fallback_edit = None;
 }
 
 /// A typed override is a number in `0..=100`, or EMPTY — the explicit
@@ -6036,17 +7038,11 @@ fn selected_weekly_override(app: &App) -> Option<(Option<f64>, bool)> {
     cfg.find(name).map(|p| (p.weekly_threshold, p.check_weekly))
 }
 
-/// Write (or clear) the selected member's weekly-line override and persist.
-fn write_weekly_override(app: &mut App, value: Option<f64>) {
-    let Some(pos) = selected_chain_member(app) else {
-        return;
-    };
+/// Write (or clear) `name`'s weekly-line override and persist.
+fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) {
     let save_err = {
         let mut cfg = app.config();
-        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
-            return;
-        };
-        match cfg.find_mut(&name) {
+        match cfg.find_mut(name) {
             Some(profile) => {
                 profile.weekly_threshold = value;
                 save_profile(profile).err()
@@ -6057,32 +7053,6 @@ fn write_weekly_override(app: &mut App, value: Option<f64>) {
     if let Some(e) = save_err {
         app.toast(ToastKind::Danger, format!("save failed\n{e}"));
     }
-}
-
-/// Keystrokes while the `max auto-spend` field is open: ⏎ saves, ⎋ discards.
-fn handle_fallback_max_spend_edit_key(app: &mut App, key: KeyEvent) {
-    match key.code {
-        KeyCode::Esc => app.fallback_max_spend_draft = None,
-        KeyCode::Enter => commit_max_spend_edit(app),
-        _ => {
-            if let Some(input) = app.fallback_max_spend_draft.as_mut() {
-                apply_input_edit(input, key);
-            }
-        }
-    }
-}
-
-/// Parse and persist the typed ceiling. Invalid input keeps the draft open, the
-/// same no-toast treatment the threshold editor uses.
-fn commit_max_spend_edit(app: &mut App) {
-    let Some(raw) = app.fallback_max_spend_draft.as_ref().map(|i| i.trimmed()) else {
-        return;
-    };
-    let Some(value) = parse_max_spend(raw) else {
-        return;
-    };
-    write_max_spend(app, value);
-    app.fallback_max_spend_draft = None;
 }
 
 /// A typed ceiling is valid only as a finite, non-negative number of dollars.
@@ -6105,17 +7075,11 @@ fn selected_max_spend(app: &App) -> Option<f64> {
     Some(cfg.find(name).and_then(|p| p.max_auto_spend).unwrap_or(0.0))
 }
 
-/// Write the ceiling for the selected member and persist.
-fn write_max_spend(app: &mut App, value: f64) {
-    let Some(pos) = selected_chain_member(app) else {
-        return;
-    };
+/// Write `name`'s ceiling and persist.
+fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) {
     let save_err = {
         let mut cfg = app.config();
-        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
-            return;
-        };
-        match cfg.find_mut(&name) {
+        match cfg.find_mut(name) {
             Some(profile) => {
                 profile.max_auto_spend = Some(value);
                 save_profile(profile).err()
@@ -6128,6 +7092,209 @@ fn write_max_spend(app: &mut App, value: f64) {
     }
 }
 
+/// The chain member under the cursor, by name, or `None` on `+ add`.
+fn selected_member_name(app: &App) -> Option<ProfileName> {
+    let pos = selected_chain_member(app)?;
+    app.config().state.fallback_chain.get(pos).cloned()
+}
+
+/// `name`'s home days as the in-memory config holds them.
+pub(crate) fn member_days(app: &App, name: &ProfileName) -> Option<Vec<Weekday>> {
+    app.config().find(name).map(|p| p.preferred_days.clone())
+}
+
+/// After a config reload: point `chain_cursor` back at the member the open
+/// [`MemberEdit`] is pinned to. When the reload took that member off the chain
+/// or its account off the roster, close the edit and hand focus back to the
+/// chain list, so no key meant for the edit lands on the member that moved into
+/// its slot, and none writes to an account that is gone. A remembered day-list
+/// stop goes once the card no longer shows its member.
+fn repin_member_edit(app: &mut App) {
+    if let Some(member) = app.fallback_edit.as_ref().map(|e| e.member.clone()) {
+        let slot = {
+            let cfg = app.config();
+            cfg.find(&member)
+                .and_then(|_| cfg.state.fallback_chain.iter().position(|n| *n == member))
+        };
+        match slot {
+            Some(i) => app.chain_cursor = i,
+            None => leave_fallback_detail(app),
+        }
+    }
+    if app
+        .fallback_day_stop
+        .as_ref()
+        .is_some_and(|stop| selected_member_name(app).as_ref() != Some(&stop.member))
+    {
+        app.fallback_day_stop = None;
+    }
+}
+
+/// Space on the `preferred days` row at rest: step to the next stop and
+/// persist. A set matching no rung (a custom list) is one more stop past the
+/// last rung for as long as the card stays open: stepping off it remembers it
+/// and lands on `never`, the ladder's first rung (a set has no order, so no
+/// rung sits above it the way `step_weekly_threshold` finds the next preset
+/// above a custom percent), and the last rung steps back onto it.
+fn step_preferred_days(app: &mut App) {
+    let Some(name) = selected_member_name(app) else {
+        return;
+    };
+    // Stepped from the rung the card shows, since that is what the press
+    // answered; a chain entry with no account behind it has no rung to step.
+    let Some(shown) = member_days(app, &name) else {
+        return;
+    };
+    let next = match preferred_days_preset(&shown) {
+        Some(i) if i + 1 < PREFERRED_DAY_PRESETS.len() => preferred_days_at(i + 1),
+        Some(_) => app
+            .fallback_day_stop
+            .as_ref()
+            .filter(|stop| stop.member == name)
+            .map(|stop| stop.state.clone())
+            .unwrap_or_default(),
+        None => {
+            app.fallback_day_stop = Some(MemberEdit {
+                member: name.clone(),
+                state: shown,
+            });
+            preferred_days_at(0)
+        }
+    };
+    if let Some(reason) = write_preferred_days(app, &name, move |_| next) {
+        warn_list_claims_nothing(app, reason);
+    }
+}
+
+/// ⏎ on the day row: descend into the chip picker, pinned to the member under
+/// the cursor, caret on Monday. A chain entry with no account behind it has no
+/// row to draw the picker in, so it opens nothing.
+fn open_day_picker(app: &mut App) {
+    if let Some(member) = selected_member_name(app)
+        && member_days(app, &member).is_some()
+    {
+        app.fallback_edit = Some(MemberEdit {
+            member,
+            state: CardEdit::Days(DayPicker::default()),
+        });
+    }
+}
+
+/// Keystrokes while the chip picker is open (a multi-select chip row):
+/// ←/→ walk the caret with wrap, space toggles the day under it and saves at
+/// once, ⏎/esc/q leave the mode, ↑/↓ leave the mode and the row together.
+/// `?` and `x` never reach here ([`KeyOwner::claims`]); every other key is
+/// claimed and does nothing, so no other global binding fires mid-pick.
+fn handle_day_picker_key(app: &mut App, key: KeyEvent) {
+    let days = WEEKDAYS_ALL.len();
+    match key.code {
+        KeyCode::Left | KeyCode::Right => {
+            if let Some(MemberEdit {
+                state: CardEdit::Days(picker),
+                ..
+            }) = app.fallback_edit.as_mut()
+            {
+                let step = if key.code == KeyCode::Left {
+                    days - 1
+                } else {
+                    1
+                };
+                picker.cursor = (picker.cursor + step) % days;
+            }
+        }
+        KeyCode::Char(' ') => toggle_picked_day(app),
+        KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => app.fallback_edit = None,
+        KeyCode::Up | KeyCode::Down => {
+            app.fallback_edit = None;
+            handle_fallback_detail_key(app, key);
+        }
+        _ => {}
+    }
+}
+
+/// Space in the picker: flip the day under the caret on the pinned member's
+/// list and save the result in `WEEKDAYS_ALL` order. A dead account's list
+/// still saves; its claims-nothing warning is raised once per descend.
+fn toggle_picked_day(app: &mut App) {
+    let Some(MemberEdit {
+        member,
+        state: CardEdit::Days(state),
+    }) = app.fallback_edit.clone()
+    else {
+        return;
+    };
+    let (Some(&day), Some(shown)) = (WEEKDAYS_ALL.get(state.cursor), member_days(app, &member))
+    else {
+        return;
+    };
+    // The caret's day lands where the shown list says the press sends it; the
+    // other days come from the list read under the lock, so another writer's
+    // days survive and the operator's own press is never inverted.
+    let want = !shown.contains(&day);
+    let toggle = move |days: &[Weekday]| -> Vec<Weekday> {
+        WEEKDAYS_ALL
+            .into_iter()
+            .filter(|d| if *d == day { want } else { days.contains(d) })
+            .collect()
+    };
+    if let Some(reason) = write_preferred_days(app, &member, toggle)
+        && !state.warned
+    {
+        warn_list_claims_nothing(app, reason);
+        if let Some(MemberEdit {
+            state: CardEdit::Days(picker),
+            ..
+        }) = app.fallback_edit.as_mut()
+        {
+            picker.warned = true;
+        }
+    }
+}
+
+/// Rewrite `name`'s home days through `edit` and persist. A failed save toasts
+/// the error and leaves the in-memory list on what the disk still holds.
+/// `Some(reason)` when the saved list claims nothing, for the caller to say so.
+///
+/// Saved rather than refused because the state is reachable without this row — a
+/// list goes inert when the account later leaves the chain or its login breaks —
+/// and a row that quietly does nothing is worse than one that says why.
+fn write_preferred_days(
+    app: &mut App,
+    name: &ProfileName,
+    edit: impl FnOnce(&[Weekday]) -> Vec<Weekday>,
+) -> Option<&'static str> {
+    let result = {
+        let mut cfg = app.config();
+        crate::actions::edit_profile_preferred_days(&mut cfg, name, edit)
+    };
+    match result {
+        Ok(saved) => (!saved.is_empty())
+            .then(|| {
+                let key_rejected = app.key_rejected_names();
+                crate::fallback::day_claim_blocker(&app.config(), name, &key_rejected)
+            })
+            .flatten(),
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("preferred days update failed\n{e}"),
+            );
+            None
+        }
+    }
+}
+
+/// The saved-anyway warning for a day list the chain walk will never read.
+fn warn_list_claims_nothing(app: &mut App, reason: &str) {
+    app.toast(
+        ToastKind::Warning,
+        format!(
+            "saved, but this list claims nothing: {reason}\nthe chain decides those days \
+             without this account"
+        ),
+    );
+}
+
 /// Effective threshold for the selected member, or `None` on `+ add`.
 fn selected_threshold(app: &App) -> Option<f64> {
     let pos = selected_chain_member(app)?;
@@ -6136,17 +7303,11 @@ fn selected_threshold(app: &App) -> Option<f64> {
     cfg.find(name).map(threshold_for)
 }
 
-/// Write threshold for the selected member and persist.
-fn write_threshold(app: &mut App, value: f64) {
-    let Some(pos) = selected_chain_member(app) else {
-        return;
-    };
+/// Write `name`'s threshold and persist.
+fn write_threshold(app: &mut App, name: &ProfileName, value: f64) {
     let save_err = {
         let mut cfg = app.config();
-        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
-            return;
-        };
-        set_member_threshold(&mut cfg, &name, value).err()
+        set_member_threshold(&mut cfg, name, value).err()
     };
     let Some(e) = save_err else {
         return;
@@ -6166,8 +7327,14 @@ fn write_threshold(app: &mut App, value: f64) {
 
 /// Step the threshold by `delta`, clamped to 0..=100, and persist.
 fn adjust_threshold(app: &mut App, delta: f64) {
-    if let Some(current) = selected_threshold(app) {
-        write_threshold(app, (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD));
+    if let Some(name) = selected_member_name(app)
+        && let Some(current) = selected_threshold(app)
+    {
+        write_threshold(
+            app,
+            &name,
+            (current + delta).clamp(MIN_THRESHOLD, MAX_THRESHOLD),
+        );
     }
 }
 
@@ -6178,7 +7345,9 @@ fn adjust_threshold(app: &mut App, delta: f64) {
 /// An unset override bases the nudge on the chain-wide resolved default so
 /// the value visibly moves off what the dimmed-default row already shows.
 fn adjust_weekly(app: &mut App, delta: f64) {
-    let Some((override_pct, check_weekly)) = selected_weekly_override(app) else {
+    let (Some(name), Some((override_pct, check_weekly))) =
+        (selected_member_name(app), selected_weekly_override(app))
+    else {
         return;
     };
     if !check_weekly {
@@ -6186,7 +7355,7 @@ fn adjust_weekly(app: &mut App, delta: f64) {
     }
     let base = override_pct.unwrap_or_else(|| app.config().state.weekly_switch_threshold_pct());
     let next = (base + delta).clamp(MIN_WEEKLY_SWITCH_PCT, MAX_WEEKLY_SWITCH_PCT);
-    write_weekly_override(app, Some(next));
+    write_weekly_override(app, &name, Some(next));
 }
 
 /// ⏎/space on the `last resort` row: flip `Profile::last_resort` and persist.
@@ -6403,20 +7572,16 @@ fn add_chain_candidate(app: &mut App, name: &ProfileName) {
     let _ = save_app_state(&cfg.state);
 }
 
-/// Remove the selected member, persist, and return focus to the list.
-fn remove_chain_member(app: &mut App) {
-    let Some(pos) = selected_chain_member(app) else {
-        return;
-    };
-    let name = {
+/// Remove `name` from the chain, persist, and return focus to the list.
+fn remove_chain_member(app: &mut App, name: &ProfileName) {
+    {
         let mut cfg = app.config();
-        let Some(name) = cfg.state.fallback_chain.get(pos).cloned() else {
+        if !cfg.state.fallback_chain.contains(name) {
             return;
-        };
-        cfg.state.fallback_chain.retain(|n| n != &name);
+        }
+        cfg.state.fallback_chain.retain(|n| n != name);
         let _ = save_app_state(&cfg.state);
-        name
-    };
+    }
     leave_fallback_detail(app);
     let items_len = chain_items(app).len();
     if app.chain_cursor >= items_len {
@@ -6592,7 +7757,11 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
 
     match app.tab {
         Tab::Overview => {
-            context = push_account_scope(app, &mut scoped);
+            // The codex filter hides the claude rows the cursor is bound to,
+            // so nothing may act on the row under it.
+            if app.harness_filter.shows_claude() {
+                context = push_account_scope(app, &mut scoped);
+            }
             actions.push(RefreshAll);
             actions.push(NewAccount);
         }
@@ -6656,7 +7825,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             }
         }
         // Fallback: every action the chain and its detail rows carry is bound to
-        // a key of its own (⏎, ⇧↑↓, space, +/-), so `a` offers nothing.
+        // a key of its own (⏎, ⇧↑↓, space, +/-).
         Tab::Fallback => {}
         Tab::Config => {}
         Tab::Status => {
@@ -6665,8 +7834,15 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 actions.push(OpenIncidentLink);
             }
         }
-        // Plugin: no action menu — `r` re-runs checks, `f` fixes, ⏎/esc navigate.
-        Tab::Plugin => {}
+        // Services: `r` re-runs checks, `f` fixes, ⏎/esc navigate.
+        Tab::Services => {}
+    }
+    // Every tab: the daemon verb that applies, none while one is in flight.
+    if !app.daemon_control_busy {
+        actions.push(match app.daemon_health {
+            crate::daemon::DaemonHealth::Absent => StartDaemon,
+            crate::daemon::DaemonHealth::Stale | crate::daemon::DaemonHealth::Fresh => StopDaemon,
+        });
     }
 
     ActionMenuState::new(scoped, actions, context)
@@ -6832,7 +8008,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             // macOS refuses this rotation (`runtime::rotation_blocked_for`), so
             // say why up front instead of arming a confirm that no-ops.
             Some((name, true, _)) if crate::runtime::rotation_blocked_for(&name) => {
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
                     detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
                     choice: true,
@@ -6840,7 +8016,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                 }));
             }
             Some((name, true, _)) => {
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
@@ -6860,6 +8036,8 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             toggle_focused_account_disabled(app);
         }
         ActionMenuAction::OpenProviderConsole => open_provider_console(app),
+        ActionMenuAction::StartDaemon => start_daemon(app),
+        ActionMenuAction::StopDaemon => stop_daemon(app),
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),
@@ -6876,6 +8054,110 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
         ActionMenuAction::TokensShowOthers => set_token_filter(app, TokenFilter::Others),
         ActionMenuAction::ToggleCountCache => toggle_count_cache(app),
         ActionMenuAction::ReloadTokenStats => reload_token_stats(app),
+    }
+}
+
+/// Where the daemon's start and stop toasts send the user when either fails.
+const DAEMON_LOG_HINT: &str = "see ~/.clauth/daemon.log";
+
+/// The action menu's `start daemon`: spawn `<this binary> daemon` detached,
+/// then report, off the UI thread, whether a daemon came up. The worker stays
+/// to reap the child, so a daemon this TUI started and stops never lingers as
+/// a zombie while the TUI runs.
+fn start_daemon(app: &mut App) {
+    let exe = match daemon_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+            return;
+        }
+    };
+    let tx = app.daemon_control_tx.clone();
+    app.daemon_control_busy = true;
+    app.toast(ToastKind::Info, "starting daemon");
+    spawn_worker(move || match crate::daemon::spawn_detached(&exe) {
+        Ok(mut child) => {
+            let outcome = crate::daemon::await_start(
+                &mut child,
+                crate::daemon::START_WAIT,
+                DAEMON_CONTROL_POLL,
+            );
+            let _ = tx.send(DaemonControlResult::Start(Ok(outcome)));
+            let _ = child.wait();
+        }
+        Err(e) => {
+            let _ = tx.send(DaemonControlResult::Start(Err(format!("{e:#}"))));
+        }
+    });
+}
+
+/// The binary `start daemon` runs: this one, as installed. A test build's
+/// binary is the test harness, which would take `daemon` as a filter and run
+/// the suite's daemon tests as its "daemon", so a test build refuses.
+fn daemon_exe() -> std::io::Result<std::path::PathBuf> {
+    if cfg!(test) {
+        return Err(std::io::Error::other("a test build starts no daemon"));
+    }
+    std::env::current_exe().map(|exe| crate::platform::installed_exe_path(&exe))
+}
+
+/// The action menu's `stop daemon`: `--replace`'s termination, which can wait
+/// out two bounded passes, so it runs off the UI thread.
+fn stop_daemon(app: &mut App) {
+    let tx = app.daemon_control_tx.clone();
+    app.daemon_control_busy = true;
+    app.toast(ToastKind::Info, "stopping daemon");
+    spawn_worker(move || {
+        let outcome = crate::daemon::stop_running().map_err(|e| format!("{e:#}"));
+        let _ = tx.send(DaemonControlResult::Stop(outcome));
+    });
+}
+
+/// How often the start worker re-checks its child.
+const DAEMON_CONTROL_POLL: Duration = Duration::from_millis(50);
+
+/// Toast each daemon start/stop outcome, re-arm the menu's verb, and re-probe
+/// the header chip at once rather than at the next throttled probe.
+fn drain_daemon_control(app: &mut App) {
+    use crate::daemon::{DaemonStop, StartOutcome};
+    while let Ok(result) = app.daemon_control_rx.try_recv() {
+        app.daemon_control_busy = false;
+        match result {
+            DaemonControlResult::Start(Ok(StartOutcome::Holding)) => {
+                app.toast(ToastKind::Success, "daemon started");
+            }
+            DaemonControlResult::Start(Ok(StartOutcome::Exited)) => app.toast(
+                ToastKind::Danger,
+                format!("daemon exited at start\n{DAEMON_LOG_HINT}"),
+            ),
+            DaemonControlResult::Start(Ok(StartOutcome::NotYet)) => app.toast(
+                ToastKind::Warning,
+                format!(
+                    "daemon not up after {}s\n{DAEMON_LOG_HINT}",
+                    crate::daemon::START_WAIT.as_secs()
+                ),
+            ),
+            DaemonControlResult::Start(Err(e)) => {
+                app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+            }
+            DaemonControlResult::Stop(Ok(DaemonStop::Stopped)) => {
+                app.toast(ToastKind::Success, "daemon stopped");
+            }
+            DaemonControlResult::Stop(Ok(DaemonStop::NotRunning)) => {
+                app.toast(ToastKind::Info, "no daemon was running");
+            }
+            DaemonControlResult::Stop(Ok(DaemonStop::Replaced)) => {
+                app.toast(
+                    ToastKind::Warning,
+                    "daemon stopped\nanother daemon took over",
+                );
+            }
+            DaemonControlResult::Stop(Err(e)) => {
+                app.toast(ToastKind::Danger, format!("daemon stop failed\n{e}"));
+            }
+        }
+        app.daemon_health = crate::daemon::daemon_health();
+        app.last_daemon_probe = Instant::now();
     }
 }
 
@@ -6995,11 +8277,6 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     if !is_api {
         rows.push(ConfigRow::AutoStart);
     }
-    // The day list keeps auto-start company: the two rows on this card that
-    // change how the CHAIN treats the account, above the endpoint/model rows
-    // that describe what it talks to. Existing accounts only — same rule the
-    // env rows follow, and the `+ new` form has no chain seat to claim from yet.
-    rows.push(ConfigRow::PreferredDays);
     rows.push(ConfigRow::BaseUrl);
     if is_api {
         rows.push(ConfigRow::ApiKey);
@@ -7112,7 +8389,6 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
     ConfigDraft {
         editing_name: None,
         name: InputState::new(""),
-        preferred_days: InputState::new(""),
         base_url: InputState::new(""),
         api_key: InputState::new(""),
         model: InputState::new(""),
@@ -7139,7 +8415,6 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
     ConfigDraft {
         editing_name: Some(name.to_string()),
         name: InputState::new(name),
-        preferred_days: InputState::new(&preferred_days_buffer(profile)),
         base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
         api_key: InputState::new(profile.and_then(|p| p.api_key.as_deref()).unwrap_or("")),
         model: InputState::new(m.default.as_deref().unwrap_or("")),
@@ -7320,7 +8595,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
             if mint_stashed {
                 // The browser round-trip a mint cost can't be redone for free;
                 // gate replacing it, mirroring the re-login gate above.
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: "replace the logged-in mint?".to_string(),
                     detail: Some(
                         "the browser login you already captured will be dropped".to_string(),
@@ -7350,7 +8625,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 } else {
                     "blanks the login; keeps the account, model, env, and chain slot. re-login any time."
                 };
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
@@ -7754,7 +9029,7 @@ fn begin_oauth_login(app: &mut App, name: String, is_new: bool) {
         .as_ref()
         .is_some_and(|d| d.captured_login.is_some());
     if has_stash {
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: "replace the captured login?".to_string(),
             detail: Some("the login you already captured will be dropped".to_string()),
             choice: false,
@@ -7848,7 +9123,7 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
 /// Show the login progress modal (no-op when already open).
 fn open_login_modal(app: &mut App) {
     if !app.modals.iter().any(|m| matches!(m, Modal::Login)) {
-        app.modals.push(Modal::Login);
+        app.open_modal(Modal::Login);
     }
 }
 
@@ -7984,22 +9259,11 @@ fn cancel_just_added_env(app: &mut App, name: &ProfileName, key: &str) {
     }
 }
 
-/// A profile's day list as the editor shows it: the canonical lowercase
-/// three-letter names, comma-separated. One spelling for the seed, the ⎋
-/// revert and the post-commit reseed, so `Saturday, SUN` settles to `sat, sun`
-/// in the field exactly as it settles on disk.
-fn preferred_days_buffer(profile: Option<&Profile>) -> String {
-    profile
-        .map(|p| crate::profile::render_preferred_days(&p.preferred_days).join(", "))
-        .unwrap_or_default()
-}
-
 /// The persisted value behind a buffered row, used to revert on ⎋ and to reseed
 /// the buffer after a commit. Toggle/action rows have no buffer → empty string.
 fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: ConfigRow) -> String {
     match row {
         ConfigRow::Name => name.to_string(),
-        ConfigRow::PreferredDays => preferred_days_buffer(profile),
         ConfigRow::BaseUrl => profile.and_then(|p| p.base_url.clone()).unwrap_or_default(),
         ConfigRow::ApiKey => profile.and_then(|p| p.api_key.clone()).unwrap_or_default(),
         ConfigRow::Model => profile
@@ -8052,7 +9316,6 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
     }
     match field {
         ConfigRow::Name => commit_rename(app),
-        ConfigRow::PreferredDays => commit_preferred_days(app),
         ConfigRow::BaseUrl | ConfigRow::ApiKey => commit_endpoint(app),
         ConfigRow::Model
         | ConfigRow::OpusModel
@@ -8067,80 +9330,6 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
                 d.active = None;
             }
         }
-    }
-}
-
-/// ⏎ on the day row: parse the typed list, persist it, then reseed the buffer
-/// from the saved value so the canonical spelling lands in the field.
-///
-/// An entry that does not parse leaves the editor OPEN with the typing intact
-/// — the loader drops a bad entry because a file nobody is watching must still
-/// load, but here the operator is standing at the field and can fix it.
-///
-/// A saved list on an account the chain walk would skip claims nothing
-/// (`AppConfig::is_home_on` lets only members the claim scan reaches claim), so
-/// the save is followed by the reason. Saved rather than refused because the
-/// state is reachable without this row — a list goes inert when the account
-/// later leaves the chain or its login breaks — and a row that quietly does
-/// nothing is worse than one that says why.
-fn commit_preferred_days(app: &mut App) {
-    let Some(name) = app
-        .config_draft
-        .as_ref()
-        .and_then(|d| d.editing_name.clone())
-        .map(ProfileName::from)
-    else {
-        return;
-    };
-    let raw = app
-        .config_draft
-        .as_ref()
-        .and_then(|d| d.field(ConfigRow::PreferredDays))
-        .map(|i| i.trimmed().to_string())
-        .unwrap_or_default();
-    let days = match crate::profile::parse_day_list(&raw) {
-        Ok(days) => days,
-        Err(bad) => {
-            app.toast(
-                ToastKind::Danger,
-                format!("'{bad}' is not a weekday\nuse sat, sun — or saturday, sunday"),
-            );
-            return;
-        }
-    };
-    let claims = !days.is_empty();
-    let result = {
-        let mut cfg = app.config();
-        crate::actions::edit_profile_preferred_days(&mut cfg, &name, days)
-    };
-    match result {
-        Ok(()) => {
-            let (value, blocker) = {
-                let cfg = app.config();
-                (
-                    preferred_days_buffer(cfg.find(&name)),
-                    claims
-                        .then(|| crate::fallback::day_claim_blocker(&cfg, &name))
-                        .flatten(),
-                )
-            };
-            if let Some(d) = app.config_draft.as_mut() {
-                if let Some(input) = d.field_mut(ConfigRow::PreferredDays) {
-                    *input = InputState::new(&value);
-                }
-                d.active = None;
-            }
-            if let Some(reason) = blocker {
-                app.toast(
-                    ToastKind::Warning,
-                    format!(
-                        "saved, but this list claims nothing: {reason}\nthe chain decides those \
-                         days without this account"
-                    ),
-                );
-            }
-        }
-        Err(e) => app.toast(ToastKind::Danger, format!("home days update failed\n{e}")),
     }
 }
 
@@ -8205,7 +9394,6 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         // `ConfigRow` variant fails the build instead of a silent no-op.
         ConfigRow::Name
         | ConfigRow::AutoStart
-        | ConfigRow::PreferredDays
         | ConfigRow::BaseUrl
         | ConfigRow::ApiKey
         | ConfigRow::ModelOverrideAdd
@@ -8424,7 +9612,7 @@ fn commit_env_new_key(app: &mut App) {
         d.active = None;
     }
     match collision {
-        Some(c) => app.modals.push(Modal::EnvCollision(env_collision_form(
+        Some(c) => app.open_modal(Modal::EnvCollision(env_collision_form(
             name.to_string(),
             key,
             c,
@@ -8614,6 +9802,51 @@ fn commit_rename(app: &mut App) {
     }
 }
 
+/// Drop one profile's name-keyed fetch-status + streak chrome — the shared
+/// clear every credential-replacing path runs: a repaired or repointed
+/// credential retires the old provider's verdicts, so the next frame
+/// must read no stale `[ key rejected ]` pill and the throttler attribution
+/// cannot accuse the new endpoint with the old provider's streak. The OAuth
+/// fetch status joins them because the render merges it over the third-party
+/// one — either left standing would still read as the stale verdict. The
+/// config handle's `Profile.fetch_status` copy retires with them: that copy
+/// is the render's read, and only the next tick's `apply_usage` refreshes it
+/// from the cleared stores, so the pre-tick frame would flash the retired
+/// pill without it. The handle write is unconditional: a poison-skipped
+/// clear keeps its store entry, but that entry is dead weight — `apply_usage`
+/// reads these stores with `.lock().ok()` and skips a poisoned one, so the
+/// next tick can never re-copy it. `None` here is the stable outcome in
+/// every poison placement; a gated write would strand the stale pill on the
+/// handle indefinitely where the skipped store is the merge's third-party
+/// fallback (the OAuth arm's cleared entry misses `contains_key`, the
+/// poisoned fallback reads as `None`, and nothing rewrites the field).
+fn clear_profile_status_chrome(app: &App, name: &ProfileName) {
+    if let Ok(mut m) = app.third_party_status.lock() {
+        m.remove(name.as_str());
+    }
+    if let Ok(mut m) = app.third_party_streaks.lock() {
+        m.remove(name.as_str());
+    }
+    if let Ok(mut m) = app.usage_status.lock() {
+        m.remove(name.as_str());
+    }
+    // All three store guards are dropped above, so this keeps the documented
+    // order (stores 280/290/350 before Config 400). The write is the outcome
+    // the store→handle sync in `apply_usage` would derive from the cleared
+    // stores (OAuth entry, else third-party entry, else None) — written in
+    // place, since re-reading the stores under the config guard would invert
+    // that order. And unconditional: a poison-skipped clear leaves its entry
+    // in a store `apply_usage` skips (`.lock().ok()`), so the entry is dead
+    // weight and `None` is stable in every placement — a gated write would
+    // strand the stale pill where the skipped store is the merge's
+    // third-party fallback (the OAuth arm misses, the poisoned arm reads as
+    // `None`, nothing rewrites the handle).
+    let mut cfg = app.config();
+    if let Some(p) = cfg.find_mut(name) {
+        p.fetch_status = None;
+    }
+}
+
 fn commit_endpoint(app: &mut App) {
     let Some(d) = app.config_draft.as_ref() else {
         return;
@@ -8635,6 +9868,12 @@ fn commit_endpoint(app: &mut App) {
     };
     match result {
         Ok(()) => {
+            // Re-collect the token and third-party entries so the fetch leg
+            // schedules the re-keyed credential's first fetch same-frame. The
+            // rejection verdict reads the AppConfig profile fingerprint, never
+            // this list, so a stale entry cannot keep the name key-rejected.
+            app.refresh_tokens();
+            clear_profile_status_chrome(app, &name);
             // Reseed from the saved profile (API key may have been dropped).
             let (base, key) = {
                 let cfg = app.config();
@@ -8748,7 +9987,7 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
     // forward. Confirm the deauth risk instead of attempting (and failing)
     // the unforced delete first.
     if crate::runtime::has_live_session(name) {
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: format!("delete '{name}' anyway?"),
             detail: Some(
                 "this account has a live clauth start session; deleting it may log that \
@@ -8812,7 +10051,7 @@ fn toggle_focused_account_disabled(app: &mut App) {
         toggle_profile_disabled(app, &name);
         return;
     }
-    app.modals.push(Modal::Confirm(ConfirmState {
+    app.open_modal(Modal::Confirm(ConfirmState {
         message: format!("disable '{name}'?"),
         detail: Some(DISABLE_DETAIL.to_string()),
         choice: false,
@@ -8828,7 +10067,7 @@ fn prompt_duplicate_profile(app: &mut App) {
     let Some((name, _, _)) = focused_account(app) else {
         return;
     };
-    app.modals.push(Modal::NamePrompt(NamePromptForm {
+    app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
         action: NamePromptAction::DuplicateProfile(name.to_string()),
     }));
@@ -8839,7 +10078,7 @@ fn prompt_save_preset(app: &mut App) {
     let Some((name, _, _)) = focused_account(app) else {
         return;
     };
-    app.modals.push(Modal::NamePrompt(NamePromptForm {
+    app.open_modal(Modal::NamePrompt(NamePromptForm {
         input: InputState::new(""),
         action: NamePromptAction::SavePreset(name.to_string()),
     }));
@@ -8863,7 +10102,7 @@ fn open_preset_picker(app: &mut App) {
     } else {
         return;
     };
-    app.modals.push(Modal::PresetPicker(PresetPickerForm {
+    app.open_modal(Modal::PresetPicker(PresetPickerForm {
         target,
         presets: crate::presets::list_presets(),
         cursor: 0,
@@ -8917,7 +10156,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                     }
                     app.modals.pop();
                     if crate::presets::preset_exists(&name) {
-                        app.modals.push(Modal::Confirm(ConfirmState {
+                        app.open_modal(Modal::Confirm(ConfirmState {
                             message: format!("preset '{name}' already exists."),
                             detail: Some(
                                 "overwrite it with this account's base url and model settings?"
@@ -8974,7 +10213,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 return;
             }
             app.modals.pop();
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
@@ -9000,7 +10239,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 apply_preset_to(app, &target, &preset.name);
                 return;
             }
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("apply '{}' over '{target}'?", preset.name),
                 detail: Some(format!("replaces {}.", clobbered.join(", "))),
                 choice: false,
@@ -9073,6 +10312,9 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            // The repoint retires the old provider's verdicts — the shared
+            // clear keeps its streak from accusing the new endpoint.
+            clear_profile_status_chrome(app, &target);
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
                 app.config_draft = Some(build_draft_existing(app, &target));
@@ -9169,11 +10411,11 @@ fn duplicate_profile_into(app: &mut App, source: &ProfileName, new_name: &Profil
 /// Flip `name`'s `Profile::disabled` flag (Setup `disabled` row). Inert while
 /// `name` is the active profile or holds a live `clauth start` session — the
 /// same gate `actions::disable_profile` itself enforces, checked here TOO so
-/// the row stays truly inert (silent no-op, matching the dimmed-row cloudy-
-/// tui contract): `disable_profile`'s own refusal is a real `bail!`, and
-/// without this early return every press would surface a red danger toast
-/// instead of doing nothing, which is what a dimmed/disabled row is supposed
-/// to mean. `disable_profile`/`enable_profile` persist into the live shared
+/// the row stays truly inert (silent no-op, matching the dimmed-row rule):
+/// `disable_profile`'s own refusal is a real `bail!`, and without this early
+/// return every press would surface a red danger toast instead of doing
+/// nothing, which is what a dimmed/disabled row is supposed to mean.
+/// `disable_profile`/`enable_profile` persist into the live shared
 /// `AppConfig` directly (`app.config()`), so the flip renders next frame with
 /// no reload round-trip; `refresh_tokens` rebuilds the scheduler's per-profile
 /// work lists (`collect_tokens`/`collect_third_party_entries` both filter on
@@ -9283,7 +10525,7 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
 
 /// Run `crate::herdr::heal` with the knob the state now holds and surface the
 /// outcome: success, non-empty refusal notes (warning), or failure (danger).
-/// Shared by the `[f]` fix and the `delegate row text` options row — the knob
+/// Shared by the heal fix and the `delegate row text` options row — the knob
 /// rides the heal the way `install` reads it, so the row written matches the
 /// `delegate_row_text` set in the TUI.
 fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
@@ -9306,7 +10548,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                     if delegate_row_text { "on" } else { "off" }
                 ),
             );
-            recompute_plugin_checks(app, false);
+            recompute_services_checks(app, false);
         }
         Ok(notes) => {
             // Non-empty notes = pieces clauth refused to touch (a table it
@@ -9316,7 +10558,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                 ToastKind::Warning,
                 format!("herdr's config needs attention\n{}", notes.join("\n")),
             );
-            recompute_plugin_checks(app, false);
+            recompute_services_checks(app, false);
         }
         Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
     }
@@ -9325,7 +10567,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
         ConfirmAction::CaptureConflict(snapshot, from_divergence) => {
-            app.modals.push(Modal::CaptureName(CaptureNameForm {
+            app.open_modal(Modal::CaptureName(CaptureNameForm {
                 snapshot,
                 input: InputState::new(""),
                 from_divergence,
@@ -9352,6 +10594,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    clear_profile_status_chrome(app, &name);
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -9399,6 +10642,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    clear_profile_status_chrome(app, &name);
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(
@@ -9482,24 +10726,9 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.toast(ToastKind::Success, "wired clauth into ~/.claude.json");
                     // Reflect the new wiring in the rows without a fresh version probe.
-                    recompute_plugin_checks(app, false);
+                    recompute_services_checks(app, false);
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
-            }
-        }
-        ConfirmAction::RelinkCredentials(name) => {
-            let name = ProfileName::from(name);
-            match force_link_profile_credentials(&name) {
-                Ok(()) => {
-                    app.refresh_tokens();
-                    app.refresh_unsaved_live_login();
-                    app.toast(
-                        ToastKind::Success,
-                        format!("relinked credentials to '{name}'"),
-                    );
-                    recompute_plugin_checks(app, false);
-                }
-                Err(e) => app.toast(ToastKind::Danger, format!("relink failed\n{e}")),
             }
         }
         ConfirmAction::HealHerdrConfig(path) => run_herdr_heal(app, &path),
@@ -9526,7 +10755,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     ToastKind::Warning,
                     "plugin install made no changes\ninstall claude code first, then try again",
                 );
-                recompute_plugin_checks(app, false);
+                recompute_services_checks(app, false);
             }
             // Installed / Repaired / Adopted / Updated, or anything agentgear
             // adds later: a real change happened, so the success toast is
@@ -9535,7 +10764,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Ok(outcome) => {
                 app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
                 // Reflect the fresh install in the rows without a version probe.
-                recompute_plugin_checks(app, false);
+                recompute_services_checks(app, false);
             }
             Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
         },
@@ -9555,6 +10784,10 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             match result {
                 Ok(()) => {
                     app.refresh_tokens();
+                    // No leg ever fetches a keyless profile, so a stale
+                    // `[ key rejected ]` verdict would render forever — the
+                    // shared clear retires it with the credential.
+                    clear_profile_status_chrome(app, &name);
                     app.last_reload_fp = reload_fingerprint();
                     app.refresh_unsaved_live_login();
                     app.toast(ToastKind::Success, format!("logged out of '{name}'"));
@@ -9623,7 +10856,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                     let Some(snapshot) = capture_live_or_toast(app) else {
                         return;
                     };
-                    app.modals.push(Modal::Confirm(ConfirmState {
+                    app.open_modal(Modal::Confirm(ConfirmState {
                         message: format!("switch to '{owner}'? the live login is its account."),
                         detail: Some(format!(
                             "the login is saved into '{owner}' and '{owner}' becomes the active \
@@ -9656,6 +10889,14 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 return;
             }
             app.refresh_tokens();
+            // The live login replaced the stored credential, so the old
+            // credential's verdicts must not survive it — the shared clear,
+            // not a wait for the next OAuth fetch.
+            clear_profile_status_chrome(app, &ProfileName::from(active));
+            // AUTH-1: the fresh login is the documented recovery for a revoked
+            // chain, so a standing auth_broken quarantine is stale — same lift
+            // every sibling fresh-login path runs.
+            oauth::mark_auth_broken(&app.config, &ProfileName::from(active), false);
             app.toast(
                 ToastKind::Success,
                 format!("saved live credentials into '{active}'"),
@@ -9663,7 +10904,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
         }
         DivergenceChoice::NewProfile => open_divergence_target_picker(app),
         DivergenceChoice::Discard => {
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("discard the new login and restore '{active}'?"),
                 detail: Some(
                     "claude code's freshly written credentials will be overwritten with the account's stored tokens.".to_string(),
@@ -9767,7 +11008,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             // it; an OAuth-active one fills neither and the preserve arm keeps
             // the target's. The outcome turns on an account this prompt is not
             // about, so it promises nothing about either field.
-            app.modals.push(Modal::Confirm(ConfirmState {
+            app.open_modal(Modal::Confirm(ConfirmState {
                 message: format!("save the live login into '{target}'?"),
                 detail: Some(format!(
                     "'{target}' becomes the active account; its old credentials are replaced. usage history, env, and model settings are kept."
@@ -9820,7 +11061,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                 // Issue #7: typing an existing profile's name used to dead-end
                 // with an error. Route to the same confirm-modal machinery as
                 // every other destructive action instead of a picker/new modal.
-                app.modals.push(Modal::Confirm(ConfirmState {
+                app.open_modal(Modal::Confirm(ConfirmState {
                     message: format!("account '{existing}' already exists."),
                     detail: Some(
                         "overwrite its credentials with the captured login? usage history, env, and model settings are kept.".to_string(),
@@ -10149,7 +11390,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
             .config()
             .find(&ProfileName::from(session.name.clone()))
             .is_some_and(crate::claude::has_own_inference_endpoint);
-        app.modals.push(Modal::Confirm(ConfirmState {
+        app.open_modal(Modal::Confirm(ConfirmState {
             message: format!("replace the stored credentials for '{}'?", session.name),
             detail: Some(
                 if keeps_endpoint {
@@ -10171,6 +11412,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
     match result {
         Ok(()) => {
             app.refresh_tokens();
+            clear_profile_status_chrome(app, &ProfileName::from(session.name.clone()));
             app.last_reload_fp = reload_fingerprint();
             app.refresh_unsaved_live_login();
             app.toast(ToastKind::Success, format!("logged in '{}'", session.name));
@@ -10233,8 +11475,11 @@ fn apply_console_login(
         Ok(()) => {
             // The stored session is what the usage leg fetches with, and
             // `store_console_login` drops the cache the old one filled, so ask
-            // for the figures the new one can actually read.
+            // for the figures the new one can actually read. The stale
+            // `console login expired` verdict goes with the old session via
+            // the shared clear — it must not survive until the queued fetch.
             app.refresh_tokens();
+            clear_profile_status_chrome(app, &name);
             app.manual_refresh_one(&name);
             // The window is the surprising part and the CLI's own summary leads
             // with it: the 48h runs from the aliyun browser sign-in, so a login
@@ -10283,13 +11528,13 @@ pub(crate) fn on_tick(app: &mut App) {
 
     drain_switch_gates(app);
 
-    let auto_switch_targets: Vec<String> = app
+    let auto_switch_targets: Vec<PendingSwitchTarget> = app
         .pending_switch
         .lock()
         .map(|mut g| g.drain().collect())
         .unwrap_or_default();
-    for name in auto_switch_targets {
-        let name = ProfileName::from(name);
+    for decision in auto_switch_targets {
+        let name = ProfileName::from(decision.target.clone());
         if switch_gate_in_flight(&app.activity) || !is_idle(&app.activity, &name) {
             continue;
         }
@@ -10299,7 +11544,23 @@ pub(crate) fn on_tick(app: &mut App) {
         // can also land here when the preferred is the only clear member left —
         // both are genuinely "now on home", so the destination-based label holds
         // without threading the cause through `SwitchAction`.
-        let returning = app.config().is_home_today(&name);
+        let key_rejected = app.key_rejected_names();
+        // Revalidate under the fresh config (reloaded above). Only a record that
+        // CARRIES a key-rejection cause can be stale: a repair landing between
+        // the scan's queue and this dispatch changes the active's fingerprint, so
+        // the switch-away it motivated is dropped instead of moving off the
+        // just-repaired account. A cause-absent (ordinary exhaustion/home) record
+        // executes even beside an ambient stale mark.
+        {
+            let cfg = app.config();
+            if crate::usage::queued_switch_away_is_stale(
+                decision.key_rejected_cause.as_ref(),
+                &cfg.profiles,
+            ) {
+                continue;
+            }
+        }
+        let returning = app.config().is_home_today(&name, &key_rejected);
         let msg = if returning {
             format!("returning to preferred account '{name}'")
         } else {
@@ -10316,11 +11577,12 @@ pub(crate) fn on_tick(app: &mut App) {
     maybe_spawn_bootstrap(app);
 
     poll_credentials_divergence(app);
-    // Before the plugin refresh, which folds the tally into its runtime row and
-    // would otherwise render this tick against the previous one's fleet.
     poll_live_sessions(app);
+    sync_broken_verdicts(app);
     poll_codex_rows(app);
-    poll_plugin_refresh(app);
+    drain_service_probes(app);
+    poll_services_refresh(app);
+    drain_daemon_control(app);
     poll_daemon_health(app);
 
     warn_day_claim_notices(app);
@@ -10339,7 +11601,8 @@ pub(crate) fn on_tick(app: &mut App) {
 /// Dropping a notice out of the set is what lets the same state, removed and
 /// re-introduced, warn again.
 pub(crate) fn warn_day_claim_notices(app: &mut App) {
-    let notices = app.config().day_claim_notices_today();
+    let key_rejected = app.key_rejected_names();
+    let notices = app.config().day_claim_notices_today(&key_rejected);
     if notices == app.day_claim_notices {
         return;
     }
@@ -10373,9 +11636,9 @@ fn poll_codex_rows(app: &mut App) {
     app.codex_rows = codex_rows();
 }
 
-/// Re-probe the daemon presence + `status.json` health for the `● daemon`
-/// header dot, at most once a second (a flock try-lock + `status.json` read is
-/// cheap but not free, and the dot changes on a human timescale).
+/// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
+/// header chip, at most once a second (a flock try-lock + `status.json` read is
+/// cheap but not free, and the chip changes on a human timescale).
 fn poll_daemon_health(app: &mut App) {
     const DAEMON_PROBE_INTERVAL: Duration = Duration::from_secs(1);
     if app.last_daemon_probe.elapsed() < DAEMON_PROBE_INTERVAL {
@@ -10386,10 +11649,10 @@ fn poll_daemon_health(app: &mut App) {
 }
 
 /// Re-tally the live-session registry for the Overview `live` column, the
-/// Fallback member card and the Plugin tab's `runtime` row, at most once a
-/// second — a readdir plus an `open` + `try_lock` per row is cheap but not
-/// per-frame cheap, and a session starting or exiting is a human-timescale
-/// event. Ungated by tab: all three read it, and a snapshot a second stale on
+/// Fallback member card and the header's fleet count, at most once a second —
+/// a readdir plus an `open` + `try_lock` per row is cheap but not per-frame
+/// cheap, and a session starting or exiting is a human-timescale event. Ungated
+/// by tab: the header reads it on every tab, and a snapshot a second stale on
 /// arrival would show the wrong fleet for that second.
 fn poll_live_sessions(app: &mut App) {
     const LIVE_SESSIONS_INTERVAL: Duration = Duration::from_secs(1);
@@ -10404,21 +11667,104 @@ fn poll_live_sessions(app: &mut App) {
     app.live_sessions = tally;
 }
 
-/// Plugin tab live refresh: re-run the cheap local checks (session counts + link
-/// state) at most once per interval while the tab is focused and no modal is open,
-/// so a session started elsewhere shows up without a manual `r`. Never re-probes
-/// `claude --version` or `clauth mcp` — both stay `r`-gated.
-fn poll_plugin_refresh(app: &mut App) {
-    const PLUGIN_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`
+/// mirror, at most once a second, gated per profile on the record's stat (an
+/// mtime move, or the file appearing/disappearing). This is the stood-down
+/// TUI's heal path: the fetcher (another process) clears or rewrites
+/// `third_party_auth.json` under a credential the local mirror still marks,
+/// and the config never changes, so the reload seed cannot see it. Both
+/// directions ride the same stat walk — a record appearing seeds the name, a
+/// record gone drops it. The seed's own shape gate
+/// (`fallback::third_party_key_rejected`) is the ONE gate the insert branch
+/// runs: a `ConsoleExpired` outcome also writes the record under a
+/// still-matching fingerprint, and a lapsed Alibaba console session is
+/// usage-only — it must never render as key-rejected, so a profile the
+/// predicate refuses never inserts and any entry it already has drops. Reads
+/// the record only when the stat moved; the per-second cost is one stat per
+/// credentialed profile, the same discipline `poll_live_sessions` applies.
+fn sync_broken_verdicts(app: &mut App) {
+    const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+    if app
+        .last_broken_verdict_sync
+        .is_some_and(|t| t.elapsed() < SYNC_INTERVAL)
+    {
+        return;
+    }
+    app.last_broken_verdict_sync = Some(Instant::now());
 
-    if app.tab != Tab::Plugin || !app.modals.is_empty() {
+    // The credentialed profiles plus their fingerprints, collected under the
+    // config guard so the stat walk below is lock-free; the mirror lock (295)
+    // ranks outside Config (400), so the update happens after the guard drops.
+    // The clone carries what the shared shape predicate reads — the predicate
+    // itself is the gate, never a reimplementation of its fields.
+    let credentialed: Vec<(Profile, u64)> = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .filter_map(|p| {
+                crate::usage::profile_credential_fingerprint(p).map(|fp| (p.clone(), fp))
+            })
+            .collect()
+    };
+
+    let changed: Vec<(Profile, Option<std::time::SystemTime>, u64)> = credentialed
+        .into_iter()
+        .filter_map(|(profile, fp)| {
+            let name = profile.name.to_string();
+            let stat = crate::profile_cache::profile_cache_path(
+                &ProfileName::from(name.clone()),
+                crate::profile_cache::THIRD_PARTY_AUTH_FILE,
+            )
+            .as_deref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok());
+            // `Some(&stat)` doubles as the changed check: an unseen name has no
+            // entry (always "changed"), and a seen one skips while the stat
+            // matches — including two `None`s for a record that never existed.
+            if app.broken_verdict_mtimes.get(&name) == Some(&stat) {
+                return None;
+            }
+            Some((profile, stat, fp))
+        })
+        .collect();
+    if changed.is_empty() {
         return;
     }
-    if app.last_plugin_refresh.elapsed() < PLUGIN_REFRESH_INTERVAL {
+
+    if let Ok(mut broken) = app.third_party_broken.lock() {
+        for (profile, stat, fp) in changed {
+            // The insert branch runs the seed's own predicate: the record must
+            // match the credential the profile holds RIGHT NOW, on a profile
+            // shape that can be key-rejected at all. Everything the predicate
+            // refuses — a cleared record, a re-keyed one, or a lapsed Alibaba
+            // console session — drops the entry.
+            if crate::fallback::third_party_key_rejected(&profile, &profile.name) {
+                broken.insert(profile.name.to_string(), fp);
+            } else {
+                broken.remove(profile.name.as_str());
+            }
+            app.broken_verdict_mtimes
+                .insert(profile.name.to_string(), stat);
+        }
+    }
+}
+
+/// Services tab live refresh: re-run the cheap local reads (job store, wiring,
+/// herdr config) at most once per interval while the tab is focused and no
+/// modal is open, so a delegate started elsewhere shows up without a manual
+/// `r`. Never re-probes `claude --version` or `clauth mcp` — both stay
+/// `r`-gated.
+fn poll_services_refresh(app: &mut App) {
+    const SERVICES_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+    if app.tab != Tab::Services || !app.modals.is_empty() {
         return;
     }
-    app.last_plugin_refresh = Instant::now();
-    recompute_plugin_checks(app, false);
+    if app.last_services_refresh.elapsed() < SERVICES_REFRESH_INTERVAL {
+        return;
+    }
+    app.last_services_refresh = Instant::now();
+    recompute_services_checks(app, false);
 }
 
 /// Recompute the sticky banner from current app state. Called every tick.
@@ -10632,6 +11978,10 @@ fn poll_credentials_divergence(app: &mut App) {
         match result {
             Ok(()) => {
                 app.refresh_tokens();
+                // AUTH-1: an adopted first login is a fresh login — lift a
+                // standing auth_broken quarantine like the sibling fresh-login
+                // paths do.
+                oauth::mark_auth_broken(&app.config, &active, false);
                 app.last_reload_fp = reload_fingerprint();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));

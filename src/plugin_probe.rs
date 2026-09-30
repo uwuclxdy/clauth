@@ -1,10 +1,10 @@
-//! Local-read probes backing the Plugin tab: binary-on-`PATH` resolution, Claude
+//! Local-read probes backing the Services tab: binary-on-`PATH` resolution, Claude
 //! Code's plugin registry (`installed_plugins.json` / `known_marketplaces.json`),
 //! the manual `mcpServers` wiring, the `claude --version` string, and the one
 //! safe write the tab performs (wire `mcpServers.clauth`).
 //!
 //! Everything here is a cheap filesystem/`PATH` read except [`cc_version`], which
-//! runs one short subprocess; the Plugin tab caches that result. Nothing spawns a
+//! runs one short subprocess; the Services tab caches that result. Nothing spawns a
 //! background thread. All path reads route through the test-overridable
 //! `home_dir()` / `claude_dir()`, so the inline tests can sandbox `$HOME`.
 
@@ -43,14 +43,14 @@ pub(crate) fn on_path(binary: &str) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 

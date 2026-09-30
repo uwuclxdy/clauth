@@ -1344,12 +1344,22 @@ fn a_panicking_oauth_worker_records_failed_status() {
 }
 
 /// Third-party twin: the join loop's panic arm records Failed in the provider
-/// status store.
+/// status store AND clears the live broken mark — a panicked worker produced no
+/// key-rejection, so a pre-seeded mark must not survive to keep a recovered
+/// member chain-broken.
 #[test]
 fn a_panicking_third_party_worker_records_failed_status() {
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["boom"]);
     let state = third_party_state(|_, _, _| panic!("simulated provider worker panic"));
+    state
+        .third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert(
+            "boom".to_string(),
+            tp_entry("boom").credential_fingerprint(),
+        );
 
     fetch_third_party_due(&state, vec![tp_entry("boom")]);
 
@@ -1361,6 +1371,14 @@ fn a_panicking_third_party_worker_records_failed_status() {
         status.get("boom"),
         Some(&super::FetchStatus::Failed),
         "a panicked provider worker records Failed"
+    );
+    assert!(
+        !state
+            .third_party_broken
+            .lock()
+            .expect("broken store unpoisoned")
+            .contains_key("boom"),
+        "a panic clears the live broken mark — no key rejection was observed"
     );
 }
 
@@ -2989,6 +3007,124 @@ fn run_fetch_consumes_the_weekly_reset_mark_only_on_a_fired_kick() {
     );
 }
 
+/// The scheduler's own record of a window exhaustion, wire to grade: `run_fetch`
+/// kicks, a real exhaustion 429 comes back (`testutil::window_exhaustion_429_headers`),
+/// and the block it records carries the limiter's `rejected` verdict and the
+/// window's reset; the next tick's kick re-tests the standing block, its 429
+/// makes the block switch-grade, and the fallback walk may move off the account.
+/// Covers the `note_kick_outcome` call site in `run_fetch`, the one place a kick
+/// block is recorded.
+#[test]
+fn run_fetch_records_a_window_exhaustion_429_as_a_switch_grade_block() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+
+    let home = crate::testutil::HomeSandbox::new();
+    let now_before = crate::usage::now_epoch_secs();
+    let reset = now_before + 6_073;
+    let limiter = crate::testutil::window_exhaustion_429_headers(reset, now_before + 383_473);
+    let usage_body = format!(
+        r#"{{"five_hour":{{"utilization":100.0,"resets_at":"{}"}}}}"#,
+        epoch_secs_to_iso(reset),
+    );
+    // `max` sits above the two kicks plus their fetches, so a stray rotation or
+    // a third kick would be recorded rather than refused a socket.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(8, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (429, limiter.clone(), String::new())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, Vec::new(), usage_body.clone())
+        } else if path.starts_with("/api/oauth/profile") {
+            (200, Vec::new(), "{}".to_string())
+        } else {
+            (404, Vec::new(), "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let app_config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![auto_start_queue_profile("a")],
+    };
+    let entry = super::collect_tokens(&app_config)
+        .into_iter()
+        .next()
+        .expect("queued token");
+    let config = Arc::new(RankedMutex::new(app_config));
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(reset)),
+            }),
+            ..UsageInfo::default()
+        },
+    )])));
+    let refetch = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity = Arc::new(RankedMutex::new(HashMap::new()));
+    let streaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let blocks: super::KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
+    // The weekly-reset mark makes the first tick kick on a live window; the
+    // block that kick records makes the second tick kick again.
+    let weekly_reset_kicks: super::WeeklyResetKicks =
+        Arc::new(RankedMutex::new(HashSet::from([ProfileName::from("a")])));
+    let queue = crate::usage::new_auto_start_queue_state();
+    let tick = |entry| {
+        let _ = super::run_fetch(
+            &config,
+            entry,
+            &store,
+            &refetch,
+            &activity,
+            &streaks,
+            &blocks,
+            &weekly_reset_kicks,
+            &HashSet::new(),
+            &queue,
+            REFRESH_INTERVAL_MS,
+        );
+    };
+    let a = ProfileName::from("a");
+
+    tick(entry.clone());
+    assert_eq!(
+        super::kick_block(&blocks, &a).map(|b| (b.streak, b.rejected, b.until)),
+        Some((1, true, Some(reset))),
+        "the first exhaustion 429 records the limiter's rejection and the window's reset"
+    );
+    assert!(
+        super::kick_rejected_names(&blocks, now_before).is_empty(),
+        "one exhaustion kick must not move the chain"
+    );
+
+    crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
+    tick(entry);
+    assert_eq!(
+        super::kick_block(&blocks, &a).map(|b| (b.streak, b.rejected, b.until)),
+        Some((2, true, Some(reset))),
+        "the re-test's 429 grows the same block"
+    );
+    assert_eq!(
+        super::kick_rejected_names(&blocks, crate::usage::now_epoch_secs()),
+        vec![a],
+        "the second exhaustion kick makes the block switch-grade"
+    );
+
+    let kicks: Vec<String> = server
+        .join()
+        .expect("listener")
+        .iter()
+        .map(|raw| crate::testutil::request_path(raw))
+        .filter(|path| path.starts_with("/v1/"))
+        .collect();
+    assert_eq!(
+        kicks,
+        vec!["/v1/messages?beta=true".to_string(); 2],
+        "one kick per tick and no token refresh"
+    );
+}
+
 /// The arming path production uses runs through the drain's config read: a
 /// FRESH rolled-over outcome arms the mark for the profile the CONFIG says is
 /// opted in. Guards the `(is_active, auto_start)` plumbing
@@ -3136,12 +3272,32 @@ fn kick_block_backoff_decays_toward_the_advertised_ceiling() {
 
 /// Only a switch-grade block moves the fallback chain: the limiter's own
 /// `rejected` verdict, ≥2 consecutive kicks, ceiling still ahead. Anything
-/// weaker gets the pill + backoff but never rotates accounts.
+/// weaker gets the pill + backoff but never rotates accounts. The block the
+/// scheduler folds from a window exhaustion's 429 metadata (what
+/// `a_captured_window_exhaustion_429_carries_the_limiters_rejection` hands
+/// back) crosses the line on its second kick, never its first.
 #[test]
 fn only_a_switch_grade_kick_block_rotates_the_chain() {
-    use super::{KickBlock, KickBlocks, kick_block_switch_grade, kick_rejected_names};
+    use super::{
+        KickBlock, KickBlocks, kick_block_after_429, kick_block_switch_grade, kick_rejected_names,
+    };
 
     let now = 3_000_000;
+    let exhausted = crate::oauth::KickRateLimit {
+        rejected: true,
+        until_epoch_secs: Some(now + 6_073),
+    };
+    let first = kick_block_after_429(None, &exhausted, now);
+    assert!(
+        !kick_block_switch_grade(&first, now),
+        "one exhaustion kick must not move the chain"
+    );
+    let second = kick_block_after_429(Some(first), &exhausted, now + 10);
+    assert!(
+        kick_block_switch_grade(&second, now + 10),
+        "a second exhaustion kick must be switch-grade"
+    );
+
     let grade = KickBlock {
         streak: 2,
         rejected: true,
@@ -3247,6 +3403,11 @@ fn kick_block_persists_and_clears_by_outcome() {
     assert_eq!(
         kick_block(&blocks, &crate::profile::ProfileName::from("kitty")).map(|b| b.streak),
         Some(2)
+    );
+    assert_eq!(
+        super::kick_rejected_names(&blocks, now + 30),
+        vec![crate::profile::ProfileName::from("kitty")],
+        "two 429s carrying the limiter's rejection make the block switch-grade"
     );
 
     // A fresh map (new process) resumes the persisted block…
@@ -3396,6 +3557,8 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &store,
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
@@ -3403,7 +3566,7 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &pending_off,
     );
     assert!(
-        pending.lock().unwrap().contains("b"),
+        pending.lock().unwrap().iter().any(|d| d.target == "b"),
         "a dead active must be walked away from without waiting for a Fresh read"
     );
 
@@ -3414,6 +3577,8 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
         &config_handle(false),
         &store,
         &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -3477,17 +3642,19 @@ fn scan_auto_switch_prefers_a_fresh_member_over_an_earlier_stale_one() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &pending,
         &Arc::new(RankedMutex::new(false)),
     );
     let queued = pending.lock().unwrap();
     assert!(
-        queued.contains("c"),
+        queued.iter().any(|d| d.target == "c"),
         "the scan must fill `fresh` so the walk prefers c's trusted read; queued: {:?}",
         *queued
     );
     assert!(
-        !queued.contains("b"),
+        !queued.iter().any(|d| d.target == "b"),
         "b is reached first but its read is Cached — walk order must not win"
     );
 }
@@ -3623,13 +3790,20 @@ fn scan_auto_switch_distrusts_a_deep_slot_stuck_rate_limited_active() {
             &store,
             &status,
             &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
             &streaks,
             &Arc::new(RankedMutex::new(HashMap::new())),
             &activity,
             &pending,
             &pending_off,
         );
-        let mut queued: Vec<String> = pending.lock().unwrap().iter().cloned().collect();
+        let mut queued: Vec<String> = pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.target.clone())
+            .collect();
         queued.sort();
         queued
     };
@@ -3718,6 +3892,40 @@ fn session_config(names: &[&str], active: Option<&str>) -> crate::profile::Confi
     }))
 }
 
+/// `session_config` plus a third-party credential (the same generic endpoint +
+/// key `tp_entry` uses) on the named profiles, so a key-rejected mark recorded
+/// against that credential's fingerprint intersects with the REAL config
+/// fingerprint the scan now reads.
+fn session_config_tp(
+    names: &[&str],
+    active: Option<&str>,
+    third_party: &[&str],
+) -> crate::profile::ConfigHandle {
+    use crate::profile::{AppConfig, AppState, Profile};
+    Arc::new(RankedMutex::new(AppConfig {
+        state: AppState {
+            active_profile: active.map(Into::into),
+            profiles: names.iter().map(|n| (*n).into()).collect(),
+            fallback_chain: names.iter().map(|n| (*n).into()).collect(),
+            ..AppState::default()
+        },
+        profiles: names
+            .iter()
+            .map(|n| {
+                if third_party.contains(n) {
+                    Profile::new(
+                        (*n).to_string(),
+                        Some("https://example.com".to_string()),
+                        Some("key".to_string()),
+                    )
+                } else {
+                    Profile::new((*n).to_string(), None, None)
+                }
+            })
+            .collect(),
+    }))
+}
+
 /// Live 5h windows at the given utilizations — a member at 100 is spent, one at 10
 /// has headroom.
 fn session_store(utils: &[(&str, f64)]) -> UsageStore {
@@ -3777,6 +3985,8 @@ fn scan_sessions_with_streaks(
         config,
         store,
         status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &Arc::new(RankedMutex::new(HashMap::new())),
         streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
@@ -4278,7 +4488,7 @@ fn an_isolated_session_gets_no_decision() {
 /// A Fresh `/usage` body fetched in the same tick as a kick can lag the
 /// just-opened window and still report it closed; `preserve_live_window` keeps
 /// the live window we already hold so it can't re-lapse and re-fire the kick.
-/// The carry is gated on kick provenance: only a window this process stamped
+/// The carry is gated on kick provenance: only a window a kick stamped
 /// (`open_at`) within `KICK_LAG_HORIZON_SECS` survives, and the stamp rides
 /// the merge so the next lagging tick re-derives the bound. A wire-sourced
 /// prev (`open_at: None`) or a kick past the horizon takes the fresh body
@@ -5197,6 +5407,8 @@ fn third_party_state_at_interval(
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -6519,6 +6731,8 @@ fn standdown_tick_drains_forced_and_publishes_countdowns() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -6612,6 +6826,8 @@ fn standdown_sweeps_bootstrap_queued_marks() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -6709,6 +6925,8 @@ fn tick_stands_down_when_another_instance_holds_the_fetch_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // A DIFFERENT lease over the same file → its acquire() is denied while
@@ -6812,6 +7030,8 @@ fn tick_fetches_the_third_party_leg_under_its_own_lease() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         // Nothing else holds the flock, so this tick is the fetcher.
@@ -6933,6 +7153,8 @@ fn tick_prunes_histories_and_throttles_a_second_tick_inside_the_cadence_window()
         third_party_tokens: Arc::new(RankedMutex::new(vec![entry])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -7045,6 +7267,8 @@ fn auto_start_queue_election_is_wired_into_tick() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -7642,6 +7866,8 @@ fn completion_order_state() -> super::SchedulerState {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -7923,7 +8149,10 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
     )])));
     let kick_blocks: KickBlocks = Arc::new(RankedMutex::new(HashMap::new()));
     let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::from([
-        "already-queued".to_string()
+        super::PendingSwitchTarget {
+            target: "already-queued".to_string(),
+            key_rejected_cause: None,
+        },
     ])));
 
     scan_recovery(
@@ -7933,11 +8162,15 @@ fn scan_recovery_is_a_no_op_while_a_switch_is_pending() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert_eq!(
         pending.lock().unwrap().clone(),
-        HashSet::from(["already-queued".to_string()]),
+        HashSet::from([super::PendingSwitchTarget {
+            target: "already-queued".to_string(),
+            key_rejected_cause: None,
+        }]),
         "a pending switch must be left untouched, not joined by a second target"
     );
 }
@@ -7962,6 +8195,7 @@ fn scan_recovery_is_a_no_op_with_an_active_profile_set() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert!(
@@ -7995,6 +8229,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
             &Arc::new(RankedMutex::new(HashMap::new())),
             &kick_blocks,
             &pending,
+            &Arc::new(RankedMutex::new(HashMap::new())),
         );
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -8012,6 +8247,7 @@ fn scan_recovery_ignores_a_stale_or_synthetic_read() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
     assert!(
         pending.lock().unwrap().is_empty(),
@@ -8050,6 +8286,7 @@ fn scan_recovery_never_relinks_to_a_switch_grade_kick_rejected_member() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert!(
@@ -8078,11 +8315,15 @@ fn scan_recovery_queues_a_recovered_chain_member() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert_eq!(
         pending.lock().unwrap().clone(),
-        HashSet::from(["b".to_string()]),
+        HashSet::from([super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }]),
         "a recovered chain member must be queued for switch"
     );
 }
@@ -8120,6 +8361,7 @@ fn scan_recovery_never_relinks_to_a_disabled_member() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert!(
@@ -8173,6 +8415,7 @@ fn scan_recovery_never_relinks_to_a_chain_member_with_no_profile() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert!(
@@ -8220,6 +8463,7 @@ fn scan_recovery_never_relinks_to_a_canceled_member() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert!(
@@ -8261,6 +8505,7 @@ fn scan_recovery_never_relinks_to_an_auth_broken_member() {
         &Arc::new(RankedMutex::new(HashMap::new())),
         &kick_blocks,
         &pending,
+        &Arc::new(RankedMutex::new(HashMap::new())),
     );
 
     assert!(
@@ -8322,6 +8567,8 @@ fn spawn_refresher_seeds_kick_blocks_before_returning() {
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
@@ -8518,7 +8765,7 @@ fn a_cached_body_appends_no_sample() {
 /// used to carry ANY prev live window into a Fresh body reporting none, so the
 /// wire's post-reset reading (`utilization: 0.0, resets_at: null`) was
 /// overwritten with the frozen pre-reset window and re-stamped Fresh. The
-/// carry is gated on kick provenance: a prev this process never kicked open
+/// carry is gated on kick provenance: a prev no kick opened
 /// (`open_at: None` — every wire parse) or one whose kick aged past
 /// `KICK_LAG_HORIZON_SECS` takes the Fresh body verbatim, in store and on
 /// disk.
@@ -8866,6 +9113,8 @@ fn spawn_refresher_prunes_stale_history_before_returning() {
         Arc::new(RankedMutex::new(false)),
         Arc::new(RankedMutex::new(HashSet::new())),
         Arc::new(RankedMutex::new(vec![])),
+        Arc::new(RankedMutex::new(HashMap::new())),
+        Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
         Arc::new(RankedMutex::new(HashMap::new())),
@@ -11163,6 +11412,8 @@ fn auto_start_queue_election_picks_one_member_and_holds_the_rest() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -11379,6 +11630,8 @@ fn auto_start_queue_election_is_a_no_op_when_the_toggle_is_off() {
         third_party_tokens: Arc::new(RankedMutex::new(vec![])),
         third_party_usage_store: Arc::new(RankedMutex::new(HashMap::new())),
         third_party_status: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_streaks: Arc::new(RankedMutex::new(HashMap::new())),
+        third_party_broken: Arc::new(RankedMutex::new(HashMap::new())),
         suppressed_auth_expired: Arc::new(RankedMutex::new(HashMap::new())),
         shutting_down: Arc::new(AtomicBool::new(false)),
         fetch_lease: Arc::new(crate::daemon::FetchLease::new()),
@@ -11412,9 +11665,7 @@ fn seed_codex_walk(
     toml: &str,
     readings: &[(&str, &str)],
 ) -> crate::codex_profiles::CodexState {
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(clauth.join("codex-profiles.toml"), toml).expect("write codex state");
+    crate::testutil::write_codex_state(toml);
     for (name, body) in readings {
         let info = crate::usage::map_codex_usage(body, now_epoch_secs()).expect("maps");
         state
@@ -11801,16 +12052,1038 @@ fn scan_auto_switch_leaves_a_reading_dead_global_active() {
         &store,
         &status,
         &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
         &streaks,
         &Arc::new(RankedMutex::new(HashMap::new())),
         &activity,
         &pending,
         &pending_off,
     );
-    let queued: Vec<String> = pending.lock().unwrap().iter().cloned().collect();
+    let queued: Vec<String> = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.target.clone())
+        .collect();
     assert_eq!(
         queued,
         vec!["b".to_string()],
         "global twin: the dead-reading bypass must queue the switch the wedge held back"
+    );
+}
+
+/// The third-party twin of [`issue83_inputs`]: `a`'s reading lives in the
+/// third-party status/streak stores (a pure third-party member never has an
+/// OAuth status entry), `b` is a clear Fresh OAuth sibling with headroom.
+/// `a_oauth` sets `a`'s OAuth status entry (the hybrid case); `None` leaves it
+/// absent (the pure-third-party case).
+fn issue83_third_party_inputs(
+    a_tp: Option<super::FetchStatus>,
+    a_streak: Option<u32>,
+    a_window: Option<crate::usage::UsageInfo>,
+    a_oauth: Option<super::FetchStatus>,
+) -> (
+    UsageStore,
+    super::StatusStore,
+    super::ThirdPartyStatusStore,
+    super::ThirdPartyStreaks,
+) {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let mut entries: Vec<(String, UsageInfo)> = Vec::new();
+    if let Some(info) = a_window {
+        entries.push(("a".to_string(), info));
+    }
+    entries.push((
+        "b".to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        },
+    ));
+    let store: UsageStore = Arc::new(RankedMutex::new(entries.into_iter().collect()));
+    let mut oauth = HashMap::from([("b".to_string(), super::FetchStatus::Fresh)]);
+    if let Some(s) = a_oauth {
+        oauth.insert("a".to_string(), s);
+    }
+    let status: super::StatusStore = Arc::new(RankedMutex::new(oauth));
+    let mut tp = HashMap::new();
+    if let Some(s) = a_tp {
+        tp.insert("a".to_string(), s);
+    }
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(tp));
+    let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(match a_streak {
+        Some(n) => HashMap::from([("a".to_string(), n)]),
+        None => HashMap::new(),
+    }));
+    (store, status, tp_status, tp_streaks)
+}
+
+/// Drive `scan_auto_switch` over third-party-aware inputs and return the queued
+/// switch targets, sorted for determinism.
+fn run_third_party_scan(
+    store: &UsageStore,
+    status: &super::StatusStore,
+    tp_status: &super::ThirdPartyStatusStore,
+    tp_streaks: &super::ThirdPartyStreaks,
+) -> Vec<String> {
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config(&["a", "b"], Some("a")),
+        store,
+        status,
+        tp_status,
+        tp_streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    let mut queued: Vec<String> = pending
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|d| d.target.clone())
+        .collect();
+    queued.sort();
+    queued
+}
+
+/// Half 1's dead-reading case, third-party: `a` is the global active, a pure
+/// third-party member (no OAuth status entry) whose windowless store entry and
+/// deep consecutive-429 streak mark its reading channel dead. The scan must
+/// leave it exactly as it leaves a stuck OAuth active.
+#[test]
+fn scan_auto_switch_leaves_a_reading_dead_third_party_global_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::RateLimited),
+        Some(super::ACTIVE_CAP_MAX_STREAK + 1),
+        None,
+        None,
+    );
+    assert_eq!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks),
+        vec!["b".to_string()],
+        "a deep-stuck windowless third-party active must be walked off like an OAuth one"
+    );
+}
+
+/// The broader half of the class: a healthy (Fresh) exhausted third-party
+/// active must still drive the switch — the blind spot disabled the walk for
+/// ANY pure-third-party active, not only the stuck one.
+#[test]
+fn a_fresh_exhausted_third_party_active_can_auto_switch() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::Fresh),
+        None,
+        Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        }),
+        None,
+    );
+    assert_eq!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks),
+        vec!["b".to_string()],
+        "a Fresh but genuinely exhausted third-party active must switch to a clear sibling"
+    );
+}
+
+/// The shallow bound, third-party: a windowless `RateLimited` member whose
+/// consecutive-429 streak has NOT passed the active cap is a transient storm,
+/// not a dead channel — the scan must stay put.
+#[test]
+fn a_windowless_third_party_member_with_shallow_streak_is_not_reading_dead() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::RateLimited),
+        Some(super::ACTIVE_CAP_MAX_STREAK),
+        None,
+        None,
+    );
+    assert!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks).is_empty(),
+        "a shallow third-party streak must still read as a transient storm, not a dead channel"
+    );
+}
+
+/// A hybrid member's OAuth reading stays authoritative: with an OAuth status
+/// entry present, the third-party stuck reading must not override it.
+#[test]
+fn a_hybrid_members_oauth_reading_wins_over_its_third_party_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::RateLimited),
+        Some(super::ACTIVE_CAP_MAX_STREAK + 1),
+        None,
+        Some(super::FetchStatus::Cached),
+    );
+    assert!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks).is_empty(),
+        "an OAuth Cached reading must keep a windowless hybrid member from the \
+         third-party stuck judgment"
+    );
+}
+
+/// The third-party leg resets the consecutive-429 streak on a live body.
+#[test]
+fn fetch_third_party_due_resets_the_streak_on_a_live_body() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-live"]);
+    let entry = tp_entry("tp-live");
+    let state = third_party_state(stub_ok_stats);
+    state
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("tp-live".to_string(), 5);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state.third_party_streaks.lock().unwrap().get("tp-live"),
+        None,
+        "a live body must clear the consecutive-429 streak"
+    );
+}
+
+/// `AuthExpired` is a dead credential, not a dead channel — it must leave the
+/// consecutive-429 streak untouched (a re-login, not the ramp, is its fix).
+#[test]
+fn fetch_third_party_due_leaves_the_streak_untouched_on_auth_expired() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-dead"]);
+    let entry = tp_entry("tp-dead");
+    let state = third_party_state(stub_auth_expired);
+    state
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("tp-dead".to_string(), 5);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state.third_party_streaks.lock().unwrap().get("tp-dead"),
+        Some(&5),
+        "a dead credential must not feed the consecutive-429 streak"
+    );
+}
+
+/// Only a provider 429 feeds the streak.
+#[test]
+fn fetch_third_party_due_bumps_the_streak_on_a_provider_429() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-limited"]);
+    let entry = tp_entry("tp-limited");
+    let state = third_party_state(stub_rate_limited);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert_eq!(
+        state.third_party_streaks.lock().unwrap().get("tp-limited"),
+        Some(&1),
+        "a provider 429 must bump the consecutive-429 streak"
+    );
+}
+
+/// A live, fully spent 5h window (100% at a future reset) — the shape the
+/// walk's exhaustion gate reads as spent.
+fn spent_window() -> crate::usage::UsageInfo {
+    use crate::usage::{UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    crate::usage::UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 100.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A shallow-streak `RateLimited` third-party active with a live SPENT window
+/// must stay put: the shallow streak is a transient storm, not a dead channel,
+/// and the walk may not trust the stale spent numbers — the third-party twin of
+/// the OAuth "shallow slot + spent → still gated on Fresh" pin.
+#[test]
+fn a_shallow_streak_third_party_active_with_a_spent_window_stays_put() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::RateLimited),
+        Some(super::ACTIVE_CAP_MAX_STREAK),
+        Some(spent_window()),
+        None,
+    );
+    assert!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks).is_empty(),
+        "a shallow third-party 429 streak over a spent window must not drive a switch"
+    );
+}
+
+/// A `Cached` third-party active with a live SPENT window stays put: a stale
+/// reading is never actionable, whatever the window says.
+#[test]
+fn a_cached_third_party_active_with_a_spent_window_stays_put() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::Cached),
+        None,
+        Some(spent_window()),
+        None,
+    );
+    assert!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks).is_empty(),
+        "a Cached third-party reading over a spent window must not drive a switch"
+    );
+}
+
+/// A hybrid member's OAuth `Cached` reading outranks a third-party `Fresh` one:
+/// the third-party leg must not open a gate the OAuth reading closed.
+#[test]
+fn a_hybrids_cached_oauth_reading_outranks_a_fresh_third_party_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::Fresh),
+        None,
+        Some(spent_window()),
+        Some(super::FetchStatus::Cached),
+    );
+    assert!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks).is_empty(),
+        "a Cached OAuth reading must keep a hybrid member from switching on \
+         third-party freshness"
+    );
+}
+
+/// A hybrid member's OAuth `Fresh` reading outranks a third-party stuck one:
+/// the third-party 429 streak must not mark a Fresh-OAuth member reading-dead.
+#[test]
+fn a_fresh_oauth_reading_outranks_a_stuck_third_party_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::RateLimited),
+        Some(super::ACTIVE_CAP_MAX_STREAK + 1),
+        None,
+        Some(super::FetchStatus::Fresh),
+    );
+    assert!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks).is_empty(),
+        "a Fresh OAuth reading must keep a windowless hybrid member from the \
+         third-party stuck judgment"
+    );
+}
+
+/// A member with neither an OAuth nor a third-party entry and a spent window
+/// stays put: no reading is no verdict, so the scan may not switch on it.
+#[test]
+fn a_member_with_no_reading_and_a_spent_window_stays_put() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) =
+        issue83_third_party_inputs(None, None, Some(spent_window()), None);
+    assert!(
+        run_third_party_scan(&store, &status, &tp_status, &tp_streaks).is_empty(),
+        "an unread member with a spent window must not drive a switch"
+    );
+}
+
+/// A transient third-party fetch failure (a network blip) leaves the
+/// consecutive-429 streak untouched — `Failed` (no cache) and `Cached` (a
+/// cache cold-fills) alike. The ramp must survive the blip, not reset.
+#[test]
+fn fetch_third_party_due_leaves_the_streak_untouched_on_a_transient_blip() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-failed", "tp-cached"]);
+    let failed = tp_entry("tp-failed");
+    let cached = tp_entry("tp-cached");
+    // A cache makes the same network error read `Cached` for tp-cached;
+    // tp-failed has none, so it reads `Failed`.
+    crate::profile_cache::write_profile_cache(
+        &cached.name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::providers::ThirdPartyStats {
+            is_available: true,
+            rows: vec![],
+            bars: vec![],
+            plan: None,
+            endpoint: None,
+            best_effort: false,
+        },
+    );
+    let state = third_party_state(stub_network_error);
+    state
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("tp-failed".to_string(), 5);
+    state
+        .third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("tp-cached".to_string(), 5);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![failed, cached]);
+    assert_eq!(
+        state.third_party_streaks.lock().unwrap().get("tp-failed"),
+        Some(&5),
+        "a Failed (network blip) outcome must not reset the consecutive-429 streak"
+    );
+    assert_eq!(
+        state.third_party_streaks.lock().unwrap().get("tp-cached"),
+        Some(&5),
+        "a Cached (network blip with cache) outcome must not reset the consecutive-429 streak"
+    );
+}
+
+// ── ruling 2: a dead third-party api key leaves the chain ───────────────────
+
+fn stub_console_expired(
+    _: &crate::providers::ThirdPartyTarget,
+    _: &str,
+    _: Option<&str>,
+) -> Result<crate::providers::ThirdPartyStats, crate::providers::ThirdPartyError> {
+    Err(crate::providers::ThirdPartyError::ConsoleExpired)
+}
+
+/// The discriminator is WHICH credential the provider rejected: a dead api KEY
+/// (the credential a member's sessions spend) marks the member broken; a lapsed
+/// Alibaba console session (usage-only) does not.
+#[test]
+fn fetch_third_party_due_marks_a_dead_key_broken_not_a_console_lapse() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-key", "tp-console"]);
+
+    let key = tp_entry("tp-key");
+    let key_state = third_party_state(stub_auth_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&key_state, vec![key]);
+    assert!(
+        key_state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("tp-key"),
+        "a rejected api key must mark the member broken"
+    );
+
+    let console = tp_entry("tp-console");
+    let console_state = third_party_state(stub_console_expired);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&console_state, vec![console]);
+    assert!(
+        !console_state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("tp-console"),
+        "a lapsed console session is usage-only and must not mark the member broken"
+    );
+}
+
+/// B1: the live set is keyed by credential fingerprint, so a re-keyed profile
+/// (same name, new credential) drops out of the union at once — the
+/// `SuppressedAuthExpiredStore` failure class. The current entry's fingerprint
+/// must match the recorded one, never the bare name.
+#[test]
+fn current_key_rejected_names_drops_a_rekeyed_profile() {
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-rekeyed"]);
+    // The CURRENT config profile (a third-party credential), whose fingerprint
+    // the verdict intersects against — not a separately refreshed entry list.
+    let profile = Profile::new(
+        "tp-rekeyed".to_string(),
+        Some("https://example.com".to_string()),
+        Some("key".to_string()),
+    );
+    let current_fp = crate::usage::profile_credential_fingerprint(&profile).expect("credentialed");
+    // A recorded verdict for a DIFFERENT credential (the old key).
+    let broken: HashMap<String, u64> =
+        HashMap::from([("tp-rekeyed".to_string(), current_fp.wrapping_add(1))]);
+    assert!(
+        super::current_key_rejected_names(&broken, std::slice::from_ref(&profile)).is_empty(),
+        "a re-keyed profile drops out of the union at once"
+    );
+    // The matching fingerprint IS unioned.
+    let broken: HashMap<String, u64> = HashMap::from([("tp-rekeyed".to_string(), current_fp)]);
+    assert_eq!(
+        super::current_key_rejected_names(&broken, &[profile]),
+        vec![crate::profile::ProfileName::from("tp-rekeyed")],
+        "the matching fingerprint is the key-rejected member"
+    );
+}
+
+/// F1 (interleaving): the verdict reads the CURRENT config profiles, never the
+/// separately refreshed entry list, so a stale list cannot pair a new config
+/// with an old fingerprint mark. The old entry's fingerprint and the current
+/// config's deliberately differ (the re-keyed shape).
+#[test]
+fn a_stale_entry_list_cannot_pair_new_config_with_an_old_mark() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-interleaved"]);
+    // The deliberately STALE entry (the old key), left behind by a real
+    // producer's re-key: its fingerprint differs from the CURRENT config's.
+    let old_fp = tp_entry("tp-interleaved").credential_fingerprint();
+    let current = Profile::new(
+        "tp-interleaved".to_string(),
+        Some("https://example.com".to_string()),
+        Some("new-key".to_string()),
+    );
+    assert_ne!(
+        crate::usage::profile_credential_fingerprint(&current),
+        Some(old_fp),
+        "the fixture is the interleaving shape: stale entry ≠ current credential"
+    );
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![current],
+    };
+    let broken: HashMap<String, u64> = HashMap::from([("tp-interleaved".to_string(), old_fp)]);
+    assert!(
+        super::current_key_rejected_names(&broken, &config.profiles).is_empty(),
+        "a stale entry list must never keep a re-keyed name in the rejected set"
+    );
+}
+
+/// Q1 (dispatch revalidation): a queued switch-away is stale exactly when its
+/// record CARRIES a key-rejection cause and the fresh config's fingerprint for
+/// that active no longer matches the recorded one — a repair landed before
+/// dispatch. A cause-absent record (an ordinary exhaustion/home decision) is
+/// never stale, whatever the ambient broken map holds, and a still-matching
+/// fingerprint keeps the queued switch.
+#[test]
+fn queued_switch_away_is_stale_detects_a_repair() {
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-repair"]);
+    let old = Profile::new(
+        "tp-repair".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    let new = Profile::new(
+        "tp-repair".to_string(),
+        Some("https://example.com".to_string()),
+        Some("new-key".to_string()),
+    );
+    let old_fp = crate::usage::profile_credential_fingerprint(&old).expect("credentialed");
+    let new_fp = crate::usage::profile_credential_fingerprint(&new).expect("credentialed");
+    assert_ne!(old_fp, new_fp, "fixture must change the fingerprint");
+    let cause_old = Some(("tp-repair".to_string(), old_fp));
+    assert!(
+        super::queued_switch_away_is_stale(cause_old.as_ref(), std::slice::from_ref(&new)),
+        "a recorded old fingerprint against a fresh new one is a stale switch-away"
+    );
+    let cause_new = Some(("tp-repair".to_string(), new_fp));
+    assert!(
+        !super::queued_switch_away_is_stale(cause_new.as_ref(), std::slice::from_ref(&new)),
+        "a still-matching fingerprint keeps the queued switch"
+    );
+    assert!(
+        !super::queued_switch_away_is_stale(None, std::slice::from_ref(&new)),
+        "a cause-absent ordinary decision is never stale"
+    );
+    // Same-name conversion to OAuth: the old key-rejection cause is stale, and an
+    // ordinary decision queued after the conversion carries no cause, so it runs.
+    let oauth = Profile::new("tp-repair".to_string(), None, None);
+    assert!(
+        super::queued_switch_away_is_stale(cause_old.as_ref(), std::slice::from_ref(&oauth)),
+        "a converted active has no credential fingerprint — the old cause is stale"
+    );
+    assert!(
+        !super::queued_switch_away_is_stale(None, std::slice::from_ref(&oauth)),
+        "the post-conversion ordinary decision is never stale"
+    );
+}
+
+/// Live state, never persisted: the broken mark clears the moment the reading is
+/// no longer the key-rejected one (a live body re-admits the member).
+#[test]
+fn fetch_third_party_due_clears_the_broken_mark_on_a_live_body() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-recovered"]);
+    let entry = tp_entry("tp-recovered");
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_ok_stats);
+    state
+        .third_party_broken
+        .lock()
+        .unwrap()
+        .insert("tp-recovered".to_string(), fp);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(
+        !state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("tp-recovered"),
+        "a live body must clear the broken mark"
+    );
+}
+
+/// N1 (E-clear): a NON-dead-key outcome (a transient network blip, no cache →
+/// `Failed`) also clears the mark — a key rejection is "the last fetch under
+/// THIS credential died", so one that didn't must not leave it standing.
+#[test]
+fn fetch_third_party_due_clears_the_broken_mark_on_a_non_dead_key_outcome() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp-blip"]);
+    let entry = tp_entry("tp-blip");
+    let fp = entry.credential_fingerprint();
+    let state = third_party_state(stub_network_error);
+    state
+        .third_party_broken
+        .lock()
+        .unwrap()
+        .insert("tp-blip".to_string(), fp);
+    crate::usage::reset_request_slots();
+    fetch_third_party_due(&state, vec![entry]);
+    assert!(
+        !state
+            .third_party_broken
+            .lock()
+            .unwrap()
+            .contains_key("tp-blip"),
+        "a non-dead-key outcome must clear the broken mark"
+    );
+}
+
+/// A key-rejected third-party global active leaves the chain like an OAuth
+/// auth-broken active: the actionability bypass opens and the walk lands on the
+/// clear sibling.
+#[test]
+fn scan_auto_switch_leaves_a_key_rejected_third_party_active() {
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(None, None, None, None);
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config_tp(&["a", "b"], Some("a"), &["a"]),
+        &store,
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    let queued: Vec<super::PendingSwitchTarget> = pending.lock().unwrap().iter().cloned().collect();
+    assert_eq!(
+        queued,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: Some(("a".to_string(), entry_a.credential_fingerprint())),
+        }],
+        "a key-rejected third-party active must be walked off, and the record must carry the key-rejection cause it was decided under"
+    );
+}
+
+/// Drive `scan_auto_switch` over a key-rejected `a` (a broken mark from `entry_a`)
+/// and return the queued records whole, so producer tests can assert the exact
+/// `key_rejected_cause` rather than only the target.
+fn scan_records_key_rejected(
+    config: &crate::profile::ConfigHandle,
+    store: &UsageStore,
+    status: &super::StatusStore,
+    tp_status: &super::ThirdPartyStatusStore,
+    tp_streaks: &super::ThirdPartyStreaks,
+    broken: &super::ThirdPartyBroken,
+) -> Vec<super::PendingSwitchTarget> {
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        config,
+        store,
+        status,
+        tp_status,
+        tp_streaks,
+        broken,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    pending.lock().unwrap().iter().cloned().collect()
+}
+
+/// Q1 (overlap): a key-rejected active that is ALSO independently exhausted must
+/// queue an ordinary move — the exhaustion alone already forces the walk, so the
+/// record carries no key-rejection cause and a later repair does not drop it.
+#[test]
+fn scan_auto_switch_does_not_label_an_independently_exhausted_key_rejected_active() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::Fresh),
+        None,
+        Some(UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 100.0,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            ..Default::default()
+        }),
+        None,
+    );
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let records = scan_records_key_rejected(
+        &session_config_tp(&["a", "b"], Some("a"), &["a"]),
+        &store,
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+    );
+    assert_eq!(
+        records,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }],
+        "a key-rejected active that is independently exhausted must queue an ordinary (cause-absent) move"
+    );
+}
+
+/// Q1 (overlap): a key-rejected active that a healthy home return would move
+/// anyway must queue an ordinary move — the preferred sibling fires the same
+/// action without key rejection, so the record carries no cause.
+#[test]
+fn scan_auto_switch_does_not_label_an_independent_healthy_home_return_beside_key_rejection() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) =
+        issue83_third_party_inputs(Some(super::FetchStatus::Fresh), None, None, None);
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let config = session_config_tp(&["a", "b"], Some("a"), &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("b"))
+        .unwrap()
+        .preferred = true;
+    let records =
+        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    assert_eq!(
+        records,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }],
+        "a healthy home return firing beside key rejection must queue an ordinary move"
+    );
+}
+
+/// Q1 (target change): when removing the active's key rejection changes which
+/// target the walk lands on (exhaustion picks the first clear sibling, a healthy
+/// home return picks the preferred one), the record must still carry the cause.
+#[test]
+fn scan_auto_switch_records_the_cause_when_key_rejection_changes_the_target() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    let clear = UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let store: UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("b".to_string(), clear.clone()),
+        ("c".to_string(), clear),
+    ])));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("b".to_string(), super::FetchStatus::Fresh),
+        ("c".to_string(), super::FetchStatus::Fresh),
+    ])));
+    let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        super::FetchStatus::Fresh,
+    )])));
+    let tp_streaks: super::ThirdPartyStreaks = Arc::new(RankedMutex::new(HashMap::new()));
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let config = session_config_tp(&["a", "b", "c"], Some("a"), &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .find_mut(&crate::profile::ProfileName::from("c"))
+        .unwrap()
+        .preferred = true;
+    let records =
+        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    assert_eq!(
+        records,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: Some(("a".to_string(), entry_a.credential_fingerprint())),
+        }],
+        "when removing key rejection changes the target, the record must carry the key-rejection cause"
+    );
+}
+
+/// Q1 (whole-chain home): the active's key rejection suppresses its `preferred_days`
+/// claim, so the sibling's bare `preferred` fallback flag fires and the walk lands
+/// on the sibling. Removing ONLY the active's rejection must recompute EVERY
+/// member's home: the active reclaims its day and the sibling stands down, so the
+/// exact action disappears and the record carries the cause.
+#[test]
+fn scan_auto_switch_records_the_cause_when_the_active_day_claim_reclaims_home() {
+    use chrono::Weekday::*;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) =
+        issue83_third_party_inputs(Some(super::FetchStatus::Fresh), None, None, None);
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let config = session_config_tp(&["a", "b"], Some("a"), &["a"]);
+    {
+        let mut cfg = config.lock().unwrap();
+        cfg.find_mut(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .preferred_days = vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun];
+        cfg.find_mut(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .preferred = true;
+    }
+    let records =
+        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    assert_eq!(
+        records,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: Some(("a".to_string(), entry_a.credential_fingerprint())),
+        }],
+        "when the active's key rejection alone suppresses its day claim and the sibling's fallback flag fires, the record must carry the cause"
+    );
+}
+
+/// Q1 (collision control): when the active's day claim and a sibling's day claim
+/// would BOTH be live without the rejection, the counterfactual run keeps the
+/// same first clear+fresh claimant ordering a real snapshot produces — the action
+/// is unchanged, so no cause is recorded.
+#[test]
+fn scan_auto_switch_does_not_label_a_two_claimant_day_collision_beside_key_rejection() {
+    use chrono::Weekday::*;
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) =
+        issue83_third_party_inputs(Some(super::FetchStatus::Fresh), None, None, None);
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let config = session_config_tp(&["a", "b"], Some("a"), &["a"]);
+    {
+        let mut cfg = config.lock().unwrap();
+        let days = vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun];
+        cfg.find_mut(&crate::profile::ProfileName::from("a"))
+            .unwrap()
+            .preferred_days = days.clone();
+        cfg.find_mut(&crate::profile::ProfileName::from("b"))
+            .unwrap()
+            .preferred_days = days;
+    }
+    let records =
+        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    assert_eq!(
+        records,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }],
+        "two live day claimants without the rejection keep the first clear+fresh claimant as the target, so the action is unchanged and no cause is recorded"
+    );
+}
+
+/// Q1 (overlap): an OAuth auth-broken active that is also key-rejected queues an
+/// ordinary move — the OAuth breakage alone already forces the walk, so no cause.
+#[test]
+fn scan_auto_switch_does_not_label_a_key_rejected_auth_broken_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) =
+        issue83_third_party_inputs(Some(super::FetchStatus::Fresh), None, None, None);
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let config = session_config_tp(&["a", "b"], Some("a"), &["a"]);
+    config
+        .lock()
+        .unwrap()
+        .state
+        .auth_broken
+        .push(crate::profile::ProfileName::from("a"));
+    let records =
+        scan_records_key_rejected(&config, &store, &status, &tp_status, &tp_streaks, &broken);
+    assert_eq!(
+        records,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }],
+        "an auth-broken active that is also key-rejected must queue an ordinary move"
+    );
+}
+
+/// Q1 (overlap): a reading-dead active that is also key-rejected queues an
+/// ordinary move — the dead reading channel alone already forces the walk.
+#[test]
+fn scan_auto_switch_does_not_label_a_reading_dead_key_rejected_active() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) = issue83_third_party_inputs(
+        Some(super::FetchStatus::RateLimited),
+        Some(super::ACTIVE_CAP_MAX_STREAK + 1),
+        None,
+        None,
+    );
+    let entry_a = tp_entry("a");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "a".to_string(),
+        entry_a.credential_fingerprint(),
+    )])));
+    let records = scan_records_key_rejected(
+        &session_config_tp(&["a", "b"], Some("a"), &["a"]),
+        &store,
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &broken,
+    );
+    assert_eq!(
+        records,
+        vec![super::PendingSwitchTarget {
+            target: "b".to_string(),
+            key_rejected_cause: None,
+        }],
+        "a reading-dead active that is also key-rejected must queue an ordinary move"
+    );
+}
+
+/// The console-lapse twin: the same `AuthExpired` reading WITHOUT the broken
+/// mark is not actionable, so the active stays put.
+#[test]
+fn scan_auto_switch_keeps_a_console_lapse_active() {
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    let _home = crate::testutil::HomeSandbox::new();
+    let (store, status, tp_status, tp_streaks) =
+        issue83_third_party_inputs(Some(super::FetchStatus::AuthExpired), None, None, None);
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config(&["a", "b"], Some("a")),
+        &store,
+        &status,
+        &tp_status,
+        &tp_streaks,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a console-lapse AuthExpired active (not broken) must stay put"
+    );
+}
+
+/// A key-rejected member is never chosen as a walk TARGET: with the only clear
+/// candidate key-rejected, the walk finds nothing and holds the chain.
+#[test]
+fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
+    use super::{PendingSwitch, PendingSwitchOff, scan_auto_switch};
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+    let _home = crate::testutil::HomeSandbox::new();
+    // `a` active, OAuth Fresh + live spent window (exhausted); `b` the only
+    // sibling, key-rejected (broken) — the walk must not land on it.
+    let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::from([
+        (
+            "a".to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 100.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            "b".to_string(),
+            UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 10.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                }),
+                ..Default::default()
+            },
+        ),
+    ])));
+    let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::from([
+        ("a".to_string(), super::FetchStatus::Fresh),
+        ("b".to_string(), super::FetchStatus::Fresh),
+    ])));
+    let entry_b = tp_entry("b");
+    let broken: super::ThirdPartyBroken = Arc::new(RankedMutex::new(HashMap::from([(
+        "b".to_string(),
+        entry_b.credential_fingerprint(),
+    )])));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+    let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+    scan_auto_switch(
+        &session_config_tp(&["a", "b"], Some("a"), &["b"]),
+        &store,
+        &status,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &broken,
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &Arc::new(RankedMutex::new(HashMap::new())),
+        &activity,
+        &pending,
+        &pending_off,
+    );
+    assert!(
+        pending.lock().unwrap().is_empty(),
+        "a key-rejected member must never be chosen as a walk target"
     );
 }

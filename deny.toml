@@ -22,6 +22,8 @@ ignore = []
 # ---------------------------------------------------------------------------
 [licenses]
 version = 2
+# No [[licenses.clarify]] blocks: a clarify pins a license file's content hash,
+# so any upstream edit to that file voids the clarification.
 # Licenses actually present in the dependency tree (derived from `cargo metadata`).
 allow = [
     "MIT",

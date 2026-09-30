@@ -393,6 +393,10 @@ fn the_route_table_is_exactly_this() {
             ("HEAD", "/sessions/{id}", Access::View),
             ("POST", "/panes/{id}/prompt", Access::Control),
             ("POST", "/panes/{id}/keys", Access::Control),
+            ("GET", "/gateway", Access::View),
+            ("HEAD", "/gateway", Access::View),
+            ("GET", "/proxies", Access::View),
+            ("HEAD", "/proxies", Access::View),
         ]
     );
 }
@@ -983,6 +987,28 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         &mut produced,
     );
 
+    let gateway = call(&ctx, &req("GET", "/api/v1/gateway", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/gateway",
+        200,
+        &gateway,
+        &mut driven,
+        &mut produced,
+    );
+
+    let proxies = call(&ctx, &req("GET", "/api/v1/proxies", Some(TOKEN), ""));
+    check_answer(
+        &doc,
+        "GET",
+        "/proxies",
+        200,
+        &proxies,
+        &mut driven,
+        &mut produced,
+    );
+
     // The sessions routes: the listing over the still-empty store, then the
     // captured transcript paged under the fixture id. A record is the one
     // free-form body besides the document's own: documented as a bare object
@@ -1494,6 +1520,8 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("GET", "/gateway"),
+        ("GET", "/proxies"),
     ] {
         let resp = call(&ctx, &req(method, &concrete(path), None, ""));
         check_answer(&doc, method, path, 401, &resp, &mut driven, &mut produced);
@@ -1545,6 +1573,8 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("GET", "/gateway"),
+        ("GET", "/proxies"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -1967,6 +1997,8 @@ fn every_reachable_answer_matches_the_schema_the_document_names() {
         ("POST", "/chain/wrap-off"),
         ("POST", "/panes/{id}/prompt"),
         ("POST", "/panes/{id}/keys"),
+        ("GET", "/gateway"),
+        ("GET", "/proxies"),
     ] {
         let body = if method == "POST" {
             r#"{"profile":"beta"}"#
@@ -3308,5 +3340,84 @@ fn a_refused_switch_line_names_the_device() {
             .any(|line| line.starts_with("clauth api: device 'test' switch to 'beta' refused: ")),
         "{:#?}",
         lines.snapshot()
+    );
+}
+
+/// `GET /proxies` answers the supervisors' live slots over the record-only
+/// verdict: a published slot wins for its row, not the record alone.
+#[test]
+fn get_proxies_publishes_the_live_slot_over_the_record() {
+    use crate::daemon::proxies::{ProxySlot, ProxyState};
+    use crate::proxy::Service;
+    let _home = HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("dir");
+    std::fs::create_dir_all(&dir).expect("dir");
+    std::fs::write(
+        dir.join("proxies.toml"),
+        "[zcode]\nport = 9101\nenabled = true\n",
+    )
+    .expect("registry");
+    let live = crate::daemon::LiveStores::default();
+    let slot = ProxySlot {
+        service: "zcode".to_string(),
+        state: ProxyState::Healthy,
+        binary: Some("/usr/local/bin/clauth-zcode-proxy".to_string()),
+        port: Some(9101),
+        pid: Some(4242),
+        version: Some("1.2.0".to_string()),
+        contract: Some("1.0".to_string()),
+        answerer: None,
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: Some("2026-09-29T00:00:00Z".to_string()),
+    };
+    live.proxies
+        .lock()
+        .expect("slots")
+        .insert(Service::parse("zcode").expect("a service"), slot);
+    let ctx = ctx_with_live(seeded_config(), live);
+
+    let resp = call(&ctx, &req("GET", "/api/v1/proxies", Some(TOKEN), ""));
+    assert_eq!(resp.status, 200);
+    let body = body_json(&resp);
+    assert_eq!(body[0]["service"], "zcode");
+    assert_eq!(body[0]["state"], "healthy", "the live slot wins");
+    assert_eq!(body[0]["version"], "1.2.0");
+    assert_eq!(body[0]["pid"], 4242);
+}
+
+/// `ProxySlot` documents every field as required, like `GatewaySlot`: the
+/// served OpenAPI schema's `required` list names all 12 fields, so a client
+/// generated from it never types a proxy field as optional by accident.
+#[test]
+fn proxy_slot_requires_every_field() {
+    let doc = openapi_document_bytes().expect("document serializes");
+    let value: serde_json::Value = serde_json::from_slice(&doc).expect("json");
+    let required = value["components"]["schemas"]["ProxySlot"]["required"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ProxySlot documents a required list"));
+    let mut required: Vec<&str> = required
+        .iter()
+        .map(|field| field.as_str().expect("a field name"))
+        .collect();
+    required.sort_unstable();
+    assert_eq!(
+        required,
+        [
+            "answerer",
+            "binary",
+            "contract",
+            "last_exit",
+            "pid",
+            "port",
+            "reason",
+            "restarts",
+            "service",
+            "since",
+            "state",
+            "version",
+        ],
+        "ProxySlot's required set"
     );
 }

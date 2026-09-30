@@ -148,6 +148,24 @@ pub(crate) mod rank {
         ThirdParty = 260;
         ThirdPartyUsageStore = 270;
         ThirdPartyStatus = 280;
+        /// Per-profile consecutive provider-429 streak
+        /// (`usage::scheduler::ThirdPartyStreaks`): the third-party analogue of
+        /// [`PollStreak`]'s `rate_limit` axis, driving the same stuck judgment.
+        /// Leaf like `ThirdPartyStatus` — bumped/reset in the third-party leg
+        /// and read alone by the two auto-switch predicates, the status feed,
+        /// and the TUI Usage row.
+        ThirdPartyStreak = 290;
+        /// Per-profile third-party key-rejection set
+        /// (`usage::scheduler::ThirdPartyBroken`): members whose api KEY the
+        /// provider rejected, treated as auth-broken by the chain walks. Live
+        /// only (never persisted); leaf — written/cleared in the third-party
+        /// leg, plus the TUI's stood-down seed (construction/reload plus the
+        /// once-per-second stat-gated re-sync, add-only and
+        /// fingerprint-intersected at every read), and read by the scans, the
+        /// TUI/daemon key-rejected helpers (chain walks and day notices), and
+        /// both switch drains, each comparing the recorded fingerprint with
+        /// the current profile under one config snapshot.
+        ThirdPartyBroken = 295;
         UsageStore = 300;
         UsageStatus = 350;
         Config = 400;
@@ -230,6 +248,16 @@ pub(crate) mod rank {
         /// unranked mutex, `profile::HOME_OVERRIDE`, which every `home_dir()`
         /// takes and releases with nothing under it.
         McpDigest = 1800;
+        /// The managed gateway's published slot (`daemon::gateway`): the
+        /// supervisor thread replaces it, the status writer and
+        /// `GET /api/v1/gateway` clone it. A true leaf: every acquisition is
+        /// one clone or one assignment, with no IO, probe or child wait under
+        /// it.
+        GatewayPublished = 1900;
+        /// A managed proxy's published slot (`daemon::proxies`): one shared map
+        /// for the kind, same leaf discipline as the gateway's. One rank for
+        /// the kind, so the ranks never nest.
+        ProxyPublished = 1901;
     }
 }
 

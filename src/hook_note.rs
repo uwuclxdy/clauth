@@ -118,10 +118,9 @@ const RESOLUTION_TTL: Duration = Duration::from_secs(60);
 const MAX_PAYLOAD_BYTES: u64 = 10 * 1024 * 1024;
 
 /// The two spellings, behind one renderer so they cannot drift apart. The
-/// switched spelling carries an optional headroom clause (r9, reviewzy entry
-/// E4, 2026-08-28): the new account's live 5h window percent when the disk
-/// cache holds one, omitted — the sentence byte-identical to the pre-r9
-/// spelling — when it does not.
+/// switched spelling carries an optional headroom clause (r9, 2026-08-28): the
+/// new account's live 5h window percent when the disk cache holds one, omitted
+/// — the sentence byte-identical to the pre-r9 spelling — when it does not.
 ///
 /// The noun is "session", by owner ruling on 2026-08-21, superseding an earlier
 /// one here that said "conversation" and never "session". Carry the cost that
@@ -1011,7 +1010,7 @@ struct SwitchedHeadroom {
 }
 
 /// The new account's live 5h window percent off the disk usage cache — the
-/// account-changed note's figure (r9, reviewzy entry E4). The same read class
+/// account-changed note's figure (r9). The same read class
 /// as the nudge's [`headroom_of`], by name where that one takes a loaded
 /// profile: [`crate::profile_json::profile_windows_for`] (the read
 /// `chain_would_act` uses) plus the liveness predicate [`crate::usage::five_hour_live`]
@@ -1276,12 +1275,10 @@ fn nudge_figures(read: &NudgeRead) -> Option<NudgeFigures> {
     })
 }
 
-/// The shipped copy, byte for byte — reviewzy-approved human_text (project
-/// clauth, entry on this file titled "new nudge copy: headroom exhaustion
-/// after an agent spawn", 2026-08-28). Never reword. The two instants render
-/// through [`crate::format::local_stamp`], the crate's one LOCAL prose-stamp
-/// formatter (owner ruling 2026-08-22); `None` — silence — when a stamp
-/// cannot render.
+/// The shipped copy, byte for byte, as the maintainer approved it on
+/// 2026-08-28. Never reword. The two instants render through
+/// [`crate::format::local_stamp`], the crate's one LOCAL prose-stamp formatter
+/// (owner ruling 2026-08-22); `None` — silence — when a stamp cannot render.
 fn render_nudge(f: &NudgeFigures) -> Option<String> {
     let when = crate::format::local_stamp(f.when)?;
     let reset = crate::format::local_stamp(f.reset)?;
@@ -1320,11 +1317,20 @@ fn chain_would_act(
     config: &crate::profile::AppConfig,
     anchor: &crate::profile::ProfileName,
 ) -> bool {
-    let Some(snapshot) = crate::fallback::snapshot_chain_from(config, anchor) else {
+    let key_rejected = crate::fallback::durable_key_rejected(config);
+    let Some(mut snapshot) = crate::fallback::snapshot_chain_from(config, anchor, &key_rejected)
+    else {
         // The resolved account is outside the chain: the leg would do
         // nothing, which is exactly "nothing would catch".
         return false;
     };
+    // The key-rejected union the scheduler's live leg performs on top of the
+    // snapshot, read off the durable per-credential verdict instead: a hook
+    // process has no refresher's live `ThirdPartyBroken` set, and a dead key
+    // is not a bounded corner — the leg skips that sibling every tick, so a
+    // replay that reads it as headroom would answer "the chain would act"
+    // about a switch nothing will make.
+    snapshot.broken.extend(key_rejected);
     let usage: std::collections::HashMap<String, crate::usage::UsageInfo> = snapshot
         .chain
         .iter()

@@ -760,6 +760,14 @@ fn auto_start_of(app: &app::App, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The open `rotate at` field's text, `None` while it is closed.
+fn threshold_draft(app: &app::App) -> Option<&str> {
+    match app.fallback_edit.as_ref().map(|e| &e.state) {
+        Some(app::CardEdit::Threshold(input)) => Some(input.value.as_str()),
+        _ => None,
+    }
+}
+
 fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
     app.config()
         .find(&crate::profile::ProfileName::from(name))
@@ -820,11 +828,11 @@ fn demo_data_drives_all_actions() {
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Status);
     press(&mut app, KeyCode::Right);
-    assert_eq!(app.tab, Tab::Plugin);
+    assert_eq!(app.tab, Tab::Services);
     press(&mut app, KeyCode::Right);
     assert_eq!(app.tab, Tab::Overview, "→ wraps back to Overview");
     press(&mut app, KeyCode::Left);
-    assert_eq!(app.tab, Tab::Plugin, "← wraps to the last tab");
+    assert_eq!(app.tab, Tab::Services, "← wraps to the last tab");
     // Seven ← from the last tab walk back to the first.
     for _ in 0..7 {
         press(&mut app, KeyCode::Left);
@@ -877,8 +885,7 @@ fn demo_data_drives_all_actions() {
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
     press(&mut app, KeyCode::Down); // Name → AutoStart (OAuth row)
-    press(&mut app, KeyCode::Down); // AutoStart → PreferredDays
-    press(&mut app, KeyCode::Down); // PreferredDays → BaseUrl
+    press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing the field
     assert_eq!(
         app.config_draft.as_ref().and_then(|d| d.active),
@@ -942,7 +949,7 @@ fn demo_data_drives_all_actions() {
 
     // ── Set threshold (inline editor) ──
     press(&mut app, KeyCode::Enter); // open inline editor on Threshold row
-    assert!(app.fallback_threshold_draft.is_some());
+    assert!(threshold_draft(&app).is_some());
     press(&mut app, KeyCode::Backspace); // clear "85" (2 chars)
     press(&mut app, KeyCode::Backspace);
 
@@ -951,7 +958,7 @@ fn demo_data_drives_all_actions() {
     type_str(&mut app, "150");
     press(&mut app, KeyCode::Enter); // commit attempt — rejected
     assert!(
-        app.fallback_threshold_draft.is_some(),
+        threshold_draft(&app).is_some(),
         "an out-of-range threshold keeps the editor open (inline invalid, no toast)"
     );
     assert_eq!(
@@ -963,15 +970,13 @@ fn demo_data_drives_all_actions() {
     // ctrl+w wipes the bad input as one word, then a valid value commits.
     app::handle_key(&mut app, key_ctrl(KeyCode::Char('w')));
     assert_eq!(
-        app.fallback_threshold_draft
-            .as_ref()
-            .map(|d| d.value.as_str()),
+        threshold_draft(&app),
         Some(""),
         "ctrl+w clears the whole typed run"
     );
     type_str(&mut app, "50");
     press(&mut app, KeyCode::Enter); // commit
-    assert!(app.fallback_threshold_draft.is_none());
+    assert!(threshold_draft(&app).is_none());
     assert_eq!(
         threshold_of(&app, "personal"),
         Some(50.0),
@@ -1172,12 +1177,12 @@ fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
     press(&mut app, KeyCode::Tab);
     assert_eq!(app.tab, Tab::Status);
     press(&mut app, KeyCode::Tab);
-    assert_eq!(app.tab, Tab::Plugin);
+    assert_eq!(app.tab, Tab::Services);
     press(&mut app, KeyCode::Tab);
     assert_eq!(app.tab, Tab::Overview, "Tab wraps back to Overview");
 
     press(&mut app, KeyCode::BackTab);
-    assert_eq!(app.tab, Tab::Plugin, "BackTab wraps to the last tab");
+    assert_eq!(app.tab, Tab::Services, "BackTab wraps to the last tab");
     // Seven BackTab from the last tab walk back to the first, same as ←.
     for _ in 0..7 {
         press(&mut app, KeyCode::BackTab);
@@ -1199,8 +1204,7 @@ fn tab_key_does_not_leak_past_modal_or_field_capture() {
     press(&mut app, KeyCode::Enter); // focus detail pane for "personal" (cursor 0)
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     press(&mut app, KeyCode::Down); // Name → AutoStart
-    press(&mut app, KeyCode::Down); // AutoStart → PreferredDays
-    press(&mut app, KeyCode::Down); // PreferredDays → BaseUrl
+    press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing BaseUrl
     assert_eq!(
         app.config_draft.as_ref().and_then(|d| d.active),

@@ -10,6 +10,17 @@ pub(crate) fn init() {
     }
 }
 
+/// `exe` (a `current_exe()` answer) as installed. A long-lived process (the
+/// daemon, a TUI) outlives an in-place self-update, after which Linux answers
+/// `current_exe()` as `<path> (deleted)` while the replacement sits at
+/// `<path>`: anything it spawns or hands out by that path must drop the marker.
+pub(crate) fn installed_exe_path(exe: &std::path::Path) -> std::path::PathBuf {
+    match exe.to_string_lossy().strip_suffix(" (deleted)") {
+        Some(installed) => std::path::PathBuf::from(installed),
+        None => exe.to_path_buf(),
+    }
+}
+
 /// Open `url` in the operator's default browser. Used by the interactive OAuth
 /// login (`oauth_login`) to launch the authorize page. Detached (stdio nulled)
 /// so it never blocks or leaks output into clauth's own stdout/stderr.

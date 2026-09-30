@@ -22,7 +22,7 @@ An endpoint account's API key reaches Claude Code through `apiKeyHelper`, so it 
 
 ## What a switch touches
 
-A switch rewrites exactly the files in SECURITY.md's switch list: the global credentials link, the `env`/`model`/`apiKeyHelper` parts of `~/.claude/settings.json`, and the stale identity block in `~/.claude.json`, plus the target profile's stored MCP logins so you are not signed out of them. Nothing else moves. Hooks, permissions, status line, projects, plugins and token stats are all left where they are. A switch onto a codex profile rewrites `~/.clauth/codex-profiles.toml` and nothing else: no file under `~/.claude` or `~/.codex` moves ([Codex](Codex#switch)).
+A switch rewrites exactly the files in SECURITY.md's switch list: the global credentials link, the `env`/`model`/`apiKeyHelper` parts of `~/.claude/settings.json`, and the stale identity block in `~/.claude.json`, plus the target profile's stored MCP logins so you are not signed out of them. Nothing else moves. Hooks, permissions, status line, projects, plugins and token stats are all left where they are. A switch onto a codex profile rewrites `~/.clauth/codex-profiles.toml`; when your own `~/.codex/auth.json` is the link clauth installed into a profile's store, that link moves with the switch, and nothing under `~/.claude` does ([Codex](Codex#switch)).
 
 ## MCP-server logins
 
@@ -67,6 +67,6 @@ If Claude Code logged into a different account while clauth was closed, the next
 
 ## Switching things off
 
-The off-switches are SECURITY.md's table: `CLAUTH_NO_UPDATE=1`, `CLAUTH_NO_COMPLETIONS=1`, `CLAUTH_NO_API=1`, an empty `fallback_chain`, `allow extra usage` off, and `auto_start = false` are all default-safe and named there with their effects.
+The off-switches are SECURITY.md's table: auto-update off (the Config tab row), `CLAUTH_NO_UPDATE=1`, `CLAUTH_NO_COMPLETIONS=1`, `CLAUTH_NO_API=1`, an empty `fallback_chain`, `allow extra usage` off, and `auto_start = false` are all default-safe and named there with their effects.
 
 Found something exploitable? Report it privately through the repo's **Security → Report a vulnerability**.

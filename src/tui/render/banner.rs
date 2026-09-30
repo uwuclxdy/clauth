@@ -1,8 +1,8 @@
 //! Full-width body banner for critical sticky system conditions.
 //!
-//! Per the cloudy-ui contract: single line, full width, full-width semantic
-//! background tint, leading ` ! ` glyph in the semantic color. Stays until
-//! the condition resolves — not user-dismissable.
+//! Single line, full width, full-width semantic background tint, leading ` ! `
+//! glyph in the semantic color. Stays until the condition resolves — not
+//! user-dismissable.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

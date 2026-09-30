@@ -79,6 +79,8 @@ fn write_job(id: &str, live: bool) {
         endpoint: None,
         provider: None,
         isolated: false,
+        cwd: None,
+        spawned_by: None,
         session_id: None,
         timeout_secs: 0,
         idle_secs: None,

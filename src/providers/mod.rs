@@ -18,14 +18,15 @@
 //!    ignores it, so [`alibaba`] runs on a separate per-profile console session
 //!    and its entries are collected even when the api key is absent
 //!    ([`crate::usage::third_party_credentialed`] is the shared test, and the
-//!    render layer reads the same one). A provider whose usage credential can
-//!    die with no refresh path returns [`ThirdPartyError::AuthExpired`] rather
-//!    than a generic failure, which is what stops the cadence and tells the
-//!    operator to re-authenticate instead of waiting. The shared `get_json`
-//!    already maps a 401 to it — a dead api key has no refresh path either — so
-//!    a provider only needs to produce the verdict itself when the death
-//!    arrives in an HTTP 200 body: Alibaba's session verdict and MiniMax's
-//!    in-band dead-key codes.
+//!    render layer reads the same one). WHICH credential died decides the
+//!    verdict: a rejected api KEY (the credential the member's sessions spend)
+//!    returns [`ThirdPartyError::AuthExpired`] — the chain walks treat it as
+//!    auth-broken — while a lapsed Alibaba console session (usage-only)
+//!    returns [`ThirdPartyError::ConsoleExpired`] and keeps today's behaviour.
+//!    The shared `get_json` already maps a 401 to `AuthExpired`, so a provider
+//!    only needs to produce a verdict itself when the death arrives in an HTTP
+//!    200 body: Alibaba's session verdict (which is `ConsoleExpired`) and
+//!    MiniMax's in-band dead-key codes (which are `AuthExpired`).
 //!
 //! No render-layer changes needed — [`ThirdPartyStats`] carries provider-agnostic
 //! [`UsageBar`]s (percentage windows) and [`StatRow`]s (text), which
@@ -158,6 +159,12 @@ impl Provider {
             Self::OpenRouter => openrouter::DISPLAY_NAME,
             Self::MiniMax => minimax::DISPLAY_NAME,
         }
+    }
+
+    /// The lowercase name a stuck-429 hint names — the display name lowercased
+    /// (`Z.ai` → `z.ai`), so the throttler reads the same vendor the row shows.
+    pub(crate) fn throttle_hint_name(self) -> String {
+        self.display_name().to_ascii_lowercase()
     }
 
     /// Whether this provider publishes usage windows of its own (percentage
@@ -511,14 +518,21 @@ pub(crate) enum ThirdPartyError {
     },
     Network,
     Parse,
-    /// The provider's usage credential is dead or was never captured, and no
-    /// refresh path exists — only an operator re-login clears it. Distinct from
-    /// `Status` because retrying on the cadence can never succeed: the scheduler
-    /// session-suppresses this profile and the UI names the login instead of a
-    /// network fault. Three producers: a 401 from the shared `get_json` (a dead
-    /// api key), Alibaba's 48-hour console session, and MiniMax's in-band
-    /// dead-key codes — the latter two ride HTTP 200 bodies.
+    /// The api KEY (the credential the member's sessions spend) was rejected,
+    /// and no refresh path exists — only re-entering the key clears it. Distinct
+    /// from `Status` because retrying on the cadence can never succeed: the
+    /// scheduler session-suppresses this profile, the chain walks treat it as
+    /// auth-broken ([`crate::usage::ThirdPartyBroken`]), and the UI names the
+    /// key re-entry instead of a network fault. Produced by a 401 from the
+    /// shared `get_json`, or MiniMax's in-band dead-key codes (an HTTP 200
+    /// body).
     AuthExpired,
+    /// Alibaba's console session (the USAGE-ONLY credential) lapsed or was never
+    /// captured. The api key still serves, so the account is NOT dead — it is
+    /// session-suppressed and keeps today's behaviour, never the auth-broken
+    /// treatment. Produced by `alibaba::fetch`'s missing-console arm and its
+    /// in-body login-error codes.
+    ConsoleExpired,
 }
 
 // ── HTTP ────────────────────────────────────────────────────────────────────────

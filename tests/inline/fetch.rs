@@ -832,10 +832,10 @@ fn retry_after_parses_delta_seconds_and_http_date() {
 }
 
 /// The parser clamps a server `retry-after` at
-/// [`crate::usage::MAX_RETRY_AFTER_MS`] (cloudy's 2026-09-07 ruling, applied at
-/// the source so no consumer's `as_millis() as u64` cast can wrap: 2^61
-/// delta-seconds would otherwise cast to exactly 0 ms — "retry now"). A hint
-/// past the cap becomes exactly the cap; at or under it passes verbatim;
+/// [`crate::usage::MAX_RETRY_AFTER_MS`] (the maintainer's 2026-09-07 ruling,
+/// applied at the source so no consumer's `as_millis() as u64` cast can wrap:
+/// 2^61 delta-seconds would otherwise cast to exactly 0 ms — "retry now"). A
+/// hint past the cap becomes exactly the cap; at or under it passes verbatim;
 /// `Duration::ZERO` survives.
 #[test]
 fn retry_after_clamps_huge_hints_at_max() {

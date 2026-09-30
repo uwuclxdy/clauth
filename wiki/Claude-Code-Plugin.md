@@ -4,7 +4,7 @@ clauth ships an MCP server that hands your profiles to a live Claude Code sessio
 
 ## Install
 
-Open the TUI's Plugin tab, move to the `plugin` row, and press <kbd>f</kbd>. Confirming the prompt installs the plugin at user scope through Claude Code's own installer. If a broken registration ever trips it, the plugin repairs itself: its `SessionStart` hook runs `clauth self-heal`, which reinstalls a registered-but-broken install and leaves a deliberate uninstall alone. `clauth self-heal` also converges plugin install paths Claude Code recorded through a dead session tree back to their shared `~/.claude` twins, and `clauth start` plus the daemon run the same convergence before a session loads — so a plugin whose recorded path dangled loads again, no manual fix.
+Open the TUI's Services tab, move to the `plugin` row, then press <kbd>f</kbd>. Confirming the prompt installs the plugin at user scope through Claude Code's own installer. If a broken registration ever trips it, the plugin repairs itself: its `SessionStart` hook runs `clauth self-heal`, which reinstalls a registered-but-broken install and leaves a deliberate uninstall alone. `clauth self-heal` also converges plugin install paths Claude Code recorded through a dead session tree back to their shared `~/.claude` twins, and `clauth start` plus the daemon run the same convergence before a session loads, so a plugin whose recorded path dangled loads again, no manual fix.
 
 `/plugin marketplace add uwuclxdy/clauth` then `/plugin install clauth@clauth` is the other route. It registers the same plugin against this repo rather than the local tree, and clauth converges the two: the registration is re-pointed at the locally materialized tree the next time `clauth mcp` starts, the daemon ticks, or `clauth start` runs. Nothing to do by hand, and nothing to undo if you took that route before.
 
@@ -18,7 +18,7 @@ To wire the server by hand instead, add this to `mcpServers` in `~/.claude.json`
 "clauth": { "type": "stdio", "command": "clauth", "args": ["mcp"] }
 ```
 
-The TUI's Plugin tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same four tools, minus the bundled hooks. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, and a conversation is never told when the account behind it changes or its context crosses the configured threshold.
+The TUI's Services tab writes exactly that entry for you with <kbd>f</kbd>. The manual route gives you the same four tools, minus the bundled hooks. Without the plugin, a backgrounded `delegate` result has to be collected with `monitor`, and a conversation is never told when the account behind it changes or its context crosses the configured threshold.
 
 ## Tools
 

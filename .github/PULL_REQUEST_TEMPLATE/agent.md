@@ -25,7 +25,7 @@ describe the behavior you changed, say whether you updated them.
 <!--
 Three short lines:
 - tool + model + operator, e.g. `Claude Code (claude-fable-5), operated by @handle`
-- ran: exact commands + outcomes (`cargo.sh` result if you ran it); add "operator verified: ..." if known, else "operator verification: unknown"
+- ran: exact commands + outcomes (`cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings` and `cargo test --locked --all-features` results if you ran them); add "operator verified: ..." if known, else "operator verification: unknown"
 - unsure: decisions made without operator input, whatever you're least confident about. "none" only if you mean it
 Redact secrets from anything you paste (no `sk-ant-*`, no credential-file contents).
 -->

@@ -153,10 +153,11 @@ pub(crate) fn generate_chain(
     // flags too and writes named-curve keys either way, so this is the shape
     // both parsers take. SEC1 from `ecparam`, wrapped to PKCS#8 by `pkey`.
     let gen_key = |out: &Path| -> Result<(), String> {
-        // One retry: `ecparam`/`pkey` were measured (mac-6, 2026-09-10) exiting
-        // 1 with empty stderr roughly once per ten loaded full-suite runs —
-        // only inside the test harness, never in 900 shell-level spawns — so a
-        // transient is masked rather than reported as a product failure.
+        // One retry: `ecparam`/`pkey` were measured (on a macOS host,
+        // 2026-09-10) exiting 1 with empty stderr roughly once per ten loaded
+        // full-suite runs — only inside the test harness, never in 900
+        // shell-level spawns — so a transient is masked rather than reported
+        // as a product failure.
         let mut err = String::new();
         for _ in 0..2 {
             let raw = out.with_extension("sec1");

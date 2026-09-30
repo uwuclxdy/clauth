@@ -1826,8 +1826,9 @@ fn sidecar_rescue_never_follows_a_symlink_into_the_global_store() {
 }
 
 /// A DESTINATION entry that is a symlink is left alone: the real `~/.claude`
-/// holds operator links pointing outside the store (`skills -> ~/.agents/…`),
-/// and writing through one would land rescued files in the operator's repos.
+/// can hold operator links pointing outside the store (a `skills` dir symlinked
+/// elsewhere), and writing through one would land rescued files in the
+/// operator's repos.
 #[cfg(unix)]
 #[test]
 fn sidecar_rescue_never_writes_through_a_symlinked_destination() {

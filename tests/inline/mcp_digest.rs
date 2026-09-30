@@ -614,7 +614,7 @@ fn monitor_done_envelope_reports_the_digest() {
         "is_error": false,
         "result": "all done",
     });
-    jobs::write_done("d-digest-0", "work", 1, None, None, false, envelope.clone())
+    jobs::write_done_parts("d-digest-0", "work", 1, None, None, false, envelope.clone())
         .expect("write job");
     let first = call_monitor_ids(&server, &["d-digest-0"]);
     assert!(
@@ -622,7 +622,8 @@ fn monitor_done_envelope_reports_the_digest() {
         "first digest call seeds, even through a collected job: {first}",
     );
 
-    jobs::write_done("d-digest-1", "work", 1, None, None, false, envelope).expect("write job");
+    jobs::write_done_parts("d-digest-1", "work", 1, None, None, false, envelope)
+        .expect("write job");
     set_mtime(&credentials_path(), t1());
     let second = call_monitor_ids(&server, &["d-digest-1"]);
     assert!(
@@ -633,7 +634,7 @@ fn monitor_done_envelope_reports_the_digest() {
 
 /// Seed one finished job whose envelope reads `all done`.
 fn seed_done_job(id: &str) {
-    jobs::write_done(
+    jobs::write_done_parts(
         id,
         "work",
         1,

@@ -1513,9 +1513,9 @@ fn rescuable_sidecar(name: &std::ffi::OsStr) -> bool {
 ///
 /// Symlinks are skipped on BOTH sides, never followed: an isolated runtime links
 /// nothing, so a source link is anomalous and walking one could reach the
-/// operator's own store, while `~/.claude` does hold operator links pointing
-/// outside the store (`skills -> ~/.agents/…`) that a rescue must not write
-/// through.
+/// operator's own store, while `~/.claude` can hold operator links pointing
+/// outside the store (a `skills` dir symlinked elsewhere) that a rescue must
+/// not write through.
 pub(crate) fn rescue_isolated_sidecars(iso_root: &Path, global_root: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(iso_root) else {
         return 0;

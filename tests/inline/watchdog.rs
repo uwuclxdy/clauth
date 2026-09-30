@@ -821,7 +821,7 @@ fn the_watched_list_names_both_spellings_when_they_differ() {
     let real = tmp.path().join("real");
     std::fs::create_dir_all(&real).expect("mkdir real");
     // Resolved, or the "resolves to itself" half is untrue wherever TMPDIR is
-    // itself symlinked: the `cargo.sh` test leg and every macOS run.
+    // itself symlinked, as on every macOS run.
     let real = std::fs::canonicalize(&real).expect("realpath");
 
     // Gated for want of `std::os::unix::fs::symlink`, not because the rule is

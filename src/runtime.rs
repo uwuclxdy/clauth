@@ -160,7 +160,9 @@ pub(crate) enum Isolation {
 }
 
 /// Directory-name stems. A per-session dir appends `-<sid>`; the bare stem is
-/// the pre-per-session layout, which the pairing rule still covers.
+/// the pre-per-session layout, and under [`LinkMode::Fake`] still the live one
+/// for a shared claude session and for every codex session's sessions dir. The
+/// pairing rule covers both.
 const RUNTIME_STEM: &str = "runtime";
 const SESSIONS_STEM: &str = "sessions";
 const ISOLATED_RUNTIME_STEM: &str = "runtime-isolated";
@@ -363,6 +365,22 @@ pub(crate) fn is_codex_home_path(path: &Path) -> bool {
             == Some(std::ffi::OsStr::new("profiles"))
 }
 
+/// Drop from `command` each session home it would inherit that names a tree
+/// clauth built: `CLAUDE_CONFIG_DIR` onto a runtime tree, `CODEX_HOME` onto a
+/// codex home. A process spawned from inside a clauth session otherwise
+/// answers as that session (`clauth which`, a `codex` run landing in another
+/// profile's home) and keeps pointing at its tree after teardown. The user's
+/// own custom dirs are theirs and stay.
+pub(crate) fn scrub_clauth_homes(command: &mut std::process::Command) {
+    if std::env::var_os("CLAUDE_CONFIG_DIR").is_some_and(|v| is_clauth_runtime_path(Path::new(&v)))
+    {
+        command.env_remove("CLAUDE_CONFIG_DIR");
+    }
+    if std::env::var_os("CODEX_HOME").is_some_and(|v| is_codex_home_path(Path::new(&v))) {
+        command.env_remove("CODEX_HOME");
+    }
+}
+
 /// The sessions dir paired with a runtime dir of this name, per the module's one
 /// layout rule: `runtime<rest>` ↔ `sessions<rest>`. Deliberately loose about
 /// what `<rest>` is; callers that DELETE gate on [`is_runtime_dir_name`] first.
@@ -417,10 +435,6 @@ struct SessionPaths {
     runtime: PathBuf,
     sessions: PathBuf,
     pid_file: PathBuf,
-    /// The upgrade-compat marker, and `None` when the session's own `pid_file`
-    /// already sits at that path — which is exactly the shared-tree case. See
-    /// [`stamp_legacy_marker`].
-    legacy_marker: Option<PathBuf>,
 }
 
 impl SessionPaths {
@@ -433,78 +447,11 @@ impl SessionPaths {
         let (runtime_name, sessions_name) = paired_dir_names(isolation, session.as_str(), mode);
         let sessions = profile_subpath(name, &sessions_name)?;
         let pid_file = sessions.join(session.as_str());
-        // The PRE-per-session marker path, `<profile>/sessions[-isolated]/<sid>`.
-        let legacy = profile_subpath(name, isolation.sessions_stem())?.join(session.as_str());
         Ok(Self {
             runtime: profile_subpath(name, &runtime_name)?,
-            legacy_marker: (legacy != pid_file).then_some(legacy),
             sessions,
             pid_file,
         })
-    }
-}
-
-/// Stamp and hold this session's upgrade-compat marker, returning the fd whose
-/// flock is the liveness signal.
-///
-/// A clauth process built before the per-session layout probes exactly
-/// `<profile>/sessions` and `<profile>/sessions-isolated`. It cannot see a
-/// `sessions-<sid>/` dir, so its `has_live_session` reads a live new-layout
-/// session as idle and its rotation leg spends the single-use refresh token that
-/// session still holds — the chain dies and the account needs a re-login. That is
-/// the DEFAULT state right after an upgrade: `clauth daemon --replace` exists
-/// precisely because the running daemon is otherwise the old binary until the
-/// next restart.
-///
-/// Under the shared bare-stem tree the session's OWN marker already sits at that
-/// path, so a second marker would be the same file: `open` + `try_lock` from this
-/// process conflicts with the fd `acquire` holds and fails. Hence
-/// [`SessionPaths::legacy_marker`] is an `Option` — there is no second marker to
-/// stamp, and this is unreachable rather than failing every start.
-///
-/// Best-effort: failing to stamp costs upgrade safety, not the session, so it is
-/// logged and stepped over rather than propagated.
-///
-/// Ceiling: an upgrade-window shim, added 2026-07-25. Delete it — with
-/// `ProfileRuntime::legacy_marker` and the count dedupe it forces in
-/// `live_session_count` (unlinked: that one is `cfg(test)` now, so an intra-doc
-/// link to it would not resolve in a doc build) — a few releases after the
-/// per-session layout ships, once no pre-layout binary can still be supervising
-/// a live install.
-fn stamp_legacy_marker(path: &Path) -> Option<File> {
-    let dir = path.parent()?;
-    if let Err(e) = crate::profile::mkdir_700(dir) {
-        logline!(
-            "clauth: upgrade-compat marker dir {} failed: {e}",
-            dir.display()
-        );
-        return None;
-    }
-    let file = match open_pid_file(path) {
-        Ok(file) => file,
-        Err(e) => {
-            logline!(
-                "clauth: upgrade-compat marker {} failed: {e}",
-                path.display()
-            );
-            return None;
-        }
-    };
-    // `try_lock`, not `lock`. The DIR here is shared across the profile's
-    // sessions but this FILE is `sessions/<sid>`, so contention needs a second
-    // live process that minted the same `<pid>-<seq>` — a shared `~/.clauth`
-    // across pid namespaces, or an NFS home. Rare, and a blocking wait would hang
-    // `acquire` inside the state lock; a `None` here is also what keeps teardown
-    // from unlinking a marker this session never owned.
-    match file.try_lock() {
-        Ok(()) => Some(file),
-        Err(e) => {
-            logline!(
-                "clauth: upgrade-compat marker {} not lockable: {e}",
-                path.display()
-            );
-            None
-        }
     }
 }
 
@@ -546,7 +493,7 @@ fn session_marker_paths(
 /// session's row).
 ///
 /// Callers choose WHICH profile to probe: the tally, GC, and the decision leg all
-/// probe `current_member` first (where a swapped session holds its markers) and
+/// probe `current_member` first (where a swapped session holds its marker) and
 /// fall back to `start_profile` (where a session that never moved lives), so a row
 /// can never be alive for one consumer and dead for another. A caller MUST use the
 /// same fallback the tally uses, or GC would reap what the tally counts.
@@ -590,8 +537,7 @@ fn profiles_root_dir() -> Result<PathBuf> {
 }
 
 /// Every marker dir under the profile: each live session's own
-/// `sessions[-isolated]-<sid>`, the legacy bare `sessions`/`sessions-isolated`,
-/// and the upgrade-compat markers [`stamp_legacy_marker`] puts in the latter.
+/// `sessions[-isolated]-<sid>` and the bare `sessions`/`sessions-isolated`.
 ///
 /// `None` when the profile dir could not be enumerated for any reason OTHER than
 /// being absent — a caller must read that as "cannot rule out a live session".
@@ -841,16 +787,14 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
     ROTATION_BLOCKED_OVERRIDE.with(|c| c.set(forced));
 }
 
-/// Count of live `clauth start` sessions for the profile, deduped by marker NAME
-/// across every marker dir: one session holds its own `sessions-<sid>/<sid>` and
-/// an upgrade-compat `sessions/<sid>`, and the shared session id is what makes
-/// those one session rather than two. Reports 1 on an unknown, so it never
+/// Count of live `clauth start` sessions for the profile: the flock-held markers
+/// across every marker dir, one per session. Reports 1 on an unknown, so it never
 /// contradicts [`has_live_session`] within a tick.
 ///
-/// TEST-ONLY since 2026-07-25. Its one production consumer, the Plugin tab's
-/// fleet tally, moved to `live_sessions::LiveTally`: this dedupes markers WITHIN
-/// a profile but not across them, so a session that swapped A→B read as two
-/// sessions on two accounts, and only the registry can tell those apart.
+/// TEST-ONLY since 2026-07-25. Its one production consumer, the Services tab's
+/// fleet tally, moved to `live_sessions::LiveTally`: this counts markers per
+/// profile, so a session that swapped A→B reads as one session on each of two
+/// accounts, and only the registry can tell those apart.
 ///
 /// Kept rather than deleted because the marker-layout tests need the COUNT, and
 /// [`has_live_session`] cannot supply it — it is a boolean `.any()`, so it reads
@@ -860,17 +804,9 @@ pub(crate) fn set_rotation_blocked_override(forced: Option<bool>) {
 /// owns, so nothing outside it rebuilds the paths.
 #[cfg(test)]
 pub(crate) fn live_session_count(name: &ProfileName) -> usize {
-    let Some(dirs) = session_marker_dirs(name) else {
-        return 1;
-    };
-    let mut ids: HashSet<std::ffi::OsString> = HashSet::new();
-    for dir in &dirs {
-        match live_marker_names(dir) {
-            Some(names) => ids.extend(names),
-            None => return 1,
-        }
-    }
-    ids.len()
+    session_marker_dirs(name)
+        .and_then(|dirs| dirs.iter().map(|dir| live_sessions_at(dir)).sum())
+        .unwrap_or(1)
 }
 
 /// Names of the markers currently flock-held in `sessions`. `None` when the dir
@@ -983,7 +919,7 @@ pub(crate) fn gc_stale_runtimes() {
     // wider one is adopted rather than replaced.
     #[cfg(target_os = "macos")]
     let _item_budget = crate::lock::SharedSubprocessBudget::arm(crate::lock::SUBPROCESS_BUDGET);
-    // The Plugin tab's boot probe kills its `clauth mcp` child within 3 s, so
+    // The Services tab's boot probe kills its `clauth mcp` child within 3 s, so
     // the tree sweep skips there WHOLE: on macOS it spends `security`
     // subprocesses collecting the removed trees' Keychain items, and on every
     // platform it takes the state flock per pair against the 25 s deadline a
@@ -1114,10 +1050,6 @@ fn gc_runtime_trees() {
             } else if is_runtime_dir_name(child_name)
                 && let Some(sessions) = paired_sessions_name(child_name)
             {
-                // A stale pre-upgrade `runtime/` pairs with the same `sessions/`
-                // the compat markers live in, so it is spared while ANY session of
-                // the profile runs and only collected once the last one leaves.
-                // Delayed cleanup, not a leak.
                 let _ = gc_one_pair(&child.path(), &profile.join(sessions));
             } else if is_sessions_dir_name(child_name)
                 && let Some(runtime) = paired_runtime_name(child_name)
@@ -1125,9 +1057,7 @@ fn gc_runtime_trees() {
                 // A marker dir with no runtime sibling. `acquire` mints it before
                 // it builds the tree, so a crash in that window strands one — and
                 // per-session keying makes that a fresh empty dir every time
-                // rather than a reused one. A legacy `sessions/` holding only
-                // upgrade-compat markers lands here too, and is spared until the
-                // last of them is released.
+                // rather than a reused one.
                 let runtime = profile.join(runtime);
                 if runtime.symlink_metadata().is_err() {
                     let _ = gc_one_pair(&runtime, &child.path());
@@ -1739,7 +1669,7 @@ fn gc_bare_markers() {
         return;
     };
     // Peek before locking. This runs at every `clauth mcp` boot — including the
-    // Plugin tab's probe child, which dies at 3s — while the state flock waits up
+    // Services tab's probe child, which dies at 3s — while the state flock waits up
     // to `STATE_LOCK_TIMEOUT` and is legitimately held ~20s by a macOS switch's
     // keychain shell-out. Nothing to prune must not pay that wait. A marker that
     // appears after the peek is collected by the next sweep, which is the whole
@@ -2914,23 +2844,17 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// One swapped-onto member's liveness markers, held for the session's life.
+/// One swapped-onto member's liveness marker, held for the session's life.
 struct SwappedMarkers {
     pid_file: PathBuf,
     pid_lock: File,
-    /// The upgrade-compat marker, `None` exactly as in [`ProfileRuntime`]: there
-    /// is no second path to stamp. Its lock is `None` when [`stamp_legacy_marker`]
-    /// lost `try_lock` to a live process holding a colliding sid, which is what
-    /// keeps teardown from unlinking a file this session never owned.
-    legacy_marker: Option<PathBuf>,
-    legacy_lock: Option<File>,
 }
 
-/// What claiming a member's liveness markers found.
+/// What claiming a member's liveness marker found.
 enum MarkerClaim {
     /// Freshly stamped; hold for the session's life.
     Stamped(SwappedMarkers),
-    /// This session already holds them — a member it has run on before. `flock`
+    /// This session already holds it — a member it has run on before. `flock`
     /// locks the open file description, so a second `open` + `try_lock` from THIS
     /// process is denied by our own lock; without recognizing that, every swap back
     /// onto a recovered member would read as a foreign holder and be refused,
@@ -2940,21 +2864,14 @@ enum MarkerClaim {
     Foreign,
 }
 
-/// Stamp and hold the intended member's liveness markers, BOTH layouts.
+/// Stamp and hold the intended member's per-session liveness marker.
 ///
-/// The per-session one makes the swapped-onto member read live to
-/// [`has_live_session`], which is what stops a delete or disable landing on the
-/// account this session is now running as. It is NOT a rotation gate on this
-/// platform: rotation refuses only on macOS
-/// ([`rotation_blocked_by_live_session`]), and [`swap_support`] refuses to swap
-/// there at all, so no swapped session ever meets that refusal.
+/// It makes the swapped-onto member read live to [`has_live_session`], which is
+/// what stops a delete or disable landing on the account this session is now
+/// running as, and on macOS what [`rotation_blocked_for`] reads to refuse a
+/// rotation of it.
 ///
-/// The compat one is what a clauth predating the per-session layout reads, and
-/// right after an upgrade that old binary is the running daemon. That binary DOES
-/// still gate rotation on liveness, so missing it costs the live child one failed
-/// refresh until the daemon is replaced.
-///
-/// `None` when the per-session marker is held by something else, so the caller
+/// `None` when the marker is held by something else, so the caller
 /// refuses the swap. A foreign holder means a colliding session id, and marker
 /// ownership is what teardown keys on — unlinking a marker another session minted
 /// would report that session dead while it runs. Callers go through
@@ -2970,12 +2887,9 @@ fn stamp_swapped_markers(paths: &SessionPaths) -> Result<Option<SwappedMarkers>>
     if pid_lock.try_lock().is_err() {
         return Ok(None);
     }
-    let legacy_lock = paths.legacy_marker.as_deref().and_then(stamp_legacy_marker);
     Ok(Some(SwappedMarkers {
         pid_file: paths.pid_file.clone(),
         pid_lock,
-        legacy_marker: paths.legacy_marker.clone(),
-        legacy_lock,
     }))
 }
 
@@ -3125,7 +3039,7 @@ impl SessionSwap {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Claim `paths`'s markers for this session, separating a marker this session
+    /// Claim `paths`'s marker for this session, separating a marker this session
     /// already holds from one a foreign process does. The two are
     /// indistinguishable to `try_lock`, and conflating them is what would refuse
     /// every swap back onto a member the session has already run on.
@@ -3286,7 +3200,7 @@ impl SessionSwap {
     /// belonging to one member as the other's, writing it over a chain the
     /// session never authenticated as.
     ///
-    /// Every member the session has run on keeps its markers for the session's
+    /// Every member the session has run on keeps its marker for the session's
     /// life, so a claim never replaces one; the whole `held` vec is released by
     /// [`release_swapped_markers`](Self::release_swapped_markers) at teardown.
     fn publish_swap(&self, plan: &SwapPlan, claim: MarkerClaim) {
@@ -3484,7 +3398,10 @@ impl SessionSwap {
                                 // The item now holds the incoming member's pair,
                                 // so that is what the session reads: the row's
                                 // verdict follows.
-                                Ok(()) => self.repoint_row_store(&plan),
+                                Ok(()) => {
+                                    self.repoint_row_store(&plan);
+                                    self.retouch_after_item_leg(&plan);
+                                }
                                 Err(e) => logline!(
                                     "clauth: session {} swapped onto {} but writing its per-session \
                                      Keychain item failed: {e:#}. The session keeps authenticating as its \
@@ -3512,7 +3429,8 @@ impl SessionSwap {
                                 // falls back to the file layer this swap moved:
                                 // the row's verdict follows.
                                 Ok(crate::keychain::SignOutOutcome::SignedOut) => {
-                                    self.repoint_row_store(&plan)
+                                    self.repoint_row_store(&plan);
+                                    self.retouch_after_item_leg(&plan);
                                 }
                                 // The locked keychain left the item untouched,
                                 // so the session still reads the outgoing
@@ -3783,21 +3701,38 @@ impl SessionSwap {
         }
     }
 
-    /// Release and unlink everything the swaps stamped. Called from `Drop`'s
-    /// single teardown hold, and the mirror of the launch member's own leg: only a
-    /// marker whose flock this session holds is unlinked, and a dir shared with
-    /// other sessions goes only once the last of them has left.
+    /// Move the store's mtime once more after the item leg landed.
+    ///
+    /// The swap stamps the store and repoints the link inside the hold, but the
+    /// item leg runs after it. A request the session sent in between saw the
+    /// stamped mtime, re-read the item while it still held the OUTGOING member,
+    /// and memoized that mtime; Claude Code re-reads only when the mtime moves
+    /// again, so the session would stay on the member the swap left. A second
+    /// stamp makes every session that read in the gap re-read the item, which
+    /// now holds the incoming login (or nothing, falling back to the file).
+    /// Loud-not-fatal like the legs themselves: the swap already happened.
+    #[cfg(target_os = "macos")]
+    fn retouch_after_item_leg(&self, plan: &SwapPlan) {
+        if let Err(e) = with_state_lock(|_held| touch_store(plan, file_mtime(&plan.store))) {
+            logline!(
+                "clauth: session {} swapped onto {} but re-stamping its store after the \
+                 Keychain leg failed: {e:#}. A request sent during the swap may keep the \
+                 session on its previous member until the store is next written",
+                self.session.as_str(),
+                plan.member
+            );
+        }
+    }
+
+    /// Release and unlink every marker the swaps stamped. Called from `Drop`'s
+    /// single teardown hold, and the mirror of the launch member's own leg: a
+    /// marker dir goes only once no live marker is left in it.
     fn release_swapped_markers(&self) {
         // Taken out from under the cell first: the IO below acquires nothing, and
         // the rank is a true leaf only while it stays that way.
         let held = std::mem::take(&mut self.cell().held);
         for markers in held {
-            let SwappedMarkers {
-                pid_file,
-                pid_lock,
-                legacy_marker,
-                legacy_lock,
-            } = markers;
+            let SwappedMarkers { pid_file, pid_lock } = markers;
             // Release before unlinking, so a sibling's `prune_stale_sessions`
             // never reads a removed path.
             drop(pid_lock);
@@ -3808,19 +3743,6 @@ impl SessionSwap {
                     "clauth: remove swapped marker {} failed: {e}",
                     pid_file.display()
                 );
-            }
-            if let Some(legacy_marker) = legacy_marker {
-                // `None` is a marker a live foreign process holds — unlinking it
-                // would delete THEIR liveness signal.
-                if legacy_lock.is_some() {
-                    drop(legacy_lock);
-                    let _ = std::fs::remove_file(&legacy_marker);
-                }
-                if let Some(dir) = legacy_marker.parent()
-                    && prune_stale_sessions(dir).unwrap_or(1) == 0
-                {
-                    let _ = std::fs::remove_dir(dir);
-                }
             }
             if let Some(dir) = pid_file.parent()
                 && prune_stale_sessions(dir).unwrap_or(1) == 0
@@ -3839,19 +3761,11 @@ pub(crate) struct ProfileRuntime {
     /// to, which a swap moves, plus everything that swap needs.
     swap: std::sync::Arc<SessionSwap>,
     pid_file: PathBuf,
-    /// Upgrade-compat marker path, `None` when this session's own `pid_file`
-    /// already sits there and there is nothing separate to stamp. See
-    /// [`stamp_legacy_marker`] for its lifetime and the release at which both it
-    /// and this field go away.
-    legacy_marker: Option<PathBuf>,
     claude_home: PathBuf,
     sessions: PathBuf,
     /// Held for the lifetime of the session so a sibling process's
     /// `try_lock` reveals we're still alive.
     _pid_lock: File,
-    /// The same signal at the pre-per-session path, for a still-running clauth
-    /// that predates this layout. `None` when it could not be stamped.
-    legacy_lock: Option<File>,
     /// Wrapped in Option so Drop can take() it before joining the watchdog,
     /// signalling the thread to exit.
     watchdog_signal: Option<crossbeam_channel::Sender<()>>,
@@ -3864,8 +3778,8 @@ pub(crate) struct ProfileRuntime {
 /// config loaded earlier, and its rotation-lock acquisition WAITS (bounded by
 /// [`ROTATION_LOCK_TIMEOUT`], but a wait either way), so an
 /// `actions::delete_profile` or `actions::rename_profile` can land in between —
-/// leaving the acquire to re-create the profile dir, build a tree, stamp markers
-/// and register a live row for an account nothing configures.
+/// leaving the acquire to re-create the profile dir, build a tree, stamp its
+/// marker and register a live row for an account nothing configures.
 ///
 /// Called as the first act of the acquire's state-flock hold — before the
 /// profile directory is re-created, though not before every side effect: the
@@ -3998,9 +3912,8 @@ impl ProfileRuntime {
     ///
     /// The paths and the id rather than the profile name, for the same reason: the
     /// profile-wide `has_live_session` and a `start_profile` scan over the registry
-    /// are each satisfied by artifacts this closure stamps for OTHER reasons — the
-    /// compat marker, a sibling session's row — so a probe written against them
-    /// passes with this session's own marker unclaimed. Measured, it did.
+    /// are each satisfied by a sibling session's marker or row, so a probe written
+    /// against them passes with this session's own marker unclaimed.
     ///
     /// `hold_released` runs after the drop and asks the one thing the other cannot:
     /// that the lock is free by then. It needs no fixed position now that the
@@ -4037,7 +3950,7 @@ impl ProfileRuntime {
         let rotation_guard = RotationGuard::acquire_with_timeout(name, rotation_lock_timeout())?;
         pre_lock_done();
 
-        let (session, paths, pid_lock, legacy_lock, mode, fresh) = with_state_lock(|_held| {
+        let (session, paths, pid_lock, mode, fresh) = with_state_lock(|_held| {
             // Inside the hold, and ahead of every write this closure does — see
             // `refuse_if_unconfigured` for which mechanism each half buys.
             refuse_if_unconfigured(name)?;
@@ -4073,14 +3986,10 @@ impl ProfileRuntime {
                 .with_context(|| format!("failed to create {}", profile_root.display()))?;
             let mode = detect_link_mode(&profile_root)?;
             // A sid is a NAME, not a claim. `<pid>-<seq>` collides only when a
-            // second LIVE process minted the same pair, which needs the shapes
-            // `stamp_legacy_marker` names: a `~/.clauth` shared across pid
-            // namespaces, or an NFS home. Under a shared bare-stem tree
-            // (`LinkMode::Fake`, SHARED) that collision lands on this session's
-            // OWN marker, because the bare-stem tree puts it at the compat path,
-            // so there is no separate marker to fall back to and no `try_lock`
-            // concede on the way in. Re-mint rather than
-            // wait: the claim below runs inside the state flock, so a blocking
+            // second LIVE process minted the same pair, which needs a `~/.clauth`
+            // shared across pid namespaces, or an NFS home, and the collision
+            // lands on this session's OWN marker. Re-mint rather than wait: the
+            // claim below runs inside the state flock, so a blocking
             // wait there wedges every other clauth process on this home, and
             // `is_session_alive` reads every unknown as live, so an unreadable
             // marker moves this session aside instead of parking it.
@@ -4097,7 +4006,6 @@ impl ProfileRuntime {
                 runtime,
                 sessions,
                 pid_file,
-                legacy_marker,
             } = &paths;
 
             crate::profile::mkdir_700(sessions)
@@ -4114,16 +4022,6 @@ impl ProfileRuntime {
             // Rebuild from scratch so stale symlinks/copies to entries that have
             // since vanished from ~/.claude/ don't carry over. A live sibling
             // holds a marker here, so its tree is never the one wiped.
-            //
-            // The converse does NOT hold: two concurrent starts can land on
-            // different modes. A live REAL
-            // session's compat marker sits in this same shared dir, so it makes
-            // `active` nonzero for a Fake acquire and suppresses the wipe of a
-            // bare `runtime/` that session does not use. A stale pre-upgrade tree
-            // is then adopted rather than rebuilt, and since the build is
-            // additive, a symlink forest stays symlinks under `mode == Fake`.
-            // Benign — reading a symlink needs no privilege — but it is why this
-            // wipe cannot be relied on as the only staleness cure.
             if active == 0 && runtime.symlink_metadata().is_ok() {
                 std::fs::remove_dir_all(runtime)
                     .with_context(|| format!("failed to clear {}", runtime.display()))?;
@@ -4152,7 +4050,6 @@ impl ProfileRuntime {
                     pid_file.display()
                 );
             }
-            let legacy_lock = legacy_marker.as_deref().and_then(stamp_legacy_marker);
 
             // Register inside this same hold, once the marker is flock-held: the
             // row can then never exist without a liveness signal for GC to test
@@ -4191,7 +4088,7 @@ impl ProfileRuntime {
                 logline!("clauth: registering the live session failed: {e}");
             }
             stamp_window_closing(&paths, &session);
-            Ok::<_, anyhow::Error>((session, paths, file, legacy_lock, mode, fresh))
+            Ok::<_, anyhow::Error>((session, paths, file, mode, fresh))
         })?;
         // macOS: the Keychain half of the tree build. Before the guard drops,
         // so a rotation queued behind it cannot land between the build and the
@@ -4260,10 +4157,7 @@ impl ProfileRuntime {
             session, isolation, mode, &fresh, canonical, &paths,
         ));
         let SessionPaths {
-            sessions,
-            pid_file,
-            legacy_marker,
-            ..
+            sessions, pid_file, ..
         } = paths;
 
         // This session's three reconcile legs, as one value the watchdog loop
@@ -4353,11 +4247,9 @@ impl ProfileRuntime {
         Ok(Self {
             swap,
             pid_file,
-            legacy_marker,
             claude_home,
             sessions,
             _pid_lock: pid_lock,
-            legacy_lock,
             watchdog_signal: Some(watchdog_tx),
             watchdog_handle: Some(watchdog_handle),
         })
@@ -4498,7 +4390,6 @@ impl Drop for ProfileRuntime {
         // wedged peer, not a permissions fault, so the SAME hold is retried
         // (bounded, via `acquire_state_lock_for_teardown`) rather than split:
         // the retry re-enters the same flock for the same body.
-        let legacy_lock = self.legacy_lock.take();
         match acquire_state_lock_for_teardown() {
             Ok(_guard) => {
                 if let Err(e) = crate::live_sessions::unregister(self.swap.session.as_str()) {
@@ -4509,31 +4400,9 @@ impl Drop for ProfileRuntime {
                 {
                     logline!("clauth: remove pid file failed: {e}");
                 }
-                // A `None` marker is a session whose own `pid_file` IS the compat
-                // path, already unlinked above — there is no second file, so this
-                // whole leg is skipped rather than special-cased inside it.
-                if let Some(legacy_marker) = self.legacy_marker.as_deref() {
-                    // Only unlink a marker this session actually owns. `legacy_lock`
-                    // is `None` when `try_lock` lost to a live process that minted
-                    // the same sid — unlinking there would delete a FOREIGN session's
-                    // liveness signal, which is the same rotation-burn this marker
-                    // exists to prevent. Release before unlinking, so a sibling's
-                    // `prune_stale_sessions` never reads a removed path.
-                    if legacy_lock.is_some() {
-                        drop(legacy_lock);
-                        let _ = std::fs::remove_file(legacy_marker);
-                    }
-                    // The compat dir is shared by every session of this
-                    // profile+flavor, so it goes only once the last has released.
-                    if let Some(legacy_dir) = legacy_marker.parent()
-                        && prune_stale_sessions(legacy_dir).unwrap_or(1) == 0
-                    {
-                        let _ = std::fs::remove_dir(legacy_dir);
-                    }
-                }
-                // Every member a swap moved this session onto holds markers of its
-                // own, in both layouts. A dead session that keeps one blocks rotation
-                // on an account nothing is using.
+                // Every member a swap moved this session onto holds a marker of
+                // its own. A dead session that keeps one blocks rotation on an
+                // account nothing is using.
                 self.swap.release_swapped_markers();
                 let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
                 if still_active == 0 {
@@ -6423,9 +6292,8 @@ fn link_entry(_src: &Path, _dst: &Path) -> Result<()> {
 // dirs (which is what makes `has_live_session` — and so delete/disable/rotation
 // gating — work for codex with no harness awareness), registered in the same
 // live-session registry with the codex tag. What it does NOT mirror: no swap
-// executor, no settings/claude-json watchdog legs, no legacy marker (a binary
-// old enough to probe the bare marker dirs predates codex profiles entirely and
-// never gates on their names), and no wipe of the profile-global store.
+// executor, no settings/claude-json watchdog legs, and no wipe of the
+// profile-global store.
 
 /// The stem of a codex home of this flavor. Both spell a `codex-home` prefix,
 /// so [`is_codex_home_dir_name`] covers every variant, and neither matches the

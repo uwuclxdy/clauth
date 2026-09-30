@@ -156,14 +156,20 @@ fn with_no_update_env<F: FnOnce()>(val: Option<&str>, f: F) {
 #[test]
 fn updates_enabled_when_env_unset() {
     with_no_update_env(None, || {
-        assert!(updates_enabled(), "unset env → updates enabled");
+        assert!(
+            updates_enabled(true),
+            "saved on, unset env → updates enabled"
+        );
     });
 }
 
 #[test]
 fn updates_disabled_when_env_is_one() {
     with_no_update_env(Some("1"), || {
-        assert!(!updates_enabled(), "CLAUTH_NO_UPDATE=1 → updates disabled");
+        assert!(
+            !updates_enabled(true),
+            "CLAUTH_NO_UPDATE=1 → updates disabled"
+        );
     });
 }
 
@@ -171,7 +177,7 @@ fn updates_disabled_when_env_is_one() {
 fn updates_enabled_when_env_is_zero() {
     with_no_update_env(Some("0"), || {
         assert!(
-            updates_enabled(),
+            updates_enabled(true),
             "CLAUTH_NO_UPDATE=0 → updates still enabled"
         );
     });
@@ -181,7 +187,7 @@ fn updates_enabled_when_env_is_zero() {
 fn updates_enabled_when_env_is_other_value() {
     with_no_update_env(Some("true"), || {
         assert!(
-            updates_enabled(),
+            updates_enabled(true),
             "CLAUTH_NO_UPDATE=true (not '1') → still enabled"
         );
     });
@@ -195,11 +201,49 @@ fn updates_enabled_when_env_is_other_value() {
 fn spawn_sends_nothing_when_update_disabled() {
     with_no_update_env(Some("1"), || {
         let (tx, rx) = std::sync::mpsc::channel();
-        spawn(tx); // returns early; `tx` is moved in and dropped at return
+        spawn(tx, true); // returns early; `tx` is moved in and dropped at return
         match rx.try_recv() {
             Err(std::sync::mpsc::TryRecvError::Disconnected)
             | Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Ok(_) => panic!("spawn must not deliver an event when updates are disabled"),
+        }
+    });
+}
+
+/// The saved `[update].auto_update` toggle is the other half of the gate:
+/// saved × env is a truth table over ONE predicate, and an env value of `0`
+/// (or anything but `"1"`) cannot re-enable a saved off.
+#[test]
+fn updates_enabled_follows_the_saved_toggle() {
+    with_no_update_env(None, || {
+        assert!(updates_enabled(true), "saved on + env unset → enabled");
+        assert!(!updates_enabled(false), "saved off + env unset → disabled");
+    });
+    with_no_update_env(Some("1"), || {
+        assert!(!updates_enabled(true), "env 1 wins over saved on");
+        assert!(!updates_enabled(false), "saved off + env 1 → disabled");
+    });
+    with_no_update_env(Some("0"), || {
+        assert!(updates_enabled(true), "env 0 leaves saved on enabled");
+        assert!(
+            !updates_enabled(false),
+            "env 0 cannot re-enable a saved off"
+        );
+    });
+}
+
+/// `spawn` returns no handle and the channel closes immediately when the saved
+/// toggle is off — no thread, no network path.
+#[test]
+fn spawn_returns_no_handle_and_closes_the_channel_when_saved_off() {
+    with_no_update_env(None, || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(spawn(tx, false).is_none(), "saved off → no handle");
+        match rx.try_recv() {
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            Err(std::sync::mpsc::TryRecvError::Empty) | Ok(_) => {
+                panic!("saved off must close the channel, not just skip sending")
+            }
         }
     });
 }

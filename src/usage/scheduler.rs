@@ -43,7 +43,8 @@ pub(crate) const MAX_RETRY_AFTER_MS: u64 = 15 * 60 * 1000;
 /// `retry-after` hint stays honored to [`MAX_RETRY_AFTER_MS`] — an endpoint
 /// that NAMES its recovery time outranks the ladder, and only a hint beyond
 /// the 15min clamp is shortened, never one under it. Terminal credentials
-/// (`AuthExpired` — dead api key, lapsed console) stop outright instead.
+/// (`AuthExpired` — dead api key; `ConsoleExpired` — lapsed console) stop
+/// outright instead.
 pub(crate) const DEGRADED_GAP_CEILING_MS: u64 = 5 * 60 * 1000;
 
 /// Base extra backoff applied after a 429 that carries no usable `retry-after`:
@@ -241,9 +242,23 @@ pub(crate) type WeeklyResetKicks = Arc<RankedMutex<HashSet<ProfileName>, rank::W
 /// Names pushed here after a successful token rotation bypass the cadence on the next tick.
 pub(crate) type RefetchQueue = Arc<RankedMutex<HashSet<String>, rank::RefetchQueue>>;
 
+/// One queued auto-switch decision: the target plus, when the switch-away was
+/// prompted by the active's api key being rejected, the active's name and the
+/// broken-mark fingerprint recorded at queue time. The cause rides the record so
+/// dispatch revalidates the decision itself instead of inferring intent from the
+/// ambient broken map — a stale mark left beside a since-converted/re-keyed name
+/// must not drop an ordinary exhaustion switch.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PendingSwitchTarget {
+    pub(crate) target: String,
+    /// `(active name, recorded fingerprint)` set only when the active's key
+    /// rejection caused this switch-away.
+    pub(crate) key_rejected_cause: Option<(String, u64)>,
+}
+
 /// Auto-switch targets posted by the scheduler when the active profile crosses its threshold.
 /// Set (not Vec) so duplicate enqueues collapse. Drained by `on_tick`, which dispatches a switch worker.
-pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<String>, rank::PendingSwitch>>;
+pub(crate) type PendingSwitch = Arc<RankedMutex<HashSet<PendingSwitchTarget>, rank::PendingSwitch>>;
 
 /// Set true when wrap-off mode finds the entire chain exhausted (no sink below 100%).
 /// Drained by `on_tick` to turn off all accounts. Bool because switch-off is a global act.
@@ -425,6 +440,34 @@ pub(crate) type ThirdPartyUsageStore =
     Arc<RankedMutex<HashMap<String, ThirdPartyStats>, rank::ThirdPartyUsageStore>>;
 pub(crate) type ThirdPartyStatusStore =
     Arc<RankedMutex<HashMap<String, FetchStatus>, rank::ThirdPartyStatus>>;
+/// Per-profile consecutive provider-429 streak, the third-party analogue of the
+/// OAuth [`PollStreaks`] `rate_limit` axis. A live body clears it, a provider
+/// 429 bumps it, and every other outcome leaves it untouched (a dead credential
+/// [`FetchStatus::AuthExpired`] is not a dead channel, and a transient blip must
+/// not drop the ramp) — the same shape [`update_streaks`] keeps for the OAuth
+/// axis. Only the third-party leg writes it; the stuck decision
+/// ([`reading_is_actionable`] / [`reading_dead_names`]), the status feed, and
+/// the TUI Usage row read it.
+pub(crate) type ThirdPartyStreaks = Arc<RankedMutex<HashMap<String, u32>, rank::ThirdPartyStreak>>;
+/// Members whose api KEY the provider rejected — the credential their sessions
+/// spend — treated as auth-broken by the chain walks (like an OAuth
+/// [`AppState::auth_broken`] member). Keyed by the credential fingerprint it
+/// failed under, the same shape [`SuppressedAuthExpiredStore`] uses, so a
+/// deleted, converted or re-keyed profile drops out at once (a reader keeps a
+/// name only while its CURRENT config profile carries the recorded fingerprint,
+/// intersected under one config snapshot). Live only, never persisted: a name
+/// enters on a key-rejection
+/// outcome and leaves the moment any other outcome lands. A lapsed Alibaba
+/// console session is NOT this — its api key still serves, only its usage
+/// reading is blind. Written/cleared by the third-party leg; the TUI's
+/// stood-down seed is the second writer — `app.rs` `durable_key_rejected_seed`
+/// at construction/reload plus the once-per-second stat-gated
+/// `sync_broken_verdicts` re-sync, which union-adds names the durable record
+/// still matches and removes seed entries the record no longer does (add-only
+/// from the seed's side, still fingerprint-intersected at every read); read by
+/// the scans, the TUI/daemon key-rejected helpers (chain walks and day
+/// notices), and both switch drains.
+pub(crate) type ThirdPartyBroken = Arc<RankedMutex<HashMap<String, u64>, rank::ThirdPartyBroken>>;
 /// Session-scoped (in-memory) map of third-party profiles suppressed from the
 /// timer, each recorded against the credential fingerprint it failed under
 /// ([`ThirdPartyEntry::credential_fingerprint`]). Never persisted — clears when
@@ -1331,20 +1374,23 @@ impl FetchOutcome {
 /// just-opened window closed (the same 5-min ceiling as the degraded fetch
 /// floor). Past it the wire's closed reading wins — a server-side reset (e.g.
 /// a subscription upgrade) must reach the surfaces within minutes, not wait
-/// out the window's own `resets_at`.
+/// out the window's own `resets_at`. Both ends of the comparison are wall clock
+/// because `open_at` survives a restart, so a backward clock step of N seconds
+/// extends the carry by up to N: accepted, since the horizon is a grace for a
+/// lagging read and `resets_at` still bounds the window's liveness.
 const KICK_LAG_HORIZON_SECS: i64 = 300;
 
 /// Patch a just-kicked live 5h window back into a Fresh body that lags it. A
 /// kick opens the window before `/usage` reflects it, so a Fresh body fetched
 /// in the same tick can still report the window closed; writing it verbatim
 /// would re-lapse the window and re-fire the kick. When `fresh` has no live 5h
-/// window but `prev` holds one THIS PROCESS kicked open — `open_at` stamped no
-/// more than [`KICK_LAG_HORIZON_SECS`] ago — keep `prev`'s window and its
-/// stamp, so the next lagging tick re-derives the bound instead of carrying
-/// the window until its own `resets_at`. Any other live `prev` (wire-sourced,
-/// or a kick past the horizon — e.g. a server-side reset such as a
-/// subscription upgrade) takes `fresh` verbatim, so the wire's verdict wins
-/// once the kick's lag can have passed. A genuine new window (live in
+/// window but `prev` holds one a kick opened — `open_at` stamped no more than
+/// [`KICK_LAG_HORIZON_SECS`] ago, by this process or, through the seeded cache,
+/// an earlier one — keep `prev`'s window and its stamp, so the next lagging
+/// tick re-derives the bound instead of carrying the window until its own
+/// `resets_at`. Any other live `prev` (wire-sourced, or a kick past the horizon
+/// — e.g. a server-side reset such as a subscription upgrade) takes `fresh`
+/// verbatim, so the wire's verdict wins once the kick's lag can have passed. A genuine new window (live in
 /// `fresh`) or a still-closed `prev` is left untouched.
 fn preserve_live_window(
     mut fresh: UsageInfo,
@@ -1426,6 +1472,105 @@ fn rate_limit_streak(streaks: &PollStreaks, name: &ProfileName) -> u32 {
 /// held under the `LastFetched`(200)/`Activity` locks that live there.
 fn streak_snapshot(streaks: &PollStreaks) -> HashMap<String, StreakCounts> {
     streaks.lock().map(|m| m.clone()).unwrap_or_default()
+}
+
+/// Current consecutive provider-429 streak for `name` (0 when absent or
+/// poisoned) — the third-party twin of [`rate_limit_streak`].
+fn third_party_rate_limit_streak(streaks: &ThirdPartyStreaks, name: &ProfileName) -> u32 {
+    streaks
+        .lock()
+        .ok()
+        .and_then(|m| m.get(name.as_str()).copied())
+        .unwrap_or_default()
+}
+
+/// Third-party analogue of [`update_streaks`]'s `rate_limit` axis. A live body
+/// clears the streak (the provider is serving again); a provider 429 bumps it;
+/// anything else — [`FetchStatus::AuthExpired`] (a dead credential, not a dead
+/// channel) and a transient `Cached`/`Failed` blip alike — leaves it, so the
+/// ramp survives a mid-storm non-429 outcome exactly as the OAuth axis does.
+/// Leaf lock, taken and released before the caller touches any other store.
+fn update_third_party_streak(streaks: &ThirdPartyStreaks, name: &ProfileName, status: FetchStatus) {
+    let Ok(mut m) = streaks.lock() else {
+        return;
+    };
+    match status {
+        FetchStatus::Fresh => {
+            m.remove(name.as_str());
+        }
+        FetchStatus::RateLimited => {
+            let count = m.entry(name.to_string()).or_default();
+            *count = count.saturating_add(1);
+        }
+        FetchStatus::Cached | FetchStatus::Failed | FetchStatus::AuthExpired => {}
+    }
+}
+
+/// The key-rejection twin of [`update_third_party_streak`]: a dead api KEY (the
+/// credential a member's sessions spend — never a lapsed Alibaba console
+/// session) marks the member broken for the chain walks, recorded against the
+/// credential fingerprint it failed under (so a re-key drops out at once), and
+/// every other outcome clears the mark. Live only — never persisted.
+fn update_third_party_broken(
+    broken: &ThirdPartyBroken,
+    name: &ProfileName,
+    dead_key: bool,
+    fingerprint: u64,
+) {
+    let Ok(mut m) = broken.lock() else {
+        return;
+    };
+    if dead_key {
+        m.insert(name.to_string(), fingerprint);
+    } else {
+        m.remove(name.as_str());
+    }
+}
+
+/// Names in the live key-rejection set whose CURRENT config profile still
+/// carries the recorded fingerprint. `broken` is a pre-cloned snapshot of the
+/// `ThirdPartyBroken` map (taken under its own guard, before `config`), and
+/// `profiles` is the SAME config snapshot the caller builds the chain/render
+/// state from — so a key replacement or conversion drops out the moment the
+/// config write lands, never gated on the separately refreshed
+/// `ThirdPartyList`. A deleted, converted or re-keyed profile drops out at
+/// once — the same failure class `filter_suppressed` fixes by keying on the
+/// fingerprint. Read by the scans to union into `broken`, and by the
+/// TUI/daemon to hand the config-side walks a pre-read set.
+pub(crate) fn current_key_rejected_names(
+    broken: &HashMap<String, u64>,
+    profiles: &[crate::profile::Profile],
+) -> Vec<ProfileName> {
+    let current: HashMap<String, u64> = profiles
+        .iter()
+        .filter_map(|p| profile_credential_fingerprint(p).map(|fp| (p.name.to_string(), fp)))
+        .collect();
+    broken
+        .iter()
+        .filter(|(name, fp)| current.get(name.as_str()) == Some(fp))
+        .map(|(name, _)| ProfileName::from(name.clone()))
+        .collect()
+}
+
+/// Whether a queued switch-away is stale because a repair landed between the
+/// scan's queue and the dispatch. `cause` is the record's own key-rejection
+/// source `(active, recorded fingerprint)`, present only when key rejection
+/// caused the decision — a cause-absent record (an ordinary exhaustion/home
+/// decision) is never stale, whatever the ambient broken map now holds. With a
+/// cause, the switch-away drops once the active's fresh config fingerprint no
+/// longer matches the recorded one (re-keyed, converted, or deleted) and stays
+/// while it still matches.
+pub(crate) fn queued_switch_away_is_stale(
+    cause: Option<&(String, u64)>,
+    profiles: &[crate::profile::Profile],
+) -> bool {
+    let Some((active, recorded)) = cause else {
+        return false;
+    };
+    let Some(profile) = profiles.iter().find(|p| p.name.as_str() == active) else {
+        return true;
+    };
+    profile_credential_fingerprint(profile) != Some(*recorded)
 }
 
 /// Whether `run_fetch` should fire the auto-start kick. Mid-`/usage`-429-streak
@@ -2980,6 +3125,8 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), FetchStatus::Fresh);
                 }
+                update_third_party_streak(&state.third_party_streaks, &name, FetchStatus::Fresh);
+                update_third_party_broken(&state.third_party_broken, &name, false, fingerprint);
                 stamp_last_fetched(
                     &state.last_fetched,
                     &state.next_refresh_per_profile,
@@ -2997,19 +3144,26 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 // slot (same server-directed deferral as the OAuth 429 path);
                 // any other error falls back to cache, and a GENERIC no-data
                 // rescan additionally defers to the degraded floor below.
-                let (status, retry_after) = match &err {
+                let (status, retry_after, dead_key) = match &err {
                     crate::providers::ThirdPartyError::RateLimited { retry_after } => {
-                        (FetchStatus::RateLimited, *retry_after)
+                        (FetchStatus::RateLimited, *retry_after, false)
                     }
                     // Ahead of the cache arm on purpose: a cached copy still
                     // renders (the cold-fill below is unchanged), but the STATUS
                     // has to name the dead credential — `Cached` would read as a
-                    // transient blip on a state only a re-login clears.
+                    // transient blip on a state only a re-login clears. A dead
+                    // api KEY is a dead ACCOUNT (its sessions spend that key), so
+                    // it also marks the member broken for the chain walks; a
+                    // lapsed Alibaba console session (`ConsoleExpired`) is
+                    // usage-only and keeps today's suppression, not broken.
                     crate::providers::ThirdPartyError::AuthExpired => {
-                        (FetchStatus::AuthExpired, None)
+                        (FetchStatus::AuthExpired, None, true)
                     }
-                    _ if cached.is_some() => (FetchStatus::Cached, None),
-                    _ => (FetchStatus::Failed, None),
+                    crate::providers::ThirdPartyError::ConsoleExpired => {
+                        (FetchStatus::AuthExpired, None, false)
+                    }
+                    _ if cached.is_some() => (FetchStatus::Cached, None, false),
+                    _ => (FetchStatus::Failed, None, false),
                 };
                 let derived = cached
                     .as_ref()
@@ -3030,6 +3184,11 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), status);
                 }
+                // Only a provider 429 feeds the consecutive-429 streak; a live
+                // body (the Fresh arm above) clears it, and AuthExpired / a
+                // transient Cached/Failed leave it — see `update_third_party_streak`.
+                update_third_party_streak(&state.third_party_streaks, &name, status);
+                update_third_party_broken(&state.third_party_broken, &name, dead_key, fingerprint);
                 // One outcome suppresses for the rest of the session — no timer
                 // retry, only a manual refresh re-admits one for a single try: a
                 // profile whose usage credential is dead. The cadence can't fix
@@ -3080,6 +3239,7 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), FetchStatus::Failed);
                 }
+                update_third_party_broken(&state.third_party_broken, &name, false, fingerprint);
             }
         }
     }
@@ -3299,6 +3459,8 @@ pub(crate) struct SchedulerState {
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    third_party_streaks: ThirdPartyStreaks,
+    third_party_broken: ThirdPartyBroken,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     /// Single-fetcher lease (issue #27): `acquire()` reports whether THIS
@@ -3554,6 +3716,8 @@ fn tick(state: &SchedulerState) {
         &state.store,
         &state.status,
         &state.third_party_status,
+        &state.third_party_streaks,
+        &state.third_party_broken,
         &state.poll_streaks,
         &state.kick_blocks,
         &state.activity,
@@ -3568,6 +3732,8 @@ fn tick(state: &SchedulerState) {
         &state.store,
         &state.status,
         &state.third_party_status,
+        &state.third_party_streaks,
+        &state.third_party_broken,
         &state.poll_streaks,
         &state.kick_blocks,
     );
@@ -3578,6 +3744,7 @@ fn tick(state: &SchedulerState) {
         &state.third_party_status,
         &state.kick_blocks,
         &state.pending_switch,
+        &state.third_party_broken,
     );
 }
 
@@ -3645,7 +3812,12 @@ fn codex_usage_tick(state: &SchedulerState) {
             continue;
         };
         await_request_slot(CODEX_USAGE_ORIGIN);
-        let outcome = crate::usage::fetch_codex_usage(token, auth.account_id(), now_epoch_secs());
+        let outcome = crate::usage::fetch_codex_usage(
+            token,
+            auth.account_id(),
+            auth.is_fedramp(),
+            now_epoch_secs(),
+        );
         if let Ok(mut guard) = CODEX_POLLED_AT.lock() {
             guard
                 .get_or_insert_with(HashMap::new)
@@ -3915,6 +4087,8 @@ pub(crate) fn spawn_refresher(
     third_party_tokens: ThirdPartyList,
     third_party_usage_store: ThirdPartyUsageStore,
     third_party_status: ThirdPartyStatusStore,
+    third_party_streaks: ThirdPartyStreaks,
+    third_party_broken: ThirdPartyBroken,
     suppressed_auth_expired: SuppressedAuthExpiredStore,
     shutting_down: Arc<AtomicBool>,
     fetch_lease: Arc<crate::daemon::FetchLease>,
@@ -3975,6 +4149,8 @@ pub(crate) fn spawn_refresher(
         third_party_tokens,
         third_party_usage_store,
         third_party_status,
+        third_party_streaks,
+        third_party_broken,
         suppressed_auth_expired,
         shutting_down,
         fetch_lease,
@@ -4063,6 +4239,11 @@ fn decision_fresh_any(
 ///     stuck active moves.
 ///   * `status.json`'s per-profile `stale` flag publishes the same judgment so a
 ///     menu-bar reader renders the reading as distrusted, not current truth.
+///
+/// The `status`+`streak` pair each consumer hands it is OAuth-first with a
+/// third-party fallback (see [`reading_is_actionable`]), so a member with no
+/// OAuth status entry is judged off its third-party reading by both consumers
+/// alike.
 pub(crate) fn is_stuck_rate_limited(status: FetchStatus, streak: u32) -> bool {
     matches!(status, FetchStatus::RateLimited) && is_stuck_streak(streak)
 }
@@ -4084,10 +4265,14 @@ pub(crate) fn is_stuck_rate_limited(status: FetchStatus, streak: u32) -> bool {
 /// ONE predicate for the global active ([`scan_auto_switch`]) and for each
 /// chain-following session's own member ([`scan_session_switches`]): the rule is
 /// about what a reading is worth, which does not change with who is reading it.
+/// The reading is OAuth-first: a member with no OAuth status entry (a pure
+/// third-party profile) is judged off its third-party status + streak instead.
 fn reading_is_actionable(
     broken: bool,
     status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
     streaks: &PollStreaks,
+    third_party_streaks: &ThirdPartyStreaks,
     name: &ProfileName,
 ) -> bool {
     if broken {
@@ -4097,8 +4282,25 @@ fn reading_is_actionable(
         .lock()
         .ok()
         .and_then(|m| m.get(name.as_str()).copied());
-    reading.is_some_and(|s| is_stuck_rate_limited(s, rate_limit_streak(streaks, name)))
-        || matches!(reading, Some(FetchStatus::Fresh))
+    match reading {
+        // OAuth reading first; a hybrid member's OAuth verdict stays
+        // authoritative even when the third-party leg disagrees.
+        Some(s) => {
+            is_stuck_rate_limited(s, rate_limit_streak(streaks, name))
+                || matches!(s, FetchStatus::Fresh)
+        }
+        // No OAuth entry (a pure third-party member never enters the OAuth leg):
+        // fall back to the third-party reading so it isn't invisible to the scan.
+        None => {
+            let tp = third_party_status
+                .lock()
+                .ok()
+                .and_then(|m| m.get(name.as_str()).copied());
+            tp.is_some_and(|s| {
+                is_stuck_rate_limited(s, third_party_rate_limit_streak(third_party_streaks, name))
+            }) || matches!(tp, Some(FetchStatus::Fresh))
+        }
+    }
 }
 
 /// Whether a consecutive-failure streak has run deeper than the active row's
@@ -4120,11 +4322,15 @@ pub(crate) fn is_stuck_streak(streak: u32) -> bool {
 /// member holding ANY window — lapsed or headroom — never qualifies: that
 /// last Fresh read is a trustworthy verdict the existing rules already judge
 /// (RLS-1), and only the channel's death, not a missing reading, opens the
-/// bypass.
+/// bypass. The reading is OAuth-first, with the same third-party
+/// status+streak fallback as [`reading_is_actionable`] for a member with no
+/// OAuth status entry.
 fn reading_dead_names(
     members: &[crate::fallback::ChainMember],
     status: &StatusStore,
+    third_party_status: &ThirdPartyStatusStore,
     streaks: &PollStreaks,
+    third_party_streaks: &ThirdPartyStreaks,
     store: &UsageStore,
 ) -> Vec<ProfileName> {
     // One store lock window for the windowless checks — the same map the walk
@@ -4150,18 +4356,35 @@ fn reading_dead_names(
                 .lock()
                 .ok()
                 .and_then(|s| s.get(m.name.as_str()).copied());
-            reading.is_some_and(|s| is_stuck_rate_limited(s, rate_limit_streak(streaks, &m.name)))
+            match reading {
+                Some(s) => is_stuck_rate_limited(s, rate_limit_streak(streaks, &m.name)),
+                // A pure third-party member has no OAuth status entry: fall back
+                // to the third-party reading so a stuck windowless one is still
+                // flagged dead, mirroring `reading_is_actionable`'s fallback.
+                None => third_party_status
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.get(m.name.as_str()).copied())
+                    .is_some_and(|s| {
+                        is_stuck_rate_limited(
+                            s,
+                            third_party_rate_limit_streak(third_party_streaks, &m.name),
+                        )
+                    }),
+            }
         })
         .map(|m| m.name.clone())
         .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
-fn scan_auto_switch(
+pub(crate) fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
+    third_party_streaks: &ThirdPartyStreaks,
+    third_party_broken: &ThirdPartyBroken,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
     _activity: &ActivityStore,
@@ -4185,54 +4408,144 @@ fn scan_auto_switch(
             return;
         }
     }
+    // Clone the live broken map first (rank 295 below config 400), then
+    // intersect it with the SAME config snapshot the chain is built from below —
+    // a repair landing since the last tick drops the name at once instead of
+    // pairing fresh config with a stale entry list.
+    let broken_snapshot: HashMap<String, u64> = third_party_broken
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
     // Snapshot under `config` only — drop guard before taking `usage_store`.
-    let snapshot = {
+    let (snapshot, without_snapshot, key_rejected, key_rejected_without_active) = {
         let cfg = match config.lock() {
             Ok(c) => c,
             Err(_) => return,
         };
-        crate::fallback::snapshot_chain(&cfg)
+        let key_rejected: HashSet<ProfileName> =
+            current_key_rejected_names(&broken_snapshot, &cfg.profiles)
+                .into_iter()
+                .collect();
+        let snapshot = crate::fallback::snapshot_chain(&cfg, &key_rejected);
+        // The counterfactual run rebuilds the COMPLETE chain from the same
+        // config with only the active removed from the key-rejected set, so
+        // every member's home/preferred judgment is recomputed — a sibling
+        // whose bare `preferred` flag stands down once the active reclaims a
+        // day claim must read that truth, not the with-rejection one.
+        let active = snapshot.as_ref().map(|s| s.active.clone());
+        let key_rejected_without_active = match &active {
+            Some(a) => {
+                let mut set = key_rejected.clone();
+                set.remove(a);
+                set
+            }
+            None => key_rejected.clone(),
+        };
+        let without_snapshot = crate::fallback::snapshot_chain(&cfg, &key_rejected_without_active);
+        (
+            snapshot,
+            without_snapshot,
+            key_rejected,
+            key_rejected_without_active,
+        )
     };
     let Some(mut snapshot) = snapshot else {
         return;
     };
+    let Some(mut without_snapshot) = without_snapshot else {
+        return;
+    };
     // Not config state, so `snapshot_chain` can't fill it: the walk skips
     // switch-grade kick-rejected members and a rejected ACTIVE bypasses the
-    // exhaustion gate (its usage reads idle while inference is refused).
-    snapshot.kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    // exhaustion gate (its usage reads idle while inference is refused). The
+    // kick/reading-dead/fresh fillers read only the member NAMES, which the
+    // two builds share, so they run once and clone into both snapshots.
+    let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    snapshot.kick_rejected = kick_rejected.clone();
+    without_snapshot.kick_rejected = kick_rejected;
+    // A third-party member whose api KEY the provider rejected is dead like an
+    // OAuth auth-broken member — not config state (live only), so
+    // `snapshot_chain` can't fill it: union the live set into `broken` so the
+    // actionability bypass and the walk's target exclusion both treat it dead.
+    // The without-run unions the set MINUS the active, so the active's own key
+    // rejection is the one fact removed while every sibling's stays.
+    snapshot.broken.extend(key_rejected.iter().cloned());
+    without_snapshot
+        .broken
+        .extend(key_rejected_without_active.iter().cloned());
     // The dead-reading channel is the same kind of non-config state (issue
     // #83): a deep-stuck `RateLimited` member with no window at all can never
     // produce the live window the walk's exhaustion gate needs, so the scan
     // hands the walk the bypass flag instead.
-    snapshot.reading_dead = reading_dead_names(&snapshot.chain, status, streaks, store);
+    let reading_dead = reading_dead_names(
+        &snapshot.chain,
+        status,
+        third_party_status,
+        streaks,
+        third_party_streaks,
+        store,
+    );
+    snapshot.reading_dead = reading_dead.clone();
+    without_snapshot.reading_dead = reading_dead;
     // Same reason: freshness lives in the status stores, not in config, and
     // `Profile.fetch_status` (what the UI twin reads) is written only by the UI
     // thread. Unions BOTH stores (OAuth + third-party) via `decision_fresh_any`,
     // exactly as the UI twin's `apply_usage` fills `fetch_status`, so a fresh
     // third-party member isn't invisible to this walk alone. A PREFERENCE for
     // the headroom walk, never a gate — see `ChainSnapshot::fresh`.
-    snapshot.fresh = snapshot
+    let fresh: Vec<ProfileName> = snapshot
         .chain
         .iter()
         .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
         .map(|m| m.name.clone())
         .collect();
+    snapshot.fresh = fresh.clone();
+    without_snapshot.fresh = fresh;
 
     // Only act on a reading worth acting on. The rule, and the two bypasses that
     // keep it from wedging the scan, live in `reading_is_actionable` — shared with
     // the per-session leg, which applies it to each session's own member.
     let active_broken = snapshot.broken.iter().any(|b| b == &snapshot.active);
-    if !reading_is_actionable(active_broken, status, streaks, &snapshot.active.clone()) {
+    if !reading_is_actionable(
+        active_broken,
+        status,
+        third_party_status,
+        streaks,
+        third_party_streaks,
+        &snapshot.active.clone(),
+    ) {
         return;
     }
 
-    match crate::fallback::next_auto_switch_target(&snapshot, store) {
-        Some(crate::fallback::SwitchAction::To(name)) => {
+    match crate::fallback::next_auto_switch_decision(&snapshot, &without_snapshot, store) {
+        Some(crate::fallback::AutoSwitchDecision {
+            action: crate::fallback::SwitchAction::To(name),
+            key_rejection_necessary,
+        }) => {
+            // The record carries WHY this switch-away was queued: the active's
+            // key rejection (its recorded fingerprint) only when the evaluator
+            // judged that fact necessary for THIS action, else none. An
+            // independently exhausted/home/overlap move comes out cause-absent,
+            // so a stale mark beside a since-converted name never drops it.
+            let key_rejected_cause = if key_rejection_necessary {
+                broken_snapshot
+                    .get(snapshot.active.as_str())
+                    .copied()
+                    .map(|fp| (snapshot.active.to_string(), fp))
+            } else {
+                None
+            };
             if let Ok(mut p) = pending_switch.lock() {
-                p.insert(name);
+                p.insert(PendingSwitchTarget {
+                    target: name,
+                    key_rejected_cause,
+                });
             }
         }
-        Some(crate::fallback::SwitchAction::Off) => {
+        Some(crate::fallback::AutoSwitchDecision {
+            action: crate::fallback::SwitchAction::Off,
+            ..
+        }) => {
             if let Ok(mut off) = pending_switch_off.lock() {
                 *off = true;
             }
@@ -4272,11 +4585,14 @@ struct SessionDecision {
 /// `ProfileTtl` ranks outside `State`), and no pending-switch lock is held
 /// anywhere here: those rank OUTSIDE the flock (1500/1700 vs 500), so holding one
 /// across the write inverts the order.
+#[allow(clippy::too_many_arguments)]
 fn scan_session_switches(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
+    third_party_streaks: &ThirdPartyStreaks,
+    third_party_broken: &ThirdPartyBroken,
     streaks: &PollStreaks,
     kick_blocks: &KickBlocks,
 ) {
@@ -4293,10 +4609,21 @@ fn scan_session_switches(
         return;
     }
 
+    // Clone the live broken map first (rank 295 below config 400), then
+    // intersect with the SAME config snapshot `snapshot_session_chain` folds
+    // into each member's home judgment below.
+    let broken_snapshot: HashMap<String, u64> = third_party_broken
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
     // Snapshot under `config` only, exactly as `scan_auto_switch` does: holding it
     // while taking `usage_store` is the `App::apply_usage` inversion.
-    let (chain, pending): (Vec<String>, Vec<SessionDecision>) = {
+    let (chain, pending, key_rejected): (Vec<String>, Vec<SessionDecision>, HashSet<ProfileName>) = {
         let Ok(cfg) = config.lock() else { return };
+        let key_rejected: HashSet<ProfileName> =
+            current_key_rejected_names(&broken_snapshot, &cfg.profiles)
+                .into_iter()
+                .collect();
         let chain = cfg
             .state
             .fallback_chain
@@ -4316,7 +4643,8 @@ fn scan_session_switches(
                 let launch = crate::runtime::LaunchTransport::of(
                     cfg.find(&ProfileName::from(row.start_profile.clone()))?,
                 );
-                let snapshot = crate::fallback::snapshot_session_chain(&cfg, &member, &launch)?;
+                let snapshot =
+                    crate::fallback::snapshot_session_chain(&cfg, &member, &launch, &key_rejected)?;
                 Some(SessionDecision {
                     snapshot,
                     member,
@@ -4324,7 +4652,7 @@ fn scan_session_switches(
                 })
             })
             .collect();
-        (chain, pending)
+        (chain, pending, key_rejected)
     };
 
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
@@ -4339,7 +4667,15 @@ fn scan_session_switches(
         // them — same split `scan_auto_switch` works to. `reading_dead` follows the
         // same split again (issue #83's dead-reading bypass).
         snapshot.kick_rejected = kick_rejected.clone();
-        snapshot.reading_dead = reading_dead_names(&snapshot.chain, status, streaks, store);
+        snapshot.broken.extend(key_rejected.iter().cloned());
+        snapshot.reading_dead = reading_dead_names(
+            &snapshot.chain,
+            status,
+            third_party_status,
+            streaks,
+            third_party_streaks,
+            store,
+        );
         snapshot.fresh = snapshot
             .chain
             .iter()
@@ -4347,15 +4683,23 @@ fn scan_session_switches(
             .map(|m| m.name.clone())
             .collect();
         let member_broken = snapshot.broken.contains(&member);
-        // The OAuth `StatusStore` alone, where the candidate fill above unions both
-        // — and `decision_fresh_any` records why the twins must not disagree. Sound
-        // here only because `swap_eligible`'s `is_oauth` arm leaves a
-        // third-party-launched session a SINGLETON chain, which the chain walk cannot
-        // move off whatever this gate says. Relaxing that arm (same-provider
-        // swapping is the obvious next ask) closes such a session's gate
-        // permanently with nothing saying so, so relax it and this gate goes
-        // through the union too.
-        if !reading_is_actionable(member_broken, status, streaks, &member) {
+        // The gate reads OAuth-first with the third-party fallback, the same rule
+        // the candidate fill above applies through `decision_fresh_any` — so a
+        // pure-third-party session's member is no longer invisible to it. A
+        // third-party-launched session is still a SINGLETON chain
+        // (`swap_eligible`'s `is_oauth` arm drops every other member), so its
+        // now-visible reading opens this gate but the walk has no target to move
+        // to; nothing changes for such a session. Relaxing that arm
+        // (same-provider swapping is the obvious next ask) gives the reading a
+        // real target to reach.
+        if !reading_is_actionable(
+            member_broken,
+            status,
+            third_party_status,
+            streaks,
+            third_party_streaks,
+            &member,
+        ) {
             continue;
         }
         // `Off` means "sign every account out", which has no per-session form: a
@@ -4414,6 +4758,7 @@ fn scan_session_switches(
 ///
 /// Lock-safe: acquires `config` (rank 400) then drops before `store` (300)
 /// and `pending_switch` (1500) — never two tracked locks at once.
+#[allow(clippy::too_many_arguments)]
 fn scan_recovery(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
@@ -4421,6 +4766,7 @@ fn scan_recovery(
     third_party_status: &ThirdPartyStatusStore,
     kick_blocks: &KickBlocks,
     pending_switch: &PendingSwitch,
+    third_party_broken: &ThirdPartyBroken,
 ) {
     // Skip when a previous switch is still pending.
     if let Ok(p) = pending_switch.lock()
@@ -4428,6 +4774,14 @@ fn scan_recovery(
     {
         return;
     }
+
+    // Clone the live broken map first (rank 295 below config 400), then
+    // intersect it with the SAME config snapshot the member filter and home
+    // judgment below are built from.
+    let broken_snapshot: HashMap<String, u64> = third_party_broken
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
 
     // Build chain-member snapshot under config lock, then drop before
     // touching store (avoids the config↔store inversion that
@@ -4438,11 +4792,18 @@ fn scan_recovery(
             Ok(c) => c,
             Err(_) => return,
         };
+        let key_rejected: HashSet<ProfileName> =
+            current_key_rejected_names(&broken_snapshot, &cfg.profiles)
+                .into_iter()
+                .collect();
         let weekly_pct = cfg.state.weekly_switch_threshold_pct();
         // Only scan for recovery after switch-off-all (no active profile).
         if cfg.state.active_profile.is_some() {
             return;
         }
+        // An empty chain yields no members, so no switch follows either way: the
+        // return only saves the kick-block read and the store clone, so no test
+        // pins it.
         if cfg.state.fallback_chain.is_empty() {
             return;
         }
@@ -4451,13 +4812,14 @@ fn scan_recovery(
             cfg.state
                 .fallback_chain
                 .iter()
-                // A disabled or auth-broken member is not a recovery target. Shares
-                // `fallback::walk_excluded` with `next_target`/`fully_clear_target`
-                // so the skip list can't drift; canceled is caught store-side inside
+                // A disabled, auth-broken, or key-rejected member is not a
+                // recovery target. Shares `fallback::walk_excluded` with
+                // `next_target`/`fully_clear_target` so the skip list can't
+                // drift; canceled is caught store-side inside
                 // `find_recovered_member` (this walk's `Profile.usage` is stale
-                // headless, so the config-plan `is_canceled` the selection walks use
-                // would read empty here).
-                .filter(|name| !crate::fallback::walk_excluded(&cfg, name))
+                // headless, so the config-plan `is_canceled` the selection walks
+                // use would read empty here).
+                .filter(|name| !crate::fallback::walk_excluded(&cfg, name, &key_rejected))
                 .map(|name| {
                     let profile = cfg.find(name);
                     crate::fallback::ChainMember {
@@ -4466,7 +4828,7 @@ fn scan_recovery(
                             .map(crate::fallback::threshold_for)
                             .unwrap_or(crate::fallback::DEFAULT_THRESHOLD),
                         last_resort: profile.is_some_and(|p| p.last_resort),
-                        preferred: cfg.is_home_today(name),
+                        preferred: cfg.is_home_today(name, &key_rejected),
                         max_spend: profile.and_then(|p| p.max_auto_spend).unwrap_or(0.0),
                         weekly_line: profile
                             .map(|p| crate::fallback::member_weekly_line(p, weekly_pct))
@@ -4498,7 +4860,12 @@ fn scan_recovery(
         crate::fallback::find_recovered_member(&members, store, &kick_rejected, walk_order)
         && let Ok(mut p) = pending_switch.lock()
     {
-        p.insert(name);
+        // Recovery has no key-rejected active (it only runs after switch-off), so
+        // the record carries no cause and dispatch never revalidates it.
+        p.insert(PendingSwitchTarget {
+            target: name,
+            key_rejected_cause: None,
+        });
     }
 }
 

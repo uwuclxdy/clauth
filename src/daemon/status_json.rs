@@ -17,6 +17,8 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use super::gateway::{GatewaySlot, slot_or_record};
+use super::proxies::ProxySlot;
 use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::profile_cache::{
     THIRD_PARTY_CACHE_FILE, USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms,
@@ -52,6 +54,10 @@ pub(crate) struct LiveSignals<'a> {
     /// into `status`: `stale`'s stuck arm is contracted as a stuck 429 read off
     /// the OAuth store, and folding the two would silently retarget it.
     pub(crate) third_party_status: &'a HashMap<String, FetchStatus>,
+    /// The third-party consecutive-429 streak, so `stale`'s stuck arm can judge a
+    /// member with no OAuth status entry off the same predicate the switch
+    /// decision uses (OAuth-first, third-party fallback).
+    pub(crate) third_party_streaks: &'a HashMap<String, u32>,
     pub(crate) next_refresh: &'a HashMap<LegKey, u64>,
     /// Consecutive-429 streaks, so a profile whose live `status` is `RateLimited`
     /// AND whose streak has passed the active cap can be published as `stale` (a
@@ -86,6 +92,15 @@ pub(crate) struct LiveSignals<'a> {
     /// off their `kick_block.json` caches instead
     /// ([`crate::usage::switch_grade_kick_blocked_from_cache`]).
     pub(crate) queue_blocked: &'a [ProfileName],
+    /// The gateway slot the daemon's supervisor last published. `None`
+    /// single-shot or before the supervisor's first publish, where the slot
+    /// reads the gateway record alone ([`super::gateway::unsupervised_slot`]).
+    pub(crate) gateway: Option<&'a GatewaySlot>,
+    /// The per-proxy slots the daemon's supervisors last published, in
+    /// service-name order. `None` single-shot or before the supervisors'
+    /// first publish, where each slot reads its row alone
+    /// ([`super::proxies::unsupervised_slot`]).
+    pub(crate) proxies: Option<&'a [ProxySlot]>,
 }
 
 fn fetch_status_str(s: FetchStatus) -> &'static str {
@@ -435,13 +450,11 @@ pub(crate) fn build_profile_entries(
             // `stale` = the daemon distrusts this reading, by either arm:
             //
             // * a deep-slot stuck RateLimited (live status RateLimited AND the
-            //   429 streak past the active cap). Read from the OAuth `status`
-            //   store ALONE, deliberately narrower than the `fetch_status`
-            //   above: the streak counter it pairs with is written only by
-            //   `apply_outcome`, the OAuth leg's own handler, so a third-party
-            //   429 has no streak to judge and would always read as a shallow
-            //   one. Same predicate `scan_auto_switch` distrusts, so the
-            //   published flag and the switch decision cannot drift.
+            //   429 streak past the active cap). OAuth-first with a third-party
+            //   fallback: a member with no OAuth status entry is judged off its
+            //   third-party status + streak — the same predicate
+            //   `scan_auto_switch` distrusts — so the published flag and the
+            //   switch decision cannot drift for a third-party member either.
             // * cache AGE past `2 × max(interval, 5min) + interval` (#74): a
             //   figure that old is one nothing is maintaining, live scheduler
             //   or none. Keyed to the LIVE interval (a long interval is an
@@ -483,9 +496,25 @@ pub(crate) fn build_profile_entries(
             };
             let age_stale = !spent_skipped && past_threshold;
             let stale = match live {
-                Some(sig) => sig.status.get(name.as_str()).copied().is_some_and(|s| {
-                    is_stuck_rate_limited(s, sig.streaks.get(name.as_str()).copied().unwrap_or(0))
-                }),
+                Some(sig) => match sig.status.get(name.as_str()).copied() {
+                    Some(s) => is_stuck_rate_limited(
+                        s,
+                        sig.streaks.get(name.as_str()).copied().unwrap_or(0),
+                    ),
+                    None => sig
+                        .third_party_status
+                        .get(name.as_str())
+                        .copied()
+                        .is_some_and(|s| {
+                            is_stuck_rate_limited(
+                                s,
+                                sig.third_party_streaks
+                                    .get(name.as_str())
+                                    .copied()
+                                    .unwrap_or(0),
+                            )
+                        }),
+                },
                 None => false,
             } || age_stale;
 
@@ -645,6 +674,18 @@ pub(crate) struct StatusBody {
     /// codex roster, which are otherwise byte-identical.
     #[serde(default)]
     pub(crate) clauth_version: String,
+    /// Additive: the managed shunt gateway, the object `GET /api/v1/gateway`
+    /// serves. `default` so a reader stays additive-tolerant of an older
+    /// writer.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub(crate) gateway: Option<GatewaySlot>,
+    /// Additive: the managed proxies, one object per registry row, the array
+    /// `GET /api/v1/proxies` serves. `default` so a reader stays
+    /// additive-tolerant of an older writer.
+    #[serde(default)]
+    #[schema(required = true)]
+    pub(crate) proxies: Vec<ProxySlot>,
     pub(crate) profiles: Vec<ProfileEntry>,
 }
 
@@ -680,6 +721,8 @@ pub(crate) fn build_status(
         codex_wrap_off: codex.switch_off_when_spent(),
         refresh_interval_ms: interval_ms,
         clauth_version: env!("CARGO_PKG_VERSION").to_string(),
+        gateway: Some(slot_or_record(live.and_then(|s| s.gateway))),
+        proxies: super::proxies::entries(live.and_then(|s| s.proxies)),
         profiles,
     }
 }

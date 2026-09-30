@@ -10,6 +10,8 @@ use clap::{CommandFactory, Parser as _};
 
 use crate::cli::{Cli, Command, HerdrCommand, HerdrConfigCommand};
 use crate::profile::{HerdrSettings, HomeTab, PopupWidth};
+#[cfg(unix)]
+use crate::testutil::{git_shim, heal_env, lightweight_tag, stateful_heal_shim, write_shim};
 
 /// Every plan this produces has to append onto the file it was planned against
 /// and still parse, or the write turns a working herdr config into a broken one.
@@ -533,72 +535,11 @@ fn pick_release_skips_unparseable_lines_and_non_release_tags() {
     assert_eq!(pick_release(""), None);
 }
 
-/// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT`, the real
-/// git's output shape, and recording every argv into `git.log` so a test pins
-/// exactly what the code passed. The heal and `install` resolve `git` off
-/// `PATH`, so the test prepends the shim's dir.
-#[cfg(unix)]
-fn git_shim(dir: &Path) -> PathBuf {
-    write_shim(
-        dir,
-        "git",
-        "echo \"$@\" >> \"$(dirname \"$0\")/git.log\"; if [ \"$1\" = \"ls-remote\" ] && [ \"$2\" = \"--tags\" ]; then printf '%s' \"$TAGS_OUTPUT\"; fi; exit 0",
-    )
-}
-
 /// One annotated release tag's `ls-remote --tags` pair, the real git's shape:
 /// the tag-object line and its peeled `^{}` commit line.
 #[cfg(unix)]
 fn annotated_tag(tag: &str, tag_object: &str, commit: &str) -> String {
     format!("{tag_object}\trefs/tags/{tag}\n{commit}\trefs/tags/{tag}^{{}}\n")
-}
-
-/// One lightweight release tag's single `ls-remote --tags` line.
-#[cfg(unix)]
-fn lightweight_tag(tag: &str, commit: &str) -> String {
-    format!("{commit}\trefs/tags/{tag}\n")
-}
-
-/// The heal's staleness truth is the installed checkout's commit, so the shim
-/// flips its `plugin list --json` answer when an install runs: `ANSWER_BEFORE`
-/// until the `installed` state file exists, then `ANSWER_AFTER` (the install
-/// leg creates it). Every other invocation logs its argv into `heal.log`.
-#[cfg(unix)]
-fn stateful_heal_shim(dir: &Path) -> PathBuf {
-    write_shim(
-        dir,
-        "herdr",
-        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then if [ -f \"$(dirname \"$0\")/installed\" ]; then echo \"$ANSWER_AFTER\"; else echo \"$ANSWER_BEFORE\"; fi; exit 0; fi; if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"install\" ]; then : > \"$(dirname \"$0\")/installed\"; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exit 0",
-    )
-}
-
-/// The heal's own env: the herdr shim, the git shim ahead of `PATH`, the
-/// list answers, and the `ls-remote --tags` body. Returns the `EnvPin` guard.
-#[cfg(unix)]
-fn heal_env<'a>(
-    home: &'a crate::testutil::HomeSandbox,
-    herdr_shim: &Path,
-    before: &str,
-    after: &str,
-    tags: &str,
-    extra: &[(&'static str, &OsStr)],
-) -> crate::testutil::EnvPin<'a> {
-    let path = format!(
-        "{}:{}",
-        home.home().display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut pins: Vec<(&'static str, Option<&OsStr>)> = vec![
-        ("HERDR_BIN_PATH", Some(herdr_shim.as_os_str())),
-        ("ANSWER_BEFORE", Some(OsStr::new(before))),
-        ("ANSWER_AFTER", Some(OsStr::new(after))),
-        ("TAGS_OUTPUT", Some(OsStr::new(tags))),
-        ("PATH", Some(OsStr::new(&path))),
-    ];
-    for (key, value) in extra {
-        pins.push((key, Some(*value)));
-    }
-    crate::testutil::EnvPin::new(home, &pins)
 }
 
 /// A stale github install (installed commit differs from the newest release
@@ -944,7 +885,7 @@ fn heal_detached_reinstalls_once_and_throttles() {
     );
     reset_heal_throttle_for_test();
 
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
@@ -954,7 +895,7 @@ fn heal_detached_reinstalls_once_and_throttles() {
     );
 
     // The floor is armed by the first attempt: a second spawns nothing.
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
@@ -990,7 +931,7 @@ fn heal_detached_respects_the_update_optout() {
     );
     reset_heal_throttle_for_test();
 
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     assert!(
         !home.home().join("heal.log").exists(),
@@ -1001,13 +942,60 @@ fn heal_detached_respects_the_update_optout() {
     // claimed, the floor would refuse this second, un-gated call. It landing
     // proves the opted-out call never armed the floor.
     let _unset = crate::testutil::EnvPin::new(&home, &[("CLAUTH_NO_UPDATE", None)]);
-    heal_detached();
+    heal_detached(true);
     join_background_tasks();
     let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
     assert_eq!(
         log.trim(),
         "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
         "an un-gated call right after an opted-out one still installs"
+    );
+}
+
+/// The saved `[update].auto_update` toggle gates the network update exactly
+/// like the env opt-out: with the env unset, a saved off must suppress the
+/// install AND leave the throttle unclaimed (the un-gated follow-up call
+/// proves the floor was never armed). Red pre-change — the old gate read the
+/// env alone, so this first call installs.
+#[cfg(unix)]
+#[test]
+fn heal_detached_respects_the_saved_update_toggle() {
+    use crate::testutil::join_background_tasks;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let entry = plugin_list_json(
+        r#"{"enabled":true,"plugin_id":"clauth","source":{"kind":"github","owner":"uwuclxdy","repo":"clauth","resolved_commit":"aaaaaaaaaaaaaaaa"}}"#,
+    );
+    let shim = stateful_heal_shim(home.home());
+    git_shim(home.home());
+    let tags = lightweight_tag("v0.15.1", "bbbbbbbbbbbbbbbb");
+    let _env = heal_env(
+        &home,
+        &shim,
+        &entry,
+        &entry,
+        &tags,
+        &[("HERDR_SHIM_STATE", std::ffi::OsStr::new("1"))],
+    );
+    reset_heal_throttle_for_test();
+
+    heal_detached(false);
+    join_background_tasks();
+    assert!(
+        !home.home().join("heal.log").exists(),
+        "the saved off gates the network update"
+    );
+
+    // The gate must run BEFORE the throttle claim: if the saved-off call had
+    // claimed, the floor would refuse this second, un-gated call. It landing
+    // proves the saved-off call never armed the floor.
+    heal_detached(true);
+    join_background_tasks();
+    let log = std::fs::read_to_string(home.home().join("heal.log")).unwrap_or_default();
+    assert_eq!(
+        log.trim(),
+        "plugin install uwuclxdy/clauth/herdr-plugin --ref v0.15.1 --yes",
+        "an un-gated call right after a saved-off one still installs"
     );
 }
 
@@ -1032,7 +1020,7 @@ fn heal_detached_fails_closed_without_the_shim_sentinel() {
         ],
     );
 
-    heal_detached();
+    heal_detached(true);
 }
 
 /// `install`'s herdr shim: answers the plugin list with `$ANSWER` (a registry
@@ -1824,18 +1812,6 @@ fn sed_pipe(input: &str, program: &str) -> String {
 /// Writes an executable shim named `name` under `dir`, the same shape the
 /// report tests use: a probe against a slow herdr must hit the timeout arm.
 #[cfg(unix)]
-fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("shim written");
-    let mut perms = std::fs::metadata(&path)
-        .expect("shim metadata")
-        .permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("shim chmod");
-    path
-}
-
 /// The probe bound: a herdr that never answers costs the caller the timeout,
 /// never a hang. A 10 s sleep shim must resolve as no version inside roughly
 /// the 2 s bound.
@@ -2478,21 +2454,25 @@ fn home_tab_round_trips_through_the_app_load_path() {
         "a default home_tab renders no key: {rendered}"
     );
 
-    // A written top-level home_tab loads, renders top-level (never inside
-    // `[herdr]`), and survives a save + reload.
+    // The retired `plugin` spelling loads as the Services tab (the
+    // `#[serde(alias = "plugin")]` on the variant) and writes back `services`.
     write_profiles_toml(
         "active_profile = \"acct\"\nprofiles = [\"acct\"]\nhome_tab = \"plugin\"\n",
     );
     let config = crate::profile::load_config().expect("load");
     assert_eq!(
         config.state.home_tab(),
-        HomeTab::Plugin,
-        "the written home_tab loads"
+        HomeTab::Services,
+        "the retired `plugin` spelling loads as the Services tab"
     );
     let rendered = toml::to_string_pretty(&config.state).expect("render");
     assert!(
-        rendered.contains("home_tab = \"plugin\""),
-        "an off-default home_tab renders as a top-level key: {rendered}"
+        rendered.contains("home_tab = \"services\""),
+        "the alias writes back the canonical spelling, never `plugin`: {rendered}"
+    );
+    assert!(
+        !rendered.contains("home_tab = \"plugin\""),
+        "the retired spelling is not round-tripped: {rendered}"
     );
     assert!(
         !rendered.contains("[herdr]"),
@@ -2502,7 +2482,7 @@ fn home_tab_round_trips_through_the_app_load_path() {
     let again = crate::profile::load_config().expect("reload");
     assert_eq!(
         again.state.home_tab(),
-        HomeTab::Plugin,
+        HomeTab::Services,
         "the home_tab survives a save + reload"
     );
 
@@ -2580,19 +2560,15 @@ fn herdr_config_get_parses_and_stays_out_of_herdrs_help() {
 
 /// Runs the real `herdr-plugin/report-profile.sh` against a shimmed `herdr`
 /// and `clauth`: the herdr shim logs every `pane report-metadata` argv as one
-/// line (and fails `process-info`, so a leaked watcher ends itself after its
-/// retry budget instead of looping), the clauth shim answers `which` with
-/// `fit` and dispatches `herdr config get <key>` to the knob values baked in
-/// at write time. HOME, the state dir and the pane id all point into the
-/// sandbox, so no live pane or real tree is touched. Returns the logged
-/// report lines and whether the watcher pidfile appeared under the state
-/// dir. `agent_json` is the event hook's `agent` field; `None` reads as no
-/// claude agent, which the script leaves watcher-less.
-///
-/// The watcher verdict is captured HERE, not by the caller: the sandbox is
-/// dropped when this returns, so a path-based check outside would always
-/// read absent. The pidfile is created synchronously before the detached
-/// spawn, so it exists here exactly when the script's watcher path ran.
+/// line and fails both `process-info` and `pane get` (the latter makes a
+/// spawned watcher end on its retry budget without re-reporting), the clauth
+/// shim answers `which` with `fit` and dispatches `herdr config get <key>` to
+/// the knob values baked in at write time. HOME, the state dir and the pane id
+/// all point into the sandbox, so no live pane or real tree is touched.
+/// Returns the logged report lines and whether the watcher pidfile appeared,
+/// observed before the helper joins that watcher so it never outlives the
+/// sandbox. `agent_json` is the event hook's `agent` field; the knob tests
+/// pass `{"agent":"claude"}`, whose pane publishes the claude-arm `fit` answer.
 #[cfg(unix)]
 fn report_profile_run(
     pane_tag: &str,
@@ -2603,7 +2579,7 @@ fn report_profile_run(
     write_shim(
         home.home(),
         "herdr",
-        "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then exit 1; fi\nexit 0\n",
+        "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then exit 1; fi\nif [ \"$1\" = pane ] && [ \"$2\" = get ]; then exit 1; fi\nexit 0\n",
     );
     write_shim(
         home.home(),
@@ -2621,6 +2597,8 @@ fn report_profile_run(
     .env("HERDR_PLUGIN_ID", "clauth")
     .env("HERDR_PANE_ID", "p1")
     .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+    // Never the host's /proc: see `report_profile_resolve_run_in`.
+    .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
     .env("HOME", home.home())
     .env(
         "PATH",
@@ -2656,7 +2634,12 @@ fn report_profile_run(
         );
     }
     let pidfile = home.home().join("state/watch-p1.pid");
-    (lines, pidfile.exists())
+    let spawned = pidfile.exists();
+    // A claude arm on a live pane spawns the watcher; join it before the
+    // sandbox drops (its `pane get` fails here, so it ends on its retry budget
+    // without re-reporting).
+    join_watcher(&home.home().join("state"), "p1");
+    (lines, spawned)
 }
 
 /// `pane_tag` off publishes the token clear instead of silently skipping the
@@ -2694,7 +2677,7 @@ fn pane_tag_off_publishes_the_token_clear_and_spawns_no_watcher() {
 #[cfg(unix)]
 #[test]
 fn border_label_off_publishes_the_display_agent_clear() {
-    let (lines, _watcher_spawned) = report_profile_run("on", "off", None);
+    let (lines, _watcher_spawned) = report_profile_run("on", "off", Some(r#"{"agent":"claude"}"#));
     assert_eq!(
         lines.len(),
         1,
@@ -2720,7 +2703,7 @@ fn border_label_off_publishes_the_display_agent_clear() {
 #[cfg(unix)]
 #[test]
 fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
-    let (lines, _watcher_spawned) = report_profile_run("on", "on", None);
+    let (lines, _watcher_spawned) = report_profile_run("on", "on", Some(r#"{"agent":"claude"}"#));
     assert_eq!(
         lines.len(),
         1,
@@ -2752,7 +2735,7 @@ fn both_knobs_on_publish_the_token_and_display_agent_unchanged() {
 #[cfg(unix)]
 #[test]
 fn both_knobs_off_publish_both_clears_in_one_call() {
-    let (lines, _watcher_spawned) = report_profile_run("off", "off", None);
+    let (lines, _watcher_spawned) = report_profile_run("off", "off", Some(r#"{"agent":"claude"}"#));
     assert_eq!(lines.len(), 1, "both clears ride the one call: {lines:?}");
     let line = &lines[0];
     assert!(
@@ -2794,6 +2777,7 @@ fn report_profile_resolve_run(
     report_profile_resolve_run_as(
         r#"{"agent":"claude"}"#,
         None,
+        "off",
         info_json,
         ps_body,
         rows,
@@ -2803,24 +2787,101 @@ fn report_profile_resolve_run(
 }
 
 /// [`report_profile_resolve_run`] with the event hook's `agent` field spelled
-/// by the caller, plus an optional ADOPTED codex login: `adopted_codex =
-/// Some(name)` lays `~/.codex/auth.json` as a symlink onto
-/// `~/.clauth/profiles/<name>/auth.json` in the sandbox, the shape
+/// by the caller, an optional ADOPTED codex login, and the `border_label`
+/// knob: `adopted_codex = Some(name)` lays `~/.codex/auth.json` as a symlink
+/// onto `~/.clauth/profiles/<name>/auth.json` in the sandbox, the shape
 /// `clauth login <name> --codex` leaves behind. `CODEX_HOME` is scrubbed from
 /// the script's env so the sandbox's `~/.codex` is the operator home it reads.
-/// Returns the report lines and whether the watcher pidfile appeared: it is
-/// created synchronously before the detached spawn, so it exists here exactly
-/// when the script's watcher path ran.
+/// The shim's `pane get` fails, so a spawned watcher ends on its retry budget
+/// without re-reporting; the helper joins that watcher (the pidfile disappears)
+/// before the sandbox drops. Returns the report lines and whether the watcher
+/// pidfile appeared, observed before the join: it is created synchronously
+/// before the detached spawn, so it exists here exactly when the script's
+/// watcher path ran.
 #[cfg(unix)]
 fn report_profile_resolve_run_as(
     agent_json: &str,
     adopted_codex: Option<&str>,
+    border_label: &str,
     info_json: &str,
     ps_body: &str,
     rows: &[(&str, &str, u32)],
     stale_row: Option<&str>,
 ) -> (Vec<String>, bool) {
+    let (lines, watcher, _) = report_profile_resolve_run_in(
+        agent_json,
+        adopted_codex,
+        border_label,
+        info_json,
+        ps_body,
+        None,
+        rows,
+        stale_row,
+    );
+    (lines, watcher)
+}
+
+/// A faked `/proc`: one `(pid, ppid, argv)` per process, `argv` space-joined
+/// the way `ps -o args=` prints it.
+#[cfg(unix)]
+type ProcTree<'a> = &'a [(u32, u32, &'a str)];
+
+/// [`report_profile_resolve_run`] on the Linux path: the script reads the
+/// process tree from a faked `/proc` instead of asking `ps`. The `ps` shim
+/// only logs its argv and fails, so a `ps` call both shows up and breaks the
+/// resolve. Returns the report lines and every logged `ps` call.
+#[cfg(unix)]
+fn report_profile_resolve_run_proc(
+    info_json: &str,
+    tree: ProcTree<'_>,
+    rows: &[(&str, &str, u32)],
+) -> (Vec<String>, Vec<String>) {
+    let (lines, _, ps_calls) = report_profile_resolve_run_in(
+        r#"{"agent":"claude"}"#,
+        None,
+        "off",
+        info_json,
+        "echo \"$*\" >> \"$(dirname \"$0\")/ps.log\"\nexit 1\n",
+        Some(tree),
+        rows,
+        None,
+    );
+    (lines, ps_calls)
+}
+
+/// The shared body of the resolve runs above. `proc_tree = None` points
+/// `CLAUTH_PROC_ROOT` at a directory that does not exist, so the script takes
+/// its `ps` path (the one macOS runs) and the scripted `ps` shim answers.
+/// Either way the variable is set: left unset, the script would read the
+/// HOST's `/proc`, where the fake pids these tests use may be real processes.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn report_profile_resolve_run_in(
+    agent_json: &str,
+    adopted_codex: Option<&str>,
+    border_label: &str,
+    info_json: &str,
+    ps_body: &str,
+    proc_tree: Option<ProcTree<'_>>,
+    rows: &[(&str, &str, u32)],
+    stale_row: Option<&str>,
+) -> (Vec<String>, bool, Vec<String>) {
     let home = crate::testutil::HomeSandbox::new();
+    let proc_root = home.home().join("proc");
+    for (pid, ppid, argv) in proc_tree.unwrap_or_default() {
+        let dir = proc_root.join(pid.to_string());
+        std::fs::create_dir_all(&dir).expect("proc dir");
+        // The comm field holds ") " itself, as a real one may: a parser that
+        // cuts at the FIRST ") " reads the state letter as the ppid.
+        std::fs::write(
+            dir.join("stat"),
+            format!("{pid} (a) b) S {ppid} {pid} {pid} 0 -1\n"),
+        )
+        .expect("stat written");
+        let mut cmdline = argv.replace(' ', "\0");
+        cmdline.push('\0');
+        std::fs::write(dir.join("cmdline"), cmdline).expect("cmdline written");
+    }
     let sessions = home.home().join(".clauth/live_sessions");
     std::fs::create_dir_all(&sessions).expect("sessions dir");
     if let Some(name) = adopted_codex {
@@ -2849,14 +2910,16 @@ fn report_profile_resolve_run_as(
         home.home(),
         "herdr",
         &format!(
-            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info_json}'; exit 0; fi\nexit 0\n"
+            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info_json}'; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = get ]; then exit 1; fi\nexit 0\n"
         ),
     );
     write_shim(home.home(), "ps", ps_body);
     write_shim(
         home.home(),
         "clauth",
-        "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+        &format!(
+            "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
+        ),
     );
     let mut cmd = std::process::Command::new("sh");
     cmd.arg(concat!(
@@ -2869,6 +2932,7 @@ fn report_profile_resolve_run_as(
     .env("HERDR_PLUGIN_EVENT_JSON", agent_json)
     .env_remove("CODEX_HOME")
     .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+    .env("CLAUTH_PROC_ROOT", &proc_root)
     .env("HOME", home.home())
     .env(
         "PATH",
@@ -2884,13 +2948,34 @@ fn report_profile_resolve_run_as(
         "the script exits 0: stderr {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect();
+    let read_lines = |name: &str| -> Vec<String> {
+        std::fs::read_to_string(home.home().join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    };
     let pidfile = home.home().join("state/watch-p1.pid");
-    (lines, pidfile.exists())
+    let spawned = pidfile.exists();
+    join_watcher(&home.home().join("state"), "p1");
+    (read_lines("report.log"), spawned, read_lines("ps.log"))
+}
+
+/// Waits for a spawned watcher's pidfile to disappear, so the detached watcher
+/// never outlives its sandbox (whose shims vanish at drop, sending the
+/// watcher's probes to the installed `clauth`). Bounded as a hang detector,
+/// never a fixed sleep; the watcher removes the pidfile in its EXIT trap.
+#[cfg(unix)]
+fn join_watcher(state_dir: &std::path::Path, pane: &str) {
+    let pidfile = state_dir.join(format!("watch-{pane}.pid"));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if !pidfile.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the detached watcher did not end within the join bound: {pidfile:?}");
 }
 
 /// The token the resolve published; the four resolution tests below pin the
@@ -2965,6 +3050,92 @@ fn the_compat_sweep_climbs_through_an_mcp_without_matching_its_rows() {
     );
 }
 
+/// On Linux the walk reads `/proc` and never runs `ps`: each `ps -o … -p` scans
+/// every process on the host to answer for one, and every watcher tick of every
+/// pane makes several. This is the foreground case above, answered from a faked
+/// `/proc` whose `ps` shim fails on any call.
+#[cfg(unix)]
+#[test]
+fn the_proc_walk_resolves_the_foreground_chain_without_ps() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1000,"foreground_processes":[{"pid":1001,"ppid":1002,"command":"claude"},{"pid":1002,"ppid":1000,"command":"clauth"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let (lines, ps_calls) = report_profile_resolve_run_proc(
+        info,
+        &[
+            (1000, 1, "clauth start uwuclxdy"),
+            (1001, 1002, "claude"),
+            (1002, 1000, "clauth mcp"),
+        ],
+        &[("1000-0", "uwuclxdy", 1000), ("1002-0", "D3", 1002)],
+    );
+    assert!(
+        ps_calls.is_empty(),
+        "no ps call on the /proc path: {ps_calls:?}"
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the pane's own session wins over the delegate row: {}",
+        lines[0]
+    );
+}
+
+/// The `/proc` ppid read decides the answer here: the foreground pid has no
+/// row of its own, so only the climb to its parent reaches one. A ppid parse
+/// that cuts `stat` at the FIRST ") " (the faked comm holds one) reads the
+/// state letter as the parent, stops the climb, and falls to `clauth which`.
+#[cfg(unix)]
+#[test]
+fn the_proc_walk_climbs_to_the_parent_row() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1000,"command":"claude"}]}}"#;
+    let (lines, ps_calls) = report_profile_resolve_run_proc(
+        info,
+        &[(1000, 1, "clauth start uwuclxdy"), (1001, 1000, "claude")],
+        &[("1000-0", "uwuclxdy", 1000)],
+    );
+    assert!(
+        ps_calls.is_empty(),
+        "no ps call on the /proc path: {ps_calls:?}"
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the climb reaches the parent's row, not the global account: {}",
+        lines[0]
+    );
+}
+
+/// The compat sweep on the `/proc` path: the parent check and the climb both
+/// read `/proc`, and an mcp carrying arguments (`clauth mcp --stdio`, the
+/// `'clauth mcp '*` arm) is still recognised and climbed through. The delegate
+/// child 1002 carries a row of its own, so the sweep's parent check is what
+/// keeps its account off the pane.
+#[cfg(unix)]
+#[test]
+fn the_proc_walk_compat_sweep_climbs_through_an_mcp_without_ps() {
+    let info = r#"{"process_info":{"foreground_processes":[{"pid":1002,"ppid":1003,"command":"claude"},{"pid":1003,"ppid":1001,"command":"clauth"},{"pid":1001,"ppid":1000,"command":"claude"},{"pid":1000,"ppid":1,"command":"clauth"}]}}"#;
+    let (lines, ps_calls) = report_profile_resolve_run_proc(
+        info,
+        &[
+            (1000, 1, "clauth start uwuclxdy"),
+            (1001, 1000, "claude"),
+            (1002, 1003, "claude"),
+            (1003, 1001, "clauth mcp --stdio"),
+        ],
+        &[
+            ("1000-0", "uwuclxdy", 1000),
+            ("1002-0", "D3", 1002),
+            ("1003-0", "D3", 1003),
+        ],
+    );
+    assert!(
+        ps_calls.is_empty(),
+        "no ps call on the /proc path: {ps_calls:?}"
+    );
+    assert!(
+        token_line(&lines).contains("--token clauth=uwuclxdy"),
+        "the sweep climbs past the mcp to the pane's supervisor: {}",
+        lines[0]
+    );
+}
+
 /// Two rows carrying one pid — the D2/DS4 aliasing measured live 2026-09-03,
 /// a finished delegate's stale row beside a newer one — resolve to the
 /// NEWEST, never the alphabetically-first file. The ids sort so the stale one
@@ -3001,6 +3172,7 @@ fn a_codex_pane_running_a_clauth_session_names_its_profile() {
     let (lines, watcher_spawned) = report_profile_resolve_run_as(
         r#"{"agent":"codex"}"#,
         None,
+        "off",
         info,
         ps,
         &[("1000-0", "work", 1000)],
@@ -3024,8 +3196,15 @@ fn a_codex_pane_running_a_clauth_session_names_its_profile() {
 fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
-    let (lines, _) =
-        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, Some("work"), info, ps, &[], None);
+    let (lines, _) = report_profile_resolve_run_as(
+        r#"{"agent":"codex"}"#,
+        Some("work"),
+        "off",
+        info,
+        ps,
+        &[],
+        None,
+    );
     assert!(
         token_line(&lines).contains("--token clauth=work"),
         "the adopted profile is published, not the claude account: {}",
@@ -3033,50 +3212,128 @@ fn a_bare_codex_pane_answers_the_adopted_login_never_the_claude_account() {
     );
 }
 
-/// A bare codex pane whose login is NOT adopted spends no clauth account:
-/// nothing is published and no watcher is spawned. The Claude Code fallback
-/// (`clauth which` → `fit`) must not leak onto it.
+/// A bare codex pane whose login is NOT adopted publishes the token clear
+/// instead of leaving a stale tag standing: the empty resolution flows through
+/// the off-side clear branch, and the Claude Code fallback (`clauth which` →
+/// `fit`) never leaks onto it.
 #[cfg(unix)]
 #[test]
-fn a_bare_codex_pane_without_an_adopted_login_publishes_nothing() {
+fn an_unadopted_codex_pane_publishes_the_token_clear() {
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
     let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
-    let (lines, watcher_spawned) =
-        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, info, ps, &[], None);
+    let (lines, _watcher_spawned) =
+        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "off", info, ps, &[], None);
+    let line = token_line(&lines);
     assert!(
-        lines.is_empty(),
-        "an unadopted codex login publishes nothing: {lines:?}"
+        line.contains("--clear-token clauth"),
+        "an unadopted codex login publishes the token clear: {line}"
     );
-    assert!(!watcher_spawned, "and spawns no watcher");
+    assert!(
+        !line.contains("--token"),
+        "no token publish beside the clear: {line}"
+    );
+    assert!(
+        !line.contains("clauth=fit"),
+        "the claude account never leaks onto a codex pane: {line}"
+    );
 }
 
-/// The watcher's re-report carries the harness it was spawned for. It empties
-/// the event JSON on purpose (the spawn hook's value goes stale), so without a
-/// passthrough a codex pane's re-run resolves `agent` to nothing, falls to
-/// `clauth which`, and paints the Claude Code account (`fit`) on the pane every
-/// tick. Drives the real `watch-profile.sh` → `report-profile.sh` chain: the
-/// herdr shim answers `process-info` once, then fails until the watcher's
-/// retry budget ends it.
+/// The empty resolution still spawns the per-pane watcher through the pidfile
+/// gate, so a mid-pane `clauth login <name> --codex` is picked up on the next
+/// tick instead of waiting for a herdr event.
 #[cfg(unix)]
 #[test]
-fn the_watcher_rereport_keeps_the_codex_harness() {
-    let home = crate::testutil::HomeSandbox::new();
-    let store = home.home().join(".clauth/profiles/work");
-    std::fs::create_dir_all(&store).expect("profile store");
-    std::fs::write(store.join("auth.json"), "{}").expect("chain written");
-    std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
-    let codex = home.home().join(".codex");
-    std::fs::create_dir_all(&codex).expect("codex home");
-    std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
-        .expect("adopted link");
+fn an_unadopted_codex_pane_spawns_a_watcher() {
     let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (_lines, watcher_spawned) =
+        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "off", info, ps, &[], None);
+    assert!(
+        watcher_spawned,
+        "an unadopted codex pane still gets a watcher (the spawn gates on pane, not profile)"
+    );
+}
+
+/// Writes the shared herdr shim for the report→spawned-watcher chain tests:
+/// `pane report-metadata` logs its argv, `pane process-info` answers
+/// `process_info_answers` times (then fails), and `pane get` answers
+/// `get_answers` times with the sandbox's current `agent` file (default
+/// `codex`), then fails. The two counters are separate files, so a test bounds
+/// the watcher's ticks independently of the resolve probes.
+///
+/// `pane get` emits the real v0.8.0 shape so a parse regression reds: the
+/// `SuccessResponse { id, result }` envelope with `ResponseResult::PaneInfo`
+/// (`src/api/schema/response.rs`, `#[serde(tag = "type", rename_all =
+/// "snake_case")]`), and inside `pane` the `PaneInfo` fields `agent`
+/// (`Option<String>`, omitted when absent), `display_agent`, and a nested
+/// `agent_session` whose `agent` is always present
+/// (`src/api/schema/agents.rs` `AgentSessionInfo`) — the nested agent that
+/// must never be read. The CLI re-serializes the response through
+/// `serde_json::Value` (`src/cli.rs` `print_response`), so every object's
+/// keys print SORTED (serde_json has no `preserve_order` here); the shim
+/// mirrors that order, not `PaneInfo`'s struct order. The agent file is empty
+/// for an idle pane (no top-level `agent`).
+#[cfg(unix)]
+fn write_herdr_shim(
+    home: &crate::testutil::HomeSandbox,
+    info: &str,
+    process_info_answers: u32,
+    get_answers: u32,
+) {
+    let body = r#"if [ "$1" = pane ] && [ "$2" = report-metadata ]; then echo "$*" >> "$(dirname "$0")/report.log"; exit 0; fi
+if [ "$1" = pane ] && [ "$2" = process-info ]; then n=$(cat "$(dirname "$0")/answered" 2>/dev/null || echo 0); if [ "$n" -ge {PI_ANSWERS} ]; then exit 1; fi; echo $((n+1)) > "$(dirname "$0")/answered"; printf '%s\n' '{INFO}'; exit 0; fi
+if [ "$1" = pane ] && [ "$2" = get ]; then n=$(cat "$(dirname "$0")/getcount" 2>/dev/null || echo 0); if [ "$n" -ge {GET_ANSWERS} ]; then exit 1; fi; echo $((n+1)) > "$(dirname "$0")/getcount"; a=$(cat "$(dirname "$0")/agent" 2>/dev/null || echo codex); if [ -n "$a" ]; then printf '{"id":"g","result":{"pane":{"agent":"%s","agent_session":{"agent":"codex","kind":"id","source":"codex","value":"x"},"agent_status":"idle","display_agent":"%s","pane_id":"p1","revision":1},"type":"pane_info"}}\n' "$a" "$a"; else printf '{"id":"g","result":{"pane":{"agent_session":{"agent":"codex","kind":"id","source":"codex","value":"x"},"agent_status":"idle","pane_id":"p1","revision":1},"type":"pane_info"}}\n'; fi; exit 0; fi
+exit 0
+"#;
     write_shim(
         home.home(),
         "herdr",
-        &format!(
-            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then if [ -f \"$(dirname \"$0\")/answered\" ]; then exit 1; fi; touch \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info}'; exit 0; fi\nexit 0\n"
-        ),
+        &body
+            .replace("{INFO}", info)
+            .replace("{PI_ANSWERS}", &process_info_answers.to_string())
+            .replace("{GET_ANSWERS}", &get_answers.to_string()),
     );
+}
+
+/// A sandbox armed for a report→spawned-watcher chain: herdr/ps/clauth shims,
+/// a state dir, and the `agent` file the herdr shim's `pane get` reads (the
+/// pane's live agent, mutable mid-run to model a harness transition).
+#[cfg(unix)]
+struct ChainSetup {
+    home: crate::testutil::HomeSandbox,
+    report: std::path::PathBuf,
+    agent_file: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+fn chain_setup(adopted_codex: Option<&str>, initial_agent: &str) -> ChainSetup {
+    chain_setup_labeled(adopted_codex, initial_agent, "off")
+}
+
+/// [`chain_setup`] with the `border_label` knob spelled by the caller: `on`
+/// makes the report publish (and clear) the display-agent artifact, the knob
+/// whose label is what herdr reacts to when the watcher clears an idle pane.
+#[cfg(unix)]
+fn chain_setup_labeled(
+    adopted_codex: Option<&str>,
+    initial_agent: &str,
+    border_label: &str,
+) -> ChainSetup {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
+    if let Some(name) = adopted_codex {
+        let store = home.home().join(".clauth/profiles").join(name);
+        std::fs::create_dir_all(&store).expect("profile store");
+        std::fs::write(store.join("auth.json"), "{}").expect("chain written");
+        let codex = home.home().join(".codex");
+        std::fs::create_dir_all(&codex).expect("codex home");
+        std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
+            .expect("adopted link");
+    }
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    write_herdr_shim(&home, info, 50, 50);
+    let agent_file = home.home().join("agent");
+    std::fs::write(&agent_file, initial_agent).expect("agent written");
     write_shim(
         home.home(),
         "ps",
@@ -3085,78 +3342,412 @@ fn the_watcher_rereport_keeps_the_codex_harness() {
     write_shim(
         home.home(),
         "clauth",
-        "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+        &format!(
+            "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo {border_label} ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n"
+        ),
     );
-    let state = home.home().join("state");
-    std::fs::create_dir_all(&state).expect("state dir");
+    std::fs::create_dir_all(home.home().join("state")).expect("state dir");
+    let report = home.home().join("report.log");
+    ChainSetup {
+        home,
+        report,
+        agent_file,
+    }
+}
+
+#[cfg(unix)]
+fn chain_report(setup: &ChainSetup, event_json: &str) {
+    let _ = chain_report_out(setup, event_json);
+}
+
+/// [`chain_report`], returning the script's stdout: the profile name it
+/// printed, empty for an agentless pane (which is what the `clauth.which`
+/// action shows).
+#[cfg(unix)]
+fn chain_report_out(setup: &ChainSetup, event_json: &str) -> String {
     let out = std::process::Command::new("sh")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/herdr-plugin/watch-profile.sh"
+            "/herdr-plugin/report-profile.sh"
         ))
-        .arg("p1")
-        .arg(state.join("watch-p1.pid"))
-        .arg("codex")
-        .env("HERDR_BIN_PATH", home.home().join("herdr"))
+        .env("HERDR_BIN_PATH", setup.home.home().join("herdr"))
         .env("HERDR_PLUGIN_ID", "clauth")
-        .env("HERDR_PLUGIN_STATE_DIR", &state)
-        .env("HOME", home.home())
+        .env("HERDR_PANE_ID", "p1")
+        .env("HERDR_PLUGIN_EVENT_JSON", event_json)
+        .env("HERDR_PLUGIN_CONTEXT_JSON", "")
+        .env("HERDR_PLUGIN_STATE_DIR", setup.home.home().join("state"))
+        // Never the host's /proc: see `report_profile_resolve_run_in`.
+        .env("CLAUTH_PROC_ROOT", setup.home.home().join("proc"))
+        .env("HOME", setup.home.home())
         .env_remove("CODEX_HOME")
         .env(
             "PATH",
             format!(
                 "{}:{}",
-                home.home().display(),
+                setup.home.home().display(),
                 std::env::var("PATH").unwrap_or_default()
             ),
         )
         .output()
-        .expect("watch-profile.sh runs");
+        .expect("report-profile.sh runs");
     assert!(
         out.status.success(),
-        "the watcher ends itself once herdr stops answering: stderr {}",
+        "the report exits 0: stderr {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
+    String::from_utf8(out.stdout).expect("utf8 stdout")
+}
+
+#[cfg(unix)]
+fn chain_lines(setup: &ChainSetup) -> Vec<String> {
+    std::fs::read_to_string(&setup.report)
         .unwrap_or_default()
         .lines()
         .map(str::to_string)
-        .collect();
+        .collect()
+}
+
+/// Ends a chain test's watcher: the pane now runs something other than claude
+/// or codex, so the watcher clears the tag and exits on its next tick,
+/// releasing the pidfile. Joined before the sandbox drops (see `join_watcher`).
+#[cfg(unix)]
+fn chain_stop(setup: &ChainSetup) {
+    std::fs::write(&setup.agent_file, "shell").expect("agent switched");
+    join_watcher(&setup.home.home().join("state"), "p1");
+}
+
+/// Waits (bounded, as a hang detector) until `pred` holds over the report
+/// log's current lines, returning the lines it last read.
+#[cfg(unix)]
+fn wait_until(setup: &ChainSetup, pred: impl Fn(&[String]) -> bool) -> Vec<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut lines = Vec::new();
+    while std::time::Instant::now() < deadline {
+        lines = chain_lines(setup);
+        if pred(&lines) {
+            return lines;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    lines
+}
+
+/// A pane that ran an unadopted codex and then a bare `claude` keeps the
+/// Claude Code account on its tag: the watcher spawned for the codex pane's
+/// empty resolution must not clear the tag the claude hook publishes. Each
+/// tick the watcher re-reads the pane's live agent, so it re-reports as claude
+/// once the pane runs claude — the claude hook's `--token clauth=fit` and the
+/// watcher's re-reported one both land, never a clear on top.
+#[cfg(unix)]
+#[test]
+fn a_codex_watcher_never_clears_the_claude_tag_that_follows_it() {
+    let setup = chain_setup(None, "codex");
+    chain_report(&setup, r#"{"agent":"codex"}"#);
+    std::fs::write(&setup.agent_file, "claude").expect("agent switched");
+    chain_report(&setup, r#"{"agent":"claude"}"#);
+    let lines = wait_until(&setup, |ls| {
+        ls.iter()
+            .filter(|l| l.contains("--token clauth=fit"))
+            .count()
+            >= 2
+    });
     assert!(
-        token_line(&lines).contains("--token clauth=work"),
-        "the re-report keeps the codex harness and names the adopted profile: {}",
-        lines[0]
+        lines
+            .iter()
+            .filter(|l| l.contains("--token clauth=fit"))
+            .count()
+            >= 2,
+        "the watcher re-reports as the live claude agent instead of clearing it: {lines:?}"
+    );
+    assert!(
+        lines
+            .last()
+            .is_some_and(|l| l.contains("--token clauth=fit")),
+        "the claude tag is the last publish, not a codex clear: {lines:?}"
+    );
+    chain_stop(&setup);
+}
+
+/// A watcher spawned under claude follows the pane to codex: once the pane's
+/// live agent reads codex, the watcher re-reports the adopted codex profile,
+/// never the claude-arm `fit` it was spawned with.
+#[cfg(unix)]
+#[test]
+fn a_claude_watcher_reports_the_codex_pane_as_codex() {
+    let setup = chain_setup(Some("work"), "claude");
+    chain_report(&setup, r#"{"agent":"claude"}"#);
+    std::fs::write(&setup.agent_file, "codex").expect("agent switched");
+    let lines = wait_until(&setup, |ls| {
+        ls.last().is_some_and(|l| l.contains("--token clauth=work"))
+    });
+    assert!(
+        lines
+            .last()
+            .is_some_and(|l| l.contains("--token clauth=work")),
+        "the claude-spawned watcher follows the pane to codex: {lines:?}"
+    );
+    chain_stop(&setup);
+}
+
+/// A watcher whose pane now runs an agent other than claude or codex publishes
+/// the clear and exits, releasing its pidfile: an idle pane stops showing an
+/// account instead of keeping a stale one forever.
+#[cfg(unix)]
+#[test]
+fn the_watcher_clears_and_exits_when_the_pane_runs_another_agent() {
+    let setup = chain_setup(Some("work"), "codex");
+    chain_report(&setup, r#"{"agent":"codex"}"#);
+    std::fs::write(&setup.agent_file, "cursor").expect("agent switched");
+    let lines = wait_until(&setup, |ls| {
+        ls.last()
+            .is_some_and(|l| l.contains("--clear-token clauth"))
+    });
+    assert!(
+        lines
+            .last()
+            .is_some_and(|l| l.contains("--clear-token clauth")),
+        "the watcher clears the tag when the pane runs another agent: {lines:?}"
+    );
+    join_watcher(&setup.home.home().join("state"), "p1");
+}
+
+/// An idle pane whose `pane get` record carries a persisted `agent_session`
+/// (its own `agent` field omitted as `None`) reads as having NO live agent:
+/// the watcher clears the tag and exits rather than answering the session's
+/// `codex`. The shim's `pane get` prints `agent_session.agent = "codex"` with
+/// no top-level `agent`, the exact shape a greedy `.*"agent":"` misreads.
+#[cfg(unix)]
+#[test]
+fn an_idle_pane_with_a_persisted_codex_session_clears_and_exits() {
+    let setup = chain_setup(Some("work"), "codex");
+    chain_report(&setup, r#"{"agent":"codex"}"#);
+    std::fs::write(&setup.agent_file, "").expect("agent cleared");
+    let lines = wait_until(&setup, |ls| {
+        ls.last()
+            .is_some_and(|l| l.contains("--clear-token clauth"))
+    });
+    assert!(
+        lines
+            .last()
+            .is_some_and(|l| l.contains("--clear-token clauth")),
+        "the idle pane clears the tag instead of answering the session's codex: {lines:?}"
+    );
+    join_watcher(&setup.home.home().join("state"), "p1");
+}
+
+/// G1: with `border_label` on, the watcher's exit clear on an idle pane makes
+/// herdr re-emit an agentless `pane.agent_status_changed` event (its own
+/// display-agent label changed). The hook re-runs the report; it must publish
+/// the clear again, never the claude-arm account, so the idle pane stays
+/// untagged. Drives the real report → watcher chain, then the follow-on event.
+#[cfg(unix)]
+#[test]
+fn an_agentless_status_event_after_the_watchers_exit_clear_leaves_the_pane_untagged() {
+    let setup = chain_setup_labeled(Some("work"), "codex", "on");
+    chain_report(&setup, r#"{"agent":"codex"}"#);
+    assert!(
+        chain_lines(&setup)
+            .first()
+            .is_some_and(|l| l.contains("--token clauth=work")),
+        "the adopted codex pane is tagged first: {:?}",
+        chain_lines(&setup)
+    );
+    // The pane goes idle; the watcher clears both artifacts and exits on its
+    // next tick (its pidfile disappears, the join's outcome wait).
+    std::fs::write(&setup.agent_file, "").expect("pane goes idle");
+    let cleared = wait_until(&setup, |ls| {
+        ls.last()
+            .is_some_and(|l| l.contains("--clear-token clauth"))
+    });
+    assert!(
+        cleared
+            .last()
+            .is_some_and(|l| l.contains("--clear-token clauth")),
+        "the watcher clears the tag on the idle pane: {cleared:?}"
+    );
+    join_watcher(&setup.home.home().join("state"), "p1");
+    // herdr answers the display-agent clear with an agentless status event; the
+    // hook re-runs and must not re-paint the global claude account.
+    chain_report(
+        &setup,
+        r#"{"event":"pane_agent_status_changed","data":{"type":"pane_agent_status_changed","pane_id":"p1","workspace_id":"w1","agent_status":"unknown"}}"#,
+    );
+    let lines = chain_lines(&setup);
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"),
+        "the agentless event after the watcher's exit clear leaves the pane untagged: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("clauth=fit")),
+        "the claude-arm account never reaches the idle pane: {lines:?}"
     );
 }
 
-/// The spawn site hands the harness into the watcher it spawns. The test
-/// above drives `watch-profile.sh` with the arg spelled out, so a dropped arg
-/// at the spawn site (`report-profile.sh`) reverts every codex watcher to the
-/// claude fallback with the suite green — the exact mislabel the codex pane
-/// exists to prevent. Drives the real `report-profile.sh` → spawned
-/// `watch-profile.sh` chain and reads the watcher's re-report out of the herdr
-/// shim's log.
+/// A pane whose own `agent` is `claude` but whose persisted `agent_session` is
+/// `codex` tags as claude: the live-agent read must return the pane's own
+/// top-level `agent`, never the nested session record.
 #[cfg(unix)]
 #[test]
-fn the_spawned_codex_watcher_keeps_the_harness() {
+fn a_claude_pane_with_a_persisted_codex_session_tags_as_claude() {
+    let setup = chain_setup(Some("work"), "claude");
+    chain_report(&setup, "");
+    let lines = chain_lines(&setup);
+    assert!(
+        lines
+            .first()
+            .is_some_and(|l| l.contains("--token clauth=fit")),
+        "the pane's own claude agent wins over the codex session record: {lines:?}"
+    );
+    assert!(
+        lines.iter().all(|l| !l.contains("clauth=work")),
+        "the codex session record never reaches the tag: {lines:?}"
+    );
+    chain_stop(&setup);
+}
+
+/// The `clauth.which` action carries no event agent (only the focused pane),
+/// so a codex pane would fall to the claude arm and get the Claude Code
+/// account. The pane's live agent is read instead: the action tags a codex
+/// pane with its adopted codex profile, never `fit`.
+#[cfg(unix)]
+#[test]
+fn the_which_action_tags_a_codex_pane_with_the_codex_account() {
+    let setup = chain_setup(Some("work"), "codex");
+    chain_report(&setup, "");
+    let lines = chain_lines(&setup);
+    assert!(
+        lines
+            .first()
+            .is_some_and(|l| l.contains("--token clauth=work")),
+        "the which action tags the codex pane with the codex account: {lines:?}"
+    );
+    assert!(
+        lines.iter().all(|l| !l.contains("clauth=fit")),
+        "the claude account never reaches a codex pane: {lines:?}"
+    );
+    chain_stop(&setup);
+}
+
+/// The `clauth.which` action carries no event agent and reads the focused
+/// pane's live agent; a plain shell (none) publishes both clears, spawns no
+/// watcher, and prints nothing — where it once named the global claude
+/// account.
+#[cfg(unix)]
+#[test]
+fn the_which_action_on_an_agentless_pane_publishes_the_clears_and_prints_nothing() {
+    let setup = chain_setup(None, "");
+    let stdout = chain_report_out(&setup, "");
+    assert_eq!(stdout, "", "an agentless pane shows no account: {stdout:?}");
+    assert_eq!(
+        chain_lines(&setup),
+        vec![
+            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+                .to_string()
+        ],
+        "the which action clears both artifacts instead of painting the global account"
+    );
+    assert!(
+        !setup.home.home().join("state/watch-p1.pid").exists(),
+        "and spawns no watcher"
+    );
+}
+
+/// The TUI knob push re-runs the reporter per pane with the pane id set and
+/// the event/context JSON cleared (`rerun_pane_report`); on a pane running
+/// another agent (cursor, which spends no clauth account) it publishes the
+/// same clears and spawns no watcher, so toggling a knob never paints the
+/// global account onto a non-claude/codex pane.
+#[cfg(unix)]
+#[test]
+fn the_tui_knob_push_rerun_on_an_agentless_pane_publishes_the_clears() {
+    let setup = chain_setup(None, "cursor");
+    let stdout = chain_report_out(&setup, "");
+    assert_eq!(
+        stdout, "",
+        "the knob push's resolve prints nothing: {stdout:?}"
+    );
+    assert_eq!(
+        chain_lines(&setup),
+        vec![
+            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+                .to_string()
+        ],
+        "the knob push clears both artifacts instead of painting the global account"
+    );
+    assert!(
+        !setup.home.home().join("state/watch-p1.pid").exists(),
+        "and spawns no watcher"
+    );
+}
+
+/// A hooked event that names no agent (herdr's `pane.agent_status_changed`
+/// with `agent` omitted on an idle pane) publishes the clears and spawns no
+/// watcher, never the claude-arm account.
+#[cfg(unix)]
+#[test]
+fn a_hook_on_an_agentless_event_publishes_the_clears() {
+    let setup = chain_setup_labeled(None, "", "on");
+    chain_report(
+        &setup,
+        r#"{"event":"pane_agent_status_changed","data":{"type":"pane_agent_status_changed","pane_id":"p1","workspace_id":"w1","agent_status":"unknown"}}"#,
+    );
+    assert_eq!(
+        chain_lines(&setup),
+        vec![
+            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+                .to_string()
+        ],
+        "an agentless event clears both artifacts, never the claude arm"
+    );
+    assert!(
+        !setup.home.home().join("state/watch-p1.pid").exists(),
+        "and spawns no watcher"
+    );
+}
+
+/// A release event names the agent that just exited (herdr's
+/// `pane.agent_detected {agent, released:true}`), so the hook must trust the
+/// pane's live agent over the event's: when `pane get` names no agent, the
+/// exited agent's account is not re-published — the pane gets the clears and
+/// no watcher.
+#[cfg(unix)]
+#[test]
+fn a_released_event_on_a_pane_that_now_runs_no_agent_publishes_the_clears() {
+    let setup = chain_setup(None, "");
+    chain_report(
+        &setup,
+        r#"{"event":"pane_agent_detected","data":{"type":"pane_agent_detected","pane_id":"p1","workspace_id":"w1","agent":"claude","released":true}}"#,
+    );
+    let lines = chain_lines(&setup);
+    assert_eq!(
+        lines,
+        vec![
+            "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent"
+                .to_string()
+        ],
+        "the released event's exited agent is not re-published: {lines:?}"
+    );
+    assert!(
+        !setup.home.home().join("state/watch-p1.pid").exists(),
+        "and spawns no watcher"
+    );
+}
+
+/// A failed `pane get` (non-zero exit) is not a definitive "no agent": the
+/// `clauth.which` action (no event agent) must keep the pane's last tag rather
+/// than clear it. It publishes nothing and spawns no watcher.
+#[cfg(unix)]
+#[test]
+fn a_pane_get_failure_on_a_tagged_pane_publishes_nothing() {
     let home = crate::testutil::HomeSandbox::new();
-    let store = home.home().join(".clauth/profiles/work");
-    std::fs::create_dir_all(&store).expect("profile store");
-    std::fs::write(store.join("auth.json"), "{}").expect("chain written");
     std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
-    let codex = home.home().join(".codex");
-    std::fs::create_dir_all(&codex).expect("codex home");
-    std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
-        .expect("adopted link");
-    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
-    // process-info answers twice: the resolve walk's own probe, then the
-    // watcher's first liveness probe (which gates its one re-report); after
-    // that it fails and the watcher's retry budget ends it.
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
     write_shim(
         home.home(),
         "herdr",
         &format!(
-            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then n=$(cat \"$(dirname \"$0\")/answered\" 2>/dev/null || echo 0); if [ \"$n\" -ge 2 ]; then exit 1; fi; echo $((n+1)) > \"$(dirname \"$0\")/answered\"; printf '%s\\n' '{info}'; exit 0; fi\nexit 0\n"
+            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then printf '%s\\n' '{info}'; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = get ]; then exit 1; fi\nexit 0\n"
         ),
     );
     write_shim(
@@ -3169,8 +3760,6 @@ fn the_spawned_codex_watcher_keeps_the_harness() {
         "clauth",
         "case \"$1:$4\" in\n  which:) echo fit ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
     );
-    let state = home.home().join("state");
-    std::fs::create_dir_all(&state).expect("state dir");
     let out = std::process::Command::new("sh")
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3179,9 +3768,10 @@ fn the_spawned_codex_watcher_keeps_the_harness() {
         .env("HERDR_BIN_PATH", home.home().join("herdr"))
         .env("HERDR_PLUGIN_ID", "clauth")
         .env("HERDR_PANE_ID", "p1")
-        .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"codex"}"#)
-        .env("HERDR_PLUGIN_CONTEXT_JSON", "")
-        .env("HERDR_PLUGIN_STATE_DIR", &state)
+        .env_remove("HERDR_PLUGIN_EVENT_JSON")
+        .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+        // Never the host's /proc: see `report_profile_resolve_run_in`.
+        .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
         .env("HOME", home.home())
         .env_remove("CODEX_HOME")
         .env(
@@ -3199,38 +3789,181 @@ fn the_spawned_codex_watcher_keeps_the_harness() {
         "the report exits 0: stderr {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // The watcher re-reports after its first liveness probe (the shim's 1 s
-    // tag_watch_secs paces the retries); require the re-report to keep the
-    // codex harness — with the spawn arg dropped the watcher defaults to
-    // claude and its re-report reads `clauth which` → `fit`.
-    let report = home.home().join("report.log");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let mut lines = Vec::new();
-    while std::time::Instant::now() < deadline {
-        lines = std::fs::read_to_string(&report)
-            .unwrap_or_default()
-            .lines()
-            .map(str::to_string)
-            .collect();
-        if lines.len() >= 2 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
     assert!(
-        lines.len() >= 2,
-        "the spawned watcher re-reports within the deadline: {lines:?}"
+        out.stdout.is_empty(),
+        "a failed pane get prints nothing: {:?}",
+        String::from_utf8_lossy(&out.stdout)
     );
+    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines.is_empty(),
+        "a failed pane get publishes nothing, so the last tag stays: {lines:?}"
+    );
+    assert!(
+        !home.home().join("state/watch-p1.pid").exists(),
+        "and spawns no watcher"
+    );
+}
+
+/// A claude-arm failure (`clauth which` exiting non-zero) is not a definitive
+/// empty resolution: it publishes nothing and spawns no watcher, whatever the
+/// caller. `clauth which` prints `unknown` at exit 0 when nothing resolves, so
+/// an empty claude arm is always a failure.
+#[cfg(unix)]
+#[test]
+fn a_claude_arm_failure_publishes_nothing_and_spawns_no_watcher() {
+    let home = crate::testutil::HomeSandbox::new();
+    std::fs::create_dir_all(home.home().join(".clauth/live_sessions")).expect("sessions dir");
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"claude"}]}}"#;
+    write_shim(
+        home.home(),
+        "herdr",
+        &format!(
+            "if [ \"$1\" = pane ] && [ \"$2\" = report-metadata ]; then echo \"$*\" >> \"$(dirname \"$0\")/report.log\"; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = process-info ]; then printf '%s\\n' '{info}'; exit 0; fi\nif [ \"$1\" = pane ] && [ \"$2\" = get ]; then exit 1; fi\nexit 0\n"
+        ),
+    );
+    write_shim(
+        home.home(),
+        "ps",
+        "case \"$*\" in\n  *'-o ppid='*) echo 1;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n",
+    );
+    write_shim(
+        home.home(),
+        "clauth",
+        "case \"$1:$4\" in\n  which:) exit 1 ;;\n  herdr:pane_tag) echo on ;;\n  herdr:border_label) echo off ;;\n  herdr:tag_watch_secs) echo 1 ;;\nesac\nexit 0\n",
+    );
+    let out = std::process::Command::new("sh")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/herdr-plugin/report-profile.sh"
+        ))
+        .env("HERDR_BIN_PATH", home.home().join("herdr"))
+        .env("HERDR_PLUGIN_ID", "clauth")
+        .env("HERDR_PANE_ID", "p1")
+        .env("HERDR_PLUGIN_EVENT_JSON", r#"{"agent":"claude"}"#)
+        .env("HERDR_PLUGIN_STATE_DIR", home.home().join("state"))
+        // Never the host's /proc: see `report_profile_resolve_run_in`.
+        .env("CLAUTH_PROC_ROOT", home.home().join("proc"))
+        .env("HOME", home.home())
+        .env_remove("CODEX_HOME")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.home().display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .expect("report-profile.sh runs");
+    assert!(
+        out.status.success(),
+        "the report exits 0: stderr {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let lines: Vec<String> = std::fs::read_to_string(home.home().join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(
+        lines.is_empty(),
+        "a claude-arm failure publishes nothing: {lines:?}"
+    );
+    assert!(
+        !home.home().join("state/watch-p1.pid").exists(),
+        "and spawns no watcher"
+    );
+}
+
+/// An empty (definitive) codex resolution with `border_label` on publishes the
+/// display-agent clear too: the argv is pinned by equality, so a dropped
+/// `[ -n "$profile" ]` guard on the display-agent branch reds.
+#[cfg(unix)]
+#[test]
+fn an_empty_codex_resolution_with_border_label_on_publishes_the_display_agent_clear() {
+    let info = r#"{"process_info":{"foreground_process_group_id":1001,"foreground_processes":[{"pid":1001,"ppid":1,"command":"codex"}]}}"#;
+    let ps = "case \"$*\" in\n  *'-o ppid='*) case \"$*\" in *' 1001') echo 1;; esac;;\n  *'-o args='*) echo other;;\nesac\nexit 0\n";
+    let (lines, _watcher_spawned) =
+        report_profile_resolve_run_as(r#"{"agent":"codex"}"#, None, "on", info, ps, &[], None);
+    let line = token_line(&lines);
+    assert_eq!(
+        line, "pane report-metadata p1 --source clauth --clear-token clauth --clear-display-agent",
+        "the empty resolution publishes both clears in one call: {line}"
+    );
+}
+
+/// A `clauth delete <name>` detaches the adopted login's link with no herdr
+/// event, so the stale `clauth=<name>` tag would stand until the pane closed.
+/// The spawned watcher's re-report resolves the now-empty profile and
+/// publishes the token clear on its next tick. Drives the real
+/// `report-profile.sh` → spawned `watch-profile.sh` chain and removes the
+/// sandbox link mid-run, modeling `detach_operator_auth_slot`'s `remove_file`.
+#[cfg(unix)]
+#[test]
+fn a_deleted_adopted_login_clears_the_tag_on_the_watchers_next_tick() {
+    let setup = chain_setup(Some("work"), "codex");
+    chain_report(&setup, r#"{"agent":"codex"}"#);
+    let before = chain_lines(&setup);
+    assert!(
+        before
+            .first()
+            .is_some_and(|l| l.contains("--token clauth=work")),
+        "the adopted login was tagged before the delete: {before:?}"
+    );
+    std::fs::remove_file(setup.home.home().join(".codex/auth.json"))
+        .expect("detach removes the link");
+    let lines = wait_until(&setup, |ls| {
+        ls.last()
+            .is_some_and(|l| l.contains("--clear-token clauth"))
+    });
+    assert!(
+        lines
+            .last()
+            .is_some_and(|l| l.contains("--clear-token clauth")),
+        "the deleted adoption clears the tag on the watcher's next tick: {lines:?}"
+    );
+    chain_stop(&setup);
+}
+
+/// A mid-pane `clauth login <name> --codex` creates the adopted link with no
+/// herdr event. With a watcher already spawned for the empty resolution, the
+/// adoption is picked up on its next tick and the token publish replaces the
+/// earlier clear. Drives the real `report-profile.sh` → spawned
+/// `watch-profile.sh` chain and creates the sandbox link mid-run.
+#[cfg(unix)]
+#[test]
+fn the_spawned_watcher_picks_up_a_mid_pane_adoption() {
+    let setup = chain_setup(None, "codex");
+    chain_report(&setup, r#"{"agent":"codex"}"#);
+    let before = chain_lines(&setup);
+    assert!(
+        before
+            .first()
+            .is_some_and(|l| l.contains("--clear-token clauth")),
+        "the empty resolution cleared the tag before the adoption: {before:?}"
+    );
+    let store = setup.home.home().join(".clauth/profiles/work");
+    std::fs::create_dir_all(&store).expect("profile store");
+    std::fs::write(store.join("auth.json"), "{}").expect("chain written");
+    let codex = setup.home.home().join(".codex");
+    std::fs::create_dir_all(&codex).expect("codex home");
+    std::os::unix::fs::symlink(store.join("auth.json"), codex.join("auth.json"))
+        .expect("adopted link");
+    let lines = wait_until(&setup, |ls| {
+        ls.last().is_some_and(|l| l.contains("--token clauth=work"))
+    });
     assert!(
         lines
             .last()
             .is_some_and(|l| l.contains("--token clauth=work")),
-        "the spawned watcher keeps the codex harness: {lines:?}"
+        "the spawned watcher picks up the mid-pane adoption: {lines:?}"
     );
-    assert!(
-        lines.iter().all(|l| !l.contains("clauth=fit")),
-        "the claude account never reaches a codex pane: {lines:?}"
-    );
+    chain_stop(&setup);
 }
 
 /// The foreground-field parse, pinned against the REAL 0.8.2 process-info
@@ -3267,5 +4000,31 @@ fn the_fg_sed_reads_the_real_process_info_shape() {
         sed_pipe(real, fg_prog).trim(),
         "1822495",
         "the fg sed resolves the real shape"
+    );
+}
+
+#[test]
+fn snapshot_rects_read_herdr_091_layouts() {
+    // herdr 0.9.1 (measured 2026-09-26): `panes[]` carries no rect, each pane's
+    // rect lives under `layouts[].panes[]`. Without the fallback every pane
+    // reads as rect-less and the terminal stream route answers 404.
+    let real = r#"{"id":"cli:api:snapshot","result":{"snapshot":{"layouts":[{"panes":[{"focused":true,"pane_id":"w1:p2","rect":{"height":40,"width":120,"x":0,"y":0}}]}],"panes":[{"agent":"claude","agent_status":"blocked","pane_id":"w1:p2","tab_id":"w1:t2","workspace_id":"w1"},{"pane_id":"w1:p9"}]}}}"#;
+    let rects = parse_snapshot_rects(real.as_bytes()).expect("the envelope parses");
+    let rect = |id: &str| {
+        rects
+            .iter()
+            .find(|(pane, _)| pane == id)
+            .and_then(|(_, rect)| rect.as_ref())
+            .map(|r| (r.width, r.height))
+    };
+    assert_eq!(rect("w1:p2"), Some((120, 40)), "the layout rect is found");
+    assert_eq!(rect("w1:p9"), None, "a pane with no layout stays rect-less");
+
+    // The older shape, a rect on the pane itself, still wins.
+    let older = r#"{"result":{"snapshot":{"panes":[{"pane_id":"w1:p1","rect":{"width":80,"height":24}}]}}}"#;
+    let rects = parse_snapshot_rects(older.as_bytes()).expect("the older envelope parses");
+    assert_eq!(
+        rects[0].1.as_ref().map(|r| (r.width, r.height)),
+        Some((80, 24))
     );
 }

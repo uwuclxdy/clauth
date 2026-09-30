@@ -396,8 +396,9 @@ fn shared_env_key_dropped_by_the_winner_is_removed_from_targets() {
 
 /// The engine's mode split, keyed on THIS reconciler's operator file. A runtime
 /// copy carries an api-key profile's `apiKeyHelper` plus its endpoint env keys,
-/// so it must land 0o600; `~/.claude/settings.json` lands at Claude Code's own
-/// 0o644, the same posture `apply_profile_to_claude_settings` leaves it in. The
+/// so it must land 0o600; `~/.claude/settings.json` lands at the writer's
+/// umask-moded mode (0o644 at the default umask), the posture
+/// `apply_profile_to_claude_settings` leaves it in. The
 /// rename swaps the inode either way, so neither branch preserves an existing
 /// mode — the point is which mode clauth imposes.
 #[cfg(unix)]
@@ -430,10 +431,14 @@ fn runtime_copies_are_owner_only_and_the_base_keeps_its_posture() {
         json!("dark"),
         "precondition: this sync rewrote the base"
     );
+    let control = home.home().join("mode-control.json");
+    crate::profile::atomic_write(&control, b"{}").expect("write mode control");
     assert_eq!(
         mode(&base),
-        0o644,
-        "~/.claude/settings.json is Claude Code's own file; do not restyle it"
+        mode(&control),
+        "the base lands at the writer's umask-moded mode, not the seed's (got {:#o}, control {:#o})",
+        mode(&base),
+        mode(&control),
     );
 }
 
@@ -549,8 +554,7 @@ fn a_codex_profiles_config_is_never_read_here() {
     write_config(home.home(), "p1", "[env]\nA_KEY = \"1\"\n");
 
     let clauth = home.home().join(".clauth");
-    fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex roster");
+    crate::testutil::write_codex_roster(&["cx"]);
     let cx = clauth.join("profiles").join("cx");
     fs::create_dir_all(&cx).expect("mkdir codex profile");
     fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");
@@ -580,11 +584,7 @@ fn a_dual_claimed_name_stays_claude_first_here() {
     let clauth = home.home().join(".clauth");
     fs::write(clauth.join("profiles.toml"), "profiles = [\"shared\"]\n")
         .expect("write claude roster");
-    fs::write(
-        clauth.join("codex-profiles.toml"),
-        "profiles = [\"shared\"]\n",
-    )
-    .expect("write codex roster claiming the same name");
+    crate::testutil::write_codex_roster(&["shared"]);
 
     let keys = per_profile_env_keys().expect("every config.toml parses");
     assert!(
@@ -620,7 +620,7 @@ fn an_unreadable_codex_roster_reads_as_no_codex_arm_and_never_pauses() {
 
     // A valid roster naming a codex dir whose own config.toml does not parse:
     // the dir is skipped by membership, the claude keys still arrive.
-    fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n").expect("write roster");
+    crate::testutil::write_codex_roster(&["cx"]);
     let cx = clauth.join("profiles").join("cx");
     fs::create_dir_all(&cx).expect("mkdir codex profile");
     fs::write(cx.join("config.toml"), "[env\nBROKEN = ").expect("write broken codex config");

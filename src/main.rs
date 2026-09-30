@@ -11,6 +11,7 @@ mod completions;
 mod daemon;
 mod fallback;
 mod format;
+mod gateway;
 mod harness;
 mod herdr;
 mod hook_context;
@@ -39,7 +40,11 @@ mod pricing;
 mod profile;
 mod profile_cache;
 mod profile_json;
+mod profile_notes;
 mod providers;
+mod proxy;
+mod proxy_check;
+mod proxy_list;
 mod runtime;
 mod sessions;
 mod sessions_cli;
@@ -256,6 +261,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             }
         }
         Command::Enable { profile } => cmd_enable(&profile),
+        Command::LimitReset { profile, list, yes } => cmd_limit_reset(&profile, list, yes),
         Command::RollingToken { profile } => cmd_rolling_token(&profile),
         Command::Which { json } => which::run(json),
         Command::List { all, disabled } => list::run(all || disabled),
@@ -304,10 +310,14 @@ fn dispatch(cli: Cli) -> Result<()> {
         // the parse pin in `tests/inline/cli.rs`, and the leg it points at is
         // pinned hermetically by the fake-`claude` tests.
         Command::SelfHeal => plugin_host::self_heal(),
-        Command::Complete { live_sessions } => cmd_complete(live_sessions),
+        Command::Complete {
+            codex,
+            live_sessions,
+        } => cmd_complete(codex, live_sessions),
         Command::ApiKey { profile } => cmd_api_key(&profile),
         Command::Completions { target, shell } => cmd_completions(&target, shell.as_deref()),
         Command::Herdr { cmd } => cmd_herdr(cmd),
+        Command::Proxy { cmd } => cmd_proxy(cmd),
         Command::Run { .. } => cmd_run(),
         Command::External(words) => cmd_external(&words),
     }
@@ -377,8 +387,10 @@ fn cmd_devices(json: bool, cmd: Option<cli::DevicesCommand>) -> Result<()> {
     }
 }
 
-fn cmd_complete(live_sessions: bool) -> Result<()> {
-    if live_sessions {
+fn cmd_complete(codex: bool, live_sessions: bool) -> Result<()> {
+    if codex {
+        completions::print_codex_profile_names();
+    } else if live_sessions {
         completions::print_session_stems();
     } else {
         completions::print_profile_names();
@@ -405,6 +417,33 @@ fn cmd_herdr(cmd: cli::HerdrCommand) -> Result<()> {
         cli::HerdrCommand::Config { cmd } => match cmd {
             cli::HerdrConfigCommand::Get { key } => herdr::config_get(&key),
         },
+    }
+}
+
+fn cmd_proxy(cmd: cli::ProxyCommand) -> Result<()> {
+    match cmd {
+        cli::ProxyCommand::List { json } => proxy_list::run(json),
+        cli::ProxyCommand::Enable { service, port } => {
+            let bind = proxy::enable(&service, port, std::env::var_os("PATH").as_deref())?;
+            outln!("clauth: enabled proxy '{service}' on {bind}");
+            Ok(())
+        }
+        cli::ProxyCommand::Disable { service } => {
+            proxy::disable(&service)?;
+            outln!("clauth: disabled proxy '{service}'; its port, admin token and state are kept");
+            Ok(())
+        }
+        cli::ProxyCommand::Check {
+            target,
+            admin_token_file,
+            key_file,
+            destructive,
+        } => proxy_check::run(
+            &target,
+            admin_token_file.as_deref(),
+            key_file.as_deref(),
+            destructive,
+        ),
     }
 }
 
@@ -2239,3 +2278,97 @@ mod feature_coverage;
 #[cfg(test)]
 #[path = "../tests/inline/cli.rs"]
 mod tests;
+
+/// `clauth limit-reset <name> [--list] [--yes|-y]` — spend one of a codex
+/// account's banked usage-limit resets ([`usage::codex_reset`]). The confirm
+/// policy is [`cmd_delete`]'s: the spend is irreversible, so a non-TTY run with
+/// no `--yes` is refused, and refused before any request leaves the machine.
+fn cmd_limit_reset(name: &str, list: bool, yes: bool) -> Result<()> {
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    limit_reset_with(
+        name,
+        list,
+        yes,
+        interactive,
+        &usage::codex_reset::ResetUrls::live(),
+        |prompt| {
+            out!("{prompt} [y/N] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(reauth_confirmed(&answer))
+        },
+    )
+}
+
+/// [`cmd_limit_reset`] with the terminal check, the endpoints and the prompt
+/// injected, so the refusals and the wire run offline.
+///
+/// On success stdout's FIRST line is the one-line summary, readable as it
+/// stands; every failure is the returned error. Reads the store as it stands:
+/// a stale token is reported, never refreshed from here, because the store has
+/// one writer and it is not this command.
+fn limit_reset_with(
+    name: &str,
+    list: bool,
+    yes: bool,
+    interactive: bool,
+    urls: &usage::codex_reset::ResetUrls,
+    confirm: impl FnOnce(&str) -> Result<bool>,
+) -> Result<()> {
+    use usage::codex_reset as reset;
+    let Some(canonical) = codex_profiles::CodexState::load()?.canonical_name(name) else {
+        let config = load_config()?;
+        if let Some(claude) = config.canonical_name(name) {
+            return Err(usage_error(format!(
+                "'{claude}' is a claude profile; limit-reset is codex-only"
+            )));
+        }
+        return Err(unknown_profile_error(&config, name));
+    };
+    codex_auth::refuse_if_quarantined(&canonical)?;
+    let auth = codex_auth::read_store_auth(&canonical);
+    let Some(access_token) = auth.as_ref().and_then(|a| a.access_token()) else {
+        anyhow::bail!(
+            "'{canonical}' has no stored codex login to use a reset with; run `clauth login \
+             {canonical} --codex --browser`"
+        );
+    };
+    let account_id = auth.as_ref().and_then(|a| a.account_id());
+    let fedramp = auth.as_ref().is_some_and(|a| a.is_fedramp());
+    if !list && !yes && !interactive {
+        anyhow::bail!("refusing to use a reset on '{canonical}' without confirmation; pass --yes");
+    }
+
+    let credits = reset::list_reset_credits_at(&urls.list, access_token, account_id, fedramp)
+        .map_err(|e| anyhow::anyhow!(reset::list_failure(&canonical, &e)))?;
+    if list {
+        for line in reset::describe_reset_credits(&canonical, &credits) {
+            outln!("{line}");
+        }
+        return Ok(());
+    }
+    let Some(credit) = credits.next_to_use() else {
+        anyhow::bail!("{}", reset::no_resets_available(&canonical));
+    };
+    if !yes && !confirm(&reset::limit_reset_prompt(&canonical, &credits, credit))? {
+        outln!("clauth: aborted. no reset was used on '{canonical}'.");
+        return Ok(());
+    }
+
+    let redeem_request_id = reset::new_redeem_request_id()?;
+    let reply = reset::consume_reset_credit_at(
+        &urls.consume,
+        access_token,
+        account_id,
+        fedramp,
+        &redeem_request_id,
+        &credit.id,
+    )
+    .map_err(|e| anyhow::anyhow!(reset::consume_failure(&canonical, &e)))?;
+    let summary =
+        reset::outcome_line(&canonical, &credits, &reply).map_err(|e| anyhow::anyhow!(e))?;
+    outln!("{summary}");
+    outln!("clauth: the daemon shows the new usage at its next poll.");
+    Ok(())
+}

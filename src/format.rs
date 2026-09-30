@@ -487,7 +487,7 @@ pub(crate) fn refresh_transient_cli(
 /// TUI, never a bare "the TUI" (which reads as some other UI).
 pub(crate) const RESOLVE_IN_TUI: &str = "resolve the divergence in the clauth TUI";
 
-/// The `s` a count needs, per cloudy-tui's counts rule: singular at one.
+/// The `s` a count needs: singular at one.
 pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
@@ -500,7 +500,7 @@ pub(crate) fn plural(n: usize) -> &'static str {
 /// function's, so this is the zero boundary and nothing else.
 ///
 /// One helper because the rule kept being re-answered: three surfaces wrote
-/// their own guard and reached three different words. `src/tui/render/plugin.rs`
+/// their own guard and reached three different words. `src/tui/render/services.rs`
 /// still spells its own `just now`, deliberately — a pane's phrasing is its own
 /// — and folding that one in is owed.
 pub(crate) fn humanize_span(secs: u64) -> String {
@@ -614,6 +614,7 @@ pub(crate) fn local_stamp(epoch: i64) -> Option<String> {
 pub(crate) const DIAG_DISABLED: &str = "disabled";
 pub(crate) const DIAG_CANCELED: &str = "canceled";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
+pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
 pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
 pub(crate) const DIAG_KICK: &str = "claude code blocked";
 pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";

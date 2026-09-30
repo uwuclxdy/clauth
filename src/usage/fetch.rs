@@ -473,7 +473,8 @@ pub(crate) struct UsageInfo {
     pub(crate) codex_limit_reached: Option<String>,
     /// Banked reset credits (`rate_limit_reset_credits.available_count`): passes
     /// the account can spend to reopen a window early. Rides the same response,
-    /// so it costs no extra request; clauth reads it and never spends one.
+    /// so it costs no extra request. The poll only reads the count; spending one
+    /// is `clauth limit-reset` ([`crate::usage::codex_reset`]), run by the operator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_reset_credits: Option<i64>,
     /// The authoritative 5h-window open instant, in epoch seconds. Present only
@@ -879,8 +880,8 @@ pub(crate) fn parse_retry_after(value: &str) -> Option<Duration> {
 /// HTTP-date branch is deterministic under test.
 ///
 /// Both branches clamp the returned delay to [`MAX_RETRY_AFTER_MS`]: a server
-/// hint past the cap becomes the cap (cloudy's 2026-09-07 ruling), and the
-/// bound keeps every consumer's `as_millis() as u64` cast from wrapping — an
+/// hint past the cap becomes the cap (the maintainer's 2026-09-07 ruling), and
+/// the bound keeps every consumer's `as_millis() as u64` cast from wrapping — an
 /// unbounded 2^61-second hint would otherwise cast to exactly 0 ms, i.e.
 /// "retry now". `Duration::ZERO` survives the clamp; the deferral sites'
 /// own `.min(MAX_RETRY_AFTER_MS)` stays as defense in depth.

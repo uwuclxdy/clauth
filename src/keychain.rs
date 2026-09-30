@@ -115,14 +115,15 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// (`adopt_first_login`'s relink, then the switch's own), so [`security_deadline`]
 /// clamps this to `lock::SUBPROCESS_BUDGET`, the aggregate one hold may spend.
 ///
-/// Measured on `mac-6` 2026-08-12: a real `add-generic-password -U` costs 22-29 ms
-/// and a `find-generic-password -w` 18-19 ms, so the happy path keeps a ~210x
-/// margin against either bound. A deadline only ever binds a stuck keychain, where
-/// both legs burn it. What the 10 s costs there is an operator with 10 s rather
-/// than 20 s to answer the one-time ACL dialog — the READ leg, which degrades to a
-/// login-only write and re-prompts next switch. The WRITE leg does not degrade: it
-/// fails the switch, so a locked keychain that prompts for a password rather than
-/// refusing outright has half as long to be answered before that.
+/// Measured on a macOS host 2026-08-12: a real `add-generic-password -U` costs
+/// 22-29 ms and a `find-generic-password -w` 18-19 ms, so the happy path keeps a
+/// ~210x margin against either bound. A deadline only ever binds a stuck keychain,
+/// where both legs burn it. What the 10 s costs there is an operator with 10 s
+/// rather than 20 s to answer the one-time ACL dialog — the READ leg, which
+/// degrades to a login-only write and re-prompts next switch. The WRITE leg does
+/// not degrade: it fails the switch, so a locked keychain that prompts for a
+/// password rather than refusing outright has half as long to be answered before
+/// that.
 const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // `runtime::KEYCHAIN_MIRROR_BUDGET` still equals the READ+WRITE pair — the two
@@ -218,9 +219,9 @@ fn run_with_deadline_witnessing(
     // A hold whose budget is spent clamps to zero. Refuse BEFORE the spawn: the
     // payload is written below before `deadline` even exists, so the write path
     // would otherwise hand the credential JSON to a process created only to be
-    // killed. Measured on `mac-6` 2026-08-12: pre-fix that cost a real spawn at
-    // ~1.6 ms, and the refusal now returns in ~15 µs having created nothing,
-    // proven by a child whose `touch` side effect never appears.
+    // killed. Measured on a macOS host 2026-08-12: pre-fix that cost a real
+    // spawn at ~1.6 ms, and the refusal now returns in ~15 µs having created
+    // nothing, proven by a child whose `touch` side effect never appears.
     //
     // Zero is the ONLY value refused, and the reason is this loop's granularity
     // rather than the cost of a call. The loop `try_wait`s first and consults
@@ -360,7 +361,7 @@ fn collect_drained(reader: std::thread::JoinHandle<std::io::Result<Vec<u8>>>) ->
 const SERVICE: &str = crate::claude::CLAUDE_KEYCHAIN_SERVICE;
 
 /// Longest `security -i` command line this writer will send, trailing `\n`
-/// included. Measured on `mac-6` (macOS 26.5.2) 2026-09-01 against a throwaway
+/// included. Measured on a macOS 26.5.2 host 2026-09-01 against a throwaway
 /// service: the tool reads one command per line into a 4096-byte buffer of
 /// command TEXT. A 4097-byte line including the `\n` round-trips intact 6/6; a
 /// 4098-byte line truncates at 4096, the write exits 1, and the tail re-parses
@@ -375,8 +376,8 @@ const SERVICE: &str = crate::claude::CLAUDE_KEYCHAIN_SERVICE;
 /// carrying `mcpOAuth` for a dozen-plus OAuth MCP servers clears it easily.
 const SECURITY_STDIN_LINE_MAX: usize = 4096;
 
-/// Largest value this writer will put on `security`'s argv. Measured on `mac-6`
-/// (macOS 26.5.2) 2026-09-01: there is NO `security`-internal ceiling — the
+/// Largest value this writer will put on `security`'s argv. Measured on a
+/// macOS 26.5.2 host 2026-09-01: there is NO `security`-internal ceiling — the
 /// break is the exec limit itself, `E2BIG` (`Argument list too long`) at
 /// 1,048,000 bytes of argv with `kern.argmax` = 1,048,576 — and that break
 /// FAILS SAFE: exec never happens, so the item is left untouched. Values
@@ -1008,9 +1009,9 @@ fn verify_write(service: &str, account: &str, written: &str) -> Result<()> {
 ///
 /// A write is gated on the keychain being UNLOCKED, never on the target item's
 /// trust list, so it lands silently against an item ACL'd to Claude Code alone
-/// and raises no dialog of its own (measured on `mac-6` 2026-08-12). It also
-/// does not re-ACL the item, which is why the read leg keeps needing its own
-/// one-time grant.
+/// and raises no dialog of its own (measured on a macOS host 2026-08-12). It
+/// also does not re-ACL the item, which is why the read leg keeps needing its
+/// own one-time grant.
 ///
 /// A write that reports success is then VERIFIED: the item is read back raw
 /// and byte-compared against the JSON just sent ([`verify_write`]). The tool's
@@ -1129,7 +1130,7 @@ pub(crate) fn salvage_delete_namespaced_item(
 /// untouched; an unreadable ledger or live set deletes nothing.
 ///
 /// Runs on every `clauth mcp` boot (accepted with the ruling). Skipped whole
-/// under the Plugin tab's boot probe ([`crate::mcp::MCP_PROBE_ENV`]), whose 3 s
+/// under the Services tab's boot probe ([`crate::mcp::MCP_PROBE_ENV`]), whose 3 s
 /// kill budget pays no `security` subprocess — the same gate `gc_stale_runtimes`
 /// reads for the tree sweep. The delete subprocesses stay outside any state
 /// lock, under one [`crate::lock::SharedSubprocessBudget`] so a stuck keychain

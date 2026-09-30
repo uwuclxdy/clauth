@@ -16,10 +16,12 @@ fn signal_status(signal: i32) -> ExitStatus {
 
 #[test]
 fn status_code_preserves_plain_exit_code() {
-    let status = Command::new("sh")
-        .args(["-c", "exit 7"])
-        .status()
-        .expect("status");
+    // A stock Windows PATH has no `sh` (it comes with Git Bash).
+    #[cfg(not(windows))]
+    let (program, args) = ("sh", ["-c", "exit 7"]);
+    #[cfg(windows)]
+    let (program, args) = ("cmd", ["/D", "/C", "exit 7"]);
+    let status = Command::new(program).args(args).status().expect("status");
 
     assert_eq!(status_code(status, None), 7);
 }

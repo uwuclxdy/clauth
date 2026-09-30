@@ -403,13 +403,27 @@ pub(crate) fn request_header(raw: &str, name: &str) -> Option<String> {
         })
 }
 
-/// The listener under [`serve_endpoints_recording`]: hands back each request's
-/// RAW text, headers included, for a leg whose correctness is in a header it
-/// sent (a bearer token, an account id, a content type). Same deadlines as the
-/// projections above.
+/// The projection under [`serve_endpoints_recording`]: hands back each
+/// request's RAW text, headers included, for a leg whose correctness is in a
+/// header it sent (a bearer token, an account id, a content type). It is
+/// [`serve_endpoints_raw_with_headers`] replying with no extra headers, so the
+/// same listener and deadlines.
 pub(crate) fn serve_endpoints_raw(
     max: usize,
     reply: impl Fn(&str, usize) -> (u16, String) + Send + 'static,
+) -> (String, std::thread::JoinHandle<Vec<String>>) {
+    serve_endpoints_raw_with_headers(max, move |path, i| {
+        let (status, body) = reply(path, i);
+        (status, Vec::new(), body)
+    })
+}
+
+/// [`serve_endpoints_raw`] whose replies also carry response headers, for a
+/// leg that reads what the server said beside the status (the limiter's
+/// rate-limit headers on a kick 429). Same listener, same deadlines.
+pub(crate) fn serve_endpoints_raw_with_headers(
+    max: usize,
+    reply: impl Fn(&str, usize) -> (u16, Vec<(String, String)>, String) + Send + 'static,
 ) -> (String, std::thread::JoinHandle<Vec<String>>) {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -476,10 +490,14 @@ pub(crate) fn serve_endpoints_raw(
                 }
             }
             let text = String::from_utf8_lossy(&req).into_owned();
-            let (status, body) = reply(&request_path(&text), i);
+            let (status, headers, body) = reply(&request_path(&text), i);
+            let extra: String = headers
+                .iter()
+                .map(|(k, v)| format!("{k}: {v}\r\n"))
+                .collect();
             let _ = sock.write_all(
                 format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n{extra}\
                      Content-Length: {}\r\nConnection: close\r\n\r\n",
                     body.len()
                 )
@@ -492,6 +510,49 @@ pub(crate) fn serve_endpoints_raw(
         seen
     });
     (format!("http://127.0.0.1:{port}"), handle)
+}
+
+/// The rate-limit header block of a real `/v1/messages` 429 from an exhausted
+/// 5h window, in its captured order (2026-09-24 on a Max 5x account:
+/// `5h-utilization` 1.0, `representative-claim` `five_hour`; a 2026-07-14 Pro
+/// capture agrees), with its two epochs supplied by the caller. The capture sent
+/// `reset` 6073 s and `weekly_reset` 383473 s past its `Date`, beside
+/// `retry-after: 6072`.
+pub(crate) fn window_exhaustion_429_headers(
+    reset: i64,
+    weekly_reset: i64,
+) -> Vec<(String, String)> {
+    let (reset, weekly_reset) = (reset.to_string(), weekly_reset.to_string());
+    [
+        ("x-should-retry", "true"),
+        (
+            "anthropic-ratelimit-unified-representative-claim",
+            "five_hour",
+        ),
+        ("anthropic-ratelimit-unified-upgrade-paths", "upgrade_plan"),
+        (
+            "anthropic-ratelimit-unified-7d-reset",
+            weekly_reset.as_str(),
+        ),
+        ("anthropic-ratelimit-unified-7d-status", "allowed"),
+        ("retry-after", "6072"),
+        ("anthropic-ratelimit-unified-overage-status", "rejected"),
+        ("anthropic-ratelimit-unified-5h-status", "rejected"),
+        ("anthropic-ratelimit-unified-reset", reset.as_str()),
+        ("anthropic-ratelimit-unified-5h-utilization", "1.0"),
+        ("anthropic-ratelimit-unified-5h-surpassed-threshold", "1.0"),
+        ("anthropic-ratelimit-unified-5h-reset", reset.as_str()),
+        (
+            "anthropic-ratelimit-unified-overage-disabled-reason",
+            "org_level_disabled",
+        ),
+        ("anthropic-ratelimit-unified-fallback-percentage", "0.5"),
+        ("anthropic-ratelimit-unified-7d-utilization", "0.62"),
+        ("anthropic-ratelimit-unified-status", "rejected"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
 }
 
 pub(crate) fn rotation_fixture_config(
@@ -735,7 +796,7 @@ case "$1" in
       install)
         : > "$CLAUDE_SHIM_STATE"
         # The registry clauth's own probe reads: write the user-scope entry so
-        # the Plugin tab recompute after the install sees it.
+        # the Services tab recompute after the install sees it.
         mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
         printf '{"plugins":{"clauth@clauth":[{"scope":"user","version":"@VERSION@","installedAt":"2026-08-25T00:00:00.000Z","installPath":"%s"}]}}\n' "$CLAUDE_SHIM_TREE" > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"
         ;;
@@ -1064,6 +1125,23 @@ pub(crate) fn read_codex_store(name: &str) -> String {
             .join("auth.json"),
     )
     .expect("read store")
+}
+
+/// Writes `body` verbatim as the sandboxed `~/.clauth/codex-profiles.toml`.
+pub(crate) fn write_codex_state(body: &str) {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
+    std::fs::write(dir.join("codex-profiles.toml"), body).expect("write codex state");
+}
+
+/// Writes a roster-only `codex-profiles.toml` into the sandboxed `~/.clauth`.
+pub(crate) fn write_codex_roster(names: &[&str]) {
+    let list = names
+        .iter()
+        .map(|n| format!("\"{n}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    write_codex_state(&format!("profiles = [{list}]\n"));
 }
 
 /// A locked handle on `name`'s rotation lock from a separate fd, standing in
@@ -1845,3 +1923,79 @@ mod route_harness {
 
 #[cfg(unix)]
 pub(crate) use route_harness::*;
+
+/// An executable shell shim: `#!/bin/sh` + `body`, mode 0755. The heal
+/// fixtures resolve `herdr`/`git`/`claude` off `PATH`, so a test pins their
+/// behavior by prepending the shim's dir (unix-only: shebang + exec bit).
+#[cfg(unix)]
+pub(crate) fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("shim written");
+    let mut perms = std::fs::metadata(&path)
+        .expect("shim metadata")
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("shim chmod");
+    path
+}
+
+/// A `git` shim answering `ls-remote --tags` with `$TAGS_OUTPUT` (the real
+/// git's output shape) and recording every argv into `git.log`.
+#[cfg(unix)]
+pub(crate) fn git_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "git",
+        "echo \"$@\" >> \"$(dirname \"$0\")/git.log\"; if [ \"$1\" = \"ls-remote\" ] && [ \"$2\" = \"--tags\" ]; then printf '%s' \"$TAGS_OUTPUT\"; fi; exit 0",
+    )
+}
+
+/// One lightweight release tag's `ls-remote --tags` line. (The annotated twin
+/// — a tag-object line plus its peeled `^{}` pair — stays local to the herdr
+/// tests, its only caller.)
+#[cfg(unix)]
+pub(crate) fn lightweight_tag(tag: &str, commit: &str) -> String {
+    format!("{commit}\trefs/tags/{tag}\n")
+}
+
+/// The herdr heal shim: `plugin list --json` answers `$ANSWER_BEFORE` until an
+/// install ran, then `$ANSWER_AFTER`; every other invocation logs into
+/// `heal.log`, so a test pins exactly what the heal passed.
+#[cfg(unix)]
+pub(crate) fn stateful_heal_shim(dir: &Path) -> PathBuf {
+    write_shim(
+        dir,
+        "herdr",
+        "if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"list\" ]; then if [ -f \"$(dirname \"$0\")/installed\" ]; then echo \"$ANSWER_AFTER\"; else echo \"$ANSWER_BEFORE\"; fi; exit 0; fi; if [ \"$1\" = \"plugin\" ] && [ \"$2\" = \"install\" ]; then : > \"$(dirname \"$0\")/installed\"; fi; echo \"$@\" >> \"$(dirname \"$0\")/heal.log\"; exit 0",
+    )
+}
+
+/// The herdr heal's own env: the shims ahead of `PATH`, the list answers, and
+/// the `ls-remote --tags` body. `extra` pins test-specific vars on top.
+#[cfg(unix)]
+pub(crate) fn heal_env<'a>(
+    home: &'a HomeSandbox,
+    herdr_shim: &Path,
+    before: &str,
+    after: &str,
+    tags: &str,
+    extra: &[(&'static str, &std::ffi::OsStr)],
+) -> EnvPin<'a> {
+    let path = format!(
+        "{}:{}",
+        home.home().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut pins: Vec<(&'static str, Option<&std::ffi::OsStr>)> = vec![
+        ("HERDR_BIN_PATH", Some(herdr_shim.as_os_str())),
+        ("ANSWER_BEFORE", Some(std::ffi::OsStr::new(before))),
+        ("ANSWER_AFTER", Some(std::ffi::OsStr::new(after))),
+        ("TAGS_OUTPUT", Some(std::ffi::OsStr::new(tags))),
+        ("PATH", Some(std::ffi::OsStr::new(&path))),
+    ];
+    for (key, value) in extra {
+        pins.push((key, Some(*value)));
+    }
+    EnvPin::new(home, &pins)
+}

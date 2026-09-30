@@ -6,7 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
 use super::super::theme;
-use crate::format::account_tier;
+use crate::format::{account_tier, truncate};
 use crate::profile::{AppState, ClockFormat, Profile, ResetDisplay};
 use crate::usage::{
     FetchStatus, ProfileActivity, UsageWindow, humanize_duration, iso_to_epoch_secs, now_epoch_secs,
@@ -40,6 +40,22 @@ pub(super) fn fixed_split(value: &str, width: usize) -> (String, String) {
     }
     let pad = " ".repeat(width - count);
     (content, pad)
+}
+
+/// Middle-ellipsis truncation (for paths / URLs / IDs — both ends carry
+/// meaning). The head and tail share what the ellipsis does not use; an odd
+/// budget spends its extra char on the head.
+pub(super) fn middle_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return truncate(s, max);
+    }
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let front: String = chars[..head].iter().collect();
+    let back: String = chars[chars.len() - tail..].iter().collect();
+    format!("{front}…{back}")
 }
 
 #[cfg(test)]
@@ -428,10 +444,9 @@ fn month_label(month: u32) -> &'static str {
         .unwrap_or("jan")
 }
 
-/// Relative age of an epoch-ms timestamp per the cloudy-tui Time-formatting
-/// contract: single largest unit under 30 days (`4m ago`, `2h ago`, `3d ago`,
-/// `2w ago`); the local prose stamp (`2026-04-12 14:03:07`) at 30 days and
-/// beyond. `< 1 minute` reads `just now`.
+/// Relative age of an epoch-ms timestamp: single largest unit under 30 days
+/// (`4m ago`, `2h ago`, `3d ago`, `2w ago`); the local prose stamp
+/// (`2026-04-12 14:03:07`) at 30 days and beyond. `< 1 minute` reads `just now`.
 pub(super) fn relative_age(epoch_ms: u64) -> String {
     let now = crate::usage::now_ms();
     let age_secs = (now.saturating_sub(epoch_ms) / 1000) as i64;

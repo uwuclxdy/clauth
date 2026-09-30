@@ -104,16 +104,9 @@ impl HarnessEngine for ClaudeEngine {
 
     fn scrub_env(&self, command: &mut std::process::Command, active_env_keys: &[String]) {
         crate::runtime::scrub_profile_env(command, active_env_keys);
-        // Cross-harness hygiene: a claude session started from inside a
-        // clauth codex session inherits that session's CODEX_HOME, and a
-        // `codex` run from the claude shell would then land in another
-        // profile's home. Scrubbed only when the value names a home clauth
-        // built — an operator's own CODEX_HOME is not clauth's to strip.
-        if std::env::var_os("CODEX_HOME")
-            .is_some_and(|v| crate::runtime::is_codex_home_path(std::path::Path::new(&v)))
-        {
-            command.env_remove("CODEX_HOME");
-        }
+        // The CODEX_HOME half is the cross-harness one; the caller pins
+        // CLAUDE_CONFIG_DIR itself right after.
+        crate::runtime::scrub_clauth_homes(command);
     }
 }
 
@@ -183,17 +176,10 @@ impl HarnessEngine for CodexEngine {
         for key in active_env_keys {
             command.env_remove(key);
         }
-        // The mirror of ClaudeEngine's CODEX_HOME hygiene: a codex session
-        // started from inside a clauth claude session inherits
-        // CLAUDE_CONFIG_DIR, and `clauth which` run in the codex session
-        // would answer as the ancestor claude session (the runtime claim
-        // deliberately outranks the codex arm). Scrubbed only when it names a
-        // tree clauth built — a custom operator dir is left alone.
-        if std::env::var_os("CLAUDE_CONFIG_DIR")
-            .is_some_and(|v| crate::runtime::is_clauth_runtime_path(std::path::Path::new(&v)))
-        {
-            command.env_remove("CLAUDE_CONFIG_DIR");
-        }
+        // The CLAUDE_CONFIG_DIR half matters here: `clauth which` in the codex
+        // session would answer as the ancestor claude session (the runtime
+        // claim deliberately outranks the codex arm).
+        crate::runtime::scrub_clauth_homes(command);
     }
 }
 

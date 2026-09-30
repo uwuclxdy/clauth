@@ -1,4 +1,4 @@
-//! cloudy-ui palette and shared style helpers.
+//! Palette and shared style helpers.
 //!
 //! Catppuccin Mocha is the only palette. Two capability tiers select the color
 //! depth: `full` uses 24-bit RGB; `compatible` uses the nearest xterm-256 index.
@@ -51,7 +51,7 @@ impl Tier {
 /// [`init`] and swappable at runtime via [`set_tier`] for the live theme picker.
 static TIER: AtomicU8 = AtomicU8::new(0);
 
-/// Detect the tier from `$COLORTERM` per the cloudy-tui contract:
+/// Detect the tier from `$COLORTERM`:
 /// `truecolor` or `24bit` → [`Tier::Full`]; anything else → [`Tier::Compatible`].
 pub(crate) fn detect() -> Tier {
     match std::env::var("COLORTERM")
@@ -161,7 +161,7 @@ pub(crate) fn text_faint_color() -> Color {
 pub(crate) fn accent_color() -> Color {
     pick(Color::Rgb(67, 171, 229), Color::Indexed(75))
 }
-/// Claude orange — the warm secondary; cloudy-ui rule "once per screen max".
+/// Claude orange — the warm secondary; rule: once per screen max.
 #[inline]
 pub(crate) fn accent_2_color() -> Color {
     pick(Color::Rgb(217, 119, 87), Color::Indexed(173))
@@ -234,9 +234,16 @@ pub(crate) fn toggle_off() -> &'static str {
 }
 
 /// Gutter glyph for a row in edit mode — replaces the `❯` selection caret while
-/// a text/stepper field is being typed into. Same on both tiers (per cloudy-tui).
+/// a text/stepper field is being typed into. Same on both tiers.
 pub(crate) fn edit_glyph() -> &'static str {
     "✎"
+}
+
+/// Compact blocked-reason marker for a dead login credential — `AuthBroken`
+/// and `KeyRejected` deliberately share it (the detail pill and the help-modal
+/// legend carry which credential class failed). Same on both tiers.
+pub(crate) fn dead_credential_glyph() -> &'static str {
+    "×"
 }
 
 // ── Style helpers ─────────────────────────────────────────────────────────────
@@ -268,7 +275,7 @@ pub(crate) fn faint() -> Style {
     Style::default().fg(text_faint_color())
 }
 
-/// Eyebrow label — bold + dim per cloudy-ui's CLI mapping.
+/// Eyebrow label — bold + dim.
 pub(crate) fn label() -> Style {
     Style::default()
         .fg(text_dim_color())

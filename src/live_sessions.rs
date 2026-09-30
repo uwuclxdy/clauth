@@ -184,7 +184,13 @@ impl SessionFields<'_> {
 /// child dropping A's tokens, so A must not rotate), which makes a marker sum
 /// report one child as two sessions on two accounts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LiveTally(std::collections::BTreeMap<String, MemberSessions>);
+pub(crate) struct LiveTally {
+    members: std::collections::BTreeMap<String, MemberSessions>,
+    /// Bare sessions whose credential link resolves to no enabled profile:
+    /// live, but on no account clauth attributes them to, so they reach
+    /// [`LiveTally::total`] only.
+    unattributed: usize,
+}
 
 /// One account's slice of a [`LiveTally`]. All-zero for an account hosting none.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -243,9 +249,10 @@ impl LiveTally {
             return;
         }
         let Some((member, _)) = crate::which::resolve_global(config) else {
+            self.unattributed += bare;
             return;
         };
-        let slot = self.0.entry(member).or_default();
+        let slot = self.members.entry(member).or_default();
         slot.sessions += bare;
         slot.following += bare;
     }
@@ -264,7 +271,10 @@ impl LiveTally {
             slot.following += usize::from(row.follows_chain);
             slot.last_swap_at = slot.last_swap_at.max(row.last_swap_at);
         }
-        Self(per_member)
+        Self {
+            members: per_member,
+            unattributed: 0,
+        }
     }
 
     /// A tally straight from rows, for tests in other modules that need a fleet
@@ -277,7 +287,13 @@ impl LiveTally {
 
     /// One account's sessions.
     pub(crate) fn member(&self, name: &crate::profile::ProfileName) -> MemberSessions {
-        self.0.get(name.as_str()).copied().unwrap_or_default()
+        self.members.get(name.as_str()).copied().unwrap_or_default()
+    }
+
+    /// Every live session across the fleet: those on a deleted account and bare
+    /// ones on a link no profile matches included.
+    pub(crate) fn total(&self) -> usize {
+        self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed
     }
 }
 

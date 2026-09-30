@@ -18,7 +18,7 @@ mod header;
 mod modals;
 mod overview;
 mod panes;
-mod plugin;
+mod services;
 mod status;
 mod tabs;
 mod toasts;
@@ -66,7 +66,7 @@ pub(crate) fn draw(frame: &mut Frame<'_>, app: &App) {
         Tab::Fallback => chain::draw(frame, body_area, app),
         Tab::Config => global_config::draw(frame, body_area, app),
         Tab::Status => status::draw(frame, body_area, app),
-        Tab::Plugin => plugin::draw(frame, body_area, app),
+        Tab::Services => services::draw(frame, body_area, app),
     }
     footer::draw(frame, footer_area, app);
 

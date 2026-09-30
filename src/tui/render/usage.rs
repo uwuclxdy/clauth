@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::App;
+use super::super::app::{App, NoteBuffer};
 use super::super::theme;
 use super::format::{
     ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
@@ -18,8 +18,8 @@ use super::format::{
 };
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, QueueView,
-    draw_profile_selector, empty_state, key_cell, master_detail, pill, rail_hint_lines,
-    section_box, section_box_verbatim,
+    draw_profile_selector, draw_scrollbar, edit_slot_block, empty_state, key_cell, master_detail,
+    pill, rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
@@ -70,6 +70,10 @@ struct HeaderState {
     /// The retry suffix names which retry the countdown leads to, so a deep slot
     /// reads as stuck from the count alone, no judgment label.
     streaks: StreakCounts,
+    /// The reading source behind `streaks.rate_limit` — OAuth-first, so the
+    /// stuck hint names the endpoint that actually throttled, never the row's
+    /// provider.
+    rate_limit_source: RateLimitSource,
     /// Live kick-429 block for the shown profile: the messages endpoint is
     /// rejecting the 5h auto-start kick. Orthogonal to `fetch_status` — `/usage`
     /// can stay Fresh straight through the outage — so it earns its own pill.
@@ -97,6 +101,39 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     draw_usage_detail(frame, detail, app);
 }
 
+/// Which reading source the shown profile's stuck judgment took — the one that
+/// actually won, never the row's shape. The stuck hint must name THIS endpoint
+/// (a hybrid whose OAuth leg is throttled reads `anthropic`, not its provider).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RateLimitSource {
+    OAuth,
+    ThirdParty,
+}
+
+/// The shown profile's effective consecutive-429 streak for the stuck judgment,
+/// plus the reading source it came from: OAuth-first — a member with an OAuth
+/// status entry reads the OAuth `rate_limit` axis, else the third-party streak —
+/// the same rule `reading_is_actionable` applies. Pure so the fallback is
+/// unit-testable.
+fn effective_rate_limit(
+    name: &crate::profile::ProfileName,
+    oauth: &HashMap<String, StreakCounts>,
+    third_party: &HashMap<String, u32>,
+    oauth_status_has: &std::collections::HashSet<String>,
+) -> (u32, RateLimitSource) {
+    if oauth_status_has.contains(name.as_str()) {
+        (
+            oauth.get(name.as_str()).map(|s| s.rate_limit).unwrap_or(0),
+            RateLimitSource::OAuth,
+        )
+    } else {
+        (
+            third_party.get(name.as_str()).copied().unwrap_or(0),
+            RateLimitSource::ThirdParty,
+        )
+    }
+}
+
 fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Streak snapshot up front: POLL_STREAK (220) ranks below CONFIG
     // (400), so it can't be taken while `cfg` is held below.
@@ -104,6 +141,20 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .poll_streaks
         .lock()
         .map(|m| m.clone())
+        .unwrap_or_default();
+    // The third-party consecutive-429 streak + the OAuth status store: the stuck
+    // judgment below mirrors the decision predicate's OAuth-first fallback, so a
+    // member with no OAuth status entry reads its third-party streak. Both ranks
+    // (ThirdPartyStreak 290, UsageStatus 350) sit below CONFIG (400).
+    let third_party_streaks: HashMap<String, u32> = app
+        .third_party_streaks
+        .lock()
+        .map(|m| m.clone())
+        .unwrap_or_default();
+    let oauth_status_has: std::collections::HashSet<String> = app
+        .usage_status
+        .lock()
+        .map(|m| m.keys().cloned().collect())
         .unwrap_or_default();
     // Same discipline as streaks: KickBlockState (230) ranks below CONFIG (400).
     let kick_blocks: HashMap<String, KickBlock> = app
@@ -117,6 +168,10 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // which a render pass must not.
     let queue_anchor = queue_anchor_cached(&app.auto_start_queue);
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
+    // The live key-rejected set, read once before the Config lock (both stores
+    // rank below it) — the spend-uncapped check under the guard never re-reads
+    // the durable verdict per member.
+    let key_rejected = app.key_rejected_names();
     let cfg = app.config();
     let profile = cfg
         .profiles
@@ -139,6 +194,12 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // `config` (via `cfg`) is outer of activity/refresh-timer in lock order.
+    let (effective_streak, rate_limit_source) = effective_rate_limit(
+        &profile.name,
+        &streaks,
+        &third_party_streaks,
+        &oauth_status_has,
+    );
     let header = HeaderState {
         activity: app
             .activity
@@ -152,10 +213,15 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
             .ok()
             .and_then(|m| selected_next_refresh(&m, profile)),
         tick: app.tick_count,
-        streaks: streaks
-            .get(profile.name.as_str())
-            .copied()
-            .unwrap_or_default(),
+        streaks: {
+            let mut s = streaks
+                .get(profile.name.as_str())
+                .copied()
+                .unwrap_or_default();
+            s.rate_limit = effective_streak;
+            s
+        },
+        rate_limit_source,
         kick_block: kick_blocks.get(profile.name.as_str()).copied(),
         // Config-dependent predicates, computed under the live config guard so
         // the lock-free line builders below just read booleans. Reuses the
@@ -168,7 +234,7 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 auto_start: profile.auto_start,
                 weekly_hard: crate::fallback::weekly_hard_blocked(profile),
                 budget_spent: crate::fallback::budget_spent_blocking(&cfg, profile),
-                spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling),
+                spend_uncapped: crate::fallback::spend_is_uncapped(&cfg, ceiling, &key_rejected),
             }
         },
         queue_slot: QueueView::new(&cfg, &kick_lifts, queue_anchor).slot(&profile.name),
@@ -180,6 +246,34 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Read off the guard already held here: `config` is a plain (non-reentrant)
     // mutex, so a second `app.config()` deeper in the render would self-deadlock.
     let reset_fmt = ResetFmt::from_state(&cfg.state);
+    // The note editor docks at the pane's bottom (the contract's multi-line
+    // input slot): content above, the auto-grow draft below.
+    let slot = app
+        .note_editor
+        .as_ref()
+        .filter(|e| e.profile.as_str() == profile.name.as_str());
+    let (content_area, slot_area) = match slot {
+        Some(editor) => {
+            let slot_h =
+                (editor.buf.row_count().min(NOTE_SLOT_MAX_ROWS) as u16 + 2).min(inner.height);
+            let content_h = inner.height.saturating_sub(slot_h);
+            (
+                Rect {
+                    x: inner.x,
+                    y: inner.y,
+                    width: inner.width,
+                    height: content_h,
+                },
+                Some(Rect {
+                    x: inner.x,
+                    y: inner.y + content_h,
+                    width: inner.width,
+                    height: slot_h,
+                }),
+            )
+        }
+        None => (inner, None),
+    };
     let lines = build_usage_lines(
         profile,
         inner.width,
@@ -189,7 +283,10 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         show_pace,
         reset_fmt,
     );
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    frame.render_widget(Paragraph::new(lines).style(theme::base()), content_area);
+    if let Some(editor) = slot {
+        draw_note_slot(frame, slot_area.unwrap_or(inner), &editor.buf);
+    }
 }
 
 fn build_usage_lines(
@@ -204,6 +301,15 @@ fn build_usage_lines(
     let mut lines: Vec<Line<'static>> = Vec::new();
     lines.extend(header_lines(profile, header, inner_w));
     lines.push(Line::from(""));
+
+    // Notes close the pane (cloudy's placement): below the usage bars and the
+    // extra-usage/balance rows, so the account's figures read first. Every
+    // branch exit appends it.
+    let with_notes = |mut lines: Vec<Line<'static>>| -> Vec<Line<'static>> {
+        lines.push(Line::from(""));
+        lines.extend(notes_lines(app.note_text.as_deref(), inner_w));
+        lines
+    };
 
     // Accounts whose usage figures live in the third-party cache — a recognised
     // provider or a generic api-key endpoint — render via the third-party
@@ -223,24 +329,18 @@ fn build_usage_lines(
             reset_fmt,
             wallet_rate.as_ref(),
         ));
-        return lines;
+        return with_notes(lines);
     }
 
     if profile.usage.is_none() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", oauth_empty_msg(profile)),
-            theme::faint(),
-        )));
-        return lines;
+        lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
+        return with_notes(lines);
     }
 
     let mut stats = collect_stats(profile, reset_fmt);
     if stats.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!("  {}", oauth_empty_msg(profile)),
-            theme::faint(),
-        )));
-        return lines;
+        lines.extend(oauth_empty_lines(oauth_empty_msg(profile), inner_w));
+        return with_notes(lines);
     }
 
     let history = app
@@ -290,7 +390,7 @@ fn build_usage_lines(
     }
 
     lines.extend(render_stat_block(&stats, inner_w));
-    lines
+    with_notes(lines)
 }
 
 /// Render a list of [`Stat`]s as the shared two-line bar blocks (eyebrow + bar),
@@ -848,9 +948,9 @@ fn kick_text(profile: &Profile, header: &HeaderState) -> String {
 }
 
 /// Spans putting `text` flush against the pane's right edge on the `plan` row,
-/// keeping the house 3-cell minimum gap from the row's left content (cloudy-tui
-/// spacing). Truncates with `…` when the row can't hold both; drops the kick
-/// when not even a countdown hint fits.
+/// keeping the house 3-cell minimum gap from the row's left content. Truncates
+/// with `…` when the row can't hold both; drops the kick when not even a
+/// countdown hint fits.
 fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
     let avail = inner_w.saturating_sub(left_w);
     if avail < 3 {
@@ -870,7 +970,7 @@ fn kick_spans(text: &str, left_w: usize, inner_w: usize) -> Vec<Span<'static>> {
 /// One row of the `status` block paired with its optional `└`/`├` fix hint.
 /// Collected before render so [`render_status_rows`] can see the total hint
 /// count up front and connect 2+ into one rail instead of floating each `└`
-/// detached (cloudy-tui Stacked hints).
+/// detached.
 struct DiagRow {
     /// Row content AFTER the key/rail column — `render_status_rows` decides
     /// that column once every row's hint state is known.
@@ -1129,7 +1229,9 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             // A deep slot the daemon itself distrusts (#40) names the throttle; a
             // shallow one is merely serving old numbers.
             fetch_hint = Some(if is_stuck_streak(header.streaks.rate_limit) {
-                UsageDiag::Stuck429
+                UsageDiag::Stuck429 {
+                    throttler: throttler_name(profile, header.rate_limit_source),
+                }
             } else {
                 UsageDiag::Stale
             });
@@ -1160,8 +1262,8 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
             ]);
         }
         _ => match countdown {
-            // A scheduled refresh is work lined up — the cloudy-tui `queued`
-            // dot (`◌` in ACCENT), not a spinner: nothing is running yet.
+            // A scheduled refresh is work lined up — the `queued` dot (`◌` in
+            // ACCENT), not a spinner: nothing is running yet.
             Some(c) => spans.extend([
                 Span::styled("◌ ", theme::accent()),
                 Span::styled(format!("refresh in {c}"), theme::dim()),
@@ -1232,8 +1334,7 @@ fn status_lines(profile: &Profile, header: &HeaderState, inner_w: u16) -> Vec<Li
 /// blank-pad to the value column — unless 2+ rows carry a fix hint, in which
 /// case every row between the first and last hint takes the rail's `│` at
 /// col 0 instead of blank padding, and each hint renders `├`/`└` + text at
-/// col 2. A single hint stays the plain `└` form: nothing to connect (cloudy-tui
-/// Stacked hints).
+/// col 2. A single hint stays the plain `└` form: nothing to connect.
 fn render_status_rows(rows: Vec<DiagRow>, width: usize) -> Vec<Line<'static>> {
     let hint_count = rows.iter().filter(|r| r.hint.is_some()).count();
     let mut lines = Vec::with_capacity(rows.len() * 2);
@@ -1265,7 +1366,7 @@ fn render_status_rows(rows: Vec<DiagRow>, width: usize) -> Vec<Line<'static>> {
 /// A detected Usage-tab diagnostic state paired with the config context that
 /// shapes its fix. Pure input to [`diag_fix`]; render-only, no decision consumes
 /// it (mirrors `fallback::blocked_reason`).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum UsageDiag {
     /// Operator disabled the account: the scheduler doesn't poll it at all.
     Disabled,
@@ -1277,8 +1378,11 @@ enum UsageDiag {
     KickSwitchGrade { auto_start: bool },
     /// Burst (non-switch-grade) kick 429 — pill + backoff only, no chain switch.
     KickBurst,
-    /// Deep-slot stuck-429 distrust (#40).
-    Stuck429,
+    /// Deep-slot stuck-429 distrust (#40). `throttler` names the endpoint that
+    /// is throttling, keyed on the reading source that won: `anthropic` for an
+    /// OAuth streak, a typed provider's lowercase display name or `the endpoint`
+    /// for a third-party streak.
+    Stuck429 { throttler: String },
     /// AUTH-1 quarantine.
     AuthBroken,
     /// 7d window at/over the hard cap.
@@ -1297,6 +1401,20 @@ enum UsageDiag {
     NoKey,
 }
 
+/// The stuck-429 throttler name, keyed on the reading source that won (never
+/// the row type): an OAuth streak reads `anthropic`, a third-party streak reads
+/// the typed provider's lowercase display name or `the endpoint` for a generic
+/// api-key base URL.
+fn throttler_name(profile: &Profile, source: RateLimitSource) -> String {
+    match source {
+        RateLimitSource::OAuth => "anthropic".to_string(),
+        RateLimitSource::ThirdParty => match profile.provider {
+            Some(p) => p.throttle_hint_name(),
+            None => "the endpoint".to_string(),
+        },
+    }
+}
+
 /// The `└` fix text for a diagnostic state: what's wrong and the concrete fix,
 /// varying with config. The `KickSwitchGrade` `auto_start` split is the flagship
 /// (state, config) → hint divergence — an auto_start account self-recovers on
@@ -1312,7 +1430,7 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
             "won't recover with auto-start off, enable it".to_string()
         }
         UsageDiag::KickBurst => "claude code hit a burst limit".to_string(),
-        UsageDiag::Stuck429 => "anthropic is throttling usage reads".to_string(),
+        UsageDiag::Stuck429 { throttler } => format!("{throttler} is throttling usage reads"),
         UsageDiag::AuthBroken => format!("re-login with clauth login {profile_name}"),
         UsageDiag::WeeklyHard => "weekly limit is spent".to_string(),
         UsageDiag::BudgetSpent => "raise max spend on the fallback tab".to_string(),
@@ -1371,6 +1489,19 @@ fn oauth_empty_msg(profile: &Profile) -> &'static str {
     }
 }
 
+/// The OAuth empty-body terminal messages, wrapped through the shared greedy
+/// wrapper like the third-party arm's (`build_tp_rows`) — stack, don't
+/// truncate. The OAuth body keeps its 2-cell indent on every segment, so the
+/// wrap width is the interior minus the indent (`tooltip_lines`' lead shape),
+/// or indent + segment would overrun the pane edge.
+fn oauth_empty_lines(msg: &str, inner_w: u16) -> Vec<Line<'static>> {
+    const INDENT_W: usize = 2;
+    wrap_words(msg, usize::from(inner_w).saturating_sub(INDENT_W).max(8))
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(format!("  {seg}"), theme::faint())))
+        .collect()
+}
+
 /// Render provider-agnostic third-party stats. The header (plan + status) was
 /// already pushed by the caller; only the stats body goes here.
 ///
@@ -1419,7 +1550,14 @@ fn build_tp_rows(
                 _ => "loading",
             }
         };
-        lines.push(Line::from(Span::styled(msg, theme::faint())));
+        // Stack, don't truncate: the fix copy must survive a narrow pane, so
+        // every terminal message routes through the shared greedy wrapper
+        // (`panes::wrap_words`) instead of clipping its tail at the pane edge.
+        lines.extend(
+            wrap_words(msg, usize::from(inner_w))
+                .into_iter()
+                .map(|seg| Line::from(Span::styled(seg, theme::faint()))),
+        );
         return lines;
     };
 
@@ -1489,10 +1627,18 @@ fn build_tp_rows(
     // report so a real integration can be added. Subtle, below everything.
     if stats.best_effort && (has_bars || !stats.rows.is_empty()) {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "looks wrong? report at github.com/uwuclxdy/clauth/issues",
-            theme::faint(),
-        )));
+        // Stack, don't truncate: the URL is the only in-app report pointer,
+        // so the footer routes through the shared greedy wrapper like the
+        // terminal arms above — a mid-URL clip at the 41-cell narrow
+        // interior would send the report nowhere.
+        lines.extend(
+            wrap_words(
+                "looks wrong? report at github.com/uwuclxdy/clauth/issues",
+                usize::from(inner_w),
+            )
+            .into_iter()
+            .map(|seg| Line::from(Span::styled(seg, theme::faint()))),
+        );
     }
 
     lines
@@ -1579,6 +1725,83 @@ fn key_value_span(key: &str, value: &str, value_style: Style) -> Vec<Span<'stati
 
 fn key_span(key: &str) -> Span<'static> {
     Span::styled(key_cell(key, KEY_W, KEY_GUTTER), theme::label())
+}
+
+/// The value column the `notes:` row opens at. `notes:` (6) is shorter than
+/// `KEY_W` (8), so the key cell always pads to `KEY_W + KEY_GUTTER`.
+const NOTES_VALUE_LEAD: usize = KEY_W + KEY_GUTTER;
+
+/// The `notes:` row: the faint add-hint while the account has none, the full
+/// note wrapped to the value column once it does. Copy is cloudy's (lowercase
+/// `notes:`, full-note display); styling is contract-clean — accent key, faint
+/// hint, no italic (the contract reserves italic for titles).
+fn notes_lines(note: Option<&str>, inner_w: u16) -> Vec<Line<'static>> {
+    let value_w = (inner_w as usize).saturating_sub(NOTES_VALUE_LEAD).max(8);
+    let pad = " ".repeat(NOTES_VALUE_LEAD);
+    match note.filter(|t| !t.is_empty()) {
+        None => vec![Line::from(vec![
+            Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent()),
+            Span::styled("press n to add notes", theme::faint()),
+        ])],
+        Some(text) => {
+            let mut lines = Vec::new();
+            for (i, note_line) in text.split('\n').enumerate() {
+                for (j, seg) in wrap_words(note_line, value_w).into_iter().enumerate() {
+                    let value = Span::styled(seg, theme::body());
+                    if i == 0 && j == 0 {
+                        lines.push(Line::from(vec![
+                            Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent()),
+                            value,
+                        ]));
+                    } else {
+                        lines.push(Line::from(vec![Span::raw(pad.clone()), value]));
+                    }
+                }
+            }
+            lines
+        }
+    }
+}
+
+/// The note editor docks at the detail pane's bottom with this many draft rows
+/// (the contract's auto-grow 1→8) before the draft scrolls inside.
+const NOTE_SLOT_MAX_ROWS: usize = 8;
+
+/// The note editor's docked slot: a `╭─ ✎ ───╮` sub-block, LINE_STRONG border,
+/// the draft inside, the native cursor at the caret, and the draft scrolling
+/// cursor-first once it passes [`NOTE_SLOT_MAX_ROWS`]. Wide chars are counted
+/// at their display width so the caret lands on the cell they occupy.
+fn draw_note_slot(frame: &mut Frame<'_>, area: Rect, buf: &NoteBuffer) {
+    let block = edit_slot_block();
+    let slot_inner = block.inner(area);
+    frame.render_widget(block, area);
+    let empty = buf.row_count() == 1 && buf.line(0).is_empty();
+    let lines: Vec<Line<'static>> = if empty {
+        vec![Line::from(Span::styled("add a note…", theme::faint()))]
+    } else {
+        (0..buf.row_count())
+            .map(|i| Line::from(Span::styled(buf.line(i).to_string(), theme::body())))
+            .collect()
+    };
+    let (crow, ccol) = buf.cursor_pos();
+    let viewport = slot_inner.height as usize;
+    let total = lines.len();
+    let offset = scroll_offset(total, viewport, (crow, crow + 1));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((offset as u16, 0)),
+        slot_inner,
+    );
+    draw_scrollbar(frame, slot_inner, total, offset, viewport);
+    let x = slot_inner.x + (ccol as u16).min(slot_inner.width.saturating_sub(1));
+    let vis_row = crow.checked_sub(offset).unwrap_or(usize::MAX);
+    if vis_row < slot_inner.height as usize {
+        frame.set_cursor_position(ratatui::layout::Position {
+            x,
+            y: slot_inner.y + vis_row as u16,
+        });
+    }
 }
 
 #[cfg(test)]

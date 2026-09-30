@@ -764,6 +764,150 @@ fn a_background_handle_notes_where_the_result_file_will_land() {
     );
 }
 
+/// Every background job record names the directory its run works in and the
+/// account of the session that spawned it, single target and fan-out alike.
+/// The spawning session is a `clauth start` runtime of `kerry`, delegating to
+/// other accounts; the `cwd` does not exist, so `run_delegate` refuses after
+/// the mint and no `claude` is spawned.
+#[test]
+fn a_background_job_records_its_cwd_and_the_spawning_account() {
+    let home = HomeSandbox::new();
+    seed_profiles(&["kerry", "solo", "vendor"], false);
+    let runtime = home.home().join(".clauth/profiles/kerry/runtime-4242-1");
+    std::fs::create_dir_all(&runtime).expect("runtime dir");
+    let _dir = crate::testutil::ConfigDirSandbox::new(&home, &runtime);
+    let cwd = home
+        .home()
+        .join("does-not-exist")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let single = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        cwd: Some(cwd.clone()),
+        ..base()
+    });
+    assert_ne!(single.is_error, Some(true), "the handle is not an error");
+    let fanout = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string(), "vendor".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        cwd: Some(cwd.clone()),
+        ..base()
+    });
+    assert_ne!(fanout.is_error, Some(true), "the handles are not an error");
+
+    let dir = jobs::jobs_dir().expect("jobs dir");
+    let mut records: Vec<jobs::JobRecord> = std::fs::read_dir(&dir)
+        .expect("jobs dir exists")
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .map(|e| serde_json::from_slice(&std::fs::read(e.path()).unwrap()).unwrap())
+        .collect();
+    records.sort_by(|a, b| a.profile.cmp(&b.profile));
+    let seen: Vec<(String, Option<String>, Option<String>)> = records
+        .into_iter()
+        .map(|r| (r.profile, r.cwd, r.spawned_by))
+        .collect();
+    let want = |profile: &str| {
+        (
+            profile.to_string(),
+            Some(cwd.clone()),
+            Some("kerry".to_string()),
+        )
+    };
+    assert_eq!(
+        seen,
+        vec![want("solo"), want("solo"), want("vendor")],
+        "each record carries the call's cwd and the spawning session's account",
+    );
+}
+
+/// A relative `cwd` is recorded as the absolute directory the child spawns in,
+/// resolved against the server's own cwd the way the spawn resolves it.
+#[test]
+fn a_relative_cwd_is_recorded_as_the_absolute_directory() {
+    let _home = HomeSandbox::new();
+    seed_profiles(&["solo"], false);
+    let result = call_delegate(DelegateArgs {
+        profiles: Some(vec!["solo".to_string()]),
+        prompt: Some("hi".to_string()),
+        background: Some(true),
+        cwd: Some("no-such-subdir".to_string()),
+        ..base()
+    });
+    assert_ne!(result.is_error, Some(true), "the handle is not an error");
+    let record = jobs::list(now_ms())
+        .into_iter()
+        .next()
+        .expect("one job record")
+        .record;
+    assert_eq!(
+        record.cwd,
+        Some(
+            std::env::current_dir()
+                .unwrap()
+                .join("no-such-subdir")
+                .to_string_lossy()
+                .into_owned()
+        ),
+    );
+}
+
+/// The blocking mints carry the call's origin too. A blocking record exists
+/// only once a live child is handed off, which no test can spawn, so the pin
+/// is a source scan (the mechanism the `run_delegate` wiring pins use): each
+/// `Handoff::blocking` mint in the handler passes the resolved `origin`.
+#[test]
+fn every_blocking_mint_carries_the_calls_origin() {
+    let src = include_str!("../../src/mcp/mod.rs");
+    let body = src
+        .split_once("async fn delegate_with(")
+        .expect("delegate_with is defined")
+        .1
+        .split_once("\nfn ")
+        .expect("delegate_with ends")
+        .0;
+    let mints: Vec<&str> = body
+        .split("Handoff::blocking(MintSpec {")
+        .skip(1)
+        .map(|rest| rest.split_once("});").expect("the mint closes").0)
+        .collect();
+    assert_eq!(mints.len(), 2, "the single and the fan-out blocking mints");
+    for mint in mints {
+        assert!(
+            mint.contains("origin,") || mint.contains("origin: origin.clone(),"),
+            "a blocking mint drops the call's origin: {mint}"
+        );
+    }
+    assert!(
+        !body.contains("DelegateOrigin::default()"),
+        "the handler never mints a default origin"
+    );
+}
+
+/// The directory a delegate spawns in: a resume's workspace beats the caller's
+/// `cwd`, which beats the server's own.
+#[test]
+fn spawn_cwd_takes_the_workspace_then_the_callers_cwd_then_the_servers() {
+    use std::path::PathBuf;
+    assert_eq!(
+        super::spawn_cwd(Some(PathBuf::from("/ws")), Some("/given")),
+        Some(PathBuf::from("/ws")),
+    );
+    assert_eq!(
+        super::spawn_cwd(None, Some("/given")),
+        Some(PathBuf::from("/given")),
+    );
+    assert_eq!(
+        super::spawn_cwd(None, None),
+        Some(std::env::current_dir().expect("the test's own cwd")),
+    );
+}
+
 /// A background fan-out with `result: "file"` names one result path per job, so
 /// the model that opted into file mode can find each account's result.
 #[test]

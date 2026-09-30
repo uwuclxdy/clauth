@@ -1109,9 +1109,7 @@ fn codex_home_parse_accepts_the_clauth_shape_only() {
 fn codex_home_attribution_is_roster_gated() {
     let home = crate::testutil::HomeSandbox::new();
     let dir = home.home().join(".clauth");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
-    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
 
     let member = home
         .home()
@@ -1154,11 +1152,8 @@ fn codex_home_attribution_is_roster_gated() {
 /// the claude payload reds this test until the codex payload carries it too.
 #[test]
 fn codex_json_view_tracks_the_claude_key_set() {
-    let home = crate::testutil::HomeSandbox::new();
-    let dir = home.home().join(".clauth");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
-    std::fs::write(dir.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx"]);
     let config = config_with(vec![blank_profile("cl")], Some("cl"));
 
     let claude_keys: std::collections::BTreeSet<String> = match json_view(
@@ -1219,9 +1214,7 @@ fn codex_json_view_keeps_the_key_set_and_reads_the_codex_slot() {
 fn a_claude_runtime_claim_outranks_an_inherited_codex_home() {
     let home = crate::testutil::HomeSandbox::new();
     let clauth = home.home().join(".clauth");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
     let codex_home = clauth.join("profiles").join("cx").join("codex-home-4242-0");
     let _codex_env = crate::testutil::CodexHomeSandbox::new(&home, &codex_home);
 

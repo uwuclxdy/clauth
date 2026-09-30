@@ -662,10 +662,10 @@ fn argv_takes_over_up_to_its_own_ceiling() {
 /// transport tests key off `SECURITY_STDIN_LINE_MAX` symbolically, so a
 /// drifted constant passes them all — and one drifted to 4098+ routes
 /// over-cap lines through stdin where `security` truncates destructively.
-/// Pinned to literals instead, both directions. Measured on `mac-6`
-/// (macOS 26.5.2) 2026-09-01: a 4097-byte line including the `\n` (4096 of
-/// text) round-trips intact 6/6, a 4098-byte line truncates at 4096, so 4096
-/// incl `\n` (text <= 4095) is the safe key with 1-2 B of deliberate headroom.
+/// Pinned to literals instead, both directions. Measured on a macOS 26.5.2
+/// host 2026-09-01: a 4097-byte line including the `\n` (4096 of text)
+/// round-trips intact 6/6, a 4098-byte line truncates at 4096, so 4096 incl
+/// `\n` (text <= 4095) is the safe key with 1-2 B of deliberate headroom.
 #[test]
 fn the_stdin_ceiling_is_pinned_to_the_measured_4096() {
     assert_eq!(

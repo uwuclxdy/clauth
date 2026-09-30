@@ -17,7 +17,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let toasts: Vec<&Toast> = app.toasts.iter().collect();
 
     // Full toast width (bar + padding + content + padding) caps at min(60, w − 4)
-    // per cloudy-tui (the −4 is the 2-cell inset each side). col_width adds the
+    // (the −4 is the 2-cell inset each side). col_width adds the
     // 3-cell chrome (`┃ ` + 1 right pad), so content = full − 3.
     let content_cap = 60_u16.min(area.width.saturating_sub(4)).saturating_sub(3);
 

@@ -59,12 +59,12 @@ fn close(a: f64, b: f64) -> bool {
 // ── Envelope ─────────────────────────────────────────────────────────────────
 
 #[test]
-fn not_logined_body_reads_as_auth_expired() {
+fn not_logined_body_reads_as_console_expired() {
     // HTTP 200 carries the dead session, so a status-only reader would call
     // this a success. The distinct error keeps the scheduler from re-polling a
     // credential only a re-login can replace.
     let err: Result<UsagePayload, _> = unwrap_payload(NOT_LOGINED);
-    assert!(matches!(err, Err(ThirdPartyError::AuthExpired)));
+    assert!(matches!(err, Err(ThirdPartyError::ConsoleExpired)));
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn the_params_json_carries_the_two_mandatory_blocks() {
 fn a_missing_console_credential_is_the_same_state_as_a_dead_one() {
     // No credential, no request: the fetch resolves without touching the
     // network, so the profile is suppressed rather than polled forever.
-    assert!(matches!(fetch(None), Err(ThirdPartyError::AuthExpired)));
+    assert!(matches!(fetch(None), Err(ThirdPartyError::ConsoleExpired)));
 }
 
 #[test]

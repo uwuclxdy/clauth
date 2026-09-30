@@ -18,7 +18,7 @@
 //! cards fall back to lifetime (badged) and costs render as `+`-marked floors.
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
@@ -27,7 +27,7 @@ use super::super::app::{App, TokenFilter, TokenPeriod, TokenView, token_period_m
 use super::super::theme;
 use super::format::{fixed, spinner_frame};
 use super::panes::{
-    draw_selector_list, master_detail, picker_row, section_box, section_box_loading,
+    draw_selector_list, master_detail, meta_line, picker_row, section_box, section_box_loading,
     section_box_verbatim,
 };
 use crate::pricing::{HourTokens, PriceTable};
@@ -521,7 +521,7 @@ fn month_ticks(dates: &[&str], width: usize, cell_w: usize, gap: usize) -> Line<
     ])
 }
 
-/// Full-width indeterminate spinner (cloudy-tui): a 4-cell `ACCENT` `█` block
+/// Full-width indeterminate spinner: a 4-cell `ACCENT` `█` block
 /// bouncing across a `░` `LINE` track inside a `[ ]` `LINE` frame, `label`
 /// trailing in `TEXT_DIM`. Position is a triangle wave over `tick` so it rides
 /// the app's one 80ms tick clock (no second timer).
@@ -600,8 +600,8 @@ fn span_w(spans: &[Span<'static>]) -> usize {
 }
 
 /// A row with `left` flush to the start and `right` flush to `width`, the gap
-/// filled with spaces. cloudy-tui leans on alignment + color to separate facts,
-/// not a `·` middot (that's reserved for banner/toast prose).
+/// filled with spaces. Alignment + color separate facts, not a `·` middot
+/// (that's reserved for banner/toast prose).
 fn lr(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Line<'static> {
     let gap = width.saturating_sub(span_w(&left) + span_w(&right)).max(1);
     let mut spans = left;
@@ -960,7 +960,7 @@ fn halves(area: Rect, left_pct: u16) -> [Rect; 2] {
 }
 
 /// Draw one bordered card with its lines. `meta` (if any) renders as a
-/// right-aligned title badge (the cloudy-tui title-right meta slot); `spinner`
+/// right-aligned title badge (the title-right meta slot); `spinner`
 /// (if any) appends a braille loading frame into the title's left inset.
 fn card(
     frame: &mut Frame<'_>,
@@ -976,9 +976,10 @@ fn card(
         None => section_box(title, false, first),
     };
     if let Some(m) = meta {
-        block = block.title(
-            Line::from(Span::styled(format!(" {m} "), theme::dim())).alignment(Alignment::Right),
-        );
+        // The badge closes with a border cell of its own (`… badge ─╮`), the
+        // same rule the meta-slot family follows — the card border is the
+        // unfocused `LINE`.
+        block = block.title(meta_line(m, Style::default().fg(theme::line_color())));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);

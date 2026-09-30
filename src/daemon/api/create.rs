@@ -382,7 +382,7 @@ pub(crate) fn create(ctx: &ApiContext, req: &Request, caller: &Caller<'_>) -> Re
             }
         }
         Start::Kind(kind) => {
-            let name = format!("clauth-{}", created.pane_id.replace(':', "-"));
+            let name = agent_name(&created.pane_id);
             let args = [
                 "agent",
                 "start",
@@ -459,6 +459,26 @@ fn drive_agent(
         }
     };
     Err(response)
+}
+
+/// herdr's agent name for the pane: `clauth-` plus the pane id, spelled to fit
+/// herdr's rule (a lowercase letter first, then lowercase letters, digits, `-`
+/// or `_`). herdr 0.9.1 numbers panes past `p9` with letters, uppercase among
+/// them (`w1:pD`), which the rule refuses; an uppercase letter becomes `_` plus
+/// its lowercase, so `pD` and `pd` stay distinct.
+fn agent_name(pane_id: &str) -> String {
+    let mut name = String::from("clauth-");
+    for c in pane_id.chars() {
+        match c {
+            ':' => name.push('-'),
+            c if c.is_ascii_uppercase() => {
+                name.push('_');
+                name.push(c.to_ascii_lowercase());
+            }
+            c => name.push(c),
+        }
+    }
+    name
 }
 
 #[cfg(test)]

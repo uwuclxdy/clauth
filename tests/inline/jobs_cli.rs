@@ -27,6 +27,8 @@ fn spec(job_id: &str, started_at: u64) -> RunningSpec {
         endpoint: None,
         provider: None,
         isolated: false,
+        cwd: None,
+        spawned_by: None,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
         owner_pid: 0,

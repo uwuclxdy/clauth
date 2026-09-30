@@ -89,7 +89,8 @@ fn per_profile_fields_never_propagate() {
 /// A sync rewrites a member by rename, so the replacement inode takes the
 /// writer's mode, not the old file's: a plain write reverts a runtime copy to
 /// the umask on every tick, whatever the seed wrote. The home file is Claude
-/// Code's own and keeps CC's posture — clauth must not chmod it either way.
+/// Code's own: it lands at the writer's umask-moded mode (CC's own posture on
+/// this host), and clauth must not chmod it either way.
 #[cfg(unix)]
 #[test]
 fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
@@ -130,10 +131,14 @@ fn sync_writes_runtime_copies_owner_only_and_leaves_the_home_file_alone() {
         json!(9),
         "precondition: the home file was rewritten by this sync"
     );
+    let control = home.home().join("mode-control.json");
+    crate::profile::atomic_write(&control, b"{}").expect("write mode control");
     assert_eq!(
         mode(&home_file),
-        0o644,
-        "~/.claude.json is Claude Code's own file; the syncer must not restyle its mode"
+        mode(&control),
+        "~/.claude.json lands at the writer's umask-moded mode, not the seed's (got {:#o}, control {:#o})",
+        mode(&home_file),
+        mode(&control),
     );
 }
 

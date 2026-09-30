@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -662,7 +662,7 @@ pub(crate) enum ClockFormat {
 /// The tab a launch opens on: the Config tab's `home tab` row, persisted as a
 /// top-level `home_tab` key in profiles.toml beside `theme` /
 /// `reset_display` / `clock_format`. Read by the TUI at construction; the
-/// first herdr launch overrides it (Plugin tab, herdr row selected, detail
+/// first herdr launch overrides it (Services tab, herdr row selected, detail
 /// open) and then marks the landing done in `[herdr] first_landing_done`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -675,7 +675,11 @@ pub(crate) enum HomeTab {
     Fallback,
     Config,
     Status,
-    Plugin,
+    /// The retired spelling `plugin` deserializes as this tab (the renamed
+    /// `PopupWidth::Fit`'s `#[serde(alias = "full")]` precedent), so a
+    /// profiles.toml written before the tab became Services still loads.
+    #[serde(alias = "plugin")]
+    Services,
 }
 
 impl HomeTab {
@@ -688,7 +692,7 @@ impl HomeTab {
         HomeTab::Fallback,
         HomeTab::Config,
         HomeTab::Status,
-        HomeTab::Plugin,
+        HomeTab::Services,
     ];
 
     /// The on-disk spelling, doubled as the cycle row's chip label.
@@ -701,7 +705,7 @@ impl HomeTab {
             HomeTab::Fallback => "fallback",
             HomeTab::Config => "config",
             HomeTab::Status => "status",
-            HomeTab::Plugin => "plugin",
+            HomeTab::Services => "services",
         }
     }
 }
@@ -744,7 +748,7 @@ impl PopupWidth {
 }
 
 /// The herdr knobs, persisted under `[herdr]` in profiles.toml. Written by the
-/// Plugin tab's herdr-options form rows, read by the plugin scripts through
+/// Services tab's herdr-options form rows, read by the plugin scripts through
 /// `clauth herdr config get <key>` and by the TUI at launch — so the on-disk
 /// shape is also a published read contract. The `[herdr]` table itself may be
 /// absent (defaults) or partial: a missing field fills from [`Default`]
@@ -797,6 +801,25 @@ pub(crate) struct ServeSettings {
     /// The daemon-wide switch: whether `POST /api/v1/sessions` is served at all
     /// (default off). Each calling device also needs its own `sessions` grant.
     pub(crate) session_creation: bool,
+}
+
+/// The auto-updater knob, persisted under `[update]` in profiles.toml. Like
+/// [`HerdrSettings`] and [`ServeSettings`], the table may be absent (defaults)
+/// or partial: a missing field fills from [`Default`] rather than erroring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct UpdateSettings {
+    /// Run the background update work (default on): the binary check on
+    /// launch and the daemon's remote herdr reinstall. `CLAUTH_NO_UPDATE=1`
+    /// still disables every leg even when this is on — the env kill-switch
+    /// stays authoritative.
+    pub(crate) auto_update: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { auto_update: true }
+    }
 }
 
 /// How the fallback-chain walk orders the candidates WITHIN one accept pass
@@ -1015,6 +1038,11 @@ pub(crate) struct AppState {
     /// next save.
     #[serde(default, skip_serializing_if = "serve_is_default")]
     pub(crate) serve: ServeSettings,
+    /// The `[update]` table: the auto-updater toggle. Omitted from the file
+    /// while at its default, so an untouched profiles.toml gains no `[update]`
+    /// block on the next save; an explicit `auto_update = false` serializes.
+    #[serde(default, skip_serializing_if = "update_is_default")]
+    pub(crate) update: UpdateSettings,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
@@ -1023,6 +1051,10 @@ fn herdr_is_default(herdr: &HerdrSettings) -> bool {
 
 fn serve_is_default(serve: &ServeSettings) -> bool {
     *serve == ServeSettings::default()
+}
+
+fn update_is_default(update: &UpdateSettings) -> bool {
+    *update == UpdateSettings::default()
 }
 
 impl AppState {
@@ -1228,6 +1260,7 @@ impl Default for AppState {
             burn_horizon_cap_ms: None,
             herdr: HerdrSettings::default(),
             serve: ServeSettings::default(),
+            update: UpdateSettings::default(),
         }
     }
 }
@@ -1270,7 +1303,12 @@ impl AppConfig {
     /// mark it home on the days no list claims. Reading the chain rather than
     /// `profiles` follows the spend warning, which is on the chain for the
     /// same reason.
-    pub(crate) fn is_home_on(&self, name: &ProfileName, day: Weekday) -> bool {
+    pub(crate) fn is_home_on(
+        &self,
+        name: &ProfileName,
+        day: Weekday,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> bool {
         // An account the walk would never visit is home on NO day: a list on it
         // claims nothing, and its flag decides nothing either. One guard at the
         // entry rather than one per branch — the gap this closes was exactly a
@@ -1278,10 +1316,10 @@ impl AppConfig {
         // the gap. Redundant on the claimed branch, where `day_listers` has
         // already applied it; the redundancy is what makes the omission
         // impossible.
-        if !crate::fallback::serves_the_chain(self, name) {
+        if !crate::fallback::serves_the_chain(self, name, key_rejected) {
             return false;
         }
-        let mut listers = self.day_listers(day);
+        let mut listers = self.day_listers(day, key_rejected);
         match listers.next() {
             // Home on a claimed day IS the claimant set, asked of the scan
             // rather than re-derived beside it. A second predicate drifts:
@@ -1295,12 +1333,17 @@ impl AppConfig {
 
     /// Chain members that name `day` and could actually serve it, in chain
     /// order. Empty when the day is unclaimed, which is what hands it back to
-    /// `preferred`.
-    pub(crate) fn day_listers(&self, day: Weekday) -> impl Iterator<Item = &ProfileName> {
+    /// `preferred`. `key_rejected` is the key-rejected set the caller read once
+    /// outside the config guard.
+    pub(crate) fn day_listers<'a>(
+        &'a self,
+        day: Weekday,
+        key_rejected: &'a HashSet<ProfileName>,
+    ) -> impl Iterator<Item = &'a ProfileName> + 'a {
         self.state
             .fallback_chain
             .iter()
-            .filter(move |n| !crate::fallback::walk_excluded(self, n))
+            .filter(move |n| !crate::fallback::walk_excluded(self, n, key_rejected))
             .filter(move |n| {
                 self.find(n)
                     .is_some_and(|p| p.preferred_days.contains(&day))
@@ -1319,8 +1362,15 @@ impl AppConfig {
     /// the claimants in chain order, so it changes exactly when the midnight
     /// rollover or a config edit changes what is being warned about, and stays
     /// byte-equal across every tick in between.
-    pub(crate) fn day_claim_collision(&self, day: Weekday) -> Option<String> {
-        let names: Vec<String> = self.day_listers(day).map(|n| format!("'{n}'")).collect();
+    pub(crate) fn day_claim_collision(
+        &self,
+        day: Weekday,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> Option<String> {
+        let names: Vec<String> = self
+            .day_listers(day, key_rejected)
+            .map(|n| format!("'{n}'"))
+            .collect();
         if names.len() < 2 {
             return None;
         }
@@ -1344,13 +1394,17 @@ impl AppConfig {
     /// Same gate-key scheme as [`AppConfig::day_claim_collision`]: the day, the
     /// blocked accounts in profile-list order, and what became of the day are
     /// all in the message.
-    pub(crate) fn day_claim_passed_over(&self, day: Weekday) -> Option<String> {
+    pub(crate) fn day_claim_passed_over(
+        &self,
+        day: Weekday,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> Option<String> {
         let blocked: Vec<String> = self
             .profiles
             .iter()
             .filter(|p| p.preferred_days.contains(&day))
             .filter_map(|p| {
-                crate::fallback::day_claim_blocker(self, &p.name)
+                crate::fallback::day_claim_blocker(self, &p.name, key_rejected)
                     .map(|why| format!("'{}' ({why})", p.name))
             })
             .collect();
@@ -1361,7 +1415,7 @@ impl AppConfig {
         // What happened to the day, not just that a line is inert: a carried
         // day still has somebody home and reads as a stray line, while an
         // uncarried one has quietly fallen back to the flag.
-        let tail = match self.day_listers(day).next() {
+        let tail = match self.day_listers(day, key_rejected).next() {
             Some(carrier) => format!("'{carrier}' carries it"),
             None => format!("nothing else claims {named}, so `preferred` decides it"),
         };
@@ -1381,11 +1435,14 @@ impl AppConfig {
     /// Each entry is its own gate key, so a caller holding the previous set
     /// emits only what is new rather than repainting the rest — a second list
     /// arriving must not re-toast a collision the operator has already read.
-    pub(crate) fn day_claim_notices_today(&self) -> Vec<String> {
+    pub(crate) fn day_claim_notices_today(
+        &self,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> Vec<String> {
         let day = Local::now().weekday();
         [
-            self.day_claim_collision(day),
-            self.day_claim_passed_over(day),
+            self.day_claim_collision(day, key_rejected),
+            self.day_claim_passed_over(day, key_rejected),
         ]
         .into_iter()
         .flatten()
@@ -1395,8 +1452,12 @@ impl AppConfig {
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
     /// per chain build rather than at load: the fingerprint that drives a hot
     /// reload is built from `config.toml` mtimes, and midnight moves no file.
-    pub(crate) fn is_home_today(&self, name: &ProfileName) -> bool {
-        self.is_home_on(name, Local::now().weekday())
+    pub(crate) fn is_home_today(
+        &self,
+        name: &ProfileName,
+        key_rejected: &HashSet<ProfileName>,
+    ) -> bool {
+        self.is_home_on(name, Local::now().weekday(), key_rejected)
     }
 
     /// True when `name`'s last OAuth refresh was rejected as revoked/invalid
@@ -1879,11 +1940,11 @@ pub(crate) fn prune_usage_history(name: &ProfileName) {
     }
 }
 
-/// Open a profile's series log (`usage_history.jsonl` / `wallet_history.jsonl`)
-/// for append, creating it 0o600 on Unix. The logs record per-profile usage
-/// and balance samples under `~/.clauth`, so they ride the owner-only
+/// Open an append-only log under `~/.clauth` (a profile's
+/// `usage_history.jsonl` / `wallet_history.jsonl`, the gateway's
+/// `gateway.log`), creating it 0o600 on Unix, so it rides the owner-only
 /// invariant rather than the process umask.
-fn history_append_file(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_append_600(path: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).append(true);
     #[cfg(unix)]
@@ -1982,7 +2043,7 @@ pub(crate) fn append_usage_sample_at(
     };
     body.push_str(&line(ts, &next_json));
 
-    match history_append_file(&path) {
+    match open_append_600(&path) {
         Ok(mut file) => {
             use std::io::Write;
             if let Err(e) = file.write_all(body.as_bytes()) {
@@ -2086,7 +2147,7 @@ pub(crate) fn append_wallet_readings_at(name: &ProfileName, stats: &ThirdPartySt
         logline!("clauth: failed to create the profile dir for {name}: {e}");
         return;
     }
-    match history_append_file(&path) {
+    match open_append_600(&path) {
         Ok(mut file) => {
             use std::io::Write;
             if let Err(e) = file.write_all(body.as_bytes()) {
@@ -2427,16 +2488,21 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
     })
 }
 
-/// Re-attach onto a rendered `profiles.toml` every top-level key the on-disk
-/// file holds that `AppState` does not model — the `profiles.toml` half of the
-/// rule `serialize_credentials_preserving_extra` states for the credential
-/// store: a rewrite over itself must keep what the model cannot hold.
+/// Re-attach onto a rendered `profiles.toml` every key the on-disk file holds
+/// that `AppState` does not model — the `profiles.toml` half of the rule
+/// `serialize_credentials_preserving_extra` states for the credential store:
+/// a rewrite over itself must keep what the model cannot hold.
 ///
 /// `AppState` is a closed struct, so a plain re-serialize deletes unknown keys
 /// on every save, and the writers that put them there are exactly the ones
 /// clauth must not overrule: a NEWER clauth whose keys this binary has not
 /// learned (an older install against a newer config silently erases them —
 /// the `auto_start_queue` regression, issue #75) and an operator's hand-edit.
+/// The carry is recursive: a future TOP-LEVEL key re-attaches whole, and a
+/// future sub-key inside a table the model DOES hold (`[update]`, `[herdr]`,
+/// `[serve]`) re-attaches inside that table's rendered block
+/// ([`merge_nested_carried_keys`]) — the class a future `[update]` knob joins
+/// the moment the model gains the table.
 ///
 /// Two exclusions, each closing the other's hole. "Modelled" is decided by
 /// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
@@ -2455,7 +2521,7 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     let Ok(disk) = raw.parse::<toml::Table>() else {
         return rendered; // unparseable: not ours to resurrect keys from
     };
-    let Ok(modelled) = modelled_state_keys(&raw) else {
+    let Ok((modelled, modelled_nested)) = modelled_state_shape(&raw) else {
         // The state did not parse, so which keys are modelled is UNKNOWN, and
         // carrying everything would duplicate modelled keys already in the
         // render — a duplicate top-level key is a hard parse error, bricking
@@ -2463,12 +2529,16 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
         return rendered;
     };
     // A key the render itself writes must never be carried beside its copy.
-    let Ok(rendered_keys) = rendered.parse::<toml::Table>() else {
+    let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
         return rendered; // a render that does not parse: nothing safe to merge
     };
+    let rendered = merge_nested_carried_keys(
+        rendered,
+        &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
+    );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
         .collect();
     if carried.is_empty() {
         return rendered; // the common case: nothing unmodelled on disk
@@ -2476,20 +2546,81 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     merge_carried_keys(rendered, &carried)
 }
 
-/// Every top-level `profiles.toml` key `AppState` recognizes, derived by
-/// parsing `raw` and re-serializing it: the keys the type emits are exactly the
-/// keys it holds. Serde ignores unmodelled keys on the parse, so their absence
-/// from the re-render is what marks them; this needs no maintained key array
-/// and cannot drift when `AppState` gains a field (a new field's key appears in
-/// the round-trip output on its own). Err on a file that does not parse as
-/// `AppState` — the caller must refuse to carry rather than guess.
-fn modelled_state_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
+/// What a store's model recognizes, derived by round-tripping the file
+/// through its type: the top-level keys it holds, plus the sub-keys of every
+/// modelled table — the shape [`nested_unmodelled`] classifies unmodelled
+/// nested keys against.
+type ModelledShape = (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+);
+
+/// What `AppState` holds, derived by round-tripping `raw` through the type:
+/// the top-level keys it recognizes, plus the sub-keys of every modelled
+/// table — the nested form of the same derivation, so a future sub-key inside
+/// a modelled table is recognized as unmodelled rather than silently deleted.
+/// Err on a file that does not parse as `AppState` — the caller must refuse to
+/// carry rather than guess.
+fn modelled_state_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
     let state = toml::from_str::<AppState>(raw).map_err(|_| ())?;
     toml::to_string_pretty(&state)
         .ok()
         .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|t| t.keys().cloned().collect())
+        .map(|table| {
+            let nested = table
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.as_table()
+                        .map(|t| (k.clone(), t.keys().cloned().collect()))
+                })
+                .collect();
+            (table.keys().cloned().collect(), nested)
+        })
         .ok_or(())
+}
+
+/// The sub-keys of `disk[k]` that neither the model nor the render holds, for
+/// every top-level key both sides hold as a table: the nested form of the
+/// unmodelled-key carry. A future sub-key inside a MODELLED table would
+/// otherwise be deleted by the next save. The top-level carry owns an
+/// unmodelled table whole, and the round-trip exclusion above owns a modelled
+/// key the new state moved to its default — this picks up exactly the gap:
+/// tables the render writes, sub-keys the model never learned.
+///
+/// A table the round-trip OMITTED (every modelled key in it parsed to its
+/// default — the round-trip skips a default table) is classified against the
+/// RENDER alone when the save writes it: the render's own keys are the
+/// duplicate guard, and a modelled key the render omits there is
+/// value-neutral to carry (it parsed to the same default the model holds).
+/// The alternative — deriving the recognized sets from a default render of
+/// the type — classifies nothing: `AppState`'s table fields all skip at their
+/// default, so a default render emits no table blocks at all.
+fn nested_unmodelled(
+    disk: &toml::Table,
+    modelled_nested: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    rendered: &toml::Table,
+) -> Vec<(String, String, toml::Value)> {
+    let mut out = Vec::new();
+    for (table, value) in disk {
+        let Some(disk_table) = value.as_table() else {
+            continue;
+        };
+        let rendered_table = rendered.get(table.as_str()).and_then(toml::Value::as_table);
+        let known = modelled_nested.get(table.as_str());
+        if known.is_none() && rendered_table.is_none() {
+            continue; // neither side holds it: the top-level carry owns it whole
+        }
+        for (key, value) in disk_table {
+            if known.is_some_and(|k| k.contains(key.as_str())) {
+                continue; // the model holds it: the round-trip already decided
+            }
+            if rendered_table.is_some_and(|t| t.contains_key(key.as_str())) {
+                continue; // the render writes it: never carried beside its copy
+            }
+            out.push((table.clone(), key.clone(), value.clone()));
+        }
+    }
+    out
 }
 
 /// Marker comment written above keys `AppState` does not model, so a hand-editor
@@ -2592,6 +2723,223 @@ pub(crate) fn merge_carried_keys(rendered: String, carried: &[(String, toml::Val
         out.push('\n');
     }
     out
+}
+
+/// Re-attach onto a rendered document the sub-keys of a modelled table that
+/// the model dropped — the nested half of the unmodelled-key carry
+/// ([`nested_unmodelled`] finds them). For each carried `(table, key, value)`
+/// whose `[table]` block the render writes (a non-default `[update]`,
+/// `[herdr]`, `[serve]`, `[console]`), the entry re-attaches so a future
+/// nested key survives the save exactly like a future top-level one.
+///
+/// Two shapes, each scoped correctly against this toml crate's parser: a
+/// table-valued entry (a table, or an array of tables) rides a wrapper table
+/// so the serializer's own path tracking emits an absolute `[table.key.sub]`
+/// header (a bare `[sub]` would scope to the root, and the render's own
+/// `[table]` re-open would be a duplicate table definition); a scalar entry
+/// is a bare `key = literal`, scoped by the `[table]` block it splices into
+/// — a dotted `table.key = v` there would re-define the table and read as a
+/// duplicate (this crate parses it current-table-relative anyway). Both land
+/// inside the block they belong to, before the next top-level header. A
+/// `table` or `key` that is not a bare identifier, and a value the serializer
+/// cannot re-emit, is DROPPED rather than risk a mis-scoped header (the same
+/// drop-don't-corrupt rule as [`merge_carried_keys`]).
+fn merge_nested_carried_keys(rendered: String, nested: &[(String, String, toml::Value)]) -> String {
+    // Two piles per table: bare scalars scope to the enclosing `[table]`
+    // block, so they must precede any `[table.key]` header of the same table
+    // (a scalar after one would scope to `table.key`).
+    let mut scalars: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    let mut headers: std::collections::BTreeMap<&str, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (table, key, value) in nested {
+        if !is_bare_key(table) || !is_bare_key(key) {
+            continue; // a non-bare segment cannot re-attach: drop rather than corrupt
+        }
+        let block = if is_table_shaped(value) {
+            let mut inner = toml::Table::new();
+            inner.insert(key.clone(), value.clone());
+            let wrapper: toml::Table = [(table.clone(), toml::Value::Table(inner))]
+                .into_iter()
+                .collect();
+            let Ok(block) = toml::to_string(&wrapper) else {
+                continue; // unrenderable: drop rather than corrupt
+            };
+            headers
+                .entry(table.as_str())
+                .or_default()
+                .push(block.trim_end().to_string());
+            continue;
+        } else if value
+            .as_array()
+            .is_some_and(|a| a.iter().any(toml::Value::is_table))
+        {
+            continue; // a mixed table array: no literal form to trust, drop
+        } else {
+            // `Display` is the TOML literal (quotes, escapes, `.0` floats);
+            // the bare key scopes to the enclosing `[table]` block.
+            format!("{key} = {value}")
+        };
+        scalars
+            .entry(table.as_str())
+            .or_default()
+            .push(block.trim_end().to_string());
+    }
+    if scalars.is_empty() && headers.is_empty() {
+        return rendered; // nothing to splice: the render alone is the answer
+    }
+    // One pending run per table: its scalars, then its header blocks.
+    fn pending_for(
+        table: &str,
+        scalars: &std::collections::BTreeMap<&str, Vec<String>>,
+        headers: &std::collections::BTreeMap<&str, Vec<String>>,
+    ) -> Vec<String> {
+        let mut run = scalars.get(table).cloned().unwrap_or_default();
+        if let Some(more) = headers.get(table) {
+            run.extend(more.iter().cloned());
+        }
+        run
+    }
+    let mut out = String::with_capacity(rendered.len() + 64);
+    // The top-level table the walk sits in; `None` above the first table
+    // header, inside a multi-line string, or after a dotted sub-header (its
+    // root has no splice-capable block). Placement IS the scoping for the
+    // bare scalar entries, and keeps the header entries beside the table they
+    // belong to rather than in one tail pile.
+    let mut scope: Option<&str> = None;
+    // The multi-line string (`"""` / `'''`) a value line opened. The render is
+    // always serializer output, so tracking the one open delimiter line-wise
+    // is bounded, and a `[`-leading line inside a literal is content, never a
+    // header — a false header there would fire the leave-block flush INSIDE
+    // the string, corrupting the modelled value.
+    let mut ml_string: Option<&'static str> = None;
+    for line in rendered.lines() {
+        if let Some(delim) = ml_string {
+            // A raw delimiter inside the literal is its close (escaped ones
+            // don't appear in serializer output); an even count is a whole
+            // `""""""`-style empty string, still inside.
+            if line.matches(delim).count() % 2 == 1 {
+                ml_string = None;
+            }
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if line.trim_start().starts_with('[') {
+            let name = line
+                .trim_start()
+                .trim_start_matches('[')
+                .split(']')
+                .next()
+                .unwrap_or("");
+            // A dotted sub-header scopes to `t.s`, never to a splice-capable
+            // `[t]` block — and a pending scalar landing after one would
+            // mis-scope to `t.s`, so it ends the region like any other
+            // header (`[[a.b]]` included; a single-segment `[[t]]` keeps its
+            // root splice-capable, where a trailing scalar legally scopes to
+            // the last element). The array shape is UNREACHABLE today, not a
+            // blessed input: no modelled table is an array — the round-trip's
+            // `as_table()` excludes array values from `modelled_nested`, so
+            // nothing classifies one — and this walk states that bound
+            // rather than handling it as a supported case.
+            let dotted = name.contains('.');
+            let root = name.split('.').next().unwrap_or("");
+            if let Some(cur) = scope
+                && (root != cur || dotted)
+                && (!scalars.get(cur).is_none_or(Vec::is_empty)
+                    || !headers.get(cur).is_none_or(Vec::is_empty))
+            {
+                // The block we are leaving still owes its carried sub-keys.
+                let pending = pending_for(cur, &scalars, &headers);
+                scalars.remove(cur);
+                headers.remove(cur);
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push('\n');
+                out.push_str(PRESERVED_KEYS_MARKER);
+                out.push('\n');
+                out.push_str(&pending.join("\n"));
+                out.push('\n');
+                out.push('\n');
+            }
+            scope = if dotted { None } else { Some(root) };
+        } else {
+            // A multi-line string OPENS only in assignment form: the
+            // serializer's openers sit at line end after `= ` (the closer
+            // rides the last content line). A delimiter run inside a
+            // single-line value — `key = "a'''"`, `'p"""q'`, both measured —
+            // must not open string state, or the following header vanishes
+            // into it and the carry re-attaches a duplicate table. One
+            // serializer shape this rule misses, unreachable through the
+            // models today (no free-form `Vec<String>` field renders through
+            // `toml::Value` display): an array element opening a multi-line
+            // string, `days = ["""` — if a model ever gains one, this rule
+            // needs the array-element form before that field ships.
+            let trimmed = line.trim_end();
+            if trimmed.ends_with("= \"\"\"") {
+                ml_string = Some("\"\"\"");
+            } else if trimmed.ends_with("= '''") {
+                ml_string = Some("'''");
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    // The last table block runs to EOF: flush whatever it still owes.
+    if let Some(cur) = scope
+        && (!scalars.get(cur).is_none_or(Vec::is_empty)
+            || !headers.get(cur).is_none_or(Vec::is_empty))
+    {
+        let pending = pending_for(cur, &scalars, &headers);
+        scalars.remove(cur);
+        headers.remove(cur);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(PRESERVED_KEYS_MARKER);
+        out.push('\n');
+        out.push_str(&pending.join("\n"));
+        out.push('\n');
+    }
+    // Tables the render never opened — a modelled table back at its default
+    // emits no block on that same save — have nothing to splice into:
+    // re-attach at EOF, scalars under a fresh bare `[table]` header,
+    // table-valued entries through their already-absolute `[table.key]`
+    // headers. EOF sits past every render block, so a fresh header cannot
+    // collide with one, and the carried keys are what re-create the table on
+    // the next load (its modelled keys read at their defaults from absence).
+    let mut rest: std::collections::BTreeSet<&str> = scalars.keys().copied().collect();
+    rest.extend(headers.keys().copied());
+    for table in rest {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        out.push_str(PRESERVED_KEYS_MARKER);
+        out.push('\n');
+        if let Some(pending) = scalars.get(table) {
+            out.push_str(&format!("[{table}]\n"));
+            out.push_str(&pending.join("\n"));
+            out.push('\n');
+        }
+        if let Some(blocks) = headers.get(table) {
+            out.push_str(&blocks.join("\n"));
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// A key segment the carry can re-attach: a bare TOML identifier, the charset
+/// the model's own fields serialize with. Anything else is dropped rather than
+/// risk a mis-scoped header (see [`merge_nested_carried_keys`]).
+fn is_bare_key(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Set or clear `name`'s persisted `auth_broken` flag against the CURRENT
@@ -3233,8 +3581,8 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
     })
 }
 
-/// `render_config_toml`'s output with every top-level key the config already
-/// holds that `ProfileConfig` does not model re-attached under a marker — the
+/// `render_config_toml`'s output with every key the config already holds that
+/// `ProfileConfig` does not model re-attached under a marker — the
 /// `config.toml` half of the same rule `serialize_credentials_preserving_extra`
 /// states for the credential store. The writers that put such keys there are
 /// the ones clauth must not overrule: a newer clauth (whose `auto_start`/
@@ -3243,7 +3591,8 @@ pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
 /// `clauth disable` erasure) loses data no other writer holds.
 ///
 /// "Modelled" is decided by round-tripping the ON-DISK file through
-/// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, and for
+/// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
+/// recursive sub-key carry ([`merge_nested_carried_keys`]) included, and for
 /// the same reason: a modelled key the profile just moved to a default is
 /// absent from the render, and must not come back from disk. `load_profile`'s
 /// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
@@ -3255,7 +3604,7 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
     let Ok(disk) = raw.parse::<toml::Table>() else {
         return rendered.to_string(); // unparseable: not ours to resurrect keys from
     };
-    let Ok(modelled) = modelled_config_keys(&raw) else {
+    let Ok((modelled, modelled_nested)) = modelled_config_shape(&raw) else {
         // Same refusal as the profiles.toml carry: an unparseable config
         // cannot be classified, and carrying everything would duplicate the
         // modelled keys already in the render — a duplicate top-level key is
@@ -3263,28 +3612,45 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
         return rendered.to_string();
     };
     // A key the render itself writes must never be carried beside its copy.
-    let Ok(rendered_keys) = rendered.parse::<toml::Table>() else {
+    let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
         return rendered.to_string(); // a render that does not parse: merge nothing
     };
+    let merged = merge_nested_carried_keys(
+        rendered.to_string(),
+        &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
+    );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
-        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_keys.contains_key(k.as_str()))
+        .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
         .collect();
     if carried.is_empty() {
-        return rendered.to_string(); // the common case
+        return merged; // the common case
     }
-    merge_carried_keys(rendered.to_string(), &carried)
+    merge_carried_keys(merged, &carried)
 }
 
-/// Every top-level `config.toml` key `ProfileConfig` recognizes, derived the
-/// same way `modelled_state_keys` derives its set: parse, re-render, take the
-/// keys. Err on a file that does not parse — the caller refuses to carry.
-fn modelled_config_keys(raw: &str) -> std::result::Result<std::collections::BTreeSet<String>, ()> {
+/// What `ProfileConfig` holds, derived by round-tripping `raw` through the
+/// type: the top-level keys it recognizes, plus the sub-keys of every modelled
+/// table — the same derivation [`modelled_state_shape`] runs for
+/// `profiles.toml`, so a future sub-key inside a modelled table is recognized
+/// as unmodelled rather than silently deleted. Err on a file that does not
+/// parse as `ProfileConfig` — the caller must refuse to carry rather than
+/// guess.
+fn modelled_config_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
     let config = toml::from_str::<ProfileConfig>(raw).map_err(|_| ())?;
     toml::to_string(&config)
         .ok()
         .and_then(|rendered| rendered.parse::<toml::Table>().ok())
-        .map(|t| t.keys().cloned().collect())
+        .map(|table| {
+            let nested = table
+                .iter()
+                .filter_map(|(k, v)| {
+                    v.as_table()
+                        .map(|t| (k.clone(), t.keys().cloned().collect()))
+                })
+                .collect();
+            (table.keys().cloned().collect(), nested)
+        })
         .ok_or(())
 }
 
@@ -3394,29 +3760,6 @@ fn parse_preferred_days(raw: &[String]) -> Vec<Weekday> {
         }
     }
     out
-}
-
-/// A typed day list → weekdays, for the Setup tab's editor. Commas and
-/// whitespace both separate, so `sat sun` and `sat, sun` land the same, and the
-/// entries themselves go through the loader's chrono parse.
-///
-/// `Err` carries the first entry that did not parse, where [`parse_preferred_days`]
-/// drops it: the loader is reading a file nobody is watching, so one typo must
-/// not take the profile with it — a human who just typed the word is owed the
-/// refusal instead.
-pub(crate) fn parse_day_list(raw: &str) -> Result<Vec<Weekday>, String> {
-    let mut out: Vec<Weekday> = Vec::new();
-    for entry in raw.split([',', ' ', '\t']) {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let day = entry.parse::<Weekday>().map_err(|_| entry.to_string())?;
-        if !out.contains(&day) {
-            out.push(day);
-        }
-    }
-    Ok(out)
 }
 
 /// The canonical on-disk spelling: lowercase three-letter names, so a rewrite

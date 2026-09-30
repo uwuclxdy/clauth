@@ -139,7 +139,7 @@ fn the_absolute_reset_wins_over_the_relative_one() {
 }
 
 /// Banked reset credits ride this same body, so reading them costs no extra
-/// request. clauth reads the count and never spends one.
+/// request. The poll only reads the count; spending one is `clauth limit-reset`.
 #[test]
 fn banked_reset_credits_ride_the_same_body() {
     let info = map_usage(
@@ -218,28 +218,30 @@ fn the_weekly_cutoff_is_exactly_one_day() {
     );
 }
 
-/// The HTTP leg against a local stub: a bearer token, the account header only
-/// when an id is given, and a 200 body through the same mapping the pure
-/// tests pin.
+/// The HTTP leg against a local stub: codex's own header set (the parity UA,
+/// a bearer token, the account header only when an id is given, the fedramp
+/// flag only when the account is one) and a 200 body through the same mapping
+/// the pure tests pin.
 #[test]
 fn the_usage_fetch_sends_the_bearer_and_the_account_header_only_when_given() {
     let body = r#"{"plan_type": "plus", "rate_limit": {"primary_window": {"used_percent": 9, "limit_window_seconds": 18000}}}"#;
     let (addr, handle) =
-        crate::testutil::serve_endpoints_raw(4, move |_path, _i| (200, body.to_string()));
+        crate::testutil::serve_endpoints_raw(5, move |_path, _i| (200, body.to_string()));
     let url = format!("{addr}/backend-api/wham/usage");
 
-    let info =
-        fetch_codex_usage_at(&url, "at.secret", Some("acc-1"), 1_600_000_000).expect("200 maps");
+    let info = fetch_codex_usage_at(&url, "at.secret", Some("acc-1"), false, 1_600_000_000)
+        .expect("200 maps");
     assert_eq!(info.five_hour.as_ref().map(|w| w.utilization), Some(9.0));
     assert_eq!(
         info.plan.as_ref().and_then(|p| p.codex_plan.as_deref()),
         Some("plus")
     );
-    fetch_codex_usage_at(&url, "at.secret", None, 1_600_000_000).expect("200 maps");
-    fetch_codex_usage_at(&url, "at.secret", Some("  "), 1_600_000_000).expect("200 maps");
+    fetch_codex_usage_at(&url, "at.secret", None, false, 1_600_000_000).expect("200 maps");
+    fetch_codex_usage_at(&url, "at.secret", Some("  "), false, 1_600_000_000).expect("200 maps");
+    fetch_codex_usage_at(&url, "at.secret", Some("acc-1"), true, 1_600_000_000).expect("200 maps");
 
     let seen = handle.join().expect("join stub");
-    assert_eq!(seen.len(), 3, "one request per call");
+    assert_eq!(seen.len(), 4, "one request per call");
     for raw in &seen {
         assert_eq!(
             crate::testutil::request_path(raw),
@@ -249,11 +251,26 @@ fn the_usage_fetch_sends_the_bearer_and_the_account_header_only_when_given() {
             crate::testutil::request_header(raw, "authorization").as_deref(),
             Some("Bearer at.secret")
         );
+        let ua = crate::testutil::request_header(raw, "user-agent").expect("a UA");
+        assert!(
+            ua == "codex_cli_rs" || ua.starts_with("codex_cli_rs/"),
+            "codex's own UA shape: {ua}"
+        );
+        assert_eq!(
+            crate::testutil::request_header(raw, "accept"),
+            None,
+            "codex's backend client sends no Accept"
+        );
     }
     assert_eq!(
         crate::testutil::request_header(&seen[0], "chatgpt-account-id").as_deref(),
         Some("acc-1"),
         "a multi-workspace login names its account"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&seen[0], "x-openai-fedramp"),
+        None,
+        "an ordinary account sends no fedramp flag"
     );
     assert_eq!(
         crate::testutil::request_header(&seen[1], "chatgpt-account-id"),
@@ -264,6 +281,11 @@ fn the_usage_fetch_sends_the_bearer_and_the_account_header_only_when_given() {
         crate::testutil::request_header(&seen[2], "chatgpt-account-id"),
         None,
         "a blank id is no id"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&seen[3], "x-openai-fedramp").as_deref(),
+        Some("true"),
+        "a fedramp account flags itself the way codex does"
     );
 }
 
@@ -278,6 +300,7 @@ fn a_401_from_the_usage_endpoint_is_reported_as_its_status() {
         &format!("{addr}/backend-api/wham/usage"),
         "at.stale",
         Some("acc-1"),
+        false,
         1_600_000_000,
     )
     .expect_err("a 401 is an error");

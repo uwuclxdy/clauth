@@ -158,20 +158,21 @@ fn write_plugin_install(scope: &str) {
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
 }
 
+#[cfg(unix)]
 fn plugin_check(app: &App) -> &super::Check {
-    app.plugin
+    app.services
         .checks
         .iter()
         .find(|c| c.label == "plugin")
         .expect("plugin check present")
 }
 
-/// The delegates pane's rows arrive BANDED, from the store.
+/// The delegates detail's rows arrive BANDED, from the store.
 ///
-/// `recompute_plugin_checks` is the pane's only reader, and it must call
+/// `recompute_services_checks` is the detail's only reader, and it must call
 /// `jobs::list_banded` — the same function `clauth jobs` and `monitor`'s listing
 /// call — rather than `jobs::list`. The renderer sorts nothing any more, so this
-/// read is the whole of the pane's ordering: reverting it to the raw retention
+/// read is the whole of the detail's ordering: reverting it to the raw retention
 /// order silently drops a long-running delegate below a burst of completions,
 /// which is the defect the shared function exists to prevent, and no render test
 /// would catch it because they all feed their fixtures in directly.
@@ -179,7 +180,7 @@ fn plugin_check(app: &App) -> &super::Check {
 /// Cross-band on purpose, and the finished rows are anchored NEWER than the live
 /// one, so raw retention order and banded order disagree.
 #[test]
-fn the_delegates_pane_reads_the_store_in_banded_order() {
+fn the_delegates_detail_reads_the_store_in_banded_order() {
     use crate::mcp::jobs::{self, JobPhase};
 
     let _home = crate::testutil::HomeSandbox::new();
@@ -195,6 +196,8 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
                 endpoint: None,
                 provider: None,
                 isolated: false,
+                cwd: None,
+                spawned_by: None,
                 idle_secs: Some(300),
                 kind: jobs::RecordKind::Collectable,
                 owner_pid: 0,
@@ -234,15 +237,15 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
     done("d-fin-b-0", 4_000);
 
     let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false);
 
     let ids: Vec<String> = app
-        .plugin
+        .services
         .delegates
         .iter()
         .map(|j| j.record.job_id.clone())
         .collect();
-    let phases: Vec<JobPhase> = app.plugin.delegates.iter().map(|j| j.phase()).collect();
+    let phases: Vec<JobPhase> = app.services.delegates.iter().map(|j| j.phase()).collect();
 
     assert_eq!(phases.len(), 4, "fixture control: every record was read");
     assert_eq!(
@@ -264,81 +267,1011 @@ fn the_delegates_pane_reads_the_store_in_banded_order() {
     );
 }
 
+/// The folded plugin check's health is the worst of its four sub-checks (clauth
+/// on PATH, mcpServers wiring, plugin install, CC version). Driven through the
+/// pure `plugin_check` with a controlled PATH so each arm is deterministic.
 #[test]
-fn plugin_check_ok_when_installed_globally() {
+fn the_plugin_check_health_is_the_worst_of_the_four() {
+    use crate::plugin_probe::McpProbe;
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = std::path::PathBuf::from("/usr/bin/clauth");
+
+    // clauth missing alone is danger, whatever the others say.
+    let check = super::plugin_check(None, Some(Some("1.2.3".to_string())), Some(McpProbe::Ok));
+    assert_eq!(check.health, super::Health::Danger);
+
+    // clauth present, nothing wired or installed: both fixes warn, and the
+    // install leads.
+    let check = super::plugin_check(Some(&path), None, None);
+    assert_eq!(check.health, super::Health::Warn);
+    assert_eq!(check.fix, Some(super::ServiceFix::InstallPlugin));
+
+    // A user-scope install wires the server and installs globally: ok, no fix.
+    write_plugin_install("user");
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
+    assert_eq!(check.health, super::Health::Ok);
+    assert!(check.fix.is_none());
+
+    // A boot failure is danger even when the wiring and install are fine.
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Failed("refused".to_string())),
+    );
+    assert_eq!(check.health, super::Health::Danger);
+}
+
+/// The folded plugin check carries every readout line in cloudy's order (the
+/// install block, the mcp entry / server / source, then claude, path, data),
+/// pinned by equality against the production builder — the readouts plus the
+/// blank separators and the plain explanation line above each fix. Health is
+/// the worst, the problems walk in the same order, and the list `f` is the
+/// first problem's fix: the install.
+#[test]
+fn the_plugin_check_folds_the_readouts_and_lists_problems_in_order() {
+    use crate::plugin_probe::McpProbe;
+    let _home = crate::testutil::HomeSandbox::new();
+    let path = std::path::PathBuf::from("/usr/bin/clauth");
+    write_plugin_install("local");
+
+    let check = super::plugin_check(
+        Some(&path),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
+
+    let data_line = format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    );
+    let expected = vec![
+        "installed: yes (local)".to_string(),
+        "version: 0.1.0".to_string(),
+        "installed for this project only, not global".to_string(),
+        "installs at user scope".to_string(),
+        "f  install plugin".to_string(),
+        String::new(),
+        "mcp entry: registered".to_string(),
+        "mcp server: ok".to_string(),
+        "mcp source: plugin install (project)".to_string(),
+        "registered for this project only, not global".to_string(),
+        "writes the clauth entry into ~/.claude.json".to_string(),
+        "f  wire mcp server".to_string(),
+        String::new(),
+        "claude: 1.2.3".to_string(),
+        "path: /usr/bin/clauth".to_string(),
+        data_line,
+    ];
+    assert_eq!(
+        check.detail, expected,
+        "the folded detail, its separators and its fix explanations, by equality"
+    );
+    assert_eq!(check.health, super::Health::Warn, "worst-of-four is warn");
+    assert_eq!(
+        check.fix,
+        Some(super::ServiceFix::InstallPlugin),
+        "list `f` fixes the first fixable problem shown: the install"
+    );
+    assert_eq!(
+        check
+            .problems
+            .iter()
+            .map(|p| (p.line, super::fix_verb(&p.fix)))
+            .collect::<Vec<_>>(),
+        vec![(4, "install plugin"), (11, "wire mcp server")],
+        "the problems carry their detail-line indices and walk in order"
+    );
+    assert!(
+        !check.detail.iter().any(|l| l.starts_with("[f]")),
+        "the bracketed `[f]` anti-pattern is gone: {:?}",
+        check.detail
+    );
+}
+
+/// A manual global `~/.claude.json` wire reads `mcp entry: registered` and
+/// leaves no wire fix; the only remaining problem is the (absent) install.
+#[test]
+fn the_plugin_check_reads_a_global_wire_as_wired() {
+    use crate::plugin_probe::McpProbe;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
+    let check = super::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
+    assert!(
+        check.detail.iter().any(|l| l == "mcp entry: registered"),
+        "a globally wired server reads registered: {:?}",
+        check.detail
+    );
+    assert!(
+        check
+            .detail
+            .iter()
+            .any(|l| l == "mcp source: ~/.claude.json (manual)"),
+        "and the source names the manual global config: {:?}",
+        check.detail
+    );
+    assert!(
+        check
+            .problems
+            .iter()
+            .all(|p| p.fix != super::ServiceFix::WireMcpServers),
+        "no wire fix when globally wired"
+    );
+}
+
+/// A user-scope install wires the server globally and installs the plugin:
+/// healthy, no wire fix, no install fix.
+#[test]
+fn the_plugin_check_reads_a_user_install_as_healthy() {
+    use crate::plugin_probe::McpProbe;
     let _home = crate::testutil::HomeSandbox::new();
     write_plugin_install("user");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
+    let check = super::plugin_check(
+        Some(std::path::Path::new("/usr/bin/clauth")),
+        Some(Some("1.2.3".to_string())),
+        Some(McpProbe::Ok),
+    );
     assert_eq!(check.health, super::Health::Ok);
     assert!(
+        check.detail.iter().any(|l| l == "installed: yes (user)"),
+        "the install readout names the user scope: {:?}",
+        check.detail
+    );
+    assert!(
+        check.problems.is_empty(),
+        "no problems on a healthy global install"
+    );
+    assert!(check.fix.is_none());
+}
+
+/// The builder's fresh-box plugin detail (nothing installed, no `mcpServers`
+/// entry, nothing probed yet), whole: the three groups cloudy picked, each fix
+/// under its field.
+#[test]
+fn the_plugin_check_reads_a_fresh_box_in_three_groups() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = super::plugin_check(Some(std::path::Path::new("/usr/bin/clauth")), None, None);
+    let data_line = format!(
+        "data: {}",
+        crate::profile::clauth_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "\u{2014}".to_string())
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "installed: no (marketplace unknown)".to_string(),
+            "installs at user scope".to_string(),
+            "f  install plugin".to_string(),
+            String::new(),
+            "mcp entry: not registered".to_string(),
+            "mcp source: none".to_string(),
+            "writes the clauth entry into ~/.claude.json".to_string(),
+            "f  wire mcp server".to_string(),
+            String::new(),
+            "claude: press r to probe".to_string(),
+            "path: /usr/bin/clauth".to_string(),
+            data_line,
+        ],
+        "the fresh-box detail, by equality"
+    );
+    assert_eq!(
+        check.problems.iter().map(|p| p.line).collect::<Vec<_>>(),
+        vec![2, 7],
+        "each fix line's index"
+    );
+}
+
+/// On a fresh box (nothing installed, no `mcpServers` entry anywhere) list-level
+/// `f` on the plugin row opens the install confirm, never the manual wire: the
+/// install also registers the server, so it is the one fix such a box needs.
+#[test]
+fn list_f_on_a_fresh_box_opens_the_install_confirm() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin row");
+    app.services.focus = super::ServicesFocus::List;
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('f')),
+    );
+    match app.modals.last() {
+        Some(super::Modal::Confirm(state)) => assert!(
+            matches!(state.on_confirm, super::ConfirmAction::InstallPlugin),
+            "list f on a fresh box installs, got {:?}",
+            state.on_confirm
+        ),
+        other => panic!("expected the install confirm, got {other:?}"),
+    }
+}
+
+/// A recent delegate rate-limit on any profile names itself in the delegates
+/// detail; the dot stays dim (green only while a job runs).
+#[test]
+fn the_delegates_detail_names_rate_limited_traffic() {
+    use crate::profile::{AppConfig, AppState, Profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    let now_secs = (crate::usage::now_ms() / 1000) as i64;
+    let profile = Profile::new("acct".to_string(), None, None);
+    // `record_rate_limit` writes through `write_profile_cache`, which persists
+    // only for a profile the saved app state names as configured.
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![profile.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::throughput::record_rate_limit(&profile.name, None, None, now_secs);
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![profile],
+    });
+    super::recompute_services_checks(&mut app, false);
+    let check = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "delegates")
+        .expect("delegates row");
+    assert_eq!(check.health, super::Health::Idle, "the dot stays dim");
+    assert_eq!(
+        check.detail,
+        vec!["delegate: rate-limited (acct)".to_string()],
+        "the detail names the rate-limited accounts"
+    );
+}
+
+/// A fix landing under a focused problem shrinks the problem set; the recompute
+/// clamps the cursor so the surviving problem is the one `f` fixes.
+#[test]
+fn the_problem_cursor_clamps_when_a_fix_lands_under_focus() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false);
+    let check = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "plugin")
+        .expect("plugin row");
+    assert_eq!(check.problems.len(), 2, "fixture: wire + install problems");
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "plugin")
+        .expect("plugin row");
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services.problem_cursor = 1;
+    // Wire the server: the wire problem leaves, the install problem stays.
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
+    super::recompute_services_checks(&mut app, false);
+    assert_eq!(
+        app.services.problem_cursor, 0,
+        "the cursor clamps onto the surviving problem"
+    );
+    assert_eq!(
+        app.services.focused_fix(),
+        Some(&super::ServiceFix::InstallPlugin),
+        "and `f` fixes the surviving install problem"
+    );
+}
+
+/// ↵ never descends into the delegates detail (it binds no key).
+#[test]
+fn enter_does_not_descend_into_the_delegates_detail() {
+    use super::{KeyCode, handle_key};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false);
+    app.services.cursor = 1; // delegates is the second row, after shunt
+    app.services.focus = super::ServicesFocus::List;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(
+        app.services.focus,
+        super::ServicesFocus::List,
+        "↵ does not descend into the delegates detail"
+    );
+}
+
+/// The shunt row's readout: every field that has a value, in cloudy's order
+/// (binary, config, version, state, reason, pid, port, restarts, last exit) —
+/// `restarts` and `last exit` only when the slot came from the daemon's feed,
+/// `reason` split onto indented sub-lines when it spans more than one line.
+#[test]
+fn shunt_check_reads_the_slot_fields_in_order() {
+    use crate::daemon::gateway::{ExitReport, GatewaySlot, GatewayState};
+    let every = GatewaySlot {
+        state: GatewayState::Healthy,
+        config: Some("/home/u/.clauth/gateway.toml".to_string()),
+        binary: Some("/usr/local/bin/shunt".to_string()),
+        port: Some(3001),
+        pid: Some(4242),
+        version: Some("0.49.1".to_string()),
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 2,
+        last_exit: Some(ExitReport {
+            code: Some(1),
+            signal: None,
+        }),
+        reason: Some("TOML parse error at line 1\n  |\n1 | foo =".to_string()),
+        since: Some("2026-09-29T00:00:00Z".to_string()),
+    };
+    let check = super::shunt_check(&every, true, None);
+    assert_eq!(check.health, super::Health::Ok, "healthy is green");
+    assert_eq!(
+        check.detail,
+        vec![
+            "binary: /usr/local/bin/shunt".to_string(),
+            "config: /home/u/.clauth/gateway.toml".to_string(),
+            "version: 0.49.1".to_string(),
+            "state: healthy".to_string(),
+            "reason: TOML parse error at line 1".to_string(),
+            "    |".to_string(),
+            "  1 | foo =".to_string(),
+            "pid: 4242".to_string(),
+            "port: 3001".to_string(),
+            "restarts: 2".to_string(),
+            "last exit: exit 1".to_string(),
+        ],
+        "every set field renders in order, a multi-line reason splits"
+    );
+
+    let absent = GatewaySlot {
+        state: GatewayState::Absent,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    };
+    let check = super::shunt_check(&absent, false, None);
+    assert_eq!(check.health, super::Health::Idle, "absent is dim");
+    assert_eq!(
+        check.detail,
+        vec!["state: not adopted".to_string()],
+        "an unprobed absent slot renders state alone, no unobserved figures"
+    );
+}
+
+/// With no gateway adopted, the row names the config shunt would load and the
+/// standalone shunt answering, each only when there is one; an adopted
+/// gateway's row never shows a standalone readout.
+#[test]
+fn an_unadopted_shunt_row_names_what_runs_without_clauth() {
+    use crate::daemon::gateway::{GatewaySlot, GatewayState};
+    use std::net::SocketAddr;
+    let slot = |state| GatewaySlot {
+        state,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    };
+    let addr: SocketAddr = "127.0.0.1:3067".parse().unwrap();
+    let found = std::path::PathBuf::from("/home/u/.config/shunt/shunt.toml");
+    let detail = |state, readout: &super::StandaloneShunt| {
+        super::shunt_check(&slot(state), false, Some(readout)).detail
+    };
+
+    assert_eq!(
+        detail(GatewayState::Absent, &super::StandaloneShunt::default()),
+        vec!["state: not adopted".to_string()],
+        "nothing found and nothing answering adds nothing",
+    );
+    assert_eq!(
+        detail(
+            GatewayState::Absent,
+            &super::StandaloneShunt {
+                found: Some(found.clone()),
+                unread_bind: None,
+                answer: None,
+            }
+        ),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /home/u/.config/shunt/shunt.toml".to_string(),
+        ],
+        "a config with nothing answering names the config alone",
+    );
+    let both = super::StandaloneShunt {
+        found: Some(found),
+        unread_bind: None,
+        answer: Some(("0.49.1".to_string(), addr)),
+    };
+    assert_eq!(
+        detail(GatewayState::Absent, &both),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /home/u/.config/shunt/shunt.toml".to_string(),
+            "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+        ],
+    );
+    assert_eq!(
+        detail(
+            GatewayState::Absent,
+            &super::StandaloneShunt {
+                found: None,
+                unread_bind: None,
+                answer: Some(("0.49.1\u{1b}[2J".to_string(), addr)),
+            }
+        ),
+        vec![
+            "state: not adopted".to_string(),
+            "standalone shunt 0.49.1\\u{1b}[2J answers on 127.0.0.1:3067".to_string(),
+        ],
+        "an answerer with no config found, its version escaped like every slot string",
+    );
+    let split = detail(
+        GatewayState::Absent,
+        &super::StandaloneShunt {
+            found: None,
+            unread_bind: None,
+            answer: Some(("0.49.1: forged".to_string(), addr)),
+        },
+    );
+    assert_eq!(
+        split[1], "standalone shunt 0.49.1\\u{3a} forged answers on 127.0.0.1:3067",
+        "a `: ` in the version is escaped, so the line stays prose",
+    );
+    assert_eq!(split[1].split_once(": "), None);
+    let trailing = detail(
+        GatewayState::Absent,
+        &super::StandaloneShunt {
+            found: None,
+            unread_bind: None,
+            answer: Some(("0.49.1:".to_string(), addr)),
+        },
+    );
+    assert_eq!(
+        trailing[1], "standalone shunt 0.49.1\\u{3a} answers on 127.0.0.1:3067",
+        "a trailing `:` would meet the space after it",
+    );
+    assert_eq!(
+        detail(
+            GatewayState::Absent,
+            &super::StandaloneShunt {
+                found: Some(std::path::PathBuf::from("/w/\u{202e}x/shunt.toml")),
+                unread_bind: None,
+                answer: None,
+            }
+        ),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /w/\\u{202e}x/shunt.toml".to_string(),
+        ],
+        "a found path is escaped too: a directory name can carry a bidi override",
+    );
+    let unread = |reason: super::UnreadBind| super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/home/u/.config/shunt/shunt.yaml")),
+        unread_bind: Some(reason),
+        answer: Some(("0.49.1".to_string(), addr)),
+    };
+    assert_eq!(
+        detail(GatewayState::Absent, &unread(super::UnreadBind::Yaml)),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /home/u/.config/shunt/shunt.yaml".to_string(),
+            "bind: not read (yaml)".to_string(),
+            "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+        ],
+        "the unread bind sits between the config and the answer",
+    );
+    for (reason, shown) in [
+        (
+            super::UnreadBind::Unreadable,
+            "bind: not read (config unreadable)",
+        ),
+        (
+            super::UnreadBind::Unparsed,
+            "bind: not read (config does not parse)",
+        ),
+        (
+            super::UnreadBind::Value("${SHUNT_\u{1b}BIND}".to_string()),
+            "bind: not read (${SHUNT_\\u{1b}BIND})",
+        ),
+        (
+            super::UnreadBind::Value(String::new()),
+            "bind: not read (empty)",
+        ),
+    ] {
+        assert_eq!(
+            detail(GatewayState::Absent, &unread(reason))[2],
+            shown,
+            "each reason's words, a raw value escaped"
+        );
+    }
+    assert_eq!(
+        detail(GatewayState::Disabled, &both),
+        vec!["state: disabled".to_string()],
+        "an adopted gateway keeps its own readout",
+    );
+}
+
+/// The standalone readout off a discovery result and one `/health` probe of
+/// the bind that config sets, against a real stub answering `/health`.
+#[test]
+fn the_standalone_readout_probes_the_found_configs_bind() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, seen) = crate::testutil::serve_endpoints(1, |_, _| {
+        (200, r#"{"status":"ok","version":"0.49.1"}"#.to_string())
+    });
+    let stub: std::net::SocketAddr = base.trim_start_matches("http://").parse().unwrap();
+    let config = home.home().join("shunt.toml");
+    // A wildcard bind, as a served shunt often has: the row names the loopback
+    // address the probe reached, never `0.0.0.0`.
+    std::fs::write(
+        &config,
+        format!("[server]\nbind = \"0.0.0.0:{}\"\n", stub.port()),
+    )
+    .unwrap();
+
+    assert_eq!(
+        super::standalone_readout_from(
+            Ok(Some(config.clone())),
+            None,
+            crate::gateway::probe_health
+        ),
+        super::StandaloneShunt {
+            found: Some(config.clone()),
+            unread_bind: None,
+            answer: Some(("0.49.1".to_string(), stub)),
+        },
+        "the stub on the config's bind answers as a standalone shunt",
+    );
+    assert_eq!(seen.join().expect("listener"), ["/health"]);
+
+    // A closed port on the config's bind: found, nothing answering.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    std::fs::write(&config, format!("[server]\nbind = \"{closed}\"\n")).unwrap();
+    assert_eq!(
+        super::standalone_readout_from(
+            Ok(Some(config.clone())),
+            None,
+            crate::gateway::probe_health
+        ),
+        super::StandaloneShunt {
+            found: Some(config),
+            unread_bind: None,
+            answer: None,
+        },
+    );
+}
+
+/// Where clauth cannot read a bind, the one probe goes to shunt's default
+/// and the readout names why; the env override moves the probe whatever the
+/// config's format, as it moves shunt's own. No config and no override is not
+/// an unread bind: shunt's default IS its bind.
+#[test]
+fn the_standalone_readout_without_a_readable_bind_probes_the_default() {
+    use super::UnreadBind;
+    use std::cell::RefCell;
+    let home = crate::testutil::HomeSandbox::new();
+    let probed = RefCell::new(Vec::new());
+    let silent = |addr| {
+        probed.borrow_mut().push(addr);
+        Ok(crate::gateway::Health::NotShunt { status: 404 })
+    };
+    let readout =
+        |found: Option<std::path::PathBuf>, unread: Option<UnreadBind>| super::StandaloneShunt {
+            found,
+            unread_bind: unread,
+            answer: None,
+        };
+    assert_eq!(
+        super::standalone_readout_from(Ok(None), None, silent),
+        readout(None, None),
+    );
+    assert_eq!(
+        super::standalone_readout_from(Ok(None), Some("127.0.0.1:4100"), silent),
+        readout(None, None),
+    );
+    assert_eq!(
+        super::standalone_readout_from(Ok(None), Some("nope"), silent),
+        readout(
+            None,
+            Some(UnreadBind::Value("SHUNT_SERVER__BIND=nope".to_string()))
+        ),
+        "a refused env override is named with its variable",
+    );
+
+    let yaml = std::path::PathBuf::from("/home/u/.config/shunt/shunt.yaml");
+    let yaml_err = || Err(crate::gateway::YamlConfig { path: yaml.clone() }.into());
+    assert_eq!(
+        super::standalone_readout_from(yaml_err(), None, silent),
+        readout(Some(yaml.clone()), Some(UnreadBind::Yaml)),
+    );
+    assert_eq!(
+        super::standalone_readout_from(yaml_err(), Some("127.0.0.1:4200"), silent),
+        readout(Some(yaml.clone()), None),
+        "the env override is read, so a YAML config's own bind does not matter",
+    );
+
+    let config = home.home().join("shunt.toml");
+    let toml_case = |text: &str| {
+        std::fs::write(&config, text).unwrap();
+        super::standalone_readout_from(Ok(Some(config.clone())), None, silent).unread_bind
+    };
+    assert_eq!(
+        toml_case("[server]\nbind = \"${SHUNT_BIND}\"\n"),
+        Some(UnreadBind::Value("${SHUNT_BIND}".to_string())),
+    );
+    assert_eq!(
+        toml_case("[server]\nbind = \"127.0.0.1:0\"\n"),
+        Some(UnreadBind::Value("127.0.0.1:0".to_string())),
+    );
+    assert_eq!(
+        toml_case("[server]\nbind = 3001\n"),
+        Some(UnreadBind::Value("3001".to_string())),
+        "a non-string bind is named in its TOML spelling",
+    );
+    assert_eq!(
+        toml_case("[server]\nbind = 3001 # the port alone\n"),
+        Some(UnreadBind::Value("3001".to_string())),
+        "a trailing comment is not part of the value",
+    );
+    assert_eq!(
+        toml_case("[server]\nbind = \"\"\n"),
+        Some(UnreadBind::Value(String::new())),
+    );
+    assert_eq!(
+        toml_case("[server.bind]\nx = 1 # a comment\n"),
+        Some(UnreadBind::Value("{ x = 1 }".to_string())),
+        "a table-shaped bind is named inline, its comment dropped",
+    );
+    assert_eq!(toml_case("[server\n"), Some(UnreadBind::Unparsed));
+    let dir = home.home().join("a-dir-not-a-file");
+    std::fs::create_dir_all(&dir).unwrap();
+    assert_eq!(
+        super::standalone_readout_from(Ok(Some(dir.clone())), None, silent),
+        readout(Some(dir), Some(UnreadBind::Unreadable)),
+    );
+
+    let want: Vec<std::net::SocketAddr> = [
+        "127.0.0.1:3001",
+        "127.0.0.1:4100",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:4200",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+        "127.0.0.1:3001",
+    ]
+    .iter()
+    .map(|a| a.parse().unwrap())
+    .collect();
+    assert_eq!(
+        *probed.borrow(),
+        want,
+        "one probe per readout, at the bind clauth reads, else shunt's default"
+    );
+}
+
+/// The dot buckets the gateway states into their classes: green healthy; amber
+/// starting/unhealthy/restarting/stopping; red the refusal states; dim
+/// absent/disabled/unobserved.
+#[test]
+fn shunt_check_maps_each_state_to_its_dot_class() {
+    use crate::daemon::gateway::{GatewaySlot, GatewayState};
+    let slot = |state| GatewaySlot {
+        state,
+        config: None,
+        binary: None,
+        port: None,
+        pid: None,
+        version: None,
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: None,
+        since: None,
+    };
+    let cases: &[(GatewayState, super::Health)] = &[
+        (GatewayState::Healthy, super::Health::Ok),
+        (GatewayState::Starting, super::Health::Warn),
+        (GatewayState::Unhealthy, super::Health::Warn),
+        (GatewayState::Restarting, super::Health::Warn),
+        (GatewayState::Stopping, super::Health::Warn),
+        (GatewayState::Misconfigured, super::Health::Danger),
+        (GatewayState::BinaryMissing, super::Health::Danger),
+        (GatewayState::Foreign, super::Health::Danger),
+        (GatewayState::YamlRefused, super::Health::Danger),
+        (GatewayState::BelowFloor, super::Health::Danger),
+        (GatewayState::NoConfig, super::Health::Danger),
+        (GatewayState::Absent, super::Health::Idle),
+        (GatewayState::Disabled, super::Health::Idle),
+        (GatewayState::Unobserved, super::Health::Idle),
+    ];
+    for (state, want) in cases {
+        assert_eq!(
+            super::shunt_check(&slot(*state), false, None).health,
+            *want,
+            "{state:?} dot class"
+        );
+    }
+}
+
+/// The sanitizer escapes exactly the control and bidi-formatting characters,
+/// and leaves every other character — backslashes, non-ASCII, quotes, the
+/// ellipsis — unchanged.
+#[test]
+fn escape_control_escapes_only_control_and_bidi_chars() {
+    assert_eq!(
+        super::escape_control(r"C:\Users\u\.clauth\shunt.toml"),
+        r"C:\Users\u\.clauth\shunt.toml",
+        "a Windows path renders with its backslashes unchanged"
+    );
+    assert_eq!(
+        super::escape_control("/home/zoë/.cargo/bin/shunt"),
+        "/home/zoë/.cargo/bin/shunt",
+        "a non-ASCII path renders unchanged"
+    );
+    assert_eq!(
+        super::escape_control(r#"invalid value: string "abc", …"#),
+        r#"invalid value: string "abc", …"#,
+        "a quoted reason renders unchanged"
+    );
+    assert_eq!(super::escape_control("\u{1b}"), "\\u{1b}", "ESC escapes");
+    assert_eq!(super::escape_control("\u{7}"), "\\u{7}", "BEL escapes");
+    assert_eq!(
+        super::escape_control("\u{202e}"),
+        "\\u{202e}",
+        "a bidi override escapes"
+    );
+}
+
+/// Every slot string the detail renders goes through the sanitizer: a planted
+/// control character never reaches the detail raw, whichever field carries it.
+#[test]
+fn shunt_check_escapes_the_untrusted_slot_strings() {
+    use crate::daemon::gateway::{GatewaySlot, GatewayState};
+    let slot = GatewaySlot {
+        state: GatewayState::Healthy,
+        config: Some("/tmp/a\u{1b}b".to_string()),
+        binary: Some("/tmp/b\u{202e}c".to_string()),
+        port: None,
+        pid: None,
+        version: Some("0.49.1\u{1b}[2J".to_string()),
+        answerer: None,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: Some("bad \u{202e} entry".to_string()),
+        since: None,
+    };
+    let check = super::shunt_check(&slot, true, None);
+    let find = |prefix: &str| {
         check
             .detail
             .iter()
-            .any(|line| line.starts_with("installed: yes")),
-        "global install should read installed, got {:?}",
+            .find(|l| l.starts_with(prefix))
+            .unwrap_or_else(|| panic!("no {prefix} line: {:?}", check.detail))
+            .clone()
+    };
+    assert_eq!(
+        find("version:"),
+        "version: 0.49.1\\u{1b}[2J",
+        "the ESC renders as its visible escape"
+    );
+    assert!(
+        !check.detail.iter().any(|l| l.contains('\u{1b}')),
+        "no raw control character reaches the readout: {:?}",
         check.detail
     );
+    assert!(
+        !check.detail.iter().any(|l| l.contains('\u{202e}')),
+        "no raw bidi override reaches the readout: {:?}",
+        check.detail
+    );
+    assert!(find("config:").contains("\\u{1b}"), "config is escaped");
+    assert!(find("binary:").contains("\\u{202e}"), "binary is escaped");
+    assert!(find("reason:").contains("\\u{202e}"), "reason is escaped");
 }
 
+/// A `foreign` slot names what answered on the bind port, beside the reason,
+/// so the red dot states its cause.
 #[test]
-fn plugin_check_warns_and_offers_global_install_when_project_local() {
-    let _home = crate::testutil::HomeSandbox::new();
-    write_plugin_install("local");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
-    assert_eq!(check.health, super::Health::Warn);
-    assert!(
-        check.detail.iter().any(|line| line.contains("(local)")),
-        "the project-local scope should surface in the readout, got {:?}",
-        check.detail
+fn shunt_check_renders_the_foreign_answerer() {
+    use crate::daemon::gateway::{Answerer, GatewaySlot, GatewayState};
+    let foreign = |answerer| GatewaySlot {
+        state: GatewayState::Foreign,
+        config: None,
+        binary: None,
+        port: Some(3001),
+        pid: None,
+        version: None,
+        answerer,
+        floor: "0.48.0".to_string(),
+        restarts: 0,
+        last_exit: None,
+        reason: Some("the port is held".to_string()),
+        since: None,
+    };
+    let expect = |word: &str| {
+        vec![
+            "state: foreign".to_string(),
+            "reason: the port is held".to_string(),
+            format!("answerer: {word}"),
+            "port: 3001".to_string(),
+        ]
+    };
+    let check = super::shunt_check(&foreign(Some(Answerer::Shunt)), false, None);
+    assert_eq!(
+        check.detail,
+        expect("shunt"),
+        "a shunt-shaped foreign answerer names itself"
     );
-    // The old shell copy-paste hint is gone; the row now offers the one-key
-    // user-scope install fix instead.
-    assert!(
-        check.fix.is_some(),
-        "non-global install should offer the install fix, got {:?}",
-        check.detail
+    let check = super::shunt_check(&foreign(Some(Answerer::NotShunt)), false, None);
+    assert_eq!(
+        check.detail,
+        expect("not shunt"),
+        "a non-shunt HTTP answerer names itself"
     );
-    assert!(
-        check.detail.iter().any(|line| line.starts_with("[f]")),
-        "the detail should show the install fix hint, got {:?}",
-        check.detail
+    let check = super::shunt_check(&foreign(Some(Answerer::NoAnswer)), false, None);
+    assert_eq!(
+        check.detail,
+        expect("no answer"),
+        "a silent answerer names itself"
     );
 }
 
+/// The reader: a fresh daemon's `gateway` object is the slot (flagged
+/// from-daemon); a stale daemon, an absent key, and an unparseable object all
+/// fall back to the record-only verdict (flagged not-from-daemon).
 #[test]
-fn plugin_check_offers_install_fix_when_missing() {
+fn gateway_slot_reads_a_fresh_feed_and_falls_back_otherwise() {
+    use crate::daemon::DaemonHealth;
+    use crate::daemon::gateway::GatewayState;
     let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let status_path = dir.join("status.json");
+
+    let feed = serde_json::json!({
+        "gateway": {
+            "state": "healthy",
+            "floor": "0.48.0",
+            "restarts": 2,
+            "version": "0.49.1"
+        }
+    });
+    std::fs::write(&status_path, serde_json::to_vec(&feed).expect("serialize")).expect("write");
+    let (slot, supervised) = crate::daemon::gateway_slot(DaemonHealth::Fresh);
+    assert!(supervised, "a fresh feed's gateway slot is from the daemon");
+    assert_eq!(
+        slot.state,
+        GatewayState::Healthy,
+        "and it is the feed's slot"
+    );
+
+    // No gateway key (an older daemon): record-only, not from the daemon.
+    std::fs::write(&status_path, b"{}").expect("write");
+    let (_, supervised) = crate::daemon::gateway_slot(DaemonHealth::Fresh);
+    assert!(
+        !supervised,
+        "a fresh feed with no gateway key is not the daemon's slot"
+    );
+
+    // A gateway object this binary cannot parse (a state word from a newer
+    // daemon): record-only, not from the daemon.
+    std::fs::write(
+        &status_path,
+        br#"{"gateway": {"state": "adopting", "floor": "0.48.0", "restarts": 0}}"#,
+    )
+    .expect("write");
+    let (_, supervised) = crate::daemon::gateway_slot(DaemonHealth::Fresh);
+    assert!(
+        !supervised,
+        "an unparseable gateway object falls back, not from the daemon"
+    );
+
+    // A stale daemon never reads its feed.
+    std::fs::write(&status_path, serde_json::to_vec(&feed).expect("serialize")).expect("write");
+    let (_, supervised) = crate::daemon::gateway_slot(DaemonHealth::Stale);
+    assert!(!supervised, "a stale daemon's verdict is record-only");
+}
+
+/// The "the daemon runs the gateway" note names the daemon only for a record
+/// the gateway WOULD run on with no daemon to run it: an `unobserved` record.
+/// An absent record shows no note — no gateway would run at all.
+#[test]
+fn the_shunt_row_names_the_daemon_only_for_an_unobserved_record() {
+    use crate::daemon::DaemonHealth;
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let status_path = dir.join("status.json");
+
+    // No record in the sandbox: the record-only verdict is `absent`.
+    std::fs::write(&status_path, b"{}").expect("feed");
     let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
-    assert_eq!(check.health, super::Health::Warn);
-    assert!(
-        check
-            .detail
-            .iter()
-            .any(|line| line.starts_with("installed: no")),
-        "an absent plugin should read not installed, got {:?}",
-        check.detail
+    app.daemon_health = DaemonHealth::Fresh;
+    super::recompute_services_checks(&mut app, false);
+    let shunt = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "shunt")
+        .expect("shunt row");
+    assert_eq!(
+        shunt.detail,
+        vec!["state: not adopted".to_string()],
+        "an absent record shows no daemon note"
     );
-    assert!(
-        check.fix.is_some(),
-        "a missing plugin should offer the install fix, got {:?}",
-        check.detail
-    );
-    assert!(
-        check.detail.iter().any(|line| line.starts_with("[f]")),
-        "the detail should show the install fix hint, got {:?}",
-        check.detail
+
+    // A record whose config exists: `unobserved` — the gateway would run on it.
+    let config = dir.join("shunt.toml");
+    std::fs::write(&config, "port = 3001\n").expect("config");
+    std::fs::write(
+        dir.join("gateway.toml"),
+        format!("config = {:?}\n", config.to_string_lossy()),
+    )
+    .expect("record");
+    let mut app = bare_app();
+    app.daemon_health = DaemonHealth::Fresh;
+    super::recompute_services_checks(&mut app, false);
+    let shunt = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "shunt")
+        .expect("shunt row");
+    assert_eq!(
+        shunt.detail,
+        vec![
+            "binary: shunt".to_string(),
+            format!("config: {}", config.to_string_lossy()),
+            "state: unobserved".to_string(),
+            "the daemon runs the gateway".to_string(),
+        ],
+        "an unobserved record names the daemon as what would run the gateway"
     );
 }
 
-/// The install row must name the OPERATIVE record, not whichever row sorts first
-/// on disk: a stale project/local row ahead of the live `user`-scope row used to
-/// print the wrong scope and version beside a verdict computed off the user row.
+/// The install readout must name the OPERATIVE record, not whichever row sorts
+/// first on disk: a stale project/local row ahead of the live `user`-scope row
+/// used to print the wrong scope and version beside a verdict computed off the
+/// user row.
 #[test]
 fn plugin_check_names_the_user_scope_record_when_one_exists() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -355,9 +1288,7 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
     });
     std::fs::write(&path, serde_json::to_vec(&body).expect("serialize")).expect("write");
 
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = plugin_check(&app);
+    let check = super::plugin_check(Some(std::path::Path::new("/usr/bin/clauth")), None, None);
     assert_eq!(
         check.health,
         super::Health::Ok,
@@ -395,21 +1326,23 @@ fn plugin_check_names_the_user_scope_record_when_one_exists() {
 /// The confirm gate every mutating fix owes (tab spec: "confirm modal first,
 /// default choice = cancel"): `f` on the plugin row must open a
 /// [`ConfirmAction::InstallPlugin`] modal that defaults to cancel and runs
-/// nothing until confirmed.
+/// nothing until confirmed. The server is already wired so the install is the
+/// first fixable problem the list `f` reaches.
 #[test]
 fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
     let _home = crate::testutil::HomeSandbox::new();
+    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
     let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
+    super::recompute_services_checks(&mut app, false);
     let idx = app
-        .plugin
+        .services
         .checks
         .iter()
         .position(|c| c.label == "plugin")
         .expect("plugin check present");
-    app.plugin.cursor = idx;
+    app.services.cursor = idx;
 
-    super::apply_plugin_fix(&mut app);
+    super::apply_service_fix(&mut app);
 
     let Some(super::Modal::Confirm(state)) = app.modals.last() else {
         panic!(
@@ -433,7 +1366,7 @@ fn the_install_fix_opens_a_default_cancel_confirm_before_installing() {
 /// agentgear's `install(Scope::User, Source::Embedded)` — visible here as the
 /// exact `claude plugin` invocations the fake CLI records (user scope on both
 /// the marketplace add and the install, exactly one install per confirm), the
-/// materialized tree landing under the hermetic data dir, and the Plugin tab
+/// materialized tree landing under the hermetic data dir, and the Services tab
 /// recomputing to `installed`.
 #[cfg(unix)]
 #[test]
@@ -499,15 +1432,14 @@ fn the_install_fix_runs_agentgear_user_scope_install() {
         app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
     let check = plugin_check(&app);
-    assert_eq!(
-        check.health,
-        super::Health::Ok,
-        "the recomputed row reads installed and healthy, got {:?}",
-        check.detail
-    );
     assert!(
         check.detail.iter().any(|l| l.starts_with("installed: yes")),
         "the row reflects the user-scope install, got {:?}",
+        check.detail
+    );
+    assert!(
+        check.fix.is_none(),
+        "a global install leaves no install or wire fix, got {:?}",
         check.detail
     );
 }
@@ -542,205 +1474,9 @@ fn the_install_fix_warns_when_claude_is_missing() {
         app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
     let check = plugin_check(&app);
-    assert_eq!(
-        check.health,
-        super::Health::Warn,
-        "the row must stay not-installed, got {:?}",
-        check.detail
-    );
     assert!(
         check.detail.iter().any(|l| l.starts_with("installed: no")),
         "the row still reads not installed, got {:?}",
-        check.detail
-    );
-}
-
-fn mcp_check(app: &App) -> &super::Check {
-    app.plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "mcp servers")
-        .expect("mcp servers check present")
-}
-
-#[test]
-fn mcp_check_ok_when_globally_wired() {
-    let _home = crate::testutil::HomeSandbox::new();
-    crate::plugin_probe::wire_mcp_server().expect("wire ~/.claude.json");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = mcp_check(&app);
-    assert_eq!(check.health, super::Health::Ok);
-    assert!(
-        check.detail.iter().any(|line| line == "present: yes"),
-        "a globally wired server should read present, got {:?}",
-        check.detail
-    );
-    assert!(check.fix.is_none());
-}
-
-#[test]
-fn mcp_check_warns_project_only_for_local_plugin() {
-    let _home = crate::testutil::HomeSandbox::new();
-    // A project-scope plugin advertises the server for one repo only, and no
-    // global `~/.claude.json` entry exists in the sandbox to make it global.
-    write_plugin_install("local");
-    let mut app = bare_app();
-    super::recompute_plugin_checks(&mut app, false);
-    let check = mcp_check(&app);
-    assert_eq!(check.health, super::Health::Warn);
-    assert!(
-        check
-            .detail
-            .iter()
-            .any(|line| line == "wired for this project only, not global"),
-        "project-only wiring should say so in the readout, got {:?}",
-        check.detail
-    );
-    assert!(check.fix.is_some(), "should offer the global write fix");
-}
-
-#[test]
-fn runtime_check_summarizes_profiles() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![Profile::new("acct".to_string(), None, None)],
-    });
-    super::recompute_plugin_checks(&mut app, false);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    // One idle, non-active, credential-less profile: no active link, no live
-    // sessions → a neutral dot (not green) and no fix.
-    assert_eq!(check.health, super::Health::Idle);
-    assert!(check.fix.is_none());
-    assert!(check.detail.iter().any(|l| l == "accounts: 1"));
-    // A zero count prints NOTHING — no row, and specifically not `live: 0`
-    // or a `—` placeholder. The Overview cell and the Fallback card both hide
-    // their zero; this row was the one surface still announcing it.
-    assert!(
-        !check.detail.iter().any(|l| l.starts_with("live:")),
-        "an idle fleet says nothing about sessions, got {:?}",
-        check.detail
-    );
-    assert!(check.detail.iter().any(|l| l == "active: \u{2014}"));
-    assert!(check.detail.iter().any(|l| l == "link: \u{2014}"));
-}
-
-/// A session that swapped A→B holds BOTH accounts' liveness markers: B's
-/// because that is what it authenticates as, A's because the chain the child
-/// still holds in memory must not rotate underneath it. Summing per-profile
-/// marker
-/// counts therefore reports one child as two sessions and names an account
-/// nothing authenticates as — A is the wrong answer, not a changed one. Only the
-/// registry can tell the two apart.
-///
-/// Driven through `r` (`refresh_version`), the one path that re-collects the
-/// fleet tally instead of folding in whatever the tick last left in
-/// `app.live_sessions` — so this also pins that `r` re-reads the registry.
-#[test]
-fn runtime_check_counts_a_swapped_session_once_on_the_member_it_moved_to() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![
-            Profile::new("swap-a".to_string(), None, None),
-            Profile::new("swap-b".to_string(), None, None),
-        ],
-    });
-
-    let sid = "4242-0";
-    let mut row = crate::testutil::live_row(sid, "swap-a");
-    row.current_member = Some("swap-b".to_string());
-    row.last_swap_at = Some(1_700_000_060_000);
-    crate::live_sessions::register(&row).expect("register row");
-    // Both markers, exactly as a swapped session holds them.
-    let _launch = crate::runtime::hold_session_row_marker(
-        &crate::profile::ProfileName::from("swap-a"),
-        false,
-        sid,
-    )
-    .expect("hold the launch member's marker");
-    let _landed = crate::runtime::hold_session_row_marker(
-        &crate::profile::ProfileName::from("swap-b"),
-        false,
-        sid,
-    )
-    .expect("hold the swapped-onto member's marker");
-
-    super::recompute_plugin_checks(&mut app, true);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .find(|l| l.starts_with("live:"))
-            .map(String::as_str),
-        Some("live: 1 across 1 account"),
-        "one child is one session on one account, got {:?}",
-        check.detail
-    );
-    assert!(
-        check.detail.iter().any(|l| l == "  swap-b"),
-        "the account the session moved ONTO is the one it runs as, got {:?}",
-        check.detail
-    );
-    assert!(
-        !check.detail.iter().any(|l| l == "  swap-a"),
-        "nothing authenticates as the launch member any more, got {:?}",
-        check.detail
-    );
-}
-
-/// The runtime row folds in the tally the tick already collected, never a sweep
-/// of its own: `LiveTally::collect` is two readdirs plus an `open` + `try_lock`
-/// per row plus a credential read, and the render thread ran it once a second
-/// for an answer `poll_live_sessions` had put in `app.live_sessions` the same
-/// tick. Two independent derivations of one number can also disagree inside a
-/// frame, which no amount of caching fixes.
-///
-/// The seeded fleet is one the registry does NOT hold, so a recompute that
-/// collects again reports an empty fleet and reds here.
-#[test]
-fn the_runtime_check_reads_the_ticks_tally_rather_than_sweeping_again() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![Profile::new("acct".to_string(), None, None)],
-    });
-    app.live_sessions =
-        crate::live_sessions::LiveTally::of([crate::testutil::live_row("4242-0", "acct")]);
-
-    super::recompute_plugin_checks(&mut app, false);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .find(|l| l.starts_with("live:"))
-            .map(String::as_str),
-        Some("live: 1 across 1 account"),
-        "the row renders the tick's tally, got {:?}",
         check.detail
     );
 }
@@ -868,18 +1604,17 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
     let rows = config_rows(&app);
     // Full runtime sequence for this fixture (OAuth account, no base url, no
     // overrides, no custom env, holding OAuth credentials): auto-start in the
-    // second slot with the day row beside it, the alias overrides collapsed
-    // behind `ModelOverrideAdd`, no env rows, then the
-    // login/delete-creds/disabled/delete action tail. A
+    // second slot, the alias overrides collapsed behind `ModelOverrideAdd`, no
+    // env rows, then the login/delete-creds/disabled/delete action tail. A
     // future reorder of `config_rows`' row-construction (the `rows.push(...)`
     // builder) reds here; a match-arm reorder elsewhere is unobservable at
-    // runtime and isn't what this test guards.
+    // runtime and isn't what this test guards. The per-account day list is NOT
+    // here: it lives on the Fallback tab's member card.
     assert_eq!(
         rows,
         [
             ConfigRow::Name,
             ConfigRow::AutoStart,
-            ConfigRow::PreferredDays,
             ConfigRow::BaseUrl,
             ConfigRow::Model,
             ConfigRow::ModelOverrideAdd,
@@ -977,6 +1712,218 @@ fn api_relogin_chain_walks_base_url_then_api_key() {
     let d = app.config_draft.as_ref().expect("draft");
     assert!(!d.relogin_chain, "⎋ abandons the chain");
     assert_eq!(d.active, None, "⎋ ends editing");
+}
+
+/// F1: a Setup re-key persists the new credential but the live key-rejected set
+/// must drop the name SAME-FRAME — not on the next tick's reload. The success
+/// arm calls `refresh_tokens`, so `key_rejected_names` re-evaluates the current
+/// entry fingerprint at once instead of intersecting the stale one.
+#[test]
+fn rekeying_an_endpoint_drops_the_live_broken_mark_immediately() {
+    use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["api"]);
+
+    let api = Profile::new(
+        "api".to_string(),
+        Some("https://api.z.ai/api/anthropic".to_string()),
+        Some("old-key".to_string()),
+    );
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("api")],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+
+    // The live rejection mark is recorded under the OLD credential fingerprint.
+    let old_fp = app
+        .third_party_tokens
+        .lock()
+        .expect("tokens store unpoisoned")
+        .iter()
+        .find(|e| e.name.as_str() == "api")
+        .expect("the old third-party entry is collected at construction")
+        .credential_fingerprint();
+    app.third_party_broken
+        .lock()
+        .expect("broken store unpoisoned")
+        .insert("api".to_string(), old_fp);
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("api")),
+        "the old key's rejection is live before the re-key"
+    );
+
+    // Re-key through the real producer (the Setup endpoint editor's ⏎).
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.config_draft.as_mut().expect("draft").base_url =
+        InputState::new("https://api.z.ai/api/anthropic");
+    app.config_draft.as_mut().expect("draft").api_key = InputState::new("new-key");
+    commit_config_field(&mut app, ConfigRow::ApiKey);
+
+    assert!(
+        !app.key_rejected_names().contains(&ProfileName::from("api")),
+        "a re-keyed account drops out of the live broken set the same frame"
+    );
+
+    // Q2: the refresh leg republished the fetch entry with the NEW credential
+    // fingerprint same-frame — not merely that verdict authority now ignores the
+    // stale list. Read config first (dropped before the token store, per lock
+    // order), then the re-collected entry.
+    {
+        let new_fp = {
+            let cfg = app.config();
+            let p = cfg
+                .find(&ProfileName::from("api"))
+                .expect("profile present");
+            crate::usage::profile_credential_fingerprint(p)
+                .expect("the re-keyed profile is credentialed")
+        };
+        let list_fp = app
+            .third_party_tokens
+            .lock()
+            .expect("tokens store unpoisoned")
+            .iter()
+            .find(|e| e.name.as_str() == "api")
+            .expect("the re-keyed entry is re-collected same-frame")
+            .credential_fingerprint();
+        assert_ne!(
+            list_fp, old_fp,
+            "the re-keyed entry fingerprint differs from the old one"
+        );
+        assert_eq!(
+            list_fp, new_fp,
+            "third_party_tokens carries the NEW credential fingerprint immediately"
+        );
+    }
+}
+
+/// Q1 (TUI repair direction): the `on_tick` drain drops a queued switch-away
+/// whose record carries a key-rejection cause when the active is re-keyed before
+/// dispatch — the active stays and the stale decision is not re-queued.
+#[test]
+fn on_tick_drops_a_repaired_key_rejected_switch_away() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", far_future());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+    let old_fp = crate::usage::profile_credential_fingerprint(
+        app.config()
+            .find(&ProfileName::from("tp"))
+            .expect("tp present"),
+    )
+    .expect("credentialed");
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: Some(("tp".to_string(), old_fp)),
+        });
+
+    // Re-key tp before the drain dispatches.
+    {
+        let mut cfg = app.config();
+        cfg.find_mut(&ProfileName::from("tp"))
+            .expect("tp present")
+            .api_key = Some("new-key".to_string());
+    }
+
+    // First tick drains the queued decision (and drops it); the second would
+    // complete a switch had one been dispatched.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("tp"),
+        "the re-keyed active stays put"
+    );
+    assert!(
+        app.pending_switch.lock().expect("pending").is_empty(),
+        "the stale switch-away is dropped, not re-queued"
+    );
+}
+
+/// Q1 (TUI ordinary direction): a cause-absent ordinary exhaustion decision
+/// still switches even beside a stale raw broken mark (the leftover of a
+/// same-name re-key).
+#[test]
+fn on_tick_still_switches_an_ordinary_decision_beside_a_stale_mark() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_profile};
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["tp", "oauth"]);
+    let tp = Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    save_profile(&tp).expect("save tp");
+    let oauth = stored_oauth_profile("oauth", far_future());
+    let state = AppState {
+        active_profile: Some(ProfileName::from("tp")),
+        profiles: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        fallback_chain: vec![ProfileName::from("tp"), ProfileName::from("oauth")],
+        ..AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("persist state");
+    let mut app = App::new(AppConfig {
+        state,
+        profiles: vec![tp, oauth],
+    });
+    app.bootstrap_started = true;
+
+    // A stale mark: recorded under a fingerprint that no longer matches tp's
+    // current credential. The ordinary decision carries no cause.
+    let stale_fp = crate::usage::profile_credential_fingerprint(&Profile::new(
+        "tp".to_string(),
+        Some("https://example.com".to_string()),
+        Some("other-key".to_string()),
+    ))
+    .expect("credentialed");
+    app.third_party_broken
+        .lock()
+        .expect("broken")
+        .insert("tp".to_string(), stale_fp);
+    app.pending_switch
+        .lock()
+        .expect("pending")
+        .insert(crate::usage::PendingSwitchTarget {
+            target: "oauth".to_string(),
+            key_rejected_cause: None,
+        });
+
+    // First tick dispatches (posts the gate); the second completes it.
+    super::on_tick(&mut app);
+    super::on_tick(&mut app);
+
+    assert_eq!(
+        app.config().state.active_profile.as_deref(),
+        Some("oauth"),
+        "the ordinary exhaustion switch still executes beside the stale mark"
+    );
 }
 
 #[test]
@@ -1120,6 +2067,1174 @@ fn reload_if_state_changed_does_not_invert_config_over_token_locks() {
     assert!(
         reloaded,
         "the reload branch must run so the token-mutex writes are exercised"
+    );
+}
+
+// ── F2: durable key-rejection seeding ────────────────────────────────────────
+
+/// F2: a fingerprint-bound key rejection survives a TUI restart. The durable
+/// `third_party_auth.json` verdict (written by the fetching process, read by
+/// every no-live-set surface) seeds the in-memory key-rejected set at
+/// construction, so the chain/overview/day-list renders see the rejection
+/// before any fetch recreates it.
+#[test]
+fn the_durable_auth_verdict_seeds_the_key_rejected_set_at_construction() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from("zai"), fingerprint),
+        "fixture control: the durable record landed"
+    );
+
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "the durable verdict must survive a restart with no fetch behind it"
+    );
+}
+
+/// F2: the same seed lands on a config reload — a stood-down TUI picks up a
+/// rejection another process recorded after a config write.
+#[test]
+fn the_durable_auth_verdict_seeds_the_key_rejected_set_on_reload() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("persist profile config");
+
+    let mut app = app_with(vec![zai.clone()]);
+
+    // The record lands AFTER construction, so the reload leg alone can seed it.
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fingerprint);
+
+    let config_toml = home
+        .home()
+        .join(".clauth")
+        .join("profiles")
+        .join("zai")
+        .join("config.toml");
+    set_mtime(&config_toml, UNIX_EPOCH + Duration::from_secs(1_000_000));
+
+    let reloaded = app.reload_if_state_changed();
+    assert!(
+        reloaded,
+        "the reload branch must run so the seed is exercised"
+    );
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "a reload seeds the rejection another process recorded"
+    );
+}
+
+// ── F3: endpoint/key edits clear stale status chrome ─────────────────────────
+
+/// F3: a successful endpoint/API-key edit clears the edited profile's
+/// name-keyed status + streak chrome, so the next frame shows no stale
+/// `[ key rejected ]` pill or old-provider throttler attribution.
+#[test]
+fn commit_endpoint_clears_the_edited_profiles_stale_status_chrome() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.profile_cursor = 0;
+    // Stale chrome the repair must clear: the dead-key verdict, a deep 429
+    // streak, and an OAuth-side status entry (the hybrid's other leg).
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+    // Precondition control: the merge the next frame reads shows the stale
+    // key-rejected verdict before the edit.
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::Fresh);
+
+    super::enter_config_detail(&mut app);
+    if let Some(d) = app.config_draft.as_mut() {
+        d.active = Some(super::ConfigRow::ApiKey);
+        d.api_key = super::InputState::new("k2");
+    }
+    super::commit_endpoint(&mut app);
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the dead-key status goes with the repaired credential"
+        );
+    }
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the OAuth-side status goes with the repaired credential"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's streak cannot accuse the new credential"
+        );
+    }
+
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a repaired key"
+    );
+}
+
+/// R2-F2: a stood-down TUI's seeded key-rejection heals when the fetcher
+/// (another process) clears the durable record under the SAME credential — no
+/// config change, so the reload seed never sees it. The once-per-second
+/// verdict sync notices the record's disappearance and drops the mirror entry.
+#[test]
+fn the_seeded_key_rejection_heals_when_another_process_clears_the_record() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("zai"), fingerprint);
+
+    let mut app = app_with(vec![zai]);
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "precondition: the construction seed marks the rejected member"
+    );
+
+    // The fetcher healed the credential: the durable record is gone while the
+    // credential (and its fingerprint) is unchanged.
+    crate::profile_cache::clear_auth_expired(&ProfileName::from("zai"));
+    assert!(
+        !crate::profile_cache::auth_expired_matches(&ProfileName::from("zai"), fingerprint),
+        "fixture control: the record is really gone"
+    );
+
+    super::on_tick(&mut app);
+    assert!(
+        !app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "the healed member must leave the key-rejected set without a config change"
+    );
+}
+
+/// R2-F2: a rejection recorded by another process AFTER construction seeds
+/// the mirror on the cadence — the fixture writes the record file directly,
+/// the way the fetcher's durable writer does.
+#[test]
+fn a_record_written_by_another_process_seeds_the_key_rejected_set_on_the_cadence() {
+    use crate::profile::{AppState, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![zai.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&zai)
+        .expect("the credential has a fingerprint");
+    let mut app = app_with(vec![zai]);
+    assert!(
+        !app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "precondition: nothing rejected yet"
+    );
+
+    // The fetcher recorded a rejection under this credential; write the
+    // record file directly, as the fetcher's durable writer would.
+    let path = crate::profile_cache::profile_cache_path(
+        &ProfileName::from("zai"),
+        crate::profile_cache::THIRD_PARTY_AUTH_FILE,
+    )
+    .expect("the record path resolves");
+    std::fs::write(&path, format!("{{\"credential\":{fingerprint}}}")).expect("write the record");
+
+    super::on_tick(&mut app);
+    assert!(
+        app.key_rejected_names().contains(&ProfileName::from("zai")),
+        "a rejection recorded by another process must appear without a config change"
+    );
+}
+
+/// R2-F3: a captured-login overwrite retires the old provider's verdicts the
+/// same way a credential edit does — one shared clear helper, not a second
+/// spelling. The pre-overwrite frame reads the stale `[ key rejected ]`
+/// verdict; the post-overwrite frame reads nothing.
+#[test]
+fn a_capture_overwrite_clears_the_stale_status_chrome() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::Fresh);
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::CaptureOverwrite(
+            Box::new(crate::actions::CaptureSnapshot {
+                credentials: None,
+                base_url: None,
+                api_key: None,
+                account_uuid: None,
+            }),
+            "zai".to_string(),
+            false,
+        ),
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the dead-key status goes with the overwritten credential"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's streak cannot accuse the new credential"
+        );
+    }
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the OAuth-side status goes with the overwritten credential"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after an overwrite"
+    );
+}
+
+/// R3-F1: the sync's insert branch runs the seed's own shape gate. A
+/// `ConsoleExpired` outcome writes the durable record under a still-matching
+/// fingerprint, but a lapsed Alibaba console session is usage-only and must
+/// never render as key-rejected. The construction seed (which shares the
+/// predicate) is the control: it already leaves the name alone.
+#[test]
+fn a_console_lapse_record_never_seeds_the_key_rejected_set() {
+    use crate::profile::{AppState, ConsoleCredential, ConsoleSite, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "dead".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![qwen.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&qwen).expect("save the profile");
+
+    // The record the leg writes for `ConsoleExpired` — bound to the same
+    // fingerprint the profile still carries.
+    let fingerprint = crate::usage::profile_credential_fingerprint(&qwen)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("qwen"), fingerprint);
+    assert!(
+        crate::profile_cache::auth_expired_matches(&ProfileName::from("qwen"), fingerprint),
+        "fixture control: the console-lapse record landed"
+    );
+
+    let mut app = app_with(vec![qwen]);
+    assert!(
+        !app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "control: the construction seed's shape gate leaves the lapsed console alone"
+    );
+
+    super::on_tick(&mut app);
+    assert!(
+        !app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "the cadence must not seed a console lapse as key-rejected"
+    );
+}
+
+/// R3-F1: the same shape gate drops a mirror entry that already exists for a
+/// console-lapsing profile — the insert branch requires the predicate, so a
+/// name the predicate refuses must leave on the cadence.
+#[test]
+fn a_console_lapse_drops_a_pre_existing_mirror_entry_on_the_cadence() {
+    use crate::profile::{AppState, ConsoleCredential, ConsoleSite, ProfileName};
+    use crate::providers::Provider;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "dead".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![qwen.name.clone()],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    crate::profile::save_profile(&qwen).expect("save the profile");
+
+    let fingerprint = crate::usage::profile_credential_fingerprint(&qwen)
+        .expect("the credential has a fingerprint");
+    crate::profile_cache::write_auth_expired(&ProfileName::from("qwen"), fingerprint);
+
+    let mut app = app_with(vec![qwen]);
+    app.third_party_broken
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), fingerprint);
+    assert!(
+        app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "precondition: the planted mirror entry is visible through the intersection"
+    );
+
+    super::on_tick(&mut app);
+    assert!(
+        !app.key_rejected_names()
+            .contains(&ProfileName::from("qwen")),
+        "a name the shape gate refuses must drop from the mirror on the cadence"
+    );
+}
+
+/// R3-F2: a blanked third-party api key retires the old provider's verdicts —
+/// no leg ever fetches a keyless profile, so a stale `[ key rejected ]` would
+/// render forever without the shared clear.
+#[test]
+fn a_blanked_key_clears_the_stale_status_chrome() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), 9);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::Fresh);
+
+    super::run_confirm_action(
+        &mut app,
+        super::ConfirmAction::BlankCredentials("zai".to_string()),
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the dead-key status goes with the blanked credential"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's streak cannot outlive the blanked key"
+        );
+    }
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the OAuth-side status goes with the blanked credential"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a blanked key"
+    );
+}
+
+/// R6: the endpoint re-key retires the stale `[ key rejected ]` verdict in
+/// the config handle's profile copy SAME-FRAME. The shared clear drops the
+/// three name-keyed stores, but the frame reads `Profile.fetch_status` from
+/// the config handle, and only the next 80 ms tick's `apply_usage` copies
+/// the cleared stores back — so the frame(s) drawn immediately after the
+/// commit flashed the retired pill. The clear now retires the handle copy
+/// too (the same assignment `apply_usage` derives from the cleared stores),
+/// so the frame right after the commit reads none: no `apply_usage` between
+/// the edit and the assertion.
+#[test]
+fn a_rekey_retires_the_handle_fetch_status_before_the_next_tick() {
+    use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["api"]);
+
+    let mut api = crate::testutil::blank_profile(&ProfileName::from("api"));
+    api.provider = Some(Provider::Zai);
+    api.api_key = Some("old-key".to_string());
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("api")],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+
+    // The rejected-key verdict lives in the third-party status store and the
+    // tick copies it into the handle — the populated state the frame renders
+    // the `[ key rejected ]` pill from.
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("api".to_string(), FetchStatus::AuthExpired);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+
+    // Re-key through the real producer (the Setup endpoint editor's ⏎).
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://new.example.com");
+    commit_config_field(&mut app, ConfigRow::BaseUrl);
+    app.config_draft.as_mut().expect("draft").api_key = InputState::new("new-key");
+    commit_config_field(&mut app, ConfigRow::ApiKey);
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("api"),
+            "the dead-key status store entry goes with the re-key"
+        );
+    }
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the frame right after the re-key reads no stale [ key rejected ] pill"
+    );
+}
+
+/// R8: a poison-skipped status-store clear cannot strand the stale pill on
+/// the handle. The store clears are poison-tolerant — a store lock poisoned
+/// at the clear instant keeps its entry — but that entry is dead weight:
+/// `apply_usage` reads these stores with `.lock().ok()` and skips a poisoned
+/// one, so nothing re-copies it. The unconditional handle write retires the
+/// pill the instant the credential is repaired, and the next tick's merge
+/// cannot resurrect it from the surviving entry (the healthy OAuth store's
+/// cleared entry misses the `contains_key` arm and the poisoned third-party
+/// fallback reads as `None`).
+#[test]
+fn a_poison_skipped_clear_still_retires_the_handle_verdict() {
+    use super::{ConfigRow, InputState, commit_config_field, enter_config_detail};
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["api"]);
+
+    let mut api = crate::testutil::blank_profile(&ProfileName::from("api"));
+    api.provider = Some(Provider::Zai);
+    api.api_key = Some("old-key".to_string());
+    api.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("api")],
+            ..AppState::default()
+        },
+        profiles: vec![api],
+    });
+
+    // The rejected-key verdict lives in both status stores; the third-party
+    // one (rank 280) is the clear we poison, the OAuth-side one (350) the
+    // clear that still succeeds — the skipped clear must not be able to
+    // strand the stale pill on the handle.
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("api".to_string(), FetchStatus::AuthExpired);
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("api".to_string(), FetchStatus::AuthExpired);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+
+    // Poison it the only way a mutex gets poisoned: panic while holding it
+    // (the lockorder.rs / oauth.rs fixtures' shape). The store stays poisoned
+    // for the rest of the test, so the clear below hits it exactly as a
+    // panic-at-the-clear-instant would.
+    let poisoner = Arc::clone(&app.third_party_status);
+    let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _held = poisoner.lock().expect("lock the store");
+        panic!("deliberate: poison the third_party_status store");
+    }));
+    assert!(poisoned.is_err(), "precondition: the closure panicked");
+
+    // Re-key through the real producer (the Setup endpoint editor's ⏎) —
+    // the round-6 flash test's exact sequence.
+    app.profile_cursor = 0;
+    enter_config_detail(&mut app);
+    app.config_draft.as_mut().expect("draft").base_url = InputState::new("https://new.example.com");
+    commit_config_field(&mut app, ConfigRow::BaseUrl);
+    app.config_draft.as_mut().expect("draft").api_key = InputState::new("new-key");
+    commit_config_field(&mut app, ConfigRow::ApiKey);
+
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("api"),
+            "the OAuth-side status entry goes with the re-key"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("api"),
+            "the old provider's streak cannot outlive the re-key"
+        );
+    }
+    // The poison-skipped store still holds its entry (`lock` recovers it
+    // through `into_inner`, the repo's documented idiom) — the dead weight
+    // the next tick's merge cannot reach.
+    {
+        let m = app
+            .third_party_status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            m.contains_key("api"),
+            "precondition: the poisoned store's entry survives the skipped clear"
+        );
+    }
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the handle retires the pill even when a poisoned store keeps the stale entry"
+    );
+    // The next tick's merge cannot resurrect the retired pill: the healthy
+    // OAuth store's cleared entry misses the `contains_key` arm and the
+    // poisoned third-party fallback reads as `None`.
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("api"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next tick does not resurrect the pill from the surviving entry"
+    );
+}
+
+/// R3-F2: an Alibaba console re-login retires the stale `console login
+/// expired` verdict — the shared clear, not a wait for the queued fetch.
+#[test]
+fn a_console_relogin_clears_the_stale_verdict() {
+    use crate::profile::{AppConfig, AppState, ConsoleCredential, ConsoleSite, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut qwen = crate::testutil::blank_profile(&ProfileName::from("qwen"));
+    qwen.base_url =
+        Some("https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic".to_string());
+    qwen.provider = Provider::from_base_url(
+        "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic",
+    );
+    qwen.api_key = Some("k".to_string());
+    qwen.console = Some(ConsoleCredential {
+        token: "dead".to_string(),
+        site: ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    crate::profile::save_profile(&qwen).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("qwen")],
+            ..AppState::default()
+        },
+        profiles: vec![qwen],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), FetchStatus::AuthExpired);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("qwen".to_string(), 9);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("qwen"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale console verdict is what the frame reads"
+    );
+
+    super::apply_console_login(
+        &mut app,
+        super::LoginSession {
+            name: "qwen".to_string(),
+            is_new: false,
+            generation: 0,
+            url: None,
+            stage: super::LoginStage::WaitingBrowser,
+            method: super::LoginMethod::Browser,
+            paste: None,
+            paste_field: None,
+        },
+        crate::alibaba_login::ConsoleLoginOutcome {
+            console: ConsoleCredential {
+                token: "fresh".to_string(),
+                site: ConsoleSite::International,
+                region: "ap-southeast-1".to_string(),
+            },
+        },
+    );
+
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("qwen"),
+            "the stale console verdict goes with the fresh session"
+        );
+    }
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("qwen"),
+            "the old session's streak cannot outlive the re-login"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("qwen"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale verdict after a console re-login"
+    );
+}
+
+/// R3-F2: applying a preset repoints the base_url — the old provider's streak
+/// must go with the shared clear, or the throttler hint can accuse the new
+/// endpoint with the old provider's evidence.
+#[test]
+fn a_preset_apply_clears_the_old_providers_streak() {
+    use crate::profile::{AppConfig, AppState, ProfileName};
+    use crate::providers::Provider;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut zai = crate::testutil::blank_profile(&ProfileName::from("zai"));
+    zai.provider = Some(Provider::Zai);
+    zai.api_key = Some("k".to_string());
+    zai.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    crate::profile::save_profile(&zai).expect("save the profile");
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("zai")],
+            ..AppState::default()
+        },
+        profiles: vec![zai],
+    });
+    app.third_party_status
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), FetchStatus::RateLimited);
+    app.third_party_streaks
+        .lock()
+        .unwrap()
+        .insert("zai".to_string(), crate::usage::ACTIVE_CAP_MAX_STREAK + 1);
+    assert!(
+        app.third_party_streaks.lock().unwrap().contains_key("zai"),
+        "precondition: the old provider's deep streak is on the books"
+    );
+
+    super::apply_preset_to(&mut app, "zai", "DeepSeek");
+
+    {
+        let m = app.third_party_streaks.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the repointed endpoint must not inherit the old provider's streak"
+        );
+    }
+    {
+        let m = app.third_party_status.lock().unwrap();
+        assert!(
+            !m.contains_key("zai"),
+            "the old provider's fetch status goes with the repoint"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("zai"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a preset repoint"
+    );
+}
+
+/// R4: the divergence resolver's Overwrite choice snapshots the LIVE login
+/// into the active profile's stored credential — a credential replacement, so
+/// the OAuth leg's stale verdict must retire with it, not survive until the
+/// next fetch. The choice is driven through the modal's real Enter router
+/// (`handle_divergence_key`), the live UI path, with the stale verdict
+/// already on the books.
+#[test]
+fn a_divergence_overwrite_clears_the_stale_status_chrome() {
+    use super::{Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_app_state, save_profile};
+    use crate::testutil::key;
+    use crate::tui::app::App;
+    use crate::usage::FetchStatus;
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Stored `rt-work` vs the live file's `rt-live`: a diverged active
+    // profile, the state the resolver exists for.
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("work")),
+            profiles: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    // The OAuth leg's stale verdict on the active profile, applied through
+    // the store — the pill the frame reads before the overwrite.
+    app.usage_status
+        .lock()
+        .unwrap()
+        .insert("work".to_string(), FetchStatus::AuthExpired);
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .unwrap()
+            .fetch_status,
+        Some(FetchStatus::AuthExpired),
+        "precondition: the stale verdict is what the frame reads"
+    );
+
+    // The live UI path: the poll flags the banner, `d` opens the resolver,
+    // Enter fires the Overwrite choice (cursor 0, no sibling).
+    force_poll(&mut app);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "precondition: the resolver opened on the diverged profile"
+    );
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .and_then(|p| p.refresh_token()),
+        Some("rt-live"),
+        "the overwrite replaces the stored credential with the live one"
+    );
+    {
+        let m = app.usage_status.lock().unwrap();
+        assert!(
+            !m.contains_key("work"),
+            "the OAuth-side verdict goes with the overwritten credential"
+        );
+    }
+    app.apply_usage();
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .unwrap()
+            .fetch_status,
+        None,
+        "the next frame shows no stale chrome after a divergence overwrite"
+    );
+}
+
+/// R5: the divergence resolver's Overwrite choice stores a fresh live OAuth
+/// login — the documented recovery for a revoked chain — so a standing
+/// name-bound `auth_broken` quarantine must lift with it (AUTH-1), like on
+/// every sibling fresh-login path. Without the lift a repaired member keeps
+/// rendering the `[ auth broken ]` chrome and stays out of chain walks
+/// forever: the poll skips the dead refresh, so nothing else clears it.
+/// The choice is driven through the modal's real Enter router
+/// (`handle_divergence_key`), the live UI path.
+#[test]
+fn a_divergence_overwrite_lifts_the_auth_broken_quarantine() {
+    use super::{Modal, handle_key};
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_app_state, save_profile};
+    use crate::testutil::key;
+    use crate::tui::app::App;
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // Stored `rt-work` vs the live file's `rt-live`: a diverged active
+    // profile carrying a persisted quarantine row — the state the finding
+    // names.
+    let mut work = Profile::new("work".to_string(), None, None);
+    work.credentials = Some(login_creds("rt-work"));
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        auth_broken: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("work")),
+            profiles: vec![ProfileName::from("work")],
+            auth_broken: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    {
+        let persisted = crate::profile::load_config().expect("reload").state;
+        assert!(
+            persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+            "precondition: the quarantine row is persisted"
+        );
+    }
+    assert!(
+        app.config().is_auth_broken(&ProfileName::from("work")),
+        "precondition: the frame renders the auth-broken chrome"
+    );
+
+    // The live UI path: the poll flags the banner, `d` opens the resolver,
+    // Enter fires the Overwrite choice (cursor 0, no sibling).
+    force_poll(&mut app);
+    handle_key(&mut app, key(KeyCode::Char('d')));
+    assert!(
+        matches!(app.modals.last(), Some(Modal::Divergence(_))),
+        "precondition: the resolver opened on the diverged profile"
+    );
+    handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .and_then(|p| p.refresh_token()),
+        Some("rt-live"),
+        "the overwrite replaces the stored credential with the live one"
+    );
+    assert!(
+        !app.config().is_auth_broken(&ProfileName::from("work")),
+        "the next frame renders no [ auth broken ] chrome after an overwrite"
+    );
+    let persisted = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+        "the persisted quarantine row goes with the overwritten credential"
+    );
+}
+
+/// R5: the first-login adopt stores a fresh live OAuth login the same way —
+/// the poll adopts it silently on a credential-less active profile (the
+/// shell `Profile::new` state `BlankCredentials` stores), so a standing
+/// `auth_broken` quarantine must lift with it (AUTH-1), like on every
+/// sibling fresh-login path. Driven through the real poll the live caller
+/// uses (`poll_credentials_divergence`), no direct call to
+/// `adopt_first_login`.
+#[test]
+fn an_adopted_first_login_lifts_the_auth_broken_quarantine() {
+    use crate::profile::{AppConfig, AppState, Profile, ProfileName, save_app_state, save_profile};
+    use crate::tui::app::App;
+
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // A credential-less (blanked) active profile: no stored credentials.json,
+    // a standing quarantine row, and a fresh live login CC just wrote.
+    let work = Profile::new("work".to_string(), None, None);
+    save_app_state(&AppState {
+        profiles: vec![ProfileName::from("work")],
+        auth_broken: vec![ProfileName::from("work")],
+        ..AppState::default()
+    })
+    .expect("persist app state");
+    save_profile(&work).expect("save the profile");
+    write_live_creds(&creds_ra("rt-live", "at-1"));
+
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            active_profile: Some(ProfileName::from("work")),
+            profiles: vec![ProfileName::from("work")],
+            auth_broken: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![work],
+    });
+
+    {
+        let persisted = crate::profile::load_config().expect("reload").state;
+        assert!(
+            persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+            "precondition: the quarantine row is persisted"
+        );
+    }
+    assert!(
+        app.config().is_auth_broken(&ProfileName::from("work")),
+        "precondition: the frame renders the auth-broken chrome"
+    );
+
+    // The real adopt path: the poll sees the fresh live login on the
+    // credential-less active profile and adopts it silently.
+    force_poll(&mut app);
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .and_then(|p| p.refresh_token()),
+        Some("rt-live"),
+        "the poll adopts the first login into the stored credential"
+    );
+    assert!(
+        !app.config().is_auth_broken(&ProfileName::from("work")),
+        "the next frame renders no [ auth broken ] chrome after an adopt"
+    );
+    let persisted = crate::profile::load_config().expect("reload").state;
+    assert!(
+        !persisted.auth_broken.iter().any(|n| n.as_str() == "work"),
+        "the persisted quarantine row goes with the adopted login"
     );
 }
 
@@ -2365,6 +4480,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("disable account", Some('d')),
             ("refresh all accounts", Some('f')),
             ("new account", Some('n')),
+            ("start daemon", Some('s')),
         ]
     );
 
@@ -2378,6 +4494,7 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
             ("refresh all accounts", Some('f')),
             ("toggle estimates", Some('e')),
             ("toggle pace marker", Some('p')),
+            ("start daemon", Some('s')),
         ]
     );
 
@@ -2389,9 +4506,167 @@ fn the_account_tabs_offer_the_focused_account_plus_the_global_actions() {
         entries(&empty),
         [
             ("refresh all accounts", Some('f')),
-            ("new account", Some('n'))
+            ("new account", Some('n')),
+            ("start daemon", Some('s')),
         ]
     );
+}
+
+/// Every tab's menu ends on the one daemon verb that applies: `start daemon`
+/// with no daemon up, `stop daemon` with one up, fresh or stale, and neither
+/// while a start or stop is in flight. It rides the tab-global group.
+#[test]
+fn every_tab_offers_the_daemon_verb_that_applies() {
+    use super::{Tab, build_action_menu};
+    use crate::daemon::DaemonHealth;
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with(vec![Profile::new("acct".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let daemon_verbs = |app: &super::App| -> Vec<&'static str> {
+        build_action_menu(app)
+            .items
+            .iter()
+            .map(|i| i.label)
+            .filter(|l| l.ends_with(" daemon"))
+            .collect()
+    };
+
+    for tab in Tab::ALL {
+        app.tab = tab;
+        for (health, verb) in [
+            (DaemonHealth::Absent, "start daemon"),
+            (DaemonHealth::Stale, "stop daemon"),
+            (DaemonHealth::Fresh, "stop daemon"),
+        ] {
+            app.daemon_health = health;
+            app.daemon_control_busy = false;
+            let menu = build_action_menu(&app);
+            assert_eq!(
+                menu.items.last().map(|i| i.label),
+                Some(verb),
+                "{tab:?} with the daemon {health:?}"
+            );
+            assert!(
+                menu.scoped_len < menu.items.len(),
+                "{tab:?}: the verb is tab-global, never under the account's name"
+            );
+            assert_eq!(
+                daemon_verbs(&app),
+                [verb],
+                "{tab:?}: only the verb that applies"
+            );
+            app.daemon_control_busy = true;
+            assert!(
+                daemon_verbs(&app).is_empty(),
+                "{tab:?}: no verb while one is in flight"
+            );
+        }
+    }
+}
+
+/// Each start/stop outcome lands as its own toast, frees the menu's verb, and
+/// re-probes the header chip at once rather than a throttled second later.
+#[test]
+fn daemon_control_outcomes_toast_and_rearm_the_verb() {
+    use super::{DaemonControlResult as R, ToastKind};
+    use crate::daemon::{DaemonHealth, DaemonStop, StartOutcome};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    let cases = [
+        (
+            R::Start(Ok(StartOutcome::Holding)),
+            ToastKind::Success,
+            "daemon started",
+        ),
+        (
+            R::Start(Ok(StartOutcome::Exited)),
+            ToastKind::Danger,
+            "daemon exited at start\nsee ~/.clauth/daemon.log",
+        ),
+        (
+            R::Start(Ok(StartOutcome::NotYet)),
+            ToastKind::Warning,
+            "daemon not up after 5s\nsee ~/.clauth/daemon.log",
+        ),
+        (
+            R::Start(Err("no such file".to_string())),
+            ToastKind::Danger,
+            "daemon start failed\nno such file",
+        ),
+        (
+            R::Stop(Ok(DaemonStop::Stopped)),
+            ToastKind::Success,
+            "daemon stopped",
+        ),
+        (
+            R::Stop(Ok(DaemonStop::NotRunning)),
+            ToastKind::Info,
+            "no daemon was running",
+        ),
+        (
+            R::Stop(Ok(DaemonStop::Replaced)),
+            ToastKind::Warning,
+            "daemon stopped\nanother daemon took over",
+        ),
+        (
+            R::Stop(Err("wedged".to_string())),
+            ToastKind::Danger,
+            "daemon stop failed\nwedged",
+        ),
+    ];
+    for (result, kind, body) in cases {
+        app.daemon_control_busy = true;
+        app.daemon_health = DaemonHealth::Fresh;
+        app.daemon_control_tx.send(result).expect("send");
+        super::drain_daemon_control(&mut app);
+        let toast = app.toasts.back().expect("a toast");
+        assert_eq!((toast.kind, toast.body.as_str()), (kind, body));
+        assert!(!app.daemon_control_busy, "{body:?} frees the verb");
+        assert_eq!(
+            app.daemon_health,
+            DaemonHealth::Absent,
+            "{body:?} re-probed the chip (no daemon in the sandbox)"
+        );
+    }
+}
+
+/// The menu's verbs reach their workers and the tick lands their outcome. A
+/// test build refuses to start a daemon, since its binary is the test harness,
+/// and says so; the stop runs the real termination, which finds no daemon in
+/// the sandbox.
+#[test]
+fn the_daemon_verbs_reach_their_workers() {
+    use super::{ActionMenuAction, dispatch_action_menu_action, join_test_workers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StartDaemon);
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("daemon start failed\na test build starts no daemon")
+    );
+    assert!(
+        !app.daemon_control_busy,
+        "a refused start leaves the verb armed"
+    );
+
+    dispatch_action_menu_action(&mut app, ActionMenuAction::StopDaemon);
+    assert!(
+        app.daemon_control_busy,
+        "the stop holds the verb back while it runs"
+    );
+    assert_eq!(
+        app.toasts.back().map(|t| t.body.as_str()),
+        Some("stopping daemon")
+    );
+    join_test_workers();
+    super::on_tick(&mut app);
+    assert!(
+        app.toasts.iter().any(|t| t.body == "no daemon was running"),
+        "the tick drains the worker's outcome"
+    );
+    assert!(!app.daemon_control_busy);
 }
 
 /// Usage `r` and the action menu's "refresh usage" share one gate. A generic
@@ -3761,7 +6036,7 @@ fn status_detail_up_steps_back_from_the_published_bound() {
 /// Plugin's detail pane, same defect and same fix as the Status one above.
 #[test]
 fn plugin_detail_up_steps_back_from_the_published_bound() {
-    use super::{KeyCode, PluginFocus, Tab, handle_key};
+    use super::{KeyCode, ServicesFocus, Tab, handle_key};
     use crate::profile::{AppConfig, AppState};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -3769,19 +6044,19 @@ fn plugin_detail_up_steps_back_from_the_published_bound() {
         state: AppState::default(),
         profiles: vec![],
     });
-    app.tab = Tab::Plugin;
-    app.plugin.focus = PluginFocus::Detail;
+    app.tab = Tab::Services;
+    app.services.focus = ServicesFocus::Detail;
 
-    app.plugin.detail_max_scroll.set(40);
+    app.services.detail_max_scroll.set(40);
     for _ in 0..60 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     }
-    assert_eq!(app.plugin.detail_scroll, 40, "↓ stops at the bound");
+    assert_eq!(app.services.detail_scroll, 40, "↓ stops at the bound");
 
-    app.plugin.detail_max_scroll.set(12);
+    app.services.detail_max_scroll.set(12);
     handle_key(&mut app, crate::testutil::key(KeyCode::Up));
     assert_eq!(
-        app.plugin.detail_scroll, 11,
+        app.services.detail_scroll, 11,
         "↑ steps back from the bound, not the stale offset"
     );
 }
@@ -4884,6 +7159,70 @@ fn auto_start_queue_space_noops_until_an_account_opts_in() {
     )
     .expect("parse profiles.toml");
     assert!(reloaded.auto_start_queue, "the toggle persists to disk");
+}
+
+// ── auto-update (the [update] toggle) ────────────────────────────────────────
+
+/// The row flips the persisted `[update]` table through the real Config
+/// router: space off writes `auto_update = false` explicitly, ⏎ back on
+/// omits the whole table again (on is the default, so nothing renders).
+#[test]
+fn auto_update_row_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::AutoUpdate)
+        .unwrap();
+    assert!(app.config().state.update.auto_update, "on by default");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(
+        !app.config().state.update.auto_update,
+        "space toggles it off"
+    );
+
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let reloaded: crate::profile::AppState =
+        toml::from_str(&std::fs::read_to_string(&path).expect("read profiles.toml"))
+            .expect("parse profiles.toml");
+    assert!(!reloaded.update.auto_update, "off persists to disk");
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        on_disk.contains("auto_update = false"),
+        "an explicit off must render or the next load reverts it to on:\n{on_disk}"
+    );
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        app.config().state.update.auto_update,
+        "⏎ mirrors space and toggles it back on"
+    );
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !on_disk.contains("update"),
+        "on (default) omits the whole [update] table:\n{on_disk}"
+    );
+}
+
+/// `App::new` reads the saved toggle: with `auto_update = false` persisted no
+/// update thread spawns — no handle, so no network path is ever driven.
+#[test]
+fn saved_off_update_leaves_new_app_with_no_update_handle() {
+    use crate::profile::AppConfig;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut state = crate::profile::AppState::default();
+    state.update.auto_update = false;
+    crate::profile::save_app_state(&state).expect("persist off toggle");
+    let app = App::new(AppConfig {
+        state,
+        profiles: Vec::new(),
+    });
+    assert!(
+        app.update_handle.is_none(),
+        "saved off → no update thread at startup"
+    );
 }
 
 // `money spent` is its own row, not an alias of `quota spent`: staying is free
@@ -6369,7 +8708,7 @@ fn write_threshold_silently_noops_for_a_vanished_member() {
     state.fallback_chain.retain(|n| n.as_str() != a.as_str());
     crate::profile::save_app_state(&state).expect("drop a from disk");
 
-    super::write_threshold(&mut app, 90.0);
+    super::write_threshold(&mut app, &a, 90.0);
 
     assert!(
         app.toasts.is_empty(),
@@ -6692,7 +9031,7 @@ fn fallback_weekly_at_and_max_spend_editors_still_open_via_space() {
     app.fallback_detail_cursor = weekly_at_row();
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
     assert!(
-        app.fallback_weekly_draft.is_some(),
+        card_edit_row(&app) == Some(super::FallbackRow::WeeklyAt),
         "space still opens the weekly-at editor"
     );
     super::handle_key(&mut app, key(KeyCode::Esc));
@@ -6700,12 +9039,17 @@ fn fallback_weekly_at_and_max_spend_editors_still_open_via_space() {
     app.fallback_detail_cursor = max_spend_row();
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
     assert!(
-        app.fallback_max_spend_draft.is_some(),
+        card_edit_row(&app) == Some(super::FallbackRow::MaxSpend),
         "space still opens the max-spend editor"
     );
 }
 
 // ── fallback max auto-spend (real money) ────────────────────────────────────
+
+/// The row the member card's open edit sits on, `None` at rest.
+fn card_edit_row(app: &App) -> Option<super::FallbackRow> {
+    app.fallback_edit.as_ref().map(|e| e.state.row())
+}
 
 /// Read the row's position rather than hardcoding it, so inserting a row above
 /// it can't silently point these tests at a different field.
@@ -6754,7 +9098,10 @@ fn fallback_max_spend_editor_types_and_persists() {
 
     // ⏎ opens the editor seeded with the current ceiling.
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
-    assert!(app.fallback_max_spend_draft.is_some(), "⏎ opens the field");
+    assert!(
+        card_edit_row(&app) == Some(super::FallbackRow::MaxSpend),
+        "⏎ opens the field"
+    );
 
     // The field opens seeded with the current ceiling ("0.00"), so clear it
     // before typing or the digits append to it.
@@ -6765,7 +9112,7 @@ fn fallback_max_spend_editor_types_and_persists() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
-    assert!(app.fallback_max_spend_draft.is_none(), "⏎ closes the field");
+    assert!(app.fallback_edit.is_none(), "⏎ closes the field");
     assert_eq!(
         app.config()
             .find(&crate::profile::ProfileName::from("a"))
@@ -6794,7 +9141,7 @@ fn fallback_max_spend_editor_is_inert_while_spend_budget_is_off() {
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
     assert!(
-        app.fallback_max_spend_draft.is_none(),
+        app.fallback_edit.is_none(),
         "⏎ must not open the editor while the row is inert"
     );
 }
@@ -6824,7 +9171,7 @@ fn fallback_max_spend_editor_refuses_an_infinite_ceiling() {
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
     assert!(
-        app.fallback_max_spend_draft.is_some(),
+        card_edit_row(&app) == Some(super::FallbackRow::MaxSpend),
         "an invalid ceiling keeps the field open"
     );
     assert_eq!(
@@ -7067,7 +9414,8 @@ fn tokens_action_menu_sets_and_swaps_the_model_filter() {
             "show claude models",
             "show other models",
             "toggle cache counting",
-            "reload stats"
+            "reload stats",
+            "start daemon",
         ]
     );
 
@@ -8690,12 +11038,15 @@ fn fallback_weekly_override_editor_sets_and_clears() {
 
     // ⏎ opens the editor with an EMPTY seed (no override yet).
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
-    assert!(app.fallback_weekly_draft.is_some(), "⏎ opens the field");
+    assert!(
+        card_edit_row(&app) == Some(super::FallbackRow::WeeklyAt),
+        "⏎ opens the field"
+    );
     for c in ['9', '0'] {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
-    assert!(app.fallback_weekly_draft.is_none(), "⏎ closes the field");
+    assert!(app.fallback_edit.is_none(), "⏎ closes the field");
     assert_eq!(
         app.config()
             .find(&crate::profile::ProfileName::from("a"))
@@ -8724,7 +11075,10 @@ fn fallback_weekly_override_editor_sets_and_clears() {
         super::handle_key(&mut app, key(KeyCode::Char(c)));
     }
     super::handle_key(&mut app, key(KeyCode::Enter));
-    assert!(app.fallback_weekly_draft.is_some(), "invalid stays open");
+    assert!(
+        card_edit_row(&app) == Some(super::FallbackRow::WeeklyAt),
+        "invalid stays open"
+    );
     assert_eq!(
         app.config()
             .find(&crate::profile::ProfileName::from("a"))
@@ -8748,7 +11102,7 @@ fn fallback_weekly_override_editor_is_inert_while_gate_is_off() {
 
     super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
     assert!(
-        app.fallback_weekly_draft.is_none(),
+        app.fallback_edit.is_none(),
         "⏎ must not open the editor while the weekly gate is off"
     );
 }
@@ -8916,147 +11270,6 @@ fn a_tick_re_tallies_live_sessions_that_appeared_after_startup() {
             "the tally must refresh on the {tab:?} tab too"
         );
     }
-}
-
-/// Two `clauth start` children on one account plus a third on another — the only
-/// shape that reaches BOTH the summary line's plural and the per-account
-/// sub-line's `·` count. Every other `runtime_check_*` fixture is single-session,
-/// so `instances > 1` never executed and the `{name} · {instances}` sub-line
-/// shipped with no pin: reverting it left the suite fully green. The summary's
-/// `account`/`accounts` split needs two hosting accounts for the same reason,
-/// and only this fixture has them, so one test carries both.
-#[test]
-fn runtime_check_names_a_multi_session_account_with_its_count() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![
-            Profile::new("busy".to_string(), None, None),
-            Profile::new("solo".to_string(), None, None),
-        ],
-    });
-
-    let mut markers = Vec::new();
-    for (name, sid) in [("busy", "4242-0"), ("busy", "4242-1"), ("solo", "4343-0")] {
-        crate::live_sessions::register(&crate::live_sessions::LiveSession {
-            session_id: sid.to_string(),
-            start_profile: name.to_string(),
-            harness: crate::harness::Harness::Claude,
-            pid: 4242,
-            started_at: 1_700_000_000_000,
-            cwd: None,
-            isolated: false,
-            follows_chain: false,
-            intended_member: None,
-            chain_cursor: None,
-            current_member: None,
-            last_swap_at: None,
-            launch_store: None,
-        })
-        .expect("register row");
-        markers.push(
-            crate::runtime::hold_session_row_marker(
-                &crate::profile::ProfileName::from(name),
-                false,
-                sid,
-            )
-            .expect("hold the marker"),
-        );
-    }
-
-    // `r`, the one path that re-collects the fleet tally these rows seed.
-    super::recompute_plugin_checks(&mut app, true);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .filter(|l| l.starts_with("live:") || l.starts_with("  "))
-            .cloned()
-            .collect::<Vec<_>>(),
-        vec![
-            "live: 3 across 2 accounts".to_string(),
-            "  busy · 2".to_string(),
-            "  solo".to_string(),
-        ],
-        "got {:?}",
-        check.detail
-    );
-}
-
-/// The singular half of the same summary line, which the fixture above cannot
-/// reach: at 3 sessions across 2 accounts BOTH counts pluralize, so swapping
-/// the `plural()` argument from the account count to the session count changes
-/// nothing and the mutant ships green. Two sessions on ONE account is the
-/// smallest shape where the two counts disagree, so it is the only shape that
-/// proves the suffix tracks the accounts.
-#[test]
-fn runtime_check_says_one_account_when_every_live_session_shares_it() {
-    use crate::profile::{AppConfig, AppState, Profile};
-    let _home = crate::testutil::HomeSandbox::new();
-    let mut app = App::new(AppConfig {
-        state: AppState::default(),
-        profiles: vec![Profile::new("busy".to_string(), None, None)],
-    });
-
-    let mut markers = Vec::new();
-    for sid in ["5151-0", "5151-1"] {
-        crate::live_sessions::register(&crate::live_sessions::LiveSession {
-            session_id: sid.to_string(),
-            start_profile: "busy".to_string(),
-            harness: crate::harness::Harness::Claude,
-            pid: 5151,
-            started_at: 1_700_000_000_000,
-            cwd: None,
-            isolated: false,
-            follows_chain: false,
-            intended_member: None,
-            chain_cursor: None,
-            current_member: None,
-            last_swap_at: None,
-            launch_store: None,
-        })
-        .expect("register row");
-        markers.push(
-            crate::runtime::hold_session_row_marker(
-                &crate::profile::ProfileName::from("busy"),
-                false,
-                sid,
-            )
-            .expect("hold the marker"),
-        );
-    }
-
-    // `r`, the one path that re-collects the fleet tally these rows seed.
-    super::recompute_plugin_checks(&mut app, true);
-
-    let check = app
-        .plugin
-        .checks
-        .iter()
-        .find(|c| c.label == "runtime")
-        .expect("runtime check");
-    assert_eq!(
-        check
-            .detail
-            .iter()
-            .filter(|l| l.starts_with("live:") || l.starts_with("  "))
-            .cloned()
-            .collect::<Vec<_>>(),
-        vec![
-            "live: 2 across 1 account".to_string(),
-            "  busy · 2".to_string()
-        ],
-        "got {:?}",
-        check.detail
-    );
 }
 
 // ── chain_would_mix ──────────────────────────────────────────────────────────
@@ -9325,16 +11538,16 @@ fn fallback_add_enter_commits_directly_when_add_would_not_mix() {
     );
 }
 
-// ── `● daemon` header dot at startup ─────────────────────────────────────────
+// ── `[ daemon ]` header chip at startup ─────────────────────────────────────
 
-/// The dot's health must be PROBED at construct, never seeded with a constant.
+/// The chip's health must be PROBED at construct, never seeded with a constant.
 /// The first paint happens before any `on_tick` and `poll_daemon_health` is
 /// throttled to 1 Hz, so a seeded `Absent` renders "no daemon runs" as fact for
 /// the first second of every launch while one is live. Two legs on one sandbox:
-/// with the singleton flock held the seed reads non-`Absent` (the dot shows),
-/// with it released `Absent` (the dot hides) — so no constant seed passes both.
+/// with the singleton flock held the seed reads non-`Absent` (the chip colors),
+/// with it released `Absent` (the chip dims) — so no constant seed passes both.
 #[test]
-fn construct_probes_the_daemon_dot_instead_of_seeding_a_constant() {
+fn construct_probes_the_daemon_health_instead_of_seeding_a_constant() {
     use crate::daemon::{DaemonHealth, hold_daemon_lock};
 
     let _home = crate::testutil::HomeSandbox::new();
@@ -9350,7 +11563,7 @@ fn construct_probes_the_daemon_dot_instead_of_seeding_a_constant() {
     assert_eq!(
         app_with(Vec::new()).daemon_health,
         DaemonHealth::Absent,
-        "no holder → the seed hides the dot, proving the probe reads the lock"
+        "no holder → the seed dims the chip, proving the probe reads the lock"
     );
 }
 
@@ -9386,8 +11599,9 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
                 ("duplicate account", Some('d')),
                 ("save as preset", Some('s')),
                 ("apply preset", Some('p')),
+                ("start daemon", Some('t')),
             ],
-            "{focus:?} carries the account-scoped trio",
+            "{focus:?} carries the account-scoped trio, then the daemon verb",
         );
         assert_eq!(menu.scoped_len, 3, "all three act on the account");
         assert_eq!(menu.context.as_deref(), Some("acct"));
@@ -9402,8 +11616,8 @@ fn the_setup_tab_offers_the_focused_accounts_whole_account_actions() {
             .iter()
             .map(|i| (i.label, i.hotkey))
             .collect::<Vec<_>>(),
-        [("apply preset", Some('p'))],
-        "`+ new` offers apply preset only",
+        [("apply preset", Some('p')), ("start daemon", Some('s'))],
+        "`+ new` offers apply preset, then the daemon verb",
     );
     assert_eq!(menu.scoped_len, 1);
     assert_eq!(menu.context, None, "the draft has no name yet");
@@ -10135,7 +12349,7 @@ fn the_login_row_keeps_its_other_two_flows() {
     );
 }
 
-// ── herdr row (Plugin tab) ──────────────────────────────────────────────────
+// ── herdr row (Services tab) ──────────────────────────────────────────────────
 
 use crate::herdr::{ConfigStatus, HerdrProbe, RegistryEntry, SidebarState};
 
@@ -10300,8 +12514,103 @@ fn herdr_check_warns_and_offers_fix_when_key_unbound() {
     assert!(check.detail.iter().any(|l| l == "key: not bound"));
     assert!(matches!(
         &check.fix,
-        Some(super::PluginFix::HealHerdrConfig(p)) if p == &std::path::PathBuf::from("/tmp/herdr/config.toml")
+        Some(super::ServiceFix::HealHerdrConfig(p)) if p == &std::path::PathBuf::from("/tmp/herdr/config.toml")
     ));
+}
+
+/// The whole herdr detail in cloudy's order: the linked checkout's root first,
+/// then the plugin, the herdr version, key, sidebar, and the fix block last.
+#[test]
+fn herdr_check_reads_root_first_and_the_fix_last() {
+    let mut entry = herdr_entry(true, Some("0.8.0"), vec![]);
+    entry.source_kind = Some("local".into());
+    entry.plugin_root = Some("/home/u/src/clauth/herdr-plugin".into());
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), Some(entry), None),
+        Some(&herdr_config(true, None, SidebarState::Templated)),
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "root: /home/u/src/clauth/herdr-plugin".to_string(),
+            "plugin: linked (local)".to_string(),
+            "herdr: 0.8.2".to_string(),
+            "key: not bound".to_string(),
+            "sidebar: templated".to_string(),
+            "adds the keybinding and sidebar row to herdr's config".to_string(),
+            "f  heal herdr config".to_string(),
+        ],
+        "every line in order, by equality"
+    );
+    assert_eq!(
+        check.problems.iter().map(|p| p.line).collect::<Vec<_>>(),
+        vec![6],
+        "the fix line's index follows the reorder"
+    );
+
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), None, None),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "plugin: not installed".to_string(),
+            "herdr: 0.8.2".to_string(),
+            String::new(),
+            "  clauth herdr install".to_string(),
+        ],
+        "an uninstalled plugin leads with its verdict"
+    );
+
+    // The registry warnings follow `plugin`, the version follows them, and the
+    // floor warning sits under the version it compares.
+    let mut entry = herdr_entry(true, Some("0.8.0"), vec!["plugin root is gone"]);
+    entry.source_kind = Some("local".into());
+    entry.plugin_root = Some("/home/u/src/clauth/herdr-plugin".into());
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.7.0"), Some(entry.clone()), None),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail,
+        vec![
+            "root: /home/u/src/clauth/herdr-plugin".to_string(),
+            "plugin: linked (local)".to_string(),
+            "  plugin root is gone".to_string(),
+            "herdr: 0.7.0".to_string(),
+            "plugin needs herdr 0.8.0 or newer".to_string(),
+            "key: prefix+a".to_string(),
+            "sidebar: templated".to_string(),
+        ],
+        "warnings, version and floor warning in order"
+    );
+
+    // A probe error sits under the version, with or without a registry entry.
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), Some(entry), Some("boom: it broke")),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail[..5].to_vec(),
+        vec![
+            "root: /home/u/src/clauth/herdr-plugin".to_string(),
+            "plugin: linked (local)".to_string(),
+            "  plugin root is gone".to_string(),
+            "herdr: 0.8.2".to_string(),
+            "  boom: it broke".to_string(),
+        ],
+        "the error follows the version when an entry exists"
+    );
+    let check = super::herdr_check(
+        &herdr_probe(Some("0.8.2"), None, Some("boom: it broke")),
+        Some(&healthy_herdr_config()),
+    );
+    assert_eq!(
+        check.detail,
+        vec!["herdr: 0.8.2".to_string(), "  boom: it broke".to_string()],
+        "with no entry the version and the error are the whole detail"
+    );
 }
 
 #[test]
@@ -10349,17 +12658,577 @@ fn version_satisfies_stays_quiet_on_unparseable() {
 fn herdr_row_absent_when_herdr_does_not_resolve() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app();
-    app.plugin.herdr = Some(None);
-    super::recompute_plugin_checks(&mut app, false);
+    app.services.herdr = Some(None);
+    super::recompute_services_checks(&mut app, false);
     assert!(
-        !app.plugin.checks.iter().any(|c| c.label == "herdr"),
+        !app.services.checks.iter().any(|c| c.label == "herdr"),
         "a resolved-but-absent herdr must not render a row, got {:?}",
-        app.plugin
+        app.services
             .checks
             .iter()
             .map(|c| c.label)
             .collect::<Vec<_>>()
     );
+}
+
+/// Drain the Services probe workers' results the way the tick does, waiting up
+/// to 10 s for every running one to land.
+fn await_service_probes(app: &mut App) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while app.services.herdr_probe.running || app.services.standalone_probe.running {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a Services probe did not land within 10 s"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        super::drain_service_probes(app);
+    }
+}
+
+/// `r` during a probe already in flight queues one follow-up run, started
+/// when the held run lands, so the toast's "re-running service checks" holds
+/// for a change made just before the key. A second `r` queues no second run.
+/// Both Services workers share it.
+#[test]
+fn r_during_a_running_probe_queues_one_follow_up_run() {
+    use ratatui::crossterm::event::KeyCode;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static HERDR_RUNS: AtomicUsize = AtomicUsize::new(0);
+    static STANDALONE_RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn herdr_stub() -> Option<crate::herdr::HerdrProbe> {
+        HERDR_RUNS.fetch_add(1, Ordering::SeqCst);
+        None
+    }
+    fn standalone_stub() -> super::StandaloneShunt {
+        STANDALONE_RUNS.fetch_add(1, Ordering::SeqCst);
+        super::StandaloneShunt::default()
+    }
+    let _home = crate::testutil::HomeSandbox::new();
+    HERDR_RUNS.store(0, Ordering::SeqCst);
+    STANDALONE_RUNS.store(0, Ordering::SeqCst);
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.herdr_probe.prober = Some(herdr_stub);
+    app.services.standalone_probe.prober = Some(standalone_stub);
+    // Both runs held in flight: set by hand, so neither stub runs for them.
+    app.services.herdr_probe.running = true;
+    app.services.standalone_probe.running = true;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('r')));
+    assert_eq!(
+        (
+            HERDR_RUNS.load(Ordering::SeqCst),
+            STANDALONE_RUNS.load(Ordering::SeqCst)
+        ),
+        (0, 0),
+        "no run starts beside the one in flight"
+    );
+
+    app.services
+        .herdr_probe
+        .tx
+        .send(Some(healthy_herdr_probe()))
+        .expect("send");
+    app.services
+        .standalone_probe
+        .tx
+        .send(super::StandaloneShunt::default())
+        .expect("send");
+    super::drain_service_probes(&mut app);
+    assert!(
+        app.services.herdr_probe.running && app.services.standalone_probe.running,
+        "each held run's landing starts its follow-up"
+    );
+    await_service_probes(&mut app);
+    assert_eq!(
+        (
+            HERDR_RUNS.load(Ordering::SeqCst),
+            STANDALONE_RUNS.load(Ordering::SeqCst)
+        ),
+        (1, 1),
+        "one follow-up each, however many `r`s"
+    );
+    assert!(
+        matches!(app.services.herdr, Some(None)),
+        "the follow-up's result is the one adopted"
+    );
+
+    // The per-tick refresh over a run in flight queues nothing: only `r` does.
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.herdr_probe.prober = Some(herdr_stub);
+    app.services.standalone_probe.prober = Some(standalone_stub);
+    app.services.herdr_probe.running = true;
+    app.services.standalone_probe.running = true;
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.herdr_probe.rerun && !app.services.standalone_probe.rerun,
+        "the refresh queues no follow-up"
+    );
+}
+
+/// A drain adopts the newest of the results that landed since the last one,
+/// and a drain with nothing landed leaves the rows as they are: no recompute.
+#[test]
+fn a_probe_drain_adopts_the_newest_result_and_skips_an_empty_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let readout = |version: &str| super::StandaloneShunt {
+        found: None,
+        unread_bind: None,
+        answer: Some((version.to_string(), "127.0.0.1:3067".parse().unwrap())),
+    };
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    app.services.standalone_probe.running = true;
+    for version in ["0.49.0", "0.49.1"] {
+        app.services
+            .standalone_probe
+            .tx
+            .send(readout(version))
+            .expect("send");
+    }
+    super::drain_service_probes(&mut app);
+    assert_eq!(
+        app.services.standalone,
+        Some(readout("0.49.1")),
+        "the newest landing wins"
+    );
+    assert!(!app.services.standalone_probe.running);
+
+    app.services.checks.clear();
+    super::drain_service_probes(&mut app);
+    assert!(
+        app.services.checks.is_empty(),
+        "a drain with nothing landed recomputes nothing"
+    );
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.checks.is_empty(),
+        "fixture control: a recompute refills the rows"
+    );
+}
+
+/// With no gateway adopted, entering the tab probes what runs standalone on a
+/// worker, and the readout lands on the `shunt` row with no key; `r` probes
+/// again. The adopted-gateway path never starts it.
+#[test]
+fn an_unadopted_gateway_row_probes_what_runs_standalone_with_no_key() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static RUNS: AtomicUsize = AtomicUsize::new(0);
+    fn stub() -> super::StandaloneShunt {
+        RUNS.fetch_add(1, Ordering::SeqCst);
+        super::StandaloneShunt {
+            found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+            unread_bind: None,
+            answer: Some(("0.49.1".to_string(), "127.0.0.1:3067".parse().unwrap())),
+        }
+    }
+    let _home = crate::testutil::HomeSandbox::new();
+    RUNS.store(0, Ordering::SeqCst);
+
+    let mut app = bare_app();
+    app.services.standalone_probe.prober = Some(stub);
+    super::switch_tab(&mut app, super::Tab::Services);
+    assert!(
+        app.services.standalone_probe.running,
+        "entering the tab starts the probe, no `r`"
+    );
+    await_service_probes(&mut app);
+    let shunt = |app: &App| {
+        app.services
+            .checks
+            .iter()
+            .find(|c| c.label == "shunt")
+            .expect("shunt row")
+            .detail
+            .clone()
+    };
+    assert_eq!(
+        shunt(&app),
+        vec![
+            "state: not adopted".to_string(),
+            "found: /cfg/shunt.toml".to_string(),
+            "standalone shunt 0.49.1 answers on 127.0.0.1:3067".to_string(),
+        ],
+    );
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.standalone_probe.running,
+        "the per-tick refresh reuses the cached readout"
+    );
+    super::recompute_services_checks(&mut app, true);
+    assert!(app.services.standalone_probe.running, "`r` probes again");
+    await_service_probes(&mut app);
+    assert_eq!(RUNS.load(Ordering::SeqCst), 2, "one run per trigger");
+
+    // An adopted gateway: no standalone probe, and a readout cached from
+    // before the adoption never reaches the row.
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let config = dir.join("shunt.toml");
+    std::fs::write(&config, "port = 3001\n").expect("config");
+    std::fs::write(
+        dir.join("gateway.toml"),
+        format!("config = {:?}\n", config.to_string_lossy()),
+    )
+    .expect("record");
+    let mut app = bare_app();
+    app.services.standalone_probe.prober = Some(stub);
+    app.services.standalone = Some(super::StandaloneShunt {
+        found: Some(std::path::PathBuf::from("/cfg/shunt.toml")),
+        unread_bind: Some(super::UnreadBind::Yaml),
+        answer: Some(("0.49.1".to_string(), "127.0.0.1:3067".parse().unwrap())),
+    });
+    super::recompute_services_checks(&mut app, true);
+    assert!(
+        !app.services.standalone_probe.running,
+        "an adopted gateway never probes for a standalone one"
+    );
+    assert!(
+        shunt(&app).iter().any(|l| l.starts_with("config: ")),
+        "fixture control: the row reads the adopted record: {:?}",
+        shunt(&app)
+    );
+    assert!(
+        !shunt(&app).iter().any(|l| l.starts_with("found")
+            || l.starts_with("bind")
+            || l.starts_with("standalone")),
+        "{:?}",
+        shunt(&app)
+    );
+}
+
+/// Entering the Services tab with an installed herdr shows its row with no
+/// key: the tab entry starts the probe (the real `herdr::probe`, over a stub
+/// herdr pinned through `HERDR_BIN_PATH`) and the drain adopts it.
+#[cfg(unix)]
+#[test]
+fn entering_the_services_tab_shows_the_herdr_row_with_no_key() {
+    let home = crate::testutil::HomeSandbox::new();
+    let shim = crate::testutil::stateful_heal_shim(home.home());
+    let listing = crate::herdr::plugin_list_json(crate::herdr::GITHUB);
+    let _env = crate::testutil::heal_env(&home, &shim, &listing, &listing, "", &[]);
+
+    let mut app = bare_app();
+    app.services.herdr_probe.prober = Some(crate::herdr::probe);
+    super::switch_tab(&mut app, super::Tab::Services);
+    assert!(
+        app.services.herdr_probe.running,
+        "entering the tab starts the probe, no `r`"
+    );
+    await_service_probes(&mut app);
+
+    let herdr = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "herdr")
+        .unwrap_or_else(|| {
+            panic!(
+                "the herdr row shows once its probe lands, got {:?}",
+                app.services
+                    .checks
+                    .iter()
+                    .map(|c| c.label)
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert!(
+        herdr
+            .detail
+            .iter()
+            .any(|l| l == "plugin: installed (github)"),
+        "the row reads the stub's listing: {:?}",
+        herdr.detail
+    );
+}
+
+/// Released by `a_slow_herdr_probe_leaves_the_first_paint_unblocked` once its
+/// first paint is done; the gated prober waits on it (10 s at most).
+static HERDR_GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+/// How many times `gated_herdr_probe` started: the one-probe-at-a-time guard's
+/// witness.
+static GATED_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn gated_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
+    GATED_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let (lock, cvar) = &HERDR_GATE;
+    let open = lock.lock().expect("gate lock");
+    let _open = cvar
+        .wait_timeout_while(open, std::time::Duration::from_secs(10), |open| !*open)
+        .expect("gate wait");
+    Some(crate::herdr::HerdrProbe {
+        version: Some("0.8.2".to_string()),
+        entry: None,
+        config_path: None,
+        error: None,
+    })
+}
+
+/// A probe that hangs never holds the first paint: entering the tab and
+/// drawing a frame return while the probe is still held, with no herdr row
+/// yet, and the row appears once the probe lands. While it is held, neither a
+/// refresh tick's recompute nor `r` starts a second one beside it; `r` queues
+/// one follow-up, which runs once the held probe lands.
+#[test]
+fn a_slow_herdr_probe_leaves_the_first_paint_unblocked() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.services.herdr_probe.prober = Some(gated_herdr_probe);
+
+    let started = std::time::Instant::now();
+    super::switch_tab(&mut app, super::Tab::Services);
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("first paint");
+    let elapsed = started.elapsed();
+    super::drain_service_probes(&mut app);
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "the tab entry and first paint waited on the held probe: {elapsed:?}"
+    );
+    assert!(
+        app.services.herdr_probe.running,
+        "the probe is still held after the first paint"
+    );
+    assert!(
+        !app.services.checks.iter().any(|c| c.label == "herdr"),
+        "no herdr row before the probe lands"
+    );
+
+    super::recompute_services_checks(&mut app, false);
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
+    );
+    assert!(app.services.herdr_probe.running, "still the one held probe");
+    assert!(
+        app.services.herdr_probe.rerun,
+        "`r` queued its probe behind the held one instead of beside it"
+    );
+
+    {
+        let (lock, cvar) = &HERDR_GATE;
+        *lock.lock().expect("gate lock") = true;
+        cvar.notify_all();
+    }
+    await_service_probes(&mut app);
+    assert!(
+        app.services.checks.iter().any(|c| c.label == "herdr"),
+        "the row appears once the probe lands"
+    );
+    super::join_test_workers();
+    assert_eq!(
+        GATED_PROBES.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the `r` held behind the first probe ran once after it landed"
+    );
+}
+
+/// How many times `counting_herdr_probe` ran.
+static COUNTED_PROBES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn counting_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
+    COUNTED_PROBES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Some(crate::herdr::HerdrProbe {
+        version: Some("0.8.2".to_string()),
+        entry: None,
+        config_path: None,
+        error: None,
+    })
+}
+
+/// With a probe cached, a plain recompute starts none; `r` on the Services tab
+/// probes herdr again.
+#[test]
+fn r_re_probes_herdr_on_the_services_tab() {
+    use std::sync::atomic::Ordering;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.services.herdr_probe.prober = Some(counting_herdr_probe);
+    let before = COUNTED_PROBES.load(Ordering::SeqCst);
+
+    super::switch_tab(&mut app, super::Tab::Services);
+    await_service_probes(&mut app);
+    assert_eq!(
+        COUNTED_PROBES.load(Ordering::SeqCst),
+        before + 1,
+        "tab entry probed once"
+    );
+
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        !app.services.herdr_probe.running,
+        "a recompute with a probe cached starts none"
+    );
+
+    super::handle_key(
+        &mut app,
+        crate::testutil::key(ratatui::crossterm::event::KeyCode::Char('r')),
+    );
+    assert!(app.services.herdr_probe.running, "`r` starts a re-probe");
+    await_service_probes(&mut app);
+    assert_eq!(
+        COUNTED_PROBES.load(Ordering::SeqCst),
+        before + 2,
+        "`r` probed again"
+    );
+}
+
+fn panicking_herdr_probe() -> Option<crate::herdr::HerdrProbe> {
+    panic!("the herdr probe blew up")
+}
+
+/// A probe that panics lands as "herdr does not resolve", so `herdr_probe.running`
+/// never sticks and `r` stays live.
+#[test]
+fn a_panicking_herdr_probe_lands_as_no_herdr() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.services.herdr_probe.prober = Some(panicking_herdr_probe);
+    super::switch_tab(&mut app, super::Tab::Services);
+    await_service_probes(&mut app);
+    assert!(
+        matches!(app.services.herdr, Some(None)),
+        "a panicking probe reads as no herdr"
+    );
+    assert!(
+        !app.services.herdr_probe.running,
+        "the in-flight flag cleared"
+    );
+}
+
+/// The first herdr landing happens on the tick that drains its probe, or
+/// never (cloudy, 2026-09-29). A modal opening before that drops the intent:
+/// the probe landing under it leaves the cursor, and so does every refresh
+/// after it closes. That holds for a modal already closed when the probe lands
+/// (`a`, then esc: the action-menu path), which the old wait-for-a-modal-free
+/// recompute landed. `f` on the list, like ↑↓/↵, is the user acting, so it
+/// drops the intent too.
+#[test]
+fn a_modal_drops_the_herdr_landing_and_f_drops_it() {
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let probe = || crate::herdr::HerdrProbe {
+        version: Some("0.8.2".to_string()),
+        entry: None,
+        config_path: None,
+        error: None,
+    };
+    let land = |app: &mut App| {
+        app.services.herdr_probe.running = true;
+        app.services
+            .herdr_probe
+            .tx
+            .send(Some(probe()))
+            .expect("send");
+        super::drain_service_probes(app);
+        assert!(
+            app.services.checks.iter().any(|c| c.label == "herdr"),
+            "fixture control: the probe landed"
+        );
+    };
+
+    // A modal still open when the probe lands.
+    let mut app = bare_app().with_herdr_mode(true);
+    assert!(app.services.land_on_herdr, "the landing is pending");
+    let parked = app.services.cursor;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('?')));
+    assert!(
+        !app.modals.is_empty(),
+        "fixture control: the help modal is open"
+    );
+    assert!(
+        !app.services.land_on_herdr,
+        "opening a modal drops the intent"
+    );
+    land(&mut app);
+    assert_eq!(
+        app.services.cursor, parked,
+        "the cursor stays under the modal"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
+    app.modals.clear();
+    super::recompute_services_checks(&mut app, false);
+    assert_eq!(
+        app.services.cursor, parked,
+        "the refresh after the modal closes does not land"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
+
+    // A modal opened and closed before the probe lands.
+    let mut app = bare_app().with_herdr_mode(true);
+    let parked = app.services.cursor;
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
+    assert!(
+        matches!(app.modals.last(), Some(super::Modal::ActionMenu(_))),
+        "fixture control: the action menu is open"
+    );
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "fixture control: the menu closed");
+    land(&mut app);
+    assert_eq!(
+        app.services.cursor, parked,
+        "a landing after the user's own modal leaves the cursor"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
+
+    let mut app = bare_app().with_herdr_mode(true);
+    assert!(app.services.land_on_herdr, "the landing is pending");
+    super::handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        !app.services.land_on_herdr,
+        "`f` on the list is the user acting: the intent drops"
+    );
+}
+
+/// With no modal, the landing is the first tick's after the probe result is
+/// sent: `on_tick` drains the probe before its 1 s Services refresh, and the
+/// refresh is held off here so only the drain can land it. A probe that
+/// resolves with no herdr drops the intent, so a later resolve never lands.
+#[test]
+fn the_herdr_landing_is_the_draining_tick_or_never() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app().with_herdr_mode(true);
+    assert!(app.services.land_on_herdr, "the landing is pending");
+    app.services.herdr_probe.running = true;
+    app.services
+        .herdr_probe
+        .tx
+        .send(Some(healthy_herdr_probe()))
+        .expect("send");
+    app.last_services_refresh = std::time::Instant::now();
+    super::on_tick(&mut app);
+    assert_eq!(
+        app.services.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "the draining tick lands on the herdr row"
+    );
+    assert_eq!(app.services.focus, super::ServicesFocus::Detail);
+    assert!(!app.services.land_on_herdr);
+
+    let mut app = bare_app().with_herdr_mode(true);
+    let parked = app.services.cursor;
+    app.services.herdr_probe.running = true;
+    app.services.herdr_probe.tx.send(None).expect("send");
+    super::drain_service_probes(&mut app);
+    assert!(
+        !app.services.land_on_herdr,
+        "a probe resolving with no herdr drops the intent"
+    );
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut app, false);
+    assert!(
+        app.services.checks.iter().any(|c| c.label == "herdr"),
+        "fixture control: the herdr row renders"
+    );
+    assert_eq!(app.services.cursor, parked, "a later resolve never lands");
+    assert_eq!(app.services.focus, super::ServicesFocus::List);
 }
 
 /// The row reads `source_kind` to decide whether a plugin is a local link, and herdr's own output is the only authority on that spelling. Driving the real captured bytes through the parse and into the check is what stops the row drifting onto a spelling herdr never emits: a hand-built fixture agrees with whatever the reader guessed.
@@ -10467,15 +13336,15 @@ fn herdr_prose_lines_are_indented_so_they_do_not_read_as_fields() {
 /// at their shipped defaults.
 fn herdr_options_app() -> App {
     let mut app = bare_app();
-    app.tab = super::Tab::Plugin;
-    app.plugin.herdr = Some(Some(healthy_herdr_probe()));
-    app.plugin.herdr_config = Some(healthy_herdr_config());
-    app.plugin.checks = vec![super::herdr_check(
+    app.tab = super::Tab::Services;
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    app.services.herdr_config = Some(healthy_herdr_config());
+    app.services.checks = vec![super::herdr_check(
         &healthy_herdr_probe(),
         Some(&healthy_herdr_config()),
     )];
-    app.plugin.cursor = 0;
-    app.plugin.focus = super::PluginFocus::Detail;
+    app.services.cursor = 0;
+    app.services.focus = super::ServicesFocus::Detail;
     app
 }
 
@@ -10536,7 +13405,7 @@ fn herdr_pane_tag_toggles_and_persists() {
     let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
     let _env = HerdrRuntimePin::new(&home, &tmp.path().join("herdr"), tmp.path(), false);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 1;
+    app.services.herdr_options_cursor = 1;
     let space = crate::testutil::key(KeyCode::Char(' '));
 
     handle_key(&mut app, space);
@@ -10553,7 +13422,7 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     use super::{KeyCode, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 2;
+    app.services.herdr_options_cursor = 2;
 
     for _ in 0..4 {
         handle_key(&mut app, crate::testutil::key(KeyCode::Char('-')));
@@ -10567,7 +13436,7 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     // ⏎ opens the typed editor, seeded with the current value.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(
-        app.plugin.herdr_tag_draft.is_some(),
+        app.services.herdr_tag_draft.is_some(),
         "⏎ opens the typed editor"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Backspace));
@@ -10575,7 +13444,7 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('0')));
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(herdr_knobs().tag_watch_secs, 30, "the typed value commits");
-    assert!(app.plugin.herdr_tag_draft.is_none());
+    assert!(app.services.herdr_tag_draft.is_none());
 
     // An under-floor value keeps the editor open and persists nothing.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
@@ -10585,12 +13454,15 @@ fn herdr_tag_refresh_steps_types_and_persists() {
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('0')));
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert!(
-        app.plugin.herdr_tag_draft.is_some(),
+        app.services.herdr_tag_draft.is_some(),
         "an invalid value stays in the editor"
     );
     assert_eq!(herdr_knobs().tag_watch_secs, 30, "and persists nothing");
     handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
-    assert!(app.plugin.herdr_tag_draft.is_none(), "⎋ discards the draft");
+    assert!(
+        app.services.herdr_tag_draft.is_none(),
+        "⎋ discards the draft"
+    );
     assert_eq!(herdr_knobs().tag_watch_secs, 30);
 }
 
@@ -10605,7 +13477,7 @@ fn herdr_border_label_toggles_and_persists() {
     let tmp = tempfile::tempdir_in(home.home()).expect("tempdir");
     let _env = HerdrRuntimePin::new(&home, &tmp.path().join("herdr"), tmp.path(), false);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 3;
+    app.services.herdr_options_cursor = 3;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -10640,7 +13512,7 @@ fn herdr_border_label_toggle_reruns_the_pane_report_per_pane() {
     );
     let _env = HerdrRuntimePin::new(&home, &herdr_shim, tmp.path(), true);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 3;
+    app.services.herdr_options_cursor = 3;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -10683,7 +13555,7 @@ fn herdr_border_label_toggle_spawns_nothing_outside_herdr() {
     );
     let _env = HerdrRuntimePin::new(&home, &herdr_shim, tmp.path(), false);
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 3;
+    app.services.herdr_options_cursor = 3;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -10708,7 +13580,7 @@ fn herdr_delegate_dot_toggles_and_persists() {
     use super::{KeyCode, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app();
-    app.plugin.herdr_options_cursor = 4;
+    app.services.herdr_options_cursor = 4;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -10727,8 +13599,8 @@ fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
     use super::{KeyCode, handle_key};
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = herdr_options_app();
-    app.plugin.herdr_config = Some(herdr_config(false, None, SidebarState::Absent));
-    app.plugin.herdr_options_cursor = 5;
+    app.services.herdr_config = Some(herdr_config(false, None, SidebarState::Absent));
+    app.services.herdr_options_cursor = 5;
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(
@@ -10738,11 +13610,11 @@ fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
     assert!(!herdr_knobs().delegate_row_text);
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
     assert_eq!(
-        app.plugin.herdr_options_cursor, 0,
+        app.services.herdr_options_cursor, 0,
         "selection wraps past the inert row"
     );
 
-    app.plugin.herdr_options_cursor = 4;
+    app.services.herdr_options_cursor = 4;
     handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
     assert!(!herdr_knobs().delegate_dot, "the other rows stay live");
 }
@@ -10756,18 +13628,23 @@ fn delegate_row_text_is_inert_when_herdr_config_does_not_parse() {
 /// list that a recompute would strand on `about`).
 fn herdr_options_app_with_config(path: &std::path::Path) -> App {
     let mut app = bare_app();
-    app.tab = super::Tab::Plugin;
+    app.tab = super::Tab::Services;
     let probe = crate::herdr::HerdrProbe {
         version: Some("0.8.0".to_string()),
         entry: Some(herdr_entry(true, Some("0.8.0"), vec![])),
         config_path: Some(path.to_path_buf()),
         error: None,
     };
-    app.plugin.herdr = Some(Some(probe));
-    app.plugin.focus = super::PluginFocus::Detail;
-    super::recompute_plugin_checks(&mut app, false);
-    app.plugin.cursor = super::HERDR_SELECTOR_ROW;
-    app.plugin.herdr_options_cursor = 5;
+    app.services.herdr = Some(Some(probe));
+    app.services.focus = super::ServicesFocus::Detail;
+    super::recompute_services_checks(&mut app, false);
+    app.services.cursor = app
+        .services
+        .checks
+        .iter()
+        .position(|c| c.label == "herdr")
+        .expect("herdr row present");
+    app.services.herdr_options_cursor = 5;
     app
 }
 
@@ -11002,87 +13879,167 @@ fn delegate_row_text_confirm_turns_the_knob_back_off() {
 
 // ── landing ──────────────────────────────────────────────────────────────────
 
-/// `with_herdr_mode(true)` on the FIRST herdr launch lands on the Plugin tab
+/// `with_herdr_mode(true)` on the FIRST herdr launch lands on the Services tab
 /// with the herdr selector row under the cursor and its detail pane descended
 /// (the `↵` shape), checks already recomputed so the first paint is not empty,
 /// and marks the landing done in `[herdr] first_landing_done` — once, forever.
-/// Construction probes herdr right away — `HERDR_ENV=1` proves herdr is
-/// present — so on a real run the row is there at first paint; the probe is
-/// skipped under test (it would read the real registry), and the
-/// injected-probe half below pins the landed cursor. The `claude --version`
-/// probe stays `r`-gated: construction must not block the first paint on a
-/// spawn.
+/// Construction's recompute starts the herdr probe on its worker; under test no
+/// prober is set (it would read the real registry), which stands in for a
+/// probe that has not landed: the landing stays PENDING (parked on the last
+/// row, list focus) and lands on the herdr row by label in the recompute that
+/// adopts the probe. The `claude --version` probe stays `r`-gated:
+/// construction must not block the first paint on a spawn.
 #[test]
 fn herdr_mode_lands_on_the_plugin_tab_with_the_herdr_row_selected() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut app = bare_app().with_herdr_mode(true);
 
-    assert_eq!(app.tab, super::Tab::Plugin, "herdr mode opens on Plugin");
-    assert!(app.herdr_mode);
     assert_eq!(
-        app.plugin.focus,
-        super::PluginFocus::Detail,
-        "the first herdr landing descends into the selected row's detail pane"
+        app.tab,
+        super::Tab::Services,
+        "herdr mode opens on Services"
+    );
+    assert!(app.herdr_mode);
+    assert!(
+        app.services.land_on_herdr,
+        "the landing intent is pending while herdr is unresolved"
     );
     assert_eq!(
-        app.plugin.herdr_options_cursor, 0,
+        app.services.focus,
+        super::ServicesFocus::List,
+        "with no herdr resolved the landing does not descend into another row"
+    );
+    assert_eq!(
+        app.services.herdr_options_cursor, 0,
         "the landed options cursor starts on the first row"
     );
     assert!(
-        matches!(app.plugin.herdr, Some(None)),
-        "construction ran the probe (skipped under test, standing in as no herdr)"
+        app.services.herdr.is_none() && !app.services.herdr_probe.running,
+        "no prober under test: herdr stays unprobed, standing in for a probe \
+         that has not landed"
     );
     assert!(
-        app.plugin.cc_version.is_none(),
+        app.services.cc_version.is_none(),
         "construction must not spawn `claude --version`; the probe stays `r`-gated"
     );
-    let labels: Vec<&str> = app.plugin.checks.iter().map(|c| c.label).collect();
+    let labels: Vec<&str> = app.services.checks.iter().map(|c| c.label).collect();
     assert_eq!(
         labels,
-        vec!["about", "mcp servers", "plugin", "runtime"],
-        "construction recomputes the checks, so the first paint is not empty"
+        vec!["shunt", "delegates", "plugin"],
+        "construction recomputes the checks, so the first paint is not empty \
+         (herdr does not render until its probe resolves)"
     );
-    assert_eq!(app.plugin.cursor, 3, "the landing cursor is the herdr slot");
     assert_eq!(
-        app.plugin.selected_check().map(|c| c.label),
-        Some("runtime"),
-        "with no herdr resolved the same index rests on the last row"
+        app.services.cursor, 2,
+        "the pending landing parks on the last row"
+    );
+    assert_eq!(
+        app.services.selected_check().map(|c| c.label),
+        Some("plugin"),
+        "with no herdr resolved the parked cursor rests on the last row"
     );
     // Unprobed must read as unprobed, never as a missing binary.
-    let about = &app.plugin.checks[0];
-    assert_eq!(about.label, "about");
+    let plugin = &app.services.checks[2];
+    assert_eq!(plugin.label, "plugin");
     assert!(
-        about.detail.iter().any(|l| l == "claude: press r to probe"),
-        "the about row invites the `r` probe: {:?}",
-        about.detail
+        plugin
+            .detail
+            .iter()
+            .any(|l| l == "claude: press r to probe"),
+        "the plugin row invites the `r` probe: {:?}",
+        plugin.detail
     );
     assert!(
-        !about.detail.iter().any(|l| l == "claude: not found"),
+        !plugin.detail.iter().any(|l| l == "claude: not found"),
         "an unprobed version must not claim claude is missing: {:?}",
-        about.detail
+        plugin.detail
     );
 
-    // The probe resolves (a real construction runs it, `r` re-runs it): the
-    // herdr row inserts at the landing index and the cursor is on it without
-    // any key handling.
-    app.plugin.herdr = Some(Some(healthy_herdr_probe()));
-    super::recompute_plugin_checks(&mut app, false);
-    assert_eq!(app.plugin.cursor, 3);
+    // The probe resolves (its drain adopts it and recomputes): the herdr row
+    // inserts and the pending landing selects it by label.
+    app.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut app, false);
+    assert!(app.services.checks.iter().any(|c| c.label == "herdr"));
     assert_eq!(
-        app.plugin.selected_check().map(|c| c.label),
+        app.services.selected_check().map(|c| c.label),
         Some("herdr"),
-        "the landing row is the herdr check once it renders"
+        "the pending landing re-lands on the herdr row once it appears"
     );
     assert_eq!(
-        app.plugin.focus,
-        super::PluginFocus::Detail,
-        "the recompute keeps the landing descended into the detail pane"
+        app.services.focus,
+        super::ServicesFocus::Detail,
+        "and descends into the herdr detail"
+    );
+    assert!(
+        !app.services.land_on_herdr,
+        "landing clears the pending intent"
+    );
+
+    // The landing slot itself: with a probe already cached, the pending
+    // intent lands on the herdr row in the same recompute.
+    let mut landed = bare_app();
+    landed.services.land_on_herdr = true;
+    landed.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut landed, false);
+    assert_eq!(
+        landed.services.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "a pending landing selects the herdr row once it renders"
+    );
+
+    // A user cursor move while the landing is still pending cancels it: the
+    // user has taken over, so a later herdr resolve must not yank the cursor.
+    let mut moved = bare_app();
+    moved.tab = super::Tab::Services;
+    moved.services.land_on_herdr = true;
+    moved.services.herdr = Some(None);
+    super::recompute_services_checks(&mut moved, false);
+    assert!(
+        moved.services.land_on_herdr,
+        "fixture control: still pending"
+    );
+    super::handle_key(&mut moved, crate::testutil::key(super::KeyCode::Up));
+    assert!(
+        !moved.services.land_on_herdr,
+        "moving the cursor clears the pending landing"
+    );
+    moved.services.herdr = Some(Some(healthy_herdr_probe()));
+    super::recompute_services_checks(&mut moved, false);
+    assert_ne!(
+        moved.services.selected_check().map(|c| c.label),
+        Some("herdr"),
+        "a cancelled landing does not re-land when herdr later resolves"
+    );
+
+    // ↵ also clears the intent: the user has descended, so focus must not move.
+    let mut descended = bare_app();
+    descended.tab = super::Tab::Services;
+    descended.services.land_on_herdr = true;
+    descended.services.herdr = Some(None);
+    super::recompute_services_checks(&mut descended, false);
+    super::handle_key(&mut descended, crate::testutil::key(super::KeyCode::Enter));
+    assert!(
+        !descended.services.land_on_herdr,
+        "↵ clears the pending landing"
+    );
+
+    // A tab switch clears the intent too: leaving the tab means no later
+    // recompute may yank the cursor back to herdr.
+    let mut left = bare_app();
+    left.tab = super::Tab::Services;
+    left.services.land_on_herdr = true;
+    left.services.herdr = Some(None);
+    super::recompute_services_checks(&mut left, false);
+    super::switch_tab(&mut left, super::Tab::Overview);
+    assert!(
+        !left.services.land_on_herdr,
+        "a tab switch clears the pending landing"
     );
 
     // `r` is still the only thing that probes the version.
-    super::recompute_plugin_checks(&mut app, true);
+    super::recompute_services_checks(&mut app, true);
     assert!(
-        app.plugin.cc_version.is_some(),
+        app.services.cc_version.is_some(),
         "`r` runs the version probe"
     );
 
@@ -11118,9 +14075,9 @@ fn a_plain_app_lands_on_overview_with_the_first_row_selected() {
         "a plain app opens the home tab (overview by default)"
     );
     assert!(!app.herdr_mode);
-    assert_eq!(app.plugin.cursor, 0);
+    assert_eq!(app.services.cursor, 0);
     assert!(
-        app.plugin.checks.is_empty(),
+        app.services.checks.is_empty(),
         "no construction recompute outside the first herdr landing"
     );
     let saved = std::fs::read_to_string(
@@ -11145,7 +14102,7 @@ fn the_herdr_landing_fires_once_then_later_launches_open_the_home_tab() {
     let first = bare_app().with_herdr_mode(true);
     assert_eq!(
         first.tab,
-        super::Tab::Plugin,
+        super::Tab::Services,
         "the first herdr launch lands on Plugin"
     );
     let saved = std::fs::read_to_string(
@@ -11167,13 +14124,14 @@ fn the_herdr_landing_fires_once_then_later_launches_open_the_home_tab() {
         "the second herdr launch opens the home tab (overview by default)"
     );
     assert!(
-        second.plugin.checks.is_empty(),
+        second.services.checks.is_empty(),
         "a later herdr launch skips the eager probe the first landing paid for"
     );
 }
 
 /// A plain launch honors the configured home tab: a top-level `home_tab = "plugin"`
-/// in profiles.toml opens the Plugin tab, with no herdr-mode flag and no eager probe.
+/// in profiles.toml loads through the alias onto the Services tab, with no
+/// herdr-mode flag and no eager probe.
 #[test]
 fn a_plain_launch_with_home_tab_set_lands_on_that_tab() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -11189,12 +14147,12 @@ fn a_plain_launch_with_home_tab_set_lands_on_that_tab() {
     let app = App::new(config).with_herdr_mode(false);
     assert_eq!(
         app.tab,
-        super::Tab::Plugin,
+        super::Tab::Services,
         "the configured home tab decides a plain launch"
     );
     assert!(!app.herdr_mode);
     assert!(
-        app.plugin.checks.is_empty(),
+        app.services.checks.is_empty(),
         "a plain launch runs no eager probe, whatever the home tab"
     );
     let saved = std::fs::read_to_string(
@@ -11812,9 +14770,10 @@ fn c_on_the_overview_cycles_the_harness_filter_and_leaves_count_cache_alone() {
 
 // ── the codex-only view disarms every key bound to the claude selection ──────
 
-/// With the claude rows hidden, reorder, cursor, switch and the action menu
-/// would act on a row the screen does not show. Each is inert with a toast
-/// saying why, and every filter that shows the claude rows (`All` and `Claude`
+/// With the claude rows hidden, reorder, cursor, switch and the action menu's
+/// account group would act on a row the screen does not show. The keys are
+/// inert with a toast saying why, the menu opens with its tab-global actions
+/// alone, and every filter that shows the claude rows (`All` and `Claude`
 /// alike) re-arms all four.
 #[test]
 fn the_codex_only_view_disarms_the_claude_selection_keys() {
@@ -11868,7 +14827,19 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     assert!(app.modals.is_empty(), "enter pushes no confirm");
 
     handle_key(&mut app, crate::testutil::key(KeyCode::Char('a')));
-    assert!(app.modals.is_empty(), "`a` opens no action menu");
+    let Some(Modal::ActionMenu(menu)) = app.modals.last() else {
+        panic!("`a` opens the tab-global actions");
+    };
+    assert_eq!(
+        (menu.scoped_len, menu.context.as_deref()),
+        (0, None),
+        "no entry acts on the hidden row"
+    );
+    assert_eq!(
+        menu.items.iter().map(|i| i.label).collect::<Vec<_>>(),
+        ["refresh all accounts", "new account", "start daemon"]
+    );
+    app.modals.clear();
 
     // Every filter showing the claude rows re-arms all four keys; each pass
     // reorders from cursor 0, so the order flips back and forth.
@@ -11893,8 +14864,8 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
 
         handle_key(app, crate::testutil::key(KeyCode::Char('a')));
         assert!(
-            matches!(app.modals.last(), Some(Modal::ActionMenu(_))),
-            "{filter:?}: `a` re-armed: the action menu is up"
+            matches!(app.modals.last(), Some(Modal::ActionMenu(m)) if m.scoped_len == 3),
+            "{filter:?}: `a` re-armed: the menu carries the account's group"
         );
         app.modals.clear();
     };
@@ -11902,7 +14873,7 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     re_armed(&mut app, HarnessFilter::Claude, ["a", "b"]);
 }
 
-// ── the Setup tab's day row ─────────────────────────────────────────────────
+// ── the day-list collision warning ───────────────────────────
 
 fn app_with_chain(profiles: Vec<crate::profile::Profile>) -> App {
     use crate::profile::{AppConfig, AppState};
@@ -11916,149 +14887,6 @@ fn app_with_chain(profiles: Vec<crate::profile::Profile>) -> App {
         profiles,
     })
 }
-
-/// The row is an existing account's, next to `auto-start`. The `+ new` form
-/// stays out: the account has no chain seat yet, so a list typed there would
-/// claim nothing and say so on a form that cannot fix it.
-#[test]
-fn the_day_row_sits_with_auto_start_and_skips_the_new_form() {
-    use super::{ConfigRow, config_rows};
-    use crate::profile::Profile;
-    let _home = crate::testutil::HomeSandbox::new();
-
-    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
-    app.config_draft = None;
-
-    app.profile_cursor = 0;
-    let rows = config_rows(&app);
-    let day = rows
-        .iter()
-        .position(|r| *r == ConfigRow::PreferredDays)
-        .expect("an existing account has the day row");
-    let auto_start = rows
-        .iter()
-        .position(|r| *r == ConfigRow::AutoStart)
-        .expect("an oauth account has auto-start");
-    assert_eq!(
-        day,
-        auto_start + 1,
-        "the two chain-behaviour rows sit together"
-    );
-
-    app.profile_cursor = 1; // the `+ new` action row
-    assert!(
-        !config_rows(&app).contains(&ConfigRow::PreferredDays),
-        "the create form has no day row"
-    );
-}
-
-/// ⏎ parses what was typed, saves it, and reseeds the field with the canonical
-/// spelling — the same settling a rewrite of a hand-written list does, so the
-/// field and the file never disagree about `Saturday` vs `sat`.
-#[test]
-fn committing_a_day_list_saves_and_reseeds_the_canonical_spelling() {
-    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
-    use crate::profile::{Profile, ProfileName};
-    let _home = crate::testutil::HomeSandbox::new();
-
-    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
-    app.profile_cursor = 0;
-    let mut draft = build_draft_existing(&app, &ProfileName::from("work"));
-    draft.preferred_days = InputState::new("Saturday, SUN");
-    draft.active = Some(ConfigRow::PreferredDays);
-    app.config_draft = Some(draft);
-
-    commit_config_field(&mut app, ConfigRow::PreferredDays);
-
-    assert_eq!(
-        app.config()
-            .find(&ProfileName::from("work"))
-            .map(|p| p.preferred_days.clone()),
-        Some(vec![chrono::Weekday::Sat, chrono::Weekday::Sun]),
-        "the typed list lands on the profile"
-    );
-    let draft = app
-        .config_draft
-        .as_ref()
-        .expect("draft survives the commit");
-    assert_eq!(draft.preferred_days.value, "sat, sun");
-    assert_eq!(draft.active, None, "the editor closes on a good commit");
-}
-
-/// A word that is not a weekday names itself and leaves the editor open with
-/// the typing intact: the loader drops a bad entry because a file nobody is
-/// watching must still load, but the operator is standing at this field.
-#[test]
-fn a_day_list_typo_names_the_word_and_keeps_the_editor_open() {
-    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
-    use crate::profile::{Profile, ProfileName};
-    let _home = crate::testutil::HomeSandbox::new();
-
-    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
-    app.profile_cursor = 0;
-    let mut draft = build_draft_existing(&app, &ProfileName::from("work"));
-    draft.preferred_days = InputState::new("sat, funday");
-    draft.active = Some(ConfigRow::PreferredDays);
-    app.config_draft = Some(draft);
-
-    commit_config_field(&mut app, ConfigRow::PreferredDays);
-
-    assert!(
-        app.config()
-            .find(&ProfileName::from("work"))
-            .is_some_and(|p| p.preferred_days.is_empty()),
-        "nothing is saved from a list that does not parse"
-    );
-    let draft = app.config_draft.as_ref().expect("draft survives");
-    assert_eq!(
-        draft.active,
-        Some(ConfigRow::PreferredDays),
-        "editor stays open"
-    );
-    assert_eq!(draft.preferred_days.value, "sat, funday", "typing survives");
-    assert!(
-        app.toasts.iter().any(|t| t.body.contains("'funday'")),
-        "the refusal names the word, got {:?}",
-        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
-    );
-}
-
-/// A list on an account the walk skips is saved and then explained. Refusing
-/// the save would hide a state `is_home_on` already handles; saving it in
-/// silence would leave a row that reads set and does nothing.
-#[test]
-fn a_day_list_on_a_dead_account_saves_with_the_reason_it_claims_nothing() {
-    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
-    use crate::profile::{Profile, ProfileName};
-    let _home = crate::testutil::HomeSandbox::new();
-
-    let mut dead = Profile::new("old".to_string(), None, None);
-    dead.disabled = true;
-    let mut app = app_with_chain(vec![dead]);
-    app.profile_cursor = 0;
-    let mut draft = build_draft_existing(&app, &ProfileName::from("old"));
-    draft.preferred_days = InputState::new("sat");
-    app.config_draft = Some(draft);
-
-    commit_config_field(&mut app, ConfigRow::PreferredDays);
-
-    assert_eq!(
-        app.config()
-            .find(&ProfileName::from("old"))
-            .map(|p| p.preferred_days.clone()),
-        Some(vec![chrono::Weekday::Sat]),
-        "the list is saved"
-    );
-    assert!(
-        app.toasts
-            .iter()
-            .any(|t| t.body.contains("claims nothing") && t.body.contains("disabled")),
-        "the warning names the blocker, got {:?}",
-        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
-    );
-}
-
-// ── the day-list collision warning ───────────────────────────
 
 /// Every weekday, so a fixture reads the same whatever day the suite runs on.
 fn all_weekdays() -> Vec<chrono::Weekday> {
@@ -12158,4 +14986,1270 @@ fn the_day_collision_warning_fires_on_the_edge_only() {
     }
     warn_day_claim_notices(&mut app);
     assert_eq!(app.toasts.len(), 2, "a collision re-introduced warns again");
+}
+
+// ── the Fallback card's `preferred days` row ─────────────────────────────────
+
+/// The row's index in `FALLBACK_ROWS`, read off the list itself so a future
+/// inserted row can never silently re-point these tests.
+fn preferred_days_row() -> usize {
+    super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::PreferredDays)
+        .expect("the row exists")
+}
+
+/// A disk-backed app, one chain member, cursor on the `preferred days` row. A
+/// member with a list is saved whole to disk as well as memory, since the row's
+/// save reads the profile it edits off disk.
+fn preferred_days_app(days: Vec<chrono::Weekday>) -> App {
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    p.preferred_days = days;
+    if !p.preferred_days.is_empty() {
+        crate::profile::save_profile(&p).expect("save the member");
+    }
+    let mut app = app_with_unlinked_profiles(vec![p]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = preferred_days_row();
+    app
+}
+
+/// Member `a`'s list on disk ([`disk_days`]).
+fn on_disk_days() -> Vec<chrono::Weekday> {
+    disk_days("a")
+}
+
+/// Write a list to the member's own file, so an unchanged file afterwards is a
+/// real claim rather than a missing one.
+fn seed_disk_days(app: &App, days: Vec<chrono::Weekday>) {
+    let mut cfg = app.config();
+    crate::actions::edit_profile_preferred_days(
+        &mut cfg,
+        &crate::profile::ProfileName::from("a"),
+        |_| days,
+    )
+    .expect("seed the member's list");
+}
+
+#[test]
+fn fallback_preferred_days_space_walks_the_preset_ladder_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = preferred_days_app(Vec::new());
+
+    let ladder: [(Vec<chrono::Weekday>, &str); 4] = [
+        (vec![Mon, Tue, Wed, Thu, Fri], "weekdays"),
+        (vec![Sat, Sun], "weekends"),
+        (super::WEEKDAYS_ALL.to_vec(), "every day"),
+        (Vec::new(), "never"),
+    ];
+    for (expected, rung) in ladder {
+        super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+        assert_eq!(on_disk_days(), expected, "space steps onto `{rung}`");
+    }
+}
+
+// A hand-written set matches no rung, so space lands on the ladder's first: a
+// set has no order, so no rung sits above it the way the weekly threshold
+// stepper finds the next preset above a custom percent.
+#[test]
+fn fallback_preferred_days_space_steps_a_custom_set_to_never() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let app = preferred_days_app(vec![Wed, Fri]);
+    seed_disk_days(&app, vec![Wed, Fri]);
+    assert_eq!(
+        on_disk_days(),
+        vec![Wed, Fri],
+        "precondition: the custom set"
+    );
+
+    let mut app = app;
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(on_disk_days().is_empty(), "a custom set steps to `never`");
+}
+
+/// Space from `every day` onto `a`'s remembered custom stop, or onto `never`
+/// when there is none, each step read back off disk.
+fn step_days(app: &mut App, want: &[Vec<chrono::Weekday>], label: &str) {
+    for (i, days) in want.iter().enumerate() {
+        super::handle_key(app, key(KeyCode::Char(' ')));
+        assert_eq!(&on_disk_days(), days, "{label}: press {}", i + 1);
+    }
+}
+
+/// A custom list is one more stop in the cycle while the card stays open:
+/// `never → weekdays → weekends → every day → the list → never`, each press
+/// saved at once, so stepping past the list and around again restores it.
+#[test]
+fn space_keeps_a_custom_day_list_in_the_cycle_while_the_card_is_open() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = preferred_days_app(vec![Wed, Fri]);
+    assert_eq!(
+        on_disk_days(),
+        vec![Wed, Fri],
+        "precondition: the custom list"
+    );
+
+    step_days(
+        &mut app,
+        &[
+            Vec::new(),
+            vec![Mon, Tue, Wed, Thu, Fri],
+            vec![Sat, Sun],
+            super::WEEKDAYS_ALL.to_vec(),
+            vec![Wed, Fri],
+            Vec::new(),
+        ],
+        "around the cycle and back",
+    );
+}
+
+/// The remembered stop belongs to the open card: leaving it for the chain list
+/// forgets the stop, so the next trip round the cycle ends on `never`. The
+/// first leg proves the stop was held before the card was left.
+#[test]
+fn leaving_the_card_forgets_the_custom_stop() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let presets_then_never = [
+        vec![Mon, Tue, Wed, Thu, Fri],
+        vec![Sat, Sun],
+        super::WEEKDAYS_ALL.to_vec(),
+        Vec::new(),
+    ];
+    let mut app = preferred_days_app(vec![Wed, Fri]);
+    step_days(
+        &mut app,
+        &[
+            Vec::new(),
+            vec![Mon, Tue, Wed, Thu, Fri],
+            vec![Sat, Sun],
+            super::WEEKDAYS_ALL.to_vec(),
+            vec![Wed, Fri],
+            Vec::new(),
+        ],
+        "the stop is held while the card is open",
+    );
+
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert_eq!(
+        app.fallback_focus,
+        super::FallbackFocus::Chain,
+        "esc left the card"
+    );
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..preferred_days_row() {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    step_days(&mut app, &presets_then_never, "after leaving the card");
+
+    // A tab switch away and back leaves the card too.
+    seed_disk_days(&app, vec![Wed, Fri]);
+    step_days(&mut app, &[Vec::new()], "stepped off the custom list again");
+    super::handle_key(&mut app, key(KeyCode::Right));
+    assert_ne!(app.tab, Tab::Fallback, "→ left the tab");
+    super::handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(app.tab, Tab::Fallback, "← came back");
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    for _ in 0..preferred_days_row() {
+        super::handle_key(&mut app, key(KeyCode::Down));
+    }
+    step_days(&mut app, &presets_then_never, "after a tab round trip");
+}
+
+/// A reload that takes the card off its member forgets the member's stop too:
+/// with no edit open the card stays on the slot, so it shows whoever took it,
+/// and coming back to the member is a new card. The first leg proves the stop
+/// was held before the reload.
+#[test]
+fn a_reload_that_moves_the_card_off_its_member_forgets_the_custom_stop() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = two_member_app();
+    seed_disk_days(&app, vec![Wed, Fri]);
+    step_days(
+        &mut app,
+        &[
+            Vec::new(),
+            vec![Mon, Tue, Wed, Thu, Fri],
+            vec![Sat, Sun],
+            super::WEEKDAYS_ALL.to_vec(),
+            vec![Wed, Fri],
+            Vec::new(),
+        ],
+        "the stop is held while the card is open",
+    );
+
+    reload_with_chain(&mut app, &["b", "a"]);
+    assert_eq!(app.chain_cursor, 0, "the card stayed on the slot `b` took");
+    // The fingerprint reads mtimes alone, so the way back needs one of its own.
+    let mut state = crate::profile::load_app_state().expect("load the state");
+    state.fallback_chain = vec!["a".into(), "b".into()];
+    crate::profile::save_app_state(&state).expect("rewrite the state");
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(3_000_000),
+    );
+    assert!(app.reload_if_state_changed(), "the reload back ran");
+    assert_eq!(
+        app.chain_cursor, 0,
+        "precondition: the card is on `a` again"
+    );
+
+    step_days(
+        &mut app,
+        &[
+            vec![Mon, Tue, Wed, Thu, Fri],
+            vec![Sat, Sun],
+            super::WEEKDAYS_ALL.to_vec(),
+            Vec::new(),
+        ],
+        "after the card moved off `a`",
+    );
+}
+
+/// The picker's caret, `None` while it is closed.
+fn picker_caret(app: &App) -> Option<usize> {
+    match app.fallback_edit.as_ref().map(|e| &e.state) {
+        Some(super::CardEdit::Days(picker)) => Some(picker.cursor),
+        _ => None,
+    }
+}
+
+// No draft: each space writes the member's toggled list at once, and the
+// picker stays open for the next one.
+#[test]
+fn each_space_in_the_day_picker_saves_the_toggled_list() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = preferred_days_app(vec![Mon, Fri]);
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(picker_caret(&app), Some(0), "the caret starts on Monday");
+
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        on_disk_days(),
+        vec![Mon, Wed, Fri],
+        "→ → space saved Wednesday on and left the rest alone"
+    );
+    assert_eq!(picker_caret(&app), Some(2), "the picker stays open");
+
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(on_disk_days(), vec![Mon, Fri], "space again saved it off");
+}
+
+/// A toggle is computed from the list read off disk under the lock, so a day
+/// another writer saved since the last reload survives it.
+#[test]
+fn a_picker_toggle_keeps_a_day_another_writer_saved() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = preferred_days_app(Vec::new());
+    let name = crate::profile::ProfileName::from("a");
+    let mut other = crate::profile::load_profile(&name).expect("load a");
+    other.preferred_days = vec![Wed];
+    crate::profile::save_profile(&other).expect("the other writer's save");
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert_eq!(
+        on_disk_days(),
+        vec![Mon, Wed],
+        "Monday joined the list on disk"
+    );
+}
+
+/// A press answers the list the card shows: with another writer's list on
+/// disk, space on a shown-on day saves it off and a preset steps from the shown
+/// rung, never inverting what the operator saw.
+#[test]
+fn a_press_follows_the_shown_list_when_another_writer_raced_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let name = crate::profile::ProfileName::from("a");
+    let race = |days: Vec<chrono::Weekday>| {
+        let mut other = crate::profile::load_profile(&name).expect("load a");
+        other.preferred_days = days;
+        crate::profile::save_profile(&other).expect("the other writer's save");
+    };
+
+    let mut app = preferred_days_app(vec![Mon]);
+    race(vec![Fri]);
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(on_disk_days(), vec![Fri], "Monday went off, as shown");
+
+    let mut app = preferred_days_app(vec![Mon, Tue, Wed, Thu, Fri]);
+    race(vec![Sat, Sun]);
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        on_disk_days(),
+        vec![Sat, Sun],
+        "`weekdays` stepped to `weekends`, the rung after the shown one"
+    );
+}
+
+/// Space at rest on a chain entry with no account behind it does nothing, the
+/// same answer ⏎ gives there.
+#[test]
+fn space_on_a_chain_entry_with_no_account_does_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preferred_days_app(Vec::new());
+    app.config()
+        .state
+        .fallback_chain
+        .insert(0, crate::profile::ProfileName::from("ghost"));
+    app.chain_cursor = 0;
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert!(app.toasts.is_empty(), "no toast for `ghost`");
+    assert!(
+        !crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from("ghost"),
+            "config.toml"
+        )
+        .expect("path")
+        .exists(),
+        "nothing written for `ghost`"
+    );
+}
+
+/// The row's save re-reads the profile under the lock, so a field another
+/// writer changed since the last reload is not rewound by the day save.
+#[test]
+fn a_day_save_keeps_a_field_another_writer_changed() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = preferred_days_app(Vec::new());
+    let name = crate::profile::ProfileName::from("a");
+    let mut other = crate::profile::load_profile(&name).expect("load a");
+    other.fallback_threshold = Some(55.0);
+    crate::profile::save_profile(&other).expect("the other writer's save");
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    let after = crate::profile::load_profile(&name).expect("reload a");
+    assert_eq!(after.preferred_days, vec![Mon, Tue, Wed, Thu, Fri]);
+    assert_eq!(
+        after.fallback_threshold,
+        Some(55.0),
+        "the threshold edit survived"
+    );
+}
+
+/// A chain entry with no account behind it draws no `preferred days` row, so ⏎
+/// there opens no picker to claim the keys invisibly.
+#[test]
+fn enter_on_a_chain_entry_with_no_account_opens_no_picker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preferred_days_app(Vec::new());
+    app.config()
+        .state
+        .fallback_chain
+        .insert(0, crate::profile::ProfileName::from("ghost"));
+    app.chain_cursor = 0;
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+
+    assert!(picker_caret(&app).is_none(), "no picker opened on `ghost`");
+}
+
+/// An account deleted on disk since the last reload is refused by name, and the
+/// save never recreates its directory.
+#[test]
+fn a_day_save_refuses_an_account_deleted_since_the_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preferred_days_app(Vec::new());
+    let name = crate::profile::ProfileName::from("a");
+    let dir = crate::profile::profile_subpath(&name, "config.toml")
+        .expect("config path")
+        .parent()
+        .expect("profile dir")
+        .to_path_buf();
+    assert!(
+        !dir.exists(),
+        "precondition: the fixture holds no dir for a"
+    );
+    let mut state = crate::profile::load_app_state().expect("load the roster");
+    state.profiles.retain(|n| *n != name);
+    crate::profile::save_app_state(&state).expect("drop a from the roster");
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert_eq!(app.toasts.len(), 1, "one toast");
+    assert!(matches!(app.toasts[0].kind, super::ToastKind::Danger));
+    assert_eq!(
+        app.toasts[0].body,
+        "preferred days update failed\nprofile not found"
+    );
+    assert!(
+        !dir.exists(),
+        "the save recreated the deleted account's dir"
+    );
+}
+
+#[test]
+fn opening_and_leaving_the_day_picker_writes_nothing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = preferred_days_app(vec![Mon, Fri]);
+    seed_disk_days(&app, vec![Mon, Fri]);
+    let path =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from("a"), "config.toml")
+            .expect("config path");
+    let before = std::fs::read(&path).expect("read the seeded file");
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Esc));
+
+    assert!(picker_caret(&app).is_none(), "esc left the picker");
+    assert_eq!(
+        std::fs::read(&path).expect("read back"),
+        before,
+        "walking the caret and leaving wrote nothing"
+    );
+}
+
+#[test]
+fn the_day_picker_caret_wraps_both_ways() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = preferred_days_app(Vec::new());
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Left));
+    assert_eq!(picker_caret(&app), Some(6), "← wraps past Monday to Sunday");
+    super::handle_key(&mut app, key(KeyCode::Right));
+    assert_eq!(picker_caret(&app), Some(0), "→ wraps past Sunday to Monday");
+    assert_eq!(app.tab, Tab::Fallback, "neither arrow switched tabs");
+}
+
+// While descended the picker binds neither `?` nor `x`, so both keep their
+// global senses mid-pick: `?` opens the help modal and `x` dismisses the
+// front toast, the picker's own claims-nothing warning included, and the
+// picker stays open through both. `a`, tab and shift-tab stay claimed.
+#[test]
+fn the_day_picker_passes_help_and_dismiss_and_claims_actions_and_tab() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dead_member_app(Vec::new());
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.toasts.iter().map(|t| t.kind).collect::<Vec<_>>(),
+        vec![super::ToastKind::Warning],
+        "precondition: the save raised the claims-nothing warning"
+    );
+
+    super::handle_key(&mut app, key(KeyCode::Char('?')));
+    assert!(
+        matches!(app.modals.as_slice(), [super::Modal::Help]),
+        "`?` opened the help modal"
+    );
+    assert_eq!(
+        picker_caret(&app),
+        Some(0),
+        "the picker stayed open under it"
+    );
+    super::handle_key(&mut app, key(KeyCode::Esc));
+    assert!(app.modals.is_empty(), "esc closed the help modal");
+    assert_eq!(picker_caret(&app), Some(0), "and left the picker open");
+
+    super::handle_key(&mut app, key(KeyCode::Char('x')));
+    assert!(app.toasts.is_empty(), "`x` dismissed the warning");
+    assert_eq!(picker_caret(&app), Some(0), "the picker stayed open");
+
+    for code in [KeyCode::Char('a'), KeyCode::Tab, KeyCode::BackTab] {
+        super::handle_key(&mut app, key(code));
+        assert!(app.modals.is_empty(), "{code:?} opened no modal");
+        assert_eq!(app.tab, Tab::Fallback, "{code:?} switched no tab");
+        assert_eq!(picker_caret(&app), Some(0), "{code:?} left the picker open");
+    }
+    assert_eq!(
+        on_disk_days(),
+        vec![chrono::Weekday::Mon],
+        "only the one space wrote"
+    );
+}
+
+/// A dead account with a list on the Fallback card, cursor on the day row.
+fn dead_member_app(days: Vec<chrono::Weekday>) -> App {
+    let mut p = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    p.disabled = true;
+    p.preferred_days = days;
+    if !p.preferred_days.is_empty() {
+        crate::profile::save_profile(&p).expect("save the member");
+    }
+    let mut app = app_with_unlinked_profiles(vec![p]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = preferred_days_row();
+    app
+}
+
+// An empty list claims nothing on any account, so clearing a dead account's
+// list is a plain save with nothing to warn about.
+#[test]
+fn a_dead_account_stepping_to_never_raises_no_toast() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = dead_member_app(super::WEEKDAYS_ALL.to_vec());
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert!(on_disk_days().is_empty(), "`every day` stepped to `never`");
+    assert!(
+        app.toasts.is_empty(),
+        "no warning, got {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+// The picker warns about a dead account once per descend, not once per
+// toggle: the first save that leaves a list raises it, the toggles after it
+// stay quiet, and a fresh descend says it again.
+#[test]
+fn a_dead_account_warns_once_per_day_picker_descend() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let warning = "saved, but this list claims nothing: the account is disabled\n\
+                   the chain decides those days without this account";
+    let mut app = dead_member_app(Vec::new());
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    super::handle_key(&mut app, key(KeyCode::Right));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(on_disk_days(), vec![Mon, Tue], "both toggles saved");
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| t.body.as_str())
+            .collect::<Vec<_>>(),
+        vec![warning],
+        "one warning for the whole descend"
+    );
+    assert_eq!(app.toasts[0].kind, super::ToastKind::Warning);
+
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(on_disk_days(), vec![Tue], "the new descend saved too");
+    assert_eq!(
+        app.toasts
+            .iter()
+            .map(|t| t.body.as_str())
+            .collect::<Vec<_>>(),
+        vec![warning, warning],
+        "a fresh descend warns again"
+    );
+}
+
+// A list on an account the walk skips is saved and then explained, with the
+// blocker's own wording: refusing the save would hide a state `is_home_on`
+// already handles, and saving it in silence would leave a row that reads set
+// and does nothing.
+#[test]
+fn a_dead_accounts_day_list_saves_with_the_claim_nothing_warning() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use chrono::Weekday::*;
+    let mut app = dead_member_app(Vec::new());
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert_eq!(
+        on_disk_days(),
+        vec![Mon, Tue, Wed, Thu, Fri],
+        "the list is saved anyway"
+    );
+    assert_eq!(app.toasts.len(), 1, "one toast, not a stack");
+    assert!(matches!(app.toasts[0].kind, super::ToastKind::Warning));
+    assert_eq!(
+        app.toasts[0].body,
+        "saved, but this list claims nothing: the account is disabled\n\
+         the chain decides those days without this account",
+        "the warning names the blocker and what the list cannot do"
+    );
+}
+
+/// `name`'s list as it sits in its own `config.toml` — read back through the
+/// loader, so a change that never reached disk fails here.
+fn disk_days(name: &str) -> Vec<chrono::Weekday> {
+    crate::profile::load_profile(&crate::profile::ProfileName::from(name))
+        .expect("reload the member")
+        .preferred_days
+}
+
+/// Chain `[a, b]` on disk and in memory, both members saved, the cursor on
+/// `a`'s `preferred days` row.
+fn two_member_app() -> App {
+    use crate::profile::ProfileName;
+    let a = crate::testutil::blank_profile(&ProfileName::from("a"));
+    let b = crate::testutil::blank_profile(&ProfileName::from("b"));
+    crate::profile::save_profile(&a).expect("seed a");
+    crate::profile::save_profile(&b).expect("seed b");
+    let mut app = app_with_unlinked_profiles(vec![a, b]);
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = preferred_days_row();
+    app
+}
+
+/// Rewrite the chain on disk the way another writer would (the REST chain
+/// route, a second TUI), then run the tick's reload over it.
+fn reload_with_chain(app: &mut App, chain: &[&str]) {
+    reload_with_state(app, |state| {
+        state.fallback_chain = chain
+            .iter()
+            .map(|n| crate::profile::ProfileName::from(*n))
+            .collect();
+    });
+}
+
+/// Rewrite `profiles.toml` through `edit` the way another writer would, then
+/// run the tick's reload over it.
+fn reload_with_state(app: &mut App, edit: impl FnOnce(&mut AppState)) {
+    let mut state = crate::profile::load_app_state().expect("load the state");
+    edit(&mut state);
+    crate::profile::save_app_state(&state).expect("rewrite the state");
+    // A distinct mtime, so the fingerprint moves however fast the write lands.
+    let path = crate::profile::clauth_dir()
+        .expect("clauth dir")
+        .join("profiles.toml");
+    crate::testutil::set_mtime(
+        &path,
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000),
+    );
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+}
+
+/// The picker is pinned to the member it opened on, by name: a reload that
+/// reorders the chain under it moves the cursor with that member, and the next
+/// toggle lands on it rather than on whoever took its old slot.
+#[test]
+fn the_day_picker_follows_its_member_through_a_reorder_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    reload_with_chain(&mut app, &["b", "a"]);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        (disk_days("a"), disk_days("b")),
+        (vec![chrono::Weekday::Mon], Vec::new()),
+        "the toggle lands on the member the picker opened on"
+    );
+    assert_eq!(
+        app.chain_cursor, 1,
+        "the cursor followed `a` to its new slot"
+    );
+    assert!(picker_caret(&app).is_none(), "⏎ left the picker");
+}
+
+/// A reload that drops the member from the chain closes its picker and hands
+/// focus back to the chain list: there is no member left for a toggle to write
+/// to, and the next key must not land on the member that moved into the slot.
+#[test]
+fn the_day_picker_closes_when_a_reload_drops_its_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+    assert!(
+        picker_caret(&app).is_some(),
+        "precondition: the picker is open on `a`"
+    );
+    reload_with_chain(&mut app, &["b"]);
+
+    assert!(
+        picker_caret(&app).is_none(),
+        "the picker closed with its member gone"
+    );
+    assert_eq!(
+        app.fallback_focus,
+        super::FallbackFocus::Chain,
+        "focus went back to the chain list"
+    );
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(
+        (disk_days("a"), disk_days("b")),
+        (Vec::new(), Vec::new()),
+        "closing wrote nothing, and a space meant for the picker reached no member"
+    );
+}
+
+/// `name`'s own `config.toml` whole: a write meant for another member that
+/// lands here changes it.
+fn member_file(name: &str) -> String {
+    let path =
+        crate::profile::profile_subpath(&crate::profile::ProfileName::from(name), "config.toml")
+            .expect("config path");
+    std::fs::read_to_string(path).expect("read the member file")
+}
+
+/// On `a`'s card, open the typed field on `row` with ⏎, clear its seed and type
+/// `value`, leaving the field open.
+fn type_into_card_field(app: &mut App, row: super::FallbackRow, value: &str) {
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == row)
+        .expect("the row exists");
+    super::handle_key(app, key(KeyCode::Enter));
+    for _ in 0..8 {
+        super::handle_key(app, key(KeyCode::Backspace));
+    }
+    for c in value.chars() {
+        super::handle_key(app, key(KeyCode::Char(c)));
+    }
+}
+
+/// A typed field opened on `a`, a reload that puts `b` in `a`'s slot, then ⏎:
+/// the commit lands on `a` and `b`'s file never moves.
+fn commit_across_a_reorder_reload(app: &mut App, row: super::FallbackRow, value: &str) {
+    let b_before = member_file("b");
+    type_into_card_field(app, row, value);
+    reload_with_chain(app, &["b", "a"]);
+    super::handle_key(app, key(KeyCode::Enter));
+    assert_eq!(member_file("b"), b_before, "`b`'s file is byte-identical");
+}
+
+#[test]
+fn the_rotate_at_field_commits_to_its_member_through_a_reorder_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+
+    commit_across_a_reorder_reload(&mut app, super::FallbackRow::Threshold, "42");
+
+    assert_eq!(
+        crate::profile::load_profile(&crate::profile::ProfileName::from("a"))
+            .expect("reload a")
+            .fallback_threshold,
+        Some(42.0),
+        "`a` carries the typed threshold"
+    );
+}
+
+#[test]
+fn the_weekly_at_field_commits_to_its_member_through_a_reorder_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+
+    commit_across_a_reorder_reload(&mut app, super::FallbackRow::WeeklyAt, "90");
+
+    assert_eq!(
+        crate::profile::load_profile(&crate::profile::ProfileName::from("a"))
+            .expect("reload a")
+            .weekly_threshold,
+        Some(90.0),
+        "`a` carries the typed weekly line"
+    );
+}
+
+/// The costly one: a dollar ceiling written on the wrong account is money the
+/// operator never agreed to spend there.
+#[test]
+fn the_max_spend_field_commits_to_its_member_through_a_reorder_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+    let mut state = crate::profile::load_app_state().expect("load the state");
+    state.spend_budget_switching = true;
+    crate::profile::save_app_state(&state).expect("arm the spend budget");
+    app.config().state.spend_budget_switching = true;
+
+    commit_across_a_reorder_reload(&mut app, super::FallbackRow::MaxSpend, "25");
+
+    assert_eq!(
+        crate::profile::load_profile(&crate::profile::ProfileName::from("a"))
+            .expect("reload a")
+            .max_auto_spend,
+        Some(25.0),
+        "`a` carries the typed ceiling"
+    );
+}
+
+/// The armed remove is pinned like a typed field: the confirming ⏎ after a
+/// reorder reload removes the member it armed on, and only that one.
+#[test]
+fn the_armed_remove_removes_its_member_through_a_reorder_reload() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+    let b_before = member_file("b");
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::Remove)
+        .expect("the row exists");
+
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    reload_with_chain(&mut app, &["b", "a"]);
+    super::handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("load the state")
+            .fallback_chain,
+        vec![crate::profile::ProfileName::from("b")],
+        "`a` left the chain and `b` stayed"
+    );
+    assert_eq!(member_file("b"), b_before, "`b`'s file is byte-identical");
+}
+
+/// Moving off an armed remove disarms it: ↓ then ↑ lands back on `remove`
+/// unarmed, so the next ⏎ arms it afresh and removes nothing.
+#[test]
+fn moving_off_an_armed_remove_disarms_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = two_member_app();
+    app.fallback_detail_cursor = super::FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == super::FallbackRow::Remove)
+        .expect("the row exists");
+
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(
+        card_edit_row(&app),
+        Some(super::FallbackRow::Remove),
+        "precondition: the first ⏎ armed it"
+    );
+    super::handle_key(&mut app, key(KeyCode::Down));
+    super::handle_key(&mut app, key(KeyCode::Up));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+
+    assert_eq!(
+        crate::profile::load_app_state()
+            .expect("load the state")
+            .fallback_chain,
+        vec![
+            crate::profile::ProfileName::from("a"),
+            crate::profile::ProfileName::from("b")
+        ],
+        "one ⏎ after moving away removed nothing"
+    );
+    assert_eq!(
+        card_edit_row(&app),
+        Some(super::FallbackRow::Remove),
+        "that ⏎ armed it afresh"
+    );
+}
+
+/// The write reads the pin, never the cursor. No key moves `chain_cursor` while
+/// an edit is open and a reload re-pins it, so the test moves it onto `b` by
+/// hand, standing in for any path that leaves it elsewhere. Every edit is
+/// checked before any assertion fires.
+#[test]
+fn a_card_edit_writes_its_member_wherever_the_cursor_points() {
+    use super::FallbackRow;
+    use crate::profile::{Profile, ProfileName};
+    type Landed = fn(&Profile, &[ProfileName]) -> bool;
+    let cases: [(FallbackRow, &str, Landed); 4] = [
+        (FallbackRow::Threshold, "42", |a, _| {
+            a.fallback_threshold == Some(42.0)
+        }),
+        (FallbackRow::WeeklyAt, "90", |a, _| {
+            a.weekly_threshold == Some(90.0)
+        }),
+        (FallbackRow::MaxSpend, "25", |a, _| {
+            a.max_auto_spend == Some(25.0)
+        }),
+        (FallbackRow::Remove, "", |_, chain| {
+            chain == [ProfileName::from("b")]
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (row, value, landed) in cases {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = two_member_app();
+        app.config().state.spend_budget_switching = true;
+        let b_before = member_file("b");
+        if row == FallbackRow::Remove {
+            app.fallback_detail_cursor = super::FALLBACK_ROWS
+                .iter()
+                .position(|r| *r == row)
+                .expect("the row exists");
+            super::handle_key(&mut app, key(KeyCode::Enter));
+        } else {
+            type_into_card_field(&mut app, row, value);
+        }
+
+        app.chain_cursor = 1;
+        super::handle_key(&mut app, key(KeyCode::Enter));
+
+        let a = crate::profile::load_profile(&ProfileName::from("a")).expect("reload a");
+        let chain = crate::profile::load_app_state()
+            .expect("load the state")
+            .fallback_chain;
+        if !landed(&a, &chain) || member_file("b") != b_before {
+            wrong.push(format!("{row:?}: the write missed `a` or touched `b`"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "writes that followed the cursor:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// An account that leaves the roster while its name stays on the chain (only a
+/// hand-edited `profiles.toml` gets there) closes whatever edit its card held
+/// and hands focus back to the chain list, for every edit the card can hold.
+/// Every edit is checked before any assertion fires.
+#[test]
+fn a_card_edit_closes_when_a_reload_drops_its_account_from_the_roster() {
+    use super::FallbackRow;
+    let mut wrong = Vec::new();
+    for row in [
+        FallbackRow::Threshold,
+        FallbackRow::WeeklyAt,
+        FallbackRow::MaxSpend,
+        FallbackRow::PreferredDays,
+        FallbackRow::Remove,
+    ] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut app = two_member_app();
+        app.config().state.spend_budget_switching = true;
+        app.fallback_detail_cursor = super::FALLBACK_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("the row exists");
+        super::handle_key(&mut app, key(KeyCode::Enter));
+
+        reload_with_state(&mut app, |state| {
+            state.profiles.retain(|n| n.as_str() != "a")
+        });
+        assert_eq!(
+            app.config().state.fallback_chain,
+            vec![
+                crate::profile::ProfileName::from("a"),
+                crate::profile::ProfileName::from("b")
+            ],
+            "{row:?}: precondition, `a` is still on the chain"
+        );
+
+        let focus = app.fallback_focus;
+        // → switches tabs only once no edit owns the arrows.
+        super::handle_key(&mut app, key(KeyCode::Right));
+        if focus != super::FallbackFocus::Chain || app.tab != Tab::Fallback.next() {
+            wrong.push(format!(
+                "{row:?}: focus {focus:?}, → left the tab at {:?}",
+                app.tab
+            ));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "edits left open on a member gone from the roster:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// Every way out of the picker the contract names: ⏎, esc and q leave the mode
+/// on the same row; ↑/↓ leave the row and the mode together. None of them
+/// ascends out of the card or writes.
+#[test]
+fn enter_esc_q_up_and_down_each_leave_the_day_picker() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = preferred_days_row();
+    let exits = [
+        (KeyCode::Enter, row),
+        (KeyCode::Esc, row),
+        (KeyCode::Char('q'), row),
+        (KeyCode::Up, row - 1),
+        (KeyCode::Down, row + 1),
+    ];
+    for (code, lands_on) in exits {
+        let mut app = preferred_days_app(Vec::new());
+        super::handle_fallback_detail_key(&mut app, key(KeyCode::Enter));
+        assert!(
+            picker_caret(&app).is_some(),
+            "{code:?}: precondition, the picker is open"
+        );
+
+        super::handle_key(&mut app, key(code));
+
+        assert!(picker_caret(&app).is_none(), "{code:?} leaves the picker");
+        assert_eq!(
+            app.fallback_focus,
+            super::FallbackFocus::Detail,
+            "{code:?} stays on the card"
+        );
+        assert_eq!(
+            app.fallback_detail_cursor, lands_on,
+            "{code:?} leaves the row cursor here"
+        );
+        assert!(on_disk_days().is_empty(), "{code:?} writes nothing");
+    }
+}
+
+/// A save that fails leaves the in-memory list on what the disk still holds and
+/// names the failure. Unix-only: it forces the failure by dropping write on the
+/// member's own directory, the posture the repo's other save-failure probes take.
+#[cfg(unix)]
+#[test]
+fn a_failed_day_list_save_keeps_memory_on_the_disk_value_and_names_the_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("a");
+    let mut app = preferred_days_app(Vec::new());
+    seed_disk_days(&app, Vec::new());
+    let dir = crate::profile::profile_dir(&name).expect("profile dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the member dir read-only");
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    // Restore before any assertion so a failure still lets the sandbox clean up.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the member dir");
+    assert_eq!(
+        app.config().find(&name).map(|p| p.preferred_days.clone()),
+        Some(Vec::new()),
+        "memory keeps the list the disk still holds"
+    );
+    assert!(on_disk_days().is_empty(), "nothing reached the disk");
+    assert_eq!(app.toasts.len(), 1, "one toast");
+    assert_eq!(app.toasts[0].kind, super::ToastKind::Danger);
+    assert_eq!(
+        app.toasts[0].body,
+        "preferred days update failed\nfailed to write config.toml"
+    );
+}
+
+// ── Note editor ───────────────────────────────────────────────────────────────
+
+fn notes_app(profiles: Vec<crate::profile::Profile>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    App::new(AppConfig {
+        state: AppState::default(),
+        profiles,
+    })
+}
+
+/// `n` on the usage tab opens the account's note editor; an empty roster keeps
+/// the empty state's `n to create one` promise; every other tab keeps the
+/// global new-account flow.
+#[test]
+fn n_on_usage_opens_the_note_editor() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // With an account, n opens the note editor for the selected account.
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(
+        app.note_editor.is_some(),
+        "usage tab: n opens the note editor"
+    );
+    assert_eq!(app.note_editor.as_ref().unwrap().profile.as_str(), "alice");
+    assert!(app.config_draft.is_none(), "new-account never started");
+
+    // An empty roster keeps the empty state's `n to create one` promise.
+    let mut app = notes_app(vec![]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_none(), "no account, no editor");
+    assert!(
+        app.config_draft.is_some(),
+        "the empty state keeps n = new account"
+    );
+
+    // Every other tab keeps the global new-account flow.
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Overview;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_none());
+    assert!(app.config_draft.is_some());
+}
+
+/// ⏎ saves the draft into the profile dir and toasts; esc discards the draft.
+#[test]
+fn enter_saves_the_note_and_esc_discards_it() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profile = mini_profile("alice", None);
+    crate::profile::save_profile(&profile).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["alice".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let mut app = notes_app(vec![profile]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert!(app.note_editor.is_some(), "editor open");
+    for ch in "hello".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    );
+    for ch in "world".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    let name = crate::profile::ProfileName::from("alice");
+    assert_eq!(
+        crate::profile_notes::load_note(&name).as_deref(),
+        Some("hello\nworld"),
+        "the draft landed on disk verbatim"
+    );
+    assert_eq!(app.note_text.as_deref(), Some("hello\nworld"));
+    assert!(app.note_editor.is_none(), "a save closes the editor");
+    assert_eq!(app.toasts[0].body, "note saved");
+
+    // Reopen: seeded from the saved text.
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    assert_eq!(app.note_editor.as_ref().unwrap().buf.text(), "hello\nworld");
+
+    // esc discards: the typed extra stays out of the stored note.
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+    );
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.note_editor.is_none());
+    assert_eq!(
+        crate::profile_notes::load_note(&name).as_deref(),
+        Some("hello\nworld"),
+        "esc never wrote"
+    );
+}
+
+/// ⌃j splits the draft, backspace at a line start joins it, ⌃w deletes the
+/// previous word.
+#[test]
+fn the_note_editor_keymap_edits_the_draft() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    let press = |app: &mut App, code| {
+        super::handle_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    };
+    for ch in "foo bar baz".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(draft(&app), "foo bar ", "⌃w removes the last word");
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+    );
+    assert_eq!(draft(&app), "foo bar \n", "⌃j splits at the caret");
+    for ch in "ab".chars() {
+        press(&mut app, KeyCode::Char(ch));
+    }
+    press(&mut app, KeyCode::Backspace);
+    press(&mut app, KeyCode::Backspace);
+    press(&mut app, KeyCode::Backspace);
+    assert_eq!(draft(&app), "foo bar ", "backspace joins at a line start");
+}
+
+/// A save for an account the roster dropped fails and keeps the editor open —
+/// the draft is the only copy.
+#[test]
+fn a_failed_save_keeps_the_editor_open() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = notes_app(vec![mini_profile("alice", None)]);
+    app.tab = Tab::Usage;
+    super::handle_key(
+        &mut app,
+        KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+    );
+    for ch in "boo".chars() {
+        super::handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE),
+        );
+    }
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        app.note_editor.is_some(),
+        "the draft survives a failed save"
+    );
+    assert!(
+        app.toasts[0].body.starts_with("couldn't save the note"),
+        "the failure names itself, got {:?}",
+        app.toasts[0].body
+    );
+}
+
+fn draft(app: &App) -> String {
+    app.note_editor.as_ref().unwrap().buf.text()
+}
+
+/// ↓ on the usage tab re-reads the note: the `notes:` row must never show the
+/// previous account's note under the newly selected header.
+#[test]
+fn stepping_the_cursor_reloads_the_note() {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let _home = crate::testutil::HomeSandbox::new();
+    let alice = mini_profile("alice", None);
+    let bob = mini_profile("bob", None);
+    crate::profile::save_profile(&alice).unwrap();
+    crate::profile::save_profile(&bob).unwrap();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["alice".into(), "bob".into()],
+        ..Default::default()
+    })
+    .unwrap();
+    let alice_name = crate::profile::ProfileName::from("alice");
+    let bob_name = crate::profile::ProfileName::from("bob");
+    crate::profile_notes::save_note(&alice_name, "A note").unwrap();
+    crate::profile_notes::save_note(&bob_name, "B note").unwrap();
+
+    let mut app = notes_app(vec![alice, bob]);
+    app.tab = Tab::Usage;
+    assert_eq!(app.note_text.as_deref(), Some("A note"));
+    super::handle_key(&mut app, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+    assert_eq!(
+        app.note_text.as_deref(),
+        Some("B note"),
+        "a cursor step re-reads the note for the new selection"
+    );
 }

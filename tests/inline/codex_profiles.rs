@@ -5,12 +5,7 @@
 
 use super::*;
 use crate::testutil::HomeSandbox;
-
-fn write_state(body: &str) {
-    let dir = clauth_dir().expect("clauth dir");
-    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
-    std::fs::write(dir.join("codex-profiles.toml"), body).expect("write codex-profiles.toml");
-}
+use crate::testutil::write_codex_state;
 
 #[test]
 fn a_missing_file_reads_as_an_empty_roster() {
@@ -26,7 +21,7 @@ fn a_missing_file_reads_as_an_empty_roster() {
 #[test]
 fn the_on_disk_spelling_is_the_profiles_toml_one() {
     let _home = HomeSandbox::new();
-    write_state(
+    write_codex_state(
         "active_profile = \"work\"\nprofiles = [\"work\", \"play\"]\nfallback_chain = [\"work\"]\nwrap_off = true\n",
     );
     let state = CodexState::load().expect("load");
@@ -41,7 +36,7 @@ fn the_on_disk_spelling_is_the_profiles_toml_one() {
 #[test]
 fn a_minimal_file_defaults_the_rest() {
     let _home = HomeSandbox::new();
-    write_state("profiles = [\"solo\"]\n");
+    write_codex_state("profiles = [\"solo\"]\n");
     let state = CodexState::load().expect("load");
     assert_eq!(state.profiles(), ["solo"]);
     assert_eq!(state.active_profile, None);
@@ -54,7 +49,7 @@ fn a_minimal_file_defaults_the_rest() {
 #[test]
 fn an_unknown_key_does_not_fail_the_load() {
     let _home = HomeSandbox::new();
-    write_state("profiles = [\"solo\"]\nfrom_the_future = 1\n");
+    write_codex_state("profiles = [\"solo\"]\nfrom_the_future = 1\n");
     let state = CodexState::load().expect("load");
     assert_eq!(state.profiles(), ["solo"]);
 }
@@ -63,7 +58,7 @@ fn an_unknown_key_does_not_fail_the_load() {
 fn the_mtime_stat_answers_absent_and_present() {
     let _home = HomeSandbox::new();
     assert_eq!(codex_state_mtime(), None, "no file, no mtime");
-    write_state("profiles = []\n");
+    write_codex_state("profiles = []\n");
     assert!(codex_state_mtime().is_some());
 }
 
@@ -74,7 +69,7 @@ fn the_mtime_stat_answers_absent_and_present() {
 #[test]
 fn the_weekly_line_is_the_codex_files_own_with_the_claude_default() {
     let _home = HomeSandbox::new();
-    write_state("profiles = [\"solo\"]\n");
+    write_codex_state("profiles = [\"solo\"]\n");
     assert_eq!(
         CodexState::load()
             .expect("load")
@@ -83,7 +78,7 @@ fn the_weekly_line_is_the_codex_files_own_with_the_claude_default() {
     );
     assert_eq!(DEFAULT_WEEKLY_SWITCH_PCT, 98.0);
 
-    write_state("profiles = [\"solo\"]\nweekly_switch_threshold = 50.0\n");
+    write_codex_state("profiles = [\"solo\"]\nweekly_switch_threshold = 50.0\n");
     assert_eq!(
         CodexState::load()
             .expect("load")
@@ -92,7 +87,7 @@ fn the_weekly_line_is_the_codex_files_own_with_the_claude_default() {
     );
 
     for garbage in ["0.98", "40", "120.0", "nan"] {
-        write_state(&format!(
+        write_codex_state(&format!(
             "profiles = [\"solo\"]\nweekly_switch_threshold = {garbage}\n"
         ));
         assert_eq!(
@@ -115,7 +110,7 @@ fn a_save_keeps_the_weekly_key_exactly_as_it_found_it() {
         .expect("clauth dir")
         .join("codex-profiles.toml");
 
-    write_state("profiles = [\"a\", \"b\"]\n");
+    write_codex_state("profiles = [\"a\", \"b\"]\n");
     CodexState::update(|state| {
         state.set_active(Some("b"));
         Ok(())
@@ -126,7 +121,7 @@ fn a_save_keeps_the_weekly_key_exactly_as_it_found_it() {
         "active_profile = \"b\"\nprofiles = [\n    \"a\",\n    \"b\",\n]\nfallback_chain = []\nwrap_off = false\n"
     );
 
-    write_state("profiles = [\"a\", \"b\"]\nweekly_switch_threshold = 75.0\n");
+    write_codex_state("profiles = [\"a\", \"b\"]\nweekly_switch_threshold = 75.0\n");
     CodexState::update(|state| {
         state.set_active(Some("a"));
         Ok(())
@@ -149,7 +144,7 @@ fn an_out_of_band_weekly_line_heals_on_the_next_save() {
         .expect("clauth dir")
         .join("codex-profiles.toml");
     let raw = "profiles = [\"a\", \"b\"]\nweekly_switch_threshold = 120.0\n";
-    write_state(raw);
+    write_codex_state(raw);
 
     let loaded = CodexState::load().expect("load");
     assert_eq!(

@@ -1,7 +1,7 @@
 //! `clauth jobs` — the operator's enumeration of the delegate job store.
 //!
 //! Reads `~/.clauth/jobs/` through `mcp::jobs::list`, the same parser the MCP
-//! surface and the TUI's delegates pane read it through, and classifies each row
+//! surface and the TUI's delegates detail read it through, and classifies each row
 //! with the same `StoredJob::phase`. Two readers of one store is already a drift
 //! risk this store carries; a third PARSER would be the drift itself, so there
 //! is none here.
@@ -247,7 +247,7 @@ fn tail_cell(tail: &str) -> String {
 /// Legitimate right-to-left text needs none of them: the implicit bidi algorithm
 /// renders a plain Arabic or Hebrew tail correctly on its own, measured on
 /// both.
-fn reorders_display(c: char) -> bool {
+pub(crate) fn reorders_display(c: char) -> bool {
     matches!(
         c,
         '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}'

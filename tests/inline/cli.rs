@@ -1293,12 +1293,21 @@ fn hidden_entry_points_parse_but_never_appear_in_help() {
     assert!(matches!(
         command(&["__complete"]),
         Command::Complete {
+            codex: false,
+            live_sessions: false
+        }
+    ));
+    assert!(matches!(
+        command(&["__complete", "--codex"]),
+        Command::Complete {
+            codex: true,
             live_sessions: false
         }
     ));
     assert!(matches!(
         command(&["__complete", "--live-sessions"]),
         Command::Complete {
+            codex: false,
             live_sessions: true
         }
     ));
@@ -1466,8 +1475,7 @@ fn per_subcommand_help_carries_that_commands_prose() {
 /// The third needle is the HEDGE, and it is pinned as hard as the promise. The
 /// lift runs in `start::run`'s teardown after `child.wait()` returns, so a hard
 /// kill of `clauth start` itself skips it and the store goes with the runtime.
-/// A help that promises the lift without that clause is the flat overclaim this
-/// entry's reviewzy constraint was filed against.
+/// A help that promises the lift without that clause is a flat overclaim.
 #[test]
 fn the_isolated_help_says_the_session_outlives_the_runtime() {
     let mut start = Cli::command();
@@ -2167,6 +2175,136 @@ mod api_key_helper_tests {
         let _home = HomeSandbox::new();
         dispatch_api_key("ghost-profile").expect_err("missing profile must fail closed");
     }
+}
+
+/// `clauth proxy check`: both secret files are flags holding paths, never the
+/// secrets themselves, and `--destructive` takes the account it may consume.
+/// Both files are optional to the parser: a registered service's come from
+/// clauth, and the URL form refuses a missing one by name at run time.
+#[test]
+fn proxy_check_parses_its_paths_and_the_destructive_account() {
+    let safe = command(&[
+        "proxy",
+        "check",
+        "http://127.0.0.1:9101",
+        "--admin-token-file",
+        "/t/admin",
+        "--key-file",
+        "/t/key",
+    ]);
+    let Command::Proxy {
+        cmd:
+            crate::cli::ProxyCommand::Check {
+                target,
+                admin_token_file,
+                key_file,
+                destructive,
+            },
+    } = safe
+    else {
+        panic!("`proxy check` must select the check arm");
+    };
+    assert_eq!(target, "http://127.0.0.1:9101");
+    assert_eq!(admin_token_file, Some(std::path::PathBuf::from("/t/admin")));
+    assert_eq!(key_file, Some(std::path::PathBuf::from("/t/key")));
+    assert_eq!(destructive, None);
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Check { destructive, .. },
+    } = command(&[
+        "proxy",
+        "check",
+        "http://127.0.0.1:9101",
+        "--admin-token-file",
+        "/t/admin",
+        "--key-file",
+        "/t/key",
+        "--destructive",
+        "acct-ci-1",
+    ])
+    else {
+        panic!("the destructive form must select the check arm");
+    };
+    assert_eq!(destructive.as_deref(), Some("acct-ci-1"));
+
+    let bare = parse(&["proxy", "check", "zcode"]).map(|cli| match cli.command {
+        Some(Command::Proxy {
+            cmd:
+                crate::cli::ProxyCommand::Check {
+                    target,
+                    admin_token_file,
+                    key_file,
+                    destructive,
+                },
+        }) => Some((target, admin_token_file, key_file, destructive)),
+        _ => None,
+    });
+    assert_eq!(
+        bare.map_err(|e| e.kind()),
+        Ok(Some(("zcode".to_string(), None, None, None))),
+        "a service needs neither file"
+    );
+}
+
+/// `clauth proxy enable <service> [--port N]` and `disable <service>`; a port
+/// outside 1..=65535 is refused by the parser.
+#[test]
+fn proxy_enable_and_disable_parse_their_service_and_port() {
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Enable { service, port },
+    } = command(&["proxy", "enable", "zcode", "--port", "9101"])
+    else {
+        panic!("`proxy enable` must select the enable arm");
+    };
+    assert_eq!((service.as_str(), port), ("zcode", Some(9101)));
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Enable { port, .. },
+    } = command(&["proxy", "enable", "zcode"])
+    else {
+        panic!("`proxy enable` must select the enable arm");
+    };
+    assert_eq!(port, None);
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::Disable { service },
+    } = command(&["proxy", "disable", "zcode"])
+    else {
+        panic!("`proxy disable` must select the disable arm");
+    };
+    assert_eq!(service, "zcode");
+
+    for port in ["0", "65536"] {
+        let err = <crate::cli::Cli as clap::Parser>::try_parse_from([
+            "clauth", "proxy", "enable", "zcode", "--port", port,
+        ])
+        .expect_err(port);
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{port}"
+        );
+    }
+}
+
+/// `clauth proxy list` and its `--json` flag.
+#[test]
+fn proxy_list_parses_its_json_flag() {
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::List { json },
+    } = command(&["proxy", "list"])
+    else {
+        panic!("`proxy list` must select the list arm");
+    };
+    assert!(!json);
+
+    let Command::Proxy {
+        cmd: crate::cli::ProxyCommand::List { json },
+    } = command(&["proxy", "list", "--json"])
+    else {
+        panic!("`proxy list --json` must select the list arm");
+    };
+    assert!(json);
 }
 
 /// `clauth herdr install` and its flags. The grammar is what makes the setup a
@@ -3323,10 +3461,7 @@ fn cli_delete_refuses_while_a_rotation_holds_the_lock() {
 #[test]
 fn the_not_found_listing_names_both_rosters() {
     let _home = crate::testutil::HomeSandbox::new();
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx1\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx1"]);
     let config = crate::profile::AppConfig {
         state: crate::profile::AppState {
             profiles: vec!["cl1".into()],
@@ -3362,10 +3497,7 @@ fn the_not_found_listing_names_both_rosters() {
 #[test]
 fn codex_start_refuses_with_fallback_by_name() {
     let _home = crate::testutil::HomeSandbox::new();
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
 
     let err = cmd_start(
         &crate::cli::StartTarget::Named("cx".to_owned()),
@@ -3431,10 +3563,7 @@ fn cli_codex_delete_refuses_while_a_rotation_holds_the_lock() {
 #[test]
 fn codex_start_refuses_a_quarantined_chain_by_name() {
     let _home = crate::testutil::HomeSandbox::new();
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
     crate::testutil::write_codex_store(
         "cx",
         &crate::testutil::codex_auth_body(&crate::testutil::jwt_with_exp(1_700_000_060), "rt.a"),
@@ -3744,10 +3873,7 @@ fn cmd_start_explain_auto_runs_the_with_fallback_refusals() {
 #[test]
 fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() {
     let _home = crate::testutil::HomeSandbox::new();
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
     let config = AppConfig {
         state: crate::profile::AppState {
             profiles: vec!["cl1".into()],
@@ -3792,10 +3918,7 @@ fn the_claude_only_verbs_refuse_a_codex_name_and_list_the_claude_roster_alone() 
 #[test]
 fn each_claude_only_verb_names_itself_in_the_codex_refusal() {
     let _home = crate::testutil::HomeSandbox::new();
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(clauth.join("codex-profiles.toml"), "profiles = [\"cx\"]\n")
-        .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
 
     let cases = [
         ("disable", cmd_disable("cx", true)),
@@ -3858,4 +3981,192 @@ fn a_corrupt_codex_roster_fails_the_claude_only_verbs_as_a_runtime_error() {
     let claude =
         resolve_or_bail(&config, "CL1", "disable").expect("a claude name never loads the roster");
     assert_eq!(claude.as_str(), "cl1");
+}
+
+// ── limit-reset ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn limit_reset_takes_list_or_yes_but_not_both() {
+    let Command::LimitReset { profile, list, yes } = command(&["limit-reset", "cx"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((profile.as_str(), list, yes), ("cx", false, false));
+    let Command::LimitReset { list, yes, .. } = command(&["limit-reset", "-y", "cx"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((list, yes), (false, true));
+    let Command::LimitReset { list, yes, .. } = command(&["limit-reset", "cx", "--list"]) else {
+        panic!("must parse");
+    };
+    assert_eq!((list, yes), (true, false));
+
+    assert_eq!(
+        parse_exit_code(&["limit-reset", "cx", "--list", "--yes"]),
+        2,
+        "--list spends nothing, so there is nothing for --yes to confirm"
+    );
+    assert_eq!(parse_exit_code(&["limit-reset"]), 2);
+    assert_eq!(parse_exit_code(&["limit-reset", "cx", "other"]), 2);
+}
+
+/// A claude profile `cl1`, a codex profile `cx` with a stored login, and a
+/// codex profile `cy` with none.
+fn seed_limit_reset_rosters() {
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec!["cl1".into()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("claude state");
+    let clauth = crate::profile::clauth_dir().expect("clauth dir");
+    std::fs::write(
+        clauth.join("codex-profiles.toml"),
+        "profiles = [\"cx\", \"cy\"]\n",
+    )
+    .expect("codex state");
+    crate::testutil::write_codex_store("cx", &crate::testutil::codex_auth_body("at.cx", "rt.cx"));
+}
+
+/// Endpoints on a listener that is bound but never accepted: a request would
+/// queue a connection on it, so `accept` answering `WouldBlock` afterwards
+/// proves nothing was sent — at once, with no stub deadline to wait out.
+fn untouched_reset_urls() -> (std::net::TcpListener, usage::codex_reset::ResetUrls) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    let urls = usage::codex_reset::ResetUrls::under(&format!("http://127.0.0.1:{port}"));
+    (listener, urls)
+}
+
+fn assert_nothing_sent(listener: &std::net::TcpListener) {
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a request reached the endpoint: {other:?}"),
+    }
+}
+
+fn no_prompt(prompt: &str) -> Result<bool> {
+    panic!("this path must not prompt, asked: {prompt}")
+}
+
+/// `limit-reset` takes codex names alone: a claude name is refused as one (the
+/// codex-side twin of the claude-only verbs' refusal), an unknown name lists
+/// both rosters, and a codex name with no stored login or a dead chain is
+/// refused by name — all before any request.
+#[test]
+fn limit_reset_refuses_a_claude_name_an_unknown_one_and_a_dead_chain_before_any_request() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (listener, urls) = untouched_reset_urls();
+
+    let err = limit_reset_with("CL1", false, true, false, &urls, no_prompt).expect_err("claude");
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "'cl1' is a claude profile; limit-reset is codex-only"
+    );
+
+    let err = limit_reset_with("zz", false, true, false, &urls, no_prompt).expect_err("unknown");
+    assert!(err.downcast_ref::<UsageError>().is_some(), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "profile 'zz' not found\navailable: cl1 · codex: cx, cy"
+    );
+
+    let err = limit_reset_with("cy", false, true, false, &urls, no_prompt).expect_err("no login");
+    assert_eq!(
+        err.to_string(),
+        "'cy' has no stored codex login to use a reset with; run `clauth login cy --codex --browser`"
+    );
+
+    crate::codex_auth::quarantine_for_test("cx", "reused", "rt.cx");
+    let err = limit_reset_with("CX", true, false, false, &urls, no_prompt).expect_err("dead chain");
+    assert!(
+        err.to_string()
+            .starts_with("'cx': codex chain is broken (reused since "),
+        "{err}"
+    );
+    crate::codex_auth::clear_quarantine("cx");
+
+    assert_nothing_sent(&listener);
+}
+
+/// Off a terminal the spend needs `--yes`, and the refusal lands before any
+/// request leaves: the delete/disable confirm policy, for a spend that cannot
+/// be given back. Exit 1, like theirs.
+#[test]
+fn limit_reset_off_a_terminal_without_yes_refuses_before_any_request() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let (listener, urls) = untouched_reset_urls();
+
+    let err = limit_reset_with("cx", false, false, false, &urls, no_prompt).expect_err("refused");
+    assert_eq!(
+        err.to_string(),
+        "refusing to use a reset on 'cx' without confirmation; pass --yes"
+    );
+    assert_nothing_sent(&listener);
+    assert_eq!(crate::exit_code(Err(err)), 1);
+}
+
+/// End to end against a stub: `--list` only lists (and needs no terminal), a
+/// declined prompt sends nothing, a confirmed one consumes the credit the
+/// prompt named — the one expiring first — under a fresh v4 key, and an
+/// account with nothing available fails without a consume. The request order
+/// is the proof: exactly one POST, right after the confirmed GET.
+#[test]
+fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    seed_limit_reset_rosters();
+    let two = r#"{"credits": [
+        {"id": "later", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-01T00:00:00Z", "expires_at": "2027-06-01T00:00:00Z"},
+        {"id": "soon", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-01-02T00:00:00Z", "expires_at": "2027-01-01T00:00:00Z", "title": "Full reset"}
+    ], "available_count": 2}"#;
+    let none = r#"{"credits": [{"id": "soon", "reset_type": "codex_rate_limits", "status": "redeemed", "granted_at": "2026-01-02T00:00:00Z"}], "available_count": 0}"#;
+    let (addr, handle) = crate::testutil::serve_endpoints_raw(5, move |_path, i| match i {
+        3 => (200, r#"{"code": "reset", "windows_reset": 2}"#.to_string()),
+        4 => (200, none.to_string()),
+        _ => (200, two.to_string()),
+    });
+    let urls = usage::codex_reset::ResetUrls::under(&addr);
+
+    limit_reset_with("cx", true, false, false, &urls, no_prompt).expect("--list lists");
+
+    let mut asked = String::new();
+    limit_reset_with("cx", false, false, true, &urls, |prompt| {
+        asked = prompt.to_string();
+        Ok(false)
+    })
+    .expect("a declined prompt is a clean abort");
+    assert!(
+        asked.contains("'cx'? Full reset · expires ") && asked.contains("1 of 2 available"),
+        "the prompt names the credit it will spend: {asked}"
+    );
+
+    limit_reset_with("cx", false, false, true, &urls, |_| Ok(true)).expect("confirmed spend");
+
+    let err = limit_reset_with("cx", false, true, false, &urls, no_prompt).expect_err("none left");
+    assert_eq!(err.to_string(), "no usage-limit resets available on 'cx'");
+
+    let seen = handle.join().expect("join stub");
+    let lines: Vec<&str> = seen
+        .iter()
+        .map(|r| r.lines().next().unwrap_or(""))
+        .collect();
+    let list = "GET /backend-api/wham/rate-limit-reset-credits HTTP/1.1";
+    let consume = "POST /backend-api/wham/rate-limit-reset-credits/consume HTTP/1.1";
+    assert_eq!(lines, [list, list, list, consume, list]);
+    let body: serde_json::Value =
+        serde_json::from_str(&crate::testutil::request_body(&seen[3])).expect("json body");
+    assert_eq!(body["credit_id"], "soon", "the earliest-expiring credit");
+    let key = body["redeem_request_id"].as_str().expect("a key");
+    assert_eq!(
+        (key.len(), key.chars().nth(14)),
+        (36, Some('4')),
+        "a v4 UUID: {key}"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&seen[3], "chatgpt-account-id").as_deref(),
+        Some("acc"),
+        "the store's account id rides along"
+    );
 }

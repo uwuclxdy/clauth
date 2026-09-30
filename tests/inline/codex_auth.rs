@@ -946,13 +946,7 @@ fn standby_tick_rotates_every_due_chain_through_the_wire() {
     // override pointing the next test at this port.
     let _token_url = crate::testutil::CodexTokenUrlSandbox::new(&home, &addr);
 
-    let clauth = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&clauth).expect("mkdir .clauth");
-    std::fs::write(
-        clauth.join("codex-profiles.toml"),
-        "profiles = [\"cx-tick-a\", \"cx-tick-b\"]\n",
-    )
-    .expect("write roster");
+    crate::testutil::write_codex_roster(&["cx-tick-a", "cx-tick-b"]);
     for name in ["cx-tick-a", "cx-tick-b"] {
         write_codex_store(
             name,

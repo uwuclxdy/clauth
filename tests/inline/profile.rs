@@ -118,8 +118,8 @@ fn an_unclaimed_day_leaves_the_flag_in_charge() {
     let mut flagged = Profile::new("work".to_string(), None, None);
     flagged.preferred = true;
     let cfg = config_of(vec![flagged]);
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon, &HashSet::new()));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()));
 }
 
 // A list on an account the walk never visits claims nothing. Letting it count
@@ -141,10 +141,14 @@ fn a_non_members_list_reads_inert() {
     };
 
     assert!(
-        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()),
         "an off-chain list does not stand the flag down"
     );
-    assert!(!cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat));
+    assert!(!cfg.is_home_on(
+        &ProfileName::from("personal"),
+        Weekday::Sat,
+        &HashSet::new()
+    ));
 }
 
 // Same for a member the walk skips: disabled here, and auth-broken and
@@ -160,11 +164,15 @@ fn a_dead_members_list_hands_its_days_back_to_the_flag() {
     let cfg = config_of(vec![flagged, dead]);
 
     assert!(
-        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()),
         "a disabled lister leaves saturday to the flag"
     );
     assert!(
-        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        !cfg.is_home_on(
+            &ProfileName::from("personal"),
+            Weekday::Sat,
+            &HashSet::new()
+        ),
         "and cannot be home itself"
     );
 }
@@ -186,48 +194,18 @@ fn a_listed_day_stands_the_flag_down_elsewhere() {
     let personal = ProfileName::from("personal");
 
     assert!(
-        cfg.is_home_on(&personal, Weekday::Sat),
+        cfg.is_home_on(&personal, Weekday::Sat, &HashSet::new()),
         "the list claims sat"
     );
     assert!(
-        !cfg.is_home_on(&work, Weekday::Sat),
+        !cfg.is_home_on(&work, Weekday::Sat, &HashSet::new()),
         "the flag stands down on a claimed day"
     );
-    assert!(cfg.is_home_on(&work, Weekday::Mon), "monday is unclaimed");
-    assert!(!cfg.is_home_on(&personal, Weekday::Mon));
-}
-
-// The editor's parse takes what a human types: either separator, any case,
-// duplicates collapsed, written order kept.
-#[test]
-fn a_typed_day_list_takes_commas_spaces_and_any_case() {
-    assert_eq!(
-        parse_day_list("sun, Saturday").expect("parses"),
-        vec![Weekday::Sun, Weekday::Sat]
-    );
-    assert_eq!(
-        parse_day_list("SAT sun").expect("parses"),
-        vec![Weekday::Sat, Weekday::Sun]
-    );
-    assert_eq!(
-        parse_day_list("sat, sat").expect("parses"),
-        vec![Weekday::Sat],
-        "a repeat collapses the way the loader's parse does"
-    );
     assert!(
-        parse_day_list("  ").expect("parses").is_empty(),
-        "an empty field clears the list rather than failing"
+        cfg.is_home_on(&work, Weekday::Mon, &HashSet::new()),
+        "monday is unclaimed"
     );
-}
-
-// Where the loader drops a bad entry (a file nobody is watching must still
-// load), the editor names it: the operator is standing at the field.
-#[test]
-fn a_typed_day_list_names_the_entry_it_cannot_read() {
-    assert_eq!(
-        parse_day_list("sat, funday, sun"),
-        Err("funday".to_string())
-    );
+    assert!(!cfg.is_home_on(&personal, Weekday::Mon, &HashSet::new()));
 }
 
 // One claimant is the ordinary case the whole feature is for, and zero is
@@ -239,8 +217,16 @@ fn one_claimant_or_none_raises_no_collision() {
     let flagged = Profile::new("work".to_string(), None, None);
     let cfg = config_of(vec![flagged, weekend]);
 
-    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None, "one claimant");
-    assert_eq!(cfg.day_claim_collision(Weekday::Mon), None, "no claimant");
+    assert_eq!(
+        cfg.day_claim_collision(Weekday::Sat, &HashSet::new()),
+        None,
+        "one claimant"
+    );
+    assert_eq!(
+        cfg.day_claim_collision(Weekday::Mon, &HashSet::new()),
+        None,
+        "no claimant"
+    );
 }
 
 // Two lists naming the same day break nothing — the return pass takes the
@@ -254,7 +240,9 @@ fn two_claimants_raise_a_collision_naming_both() {
     b.preferred_days = vec![Weekday::Sat];
     let cfg = config_of(vec![a, b]);
 
-    let notice = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    let notice = cfg
+        .day_claim_collision(Weekday::Sat, &HashSet::new())
+        .expect("collision");
     assert!(notice.contains("2 accounts claim sat"), "got {notice}");
     assert!(notice.contains("'work'"), "got {notice}");
     assert!(notice.contains("'personal'"), "got {notice}");
@@ -272,7 +260,7 @@ fn a_dead_listers_claim_does_not_count_as_a_collision() {
     dead.disabled = true;
     let cfg = config_of(vec![live, dead]);
 
-    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None);
+    assert_eq!(cfg.day_claim_collision(Weekday::Sat, &HashSet::new()), None);
 }
 
 // The notice is its callers' once-gate key, so it has to be byte-stable while
@@ -286,14 +274,17 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
     b.preferred_days = vec![Weekday::Sat, Weekday::Sun];
     let cfg = config_of(vec![a, b]);
 
-    let sat = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    let sat = cfg
+        .day_claim_collision(Weekday::Sat, &HashSet::new())
+        .expect("collision");
     assert_eq!(
-        cfg.day_claim_collision(Weekday::Sat).as_deref(),
+        cfg.day_claim_collision(Weekday::Sat, &HashSet::new())
+            .as_deref(),
         Some(sat.as_str()),
         "the same day re-derives the same bytes"
     );
     assert_ne!(
-        cfg.day_claim_collision(Weekday::Sun),
+        cfg.day_claim_collision(Weekday::Sun, &HashSet::new()),
         Some(sat.clone()),
         "the rollover changes it"
     );
@@ -308,7 +299,7 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
         .push(ProfileName::from("spare"));
     widened.profiles.push(third);
     assert_ne!(
-        widened.day_claim_collision(Weekday::Sat),
+        widened.day_claim_collision(Weekday::Sat, &HashSet::new()),
         Some(sat),
         "a config edit changes it"
     );
@@ -335,17 +326,21 @@ fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
         profiles: vec![member, off_chain],
     };
 
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat, &HashSet::new()));
     assert!(
-        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        !cfg.is_home_on(
+            &ProfileName::from("personal"),
+            Weekday::Sat,
+            &HashSet::new()
+        ),
         "a healthy account off the chain cannot be home on a day it cannot serve"
     );
 }
 
 // The flag half had the gap the list half did: an account the walk never
-// visits is home on no day, so its `⌂` was marking a homecoming that cannot
-// happen. Both ways of being unreachable are pinned, since one guard answers
-// for both.
+// visits is home on no day, so its projected hop was marking a homecoming that
+// cannot happen. Both ways of being unreachable are pinned, since one guard
+// answers for both.
 #[test]
 fn a_flag_on_an_account_the_walk_skips_is_home_on_no_day() {
     let mut disabled = Profile::new("old".to_string(), None, None);
@@ -353,7 +348,7 @@ fn a_flag_on_an_account_the_walk_skips_is_home_on_no_day() {
     disabled.disabled = true;
     let cfg = config_of(vec![Profile::new("work".to_string(), None, None), disabled]);
     assert!(
-        !cfg.is_home_on(&ProfileName::from("old"), Weekday::Mon),
+        !cfg.is_home_on(&ProfileName::from("old"), Weekday::Mon, &HashSet::new()),
         "a disabled account carrying the flag is home on no day"
     );
 
@@ -368,7 +363,7 @@ fn a_flag_on_an_account_the_walk_skips_is_home_on_no_day() {
         profiles: vec![Profile::new("work".to_string(), None, None), off_chain],
     };
     assert!(
-        !cfg.is_home_on(&ProfileName::from("spare"), Weekday::Mon),
+        !cfg.is_home_on(&ProfileName::from("spare"), Weekday::Mon, &HashSet::new()),
         "and neither is one off the chain"
     );
 }
@@ -380,7 +375,7 @@ fn a_healthy_members_flag_still_answers_an_unclaimed_day() {
     let mut flagged = Profile::new("work".to_string(), None, None);
     flagged.preferred = true;
     let cfg = config_of(vec![flagged]);
-    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon, &HashSet::new()));
 }
 
 // A list that cannot claim is worth saying at tick time, not just at save
@@ -395,7 +390,9 @@ fn a_passed_over_lister_names_what_became_of_the_day() {
     dead.disabled = true;
     let cfg = config_of(vec![carrier, dead]);
 
-    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    let notice = cfg
+        .day_claim_passed_over(Weekday::Sat, &HashSet::new())
+        .expect("a notice");
     assert!(notice.starts_with("sat:"), "got {notice}");
     assert!(notice.contains("the list on 'old'"), "got {notice}");
     assert!(notice.contains("the account is disabled"), "got {notice}");
@@ -414,7 +411,9 @@ fn a_passed_over_lister_with_no_carrier_names_the_fallback() {
     dead.disabled = true;
     let cfg = config_of(vec![dead]);
 
-    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    let notice = cfg
+        .day_claim_passed_over(Weekday::Sat, &HashSet::new())
+        .expect("a notice");
     assert!(notice.contains("nothing else claims sat"), "got {notice}");
     assert!(notice.contains("`preferred` decides it"), "got {notice}");
 }
@@ -429,9 +428,18 @@ fn listers_that_can_all_serve_raise_no_passed_over_notice() {
     b.preferred_days = vec![Weekday::Sun];
     let cfg = config_of(vec![a, b]);
 
-    assert_eq!(cfg.day_claim_passed_over(Weekday::Sat), None);
-    assert_eq!(cfg.day_claim_passed_over(Weekday::Sun), None);
-    assert_eq!(cfg.day_claim_passed_over(Weekday::Mon), None);
+    assert_eq!(
+        cfg.day_claim_passed_over(Weekday::Sat, &HashSet::new()),
+        None
+    );
+    assert_eq!(
+        cfg.day_claim_passed_over(Weekday::Sun, &HashSet::new()),
+        None
+    );
+    assert_eq!(
+        cfg.day_claim_passed_over(Weekday::Mon, &HashSet::new()),
+        None
+    );
 }
 
 // `disabled` (the per-account exclusion toggle) must default to `false` so
@@ -743,6 +751,340 @@ fn save_app_state_does_not_resurrect_a_modelled_key_from_disk() {
         after.contains("some_unknown_future_key = \"keepme\""),
         "the unknown key survives:\n{after}"
     );
+}
+
+// A future nested key inside a MODELLED table must survive the next save — the
+// recursive half of `save_app_state_keeps_unknown_keys_the_file_already_holds`.
+// `[update]` rides the top-level carry only while the key is unmodelled; the
+// moment the model gains the table (this task), a future sub-key inside it
+// would be deleted by every save — the class `[herdr]`/`[serve]` already had.
+#[test]
+fn save_app_state_keeps_unknown_nested_keys_inside_a_modelled_table() {
+    let _home = HomeSandbox::new();
+
+    let mut state = AppState {
+        profiles: vec![crate::profile::ProfileName::from("holder")],
+        herdr: HerdrSettings {
+            pane_tag: false,
+            ..HerdrSettings::default()
+        },
+        serve: ServeSettings {
+            session_creation: true,
+        },
+        ..AppState::default()
+    };
+    save_app_state(&state).expect("save non-default tables");
+    let path = app_state_path().expect("app_state_path");
+    let disk = std::fs::read_to_string(&path).expect("read state file");
+    // Append future nested keys under the modelled tables, the shape a newer
+    // clauth (or a hand-edit) would write.
+    std::fs::write(
+        &path,
+        format!(
+            "{disk}[update]\nauto_update = false\nfuture = \"keepme\"\n\
+             [herdr.extra]\nwait2 = 7\n[serve.extra]\nwait3 = true\n"
+        ),
+    )
+    .expect("write state file + future nested keys");
+
+    // A save that only adds a profile must keep every future nested key.
+    state = toml::from_str(&std::fs::read_to_string(&path).expect("read")).expect("parse state");
+    state
+        .profiles
+        .push(crate::profile::ProfileName::from("fixture"));
+    save_app_state(&state).expect("save again");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    let nested = |path: &[&str]| {
+        let mut cur = &parsed;
+        for key in path {
+            cur = match cur.get(*key).and_then(toml::Value::as_table) {
+                Some(t) => t,
+                None => panic!("{key:?} missing from the saved file:\n{after}"),
+            };
+        }
+        cur
+    };
+    assert_eq!(
+        nested(&["herdr", "extra"])
+            .get("wait2")
+            .and_then(toml::Value::as_integer),
+        Some(7),
+        "the future nested key under [herdr] survived:\n{after}"
+    );
+    assert_eq!(
+        nested(&["serve", "extra"])
+            .get("wait3")
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "the future nested key under [serve] survived:\n{after}"
+    );
+    assert_eq!(
+        nested(&["update"])
+            .get("future")
+            .and_then(toml::Value::as_str),
+        Some("keepme"),
+        "the future nested key under [update] survived:\n{after}"
+    );
+    assert!(
+        after.contains("\"fixture\""),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+// `[update]` defaults ON with the whole table omitted at the default — the
+// `preemptive_rotation` serde contract, on a table: a state file written
+// before the table existed reads as ON, an explicit OFF serializes, a partial
+// or explicitly-ON table loads, and the default renders nothing.
+#[test]
+fn update_settings_defaults_on_and_an_explicit_off_survives_a_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(
+        state.update.auto_update,
+        "a state file predating the table must read as the new default (on)"
+    );
+    assert!(AppState::default().update.auto_update);
+
+    let partial: AppState = toml::from_str("profiles = []\n[update]\nauto_update = false\n")
+        .expect("parse partial table");
+    assert!(
+        !partial.update.auto_update,
+        "a partial table fills its key from the file"
+    );
+    let explicit_on: AppState =
+        toml::from_str("profiles = []\n[update]\nauto_update = true\n").expect("parse explicit on");
+    assert!(explicit_on.update.auto_update);
+
+    let off = AppState {
+        update: UpdateSettings { auto_update: false },
+        ..AppState::default()
+    };
+    let rendered_off = toml::to_string_pretty(&off).expect("render off state");
+    assert!(
+        rendered_off.contains("[update]") && rendered_off.contains("auto_update = false"),
+        "off must render explicitly or the next load reverts it to on, got:\n{rendered_off}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_off).expect("reparse off state");
+    assert!(
+        !reparsed.update.auto_update,
+        "the operator's off must survive save + reload"
+    );
+
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_on.contains("update"),
+        "on (default) must omit the whole [update] table, got:\n{rendered_on}"
+    );
+}
+
+// The move-to-default edge: a modelled table whose modelled key flips BACK to
+// its default renders no `[table]` block on the same save, so a carried
+// unknown sub-key has no block to splice into — it must re-attach at EOF
+// under a fresh header, never drop (round-2 review, major).
+#[test]
+fn save_app_state_carries_unknown_nested_keys_when_the_table_renders_default() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n\n[update]\nauto_update = false\nfuture = \"keepme\"\n",
+    )
+    .expect("write disk state");
+
+    let mut state = load_app_state().expect("load");
+    assert!(!state.update.auto_update, "the saved off loads");
+    // The toggle flips back on: the next render omits the whole [update] table.
+    state.update.auto_update = true;
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    assert_eq!(
+        parsed
+            .get("update")
+            .and_then(|u| u.get("future"))
+            .and_then(toml::Value::as_str),
+        Some("keepme"),
+        "the future key survives the move-to-default save:\n{after}"
+    );
+    assert!(
+        after.contains(PRESERVED_KEYS_MARKER),
+        "the carried key sits under the preserved-keys marker:\n{after}"
+    );
+}
+
+// The disk-side skip (round-3 review, blocker): a disk table holding ONLY an
+// unmodelled sub-key parses with the model's table at its default, so the
+// round-trip renders no block and classifies nothing — and the top-level carry
+// excludes the table because the SAVE renders it (non-default). The sub-key
+// must survive via the nested path, classified against the render's own keys.
+#[test]
+fn save_app_state_carries_an_unknown_subkey_when_the_disk_table_is_all_unmodelled() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nfuture = \"keepme\"\n")
+        .expect("write disk state");
+
+    let mut state = load_app_state().expect("load");
+    assert!(
+        !state.serve.session_creation,
+        "the table loads at its default"
+    );
+    // The save renders [serve] non-default, so the render writes the block.
+    state.serve.session_creation = true;
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    assert_eq!(
+        parsed
+            .get("serve")
+            .and_then(|s| s.get("future"))
+            .and_then(toml::Value::as_str),
+        Some("keepme"),
+        "the sub-key survives the all-unmodelled-disk-table save:\n{after}"
+    );
+    assert_eq!(
+        parsed["serve"]["session_creation"],
+        toml::Value::Boolean(true),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+// The config.toml twin of the disk-side skip: a disk `[models]` holding ONLY
+// an unmodelled key parses with ModelSettings at its default (every field
+// skip-if-none), so the round-trip classifies nothing, and a save whose
+// profile HAS a model renders the block — the key must survive.
+#[test]
+fn save_profile_keeps_an_unknown_subkey_when_the_disk_table_is_all_unmodelled() {
+    let _home = HomeSandbox::new();
+    let mut profile = Profile::new("cfgnested".to_string(), None, None);
+    profile.models.default = Some("claude-opus".to_string());
+    save_profile(&profile).expect("save");
+
+    let config_path =
+        profile_config_path(&crate::profile::ProfileName::from("cfgnested")).expect("config path");
+    // Overwrite the disk file so [models] holds ONLY the unmodelled key: the
+    // shape a hand-edit or a newer clauth leaves when the model's own fields
+    // are unset in the file.
+    std::fs::write(
+        &config_path,
+        "base_url = \"https://api.example.com\"\n\n[models]\nfuture_model = \"keepme\"\n",
+    )
+    .expect("write all-unmodelled models table");
+
+    profile.disabled = true;
+    save_profile(&profile).expect("save the disable");
+
+    let after = std::fs::read_to_string(&config_path).expect("read after");
+    let parsed: toml::Table = toml::from_str(&after).expect("after parses");
+    assert_eq!(
+        parsed["models"]["future_model"],
+        toml::Value::String("keepme".into()),
+        "the unmodelled sub-key survives beside the rendered [models] block:\n{after}"
+    );
+    assert_eq!(
+        parsed["models"]["default"],
+        toml::Value::String("claude-opus".into()),
+        "the modelled change landed:\n{after}"
+    );
+}
+
+// The splice walk must not read `[`-leading content of a multi-line string as
+// a table header: the serializer renders a multi-line value as `key = """` on
+// its own line with the closer riding the last content line, so a value like
+// `opus = """\na\n[evil] = 1"""` puts a `[`-leading line inside the literal,
+// and a false header there fires the leave-block flush INSIDE it — the
+// modelled value corrupts and the carried key lands as string text (round-2
+// review, minor; doc re-shaped in round 3 to the serializer's measured form).
+// Direct unit on the merge, hand-built doc.
+#[test]
+fn merge_nested_carried_keys_never_reads_a_multiline_string_as_a_header() {
+    let rendered = "[models]\nopus = \"\"\"\na\n[evil] = 1\"\"\"\n";
+    let nested = vec![(
+        "models".to_string(),
+        "future".to_string(),
+        toml::Value::Integer(7),
+    )];
+    let out = merge_nested_carried_keys(rendered.to_string(), &nested);
+    let parsed: toml::Table = toml::from_str(&out).expect("output parses");
+    assert_eq!(
+        parsed["models"]["opus"],
+        toml::Value::String("a\n[evil] = 1".into()),
+        "the modelled value is byte-identical:\n{out}"
+    );
+    assert_eq!(
+        parsed["models"]["future"],
+        toml::Value::Integer(7),
+        "the carried key lands as a key, not string text:\n{out}"
+    );
+}
+
+// A dotted sub-header `[t.s]` of the same root is NOT the table's block: the
+// walk must end the splice-capable region there, so a pending scalar never
+// lands after it (it would scope to `t.s`) — and a table with no bare block
+// re-attaches at EOF (round-2 review, nit). Direct unit, hand-built doc.
+#[test]
+fn merge_nested_carried_keys_treats_a_dotted_subheader_as_end_of_block() {
+    let rendered = "[a]\nx = 1\n[t.s]\ny = 2\n";
+    let nested = vec![("t".to_string(), "wait".to_string(), toml::Value::Integer(7))];
+    let out = merge_nested_carried_keys(rendered.to_string(), &nested);
+    let parsed: toml::Table = toml::from_str(&out).expect("output parses");
+    assert_eq!(parsed["a"]["x"], toml::Value::Integer(1), "{out}");
+    assert_eq!(parsed["t"]["s"]["y"], toml::Value::Integer(2), "{out}");
+    assert_eq!(
+        parsed["t"]["wait"],
+        toml::Value::Integer(7),
+        "the scalar scopes to [t], never to [t.s] or [a]:\n{out}"
+    );
+    assert!(
+        out.contains("[t]\nwait = 7"),
+        "the no-block table re-attaches at EOF under a fresh header:\n{out}"
+    );
+}
+
+// The odd-count entry rule breaks on two measured serializer shapes (round-3
+// review, major): a single-line BASIC string ending in a `'''` run
+// (`key = "a'''"`) and a single-line LITERAL holding `"""` (`'p"""q'`) each
+// contain one delimiter occurrence, so line-wise counting read them as
+// multi-line openers — the following header vanished into string state and
+// the carry re-attached a SECOND table at EOF, a file that no longer parses.
+// Direct units on the merge, hand-built docs.
+#[test]
+fn merge_nested_carried_keys_never_opens_string_state_on_a_single_line_value() {
+    for (rendered, value) in [
+        (
+            "[models]\nopus = \"a'''\"\n\n[herdr]\npane_tag = false\n",
+            "a'''",
+        ),
+        (
+            "[models]\ntitle = 'p\"\"\"q'\n\n[herdr]\npane_tag = false\n",
+            "p\"\"\"q",
+        ),
+    ] {
+        let nested = vec![(
+            "herdr".to_string(),
+            "future".to_string(),
+            toml::Value::Integer(7),
+        )];
+        let out = merge_nested_carried_keys(rendered.to_string(), &nested);
+        let parsed: toml::Table = toml::from_str(&out).expect("output parses");
+        assert_eq!(
+            parsed["models"]
+                .get("opus")
+                .or_else(|| parsed["models"].get("title")),
+            Some(&toml::Value::String(value.into())),
+            "the modelled value is byte-identical:\n{out}"
+        );
+        assert_eq!(
+            parsed["herdr"]["future"],
+            toml::Value::Integer(7),
+            "the carried key lands inside the render's own [herdr] block:\n{out}"
+        );
+    }
 }
 
 // The reset-display pair (issue #39) renders as its own on-disk vocabulary, so
@@ -2486,7 +2828,7 @@ fn reload_fingerprint_covers_the_codex_state_file() {
     std::fs::create_dir_all(&dir).expect("mkdir .clauth");
     let before = reload_fingerprint();
     let path = dir.join("codex-profiles.toml");
-    std::fs::write(&path, "profiles = []\n").expect("write codex state");
+    crate::testutil::write_codex_roster(&[]);
     let appeared = reload_fingerprint();
     assert_ne!(before, appeared, "the file appearing must shift it");
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
@@ -4062,12 +4404,14 @@ fn a_serve_table_round_trips() {
     );
 }
 
-/// A key inside `[serve]` that `ServeSettings` does not model is dropped on the
-/// next save WHILE the table renders (its modelled key is non-default), the
-/// same as a stray `[herdr]` key: the table is a closed struct, not a carried
-/// map. The default-table case carries the whole table — see the sibling test.
+/// A key inside `[serve]` that `ServeSettings` does not model now SURVIVES the
+/// next save while the table renders (its modelled key is non-default) — the
+/// recursive carry, the `[update]`-task class fix: a future nested key of a
+/// modelled table is carried inside that table's block, exactly like a future
+/// top-level key. The default-table case carries the whole table — see the
+/// sibling test.
 #[test]
-fn a_stray_serve_key_is_dropped_while_the_table_renders_non_default() {
+fn a_stray_serve_key_survives_while_the_table_renders_non_default() {
     let _home = HomeSandbox::new();
     let path = app_state_path().expect("app_state_path");
     crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
@@ -4082,13 +4426,19 @@ fn a_stray_serve_key_is_dropped_while_the_table_renders_non_default() {
     save_app_state(&state).expect("save");
 
     let after = std::fs::read_to_string(&path).expect("read");
-    assert!(
-        !after.contains("stray"),
-        "the stray key is dropped:\n{after}"
+    let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        parsed.get("serve").and_then(|serve| serve.get("stray")),
+        Some(&toml::Value::String("gone".into())),
+        "the future nested key survives inside the [serve] table:\n{after}"
     );
     assert!(
         after.contains("session_creation = true"),
         "the modelled key survives:\n{after}"
+    );
+    assert!(
+        after.contains(PRESERVED_KEYS_MARKER),
+        "the carried key sits under the preserved-keys marker:\n{after}"
     );
 }
 

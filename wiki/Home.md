@@ -24,7 +24,7 @@ The [README](https://github.com/uwuclxdy/clauth#readme) is the tour. This wiki i
 ## Quick answers
 
 - Settings live in `~/.clauth/profiles.toml` (global), `~/.clauth/codex-profiles.toml` (the codex roster) and `~/.clauth/profiles/<name>/config.toml` (per account). All three are hand-editable.
-- Most settings in the Claude Code files are editable in the TUI too: `clauth`, then the Setup / Fallback / Config / Plugin tabs; the codex roster has no tab.
+- Most settings in the Claude Code files are editable in the TUI too: `clauth`, then the Setup / Fallback / Config / Services tabs; the codex roster has no tab.
 - A switch rewrites `~/.claude/.credentials.json`, parts of `~/.claude/settings.json`, and the stale identity block in `~/.claude.json`. Nothing else in `~/.claude/` moves.
 - `clauth start <profile>` runs a session in its own config dir, so it never disturbs the account your global `claude` is on.
 - Trust model, network activity, and vulnerability reporting: [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md).

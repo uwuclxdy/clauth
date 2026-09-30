@@ -108,6 +108,18 @@ impl CodexAuth {
         self.token_str("account_id").filter(|t| !t.is_empty())
     }
 
+    /// The account's fedramp routing flag, read from the stored tokens where
+    /// codex's own client reads it (`login/src/token_data.rs`): its backend
+    /// client adds `X-OpenAI-Fedramp: true` when the flag is set. A store
+    /// without the flag is an ordinary account.
+    pub(crate) fn is_fedramp(&self) -> bool {
+        self.raw
+            .get("tokens")
+            .and_then(|t| t.get("chatgpt_account_is_fedramp"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     /// The id_token's `chatgpt_plan_type` claim, nested where
     /// `codex_login::chatgpt_account_id` reads the account id, through
     /// [`plan_word`]. The FALLBACK plan label for an account no poll has

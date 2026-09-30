@@ -834,8 +834,16 @@ pub(crate) fn edit_profile_model(
     })
 }
 
-/// Replace an account's `preferred_days` list and persist it — the Setup tab's
-/// day-row commit.
+/// Rewrite an account's `preferred_days` list and persist it — the Fallback
+/// card's `preferred days` row commit. `edit` maps the list on disk to the new
+/// one; the saved list comes back.
+///
+/// [`set_member_threshold`]'s fresh-state shape: the roster is read off disk so
+/// an account deleted since the last reload is refused rather than recreated,
+/// the profile is re-read so a field another writer changed meanwhile is not
+/// rewound, and the in-memory copy moves only once the save landed. `edit` runs
+/// on the list read under the lock, so a concurrent writer's day is kept rather
+/// than overwritten by a toggle computed from a stale copy.
 ///
 /// No `apply_profile_to_claude_settings` follow-up, unlike its model-field
 /// twin: the list is read per chain build (`AppConfig::is_home_today`) and
@@ -844,12 +852,19 @@ pub(crate) fn edit_profile_model(
 pub(crate) fn edit_profile_preferred_days(
     config: &mut AppConfig,
     name: &ProfileName,
-    days: Vec<chrono::Weekday>,
-) -> Result<()> {
+    edit: impl FnOnce(&[chrono::Weekday]) -> Vec<chrono::Weekday>,
+) -> Result<Vec<chrono::Weekday>> {
     with_state_lock(|_held| {
-        let profile = config.find_mut(name).context("profile not found")?;
-        profile.preferred_days = days;
-        save_profile(profile)
+        if !load_app_state()?.profiles.iter().any(|n| n == name) {
+            bail!("profile not found");
+        }
+        let mut fresh = load_profile(name)?;
+        fresh.preferred_days = edit(&fresh.preferred_days);
+        save_profile(&fresh)?;
+        if let Some(profile) = config.find_mut(name) {
+            profile.preferred_days = fresh.preferred_days.clone();
+        }
+        Ok(fresh.preferred_days)
     })
 }
 
@@ -1175,7 +1190,10 @@ pub(crate) fn delete_profile(
 /// failure SAVING the state after the link moved, which leaves the link on
 /// `name` and the marker where it was. That heals on the next switch to
 /// `name`: the link is checked on the already-active path too, so switching
-/// to the account the marker already names REPAIRS a slot that drifted.
+/// to the account the marker already names REPAIRS a slot that drifted. On
+/// Windows a failed repoint can leave the slot absent rather than on the old
+/// profile — the rename there replaces by remove-then-rename — and the next
+/// switch to either account re-links it.
 pub(crate) fn switch_codex_profile(name: &str) -> Result<Option<std::path::PathBuf>> {
     crate::codex_profiles::CodexState::update(|state| {
         if !state.holds(name) {
@@ -1220,8 +1238,7 @@ fn follow_operator_auth_slot(name: &str) -> Result<Option<std::path::PathBuf>> {
     }
     if !adopt_operator_auth_slot(&slot, &store) {
         bail!(
-            "could not repoint {} at '{name}' — your codex would have stayed on \
-             '{holder}', so the switch was not made",
+            "could not repoint {} at '{name}' — the switch was not made",
             slot.display()
         );
     }

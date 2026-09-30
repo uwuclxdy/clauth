@@ -111,7 +111,7 @@ const FEATURE_MAP: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        // the MCP server's tools, the bundled hooks, plus the Plugin tab that
+        // the MCP server's tools, the bundled hooks, plus the Services tab that
         // proves the wiring.
         "From inside Claude",
         &[

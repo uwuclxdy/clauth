@@ -1,10 +1,14 @@
-//! Top bar: claude glyph on the left; brand and account count in the text
-//! column to the right. Three rows always — [`header_height`] keeps
+//! Top bar: claude glyph on the left; brand, usage gauge and status source in
+//! the text column to the right. Three rows always — [`header_height`] keeps
 //! `render::draw`'s layout in step.
 //!
-//! The active-profile usage gauge sits on row 1 to the right of the account
-//! count, separated by a middle dot. The collapse ladder drops the usage bar
-//! before the name.
+//! Row 0 reads `clauth vX.Y.Z` on the left with the herdr tag between them,
+//! and the `[ daemon ]` health chip on the right edge; it sheds the tag first,
+//! then the chip. Row 1 carries the fleet's live-session count, the
+//! active-profile usage gauge and the status indicator, nothing else: the
+//! account counts and the harness filter live on the accounts panel's title
+//! row, as meta slots beside the bare `ACCOUNTS` title. Row 1 sheds the live
+//! count first; the gauge's ladder drops the usage bar before the name.
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -190,6 +194,8 @@ pub(super) fn header_height(_app: &App) -> u16 {
 
 // ── Draw ─────────────────────────────────────────────────────────────────
 
+const CONTENT_GAP: usize = 3;
+
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let cols: [Rect; 2] =
         Layout::horizontal([Constraint::Length(10), Constraint::Min(20)]).areas(area);
@@ -198,19 +204,6 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let rows: [Rect; 3] = Layout::vertical([Constraint::Length(1); 3]).areas(cols[1]);
 
-    // The account rows the Overview lists under the harness filter: claude
-    // while it shows them, codex while it shows those; both by default.
-    let claude_n = if app.harness_filter.shows_claude() {
-        app.config().profiles.len()
-    } else {
-        0
-    };
-    let codex_n = if app.harness_filter.shows_codex() {
-        app.codex_rows.len()
-    } else {
-        0
-    };
-    let n = claude_n + codex_n;
     let info_width = rows[0].width as usize;
 
     let gauge = if app.tab == Tab::Overview || app.compact {
@@ -219,90 +212,103 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         active_gauge(app)
     };
 
-    // ── Row 0: brand [· ● daemon] ......... version ───────────────────────
+    // ── Row 0: clauth [herdr tag] vX.Y.Z ....... [ daemon ] ───────────────
     let brand = "clauth";
-    let ver = format!("v{VERSION}");
-    let mut row0: Vec<Span<'static>> = vec![Span::styled(
-        brand,
-        Style::default().fg(theme::text_color()).bold(),
-    )];
-    // `● daemon` health dot, mirroring the row-1 `status.claude.ai` dot. Hidden
-    // when no daemon runs (the TUI self-fetches under its own lease).
-    if let Some(color) = daemon_dot_color(app) {
-        row0.push(Span::raw("  "));
-        row0.push(Span::styled("● ", Style::default().fg(color)));
-        row0.push(Span::styled("daemon", theme::dim()));
-    }
+    let ver = format!(" v{VERSION}");
+    let mut row0: Vec<Span<'static>> = vec![
+        Span::styled(brand, Style::default().fg(theme::text_color()).bold()),
+        Span::styled(ver, theme::dim()),
+    ];
     let mut used: usize = row0.iter().map(|s| s.content.chars().count()).sum();
-    // `[ herdr ]` context tag, between the brand and the daemon dot. The tag is
-    // the one span this row can shed: it renders only while brand + tag +
-    // daemon + version all fit, so the version stays right-aligned and nothing
-    // new clips at narrow widths (without the tag the row is byte-identical to
-    // a non-herdr launch at every width).
+    // `[ daemon ]` health chip, stuck to the right edge. Always present: no
+    // daemon dims it rather than hiding it. It is the second span this row
+    // sheds, and only once brand + version + chip no longer fit with the
+    // content gap the chip keeps from what sits to its left.
+    const CHIP_OPEN: &str = "[ ";
+    const CHIP_WORD: &str = "daemon";
+    const CHIP_CLOSE: &str = " ]";
+    let chip_w = CHIP_OPEN.chars().count() + CHIP_WORD.chars().count() + CHIP_CLOSE.chars().count();
+    // `[ herdr ]` context tag, between the brand and the version. It is the
+    // first span this row sheds, so it renders only while it still leaves room
+    // for the chip — brand and version never clip.
     if app.herdr_mode {
         let tag = "  [ herdr ]";
-        if used + tag.chars().count() + ver.chars().count() <= info_width {
+        if used + tag.chars().count() + chip_w + CONTENT_GAP <= info_width {
             row0.insert(1, Span::styled(tag, theme::dim()));
             used += tag.chars().count();
         }
     }
-    let gap = info_width.saturating_sub(used + ver.chars().count());
-    row0.push(Span::styled(" ".repeat(gap), theme::base()));
-    row0.push(Span::styled(ver, theme::dim()));
+    if used + chip_w + CONTENT_GAP <= info_width {
+        let gap = info_width - used - chip_w;
+        row0.push(Span::raw(" ".repeat(gap)));
+        // Pill grammar: the brackets are chrome, the word carries the health
+        // color in bold.
+        row0.push(Span::styled(CHIP_OPEN, theme::dim()));
+        row0.push(Span::styled(
+            CHIP_WORD,
+            theme::label().fg(daemon_chip_color(app)),
+        ));
+        row0.push(Span::styled(CHIP_CLOSE, theme::dim()));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(row0)).style(theme::base()),
         rows[0],
     );
 
-    // ── Row 1: N accounts · [gauge] ... ● status.claude.ai ──────────────
-    // The count + gauge are left-aligned together; the status dot is the
-    // only thing right-aligned, with an elastic gap in between.
+    // ── Row 1: [N live · ][gauge] ...... ● feed ──────────────────────────
+    // The fleet's live count and the active profile's gauge, left-aligned, and
+    // the status indicator, the only thing right-aligned, across an elastic
+    // gap. The account counts and the harness filter left this row for the
+    // accounts panel's title row, whose meta slots carry them beside the bare
+    // `ACCOUNTS` title (the filter name left, the roster counts right). The
+    // indicator drops whole, head and feed together, since a dot
+    // left to render clips the feed mid-word and a half-spelled source says
+    // less than none. Its gate is charged the gauge as rendered, so the gauge's
+    // own ladder gives way before the indicator does.
     let row1_width = rows[1].width as usize;
-    // The harness chip rides the account count, because it is a statement ABOUT
-    // that count: while it shows, the number beside it is one harness's, and
-    // without it the number is both rosters together. Absent while both show,
-    // so a header with no codex roster is byte-identical to the one that
-    // predates codex.
-    let prefix = match app.harness_filter.chip() {
-        Some(chip) => format!("{n} account{} · {chip}", crate::format::plural(n)),
-        None => format!("{n} account{}", crate::format::plural(n)),
-    };
     let feed = "status.claude.ai";
     let status_head = "● ";
     let status_w = status_head.chars().count() + feed.chars().count();
-    let reserve: usize = 1;
-
-    let mut left_spans: Vec<Span<'static>> = vec![Span::styled(prefix, theme::faint())];
+    // Right-aligned columns keep a minimum 3-cell gap from the content to
+    // their left (`CONTENT_GAP`, the same gap row 0 keeps): the indicator sheds
+    // before it would render closer than that, never at a 1-2 cell squeeze.
+    let mut left_spans: Vec<Span<'static>> = Vec::new();
     if let Some(ref g) = gauge {
-        // The ` · ` separator is budgeted here but only rendered when the gauge
-        // survives the fit — a hidden gauge must not leave a dangling dot.
-        let sep = " · ";
-        let gauge_budget = row1_width.saturating_sub(
-            left_spans
-                .iter()
-                .map(|s| s.content.chars().count())
-                .sum::<usize>()
-                + sep.chars().count()
-                + status_w
-                + reserve,
-        );
+        let gauge_budget = row1_width.saturating_sub(status_w + CONTENT_GAP);
         let fit = gauge_fit(gauge_budget, g.name.chars().count(), g.pct.is_some());
         if fit.visible {
-            left_spans.push(Span::styled(sep.to_string(), theme::faint()));
             left_spans.extend(gauge_spans(fit, &g.name, g.pct, app.anim_ms()));
         }
     }
+    // The fleet's live-session count leads the row, zero included: hiding it
+    // at zero would move the gauge each time the first session starts or the
+    // last one ends. It takes only what the gauge and the indicator leave, so
+    // it is the first thing the row sheds, whole, never costing the gauge a
+    // cell.
+    let mut prefix = vec![Span::styled(
+        format!("{} live", app.live_sessions.total()),
+        theme::dim(),
+    )];
+    if !left_spans.is_empty() {
+        prefix.push(Span::styled(" · ", theme::dim()));
+    }
+    let prefix_w: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
+    let gauge_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    if prefix_w + gauge_w + status_w + CONTENT_GAP <= row1_width {
+        prefix.append(&mut left_spans);
+        left_spans = prefix;
+    }
     let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
     let mut row1_spans = left_spans;
-    if row1_width >= left_w + status_w + reserve {
+    if row1_width >= left_w + status_w + CONTENT_GAP {
         let gap = row1_width - left_w - status_w;
         row1_spans.push(Span::raw(" ".repeat(gap)));
+        row1_spans.push(Span::styled(
+            status_head,
+            Style::default().fg(status_dot_color(app)),
+        ));
+        row1_spans.push(Span::styled(feed, theme::dim()));
     }
-    row1_spans.push(Span::styled(
-        status_head,
-        Style::default().fg(status_dot_color(app)),
-    ));
-    row1_spans.push(Span::styled(feed, theme::dim()));
 
     frame.render_widget(
         Paragraph::new(Line::from(row1_spans)).style(theme::base()),
@@ -323,15 +329,16 @@ fn status_dot_color(app: &App) -> ratatui::style::Color {
     }
 }
 
-/// `● daemon` header-dot color, or `None` to hide it when no daemon runs.
-/// Mirrors [`status_dot_color`]: green = daemon up + fresh feed, amber = up but
-/// its `status.json` is stale (wedging / pre-abort / just booted).
-fn daemon_dot_color(app: &App) -> Option<ratatui::style::Color> {
+/// `[ daemon ]` header-chip color. Mirrors [`status_dot_color`]: green = daemon
+/// up + fresh feed, amber = up but its `status.json` is stale (wedging /
+/// pre-abort / just booted), dim = no daemon at all (the chip is always on the
+/// row; the TUI self-fetches under its own lease).
+fn daemon_chip_color(app: &App) -> ratatui::style::Color {
     use crate::daemon::DaemonHealth;
     match app.daemon_health {
-        DaemonHealth::Absent => None,
-        DaemonHealth::Stale => Some(theme::warning_color()),
-        DaemonHealth::Fresh => Some(theme::success_color()),
+        DaemonHealth::Absent => theme::text_dim_color(),
+        DaemonHealth::Stale => theme::warning_color(),
+        DaemonHealth::Fresh => theme::success_color(),
     }
 }
 
@@ -362,8 +369,9 @@ fn draw_logo(frame: &mut Frame<'_>, area: Rect, app: &App) {
 #[path = "../../../tests/inline/tui_render_header.rs"]
 mod gauge_tests;
 
-// Herdr-mode row-0 pins: the `[ herdr ]` tag, its shed order at narrow
-// widths, and the byte-identical plain launch.
+// Row-0 pins: the brand/version/tag/chip layout, the chip's pill colors, and
+// the shed ladder — tag first, chip second — with both seams pinned on either
+// side and the plain launch pinned as that same shape minus the tag.
 #[cfg(test)]
 #[path = "../../../tests/inline/tui_render_header_herdr.rs"]
 mod herdr_mode_tests;

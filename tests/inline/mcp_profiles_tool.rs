@@ -852,13 +852,9 @@ fn session_scope_refuses_names_by_name() {
 /// spelling.
 #[test]
 fn a_codex_name_in_the_filter_is_refused_as_a_codex_account() {
-    let home = HomeSandbox::new();
+    let _home = HomeSandbox::new();
     seed_two_profiles();
-    std::fs::write(
-        home.home().join(".clauth").join("codex-profiles.toml"),
-        "profiles = [\"cx\"]\n",
-    )
-    .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx"]);
 
     let result = call_profiles(Some(vec!["cx", "zz"]), None);
     assert_eq!(result.is_error, Some(true));

@@ -575,6 +575,38 @@ fn gate_installs_as_is_under_a_live_session_on_macos() {
     drop(file);
 }
 
+/// The same install-as-is arm, driven off macOS through the override seam:
+/// the refusal relocates the spend rather than avoiding it (the Claude Code
+/// the switch starts refreshes on its first request, in a process that can
+/// write the item its reader consults), so the switch installs the expiring
+/// token as-is instead of spending the chain here. Off macOS the predicate's
+/// `cfg!` term keeps the refusal off; the override seam answers before it, so
+/// this test pins the arm on every platform. `never_refresh` panics if the
+/// arm is lifted and the gate falls through to the refresh.
+#[test]
+fn gate_installs_as_is_under_a_forced_live_session() {
+    let _home = HomeSandbox::new();
+    let name = "test-gate-live-vanilla";
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-old"),
+        Some(past_expiry()),
+    )));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let gate = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    );
+    crate::runtime::set_rotation_blocked_override(None);
+
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "a live-session refusal installs the stored pair as-is"
+    );
+}
+
 /// Expired-but-refreshable → rotated tokens minted, persisted, installed.
 #[test]
 fn gate_refreshes_expiring_token_and_installs() {
@@ -2554,10 +2586,10 @@ fn kick_rate_limit_distills_status_reset_and_retry_after() {
     );
 }
 
-/// A live kick 429 carries the limiter's own headers out through `KickError`,
-/// and `auto_start_kick` (no refresh token → no rotation attempt) surfaces them
-/// as `KickResult.blocked` instead of swallowing the outage like it did through
-/// the 2026-07-15 incident.
+/// A live kick 429 carries the limiter's own headers out through `KickError`
+/// instead of swallowing the outage like it did through the 2026-07-15
+/// incident; `a_captured_window_exhaustion_429_carries_the_limiters_rejection`
+/// pins the hand-off from there to `KickResult.blocked`.
 #[test]
 fn kick_429_surfaces_limiter_metadata() {
     use std::io::Write;
@@ -2601,6 +2633,74 @@ fn kick_429_surfaces_limiter_metadata() {
         rl.until_epoch_secs,
         Some(reset),
         "unified-reset (later than retry-after) is the ceiling"
+    );
+}
+
+/// A real window-exhaustion 429 (`testutil::window_exhaustion_429_headers`,
+/// every epoch moved to now) on a kick with a still-valid access token hands
+/// the limiter's own `rejected` verdict back as `KickResult.blocked` without
+/// spending the refresh token; `run_fetch_records_a_window_exhaustion_429_as_a_switch_grade_block`
+/// carries it from there to the grade. Its `retry-after` (6072 s) clamps to
+/// the 15-minute retry cap, so the window's own reset is the ceiling.
+#[test]
+fn a_captured_window_exhaustion_429_carries_the_limiters_rejection() {
+    let home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("kick-exhausted");
+    let served_at = crate::usage::now_epoch_secs();
+    let reset = served_at + 6_073;
+    let limiter = crate::testutil::window_exhaustion_429_headers(reset, served_at + 383_473);
+    // `max` sits above the one kick a correct run makes, so a rotation's token
+    // request would be recorded rather than refused a socket.
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(3, move |path, _| {
+        if path.starts_with("/v1/messages") {
+            (429, limiter.clone(), String::new())
+        } else {
+            (
+                200,
+                Vec::new(),
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&name);
+
+    // A refresh token on hand and the access token an hour from expiry: the
+    // 429 arm that must not rotate.
+    let expires_at = crate::usage::now_ms() as i64 + 3_600_000;
+    let result = auto_start_kick(
+        &config,
+        &name,
+        "at-old",
+        Some("rt-old"),
+        Some(expires_at),
+        None,
+    );
+    let seen: Vec<String> = server
+        .join()
+        .expect("listener")
+        .iter()
+        .map(|raw| crate::testutil::request_path(raw))
+        .collect();
+
+    assert_eq!(
+        seen,
+        vec!["/v1/messages?beta=true".to_string()],
+        "one kick and no refresh: a 429 on a still-valid token never spends the refresh token"
+    );
+    assert!(!result.opened, "a 429 opens no window");
+    assert_eq!(
+        result.rotated, None,
+        "nothing rotated, so no pair comes back"
+    );
+    assert_eq!(
+        result.blocked,
+        Some(KickRateLimit {
+            rejected: true,
+            until_epoch_secs: Some(reset),
+        }),
+        "a window-exhaustion 429 is the limiter's rejection, ceilinged at the window's reset"
     );
 }
 
@@ -2885,6 +2985,56 @@ fn rotate_one_inner_does_not_rotate_under_a_live_session_on_macos() {
         .and_then(|p| p.access_token().map(str::to_string));
     assert_eq!(stored.as_deref(), Some("at-old"), "the pair is untouched");
     drop(pid);
+}
+
+/// The same skip, driven off macOS through the override seam: the single
+/// rotate must not spend a chain the session holds, so the skip is silent —
+/// `Persisted(false)`, activity Idle, no `OpResult`, no token request.
+#[test]
+fn rotate_one_inner_skips_under_a_forced_live_session() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "rotate-one-forced";
+    // Zero expected requests: reaching the listener at all is the failure.
+    let (base, server) = crate::testutil::serve_endpoints(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                .to_string(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(std::collections::HashMap::new()));
+    let (tx, rx) = mpsc::channel();
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let result = rotate_one_inner(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        Some(&activity),
+        &tx,
+    );
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.is_empty(),
+        "a blocked rotation must not spend the chain: {seen:?}"
+    );
+    assert!(matches!(result, RotateOutcome::Persisted(false)));
+    assert!(
+        is_idle(&activity, &crate::profile::ProfileName::from(name)),
+        "a skipped rotation stamps nothing"
+    );
+    assert!(rx.try_recv().is_err(), "the silent skip emits no OpResult");
+    #[allow(clippy::expect_used, reason = "test")]
+    let stored = config
+        .lock()
+        .expect("config lock")
+        .find(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.access_token().map(str::to_string));
+    assert_eq!(stored.as_deref(), Some("at-old"), "the pair is untouched");
 }
 
 // ── the kick's two stuck-429 arms ────────────────────────────────────────────
@@ -3732,6 +3882,125 @@ fn rolling_gate_disk_disarm_under_the_guard_stops_the_stamp() {
     assert!(
         !dir.join("session-token.json").exists(),
         "a cleared profile stays cleared on the switch-in leg"
+    );
+}
+
+/// The refusal leg carries no cfg gate: only its predicate's compile-time
+/// `cfg!(target_os = "macos")` term makes it macOS-only in production, and the
+/// override seam answers before that term, so this test drives the leg to its
+/// exact owner-picked sentence on every platform CI runs. `never_refresh`
+/// panics if the leg is lifted and the gate falls through to the refresh.
+#[test]
+fn a_live_session_on_a_rolling_chain_refuses_the_switch_with_the_live_session_copy() {
+    let _home = HomeSandbox::new();
+    let name = "test-roll-refuse";
+    let config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let handle = Arc::new(RankedMutex::new(config));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let gate = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    );
+    crate::runtime::set_rotation_blocked_override(None);
+
+    let AuthGate::Transient(e) = gate else {
+        panic!("a live session on a rotating chain must refuse, not install/refresh");
+    };
+    assert_eq!(
+        e.text(),
+        "'test-roll-refuse' has a live clauth start session still on its rotating login; retry in a moment"
+    );
+    assert_eq!(e.text_with_status(), e.text());
+}
+
+/// The refusal guards a SPEND: a comfortable stored chain stamps the sidecar
+/// with no refresh, so a live session on the rotating pair never blocks it.
+#[test]
+fn a_live_session_on_a_rolling_chain_still_stamps_from_a_comfortable_chain() {
+    let _home = HomeSandbox::new();
+    let name = "test-roll-calm";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    crate::claude::stamp_rolling_token(
+        &crate::profile::ProfileName::from(name),
+        &OAuthToken {
+            access_token: "at-fed-stale".to_string(),
+            refresh_token: None,
+            expires_at: Some(past_expiry()),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        },
+    )
+    .expect("feed");
+    let handle = Arc::new(RankedMutex::new(config));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let gate = ensure_installable(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    );
+    crate::runtime::set_rotation_blocked_override(None);
+
+    assert!(
+        matches!(gate, AuthGate::Ready),
+        "a no-spend stamp is never refused"
+    );
+    assert_eq!(
+        sidecar_oauth(name).expect("sidecar").access_token,
+        "at-old",
+        "stamped from the stored chain"
+    );
+}
+
+/// `auto_start_kick`'s refusal sits after its first 401 kick, so only a real
+/// listener reaches it. Off macOS via the override seam it must stop before the
+/// rotation leg: the window stays shut and no token is spent. Reaching the
+/// token endpoint is the failure.
+#[test]
+fn auto_start_kick_does_not_rotate_under_a_forced_live_session() {
+    let home = HomeSandbox::new();
+    let name = "kick-forced";
+    let (base, server) = crate::testutil::serve_endpoints(3, |path, _| {
+        if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-LEAK","refresh_token":"rt-LEAK","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+
+    crate::runtime::set_rotation_blocked_override(Some(true));
+    let result = auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+    );
+    crate::runtime::set_rotation_blocked_override(None);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        seen,
+        vec!["/v1/messages?beta=true".to_string()],
+        "one kick, then the refusal: no token spent"
+    );
+    assert_eq!(result.rotated, None, "nothing may be rotated");
+    assert!(!result.opened, "the window stays shut");
+    assert!(
+        result.blocked.is_none(),
+        "a 401 first kick carries no limiter metadata"
     );
 }
 

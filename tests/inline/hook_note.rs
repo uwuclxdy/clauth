@@ -77,7 +77,7 @@ const SWITCHED: &str =
     "clauth note: the active profile for this session switched from `kerry` to `cld`.";
 
 /// The shipped copy, byte for byte. All three spellings counted against
-/// opus-4-8 via cloudify's `token-count.mjs` on their placeholder spellings —
+/// opus-4-8 on their placeholder spellings —
 /// `old`/`new`/`100` standing in for the names and figure, the `%` literal:
 /// ``clauth note: session resumed under `new`; earlier turns ran under `old`.``
 /// counts 25, ``clauth note: the active profile for this session switched from
@@ -1885,6 +1885,53 @@ fn the_replay_judges_a_third_party_members_windows_like_the_live_leg() {
     let note = nudge_note(&fire, &read).expect("the nudge fires");
     assert!(
         note.starts_with("clauth note: 5h window 97% used ("),
+        "the uncovered session hears it: {note}",
+    );
+}
+
+/// m2: the replay skips a key-rejected sibling the way the live leg does — the
+/// durable per-credential verdict stands in for the live `ThirdPartyBroken`
+/// set a hook process has no refresher to fill. A key-rejected sibling with
+/// clear headroom must NOT read as a target, or the note stays silent exactly
+/// when nothing will catch the cap.
+#[test]
+fn the_replay_skips_a_key_rejected_sibling_like_the_live_leg() {
+    let _home = HomeSandbox::new();
+    seed_exhausted_chain();
+    seed_burn_history();
+    // Recast `b` as a key-rejected api-key member with a clear provider window:
+    // without the key-rejection union the replay reads it as a headroom target
+    // and answers `chain_acts` true over a switch the live leg refuses.
+    let mut config = crate::profile::load_config().expect("reload");
+    let b = config
+        .profiles
+        .iter_mut()
+        .find(|p| p.name.as_str() == "b")
+        .expect("member b");
+    b.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    b.api_key = Some("sk-zai-k".to_string());
+    b.provider = crate::providers::Provider::from_base_url(b.base_url.as_deref().unwrap());
+    let fp = crate::usage::profile_credential_fingerprint(b).expect("credentialed");
+    crate::profile_cache::write_auth_expired(&b.name, fp);
+    crate::profile::save_profile(b).expect("save b");
+    let provider_window = |pct: f64| {
+        crate::testutil::stats_with_bars(vec![crate::testutil::bar_reset_in("5h", pct, 3_600)])
+    };
+    write_profile_cache(
+        &ProfileName::from("b"),
+        THIRD_PARTY_CACHE_FILE,
+        &provider_window(10.0),
+    );
+
+    let fire = task_fire("conv-tp-key-rejected");
+    let read = read_nudge(&fire, None).expect("eligible and readable");
+    assert!(
+        !read.chain_acts,
+        "a key-rejected sibling with headroom is not a target the leg would pick"
+    );
+    let note = nudge_note(&fire, &read).expect("the nudge fires");
+    assert!(
+        note.ends_with(". no fallback is set; further agent spawns may fail with 429s."),
         "the uncovered session hears it: {note}",
     );
 }

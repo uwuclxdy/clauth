@@ -7,13 +7,17 @@
 //! `write_status` and the loop scaffolding stay in `mod.rs`.
 //! `tests/inline/daemon_mod.rs` pins each drain's behavior against this seam.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use crate::actions::{switch_off_locked, switch_profile_locked};
 use crate::logline::logline;
-use crate::profile::{load_config, reload_fingerprint};
-use crate::usage::{collect_third_party_entries, collect_tokens, is_idle, now_ms};
+use crate::profile::{ProfileName, load_config, reload_fingerprint};
+use crate::usage::{
+    PendingSwitchTarget, collect_third_party_entries, collect_tokens, current_key_rejected_names,
+    is_idle, now_ms, queued_switch_away_is_stale,
+};
 
 use super::{SwitchBackoff, active_diverged_unsaved, switch_backoff_ms};
 
@@ -64,8 +68,16 @@ impl super::Daemon {
         // `heal_detached`), so this never blocks the run loop.
         crate::plugin_host::heal_detached();
         // Same shape for the herdr plugin: update a stale install in the
-        // background, throttled inside its own `heal_detached`.
-        crate::herdr::heal_detached();
+        // background, throttled inside its own `heal_detached`. Its saved
+        // `[update]` toggle gates the network leg like the binary update,
+        // read off the config this tick's reload just refreshed (a poisoned
+        // config mutex falls back to the absent-table default: on).
+        let auto_update = self
+            .config
+            .lock()
+            .map(|c| c.state.update.auto_update)
+            .unwrap_or(true);
+        crate::herdr::heal_detached(auto_update);
     }
 
     /// Log once, per day and per config change, what today's day lists are
@@ -78,15 +90,26 @@ impl super::Daemon {
     /// reported, and gated on the messages so the per-tick re-derivation does
     /// not repaint the same line until midnight.
     pub(super) fn log_day_claim_notices(&mut self) {
+        // Clone the live broken map first (rank 295 below config 400), then
+        // intersect with the SAME config snapshot the notices scan reads, so a
+        // repair landing since the last tick drops the name at once.
+        let broken_snapshot: HashMap<String, u64> = self
+            .third_party_broken
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         #[allow(
             clippy::expect_used,
             reason = "config mutex poisoning is unrecoverable"
         )]
-        let notices = self
-            .config
-            .lock()
-            .expect("config mutex poisoned")
-            .day_claim_notices_today();
+        let notices = {
+            let cfg = self.config.lock().expect("config mutex poisoned");
+            let key_rejected: HashSet<ProfileName> =
+                current_key_rejected_names(&broken_snapshot, &cfg.profiles)
+                    .into_iter()
+                    .collect();
+            cfg.day_claim_notices_today(&key_rejected)
+        };
         if notices == self.day_claim_notices {
             return;
         }
@@ -169,21 +192,21 @@ impl super::Daemon {
     /// skip/failure logs once per distinct reason (see [`SwitchBackoff`]).
     pub(super) fn drain_pending_switch(&mut self) {
         // The set holds at most one scheduler target in practice
-        // (`scan_auto_switch` skips while one is pending); `min` keeps the
+        // (`scan_auto_switch` skips while one is pending); `min_by` keeps the
         // pick deterministic anyway.
-        let target: Option<String> = self
+        let decision: Option<PendingSwitchTarget> = self
             .pending_switch
             .lock()
             .map(|mut g| {
-                let t = g.iter().min().cloned();
+                let d = g.iter().min_by(|a, b| a.target.cmp(&b.target)).cloned();
                 g.clear();
-                t
+                d
             })
             .unwrap_or_default();
-        let Some(target) = target else {
+        let Some(decision) = decision else {
             return;
         };
-        let target = crate::profile::ProfileName::from(target);
+        let target = crate::profile::ProfileName::from(decision.target.clone());
         let now = now_ms();
 
         // A vanished target (deleted out-of-process after the enqueue — the
@@ -227,7 +250,7 @@ impl super::Daemon {
                 return;
             }
             if now < b.not_before {
-                self.requeue_quiet(&target);
+                self.requeue_quiet(&decision);
                 return;
             }
         }
@@ -235,7 +258,7 @@ impl super::Daemon {
         // Still mid-fetch/rotation — switching now would race the worker on the
         // single-use token/TokenList. Defer, keep retrying.
         if !is_idle(&self.activity, &target) {
-            self.fail_switch(&target, now, "target is mid-fetch");
+            self.fail_switch(&decision, now, "target is mid-fetch");
             return;
         }
 
@@ -251,7 +274,7 @@ impl super::Daemon {
             && active_diverged_unsaved(&active)
         {
             self.fail_switch(
-                &target,
+                &decision,
                 now,
                 &format!(
                     "active '{active}' has unsaved credentials; {}",
@@ -284,7 +307,7 @@ impl super::Daemon {
                 // The daemon log is an operator surface with no companion log of
                 // its own, so it names the status like CLI stderr does.
                 self.fail_switch(
-                    &target,
+                    &decision,
                     now,
                     &format!("refresh failed transiently ({})", e.text_with_status()),
                 );
@@ -298,18 +321,45 @@ impl super::Daemon {
         // taken FIRST (Config ranks outer of the state flock — the order
         // `lockorder` asserts), held across the switch, and dropped before the
         // republish below so its disk sweep runs under no config guard.
+        let broken_snapshot: HashMap<String, u64> = self
+            .third_party_broken
+            .lock()
+            .map(|m| m.clone())
+            .unwrap_or_default();
         let result = {
             #[allow(
                 clippy::expect_used,
                 reason = "config mutex poisoning is unrecoverable"
             )]
             let mut cfg = self.config.lock().expect("config poisoned");
+            let key_rejected: HashSet<ProfileName> =
+                current_key_rejected_names(&broken_snapshot, &cfg.profiles)
+                    .into_iter()
+                    .collect();
+            // Revalidate under the fresh config (reloaded at the top of this
+            // tick). Only a record that CARRIES a key-rejection cause can be
+            // stale: a repair landing between the scan's queue and this dispatch
+            // changes the active's fingerprint, so the switch-away it motivated
+            // is dropped instead of moving off the just-repaired account. A
+            // cause-absent (ordinary exhaustion/home) record executes even beside
+            // an ambient stale mark.
+            if queued_switch_away_is_stale(decision.key_rejected_cause.as_ref(), &cfg.profiles) {
+                logline!(
+                    "clauth daemon: dropping queued switch to '{target}': active '{}' was re-keyed",
+                    decision
+                        .key_rejected_cause
+                        .as_ref()
+                        .map(|(active, _)| active.as_str())
+                        .unwrap_or("")
+                );
+                return;
+            }
             // Destination-based: a move landing on the preferred (home) account
             // logs as a return whether the return pass or an exhaustion walk onto
             // a clear preferred put us there. Captured under the same lock so the
             // log names the two apart without threading the cause through the
             // switch action.
-            let returning = cfg.is_home_today(&target);
+            let returning = cfg.is_home_today(&target, &key_rejected);
             // A delete landing between the early drop above and this hold is
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
@@ -337,7 +387,7 @@ impl super::Daemon {
                 }
             }
             Err(e) => {
-                self.fail_switch(&target, now, &format!("switch failed: {e}"));
+                self.fail_switch(&decision, now, &format!("switch failed: {e}"));
             }
         }
     }
@@ -345,18 +395,20 @@ impl super::Daemon {
     /// Handle a switch that couldn't execute (busy / diverged / transient / switch
     /// error). Advances exponential backoff for this target, DEDUPS the failure
     /// log (emits only when the target or reason changes — a stuck switch never
-    /// logs 1/tick), and re-queues the target until its retry window closes.
-    /// A change of target resets the backoff.
-    fn fail_switch(&mut self, target: &crate::profile::ProfileName, now: u64, reason: &str) {
+    /// logs 1/tick), and re-queues the decision until its retry window closes.
+    /// A change of target resets the backoff. The decision (target + cause) is
+    /// re-queued whole so a later repair still invalidates it at dispatch.
+    fn fail_switch(&mut self, decision: &PendingSwitchTarget, now: u64, reason: &str) {
+        let target = decision.target.as_str();
         let (attempts, retry_until) = match &self.switch_backoff {
-            Some(b) if b.target == target.as_str() => (b.attempts + 1, b.retry_until),
+            Some(b) if b.target == target => (b.attempts + 1, b.retry_until),
             _ => (1, now.saturating_add(SWITCH_RETRY_TTL_MS)),
         };
         // Dedup: only log when the (target, reason) pair changed since last time.
         let changed = self
             .switch_backoff
             .as_ref()
-            .is_none_or(|b| b.target != target.as_str() || b.reason != reason);
+            .is_none_or(|b| b.target != target || b.reason != reason);
         if changed {
             logline!("clauth daemon: deferring switch to '{target}': {reason}");
             self.switch_failure_logs += 1;
@@ -369,7 +421,7 @@ impl super::Daemon {
                 reason: reason.to_string(),
                 retry_until,
             });
-            self.requeue_quiet(target);
+            self.requeue_quiet(decision);
         } else {
             // Retry window closed — give up and stop tracking this target.
             logline!("clauth daemon: gave up switching to '{target}': {reason}");
@@ -377,14 +429,14 @@ impl super::Daemon {
         }
     }
 
-    /// Re-queue a retry target. A NEWER target that arrived since the drain
+    /// Re-queue a retry decision. A NEWER target that arrived since the drain
     /// supersedes it — the scheduler's later decision wins. No logging — the
     /// backoff/dedup path owns the observability.
-    fn requeue_quiet(&mut self, target: &crate::profile::ProfileName) {
+    fn requeue_quiet(&mut self, decision: &PendingSwitchTarget) {
         if let Ok(mut q) = self.pending_switch.lock()
             && q.is_empty()
         {
-            q.insert(target.to_string());
+            q.insert(decision.clone());
         }
     }
 

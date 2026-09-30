@@ -20,7 +20,7 @@
 //! written to keep the spent window's result rather than to answer that caller,
 //! and the id is recovered afterwards by ENUMERATION rather than by delivery:
 //! `monitor` with no `job_ids` lists it, `clauth jobs` prints it, and the TUI's
-//! delegates pane draws it. All three go through [`list_banded`], and so through
+//! delegates detail draws it. All three go through [`list_banded`], and so through
 //! [`list`] beneath it.
 //!
 //! A blocking delegate that is STILL attached to its caller keeps a second
@@ -198,6 +198,17 @@ pub(crate) struct JobRecord {
     /// parseable without a migration.
     #[serde(default)]
     pub(crate) isolated: bool,
+    /// The directory the delegate's `claude` runs in, resolved once at the
+    /// call: a resume's recorded workspace, else the caller's `cwd`, else the
+    /// server's own. `None` on a record an older server wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cwd: Option<String>,
+    /// The account of the session whose `clauth mcp` server spawned the
+    /// delegate, resolved once at the call off the server's own credentials.
+    /// `None` on a record an older server wrote and where no profile owns the
+    /// session's credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) spawned_by: Option<String>,
     /// The child's own session id, off the first streamed event that carried
     /// one: the resume handle a crashed run's record must outlive its server
     /// for. The stdout reader captures it long before any crash and the
@@ -305,6 +316,10 @@ pub(crate) struct RunningSpec {
     /// same reason: a heartbeat rewrites the whole record, and a hand-off
     /// must keep the answer the mint resolved once.
     pub(crate) isolated: bool,
+    /// The run's directory and its spawning account, carried the same way and
+    /// for the same reason (see [`JobRecord::cwd`], [`JobRecord::spawned_by`]).
+    pub(crate) cwd: Option<String>,
+    pub(crate) spawned_by: Option<String>,
     /// Which spelling every write of this record lands under. A background job
     /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
     /// caller walks away and [`promote`] renames it.
@@ -454,6 +469,8 @@ pub(crate) fn write_heartbeat_with_session(
             endpoint: spec.endpoint.clone(),
             provider: spec.provider.clone(),
             isolated: spec.isolated,
+            cwd: spec.cwd.clone(),
+            spawned_by: spec.spawned_by.clone(),
             session_id: session_id.map(str::to_string),
             last_output_at,
             recorded_at: spec.recorded_at,
@@ -499,29 +516,25 @@ pub(crate) fn promote(spec: &RunningSpec) -> Result<()> {
 /// session id rides the record off the envelope's own `session_id` key — every
 /// completion arm stamps it (the id clauth pinned at the spawn), so a collected
 /// completion is resumable, and the listing names the handle beside the job id.
-pub(crate) fn write_done(
-    job_id: &str,
-    profile: &str,
-    started_at: u64,
-    endpoint: Option<String>,
-    provider: Option<String>,
-    isolated: bool,
-    envelope: serde_json::Value,
-) -> Result<()> {
+/// Every call fact comes off `spec`, the one the heartbeats wrote from, so a
+/// fact the mint resolved cannot drop off the record at the finish.
+pub(crate) fn write_done(spec: &RunningSpec, envelope: serde_json::Value) -> Result<()> {
     let session_id = envelope
         .get("session_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
     write_atomic(
         &JobRecord {
-            job_id: job_id.to_string(),
-            profile: profile.to_string(),
+            job_id: spec.job_id.clone(),
+            profile: spec.profile.clone(),
             state: JobState::Done,
-            started_at,
+            started_at: spec.started_at,
             envelope: Some(envelope),
-            endpoint,
-            provider,
-            isolated,
+            endpoint: spec.endpoint.clone(),
+            provider: spec.provider.clone(),
+            isolated: spec.isolated,
+            cwd: spec.cwd.clone(),
+            spawned_by: spec.spawned_by.clone(),
             session_id,
             timeout_secs: 0,
             idle_secs: None,
@@ -539,6 +552,40 @@ pub(crate) fn write_done(
         // took the envelope from the join, so `Handoff::finalize` deletes that
         // record rather than writing a second delivery into it.
         RecordKind::Collectable,
+    )
+}
+
+/// [`write_done`] from loose parts, for tests that finalize a record with no
+/// running spec of their own: no cwd and no spawning account, the shape an
+/// older server's finish wrote.
+#[cfg(test)]
+pub(crate) fn write_done_parts(
+    job_id: &str,
+    profile: &str,
+    started_at: u64,
+    endpoint: Option<String>,
+    provider: Option<String>,
+    isolated: bool,
+    envelope: serde_json::Value,
+) -> Result<()> {
+    write_done(
+        &RunningSpec {
+            job_id: job_id.to_string(),
+            profile: profile.to_string(),
+            started_at,
+            recorded_at: started_at,
+            timeout_secs: 0,
+            idle_secs: None,
+            endpoint,
+            provider,
+            isolated,
+            cwd: None,
+            spawned_by: None,
+            kind: RecordKind::Collectable,
+            owner_pid: 0,
+            owner_started_at: 0,
+        },
+        envelope,
     )
 }
 
@@ -1051,9 +1098,9 @@ pub(crate) enum JobLiveness {
 /// pair answers "is anything already waiting on this".
 ///
 /// One derivation for every surface that names a record's situation — `clauth
-/// jobs`, `monitor`'s listing and the TUI's delegates pane — so none of them can
+/// jobs`, `monitor`'s listing and the TUI's delegates detail — so none of them can
 /// give one record a different name, a different band, or a different word.
-/// `src/tui/render/plugin.rs` keeps only what a TERMINAL adds on top: the glyph
+/// `src/tui/render/services.rs` keeps only what a TERMINAL adds on top: the glyph
 /// and the hue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JobPhase {
@@ -1144,7 +1191,7 @@ impl StoredJob {
     /// Which of the four situations this record is in.
     ///
     /// The one classification in the crate: `clauth jobs`, `monitor`'s listing
-    /// and the TUI's delegates pane all read a record's situation from here, so
+    /// and the TUI's delegates detail all read a record's situation from here, so
     /// none of them can answer differently about one file.
     ///
     /// The spelling on disk is the whole difference between the two live ones:
@@ -1255,9 +1302,8 @@ pub(crate) fn list(now: u64) -> Vec<StoredJob> {
 /// The sort is STABLE, so the band is the only thing that moves and `list`'s
 /// within-band order survives untouched.
 ///
-/// `src/tui/render/plugin.rs` bands its own rows the same way for the same
-/// reason, one layer later (it sorts already-rendered cells). Folding the two
-/// onto this one is owed.
+/// `src/tui/render/services.rs` renders the delegates detail straight from this
+/// order — its `delegate_cells` sorts nothing — so the banding lives here alone.
 pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
     let mut jobs = list(now);
     jobs.sort_by_key(|job| job.phase().rank());
@@ -1267,7 +1313,7 @@ pub(crate) fn list_banded(now: u64) -> Vec<StoredJob> {
 /// Every liveness figure a `running` record yields at one instant.
 ///
 /// ONE derivation for two surfaces: `monitor`'s running payload renders it for
-/// the calling model, and the TUI's delegates pane draws it for the operator, so
+/// the calling model, and the TUI's delegates detail draws it for the operator, so
 /// neither can answer differently about the same file. A `None` is a figure the
 /// record structurally does not have, never an unknown one — the same rule the
 /// payload's absent keys already render by.

@@ -11,7 +11,7 @@ This PR
 ## Checklist
 
 - [ ] Secrets redacted from any pasted output (no `sk-ant-*`, no `~/.claude`/`~/.clauth` contents)
-- [ ] `~/repos/rs/cargo.sh` passes locally (fmt, clippy, tests)
+- [ ] `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings` and `cargo test --locked --all-features` pass locally
 
 ## AI
 

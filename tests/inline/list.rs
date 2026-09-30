@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 //! `clauth list` table renderer (`render_table`): hide/reveal of disabled
-//! profiles, the active marker, and exact column layout. Driven over the real
+//! profiles, the active marker, exact column layout, and the codex section
+//! with the widths it shares with the claude table. Driven over the real
 //! `build_status` body under a `HomeSandbox`, the same data path
 //! `clauth status --json` reads, so a drift in either surface reds here.
 
@@ -63,6 +64,12 @@ fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>)
 }
 
 const HEADER: &str = "  PROFILE  PLAN    5H USED  7D USED  ENDPOINT";
+
+/// `lines`, each newline-terminated: the whole `render_table` output, so a
+/// stray or missing blank line reds where `str::lines` would hide it.
+fn table_of(lines: &[&str]) -> String {
+    lines.iter().map(|l| format!("{l}\n")).collect()
+}
 
 /// ISO-8601 UTC `now_secs + ahead_secs`, the shape `resets_at` carries.
 fn future_iso(ahead_secs: i64) -> String {
@@ -129,6 +136,12 @@ fn list_table_reveals_disabled_with_a_trailing_marker_when_included() {
 /// `claude_free`, which is what makes the tier alone unable to carry the fact.
 fn warm_canceled(name: &str) {
     crate::testutil::register_names(&[name]);
+    write_canceled_cache(name);
+}
+
+/// The canceled body alone, for a name a roster already holds (the cache
+/// write is gated on either roster).
+fn write_canceled_cache(name: &str) {
     write_profile_cache(
         &crate::profile::ProfileName::from(name),
         USAGE_CACHE_FILE,
@@ -197,7 +210,7 @@ fn list_table_leaves_a_live_account_unmarked() {
     );
 }
 
-/// Both facts render. An operator usually disables an account BECAUSE it died,
+/// Both facts render. A user usually disables an account BECAUSE it died,
 /// so a `disabled` that masked `canceled` would hide the reason for the state it
 /// is reporting — the same erasure the Fallback tab's stacked pills prevent.
 #[test]
@@ -333,12 +346,12 @@ fn list_table_leaves_an_env_keyed_third_party_profile_unmarked() {
 }
 
 /// A third-party account's 5h/7d columns render the PROVIDER's own headroom —
-/// its cached usage bars — rather than dashes (owner ruling 2026-09-09 row 3:
-/// the defect was the empty columns, not the marker). The bar arms mirror the
-/// roster rank's fall-through: a live bar's `pct`, falling back to the first
-/// funded wallet when no label-matched live bar exists. Lapsed bars and spent
-/// wallets keep reading as dashes, the same missing-data call every other
-/// surface makes. The `(stale)` marker itself is pinned by its own test below.
+/// its cached usage bars — rather than dashes (the defect was the empty
+/// columns, not the marker). The bar arms mirror the roster rank's
+/// fall-through: a live bar's `pct`, falling back to the first funded wallet
+/// when no label-matched live bar exists. Lapsed bars and spent wallets keep
+/// reading as dashes, the same missing-data call every other surface makes.
+/// The `(stale)` marker itself is pinned by its own test below.
 #[test]
 fn list_table_renders_a_third_party_rows_own_headroom() {
     let _home = HomeSandbox::new();
@@ -499,10 +512,9 @@ fn list_table_dashes_a_lapsed_bars_last_reading() {
     );
 }
 
-/// The wallet fallback takes the first FUNDED wallet in ROW order (owner
-/// ruling 2026-08-28): a two-wallet cache listing the empty one first must
-/// render the funded figure, not the zero it would show on a `.last()` or
-/// amount-sorting read.
+/// The wallet fallback takes the first FUNDED wallet in ROW order: a two-wallet
+/// cache listing the empty one first must render the funded figure, not the
+/// zero it would show on a `.last()` or amount-sorting read.
 #[test]
 fn list_table_ranks_the_first_funded_wallet_not_the_empty_first_listed() {
     let _home = HomeSandbox::new();
@@ -632,7 +644,7 @@ fn a_dead_credential_is_named_in_the_state_suffix() {
 /// The same dead-credential state has two causes wanting opposite actions, and
 /// the api-key-only account is the common one: its key works for inference and
 /// authenticates nothing on the usage gateway, so it lands here having never
-/// stored a session. "expired" would send that operator looking for something to
+/// stored a session. "expired" would send that user looking for something to
 /// renew.
 #[test]
 fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
@@ -669,7 +681,7 @@ fn a_profile_that_never_stored_a_session_is_told_it_needs_one() {
 }
 
 /// A non-Alibaba profile has no session to lapse, so its `AuthExpired` can only
-/// mean the api key was rejected — the suffix must say so, or the operator goes
+/// mean the api key was rejected — the suffix must say so, or the user goes
 /// hunting for a login that does not exist.
 #[test]
 fn a_dead_api_key_is_told_the_key_was_rejected() {
@@ -871,5 +883,205 @@ fn list_table_collapses_the_identical_login_expired_pair() {
         table.matches("login expired").count(),
         1,
         "one dead credential renders one login-expired cue, got:\n{table}"
+    );
+}
+
+// ── the codex section ────────────────────────────────────────────────────────
+
+/// Warm codex `name`'s usage cache in the shape the codex leg writes: the plan
+/// in `codex_plan`, never `tier`. The codex roster must already hold `name`;
+/// `warm_usage` would put it on the claude roster instead.
+fn warm_codex_usage(name: &str, plan: &str, five_h: f64, seven_d: f64) {
+    write_profile_cache(
+        &crate::profile::ProfileName::from(name),
+        USAGE_CACHE_FILE,
+        &UsageInfo {
+            plan: Some(PlanInfo {
+                codex_plan: Some(plan.to_string()),
+                ..PlanInfo::default()
+            }),
+            five_hour: Some(UsageWindow {
+                utilization: five_h,
+                resets_at: None,
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: seven_d,
+                resets_at: None,
+            }),
+            fetched_at: Some(crate::usage::now_ms()),
+            ..Default::default()
+        },
+    );
+}
+
+/// The claude half every codex-section test renders above its section: the
+/// active `work` account on a warm cache, i.e. `[HEADER, WORK_ROW]`.
+fn work_config() -> AppConfig {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4, 17.6);
+    config
+}
+
+fn render(config: &AppConfig) -> String {
+    render_table(
+        config,
+        &build_profile_entries(config, config.state.refresh_interval_ms, None, true),
+    )
+}
+
+/// The codex roster renders as its own section under the claude table, off the
+/// entries `status --json` appends. Every column is sized over BOTH sections,
+/// in both directions: the codex name, plan and 7d cell are wider than every
+/// claude one and widen the claude rows, and the claude 5h cell, wider than
+/// its own header, widens the codex rows. The roster is out of name order and
+/// the codex rows keep its order. The codex rows carry no ENDPOINT cell, and
+/// each section marks its own active profile.
+#[test]
+fn list_table_prints_the_codex_roster_as_its_own_section_under_the_claude_table() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("work"), oauth("idle")],
+    };
+    config.state.active_profile = Some("work".into());
+    warm_usage("work", 42.4567, 17.6);
+    crate::testutil::write_codex_state(
+        "active_profile = \"codex-laptop\"\nprofiles = [\"spare\", \"codex-laptop\"]\n",
+    );
+    warm_codex_usage("spare", "business", 3.5, 61.2345);
+    warm_codex_usage("codex-laptop", "plus", 12.0, 30.0);
+
+    assert_eq!(
+        render(&config),
+        table_of(&[
+            "  PROFILE       PLAN       5H USED   7D USED  ENDPOINT",
+            "* work          Max 5x    42.4567%     17.6%  -",
+            "  idle          Max              -         -  -",
+            "",
+            "  CODEX         PLAN       5H USED   7D USED",
+            "  spare         business      3.5%  61.2345%",
+            "* codex-laptop  plus           12%       30%",
+        ])
+    );
+}
+
+/// The previous fixture with every column's winning side reversed: the claude
+/// name, plan and 7d cell are wider than every codex one and widen the codex
+/// rows, and a codex 5h cell, wider than its own header, widens the claude
+/// row. Across the two, each shared width is pinned from both sections.
+#[test]
+fn list_table_sizes_the_codex_section_off_wider_claude_columns_too() {
+    let _home = HomeSandbox::new();
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![oauth("workstation")],
+    };
+    config.state.active_profile = Some("workstation".into());
+    warm_usage("workstation", 42.4, 17.6543);
+    crate::testutil::write_codex_state(
+        "active_profile = \"cx-home\"\nprofiles = [\"cx-work\", \"cx-home\"]\n",
+    );
+    warm_codex_usage("cx-work", "plus", 3.25813, 30.0);
+    warm_codex_usage("cx-home", "go", 12.0, 61.0);
+
+    assert_eq!(
+        render(&config),
+        table_of(&[
+            "  PROFILE      PLAN     5H USED   7D USED  ENDPOINT",
+            "* workstation  Max 5x     42.4%  17.6543%  -",
+            "",
+            "  CODEX        PLAN     5H USED   7D USED",
+            "  cx-work      plus    3.25813%       30%",
+            "* cx-home      go           12%       61%",
+        ])
+    );
+}
+
+/// A quarantined codex chain reads `login expired` through the claude rows' own
+/// suffix, right after the 7d cell: the section has no ENDPOINT column to pad.
+#[test]
+fn list_table_names_a_quarantined_codex_chain_after_its_7d_cell() {
+    let _home = HomeSandbox::new();
+    let config = work_config();
+    crate::testutil::write_codex_roster(&["spare"]);
+    warm_codex_usage("spare", "pro", 12.0, 30.0);
+    crate::codex_auth::quarantine_for_test("spare", "reused", "refresh.spare");
+
+    assert_eq!(
+        render(&config),
+        table_of(&[
+            HEADER,
+            WORK_ROW,
+            "",
+            "  CODEX    PLAN    5H USED  7D USED",
+            "  spare    pro         12%      30% (login expired)",
+        ])
+    );
+}
+
+/// No codex account leaves the claude table exactly as it was: no blank line,
+/// no section. An empty roster and an unreadable `codex-profiles.toml` both
+/// read as no roster, the way `build_status` reads them.
+#[test]
+fn list_table_prints_no_codex_section_for_an_empty_or_unreadable_roster() {
+    let _home = HomeSandbox::new();
+    let config = work_config();
+    let claude_only = table_of(&[HEADER, WORK_ROW]);
+
+    assert_eq!(render(&config), claude_only, "no codex-profiles.toml");
+    crate::testutil::write_codex_roster(&[]);
+    assert_eq!(render(&config), claude_only, "an empty roster");
+    crate::testutil::write_codex_state("profiles = [\n");
+    assert_eq!(render(&config), claude_only, "an unreadable roster");
+}
+
+/// With no claude account the codex section stands alone, its own header first:
+/// no claude header above it, and no `no accounts yet` line, since the install
+/// has an account.
+#[test]
+fn list_table_prints_the_codex_section_alone_without_a_claude_account() {
+    let _home = HomeSandbox::new();
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    };
+    crate::testutil::write_codex_state("active_profile = \"spare\"\nprofiles = [\"spare\"]\n");
+    warm_codex_usage("spare", "pro", 12.0, 30.0);
+
+    assert_eq!(
+        render(&config),
+        table_of(&[
+            "  CODEX    PLAN  5H USED  7D USED",
+            "* spare    pro       12%      30%",
+        ])
+    );
+}
+
+/// A codex row reads no claude-only state. The cache write admits a name either
+/// roster holds, so a claude fetch still carrying a deleted claude profile can
+/// land its canceled `/profile` body in the `usage_cache.json` of a codex
+/// profile re-captured under that name; the codex row must not read it as a
+/// cancellation. That body carries no codex plan either, and a codex row with
+/// no plan shows the missing-data dash, never its provider's name.
+#[test]
+fn list_table_reads_no_claude_cancellation_off_a_codex_rows_cache() {
+    let _home = HomeSandbox::new();
+    let config = work_config();
+    crate::testutil::write_codex_roster(&["ghost"]);
+    write_canceled_cache("ghost");
+
+    assert_eq!(
+        render(&config),
+        table_of(&[
+            HEADER,
+            WORK_ROW,
+            "",
+            "  CODEX    PLAN    5H USED  7D USED",
+            "  ghost    -             -        -",
+        ])
     );
 }

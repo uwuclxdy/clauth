@@ -5,10 +5,10 @@
 //!     life by the running daemon; a display-only try-lock tells the TUI header
 //!     whether a daemon is up (an advisory lock auto-releases on process death,
 //!     so a dead daemon reads as absent on the next probe). Paired with
-//!     `status.json`'s freshness it drives the `● daemon` health dot
+//!     `status.json`'s freshness it drives the `[ daemon ]` header chip
 //!     ([`daemon_health`]). [`singleton_held`] reads the same lock as a decision
 //!     for `clauth daemon --status`, where not knowing has to be an error rather
-//!     than a hidden dot.
+//!     than a dim chip.
 //!   * `clauthd-standby.lock` — the **standby slot** ([`StandbySlot`], #57). One
 //!     waiter may park on the singleton lock; every later instance is
 //!     [`Claim::Redundant`] and exits, so a spawner that fires repeatedly can no
@@ -31,7 +31,8 @@ use anyhow::{Context, Result};
 
 use crate::profile::clauth_dir;
 
-/// How stale `status.json` may be before the `● daemon` dot flips green→amber.
+/// How stale `status.json` may be before the `[ daemon ]` header chip flips
+/// green→amber.
 /// The daemon stamps it every ~1s loop tick, but a single tick can legitimately
 /// block on the keychain shell-outs: a rotation's mirror makes three `security`
 /// calls (read, write, read-back verify) at 10 s each, unclamped because it
@@ -51,7 +52,7 @@ const _: () = assert!(
      read green, never amber"
 );
 
-/// The `● daemon` header dot's three display states, derived from the daemon
+/// The `[ daemon ]` header chip's three display states, derived from the daemon
 /// singleton flock (presence) + the `generated_at` stamp inside `status.json`
 /// (health — the daemon's own write time, not the file's mtime). Nothing here
 /// gates fetching — that is [`FetchLease`] — but `clauth daemon --status` does
@@ -60,7 +61,7 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonHealth {
     /// No daemon: `clauthd.lock` is free (never started, or the holder died).
-    /// The dot is hidden; the TUI self-fetches under its own lease.
+    /// The chip is dim; the TUI self-fetches under its own lease.
     Absent,
     /// A daemon holds the lock but its feed is stale/unwritten — wedging,
     /// pre-abort, or just-booted before the first `status.json` write. Amber.
@@ -69,9 +70,9 @@ pub(crate) enum DaemonHealth {
     Fresh,
 }
 
-/// Probe the daemon's presence + health for the header dot. Best-effort: any
+/// Probe the daemon's presence + health for the header chip. Best-effort: any
 /// error that hides whether a daemon is up reads as [`DaemonHealth::Absent`]
-/// (the dot simply disappears — never a false "daemon up"). Never CREATES the
+/// (the chip simply dims — never a false "daemon up"). Never CREATES the
 /// lock file: a missing file means no daemon has ever started here.
 pub(crate) fn daemon_health() -> DaemonHealth {
     let Ok(dir) = clauth_dir() else {
@@ -89,7 +90,7 @@ pub(crate) fn daemon_health() -> DaemonHealth {
         Ok(()) => return DaemonHealth::Absent,
         // Held → a daemon is present; fall through to the health read.
         Err(std::fs::TryLockError::WouldBlock) => {}
-        // Can't tell (io error): hide the dot rather than assert a daemon.
+        // Can't tell (io error): dim the chip rather than assert a daemon.
         Err(std::fs::TryLockError::Error(_)) => return DaemonHealth::Absent,
     }
     // Present. A missing/unreadable feed = booted-but-not-yet-published → amber.
@@ -106,7 +107,7 @@ pub(crate) fn daemon_health() -> DaemonHealth {
 /// Pure freshness test: `body`'s `generated_at` stamp is within [`DAEMON_STALE_MS`]
 /// of `now_ms`. An unparseable body or a missing/malformed stamp reads as stale —
 /// never render a feed we can't read as fresh. A stamp in the FUTURE counts as
-/// fresh (clock skew must not flap the dot).
+/// fresh (clock skew must not flap the chip).
 pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
         return false;
@@ -122,6 +123,80 @@ pub(crate) fn status_is_fresh(body: &str, now_ms: u64) -> bool {
     }
     let generated_ms = (secs as u64).saturating_mul(1000);
     now_ms.saturating_sub(generated_ms) <= DAEMON_STALE_MS
+}
+
+/// The managed-gateway slot for the Services tab's `shunt` row: with a fresh
+/// daemon, the `gateway` object the daemon published in `status.json` (the
+/// supervisor's live read); otherwise the record-only verdict
+/// ([`super::gateway::unsupervised_slot`]), which reads `unobserved` for a
+/// record the gateway would run on. The `bool` is `true` only when the slot
+/// came from a fresh daemon's feed AND its `gateway` object parsed — the caller
+/// names the daemon as what runs the gateway whenever it did not.
+///
+/// `health` is the caller's already-probed [`daemon_health`] verdict (the
+/// per-tick reading the header holds), so this reader never takes the flock a
+/// second time or re-reads `status.json` just to decide freshness. A fresh
+/// daemon whose feed cannot be read, whose `gateway` key is absent (an older
+/// daemon), or whose `gateway` object this binary cannot parse (a state word or
+/// field shape from a newer daemon) all fall back to the record verdict,
+/// reported as not-from-daemon, rather than guessing a state.
+pub(crate) fn gateway_slot(health: DaemonHealth) -> (super::gateway::GatewaySlot, bool) {
+    if health != DaemonHealth::Fresh {
+        return (super::gateway::unsupervised_slot(), false);
+    }
+    let Ok(dir) = clauth_dir() else {
+        return (super::gateway::unsupervised_slot(), false);
+    };
+    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
+        return (super::gateway::unsupervised_slot(), false);
+    };
+    // Parse only the `gateway` key: one unrelated profile entry or codex slot
+    // that this binary cannot read must not discard a fresh daemon's slot.
+    #[derive(serde::Deserialize)]
+    struct GatewayFeed {
+        #[serde(default)]
+        gateway: Option<super::gateway::GatewaySlot>,
+    }
+    let Ok(feed) = serde_json::from_str::<GatewayFeed>(&body) else {
+        return (super::gateway::unsupervised_slot(), false);
+    };
+    match feed.gateway {
+        Some(slot) => (slot, true),
+        None => (super::gateway::unsupervised_slot(), false),
+    }
+}
+
+/// The managed proxies' slots for `clauth proxy list` (and the P8 TUI): with a
+/// fresh daemon, the `proxies` array the daemon published in `status.json`
+/// (the supervisors' live reads); otherwise the record-only entries
+/// ([`super::proxies::entries`] over no live slots). A fresh daemon whose feed
+/// cannot be read, whose `proxies` key is absent (an older daemon), or whose
+/// array this binary cannot parse falls back to the record-only entries rather
+/// than guessing a state — the [`gateway_slot`] discipline, for the array.
+pub(crate) fn proxy_slots(health: DaemonHealth) -> Vec<super::proxies::ProxySlot> {
+    if health != DaemonHealth::Fresh {
+        return super::proxies::entries(None);
+    }
+    let Ok(dir) = clauth_dir() else {
+        return super::proxies::entries(None);
+    };
+    let Ok(body) = std::fs::read_to_string(dir.join(super::STATUS_FILE)) else {
+        return super::proxies::entries(None);
+    };
+    // Parse only the `proxies` key: one unrelated profile entry that this
+    // binary cannot read must not discard a fresh daemon's slots.
+    #[derive(serde::Deserialize)]
+    struct ProxiesFeed {
+        #[serde(default)]
+        proxies: Option<Vec<super::proxies::ProxySlot>>,
+    }
+    let Ok(feed) = serde_json::from_str::<ProxiesFeed>(&body) else {
+        return super::proxies::entries(None);
+    };
+    match feed.proxies {
+        Some(slots) => slots,
+        None => super::proxies::entries(None),
+    }
 }
 
 /// What a starting `clauth daemon` is allowed to become (#57).
@@ -210,7 +285,7 @@ const _: () = assert!(CLAIM_ATTEMPTS > 1 && !CLAIM_RETRY.is_zero());
 /// Windows) and, after the escalation, before it gives up. A dying process
 /// releases its advisory flock within a handful of scheduler ticks; 5 s is
 /// generous headroom over that.
-const REPLACE_WAIT: Duration = Duration::from_secs(5);
+pub(super) const REPLACE_WAIT: Duration = Duration::from_secs(5);
 /// Poll spacing while `--replace` waits for the freed flock. Two orders of
 /// magnitude below [`REPLACE_WAIT`], well under any human-visible delay.
 const REPLACE_POLL: Duration = Duration::from_millis(50);
@@ -344,10 +419,78 @@ pub(crate) fn claim_by_replacing_retry_with(
     attempts: u32,
     retry: Duration,
 ) -> Result<Claim> {
-    // Fast path: no daemon → a normal start. Retry past transient probe holds
-    // (TUI header at 1 Hz, clauth daemon --status) that take the flock and
-    // release it microseconds later — a real holder keeps its lock for the
-    // process lifetime, so anything that clears on retry was a reader.
+    // If the retry cleared the transient, try a normal claim. If a daemon wins
+    // the lock in the instant between the presence check and the claim, fall
+    // through and replace it rather than returning a silent `Redundant` (which
+    // `serve` would log and exit 0 on, leaving the operator's upgrade un-started).
+    if !held_past_probes(attempts, retry)?
+        && let Claim::Active(lock) = claim_once(dir, false)?
+    {
+        return Ok(Claim::Active(lock));
+    }
+    // The flock a dying holder released is what this waits on, so the poll is
+    // load-bearing: the first attempt races the death and normally still reads
+    // the lock held.
+    let lock = terminate_holder(wait, poll, |_| claim_active(dir))?;
+    Ok(Claim::Active(lock))
+}
+
+/// The singleton, when this process can take it now.
+fn claim_active(dir: &Path) -> Option<DaemonLock> {
+    match claim_once(dir, false) {
+        Ok(Claim::Active(lock)) => Some(lock),
+        _ => None,
+    }
+}
+
+/// What [`stop_running`] found and left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonStop {
+    /// No daemon held the singleton: nothing was signalled.
+    NotRunning,
+    /// The daemon exited and the singleton stayed free.
+    Stopped,
+    /// The daemon exited and another instance held the singleton at once: a
+    /// parked standby promoted, or a supervisor restarted it.
+    Replaced,
+}
+
+/// The TUI's `stop daemon`: the termination `--replace` sends, with no claim
+/// after it, so the box is left with no daemon rather than this process.
+pub(crate) fn stop_running() -> Result<DaemonStop> {
+    stop_running_with(REPLACE_WAIT, REPLACE_POLL, CLAIM_ATTEMPTS, CLAIM_RETRY)
+}
+
+/// [`stop_running`] with the wait and retry schedules injected, so a test can
+/// pin the escalation and the probe-collision recovery without sleeping for
+/// either.
+pub(crate) fn stop_running_with(
+    wait: Duration,
+    poll: Duration,
+    attempts: u32,
+    retry: Duration,
+) -> Result<DaemonStop> {
+    if !held_past_probes(attempts, retry)? {
+        return Ok(DaemonStop::NotRunning);
+    }
+    // Death is the event, not the free lock: a parked standby takes the flock
+    // the instant it is released, so a free-lock wait would sit out both
+    // passes and then SIGKILL a pid that is already gone.
+    terminate_holder(wait, poll, |pid| (!pid_is_clauth_daemon(pid)).then_some(()))?;
+    if held_past_probes(attempts, retry)? {
+        // The successor's own start reclaims whatever gateway was left.
+        return Ok(DaemonStop::Replaced);
+    }
+    super::gateway::stop_left_behind_gateway();
+    super::proxies::stop_left_behind_proxies();
+    Ok(DaemonStop::Stopped)
+}
+
+/// Whether a daemon holds the singleton, re-tested past transient probe holds
+/// (TUI header at 1 Hz, `clauth daemon --status`) that take the flock and
+/// release it microseconds later: a real holder keeps its lock for the process
+/// lifetime, so anything that clears on retry was a reader.
+fn held_past_probes(attempts: u32, retry: Duration) -> Result<bool> {
     let mut held = true;
     for attempt in 0..attempts.max(1) {
         held = singleton_held()?;
@@ -358,17 +501,20 @@ pub(crate) fn claim_by_replacing_retry_with(
             std::thread::sleep(retry);
         }
     }
-    // If the retry cleared the transient, try a normal claim. If a daemon wins
-    // the lock in the instant between the presence check and the claim, fall
-    // through and replace it rather than returning a silent `Redundant` (which
-    // `serve` would log and exit 0 on, leaving the operator's upgrade un-started).
-    if !held && let Claim::Active(lock) = claim_once(dir, false)? {
-        return Ok(Claim::Active(lock));
-    }
+    Ok(held)
+}
+
+/// Signal the daemon the [`PID_FILE`] sidecar names until `released` answers
+/// for its pid: SIGTERM (`taskkill /F` on Windows), a bounded wait, one
+/// escalation (SIGKILL, another `/F`), a second bounded wait. Shared by
+/// `--replace` and [`stop_running`], which differ only in what counts as done.
+fn terminate_holder<T>(
+    wait: Duration,
+    poll: Duration,
+    mut released: impl FnMut(u32) -> Option<T>,
+) -> Result<T> {
     let Some(pid) = holder_pid() else {
-        anyhow::bail!(
-            "a clauth daemon is running but its pid is unreadable; kill it manually, then start"
-        );
+        anyhow::bail!("a clauth daemon is running but its pid is unreadable; kill it manually");
     };
     if !pid_is_clauth_daemon(pid) {
         anyhow::bail!(
@@ -377,19 +523,17 @@ pub(crate) fn claim_by_replacing_retry_with(
         );
     }
     let sent_term = terminate_pid(pid, false);
-    if let Some(lock) = wait_for_active(dir, wait, poll) {
-        return Ok(Claim::Active(lock));
+    if let Some(done) = poll_until(wait, poll, || released(pid)) {
+        return Ok(done);
     }
-    // The first pass didn't free the lock in time: escalate (SIGKILL on unix,
-    // another `taskkill /F` on Windows) and wait once more.
     let sent_kill = terminate_pid(pid, true);
-    if let Some(lock) = wait_for_active(dir, wait, poll) {
-        return Ok(Claim::Active(lock));
+    if let Some(done) = poll_until(wait, poll, || released(pid)) {
+        return Ok(done);
     }
     if !sent_term && !sent_kill {
         anyhow::bail!(
             "could not signal the running clauth daemon (pid {pid}): no kill tool is on PATH \
-             (`kill` on unix, `taskkill` on Windows); kill it manually, then start"
+             (`kill` on unix, `taskkill` on Windows); kill it manually"
         );
     }
     anyhow::bail!(
@@ -399,16 +543,12 @@ pub(crate) fn claim_by_replacing_retry_with(
     )
 }
 
-/// Poll the singleton lock until this process can claim it, up to `wait`. Returns
-/// the held [`DaemonLock`] on success (its pid stamped by [`DaemonLock::active`]),
-/// or `None` on timeout. The flock a dying holder released is what this waits on,
-/// so the loop is load-bearing: the first attempt races the death and normally
-/// still reads the lock held.
-fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonLock> {
+/// Ask `done` every `poll` until it answers, up to `wait`; `None` on timeout.
+fn poll_until<T>(wait: Duration, poll: Duration, mut done: impl FnMut() -> Option<T>) -> Option<T> {
     let deadline = Instant::now() + wait;
     loop {
-        if let Ok(Claim::Active(lock)) = claim_once(dir, false) {
-            return Some(lock);
+        if let Some(value) = done() {
+            return Some(value);
         }
         if Instant::now() >= deadline {
             return None;
@@ -426,7 +566,7 @@ fn wait_for_active(dir: &Path, wait: Duration, poll: Duration) -> Option<DaemonL
 /// (a dead pid's `ESRCH`) still counts as run: the caller polls the flock either
 /// way. Long-form flags so the call site documents itself.
 #[cfg(unix)]
-fn terminate_pid(pid: u32, hard: bool) -> bool {
+pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     let signal = if hard { "KILL" } else { "TERM" };
     let mut cmd = std::process::Command::new("kill");
     cmd.args(["-s", signal, &pid.to_string()]);
@@ -440,7 +580,7 @@ fn terminate_pid(pid: u32, hard: bool) -> bool {
 }
 
 #[cfg(windows)]
-fn terminate_pid(pid: u32, hard: bool) -> bool {
+pub(super) fn terminate_pid(pid: u32, hard: bool) -> bool {
     // A console daemon has no window to accept the graceful WM_CLOSE, so a
     // soft taskkill can never work here: every pass is a force kill. The
     // first (soft) pass is the expected-success path and stays silenced; the
@@ -554,7 +694,7 @@ fn stamp_pid() -> std::io::Result<()> {
 
 /// The pid the running daemon stamped into the [`PID_FILE`] sidecar, when one is
 /// fully written. Informational only — its one caller reaches it past a true
-/// [`singleton_held`], and the header dot answers off [`daemon_health`], so
+/// [`singleton_held`], and the header chip answers off [`daemon_health`], so
 /// presence is proven by the flock either way and a pid left behind by a dead
 /// daemon is never read as one being up.
 ///

@@ -1,6 +1,6 @@
 [package]
 name = "clauth"
-version = "0.15.2"
+version = "0.16.0"
 edition = "2024"
 description = "Manage multiple Claude Code accounts, monitor 5h/7d usage with configurable auto-switch and delegation with an MCP plugin. CLI + TUI."
 license = "MIT"
@@ -16,6 +16,11 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["preserve_order"] }
 utoipa = { version = "5.5", features = ["preserve_order"] } # serde_json already carries preserve_order here, so the schema lists properties in the order the body serializes them
 toml = "1.1.6"
+# Format-preserving edits of the user's own `shunt.toml` (the gateway's admin
+# key entry): `toml` re-renders a document and drops its comments and layout.
+# Its deps (toml_parser, toml_writer, toml_datetime, winnow, indexmap) are
+# already in the tree via `toml`.
+toml_edit = "0.25.15"
 anyhow = "1.0.104"
 dirs = "7.0.0"
 ureq = "3.4.2"
@@ -28,6 +33,10 @@ minisign-verify = "0.2.5"
 # CSPRNG bytes for the OAuth PKCE code_verifier + state (already in the tree
 # transitively; pinned here as a direct dep). No unsafe in our crate.
 getrandom = "0.4.3"
+# The OS half of the codex UA (`codex_cli_rs/<version> (<os> <os version>;
+# <arch>) <terminal>`): codex's own client builds it from this crate, so
+# clauth's parity UA reads the same OS fields the same way.
+os_info = "3.15"
 # Echo-off prompt for the API key in `clauth login --base-url/--api-key`, so the
 # key never routes through argv / shell history / process listings. Cross-
 # platform; no transitive deps beyond libc (already in the tree).
@@ -116,6 +125,9 @@ tokio = { version = "1.53.1", features = ["test-util"] }
 # resolve (no PATHEXT search); `which` finds it. Unix uses a bare lookup.
 [target.'cfg(windows)'.dependencies]
 which = "8.0.6"
+# The store move's hard-link guard reads a file's link count on Windows; the
+# crate is already in the tree via same-file, so this floor adds no download.
+winapi-util = "0.1.11"
 
 [profile.release]
 opt-level = 3
@@ -124,10 +136,12 @@ codegen-units = 1
 strip = true
 
 [lints.rust]
-# `deny` rather than the fleet default `forbid`, because three sites are
+# `deny` rather than the fleet default `forbid`, because five sites are
 # deliberately allowed and `forbid` admits no override at all: signal delivery in
-# `start.rs`, `stderr_file_mode`'s `fcntl`/`fstat` in `daemon/log_rotate.rs`, and
-# the test sandbox's env mutation, which Rust 2024 made unsafe.
+# `start.rs`, `pid_alive`'s `kill(pid, 0)` in `runtime.rs`, `stderr_file_mode`'s
+# `fcntl`/`fstat` in `daemon/log_rotate.rs`, the inherited signal disposition read
+# in `daemon/gateway.rs`, and the test sandbox's env mutation, which Rust 2024
+# made unsafe.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 

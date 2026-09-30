@@ -265,7 +265,7 @@ fn a_session_that_never_swapped_counts_on_the_account_it_launched_on() {
 
 /// The other direction: once a session has swapped, the launch account is a
 /// place nothing authenticates as, and counting it there is the exact defect
-/// that made the Plugin tab report one child as two.
+/// that made the Services tab report one child as two.
 #[test]
 fn a_swapped_session_counts_on_its_current_member_and_not_its_launch_one() {
     let mut swapped = row("4242-0", "work");
@@ -543,6 +543,45 @@ fn bare_attribution_follows_the_credential_link_not_the_active_profile() {
         MemberSessions::default(),
         "the account the link does NOT resolve to hosts nothing"
     );
+}
+
+/// A bare `claude` on a link no profile matches (rotated tokens, an account
+/// clauth never captured) is attributed to no account, but it is still a live
+/// session: the fleet total counts it.
+#[test]
+fn an_unattributed_bare_session_still_counts_toward_the_fleet_total() {
+    let _home = HomeSandbox::new();
+    let config = config_with(vec![oauth_profile("work", "rt-work")], "work");
+    write_linked_credentials("rt-unknown");
+
+    let _bare = crate::runtime::register_bare_session().expect("hold a bare marker");
+
+    let tally = LiveTally::collect(&config);
+    assert_eq!(
+        tally.member(&crate::profile::ProfileName::from("work")),
+        MemberSessions::default(),
+        "no account hosts it"
+    );
+    assert_eq!(tally.total(), 1);
+}
+
+/// `total` counts sessions, never `following`, and a session whose account was
+/// deleted stays in it: the tally is keyed by the row's member, not the config.
+#[test]
+fn the_fleet_total_counts_every_session_whatever_its_account_or_chain_flag() {
+    let tally = LiveTally::of([
+        LiveSession {
+            follows_chain: true,
+            ..crate::testutil::live_row("4242-0", "work")
+        },
+        LiveSession {
+            follows_chain: false,
+            ..crate::testutil::live_row("4242-1", "work")
+        },
+        crate::testutil::live_row("4343-0", "deleted-account"),
+    ]);
+
+    assert_eq!(tally.total(), 3);
 }
 
 /// The fd closing IS the release, which is what makes this survive SIGKILL: a

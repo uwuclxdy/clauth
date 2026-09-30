@@ -1,7 +1,7 @@
 use super::*;
 use crate::profile::{AppConfig, AppState};
 use crate::tui::app::{
-    App, ConfigFocus, FallbackFocus, PluginFocus, StatusFocus, TokenView, has_sub_focus,
+    App, ConfigFocus, FallbackFocus, ServicesFocus, StatusFocus, TokenView, has_sub_focus,
 };
 
 fn empty_app(tab: Tab) -> App {
@@ -32,14 +32,14 @@ fn every_sub_focus_tab_documents_esc_in_help() {
         app.config_focus = ConfigFocus::Actions;
         app.fallback_focus = FallbackFocus::Detail;
         app.status.focus = StatusFocus::Detail;
-        app.plugin.focus = PluginFocus::Detail;
+        app.services.focus = ServicesFocus::Detail;
         app.token_view = TokenView::Models;
 
         if !has_sub_focus(&app) {
             continue;
         }
 
-        let rows = tab_specific_rows(tab);
+        let rows = tab_specific_rows(tab, true);
         let has_esc_row = rows
             .iter()
             .flat_map(|(_, entries)| entries.iter())
@@ -57,7 +57,7 @@ fn every_sub_focus_tab_documents_esc_in_help() {
 /// drops section titles: every current tab documents exactly one, so nothing
 /// is lost. Add another tab's row list to this loop by extending the call.
 fn assert_tab_rows(tab: Tab, expected: &[(&str, &str)]) {
-    let rows: Vec<(&str, &str)> = tab_specific_rows(tab)
+    let rows: Vec<(&str, &str)> = tab_specific_rows(tab, true)
         .iter()
         .flat_map(|(_, entries)| entries.iter().copied())
         .collect();
@@ -69,8 +69,8 @@ fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
     assert_tab_rows(
         Tab::Fallback,
         &[
-            ("↑↓", "move cursor / detail row"),
-            ("shift ↑↓", "reorder to set priority"),
+            ("↑ ↓", "move cursor / detail row"),
+            ("shift ↑ ↓", "reorder to set priority"),
             (
                 "↵",
                 "open · edit threshold · edit weekly at · edit max spend · toggle gates / last resort · remove · add",
@@ -78,6 +78,14 @@ fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
             ("+ / -", "step rotate at / weekly at by 5"),
             ("↵ on rotate at", "type a value, ↵ saves"),
             ("↵ on weekly at", "type a %, empty clears"),
+            (
+                "space on preferred days",
+                "step never / weekdays / weekends / every day",
+            ),
+            (
+                "↵ on preferred days",
+                "pick days: ← → walk · space toggles and saves · ↵ esc q leave · ↑ ↓ leave and move",
+            ),
             ("esc", "back / cancel edit"),
         ],
     );
@@ -238,7 +246,7 @@ fn a_help_modal_that_fits_renders_without_a_scrollbar() {
                 .to_string(),
             "│                                                                         │"
                 .to_string(),
-            "│    ↑↓                  scroll                                           │"
+            "│    ↑ ↓                 scroll                                           │"
                 .to_string(),
             "│    esc · q · ?         close                                            │"
                 .to_string(),
@@ -270,7 +278,7 @@ fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
     assert_tab_rows(
         Tab::Setup,
         &[
-            ("↑↓", "pick account / + new, then a row"),
+            ("↑ ↓", "pick account / + new, then a row"),
             ("↵", "open settings · edit field · flip toggle"),
             ("↵ on a field", "edit inline; ↵ again saves"),
             ("space", "cycle the model preset (model row)"),
@@ -332,7 +340,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 14].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 16].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
@@ -342,11 +350,15 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
                 .to_string(),
             "│    ⇄                   a live session here follows the fallback chain   │"
                 .to_string(),
+            "│    ↲                   the chain switches to this account next          │"
+                .to_string(),
             "│    ⊖                   disabled                                         │"
                 .to_string(),
             "│    ⊖                   canceled                                         │"
                 .to_string(),
             "│    ×                   auth broken                                      │"
+                .to_string(),
+            "│    ×                   key rejected                                     │"
                 .to_string(),
             "│    ⊘                   weekly spent                                     │"
                 .to_string(),
@@ -367,10 +379,12 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
 
     // Every mark's own hue, read off the rendered cell. The two repeated glyphs
     // are the whole point: same shape, different color, different meaning.
-    let expected: [Color; 12] = [
+    let expected: [Color; 14] = [
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
+        crate::tui::theme::text_faint_color(),
+        crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
         crate::tui::theme::danger_color(),
@@ -385,10 +399,43 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
     // 2-space gutter all sit ahead of the mark.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let got: Vec<Color> = (0..12)
+    let got: Vec<Color> = (0..14)
         .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());
+}
+
+/// Every row of the help modal spells its arrow runs spaced, `← →` and `↑ ↓`:
+/// the compact `←→` / `↑↓` is a hint-bar-only concession. Read off the rendered
+/// modal on every tab, so a new row anywhere in it is held to the same rule.
+#[test]
+fn the_help_modal_spaces_every_arrow_run() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let mut compact = Vec::new();
+    for tab in Tab::ALL {
+        let app = empty_app(tab);
+        let mut term = Terminal::new(TestBackend::new(160, 120)).unwrap();
+        term.draw(|f| draw_help(f, f.area(), &app)).unwrap();
+        assert_eq!(
+            app.help_max_scroll.get(),
+            0,
+            "{tab:?}: the whole modal is on screen, so every row is read"
+        );
+        let rows = crate::testutil::buffer_rows(term.backend().buffer());
+        compact.extend(
+            rows.iter()
+                .filter(|r| r.contains("↑↓") || r.contains("←→"))
+                .map(|r| format!("{tab:?}: {}", r.trim())),
+        );
+    }
+    assert!(
+        compact.is_empty(),
+        "compact arrow runs:\n{}",
+        compact.join("\n")
+    );
 }
 
 // ── action menu ─────────────────────────────────────────────────────────────
@@ -453,9 +500,9 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
         .expect("the top border");
 
     assert_eq!(
-        rows[top..top + 9].iter().map(slice).collect::<Vec<_>>(),
+        rows[top..top + 10].iter().map(slice).collect::<Vec<_>>(),
         vec![
-            "╭ ACTIONS ─────────────── acct ╮".to_string(),
+            "╭─ ACTIONS ───────────── acct ─╮".to_string(),
             "│                              │".to_string(),
             "│  ❯ refresh usage          r  │".to_string(),
             "│    rotate access token    t  │".to_string(),
@@ -463,6 +510,7 @@ fn the_action_menu_titles_its_scope_and_rules_off_the_global_group() {
             "│  ──────────────────────────  │".to_string(),
             "│    refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),
+            "│    start daemon           s  │".to_string(),
             "│                              │".to_string(),
         ],
     );
@@ -485,12 +533,13 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
         .expect("the top border");
 
     assert_eq!(
-        rows[top..top + 6].iter().map(slice).collect::<Vec<_>>(),
+        rows[top..top + 7].iter().map(slice).collect::<Vec<_>>(),
         vec![
-            "╭ ACTIONS ─────────────────────╮".to_string(),
+            "╭─ ACTIONS ────────────────────╮".to_string(),
             "│                              │".to_string(),
             "│  ❯ refresh all accounts   f  │".to_string(),
             "│    new account            n  │".to_string(),
+            "│    start daemon           s  │".to_string(),
             "│                              │".to_string(),
             "╰──────────────────────────────╯".to_string(),
         ],
@@ -498,8 +547,9 @@ fn a_single_group_action_menu_draws_no_rule_and_names_no_account() {
 }
 
 /// A menu that is scoped end to end (the Setup tab, whose three actions all
-/// work on the account being configured) still names that account, and still
-/// draws no rule — there is no second group to hold off.
+/// work on the account being configured, while a daemon start or stop holds
+/// the daemon verb back) still names that account, and still draws no rule —
+/// there is no second group to hold off.
 #[test]
 fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     use crate::tui::app::{ConfigFocus, handle_key};
@@ -517,6 +567,7 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     // ⏎ on the account list is what seeds the draft the menu titles itself with.
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     assert_eq!(app.config_focus, ConfigFocus::Actions);
+    app.daemon_control_busy = true;
 
     let (rows, left, right) = render_action_menu(&app, 60, 20);
     let slice =
@@ -529,7 +580,7 @@ fn an_all_scoped_action_menu_names_its_account_without_a_rule() {
     assert_eq!(
         rows[top..top + 7].iter().map(slice).collect::<Vec<_>>(),
         vec![
-            "╭ ACTIONS ──────────── acct ╮".to_string(),
+            "╭─ ACTIONS ────────── acct ─╮".to_string(),
             "│                           │".to_string(),
             "│  ❯ duplicate account   d  │".to_string(),
             "│    save as preset      s  │".to_string(),
@@ -584,5 +635,36 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
     assert!(
         !screen.contains(" confirm "),
         "the generic `confirm` label must not appear for AddChainCandidate:\n{screen}"
+    );
+}
+
+/// The Usage help section documents the note key while an account exists; on
+/// an empty roster the row is gone, so the shadow filter leaves the global
+/// `n new account` row standing, matching the empty state's promise.
+#[test]
+fn the_usage_help_section_documents_the_note_key() {
+    let rows = tab_specific_rows(Tab::Usage, true);
+    let usage: Vec<&(&str, &str)> = rows
+        .iter()
+        .flat_map(|(_, entries)| entries.iter())
+        .collect();
+    assert!(
+        usage.iter().any(|(k, _)| *k == "n"),
+        "usage section must document the n key, got {usage:?}"
+    );
+    assert!(
+        usage
+            .iter()
+            .any(|(k, d)| *k == "n" && *d == "edit the account's note"),
+        "n's usage copy is pinned, got {usage:?}"
+    );
+
+    let empty: Vec<(&str, &str)> = tab_specific_rows(Tab::Usage, false)
+        .iter()
+        .flat_map(|(_, entries)| entries.iter().copied())
+        .collect();
+    assert!(
+        empty.iter().all(|(k, _)| *k != "n"),
+        "an empty roster keeps n = new account, got {empty:?}"
     );
 }

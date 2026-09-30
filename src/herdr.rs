@@ -195,7 +195,7 @@ fn install_err(line: &str) {
 }
 
 // Per-thread rather than a process-global for the same reason `logline`'s
-// capture is: under `cargo.sh`'s `cargo test` fallback every inline test file
+// capture is: under a plain `cargo test` run every inline test file
 // compiles into one binary whose tests are THREADS, so a global buffer would
 // hand one test its neighbour's lines. Unix-only, like the install tests that
 // drive the seam: the windows cross-lint compiles the test target without
@@ -363,7 +363,7 @@ pub(crate) fn read_config(path: &Path) -> Result<String> {
     }
 }
 
-/// One clauth entry from `herdr plugin list --json`. Every field is optional: herdr's schema is read leniently, so a shape change degrades to "unknown" rather than an error, the same way the Plugin tab reads CC's registry.
+/// One clauth entry from `herdr plugin list --json`. Every field is optional: herdr's schema is read leniently, so a shape change degrades to "unknown" rather than an error, the same way the Services tab reads CC's registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RegistryEntry {
     pub(crate) enabled: bool,
@@ -383,7 +383,7 @@ pub(crate) struct RegistryEntry {
     pub(crate) warnings: Vec<String>,
 }
 
-/// Everything the Plugin tab's herdr row needs that costs a subprocess.
+/// Everything the Services tab's herdr row needs that costs a subprocess.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HerdrProbe {
     /// The version token after `herdr ` in `herdr --version`.
@@ -414,7 +414,7 @@ pub(crate) fn probe() -> Option<HerdrProbe> {
 
 /// The herdr binary to drive: `HERDR_BIN_PATH` when it names an existing file,
 /// else a `PATH`-resolved herdr. `None` when herdr is not installed. Shared by
-/// the Plugin tab probe and the pane reporter, so both resolve one name.
+/// the Services tab probe and the pane reporter, so both resolve one name.
 pub(crate) fn resolved_bin() -> Option<PathBuf> {
     let raw = herdr_bin();
     let candidate = Path::new(&raw);
@@ -428,8 +428,8 @@ pub(crate) fn resolved_bin() -> Option<PathBuf> {
     crate::plugin_probe::on_path(&raw)
 }
 
-/// Bounds one herdr subprocess on the probe path (construction in herdr mode,
-/// `r` refreshes), on the validated-write path (`check_config`), and on the
+/// Bounds one herdr subprocess on the probe path (the Services tab's probe
+/// worker), on the validated-write path (`check_config`), and on the
 /// TUI's knob push (`crate::tui::app::push_herdr_knob_change`): a hung herdr must
 /// delay the caller, never hang the first paint or a heal behind an open
 /// modal. Same kill-on-deadline shape as the pane reporter's `report`
@@ -473,7 +473,7 @@ pub(crate) fn strip_session_env(cmd: &mut Command) {
 
 /// [`bounded_output`] plus [`strip_session_env`] at a per-call deadline: the
 /// bounded herdr call shape every daemon-side spawn uses. Pane-side callers
-/// (the T6 pane reporter, the Plugin tab) keep plain [`bounded_output`],
+/// (the T6 pane reporter, the Services tab) keep plain [`bounded_output`],
 /// because a call made from inside a pane must target that pane's own session.
 pub(crate) fn daemon_bounded_output_deadline(
     bin: &str,
@@ -490,13 +490,14 @@ pub(crate) fn daemon_bounded_output_deadline(
     run_bounded(child, timeout)
 }
 
-/// One `panes[]` entry of `herdr api snapshot`'s rect, in cells. The snapshot
+/// One of `herdr api snapshot`'s `panes[]` or `layouts[].panes[]` entries, in
+/// cells. The snapshot
 /// is the only surface that names a pane's width: `pane list` and `pane get`
 /// carry `scroll.viewport_rows` and no column count, and a WebSocket control
 /// attach without an explicit geometry imposes herdr's 120x40 default on the
 /// real pane (measured 2026-08-13; the no-flag observe render reports the same
 /// default on 0.9.0), so the bridge reads both dimensions from here.
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 pub(crate) struct PaneRect {
     pub(crate) width: u16,
     pub(crate) height: u16,
@@ -515,6 +516,15 @@ struct SnapshotResult {
 #[derive(Deserialize)]
 struct SnapshotBody {
     panes: Vec<SnapshotPane>,
+    /// herdr 0.9.1 carries each pane's rect here rather than on `panes[]`.
+    #[serde(default)]
+    layouts: Vec<SnapshotLayout>,
+}
+
+#[derive(Deserialize)]
+struct SnapshotLayout {
+    #[serde(default)]
+    panes: Vec<SnapshotPane>,
 }
 
 #[derive(Deserialize)]
@@ -525,18 +535,26 @@ struct SnapshotPane {
 }
 
 /// `herdr api snapshot`'s `(pane_id, rect)` pairs, or `None` when the stdout is
-/// not the envelope. A pane whose rect is missing is simply absent from the
-/// answer; the caller decides what that means for it.
+/// not the envelope. A pane whose rect is missing pairs with `None`; the
+/// caller decides what that means for it.
 pub(crate) fn parse_snapshot_rects(stdout: &[u8]) -> Option<Vec<(String, Option<PaneRect>)>> {
     serde_json::from_slice::<SnapshotEnvelope>(stdout)
         .ok()
         .map(|envelope| {
-            envelope
-                .result
-                .snapshot
-                .panes
+            let SnapshotBody { panes, layouts } = envelope.result.snapshot;
+            let layout_rect = |id: &str| {
+                layouts
+                    .iter()
+                    .flat_map(|layout| &layout.panes)
+                    .find(|pane| pane.pane_id == id)
+                    .and_then(|pane| pane.rect.clone())
+            };
+            panes
                 .into_iter()
-                .map(|pane| (pane.pane_id, pane.rect))
+                .map(|pane| {
+                    let rect = pane.rect.or_else(|| layout_rect(&pane.pane_id));
+                    (pane.pane_id, rect)
+                })
                 .collect()
         })
 }
@@ -750,16 +768,20 @@ static HEAL_THROTTLE: crate::plugin_host::HealThrottle = crate::plugin_host::Hea
 /// installed entry lie. Callers: the daemon tick and `clauth mcp` startup,
 /// mirroring the claude plugin's detached heal. Success and failure both log
 /// through `logline!`, never stdout.
-pub(crate) fn heal_detached() {
+///
+/// `saved_auto_update` is the persisted `[update]` table's `auto_update`,
+/// supplied by the caller from the config it just loaded.
+pub(crate) fn heal_detached(saved_auto_update: bool) {
     // The plugin is linux and macos only (its entrypoints are POSIX shell), so
     // there is nothing to heal on Windows.
     if cfg!(windows) {
         return;
     }
     // This heal is a network update (herdr's install fetches from GitHub), so
-    // the same opt-out that gates clauth's own binary update gates it, before
-    // the throttle claim so a disabled box never even claims an attempt.
-    if !crate::update::updates_enabled() {
+    // the same shared gate that governs clauth's own binary update gates it —
+    // the saved toggle AND `CLAUTH_NO_UPDATE` — before the throttle claim so
+    // a disabled box never even claims an attempt.
+    if !crate::update::updates_enabled(saved_auto_update) {
         return;
     }
     let Some(claim) = HEAL_THROTTLE.claim(crate::usage::now_ms()) else {
@@ -1173,7 +1195,7 @@ pub(crate) enum SidebarState {
     Absent,
 }
 
-/// The config-side verdicts the Plugin tab's herdr row shows, read straight from the parsed document. `parsed` is false when the file does not parse.
+/// The config-side verdicts the Services tab's herdr row shows, read straight from the parsed document. `parsed` is false when the file does not parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigStatus {
     pub(crate) parsed: bool,

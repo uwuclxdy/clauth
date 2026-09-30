@@ -859,7 +859,7 @@ fn repoint_registry_says_nothing_when_clean() {
     let bytes = r#"{
   "version": 2,
   "plugins": {
-    "claudix@claudix": [
+    "widget@widget": [
       { "scope": "user", "installPath": "CLAUDE_TWIN_PLACEHOLDER" }
     ]
   }
@@ -868,7 +868,7 @@ fn repoint_registry_says_nothing_when_clean() {
     .replace(
         "CLAUDE_TWIN_PLACEHOLDER",
         &claude
-            .join("plugins/cache/claudix/claudix/0.5.1")
+            .join("plugins/cache/widget/widget/0.5.1")
             .display()
             .to_string(),
     );

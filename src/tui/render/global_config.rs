@@ -4,7 +4,7 @@
 //! eyebrow header: appearance (`theme`, `reset display`, the `clock`
 //! notation it gates, and `home tab`), scheduler (`on mismatch`, `refresh`
 //! cadence, `refresh spent` toggle, `context nudge`, `auto-start queue`,
-//! `rotation`), auto-switch (`weekly limit`,
+//! `rotation`, `auto-update`), auto-switch (`weekly limit`,
 //! `switch mode` = burn-aware, `walk order` (issue #86), the burn-aware
 //! `burn floor`/`burn horizon`
 //! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
@@ -34,14 +34,14 @@ use super::super::app::{
 };
 use super::super::theme::{self, Tier};
 use super::panes::{
-    cycle_option, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
-    invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
+    cycle_option, cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines,
+    highlight_row, invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
 /// `extra usage spent`, 17). Keys pad to it, then [`KEY_GUTTER`] separates them
 /// from the value — so every row's value starts at the same column (the Config
-/// tab is a cloudy-tui tight chip group).
+/// tab is a tight chip group).
 const KEY_W: usize = 17;
 /// Fixed gap between the padded key and the value column.
 const KEY_GUTTER: usize = 2;
@@ -61,6 +61,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spend_budget: state.spend_budget_switching,
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
+            auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
             any_auto_start: cfg.profiles.iter().any(|p| p.auto_start),
@@ -140,13 +141,26 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 lines.extend(tooltip);
             }
             None => {
+                // `home tab` is the Config tab's widest run (eight chips, 87
+                // cells focused), so it is the one row here that wraps.
                 let row_lines = if *row == GlobalConfigRow::HomeTab {
                     let arrow = if selected {
                         Span::styled("❯ ", theme::accent().bold())
                     } else {
                         Span::raw("  ")
                     };
-                    home_tab_lines(arrow, rows, selected, inner.width as usize)
+                    let lead = vec![
+                        arrow,
+                        Span::styled(
+                            key_cell("home tab", KEY_W, KEY_GUTTER),
+                            label_style(selected),
+                        ),
+                    ];
+                    let options: Vec<(&str, bool)> = HomeTab::ALL
+                        .iter()
+                        .map(|t| (t.as_str(), rows.home_tab == *t))
+                        .collect();
+                    cycle_row_lines(lead, &options, None, selected, inner.width as usize)
                 } else {
                     vec![detail_row(*row, selected, rows, tunables, row_editing)]
                 };
@@ -201,6 +215,7 @@ struct RowState {
     spend_budget: bool,
     switch_off_when_budget_spent: bool,
     preemptive: bool,
+    auto_update: bool,
     refresh_spent: bool,
     auto_start_queue: bool,
     /// Whether ANY account has opted into `auto_start` — the queue toggle is
@@ -250,7 +265,7 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             ClockFormat::H12 => "write reset times as 9:20pm, in your local timezone",
         }),
         GlobalConfigRow::HomeTab => String::from(
-            "the tab clauth opens on; the first herdr launch opens the plugin tab with the herdr row selected",
+            "the tab clauth opens on; the first herdr launch opens the services tab with the herdr row selected",
         ),
         GlobalConfigRow::DivergenceDefault => String::from(match default_divergence {
             None => "ask what to do when claude code signs in over the active account",
@@ -321,6 +336,14 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             "rotate the login before it expires"
         } else {
             "rotate the login only when a request rejects it"
+        }),
+        // The on-state hint names the env override plus the timing: the check
+        // runs at launch (and the daemon's herdr leg at its next reload), so
+        // toggling never cancels a live process.
+        GlobalConfigRow::AutoUpdate => String::from(if rows.auto_update {
+            "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
+        } else {
+            "no update checks"
         }),
         GlobalConfigRow::RefreshSpentAccounts => String::from(if rows.refresh_spent {
             "keep checking accounts that are already at 100%"
@@ -496,6 +519,10 @@ fn detail_row(
             let options = [("lazy", !rows.preemptive), ("preemptive", rows.preemptive)];
             cycle_row(arrow, "rotation", &options, selected)
         }
+        // Never dimmed, never gated: the row edits the persisted value even
+        // while `CLAUTH_NO_UPDATE=1` overrides it (the env var stays
+        // authoritative until it goes, and the row renders what is saved).
+        GlobalConfigRow::AutoUpdate => toggle_row(arrow, "auto-update", rows.auto_update, selected),
         GlobalConfigRow::RefreshSpentAccounts => {
             toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
         }
@@ -815,7 +842,7 @@ fn burn_horizon_line(
     line
 }
 
-/// A cloudy-tui cycle row: `key  label  [active]  other`. Options are bare
+/// A cycle row: `key  label  [active]  other`. Options are bare
 /// labels separated by 2-space gaps; the active option is `ACCENT` and wraps in
 /// `[]` only while the row holds the cursor, the rest stay `TEXT_FAINT`. `space`
 /// cycles the value in place. Reads as the segmented control it is, instead of
@@ -839,52 +866,7 @@ fn cycle_row(
     Line::from(spans)
 }
 
-/// [`cycle_row`]'s wrap-aware form for the `home tab` row: the run is the
-/// Config tab's widest (eight chips, 87 cells focused), so at a narrow pane a
-/// single line clips the tail of the run — the selected chip included. The
-/// run breaks BETWEEN chips onto continuation lines indented to the value
-/// column (the contract's multi-select wrapping clause, extended to the cycle
-/// row), never inside a chip.
-fn home_tab_lines(
-    arrow: Span<'static>,
-    rows: RowState,
-    selected: bool,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let value_col = 2 + KEY_W + KEY_GUTTER;
-    let mut out = vec![Line::from(vec![
-        arrow,
-        Span::styled(
-            key_cell("home tab", KEY_W, KEY_GUTTER),
-            label_style(selected),
-        ),
-    ])];
-    let mut used = value_col;
-    for (i, tab) in HomeTab::ALL.iter().enumerate() {
-        let span = cycle_option(tab.as_str(), rows.home_tab == *tab, selected);
-        let gap = if i == 0 { 0 } else { 2 };
-        let need = span.content.chars().count() + gap;
-        if used + need > width {
-            let len = span.content.chars().count();
-            let mut next = Line::from(Span::raw(" ".repeat(value_col)));
-            next.spans.push(span);
-            used = value_col + len;
-            out.push(next);
-        } else {
-            // `out` always holds the first line (built above).
-            let idx = out.len() - 1;
-            let last = &mut out[idx];
-            if gap > 0 {
-                last.spans.push(Span::raw("  "));
-            }
-            last.spans.push(span);
-            used += need;
-        }
-    }
-    out
-}
-
-/// A cloudy-tui Disabled row for a cycle setting another toggle makes inert: the
+/// A disabled row for a cycle setting another toggle makes inert: the
 /// whole row (caret, key, current value) renders `TEXT_FAINT`, no bracket
 /// highlight — just the current value. Focusable but inert (the key handler
 /// no-ops it), so `TEXT_FAINT` keeps meaning "can't touch this". The `draw` loop
@@ -929,9 +911,9 @@ fn dimmed_toggle_row(key: &str, on: bool, selected: bool) -> Line<'static> {
     ])
 }
 
-/// A cloudy-tui toggle row: `key  ─●` / `key  ○─`. A pure on/off boolean is a
+/// A toggle row: `key  ─●` / `key  ○─`. A pure on/off boolean is a
 /// toggle, not a 2-option cycle — `on`/`off` labels in brackets read as a cycle,
-/// not the switch the contract draws. Knob `ACCENT` when on, `TEXT_FAINT` off.
+/// not a switch. Knob `ACCENT` when on, `TEXT_FAINT` off.
 fn toggle_row(arrow: Span<'static>, key: &str, on: bool, row_selected: bool) -> Line<'static> {
     let (glyph, style) = if on {
         (theme::toggle_on(), theme::accent())

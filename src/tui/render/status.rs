@@ -16,12 +16,11 @@ use ratatui::widgets::{Block, Paragraph};
 
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
-use super::format::{NO_DATA, relative_age, spinner_frame};
+use super::format::{NO_DATA, middle_truncate, relative_age, spinner_frame};
 use super::panes::{draw_scrollbar, empty_state, key_cell, master_detail, section_box, wrap_words};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
-/// Detail-pane key column width (the house 11: chain/config's `KEY_W` and the
-/// usage tab's `TP_KEY_W`).
+/// Detail-pane key column width, the usage tab's `TP_KEY_W` (11).
 const KEY_W: usize = 11;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
@@ -236,8 +235,12 @@ fn list_block(app: &App, focused: bool) -> Block<'static> {
         .fg(theme::accent_2_color())
         .add_modifier(title_mods);
 
-    // Title token: ` INCIDENTS ` with the spinner inside the trailing inset.
-    let mut title_spans = vec![Span::styled(" INCIDENTS ", title_style)];
+    // Title token: ` INCIDENTS ` with the spinner inside the trailing inset,
+    // opened by the corner-adjacent border dash (`╭─ INCIDENTS`).
+    let mut title_spans = vec![
+        Span::styled("─", border_style),
+        Span::styled(" INCIDENTS ", title_style),
+    ];
     if app.status.fetching {
         title_spans.push(Span::styled(
             format!("{} ", spinner_frame(app.tick_count)),
@@ -612,20 +615,6 @@ use crate::format::{local_stamp, truncate};
 /// instant chrono cannot represent is the no-data glyph, never a UTC reading.
 fn stamp(epoch_ms: u64) -> String {
     local_stamp((epoch_ms / 1000) as i64).unwrap_or_else(|| NO_DATA.to_string())
-}
-
-/// Middle-ellipsis truncation (for URLs / IDs — both ends carry meaning).
-fn middle_truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max || max < 3 {
-        return truncate(s, max);
-    }
-    let keep = max - 1;
-    let head = keep.div_ceil(2);
-    let tail = keep - head;
-    let front: String = chars[..head].iter().collect();
-    let back: String = chars[chars.len() - tail..].iter().collect();
-    format!("{front}…{back}")
 }
 
 /// Pad `s` on the right to `width` chars (truncating with `…` if longer).

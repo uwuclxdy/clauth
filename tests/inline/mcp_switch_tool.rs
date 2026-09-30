@@ -123,6 +123,8 @@ fn switch_running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::Ru
         endpoint: None,
         provider: None,
         isolated: false,
+        cwd: None,
+        spawned_by: None,
         idle_secs: None,
         kind: jobs::RecordKind::Collectable,
         owner_pid: 0,
@@ -227,7 +229,7 @@ fn the_live_jobs_guard_scopes_to_this_servers_own_runs() {
 
     // A done job holds no run to strand.
     jobs::remove("d-switch-mine-0");
-    jobs::write_done(
+    jobs::write_done_parts(
         "d-switch-mine-0",
         "work",
         1,

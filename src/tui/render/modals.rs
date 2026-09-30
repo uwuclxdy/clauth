@@ -17,9 +17,11 @@ use super::super::app::{
 use super::super::theme;
 use super::chain::reason_marker;
 use super::format::spinner_frame;
+use super::overview::switch_mark;
 use super::panes::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
-    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines, head_cols, key_cell,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
+    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines,
+    head_cols, key_cell, meta_line,
 };
 use crate::fallback::BlockedReason;
 
@@ -161,11 +163,11 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_
 ///
 /// A terminal too short for the whole modal used to drop the tail with nothing
 /// on screen saying so. The rows now go through the shared scrolled-lines
-/// helper, which draws the overflow scrollbar the cloudy-tui contract makes the
-/// only legal overflow signal. The focus block handed to it is the viewport
-/// window itself — "keep rows `scroll..scroll + viewport` on screen" — which
-/// resolves to exactly `scroll` once clamped. A modal that fits scrolls by 0 and
-/// draws no bar, so it renders as before.
+/// helper, which draws the overflow scrollbar, the one legal overflow signal on
+/// a surface that scrolls. The focus block handed to it is the viewport window
+/// itself — "keep rows `scroll..scroll + viewport` on screen" — which resolves
+/// to exactly `scroll` once clamped. A modal that fits scrolls by 0 and draws
+/// no bar, so it renders as before.
 fn draw_modal_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -274,8 +276,11 @@ fn chunk_line(line: Line<'_>, w: usize) -> Vec<Line<'static>> {
 }
 
 /// Rounded `ACCENT_2` border, uppercase italic dim title, base `BG` fill.
+/// The title opens with the corner-adjacent border dash (`╭─ TITLE`), the
+/// same chrome rule the panel family follows.
 fn modal_block(title: impl Into<String>) -> Block<'static> {
     let title_line = Line::from(vec![
+        Span::styled("─", Style::default().fg(theme::accent_2_color())),
         Span::raw(" "),
         Span::styled(
             title.into().to_uppercase(),
@@ -298,9 +303,12 @@ fn modal_block(title: impl Into<String>) -> Block<'static> {
 fn modal_block_with_meta(title: &str, meta: Option<&str>) -> Block<'static> {
     let block = modal_block(title);
     match meta {
-        Some(meta) => block.title(
-            Line::from(Span::styled(format!(" {meta} "), theme::dim())).alignment(Alignment::Right),
-        ),
+        // The name closes with a border cell of its own (`… name ─╮`), the
+        // border token matching the modal's orange border.
+        Some(meta) => block.title(meta_line(
+            meta,
+            Style::default().fg(theme::accent_2_color()),
+        )),
         None => block,
     }
 }
@@ -628,21 +636,36 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
 /// `every_sub_focus_tab_documents_esc_in_help`.
-fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
+fn tab_specific_rows(
+    tab: Tab,
+    has_accounts: bool,
+) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
     match tab {
         Tab::Overview => vec![(
             "accounts",
             &[
-                ("\u{2191}\u{2193}", "move cursor"),
+                ("\u{2191} \u{2193}", "move cursor"),
                 ("\u{21b5}", "switch to selected account (confirm)"),
-                ("shift \u{2191}\u{2193}", "reorder account up / down"),
+                ("shift \u{2191} \u{2193}", "reorder account up / down"),
+            ][..],
+        )],
+        // `n` is the note editor only while an account exists to hold one; on
+        // an empty roster the global `n new account` row must survive the
+        // shadow filter below, matching the empty state's `n to create one`.
+        Tab::Usage if has_accounts => vec![(
+            "usage",
+            &[
+                ("\u{2191} \u{2193}", "pick account to inspect"),
+                ("r", "refresh account"),
+                ("n", "edit the account's note"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
             ][..],
         )],
         Tab::Usage => vec![(
             "usage",
             &[
-                ("\u{2191}\u{2193}", "pick account to inspect"),
-                ("r", "refresh account"),
+                ("\u{2191} \u{2193}", "pick account to inspect"),
                 ("e", "toggle estimates"),
                 ("p", "toggle pace marker"),
             ][..],
@@ -651,7 +674,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
             "tokens",
             &[
                 ("\u{21b5}", "open per-model breakdown"),
-                ("\u{2191}\u{2193}", "pick model (in breakdown)"),
+                ("\u{2191} \u{2193}", "pick model (in breakdown)"),
                 ("c", "count cache in token figures"),
                 (
                     "t",
@@ -664,7 +687,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Setup => vec![(
             "setup",
             &[
-                ("\u{2191}\u{2193}", "pick account / + new, then a row"),
+                ("\u{2191} \u{2193}", "pick account / + new, then a row"),
                 ("\u{21b5}", "open settings · edit field · flip toggle"),
                 ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
                 ("space", "cycle the model preset (model row)"),
@@ -684,7 +707,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Config => vec![(
             "config",
             &[
-                ("\u{2191}\u{2193}", "move between settings"),
+                ("\u{2191} \u{2193}", "move between settings"),
                 ("space", "cycle the focused setting"),
                 (
                     "\u{21b5}",
@@ -695,23 +718,23 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Status => vec![(
             "status",
             &[
-                ("\u{2191}\u{2193}", "pick incident / scroll detail"),
+                ("\u{2191} \u{2193}", "pick incident / scroll detail"),
                 ("\u{21b5}", "open incident timeline"),
                 ("r", "refresh the feed"),
                 ("esc", "back to the list"),
             ][..],
         )],
-        Tab::Plugin => vec![(
-            "plugin",
+        Tab::Services => vec![(
+            "services",
             &[
                 (
-                    "\u{2191}\u{2193}",
-                    "pick check · scroll detail · walk herdr options",
+                    "\u{2191} \u{2193}",
+                    "pick row · scroll detail · walk plugin problems · walk herdr options",
                 ),
                 ("\u{21b5}", "open detail · activate an option"),
                 ("space", "activate the focused herdr option"),
                 ("+ / -", "step the tag refresh"),
-                ("f", "apply the selected row's fix"),
+                ("f", "apply the focused fix"),
                 ("r", "re-run all checks"),
                 ("esc", "back to the list · close the editor"),
             ][..],
@@ -719,8 +742,8 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
         Tab::Fallback => vec![(
             "fallback chain",
             &[
-                ("\u{2191}\u{2193}", "move cursor / detail row"),
-                ("shift \u{2191}\u{2193}", "reorder to set priority"),
+                ("\u{2191} \u{2193}", "move cursor / detail row"),
+                ("shift \u{2191} \u{2193}", "reorder to set priority"),
                 (
                     "\u{21b5}",
                     "open \u{00b7} edit threshold \u{00b7} edit weekly at \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
@@ -728,6 +751,14 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
                 ("+ / -", "step rotate at / weekly at by 5"),
                 ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
                 ("\u{21b5} on weekly at", "type a %, empty clears"),
+                (
+                    "space on preferred days",
+                    "step never / weekdays / weekends / every day",
+                ),
+                (
+                    "\u{21b5} on preferred days",
+                    "pick days: \u{2190} \u{2192} walk \u{00b7} space toggles and saves \u{00b7} \u{21b5} esc q leave \u{00b7} \u{2191} \u{2193} leave and move",
+                ),
                 ("esc", "back / cancel edit"),
             ][..],
         )],
@@ -737,7 +768,7 @@ fn tab_specific_rows(tab: Tab) -> Vec<(&'static str, &'static [(&'static str, &'
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = "KEYS";
 
-    let tab_specific = tab_specific_rows(app.tab);
+    let tab_specific = tab_specific_rows(app.tab, app.profile_count() > 0);
 
     let nav: &[(&str, &str)] = &[(
         "\u{2190} \u{2192} \u{00b7} tab",
@@ -753,7 +784,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // "back / quit" and `esc` reads "back within a sub-view" — neither tells a
     // reader how to dismiss what they are looking at.
     let modal_keys: &[(&str, &str)] = &[
-        ("\u{2191}\u{2193}", "scroll"),
+        ("\u{2191} \u{2193}", "scroll"),
         ("esc \u{00b7} q \u{00b7} ?", "close"),
     ];
 
@@ -804,8 +835,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 /// Legend for the 1-cell marks the account surfaces carry, with no key of their
-/// own to document them: the Overview row's leading `●` and `⇄`, and every
-/// blocked-reason marker on the Fallback chain.
+/// own to document them: the Overview row's leading `●` and `⇄`, the Overview
+/// chain's projected-switch `↲`, and every blocked-reason marker on the
+/// Fallback chain.
 ///
 /// Each blocked-reason row takes its glyph AND its hue from [`reason_marker`]
 /// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
@@ -823,9 +855,11 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
             Span::styled("\u{21c4}", theme::dim()),
             "a live session here follows the fallback chain",
         ),
+        (switch_mark(), "the chain switches to this account next"),
         reason(BlockedReason::Disabled, DIAG_DISABLED),
         reason(BlockedReason::Canceled, DIAG_CANCELED),
         reason(BlockedReason::AuthBroken, DIAG_AUTH_BROKEN),
+        reason(BlockedReason::KeyRejected, DIAG_KEY_REJECTED),
         reason(
             BlockedReason::WeeklySpent { resets_in: None },
             DIAG_WEEKLY_SPENT,

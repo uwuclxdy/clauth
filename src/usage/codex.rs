@@ -12,7 +12,7 @@
 
 use serde::Deserialize;
 
-use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso, http_agent};
+use super::fetch::{FetchError, PlanInfo, UsageInfo, UsageWindow, epoch_secs_to_iso};
 
 /// The ChatGPT-flavored usage endpoint. codex's client also knows an
 /// `/api/codex/usage` spelling for API-key accounts (`PathStyle::CodexApi`);
@@ -187,10 +187,10 @@ pub(crate) fn map_usage(body: &str, now_secs: i64) -> Result<UsageInfo, FetchErr
     })
 }
 
-/// Poll one codex account's usage at `url`. Read-only: this endpoint is the
-/// only codex HTTP surface clauth touches outside a refresh, and it neither
-/// mints nor spends anything. Split from [`fetch_codex_usage`] so tests drive
-/// the wire shape against a local stub.
+/// Poll one codex account's usage at `url`. Read-only: it neither mints nor
+/// spends anything — spending a banked reset is [`super::codex_reset`]'s, and
+/// only when the operator runs `clauth limit-reset`. Split from
+/// [`fetch_codex_usage`] so tests drive the wire shape against a local stub.
 ///
 /// A 401 is the caller's signal that the access token is stale — it feeds
 /// [`crate::codex_auth::kick_codex`], the only producer of that queue.
@@ -198,17 +198,15 @@ pub(crate) fn fetch_codex_usage_at(
     url: &str,
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
-    let mut req = http_agent()
-        .get(url)
-        .header("Authorization", &format!("Bearer {access_token}"))
-        .header("Accept", "application/json");
-    // Multi-workspace logins answer for whichever account this header names;
-    // without it the server picks, which is not necessarily the profile's.
-    if let Some(id) = account_id.map(str::trim).filter(|id| !id.is_empty()) {
-        req = req.header("chatgpt-account-id", id);
-    }
+    let req = super::codex_headers::apply_codex_headers(
+        super::codex_headers::codex_agent().get(url),
+        access_token,
+        account_id,
+        fedramp,
+    );
     let mut response = req.call().map_err(|_| FetchError::Network)?;
     let status = response.status().as_u16();
     if status != 200 {
@@ -224,9 +222,10 @@ pub(crate) fn fetch_codex_usage_at(
 pub(crate) fn fetch_codex_usage(
     access_token: &str,
     account_id: Option<&str>,
+    fedramp: bool,
     now_secs: i64,
 ) -> Result<UsageInfo, FetchError> {
-    fetch_codex_usage_at(CODEX_USAGE_URL, access_token, account_id, now_secs)
+    fetch_codex_usage_at(CODEX_USAGE_URL, access_token, account_id, fedramp, now_secs)
 }
 
 #[cfg(test)]

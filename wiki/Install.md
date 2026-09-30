@@ -43,7 +43,7 @@ A binary install checks GitHub for a newer release in the background on launch a
 4. the platform asset's SHA-256 matches that sums file
 5. the new binary is written, fsynced, and swapped in atomically
 
-Any failing step skips the update and leaves the running binary alone. `CLAUTH_NO_UPDATE=1` turns the whole thing off. Full chain: [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md#auto-update-verification).
+Any failing step skips the update and leaves the running binary alone. The check runs at launch, so turning auto-update off (the Config tab's `auto-update` row, persisted as `[update] auto_update = false` in profiles.toml) takes effect the next time clauth starts. `CLAUTH_NO_UPDATE=1` turns the whole thing off even when the toggle is on. Full chain: [SECURITY.md](https://github.com/uwuclxdy/clauth/blob/mommy/SECURITY.md#auto-update-verification).
 
 ## Shell completions
 
@@ -61,4 +61,4 @@ clauth completions bash             # print the script to stdout instead
 
 ## Claude Code plugin
 
-The plugin is a separate step, installed from the TUI's Plugin tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants.
+The plugin is a separate step, installed from the TUI's Services tab and covered on [Claude Code plugin](Claude-Code-Plugin). Because that install drives the `claude plugin` CLI, it needs a recent `claude`: an older one fails the install naming the version it wants.

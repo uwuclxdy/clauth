@@ -3,12 +3,12 @@
 //! Probe contract (#27, #57):
 //!   * `claim_singleton` caps the daemon tree at one active instance plus one
 //!     standby: a third arrival is `Redundant` and exits instead of parking.
-//!   * `daemon_health` drives the `● daemon` header dot from two signals —
+//!   * `daemon_health` drives the `[ daemon ]` header chip from two signals —
 //!     the `clauthd.lock` flock (presence) and `status.json` freshness (health):
-//!     no lock → Absent (hidden), held + fresh → Fresh (green), held + stale →
+//!     no lock → Absent (dim), held + fresh → Fresh (green), held + stale →
 //!     Stale (amber).
 //!   * `singleton_held` asks the same presence question as a DECISION rather
-//!     than a display: where the dot hides an unreadable lock, `--status` fails
+//!     than a display: where the chip dims for an unreadable lock, `--status` fails
 //!     on it instead of telling a supervisor to spawn.
 //!   * `claim_by_replacing` (`--replace`) terminates the running daemon and takes
 //!     over, refusing to signal a pid it can't confirm is a running clauth daemon.
@@ -109,7 +109,7 @@ fn the_staleness_window_sits_above_the_watchdog_deadline() {
     );
 }
 
-// ── daemon_health (dot: presence + health) ───────────────────────────────────
+// ── daemon_health (chip: presence + health) ─────────────────────────────────
 
 #[test]
 fn no_lock_file_reads_as_absent() {
@@ -118,7 +118,7 @@ fn no_lock_file_reads_as_absent() {
     assert_eq!(
         daemon_health(),
         DaemonHealth::Absent,
-        "fresh status but no lock file ever → dot hidden"
+        "fresh status but no lock file ever → chip dimmed"
     );
     // And the probe must not have manufactured the lock file.
     assert!(
@@ -140,7 +140,7 @@ fn unheld_lock_reads_as_absent() {
     assert_eq!(
         daemon_health(),
         DaemonHealth::Absent,
-        "a released flock means the daemon died → dot hidden"
+        "a released flock means the daemon died → chip dimmed"
     );
 }
 
@@ -400,9 +400,9 @@ fn a_won_standby_slot_is_kept_rather_than_re_taken() {
     );
 }
 
-/// `clauth daemon --status` decides on `singleton_held`, not on the header dot:
+/// `clauth daemon --status` decides on `singleton_held`, not on the header chip:
 /// a lock it cannot read has to surface as an error there, since a `--status ||
-/// spawn` supervisor respawns on the dot's "no daemon". These are the three
+/// spawn` supervisor respawns on the chip's dim state ("no daemon"). These are the three
 /// answers a sandbox can produce — the io-error arm needs a filesystem without
 /// working locks.
 #[test]
@@ -495,12 +495,12 @@ fn replace_refuses_a_pid_that_is_not_the_running_daemon() {
     );
 }
 
-/// `wait_for_active` claims the lock the moment a holder releases it — the poll
+/// `--replace`'s wait claims the lock the moment a holder releases it — the poll
 /// loop bridges the gap between a killed daemon's death and its flock
 /// auto-releasing. Removing the loop reds this: the first attempt still reads
 /// the lock held.
 #[test]
-fn wait_for_active_claims_once_the_holder_releases() {
+fn the_replace_wait_claims_once_the_holder_releases() {
     let _home = HomeSandbox::new();
     let dir = sandbox_dir();
     let held = hold_daemon_lock();
@@ -508,31 +508,31 @@ fn wait_for_active_claims_once_the_holder_releases() {
         std::thread::sleep(std::time::Duration::from_millis(120));
         drop(held);
     });
-    let lock = wait_for_active(
-        &dir,
+    let lock = poll_until(
         std::time::Duration::from_secs(5),
         std::time::Duration::from_millis(10),
+        || claim_active(&dir),
     );
     assert!(
         lock.is_some(),
-        "wait_for_active must poll until the freed flock is claimable"
+        "the wait must poll until the freed flock is claimable"
     );
     releaser.join().expect("releaser thread");
 }
 
-/// The wait is bounded: a holder that never releases makes `wait_for_active`
-/// time out and return None rather than block forever, so `--replace` can
-/// escalate (SIGTERM → SIGKILL on unix) and, past that, give up with an error.
+/// The wait is bounded: a holder that never releases makes it time out and
+/// return None rather than block forever, so `--replace` can escalate
+/// (SIGTERM → SIGKILL on unix) and, past that, give up with an error.
 #[test]
-fn wait_for_active_times_out_while_the_lock_stays_held() {
+fn the_replace_wait_times_out_while_the_lock_stays_held() {
     let _home = HomeSandbox::new();
     let dir = sandbox_dir();
     let _held = hold_daemon_lock(); // never released
     let started = std::time::Instant::now();
-    let lock = wait_for_active(
-        &dir,
+    let lock = poll_until(
         std::time::Duration::from_millis(80),
         std::time::Duration::from_millis(10),
+        || claim_active(&dir),
     );
     assert!(
         lock.is_none(),
@@ -544,7 +544,7 @@ fn wait_for_active_times_out_while_the_lock_stays_held() {
     );
 }
 
-/// A transient reader of the singleton lock (TUI header dot at 1 Hz,
+/// A transient reader of the singleton lock (TUI header chip at 1 Hz,
 /// `clauth daemon --status`) holds the flock for microseconds and releases it.
 /// Without retry, `claim_by_replacing_with`'s fast path reads this as a daemon,
 /// falls through to `holder_pid` (which returns `None` for a reader with no pid
@@ -588,6 +588,267 @@ fn replace_retries_past_a_transient_lock_reader() {
     );
 
     probe.join().expect("probe thread");
+}
+
+// ── stop_running (the TUI's `stop daemon`) ───────────────────────────────────
+
+/// A process `pid_is_clauth_daemon` accepts: argv `clauth daemon`, where
+/// `daemon` is a script in `dir` that sh runs by that name. `ignore_term`
+/// makes it survive SIGTERM, so only the SIGKILL pass ends it.
+#[cfg(unix)]
+fn fake_daemon(dir: &std::path::Path, ignore_term: bool) -> std::process::Child {
+    use std::os::unix::process::CommandExt as _;
+    let trap = if ignore_term { "trap '' TERM\n" } else { "" };
+    std::fs::write(
+        dir.join("daemon"),
+        format!("{trap}while :; do sleep 0.05; done\n"),
+    )
+    .expect("write the fake daemon's script");
+    std::process::Command::new("/bin/sh")
+        .arg0("clauth")
+        .arg("daemon")
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the fake daemon")
+}
+
+/// Stand the fake in as the running daemon: stamp its pid, and hold the
+/// singleton in-process for exactly its lifetime (a real daemon's flock
+/// releases when it dies). With `successor` the singleton stays held past the
+/// death, the way a parked standby takes it at once; the handle comes back on
+/// the returned channel so the test can keep it held while it asserts. It is
+/// the same handle, never a re-acquire: a re-acquire could collide with the
+/// stop's own probe, and its gap would read as no successor.
+#[cfg(unix)]
+fn stand_in(
+    mut fake: std::process::Child,
+    successor: bool,
+) -> std::sync::mpsc::Receiver<Option<std::fs::File>> {
+    std::fs::write(
+        sandbox_dir().join(super::super::PID_FILE),
+        format!("{}\n", fake.id()),
+    )
+    .expect("stamp the fake's pid");
+    let held = hold_daemon_lock();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = fake.wait();
+        let _ = tx.send(successor.then_some(held));
+    });
+    rx
+}
+
+/// The retry schedule the stop tests pass: the in-process holder drops the
+/// lock microseconds after the fake is reaped, well inside one retry.
+const STOP_RETRY: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[test]
+fn stop_with_no_daemon_signals_nothing() {
+    let _home = HomeSandbox::new();
+    let _ = sandbox_dir();
+    let stopped = stop_running_with(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+        CLAIM_ATTEMPTS,
+        STOP_RETRY,
+    )
+    .expect("a free lock is no error");
+    assert_eq!(stopped, DaemonStop::NotRunning);
+}
+
+/// SIGTERM ends a daemon that honours it, and the box is left with no daemon:
+/// the stop never claims the singleton for itself.
+#[cfg(unix)]
+#[test]
+fn stop_terminates_the_daemon_and_leaves_the_singleton_free() {
+    let _home = HomeSandbox::new();
+    let work = tempfile::tempdir().expect("tempdir");
+    let done = stand_in(fake_daemon(work.path(), false), false);
+    let started = std::time::Instant::now();
+    let stopped = stop_running_with(
+        std::time::Duration::from_secs(5),
+        std::time::Duration::from_millis(10),
+        CLAIM_ATTEMPTS,
+        STOP_RETRY,
+    )
+    .expect("the stop lands");
+    assert_eq!(stopped, DaemonStop::Stopped);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "SIGTERM alone ended it: no wait ran out before the escalation"
+    );
+    assert!(done.recv().expect("holder thread").is_none());
+    assert!(
+        !singleton_held().expect("lock readable"),
+        "the stop left the singleton free, not held by this process"
+    );
+}
+
+/// A daemon that survives SIGTERM gets the escalation `--replace` sends.
+#[cfg(unix)]
+#[test]
+fn stop_escalates_to_sigkill_past_the_wait() {
+    let _home = HomeSandbox::new();
+    let work = tempfile::tempdir().expect("tempdir");
+    let done = stand_in(fake_daemon(work.path(), true), false);
+    let wait = std::time::Duration::from_millis(300);
+    let started = std::time::Instant::now();
+    let stopped = stop_running_with(
+        wait,
+        std::time::Duration::from_millis(10),
+        CLAIM_ATTEMPTS,
+        STOP_RETRY,
+    )
+    .expect("the escalation lands");
+    assert_eq!(stopped, DaemonStop::Stopped);
+    assert!(
+        started.elapsed() >= wait,
+        "the first pass waited out its window before escalating"
+    );
+    assert!(done.recv().expect("holder thread").is_none());
+}
+
+/// A parked standby takes the singleton the instant the daemon dies. The stop
+/// reports that, and returns on the death rather than sitting out both passes
+/// waiting for a free lock that never comes.
+#[cfg(unix)]
+#[test]
+fn stop_names_a_standby_that_took_over() {
+    let _home = HomeSandbox::new();
+    let work = tempfile::tempdir().expect("tempdir");
+    let done = stand_in(fake_daemon(work.path(), false), true);
+    let wait = std::time::Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let stopped = stop_running_with(
+        wait,
+        std::time::Duration::from_millis(10),
+        CLAIM_ATTEMPTS,
+        STOP_RETRY,
+    )
+    .expect("the stop lands");
+    let successor = done.recv().expect("holder thread");
+    assert_eq!(stopped, DaemonStop::Replaced);
+    assert!(
+        started.elapsed() < wait,
+        "the stop returned on the death, not after a wait ran out"
+    );
+    drop(successor);
+}
+
+/// A gateway the stopped daemon left running (Windows always: its daemon ends
+/// by `taskkill /F`; unix after the SIGKILL pass) is asked to stop at once,
+/// with its deadline recorded for a later daemon, rather than left to a next
+/// start that may never come. A successor that took the singleton reclaims it
+/// itself, so then nothing is signalled.
+#[cfg(unix)]
+#[test]
+fn a_stop_leaving_no_daemon_stops_the_gateway_it_left() {
+    use super::super::gateway::{ChildMarker, process_start_time, read_marker, write_marker};
+    for successor in [false, true] {
+        let _home = HomeSandbox::new();
+        let work = tempfile::tempdir().expect("tempdir");
+        let mut gateway = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn the stand-in gateway");
+        let marker = ChildMarker {
+            pid: gateway.id(),
+            start: process_start_time(gateway.id()),
+            stop_bound_secs: 12,
+            stop_deadline_ms: None,
+        };
+        assert!(marker.start.is_some(), "the stand-in's start time reads");
+        write_marker(&marker).expect("marker");
+        let done = stand_in(fake_daemon(work.path(), false), successor);
+        let before = crate::usage::now_ms();
+        let stopped = stop_running_with(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(10),
+            CLAIM_ATTEMPTS,
+            STOP_RETRY,
+        )
+        .expect("the stop lands");
+        let next = done.recv().expect("holder thread");
+        let exited = poll_until(
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_millis(20),
+            || gateway.try_wait().expect("try_wait"),
+        );
+        let left = read_marker().expect("read");
+        if successor {
+            assert_eq!(stopped, DaemonStop::Replaced);
+            assert_eq!(exited, None, "the successor's start owns the reclaim");
+            assert_eq!(left, Some(marker), "the marker is the successor's to read");
+            let _ = gateway.kill();
+            let _ = gateway.wait();
+        } else {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert_eq!(stopped, DaemonStop::Stopped);
+            assert_eq!(
+                exited.and_then(|s| s.signal()),
+                Some(libc::SIGTERM),
+                "one SIGTERM, so shunt drains"
+            );
+            let deadline = left.and_then(|m| m.stop_deadline_ms).expect("a deadline");
+            assert!(
+                (before + 12_000..=crate::usage::now_ms() + 12_000).contains(&deadline),
+                "the deadline is the stop bound from the ask: {deadline}"
+            );
+        }
+        drop(next);
+    }
+}
+
+/// A transient reader of the singleton (the TUI header's 1 Hz probe,
+/// `clauth daemon --status`) must not read as a daemon to stop: with no
+/// retry the stop would go after a pid sidecar no reader has.
+#[test]
+fn stop_retries_past_a_transient_lock_reader() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let probe = probe_holding_both(&dir);
+    let err = stop_running_with(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+        1,
+        std::time::Duration::ZERO,
+    )
+    .expect_err("one attempt reads the probe as a daemon");
+    assert!(err.to_string().contains("unreadable"), "got {err}");
+
+    let probe = probe.release_after(PROBE_HOLD);
+    let stopped = stop_running_with(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+        CLAIM_ATTEMPTS,
+        CLAIM_RETRY,
+    )
+    .expect("the retry clears the probe");
+    assert_eq!(stopped, DaemonStop::NotRunning);
+    probe.join().expect("probe thread");
+}
+
+/// The same identity guard as `--replace`: a recorded pid that is not a
+/// running clauth daemon is never signalled.
+#[test]
+fn stop_refuses_a_pid_that_is_not_the_running_daemon() {
+    let _home = HomeSandbox::new();
+    let dir = sandbox_dir();
+    let _held = hold_daemon_lock();
+    std::fs::write(dir.join(super::super::PID_FILE), "1\n").expect("stamp pid 1");
+    let err = stop_running_with(
+        std::time::Duration::from_millis(50),
+        std::time::Duration::from_millis(10),
+        CLAIM_ATTEMPTS,
+        STOP_RETRY,
+    )
+    .expect_err("pid 1 is not the daemon");
+    assert_eq!(
+        err.to_string(),
+        "the recorded daemon pid 1 is not a running clauth daemon (it exited during handover \
+         or was recycled); re-run once it settles, or kill the daemon manually"
+    );
 }
 
 // ── FetchLease (single-fetcher lease over usage-fetch.lock) ───────────────────

@@ -1,5 +1,5 @@
 //! Config-tab row geometry. Every blurred row's value starts at the same
-//! column (the Config tab is a cloudy-tui tight chip group); cycle options are
+//! column (the Config tab is a tight chip group); cycle options are
 //! bare labels on 2-space gaps with the active option bracketed only on focus;
 //! an on/off boolean renders as a toggle, not a 2-option cycle.
 
@@ -31,6 +31,7 @@ fn toggles() -> RowState {
         spend_budget: false,
         switch_off_when_budget_spent: true,
         preemptive: false,
+        auto_update: true,
         refresh_spent: true,
         auto_start_queue: true,
         any_auto_start: true,
@@ -132,7 +133,7 @@ fn home_tab_renders_in_the_appearance_band_at_the_shared_value_column() {
         if line.contains("home tab") {
             found = true;
             for name in [
-                "overview", "usage", "tokens", "setup", "fallback", "config", "status", "plugin",
+                "overview", "usage", "tokens", "setup", "fallback", "config", "status", "services",
             ] {
                 assert!(line.contains(name), "the home tab row lists {name}: {line}");
             }
@@ -264,7 +265,7 @@ fn auto_start_queue_renders_as_a_toggle_with_both_hints_pinned() {
     );
 }
 
-/// `refresh spent` is a pure on/off boolean — a cloudy-tui toggle (`─●` / `○─`),
+/// `refresh spent` is a pure on/off boolean — a toggle (`─●` / `○─`),
 /// not a 2-option cycle row (`[on]  off`).
 #[test]
 fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
@@ -302,7 +303,7 @@ fn refresh_spent_renders_as_a_toggle_not_a_cycle() {
 }
 
 /// With no account opted into `auto_start` there is nothing to space, so the
-/// queue row renders as a cloudy-tui disabled row (whole content faint, knob
+/// queue row renders as a disabled row (whole content faint, knob
 /// included) — it must never read as an armed setting. One opted-in account
 /// makes it a live toggle again.
 #[test]
@@ -343,7 +344,7 @@ fn auto_start_queue_dims_when_no_account_opts_in() {
 // ── `money spent` dims while inert (spend budget off) ────────────────────────
 
 /// With `spend budget` off nothing spends, so `money spent` decides no halt.
-/// It renders as a cloudy-tui disabled row (whole content faint) so it never
+/// It renders as a disabled row (whole content faint) so it never
 /// reads as an armed setting; flip the toggle on and it becomes a live cycle.
 #[test]
 fn money_spent_dims_when_spend_budget_is_off() {
@@ -606,6 +607,7 @@ fn context_nudge_edit_line_marks_invalid_buffer_danger() {
 /// shape. Both name the same range: `50k-2M tokens`.
 #[test]
 fn context_nudge_range_tooltip_marks_invalid_input_danger() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let invalid = InputState::new("49999");
     let lines = context_nudge_range_tooltip(&invalid, 40);
     for line in &lines {
@@ -649,6 +651,89 @@ fn context_nudge_sits_in_the_scheduler_band_after_the_refresh_rows() {
     assert!(nudge < pos(GlobalConfigRow::AutoStartQueue));
 }
 
+/// The row belongs to the scheduler band, between `rotation` and the
+/// auto-switch band — an update cadence, not a switch rule.
+#[test]
+fn auto_update_sits_in_the_scheduler_band_after_rotation() {
+    assert_eq!(GlobalConfigRow::AutoUpdate.band(), "scheduler");
+    let pos = |row: GlobalConfigRow| {
+        GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("row in the config list")
+    };
+    let auto = pos(GlobalConfigRow::AutoUpdate);
+    assert!(auto > pos(GlobalConfigRow::PreemptiveRotation));
+    assert!(auto < pos(GlobalConfigRow::WeeklyThreshold));
+}
+
+/// The row is a plain toggle on both tiers (never dimmed, never a cycle) and
+/// its hint names the env override on and the silence off — the exact copy,
+/// since both strings are provisional pending cloudy's equality pick.
+#[test]
+fn auto_update_renders_the_toggle_glyphs_and_exact_hints() {
+    let mut off_state = toggles();
+    off_state.auto_update = false;
+    {
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+        let on = line_text(&detail_row(
+            GlobalConfigRow::AutoUpdate,
+            false,
+            toggles(),
+            tunables(),
+            None,
+        ));
+        assert!(
+            on.contains("─●"),
+            "full-tier on renders the slide switch: {on}"
+        );
+        let off = line_text(&detail_row(
+            GlobalConfigRow::AutoUpdate,
+            false,
+            off_state,
+            tunables(),
+            None,
+        ));
+        assert!(
+            off.contains("○─"),
+            "full-tier off renders the hollow knob: {off}"
+        );
+    }
+    {
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+        let on = line_text(&detail_row(
+            GlobalConfigRow::AutoUpdate,
+            false,
+            toggles(),
+            tunables(),
+            None,
+        ));
+        assert!(
+            on.contains("[on]"),
+            "compatible-tier on renders the bracket: {on}"
+        );
+        let off = line_text(&detail_row(
+            GlobalConfigRow::AutoUpdate,
+            false,
+            off_state,
+            tunables(),
+            None,
+        ));
+        assert!(
+            off.contains("[off]"),
+            "compatible-tier off renders the bracket: {off}"
+        );
+    }
+
+    let hint_on = row_hint(GlobalConfigRow::AutoUpdate, toggles(), tunables()).expect("hint");
+    assert_eq!(
+        hint_on,
+        "checks for updates at launch, unless CLAUTH_NO_UPDATE=1"
+    );
+    let hint_off = row_hint(GlobalConfigRow::AutoUpdate, off_state, tunables()).expect("hint");
+    assert_eq!(hint_off, "no update checks");
+}
+
 /// Value rows fold the live value into their hint, so cycling a row re-explains
 /// what it now does with the real number.
 #[test]
@@ -679,7 +764,7 @@ fn value_rows_interpolate_the_live_value_into_their_hint() {
 // ── burn floor / horizon dim while inert (burn-aware off) ─────────────────────
 
 /// Both burn-aware tunables gate a projection that never runs under static
-/// switch mode, so they render as cloudy-tui disabled rows (whole content faint)
+/// switch mode, so they render as disabled rows (whole content faint)
 /// while burn-aware is off, and become live cycles once it is on.
 #[test]
 fn burn_tunables_dim_when_burn_aware_is_off() {
@@ -893,7 +978,7 @@ fn reset_display_row_shows_all_three_shapes() {
 }
 
 /// The notation decides nothing while resets render as a bare countdown, so the
-/// row is a cloudy-tui disabled row until a clock shows — and live after.
+/// row is a disabled row until a clock shows — and live after.
 #[test]
 fn clock_row_dims_until_a_reset_renders_a_clock() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);

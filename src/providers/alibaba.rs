@@ -16,7 +16,7 @@
 //!
 //! Every response is HTTP 200, success or not, so the verdict is read out of the
 //! body — including the dead-session code, which is a first-class state
-//! ([`ThirdPartyError::AuthExpired`]) rather than a fetch failure: the session
+//! ([`ThirdPartyError::ConsoleExpired`]) rather than a fetch failure: the session
 //! has no refresh path — it expires 48h after the operator's aliyun browser
 //! sign-in, which a re-login inherits rather than restarts — so retrying it on
 //! the cadence only burns requests.
@@ -164,7 +164,7 @@ pub(super) fn fetch(
 ) -> Result<ThirdPartyStats, ThirdPartyError> {
     // No session is the same state to every consumer as a dead one: both need a
     // console login and neither is worth a request.
-    let console = console.ok_or(ThirdPartyError::AuthExpired)?;
+    let console = console.ok_or(ThirdPartyError::ConsoleExpired)?;
     let gw = gateway(&console.region, console.site);
     let usage: UsagePayload = call(&gw, console, USAGE_API)?;
     // The other two only enrich the bars — a failure there must not drop the
@@ -249,7 +249,7 @@ fn post_form(url: &str, token: &str, body: &str) -> Result<String, ThirdPartyErr
 /// Peel the OneConsole envelope down to the API's own payload.
 ///
 /// Split from HTTP so every wire shape below is testable without a network. A
-/// dead session is reported as [`ThirdPartyError::AuthExpired`] from the BODY —
+/// dead session is reported as [`ThirdPartyError::ConsoleExpired`] from the BODY —
 /// the HTTP status is 200 for it, so a status-only reader would call it a
 /// success and then fail to parse.
 fn unwrap_payload<T: DeserializeOwned>(text: &str) -> Result<T, ThirdPartyError> {
@@ -258,7 +258,7 @@ fn unwrap_payload<T: DeserializeOwned>(text: &str) -> Result<T, ThirdPartyError>
         return Err(ThirdPartyError::Parse);
     };
     if LOGIN_ERROR_CODES.contains(&outer.error_code.as_str()) {
-        return Err(ThirdPartyError::AuthExpired);
+        return Err(ThirdPartyError::ConsoleExpired);
     }
     if !outer.success {
         return Err(ThirdPartyError::Status);

@@ -456,8 +456,8 @@ pub(crate) fn switch_effect_note(auth: &SessionAuth) -> String {
 /// so any literal spelled here would point at a directory that does not exist.
 /// It also names no destination past `~/.claude/`. Whether an entry there chains
 /// on somewhere else is the operator's own layout rather than anything clauth
-/// builds: this box reaches `~/.agents/skills` through a `~/.claude/skills`
-/// symlink the operator made, and a box without it would be told a falsehood.
+/// builds: a box may reach its skills dir through a `~/.claude/skills`
+/// symlink, and a box without one would be told a falsehood.
 ///
 /// `Global` has no runtime dir, and `IsolatedCustom` is a foreign
 /// `CLAUDE_CONFIG_DIR` whose layout clauth does not own, so neither may claim

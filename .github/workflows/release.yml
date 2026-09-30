@@ -16,13 +16,13 @@ env:
   CARGO_NET_RETRY: "10"
   CARGO_HTTP_MULTIPLEXING: "false"
 
-# The release itself is created by rs/release.sh (the maintainer's shared Rust
-# release script, sibling of cargo.sh) right after the tag push, with the full
-# changelog already in the body so the notes ride along in GitHub's release
-# email. This workflow never creates the release or touches its notes -- it only
-# builds the per-OS binaries and uploads them (plus sums + signature) to the
-# release the script already published. One upload point (the publish job), so no
-# concurrent softprops find-or-create can duplicate the release and orphan the notes.
+# The release itself is created by the maintainer's release script right after
+# the tag push, with the full changelog already in the body so the notes ride
+# along in GitHub's release email. This workflow never creates the release or
+# touches its notes -- it only builds the per-OS binaries and uploads them (plus
+# sums + signature) to the release the script already published. One upload
+# point (the publish job), so no concurrent softprops find-or-create can
+# duplicate the release and orphan the notes.
 
 jobs:
   validate:
@@ -125,10 +125,10 @@ jobs:
       - name: Upload assets to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        # rs/release.sh normally creates the release (with the full notes) moments after
-        # the tag push; fall back to a bare release so a hand-pushed tag still gets
-        # its binaries. Never generate notes here -- the script owns them. --clobber
-        # keeps re-runs idempotent.
+        # The maintainer's release script normally creates the release (with the
+        # full notes) moments after the tag push; fall back to a bare release so a
+        # hand-pushed tag still gets its binaries. Never generate notes here -- the
+        # script owns them. --clobber keeps re-runs idempotent.
         run: |
           cd artifacts
           gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \

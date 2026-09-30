@@ -1004,7 +1004,7 @@ fn oauth_creds() -> ClaudeCredentials {
 
 /// A disabled row goes inert END TO END, not just its name: the marker glyph,
 /// the type cell, and both window bars all flatten to `theme::dim()`. The
-/// glyphs and numbers stay — cloudy-tui never lets state ride on hue alone, and
+/// glyphs and numbers stay — the row never lets state ride on hue alone, and
 /// the figures are the last real reading — it is only the semantic color that
 /// lies once the data is frozen. An enabled sibling in the same config keeps
 /// every hue, which is what proves the flattening is per-row.
@@ -1439,7 +1439,7 @@ fn chain_panel_height_floors_at_three_without_panicking() {
     assert_eq!(chain_panel_height(0, 0), 3);
 }
 
-/// The projected switch target carries the compact `↩ ~eta` hint on its OWN row
+/// The projected switch target carries the compact `↲ ~eta` hint on its OWN row
 /// (not a trailing caption), parked at the shared trailer column just past the
 /// content — NOT flung out to the panel's right edge.
 #[test]
@@ -1465,8 +1465,8 @@ fn chain_row_switch_hint_rides_the_target_row() {
     let base = row.base_width();
     let line = row.into_line(base + TRAILER_GAP, 60);
     let text = line_text(&line);
-    assert!(text.contains("↩ ~"), "target row carries the hint: {text}");
-    let hint_w = Span::raw(format!("↩ ~{}", humanize_duration(7200))).width();
+    assert!(text.contains("↲ ~"), "target row carries the hint: {text}");
+    let hint_w = Span::raw(format!("↲ ~{}", humanize_duration(7200))).width();
     assert_eq!(
         line.width(),
         base + TRAILER_GAP + hint_w,
@@ -1478,12 +1478,11 @@ fn chain_row_switch_hint_rides_the_target_row() {
     );
 }
 
-/// A projected switch LANDING on the preferred (home) member carries the `⌂`
-/// homecoming glyph, while a switch onto any other member carries the plain `↩`.
-/// Pins the wording that distinguishes a return from an exhaustion hop (spec
-/// item 6) — an inverted glyph (⌂/↩ swapped) would otherwise ship green.
+/// Every projected hop carries the same `↲` glyph, the preferred (home) member
+/// included — the destination never changes the marker, and neither the old
+/// `↩` nor a `⌂` exists on this surface.
 #[test]
-fn chain_row_marks_a_homecoming_onto_preferred_with_the_house_glyph() {
+fn chain_row_renders_every_projected_hop_with_the_return_glyph() {
     let _home = crate::testutil::HomeSandbox::new();
     let mut home = profile("home", 95.0, 10.0, 3600);
     home.preferred = true;
@@ -1512,12 +1511,12 @@ fn chain_row_marks_a_homecoming_onto_preferred_with_the_house_glyph() {
 
     let home_hint = hint("home");
     assert!(
-        home_hint.contains('⌂') && !home_hint.contains('↩'),
-        "a switch onto the preferred member reads as a homecoming: {home_hint}",
+        home_hint.contains('↲') && !home_hint.contains('↩') && !home_hint.contains('⌂'),
+        "a switch onto the preferred member keeps the plain return glyph: {home_hint}",
     );
     let plain_hint = hint("plain");
     assert!(
-        plain_hint.contains('↩') && !plain_hint.contains('⌂'),
+        plain_hint.contains('↲') && !plain_hint.contains('↩') && !plain_hint.contains('⌂'),
         "a switch onto a non-preferred member keeps the plain glyph: {plain_hint}",
     );
 }
@@ -1569,9 +1568,8 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     );
 }
 
-/// Thresholds of differing digit counts left-pad so the `%` signs stack
-/// (cloudy-tui numeric-column alignment), instead of leaving a ragged edge
-/// between a `95%` row and a `100%` row.
+/// Thresholds of differing digit counts left-pad so the `%` signs stack,
+/// instead of leaving a ragged edge between a `95%` row and a `100%` row.
 #[test]
 fn chain_rows_align_the_threshold_percent_column() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -1621,7 +1619,7 @@ fn chain_row_shows_both_switch_hint_and_reason_marker_when_they_fit() {
     let col = row.base_width() + TRAILER_GAP;
     let text = line_text(&row.into_line(col, 60));
     assert!(text.contains('×'), "auth-broken shows the × marker: {text}");
-    assert!(text.contains("↩ ~"), "and the switch hint: {text}");
+    assert!(text.contains("↲ ~"), "and the switch hint: {text}");
 }
 
 /// Too narrow for the pair: the marker (the persistent block signal) survives
@@ -1654,7 +1652,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
     };
     let col = build().base_width() + TRAILER_GAP;
     let marker_w = reason_marker(&BlockedReason::AuthBroken).width();
-    let hint_w = Span::raw(format!("↩ ~{}", humanize_duration(7200))).width();
+    let hint_w = Span::raw(format!("↲ ~{}", humanize_duration(7200))).width();
 
     // Room for the marker alone at the trailer column, but not the hint (+1 sep)
     // beside it.
@@ -1668,7 +1666,7 @@ fn chain_row_drops_switch_hint_before_reason_marker_when_narrow() {
         text.contains('×'),
         "marker survives at narrow width: {text}"
     );
-    assert!(!text.contains('↩'), "hint drops first: {text}");
+    assert!(!text.contains('↲'), "hint drops first: {text}");
 }
 
 /// End to end: an auth-broken chain member surfaces its × marker in the overview
@@ -1785,8 +1783,8 @@ fn live_cell_stays_under_header_when_7d_reset_is_two_digit_hours() {
     );
 }
 
-/// Zero renders as nothing — cloudy-tui hides a zero count rather than printing
-/// it, and a table full of `0`s would drown the accounts that do host something.
+/// Zero renders as nothing — a zero count is hidden rather than printed, and a
+/// table full of `0`s would drown the accounts that do host something.
 #[test]
 fn an_account_with_no_live_sessions_renders_a_blank_live_cell() {
     let _home = crate::testutil::HomeSandbox::new();
@@ -2233,31 +2231,533 @@ fn deepseek_amount_w_spans_all_currencies() {
     );
 }
 
-/// `c` cycles the Overview's harness filter, and the header chip says which
-/// harness the account count is about. Absent while both show, so the default
-/// header is byte-identical to the one that predates codex.
+/// `c` cycles the Overview's harness filter, and `label_name` names the
+/// harness the panel is showing for the left meta slot beside the bare
+/// `ACCOUNTS` title. Nameless while both show, so the unfiltered panel renders
+/// no left slot.
 #[test]
 fn the_harness_filter_cycles_and_names_itself() {
     use crate::tui::app::HarnessFilter;
     assert_eq!(HarnessFilter::default(), HarnessFilter::All);
     assert_eq!(
-        HarnessFilter::All.chip(),
+        HarnessFilter::All.label_name(),
         None,
-        "the default carries no badge"
+        "the unfiltered label carries no harness name"
     );
 
     let claude = HarnessFilter::All.next();
     assert_eq!(claude, HarnessFilter::Claude);
-    assert_eq!(claude.chip(), Some("claude only"));
+    assert_eq!(claude.label_name(), Some("claude"));
     assert!(claude.shows_claude() && !claude.shows_codex());
 
     let codex = claude.next();
     assert_eq!(codex, HarnessFilter::Codex);
-    assert_eq!(codex.chip(), Some("codex only"));
+    assert_eq!(codex.label_name(), Some("codex"));
     assert!(codex.shows_codex() && !codex.shows_claude());
 
     assert_eq!(codex.next(), HarnessFilter::All, "three states, then back");
     assert!(HarnessFilter::All.shows_claude() && HarnessFilter::All.shows_codex());
+}
+
+/// The accounts panel's top border row, which carries the panel title, its
+/// left meta slot (the harness filter) and its title-right meta slot (the
+/// counts).
+fn accounts_title_row(app: &App, width: u16) -> String {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 8)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), app))
+        .expect("draw");
+    crate::testutil::buffer_rows(term.backend().buffer())[0].clone()
+}
+
+/// The accounts panel's title row carries the harness filter: the bare
+/// eyebrow unfiltered, the harness name under the filter as a left meta slot,
+/// a title of its own one border cell after the eyebrow (`ACCOUNTS ─ claude`).
+///
+/// The panel's row is `╭─` + ` TITLE ` + `─` + ` left ` + rule + ` meta ` +
+/// `─` + `╮` (the corner-adjacent dash is a border cell of the title line), so
+/// the one-claude fixture's ` 1 claude ` slot (10 cells, ` meta ` plus its
+/// closing dash) needs `width - 3 - 10 - 10 >= 3` unfiltered and
+/// `width - 3 - 10 - 1 - left - 10 >= 3` filtered (`left` = the name plus its
+/// two insets): the unfiltered slot holds at 26, and at width 25 the counts
+/// slot sheds in all three rows and they read as the title, its left slot and
+/// the rule alone.
+#[test]
+fn the_accounts_title_row_carries_the_harness_filter() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("cl1", 80.0, 10.0, 3_600)],
+        None,
+        vec![],
+    ));
+
+    assert_eq!(
+        accounts_title_row(&app, 25),
+        "╭─ ACCOUNTS ────────────╮",
+        "unfiltered: the eyebrow and the border rule alone"
+    );
+
+    app.harness_filter = HarnessFilter::Claude;
+    assert_eq!(
+        accounts_title_row(&app, 25),
+        "╭─ ACCOUNTS ─ claude ───╮",
+        "the claude filter names the harness it shows"
+    );
+
+    app.harness_filter = HarnessFilter::Codex;
+    assert_eq!(
+        accounts_title_row(&app, 25),
+        "╭─ ACCOUNTS ─ codex ────╮",
+        "the codex filter names the harness it shows"
+    );
+}
+
+/// R1: the title opens with the corner-adjacent dash `╭─ ACCOUNTS` — a border
+/// cell in the border token, never title styling — and the give-way arithmetic
+/// counts it before the right slot keeps its ≥3 rule cells: the
+/// `3 claude · 2 codex` meta holds at 46 and sheds at 45 under ` claude `, one
+/// column past the pre-dash boundary.
+#[test]
+fn the_accounts_title_opens_with_the_corner_dash_and_the_counts_keep_their_gap() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let mut app = App::new(config_with(
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+            profile("cl3", 80.0, 30.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+
+    assert_eq!(
+        accounts_title_row(&app, 25),
+        "╭─ ACCOUNTS ────────────╮",
+        "unfiltered: the corner-adjacent dash opens the border break"
+    );
+
+    app.harness_filter = HarnessFilter::Claude;
+    assert_eq!(
+        accounts_title_row(&app, 46),
+        "╭─ ACCOUNTS ─ claude ─── 3 claude · 2 codex ─╮",
+        "at 46 the counts keep their three rule cells behind the corner dash"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 45),
+        "╭─ ACCOUNTS ─ claude ───────────────────────╮",
+        "at 45 the counts shed, one column past the pre-dash boundary"
+    );
+}
+
+/// Below the title line's own width ratatui clips the row from the right, the
+/// left slot first; nothing sheds ahead of the clip. At 12 columns the eyebrow
+/// loses its trailing inset behind the corner dash and at 13 the label fills
+/// the border break, so every filter state reads the same there. From 14 the
+/// slot shows as far as the row reaches: at 16 a filtered row still names its
+/// harness by its first letter, and at 20 the clip takes the claude slot's
+/// tail and the codex slot's closing inset. A slot that shed instead would
+/// read as the unfiltered row at 16 under either filter; ` codex ` fills its
+/// line whole at 21.
+#[test]
+fn a_title_row_narrower_than_the_eyebrow_and_its_slot_clips_the_slot() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(config_with(
+        vec![profile("cl1", 80.0, 10.0, 3_600)],
+        None,
+        vec![],
+    ));
+
+    for (filter, at_16, at_20) in [
+        (
+            HarnessFilter::All,
+            "╭─ ACCOUNTS ───╮",
+            "╭─ ACCOUNTS ───────╮",
+        ),
+        (
+            HarnessFilter::Claude,
+            "╭─ ACCOUNTS ─ c╮",
+            "╭─ ACCOUNTS ─ claud╮",
+        ),
+        (
+            HarnessFilter::Codex,
+            "╭─ ACCOUNTS ─ c╮",
+            "╭─ ACCOUNTS ─ codex╮",
+        ),
+    ] {
+        app.harness_filter = filter;
+        assert_eq!(
+            accounts_title_row(&app, 12),
+            "╭─ ACCOUNTS╮",
+            "{filter:?} at 12"
+        );
+        assert_eq!(
+            accounts_title_row(&app, 13),
+            "╭─ ACCOUNTS ╮",
+            "{filter:?} at 13"
+        );
+        assert_eq!(accounts_title_row(&app, 16), at_16, "{filter:?} at 16");
+        assert_eq!(accounts_title_row(&app, 20), at_20, "{filter:?} at 20");
+    }
+}
+
+/// Every term of the meta slot's give-way arithmetic counts display cells,
+/// never chars, each pinned at the width that holds the meta on its three rule
+/// cells and one column narrower, where it sheds (`buffer_rows` reads each wide
+/// glyph's continuation cell as a space). The insets count the corner-adjacent
+/// dash too (3 = the two corners plus that dash):
+/// - the meta: `界界` (4 cells) under the 10-cell title needs
+///   `rule = width - 13 - 7 >= 3`, holding at 23; counting chars keeps it at 22.
+/// - the left slot: `界界` beside a `1 x` meta needs
+///   `rule = width - 13 - 1 - 6 - 6 >= 3`, holding at 29; counting chars keeps
+///   it at 28.
+/// - the title: `界ß` uppercases to ` 界SS ` (6 cells, 5 chars, 4 before
+///   uppercasing) and needs `rule = width - 9 - 6 >= 3` beside `1 x`, holding
+///   at 18; counting chars either way keeps it at 17.
+#[test]
+fn every_give_way_term_measures_wide_glyphs_in_display_cells() {
+    let row = |title: &str, left: Option<&str>, meta: &str, width: u16| {
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 3)).expect("terminal");
+        term.draw(|f| {
+            f.render_widget(
+                section_box_meta(title, left, meta, true, true, width),
+                f.area(),
+            );
+        })
+        .expect("draw");
+        crate::testutil::buffer_rows(term.backend().buffer())[0].clone()
+    };
+
+    assert_eq!(
+        row("accounts", None, "界界", 23),
+        "╭─ ACCOUNTS ─── 界 界  ─╮",
+        "a wide meta keeps its three rule cells at 23"
+    );
+    assert_eq!(
+        row("accounts", None, "界界", 22),
+        "╭─ ACCOUNTS ─────────╮",
+        "a wide meta is gone at 22"
+    );
+    assert_eq!(
+        row("accounts", Some("界界"), "1 x", 29),
+        "╭─ ACCOUNTS ─ 界 界  ─── 1 x ─╮",
+        "beside a wide left slot the meta keeps its three rule cells at 29"
+    );
+    assert_eq!(
+        row("accounts", Some("界界"), "1 x", 28),
+        "╭─ ACCOUNTS ─ 界 界  ────────╮",
+        "beside a wide left slot the meta is gone at 28"
+    );
+    assert_eq!(
+        row("界ß", None, "1 x", 18),
+        "╭─ 界 SS ─── 1 x ─╮",
+        "under a wide, lengthening title the meta keeps its three rule cells at 18"
+    );
+    assert_eq!(
+        row("界ß", None, "1 x", 17),
+        "╭─ 界 SS ────────╮",
+        "under a wide, lengthening title the meta is gone at 17"
+    );
+}
+
+/// The counts slot gives way before the filter slot: its give-way arithmetic
+/// counts the filter's cells, so a filtered panel needs
+/// `width - 3 - 10 - 1 - left - 21 >= 3` under the `3 claude · 2 codex`
+/// meta (the corner-adjacent dash, the bare gap cell, then ` meta ─`), where
+/// `left` is the name plus its two insets. That holds the counts at 46 under
+/// ` claude ` and 45 under ` codex `; one column narrower the counts drop
+/// whole and the filter stays, since a filtered list under a bare title would
+/// misread it. The 37 and 36 rows are the unfiltered shed test's widths: the
+/// unfiltered panel holds its counts at 37, and a filtered one has shed them
+/// at both.
+#[test]
+fn the_counts_slot_sheds_before_the_filter_slot() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let mut app = App::new(config_with(
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+            profile("cl3", 80.0, 30.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+    assert_eq!(
+        app.codex_rows.len(),
+        2,
+        "fixture control: the roster loaded"
+    );
+
+    app.harness_filter = HarnessFilter::Claude;
+    assert_eq!(
+        accounts_title_row(&app, 46),
+        "╭─ ACCOUNTS ─ claude ─── 3 claude · 2 codex ─╮",
+        "at 46 the counts keep their three rule cells after the claude slot"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 45),
+        "╭─ ACCOUNTS ─ claude ───────────────────────╮",
+        "one column narrower the counts are gone and the claude slot stays"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 36),
+        "╭─ ACCOUNTS ─ claude ──────────────╮",
+        "at 36 the claude slot stays without the counts"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 35),
+        "╭─ ACCOUNTS ─ claude ─────────────╮",
+        "at 35 the claude slot stays without the counts"
+    );
+
+    app.harness_filter = HarnessFilter::Codex;
+    assert_eq!(
+        accounts_title_row(&app, 45),
+        "╭─ ACCOUNTS ─ codex ─── 3 claude · 2 codex ─╮",
+        "at 45 the counts keep their three rule cells after the codex slot"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 44),
+        "╭─ ACCOUNTS ─ codex ───────────────────────╮",
+        "one column narrower the counts are gone and the codex slot stays"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 36),
+        "╭─ ACCOUNTS ─ codex ───────────────╮",
+        "at 36 the codex slot stays without the counts"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 35),
+        "╭─ ACCOUNTS ─ codex ──────────────╮",
+        "at 35 the codex slot stays without the counts"
+    );
+}
+
+/// The filter slot is data, styled like the title-right slot: `TEXT_DIM`,
+/// never bold, never italic. The eyebrow before it keeps the first panel's
+/// title treatment (`ACCENT_2`, italic, bold while focused), and the dash
+/// between them is the border's own cell in the border token, so the two read
+/// as a title and a note about it rather than one run of title text.
+#[test]
+fn the_filter_slot_is_dim_data_and_the_eyebrow_keeps_its_title_style() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut app = App::new(config_with(
+        vec![profile("cl1", 80.0, 10.0, 3_600)],
+        None,
+        vec![],
+    ));
+
+    for (filter, name) in [
+        (HarnessFilter::Claude, "claude"),
+        (HarnessFilter::Codex, "codex"),
+    ] {
+        app.harness_filter = filter;
+        let mut term =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 8)).expect("terminal");
+        term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+            .expect("draw");
+        let buf = term.backend().buffer();
+        let row = crate::testutil::buffer_rows(buf)[0].clone();
+        assert!(
+            row.starts_with(&format!("╭─ ACCOUNTS ─ {name} ")),
+            "{filter:?}: the filter slot follows the eyebrow: {row:?}"
+        );
+        let eyebrow = "╭─ ".chars().count();
+        let gap = "╭─ ACCOUNTS ".chars().count();
+        let start = "╭─ ACCOUNTS ─ ".chars().count();
+
+        let dash = &buf.content[gap];
+        assert_eq!(dash.symbol(), "─", "{filter:?}: the gap is a border cell");
+        assert_eq!(
+            dash.fg,
+            theme::line_strong_color(),
+            "{filter:?}: the gap dash carries the focused border token"
+        );
+        assert!(
+            !dash.modifier.intersects(Modifier::BOLD | Modifier::ITALIC),
+            "{filter:?}: the gap dash takes no title or slot styling"
+        );
+
+        for x in start..start + name.len() {
+            let cell = &buf.content[x];
+            assert_eq!(
+                cell.fg,
+                theme::text_dim_color(),
+                "{filter:?}: filter cell {x} is TEXT_DIM in {row:?}"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::BOLD),
+                "{filter:?}: filter cell {x} is not bold in {row:?}"
+            );
+            assert!(
+                !cell.modifier.contains(Modifier::ITALIC),
+                "{filter:?}: filter cell {x} is not italic in {row:?}"
+            );
+        }
+
+        for x in eyebrow..eyebrow + "ACCOUNTS".len() {
+            let cell = &buf.content[x];
+            assert_eq!(
+                cell.fg,
+                theme::accent_2_color(),
+                "{filter:?}: eyebrow cell {x} keeps the first panel's title color"
+            );
+            assert!(
+                cell.modifier.contains(Modifier::ITALIC | Modifier::BOLD),
+                "{filter:?}: eyebrow cell {x} stays italic and bold while focused"
+            );
+        }
+    }
+}
+
+/// The meta slot counts both harnesses whatever the filter shows — the counts
+/// describe the rows the table lists, never the view the filter narrows — as
+/// one term per harness joined by a middot.
+#[test]
+fn the_accounts_meta_slot_counts_both_harnesses_whatever_the_filter_shows() {
+    use crate::tui::app::HarnessFilter;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let mut app = App::new(config_with(
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+            profile("cl3", 80.0, 30.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+    assert_eq!(
+        app.codex_rows.len(),
+        2,
+        "fixture control: the roster loaded"
+    );
+
+    assert_eq!(
+        accounts_title_row(&app, 50),
+        "╭─ ACCOUNTS ──────────────── 3 claude · 2 codex ─╮",
+        "unfiltered: both rosters, no filter slot leaving a longer rule"
+    );
+
+    app.harness_filter = HarnessFilter::Claude;
+    assert_eq!(
+        accounts_title_row(&app, 50),
+        "╭─ ACCOUNTS ─ claude ─────── 3 claude · 2 codex ─╮",
+        "the claude filter leaves the counts alone"
+    );
+
+    app.harness_filter = HarnessFilter::Codex;
+    assert_eq!(
+        accounts_title_row(&app, 50),
+        "╭─ ACCOUNTS ─ codex ──────── 3 claude · 2 codex ─╮",
+        "the codex filter leaves the counts alone"
+    );
+}
+
+/// A roster with no accounts drops out of the words — the slot counts what the
+/// panel lists — so a claude-only config reads `2 claude` and a codex-only one
+/// `2 codex` rather than naming a harness at zero.
+#[test]
+fn the_accounts_meta_slot_omits_a_roster_with_no_accounts() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let claude_only = App::new(config_with(
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+    assert_eq!(
+        accounts_title_row(&claude_only, 50),
+        "╭─ ACCOUNTS ────────────────────────── 2 claude ─╮"
+    );
+
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let codex_only = App::new(config_with(Vec::new(), None, vec![]));
+    assert_eq!(
+        codex_only.codex_rows.len(),
+        2,
+        "fixture control: the roster loaded"
+    );
+    assert_eq!(
+        accounts_title_row(&codex_only, 50),
+        "╭─ ACCOUNTS ─────────────────────────── 2 codex ─╮"
+    );
+}
+
+/// Both rosters empty is nothing to count: an empty meta renders the plain box,
+/// the title's border rule running on to the corner.
+#[test]
+fn an_empty_roster_pair_renders_no_meta_slot() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = App::new(config_with(Vec::new(), None, vec![]));
+    assert_eq!(
+        accounts_title_row(&app, 50),
+        "╭─ ACCOUNTS ─────────────────────────────────────╮"
+    );
+}
+
+/// An EMPTY title renders the full rule run: both the corner-adjacent dash and
+/// the `title_label("")` two-space inset are skipped, so a never-titled box
+/// (today only the two width-probe callers, which measure `.inner()`) cannot
+/// punch a hole in the top border if it is ever rendered.
+#[test]
+fn an_empty_title_keeps_the_full_rule_run() {
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 3)).expect("terminal");
+    term.draw(|f| f.render_widget(section_box("", true, true), f.area()))
+        .expect("draw");
+    assert_eq!(
+        crate::testutil::buffer_rows(term.backend().buffer())[0],
+        "╭──────────╮",
+        "no dash, no hole: the border rule runs corner to corner"
+    );
+}
+
+/// The slot sheds whole rather than crowding the title: at a `3 claude ·
+/// 2 codex` meta under an `ACCOUNTS` title it renders while
+/// `rule = width - 3 - 10 - 21 >= 3` (10 = the title and its corner-adjacent
+/// dash in display cells, 21 = the bare cell plus the meta text and its
+/// closing dash), so 37 holds it at the three rule cells
+/// `META_RULE_MIN` asks for and 36 drops it with the rule run whole.
+#[test]
+fn the_accounts_meta_slot_sheds_before_the_title_loses_its_rule() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
+    let app = App::new(config_with(
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+            profile("cl3", 80.0, 30.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+    assert_eq!(
+        app.codex_rows.len(),
+        2,
+        "fixture control: the roster loaded"
+    );
+
+    assert_eq!(
+        accounts_title_row(&app, 37),
+        "╭─ ACCOUNTS ─── 3 claude · 2 codex ─╮",
+        "at 37 the slot keeps its three rule cells"
+    );
+    assert_eq!(
+        accounts_title_row(&app, 36),
+        "╭─ ACCOUNTS ───────────────────────╮",
+        "one column narrower the slot is gone and the title keeps its rule"
+    );
 }
 
 /// The codex rows the Overview draws come from the codex roster plus the same
@@ -2276,7 +2776,7 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
     .expect("write codex state");
 
     let info = crate::usage::map_codex_usage(
-        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}}}"#,
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":42,"limit_window_seconds":18000,"reset_after_seconds":600}},"rate_limit_reset_credits":{"available_count":2}}"#,
         crate::usage::now_epoch_secs(),
     )
     .expect("maps");
@@ -2284,6 +2784,16 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
         &crate::profile::ProfileName::from("cx1"),
         crate::profile_cache::USAGE_CACHE_FILE,
         &info,
+    );
+    let spent = crate::usage::map_codex_usage(
+        r#"{"plan_type":"plus","rate_limit":{"primary_window":{"used_percent":1,"limit_window_seconds":18000,"reset_after_seconds":600}},"rate_limit_reset_credits":{"available_count":0}}"#,
+        crate::usage::now_epoch_secs(),
+    )
+    .expect("maps");
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("cx2"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &spent,
     );
 
     let rows = crate::tui::app::codex_rows();
@@ -2296,10 +2806,19 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
         Some(42.0),
         "the window comes from the codex leg's own cache"
     );
+    assert_eq!(
+        rows[0].resets,
+        Some(2),
+        "the banked count rides the same cache"
+    );
     assert!(rows[1].active, "cx2 holds the codex active slot");
+    assert_eq!(
+        rows[1].resets, None,
+        "a zero count is no chip: nothing to spend"
+    );
     assert!(
-        rows[1].plan.is_none() && rows[1].five_hour.is_none(),
-        "a never-polled account shows no data rather than a fabricated reading"
+        rows[1].plan.is_some() && rows[1].five_hour.is_some(),
+        "the spent-cache account still shows its windows"
     );
 }
 
@@ -2308,14 +2827,8 @@ fn codex_rows_read_the_roster_and_its_own_cache() {
 /// `wham/usage` plan wins the moment a poll has answered.
 #[test]
 fn codex_rows_plan_falls_back_to_the_id_token_claim() {
-    let home = crate::testutil::HomeSandbox::new();
-    let dir = home.home().join(".clauth");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
-    std::fs::write(
-        dir.join("codex-profiles.toml"),
-        "profiles = [\"cx1\", \"cx2\"]\n",
-    )
-    .expect("write codex state");
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2"]);
 
     let id_token = crate::testutil::codex_jwt(
         r#"{"https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}"#,
@@ -2372,6 +2885,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
             resets_at: None,
         }),
         seven_day: None,
+        resets: None,
     };
     let app = App::new(config_with(vec![], None, vec![]));
 
@@ -2400,6 +2914,36 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
         live_cell_text(&narrow, &line).trim_end(),
         "",
         "no 7d cell is rendered where the column is gone, so nothing sits under live"
+    );
+}
+
+/// The banked-reset chip renders only while a reset is available, trailing the
+/// usage cells: `↺ N` names what `clauth limit-reset` would spend.
+#[test]
+fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let row = |resets: Option<i64>| CodexRow {
+        name: crate::profile::ProfileName::from("cx1"),
+        active: false,
+        broken: false,
+        plan: Some("pro".to_string()),
+        five_hour: None,
+        seven_day: None,
+        resets,
+    };
+    let app = App::new(config_with(vec![], None, vec![]));
+    let text = |line: ratatui::text::Line<'_>| -> String {
+        line.spans.iter().map(|s| s.content.clone()).collect()
+    };
+
+    let wide = OverviewWidths::new(80, &app);
+    assert!(
+        text(render_codex_row(&row(Some(2)), &wide)).contains("↺ 2"),
+        "two banked resets render the chip"
+    );
+    assert!(
+        !text(render_codex_row(&row(None), &wide)).contains("↺"),
+        "no available reset (the constructor floors zero to None): no chip"
     );
 }
 
@@ -2762,13 +3306,7 @@ fn the_accounts_scrollbar_counts_the_codex_rows() {
         "two claude rows fit a 5-row list: no track"
     );
 
-    let dir = crate::profile::clauth_dir().expect("clauth dir");
-    crate::profile::mkdir_700(&dir).expect("mkdir .clauth");
-    std::fs::write(
-        dir.join("codex-profiles.toml"),
-        "profiles = [\"cx1\", \"cx2\", \"cx3\"]\n",
-    )
-    .expect("write codex state");
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
     let with_codex = App::new(config_with(claude(), None, vec![]));
     assert_eq!(
         with_codex.codex_rows.len(),

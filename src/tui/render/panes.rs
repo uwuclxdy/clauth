@@ -13,7 +13,7 @@ use super::super::theme;
 use crate::profile::AppConfig;
 
 /// Account-picker column width for a master-detail tab: ~30% of the body,
-/// clamped 20-40 cells (cloudy-tui master-detail contract).
+/// clamped 20-40 cells.
 pub(super) fn selector_width(body_w: u16) -> u16 {
     (body_w.saturating_mul(3) / 10).clamp(20, 40)
 }
@@ -24,13 +24,23 @@ pub(super) fn selector_width(body_w: u16) -> u16 {
 /// it every layout is byte-identical to the desktop rendering.
 pub(super) const NARROW_BODY_W: u16 = 60;
 
+/// Key column width of the two master-detail settings cards, the Setup
+/// account card and the Fallback member card: the longest key on either, the
+/// Fallback card's `preferred days` (14). One width and one gutter
+/// ([`DETAIL_KEY_GUTTER`]) for both, so their value columns open at the same
+/// place across a tab switch.
+pub(super) const DETAIL_KEY_W: usize = 14;
+/// Fixed gap between the padded key and the value column on those two cards
+/// (house standard).
+pub(super) const DETAIL_KEY_GUTTER: usize = 2;
+
 /// True when `w` is under the phone-width threshold.
 pub(super) fn narrow(w: u16) -> bool {
     w < NARROW_BODY_W
 }
 
 /// The master-detail pane split shared by the Usage/Setup/Fallback/Status/
-/// Plugin tabs. Desktop: the house horizontal selector|detail. Narrow: stacked
+/// Services tabs. Desktop: the house horizontal selector|detail. Narrow: stacked
 /// selector-above-detail — the selector takes its `items` rows (+ box chrome)
 /// up to 40% of the body, the detail the rest, so both panes keep full-width
 /// lines on a phone. Rows, not columns, are the abundant resource there.
@@ -105,6 +115,90 @@ pub(super) fn cycle_option(label: &str, active: bool, row_selected: bool) -> Spa
     Span::styled(text, style)
 }
 
+/// Where a stacked cycle run's lines open: past the caret gutter, under the key.
+const STACK_INDENT: usize = 2;
+
+/// A cycle row as one or more lines: `lead` (the gutter glyph and the key
+/// cell), then each option as a [`cycle_option`] chip, 2 cells apart. A
+/// `custom` value matching no option trails the run the same 2 cells out,
+/// never bracketed (the refresh row's appended value): `ACCENT` while it is the
+/// row's value, `TEXT_FAINT` while it is only a stop the cycle can return to.
+///
+/// A run too wide for `width` breaks between chips onto continuation lines
+/// indented to the value column, never inside a chip. The custom value shares
+/// the run's last line only when it fits there whole, else opens a line of its
+/// own, breaking between its words where even that cannot hold it, so it never
+/// reads as one more word of the run. When the value column cannot hold the
+/// widest chip at all, the whole run drops under the key instead: stacked
+/// rather than clipped. The widest chip counts its brackets whether or not the
+/// row holds the cursor, so focus never flips a row between the two layouts.
+pub(super) fn cycle_row_lines(
+    lead: Vec<Span<'static>>,
+    options: &[(&str, bool)],
+    custom: Option<(&str, bool)>,
+    row_selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let value_col: usize = lead.iter().map(Span::width).sum();
+    // Each chip with the gap that opens it: the options 2 cells apart, the
+    // custom value's words 1 apart after its own 2-cell lead.
+    let mut chips: Vec<(usize, Span<'static>)> = options
+        .iter()
+        .map(|(label, active)| (2, cycle_option(label, *active, row_selected)))
+        .collect();
+    let run = chips.len();
+    let mut whole = 0;
+    if let Some((value, active)) = custom {
+        let style = if active {
+            theme::accent()
+        } else {
+            theme::faint()
+        };
+        whole = value.chars().count();
+        chips.extend(value.split_whitespace().enumerate().map(|(i, word)| {
+            let gap = if i == 0 { 2 } else { 1 };
+            (gap, Span::styled(word.to_string(), style))
+        }));
+    }
+    let widest = options
+        .iter()
+        .map(|(label, _)| label.chars().count() + 2)
+        .chain(chips[run..].iter().map(|(_, word)| word.width()))
+        .max()
+        .unwrap_or(0);
+    let stacked = value_col + widest > width;
+    let indent = if stacked { STACK_INDENT } else { value_col };
+    let blank = || Line::from(Span::raw(" ".repeat(indent)));
+
+    let mut out = vec![Line::from(lead)];
+    let mut used = value_col;
+    if stacked {
+        out.push(blank());
+        used = indent;
+    }
+    let mut fresh = true;
+    for (i, (gap, chip)) in chips.into_iter().enumerate() {
+        let w = chip.width();
+        // The custom value's first word asks room for the whole value.
+        let custom_wraps = i == run && used + gap + whole > width;
+        if !fresh && (custom_wraps || used + gap + w > width) {
+            out.push(blank());
+            used = indent;
+            fresh = true;
+        }
+        if let Some(line) = out.last_mut() {
+            if !fresh {
+                line.spans.push(Span::raw(" ".repeat(gap)));
+                used += gap;
+            }
+            line.spans.push(chip);
+        }
+        used += w;
+        fresh = false;
+    }
+    out
+}
+
 /// Full-width selection bar: bg tint and stretch. Callers handle per-row bold.
 pub(super) fn highlight_row(line: Line<'static>, width: usize) -> Line<'static> {
     let pad = width.saturating_sub(line.width());
@@ -139,9 +233,9 @@ pub(super) fn select_line(
 }
 
 /// Orange for the active profile, plain text otherwise. This is the app's only
-/// active-account marker: cloudy-tui takes the `ACCENT_2` name and the
-/// `[ active ]` pill as two spellings of one signal, so the detail panes carry
-/// neither, and the selector's orange name speaks for the whole screen.
+/// active-account marker: the `ACCENT_2` name and the `[ active ]` pill are
+/// two spellings of one signal, so the detail panes carry neither, and the
+/// selector's orange name speaks for the whole screen.
 pub(super) fn name_color(active: bool) -> Style {
     if active {
         Style::default().fg(theme::accent_2_color())
@@ -216,11 +310,11 @@ impl QueueView {
 /// cross-surface spelling; re-exported here so the tab-local `use super::panes::`
 /// imports stay put.
 pub(super) use crate::format::{
-    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KICK, DIAG_STALE,
-    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
+    DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
+    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
 };
 
-/// cloudy-tui status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
+/// Status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the
 /// caller's semantic style (bold for a charged state). Returns the three spans
 /// so a caller can compose them after a key cell; wrap in a `Line` for a
 /// standalone pill.
@@ -315,7 +409,7 @@ pub(super) fn draw_scrollbar(
 }
 
 /// Rows of context the form scroll keeps past the focused line while content
-/// remains (cloudy-tui: the cursor never rests against the viewport edge).
+/// remains (the cursor never rests against the viewport edge).
 const SCROLL_PAD: usize = 3;
 
 /// Render a form pane's assembled lines into `inner`, scrolled so the focused
@@ -403,7 +497,7 @@ pub(super) fn draw_selector_list(
 /// (another hint follows in the same rail) vs `└` (closes it, or the lone-hint
 /// case with nothing to connect); wrapped continuation lines keep the text at
 /// col 2 and carry `│` at col 0 while the rail is still open, blank once it has
-/// closed (cloudy-tui Stacked hints).
+/// closed.
 ///
 /// The one rail drawer: the Usage tab's `status` block and the Fallback card's
 /// blocked-reason pills both render through it, so the two can't drift apart.
@@ -476,7 +570,7 @@ pub(super) fn help_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>>
 }
 
 /// Invalid-input twin of [`help_tooltip_lines`]: both the leader and the
-/// reason render in `DANGER` (cloudy-tui Invalid-input tooltip).
+/// reason render in `DANGER`.
 pub(super) fn invalid_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
     tooltip_lines(text, width, theme::danger(), theme::danger())
 }
@@ -533,13 +627,58 @@ pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static
 /// Title: always italic, always UPPERCASE; bold added only when focused.
 /// Color: `ACCENT_2` for the first bordered panel on the screen body, `TEXT_DIM` for the rest.
 pub(super) fn section_box(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, true, Vec::new())
+    section_box_impl(title, focused, first, true, Vec::new(), None)
 }
 
 /// Like [`section_box`] but preserves the title's original case — use only when
 /// the title is a profile/account name, not a structural label.
 pub(super) fn section_box_verbatim(title: &str, focused: bool, first: bool) -> Block<'static> {
-    section_box_impl(title, focused, first, false, Vec::new())
+    section_box_impl(title, focused, first, false, Vec::new(), None)
+}
+
+/// Border cells of rule a title must keep before the meta slot may render: a
+/// single dash between the two reads as part of the title's own rule run.
+const META_RULE_MIN: usize = 3;
+
+/// [`section_box`] with two meta slots: `left` as a title of its own one
+/// border cell after the title (`╭─ TITLE ─ left ───`), `meta` in the border
+/// break just before the top-right corner (`… meta ─╮`). Both are data styled
+/// alike, `TEXT_DIM` and never bold or italic, and the dashes around them keep
+/// the border token: the corner-adjacent dash and the dash between the title
+/// and `left` are border cells — the corner dash is part of the title line,
+/// the between-titles dash is the cell ratatui leaves bare between two
+/// left-aligned titles.
+///
+/// Only the right slot gives way: it renders while `width` leaves it at least
+/// [`META_RULE_MIN`] border cells of rule after the title and the left slot,
+/// since the title names the panel and the meta only describes what is in it.
+/// The left slot never gives way to the right one, because it qualifies what
+/// the title names; only a panel too narrow for the title line itself clips
+/// that line from the right, the left slot first. An empty `meta` renders no
+/// right slot.
+pub(super) fn section_box_meta(
+    title: &str,
+    left: Option<&str>,
+    meta: &str,
+    focused: bool,
+    first: bool,
+    width: u16,
+) -> Block<'static> {
+    let left = left.map(|name| Line::from(Span::styled(format!(" {name} "), theme::dim())));
+    // `╭─` + ` TITLE ` + (the bare border cell + ` left `) + rule + ` meta ─` + `╮`:
+    // the corner-adjacent dash is a border cell of its own, counted here so the
+    // right slot keeps its ≥[`META_RULE_MIN`] rule cells at the compliant shape.
+    let insets = 3
+        + Line::from(title_label(title, true)).width()
+        + left.as_ref().map_or(0, |left| 1 + left.width())
+        + meta_line(meta, Style::default()).width();
+    let rule = usize::from(width).saturating_sub(insets);
+    let meta = (!meta.is_empty() && rule >= META_RULE_MIN).then_some(meta);
+    let block = section_box_impl(title, focused, first, true, Vec::new(), meta);
+    match left {
+        Some(left) => block.title_top(left),
+        None => block,
+    }
 }
 
 /// [`section_box`] with a live braille spinner `frame` appended inside the title
@@ -553,7 +692,24 @@ pub(super) fn section_box_loading(
     frame: &str,
 ) -> Block<'static> {
     let suffix = vec![Span::styled(format!("{frame} "), theme::accent())];
-    section_box_impl(title, focused, first, true, suffix)
+    section_box_impl(title, focused, first, true, suffix, None)
+}
+
+/// The note editor's docked slot: an empty-title section box whose title break
+/// carries the `✎` edit mark in accent — `╭─ ✎ ───╮`, the contract's multi-line
+/// input slot. The chrome dash carries the border token, never the mark color.
+pub(super) fn edit_slot_block() -> Block<'static> {
+    section_box_impl(
+        "",
+        true,
+        false,
+        false,
+        vec![
+            Span::styled("─ ", Style::default().fg(theme::line_strong_color())),
+            Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold()),
+        ],
+        None,
+    )
 }
 
 fn section_box_impl(
@@ -562,6 +718,7 @@ fn section_box_impl(
     first: bool,
     uppercase: bool,
     suffix: Vec<Span<'static>>,
+    meta: Option<&str>,
 ) -> Block<'static> {
     let border_style = if focused {
         Style::default().fg(theme::line_strong_color())
@@ -583,18 +740,47 @@ fn section_box_impl(
             base
         }
     };
-    let label = if uppercase {
-        format!(" {} ", title.to_uppercase())
-    } else {
-        format!(" {} ", title)
-    };
-    let mut title_spans = vec![Span::styled(label, title_style)];
+    let mut title_spans = Vec::with_capacity(2 + suffix.len());
+    if !title.is_empty() {
+        // The corner-adjacent dash `╭─ TITLE`: chrome owns every `─` cell, so it
+        // carries the border token, never the title style.
+        title_spans.push(Span::styled("─", border_style));
+        title_spans.push(Span::styled(title_label(title, uppercase), title_style));
+    }
+    // An EMPTY title pushes no spans at all — not even `title_label("")`'s
+    // two-space inset, which would punch a hole in the top border. The
+    // width-probe callers never render, and a rendered empty title must keep
+    // the full rule run (no dash, no hole).
     title_spans.extend(suffix);
-    Block::bordered()
+    let mut block = Block::bordered()
         .border_set(border::ROUNDED)
         .border_style(border_style)
         .title(Line::from(title_spans))
-        .padding(Padding::horizontal(1))
+        .padding(Padding::horizontal(1));
+    if let Some(meta) = meta {
+        block = block.title_top(meta_line(meta, border_style));
+    }
+    block
+}
+
+/// A panel title as it sits in the border break: ` TITLE `.
+fn title_label(title: &str, uppercase: bool) -> String {
+    if uppercase {
+        format!(" {} ", title.to_uppercase())
+    } else {
+        format!(" {title} ")
+    }
+}
+
+/// The title-right meta slot. A right-aligned title ends flush against the
+/// top-right corner, so the slot closes with a border cell of its own:
+/// `… meta ─╮`.
+pub(super) fn meta_line(meta: &str, border_style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {meta} "), theme::dim()),
+        Span::styled("─", border_style),
+    ])
+    .right_aligned()
 }
 
 pub(super) fn draw_profile_selector(

@@ -6,7 +6,7 @@ Three files, all TOML, all safe to hand-edit while clauth runs (it reloads on ex
 - `~/.clauth/profiles/<name>/config.toml` for one account: endpoint, key, env, model routing, its chain settings.
 - `~/.clauth/codex-profiles.toml` for the codex roster: its own active marker, chain and weekly line ([Codex](Codex)).
 
-Most keys below have a TUI equivalent on the Setup, Fallback, Config or Plugin tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which. The codex file has no TUI equivalent at all.
+Most keys below have a TUI equivalent on the Setup, Fallback, Config or Services tab ([Interface and keys](Interface-And-Keys#config-tab-rows)). A few are written only by a command or by clauth itself; those cells say which. The codex file has no TUI equivalent at all.
 
 ## Account types
 
@@ -150,12 +150,12 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `theme` | string | auto | `full` or `compatible` |
 | `reset_display` | string | `relative` | `relative`, `clock`, `both` |
 | `clock_format` | string | `24h` | `24h` or `12h` |
-| `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `plugin`; edited from the Config tab's `home tab` row. the first herdr launch lands on `plugin` with the herdr row open instead |
+| `home_tab` | string | `overview` | the tab every launch opens on: `overview`, `usage`, `tokens`, `setup`, `fallback`, `config`, `status`, or `services`; a saved `plugin` loads as `services`. edited from the Config tab's `home tab` row. the first herdr launch lands on `services` with the herdr row open instead |
 | `show_estimates` | bool | `true` | burn estimates on the Usage tab |
 | `show_pace` | bool | `false` | ideal-pace marker on usage bars |
 | `count_cache` | bool | `false` | count cache tokens in the Tokens totals |
 | `auth_broken` | list | `[]` | accounts quarantined after a permanent OAuth rejection; clauth writes this |
-| `[herdr]` | table | `{}` | the herdr-plugin knobs the Plugin tab edits, plus the first-launch marker ([herdr plugin](Herdr-Plugin)) |
+| `[herdr]` | table | `{}` | the herdr-plugin knobs the Services tab edits, plus the first-launch marker ([herdr plugin](Herdr-Plugin)) |
 | `[herdr] popup_width` | string | `fit` | `fit` (focused-pane width, 540-column cap), `half` (herdr's default), `split-right`, or `split-top` (a real pane right of or above the focused one); a saved `full` loads as `fit` |
 | `[herdr] pane_tag` | bool | `true` | publish the `clauth=$profile` pane-metadata tag; off clears it on every pane |
 | `[herdr] tag_watch_secs` | int | `5` | seconds between the per-pane tag watcher's re-publishes |
@@ -165,8 +165,10 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `[herdr] first_landing_done` | bool | `false` | set to `true` once the first herdr launch lands; later launches open `home_tab` |
 | `[serve]` | table | `{}` | the daemon-wide session-creation switch ([Daemon](Daemon)) |
 | `[serve] session_creation` | bool | `false` | whether `POST /api/v1/sessions` is served at all; each calling device also needs its own `sessions` grant (`clauth devices allow-sessions <name>`) |
+| `[update]` | table | `{}` | the auto-updater toggle (Config tab) |
+| `[update] auto_update` | bool | `true` | the background update check on launch and the daemon's remote herdr-plugin reinstall; the whole table is omitted while on, and `CLAUTH_NO_UPDATE=1` disables both even when this is on |
 
-A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
+A key clauth does not know (written by a newer release, or added by hand) is kept verbatim across every rewrite, under a `# keys preserved from the previous file` marker — including a key nested inside a table clauth does model, so a future knob under `[update]`, `[herdr]` or `[serve]` survives the same way, even on a save where that table's own modelled key is back at its default and the table would render nothing. The one exception is a nested key whose name is not a bare identifier, which is dropped rather than written mis-scoped. Nothing a newer version of clauth wrote into these files is lost by running an older one beside it.
 
 ## `codex-profiles.toml`
 
@@ -207,9 +209,9 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
-`preferred_days` has a `home days` row on the Setup tab: type the weekdays separated by commas or spaces and <kbd>⏎</kbd> saves, an empty field clears the list. The Fallback card's `preferred` row names the days once a list is set, and the Overview's `⌂` follows whichever account is home today. Full names and three-letter forms parse in any case (`["sat", "Sunday"]`); a hand-written entry that does not parse is dropped on the next rewrite, while the row refuses it and keeps the field open. The list is re-read per chain build, so the rollover at midnight needs no restart.
+`preferred_days` has a `preferred days` row on the member's Fallback card, listing the presets `never  weekdays  weekends  every day` with the current one lit: <kbd>space</kbd> steps through them and back to `never`, saving each step, and <kbd>⏎</kbd> opens a day picker for any other set ([Interface and keys](Interface-And-Keys#tab-dependent)). A list matching no preset shows its days after the presets and stays one more stop after `every day` while the card is open, so stepping past it and back brings it back. The card's `preferred` row names the days once a list is set, and `+ add` names a list an account still carries from before it left the chain. In a hand-written list, full names and three-letter forms parse in any case (`["sat", "Sunday"]`), and an entry that does not parse is dropped on the next rewrite. The list is re-read per chain build, so the rollover at midnight needs no restart.
 
-A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled or auth-broken claims nothing — the `home days` row says which of those is in the way, before and after the save. A list can also go inert later, or arrive by hand-editing the file, so clauth says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
+A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled, auth-broken or carrying a rejected api key claims nothing: a member's `preferred days` row names the blocker (`its api key was rejected` for that case), `+ add` names one that is off the chain, and saving such a list warns (once per day-picker visit, and on each <kbd>space</kbd> step that sets days). A lapsed Alibaba console login does not block the claim because its inference key still serves. A list can also go inert later, or arrive by hand-editing the file, so clauth says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
 
 **A named day is claimed against every account.** On a day some list names, only the accounts naming it are home; a bare `preferred = true` elsewhere stands down for that day and takes charge again on the days no list claims. So the usual split is one line in one profile:
 
@@ -236,12 +238,28 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   token_ledger.json        # the per-day token ledger behind the Tokens tab
   clauth.log, daemon.log   # event lines from the TUI and the daemon
   clauthd.pid              # the running daemon's process id
+  gateway.toml             # the managed shunt gateway: its adopted config, optional binary and env file, the disabled flag (0600)
+  gateway-admin-token      # the gateway's admin write key, alone in its file (0600)
+  gateway-child.json       # the gateway the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop
+  gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
+  shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
+  proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600)
+  proxies/<service>/       # one state dir per proxy, its CLAUTH_PROXY_STATE_DIR (0700)
+    accounts/              # the proxy's own account store
+    config.json            # the proxy's own proxy-wide settings
+    clauth-admin-token     # the proxy's admin token, alone in its file (0600)
+    clauth-child.json      # the proxy the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop (0600)
+    clauth.log             # the proxy's own stdout and stderr, size-capped like daemon.log (0600)
   completions/             # generated shell completion scripts
   .completions_installed   # marker: completions have been installed
   conversations/<sid>[.<agent_id>].json  # the account a live conversation is on
   jobs/<id>.json           # backgrounded delegate jobs, GC'd after a day
+  jobs/<id>.live.json      # blocking delegate liveness while its caller is attached
+  jobs/<id>.json.delivered # exactly-once delivery ledger after collection
+  keychain-deletes-in-flight.json # macOS namespaced-item deletes in progress
   live_bare/<pid>          # one marker per live bare `claude` session
   live_sessions/<sid>.json # one row per live `clauth start` session
+  mcp_live/<pid>           # one marker per live `clauth mcp` server, so its delegate jobs read dead once it exits
   presets/<name>.json      # endpoint + model presets you saved
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
   keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
@@ -251,6 +269,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       config.toml          # everything in the table above
       credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
+      note.txt             # the account's free-form note, edited from the usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
       usage_cache.json     # last-known utilization and plan
@@ -263,10 +282,12 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
       kick_block.json      # messages-limiter block state
       throughput_cache.json# observed delegate tokens/sec per model
       touch-receipt.json   # what the last credential swap wrote, for the watchdog
+      adopt_refusal.json   # last standing live-credential adoption refusal announced
       quarantine/          # credentials parked after a refresh token was rejected
       runtime-<sid>/       # one CLAUDE_CONFIG_DIR tree per live session
       runtime-isolated-<sid>/
       sessions-<sid>/      # that session's PID file, flock-held while it runs
+      sessions-isolated-<sid>/
     cx/                    # a codex profile (see Codex)
       config.toml          # harness = "codex", plus hooks_json
       auth.json            # the ChatGPT token chain; ~/.codex/auth.json links here after a capture
@@ -286,7 +307,7 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   markers/<hash>           # the install record `clauth self-heal` keys on
 ```
 
-Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. That is the whole tree: every path clauth writes is listed above, so a file you find here that is not is a leftover from an older version. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
+Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. The tree above lists the stable user-facing stores and the transient paths that are unsafe to remove; other clauth-owned temporary or migration files can appear, so an unlisted path is not by itself proof of leftover state. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
 Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 

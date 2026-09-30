@@ -14,14 +14,10 @@ use super::super::app::{
 };
 use super::super::theme;
 use super::panes::{
-    DIAG_DISABLED, bold_when, cycle_option, draw_scrolled_lines, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, key_cell, label_style, master_detail, name_color,
-    picker_row, pill, section_box, section_box_verbatim,
+    DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, bold_when, cycle_option, draw_scrolled_lines,
+    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, key_cell, label_style,
+    master_detail, name_color, picker_row, pill, section_box, section_box_verbatim,
 };
-
-const KEY_W: usize = 11;
-/// Fixed gap between the padded key and the value column (house standard).
-const KEY_GUTTER: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // +1 for the trailing `+ new` picker row.
@@ -77,14 +73,6 @@ struct Snap {
     haiku: String,
     fable: String,
     subagent: String,
-    /// `Profile::preferred_days` in its canonical spelling, comma-separated —
-    /// the day row's at-rest value.
-    preferred_days: String,
-    /// Why a day list on this account would claim nothing
-    /// (`fallback::day_claim_blocker`), `None` when it could serve. Read here
-    /// so the day row's hint names the same refusal the commit toasts, rather
-    /// than letting the operator find out only after typing.
-    day_claim_blocker: Option<&'static str>,
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
@@ -185,8 +173,6 @@ impl Snap {
             haiku: String::new(),
             fable: String::new(),
             subagent: String::new(),
-            preferred_days: String::new(),
-            day_claim_blocker: None,
             env: Vec::new(),
             auto_start: false,
             disabled: false,
@@ -253,12 +239,6 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 haiku: text(&p.models.haiku),
                 fable: text(&p.models.fable),
                 subagent: text(&p.models.subagent),
-                preferred_days: if with_text {
-                    crate::profile::render_preferred_days(&p.preferred_days).join(", ")
-                } else {
-                    String::new()
-                },
-                day_claim_blocker: crate::fallback::day_claim_blocker(&cfg, &p.name),
                 // Env rows render from the snapshot (no per-entry draft buffer), so
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
@@ -352,7 +332,12 @@ fn session_token_lines(
     width: usize,
 ) -> Vec<Line<'static>> {
     use crate::claude::SessionTokenStatus;
-    let key = || Span::styled(key_cell("token", KEY_W, KEY_GUTTER), theme::label());
+    let key = || {
+        Span::styled(
+            key_cell("token", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        )
+    };
     let plain =
         |text: String, style: Style| vec![Line::from(vec![key(), Span::styled(text, style)])];
     let pill_row =
@@ -451,7 +436,7 @@ fn draw_settings_rows(
     // only exists while the account is disabled.
     if snap.disabled {
         let mut spans = vec![Span::styled(
-            key_cell("status", KEY_W, KEY_GUTTER),
+            key_cell("status", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
             theme::label(),
         )];
         spans.extend(pill(DIAG_DISABLED.to_string(), theme::dim().bold()));
@@ -459,7 +444,10 @@ fn draw_settings_rows(
     }
 
     lines.push(Line::from(vec![
-        Span::styled(key_cell("type", KEY_W, KEY_GUTTER), theme::label()),
+        Span::styled(
+            key_cell("type", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            theme::label(),
+        ),
         Span::styled(type_value, type_style),
     ]));
 
@@ -468,7 +456,10 @@ fn draw_settings_rows(
     let provider_label = if is_api { snap.provider } else { None };
     if let Some(label) = provider_label {
         lines.push(Line::from(vec![
-            Span::styled(key_cell("provider", KEY_W, KEY_GUTTER), theme::label()),
+            Span::styled(
+                key_cell("provider", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                theme::label(),
+            ),
             Span::styled(label, theme::accent()),
         ]));
     }
@@ -534,7 +525,7 @@ fn draw_settings_rows(
             .checked_sub(offset)
             .filter(|v| *v < inner.height as usize)
     {
-        // x = "❯ " (2) + label block (row_label_cols: KEY_W+gutter, or key+gutter for a long env key) + caret cols
+        // x = "❯ " (2) + label block (row_label_cols: DETAIL_KEY_W+gutter, or key+gutter for a long env key) + caret cols
         let prefix_cols = 2 + row_label_cols(row, snap) + head_cols(&input);
         let cx = inner.x.saturating_add(prefix_cols as u16);
         let cy = inner.y.saturating_add(visible as u16);
@@ -543,15 +534,15 @@ fn draw_settings_rows(
 }
 
 /// Width of a row's label block (caret excluded) for native-cursor placement:
-/// the shared key-cell width (`max(KEY_W, key.len()) + KEY_GUTTER`), mirroring
+/// the shared key-cell width (`max(DETAIL_KEY_W, key.len()) + DETAIL_KEY_GUTTER`), mirroring
 /// [`kv_field`] so the caret lands right after the gap.
 fn row_label_cols(row: ConfigRow, snap: &Snap) -> usize {
     match row {
         ConfigRow::EnvEntry(i) => {
             let key_len = snap.env.get(i).map(|(k, _)| k.chars().count()).unwrap_or(0);
-            KEY_W.max(key_len) + KEY_GUTTER
+            DETAIL_KEY_W.max(key_len) + DETAIL_KEY_GUTTER
         }
-        _ => KEY_W + KEY_GUTTER,
+        _ => DETAIL_KEY_W + DETAIL_KEY_GUTTER,
     }
 }
 
@@ -576,7 +567,6 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
-        ConfigRow::PreferredDays => &snap.preferred_days,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
         | ConfigRow::ModelOverrideAdd
@@ -605,21 +595,6 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
         ConfigRow::BaseUrl => "the API endpoint this account calls instead of claude.ai",
         ConfigRow::ApiKey => "provided to Claude Code via \"apiKeyHelper\" field",
         ConfigRow::SubagentModel => "default subagent model in this account",
-        // Value-aware like the rows above, and blocker-first like `Disabled`:
-        // a list that cannot claim is the one fact worth saying before the
-        // operator types one. The `preferred` half is named on both of the
-        // other arms because the list never answers for the days it leaves
-        // alone — the Fallback card's `preferred` hint says the same from its
-        // side.
-        ConfigRow::PreferredDays if snap.day_claim_blocker.is_some() => {
-            return snap
-                .day_claim_blocker
-                .map(|reason| format!("a day list here would claim nothing: {reason}"));
-        }
-        ConfigRow::PreferredDays if snap.preferred_days.trim().is_empty() => {
-            "weekdays this account is home (sat, sun) — `preferred` holds every day"
-        }
-        ConfigRow::PreferredDays => "home on these days; `preferred` decides the rest",
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)
@@ -729,7 +704,6 @@ fn detail_row(
     };
     match row {
         ConfigRow::Name => kv_field(arrow, "name", input, editing, selected, false),
-        ConfigRow::PreferredDays => kv_field(arrow, "home days", input, editing, selected, false),
         ConfigRow::BaseUrl => kv_field(arrow, "base url", input, editing, selected, false),
         ConfigRow::ApiKey => kv_field(arrow, "api key", input, editing, selected, true),
         // Hybrid: the alias cycle at rest, a plain text field while typing a custom id.
@@ -764,7 +738,7 @@ fn detail_row(
         // ("press again to disable"). Enabling is harmless and immediate, so
         // it takes the accent, bold-on-select treatment shared with
         // `Login`/`Create` instead. Dimmed/inert while active or a live session
-        // is open — cloudy-tui disabled row (mirrors the Fallback tab's `max
+        // is open — a disabled row (mirrors the Fallback tab's `max
         // spend`): the whole row renders faint and the key handler no-ops
         // (`run_config_row`'s gate in `app.rs`).
         ConfigRow::Disabled => {
@@ -892,7 +866,10 @@ fn kv_field(
 ) -> Line<'static> {
     let mut spans = vec![
         arrow,
-        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(focused)),
+        Span::styled(
+            key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            label_style(focused),
+        ),
     ];
     spans.extend(value_spans(input, editing, mask_value));
     Line::from(spans)
@@ -907,7 +884,10 @@ fn kv_static(
 ) -> Line<'static> {
     Line::from(vec![
         arrow,
-        Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(focused)),
+        Span::styled(
+            key_cell(key, DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            label_style(focused),
+        ),
         Span::styled(value, value_style),
     ])
 }
@@ -949,7 +929,10 @@ fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<
 fn model_cycle_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
     let mut spans = vec![
         arrow,
-        Span::styled(key_cell("model", KEY_W, KEY_GUTTER), label_style(selected)),
+        Span::styled(
+            key_cell("model", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+            label_style(selected),
+        ),
     ];
     let mut options: Vec<(&str, bool)> = vec![("default", current.is_empty())];
     options.extend(MODEL_PRESETS.iter().map(|p| (*p, *p == current)));

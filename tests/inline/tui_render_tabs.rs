@@ -208,21 +208,21 @@ fn normal_form_shows_all_tabs() {
     assert!(s.contains("fallback"), "inactive tab missing");
     assert!(s.contains("config"), "inactive tab missing");
     assert!(s.contains("status"), "inactive tab missing");
-    assert!(s.contains("plugin"), "inactive tab missing");
+    assert!(s.contains("services"), "inactive tab missing");
 }
 
 #[test]
 fn normal_form_labels_untruncated_at_tight_boundary() {
     let _home = crate::testutil::HomeSandbox::new();
     let app = empty_app(Tab::Overview);
-    let s = render_tabs(&app, 71);
+    let s = render_tabs(&app, 73);
     assert!(
         s.contains("overview"),
         "overview must not be truncated at tight boundary"
     );
     assert!(
-        s.contains("plugin"),
-        "plugin must not be truncated at tight boundary"
+        s.contains("services"),
+        "services must not be truncated at tight boundary"
     );
 }
 
@@ -275,7 +275,7 @@ fn overflow_no_left_chevron_at_first_tab() {
 #[test]
 fn overflow_no_right_chevron_at_last_tab() {
     let _home = crate::testutil::HomeSandbox::new();
-    let app = empty_app(Tab::Plugin);
+    let app = empty_app(Tab::Services);
     let s = render_tabs(&app, 12);
     assert!(
         s.contains('‹'),

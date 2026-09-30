@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph};
+use std::collections::HashSet;
 
 use super::super::app::{App, CodexRow, MainItemKind};
 use super::super::theme;
@@ -15,13 +16,14 @@ use super::format::{
 };
 use super::header::pulse_name_spans;
 use super::panes::{
-    bold_when, draw_scrollbar, empty_state, name_color, section_box, select_line, wrap_words,
+    bold_when, draw_scrollbar, empty_state, name_color, section_box, section_box_meta, select_line,
+    wrap_words,
 };
 use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{
     BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
 };
-use crate::profile::{AppConfig, Profile};
+use crate::profile::{AppConfig, Profile, ProfileName};
 use crate::providers::Provider;
 use crate::usage::{
     LABEL_5H, LABEL_7D, ProfileActivity, UsageWindow, humanize_duration, now_epoch_secs, now_ms,
@@ -64,10 +66,34 @@ fn chain_panel_height(content_rows: usize, area_height: u16) -> u16 {
     desired.min(max_chain).max(3)
 }
 
+/// The accounts panel's title-right meta: one count per harness — both
+/// harnesses whatever the filter shows, since the counts describe the rows the
+/// table lists, never the view. A roster with no accounts drops out of the
+/// words; with both empty there is nothing to count and no slot renders.
+fn harness_counts(app: &App) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    let claude_n = app.config().profiles.len();
+    if claude_n > 0 {
+        terms.push(format!("{claude_n} claude"));
+    }
+    let codex_n = app.codex_rows.len();
+    if codex_n > 0 {
+        terms.push(format!("{codex_n} codex"));
+    }
+    terms.join(" · ")
+}
+
 fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Sole interactive content panel on this screen — always focused.
     let focused = true;
-    let block = section_box("accounts", focused, true);
+    let block = section_box_meta(
+        "accounts",
+        app.harness_filter.label_name(),
+        &harness_counts(app),
+        focused,
+        true,
+        area.width,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -382,9 +408,11 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
     Line::from(spans)
 }
 
-/// One codex account, in the claude columns: name, plan, 5h, 7d. The cursor
-/// and timer slots are kept blank and no live cell is drawn — this section is
-/// read-only, and a timer would promise a countdown the Overview cannot act on.
+/// One codex account, in the claude columns: name, plan, 5h, 7d, and a
+/// `↺ N` chip while the account holds a banked usage-limit reset (what
+/// `clauth limit-reset` spends). The cursor and timer slots are kept blank and
+/// no live cell is drawn — this section is read-only, and a timer would
+/// promise a countdown the Overview cannot act on.
 fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
@@ -397,7 +425,7 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     let mut spans = vec![
         Span::raw("  "),
         if row.broken {
-            Span::styled("×", theme::danger())
+            Span::styled(theme::dead_credential_glyph(), theme::danger())
         } else {
             Span::raw(" ")
         },
@@ -422,6 +450,16 @@ fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
     if widths.seven_day > 0 {
         spans.push(gap(widths));
         spans.push(cell(row.seven_day.as_ref(), widths.seven_day));
+    }
+    // The chip trails the columns — after the live slot's width, so a dim
+    // reset count can never sit under `live` and read as a session count.
+    if widths.live > 0 {
+        spans.push(gap(widths));
+        spans.push(Span::raw(" ".repeat(widths.live)));
+    }
+    if let Some(count) = row.resets {
+        spans.push(gap(widths));
+        spans.push(Span::styled(format!("↺ {count}"), theme::dim()));
     }
     Line::from(spans)
 }
@@ -507,7 +545,7 @@ fn render_overview_row(
     let mut spans = vec![cursor];
     // A disabled row flattens every semantic hue to dim — the whole row reads as
     // one inert unit rather than a live row wearing a dim name. The GLYPHS stay:
-    // cloudy-tui never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●`/`▲`
+    // this row never lets state ride on hue alone, so `⊖`/`×`/`⊘`/`!`/`●`/`▲`
     // still distinguish themselves without the color.
     let hue = |s: Style| if disabled { theme::dim() } else { s };
     // Marker precedence: canceled subscription (⊖) > broken login (×) > token
@@ -522,7 +560,10 @@ fn render_overview_row(
         spans.push(Span::styled("⊖", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if cfg.is_auth_broken(&profile.name) {
-        spans.push(Span::styled("×", hue(theme::danger())));
+        spans.push(Span::styled(
+            theme::dead_credential_glyph(),
+            hue(theme::danger()),
+        ));
         spans.push(Span::raw(" "));
     } else if token_danger {
         spans.push(Span::styled("⊘", hue(theme::danger())));
@@ -669,7 +710,7 @@ fn render_overview_row(
 
 /// The row's live-session cell: how many `clauth start` sessions are running as
 /// this account, with `⇄` when at least one of them follows the fallback chain.
-/// Blank for an account hosting none — cloudy-tui hides a zero count.
+/// Blank for an account hosting none: a zero count is hidden.
 ///
 /// Distinct from the row's leading `●`, which marks the one profile a bare
 /// `claude` authenticates as; an account can carry either, both, or neither.
@@ -804,6 +845,9 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
+    // The live key-rejected set, read once per frame before the Config lock
+    // (both stores rank below it) — never a durable read under the guard.
+    let key_rejected = app.key_rejected_names();
     let narrow = super::panes::narrow(width as u16);
     let cfg = app.config();
     if cfg.state.fallback_chain.is_empty() {
@@ -833,7 +877,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .unwrap_or(8)
         .clamp(6, if narrow { 12 } else { 18 });
     // Threshold digits vary across members (`95%` vs `100%`), so left-pad them to
-    // the widest so the `%` signs line up (cloudy-tui numeric-column alignment).
+    // the widest so the `%` signs line up.
     // It also makes every row's content the same width, which is what lets the
     // trailer column below sit flush against the content.
     let thr_w = chain
@@ -859,7 +903,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // Project the active profile's next switch once, up front: a `To(target)`
     // renders inline on the target member's row (right side); `Off` has no
     // single target row, so it stays a caption below.
-    let projection = projected_switch(app, &cfg);
+    let projection = projected_switch(app, &cfg, &key_rejected);
     let switch_to = match &projection {
         Some((SwitchAction::To(target), secs)) => Some((target.clone(), *secs)),
         _ => None,
@@ -872,9 +916,14 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .iter()
         .enumerate()
         .map(|(i, name)| {
-            let reason = cfg
-                .find(name)
-                .and_then(|p| blocked_reason(&cfg, p, kick_lifts.get(name.as_str()).copied()));
+            let reason = cfg.find(name).and_then(|p| {
+                blocked_reason(
+                    &cfg,
+                    p,
+                    kick_lifts.get(name.as_str()).copied(),
+                    &key_rejected,
+                )
+            });
             let switch_eta = switch_to
                 .as_ref()
                 .filter(|(target, _)| target.as_str() == name.as_str())
@@ -962,7 +1011,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     // equivalent), name whichever one resumes first. Mutually exclusive with the
     // projection — `burn_rate_eta` returns `None` once the active crosses its
     // own threshold, which is a precondition for `soonest_resume` to return.
-    if let Some((name, eta)) = soonest_resume(&cfg) {
+    if let Some((name, eta)) = soonest_resume(&cfg, &key_rejected) {
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
@@ -982,7 +1031,11 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 /// did: only when the active crosses its threshold BEFORE its 5h window resets
 /// (past the reset the window refills and no switch fires). Shared by the inline
 /// `To` hint (on the target's row) and the `Off` caption.
-fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
+fn projected_switch(
+    app: &App,
+    cfg: &AppConfig,
+    key_rejected: &HashSet<ProfileName>,
+) -> Option<(SwitchAction, i64)> {
     if cfg.state.fallback_chain.len() <= 1 {
         return None;
     }
@@ -998,7 +1051,7 @@ fn projected_switch(app: &App, cfg: &AppConfig) -> Option<(SwitchAction, i64)> {
     if reset_secs.is_some_and(|reset| eta_secs >= reset) {
         return None;
     }
-    next_target(cfg, active_rate).map(|action| (action, eta_secs))
+    next_target(cfg, active_rate, key_rejected).map(|action| (action, eta_secs))
 }
 
 /// Cells between the widest chain row's content and the shared trailer column.
@@ -1008,7 +1061,7 @@ const TRAILER_GAP: usize = 2;
 
 /// A chain row before its trailer lands. Split from the assembled `Line` so the
 /// panel can measure every row's content and start every trailer at one column.
-/// Only ONE row can carry the `↩ ~eta` hint (the single projected-switch
+/// Only ONE row can carry the `↲ ~eta` hint (the single projected-switch
 /// target), so at most that row's marker sits further right than its siblings'.
 struct ChainRow {
     base: Vec<Span<'static>>,
@@ -1023,7 +1076,7 @@ impl ChainRow {
 
     /// Pad the content out to `col`, then append whichever trailers fit inside
     /// `width` (the panel's inner width). A projected-switch target carries the
-    /// `↩ ~eta` hint; a blocked member carries its 1-cell reason marker. BOTH can
+    /// `↲ ~eta` hint; a blocked member carries its 1-cell reason marker. BOTH can
     /// apply to one row: `next_target`'s headroom walk only prefers a fresh
     /// member and falls through to a stale-but-unexhausted one (`is_exhausted`
     /// ignores `fetch_status`), so a `To` target can also be `Stale`. Render both
@@ -1128,21 +1181,21 @@ fn chain_row(cfg: &AppConfig, name: &crate::profile::ProfileName, ctx: ChainRowC
             // `projected_switch` only ever fires off `burn_rate_eta`, so this
             // hint is always an EXHAUSTION projection — a genuine event-driven
             // return (healthy active, preferred just freed) has no eta to show.
-            // The `⌂` glyph therefore marks an exhaustion hop that LANDS on the
-            // home account, telling it apart from the plain `↩` of a hop onto any
-            // other member; it is keyed on the destination, not on the cause.
-            let glyph = if cfg.is_home_today(name) {
-                "⌂"
-            } else {
-                "↩"
-            };
+            let mark = switch_mark();
             Span::styled(
-                format!("{glyph} ~{}", humanize_duration(secs)),
-                theme::faint(),
+                format!("{} ~{}", mark.content, humanize_duration(secs)),
+                mark.style,
             )
         }),
         marker: reason.as_ref().map(reason_marker),
     }
+}
+
+/// The projected-switch mark a target member's chain row leads its eta with.
+/// One source for the row and the help modal's glyph legend, so the legend
+/// cannot drift from the glyph or the hue the chain renders.
+pub(super) fn switch_mark() -> Span<'static> {
+    Span::styled("\u{21b2}", theme::faint())
 }
 
 /// `gauge_w`-cell bar relative to the member's threshold (full = rotate off).
