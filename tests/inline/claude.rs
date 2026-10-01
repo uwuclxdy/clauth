@@ -4623,6 +4623,7 @@ fn write_value(path: &std::path::Path, value: &serde_json::Value) {
 
 /// Claude Code saving its credential store the way 2.1.28x does: a staged file
 /// renamed over the path, which replaces clauth's symlink with a regular file.
+#[cfg(unix)]
 fn claude_code_saves(live: &serde_json::Value) {
     let path = claude_credentials_path().expect("creds path");
     let staged = path.with_extension("staged");
@@ -4640,6 +4641,7 @@ fn claude_code_saves(live: &serde_json::Value) {
 
 /// Link `active` live, then run `/design-login` on it: Claude Code adds
 /// `designOauth` (and here an MCP login) beside the login it read.
+#[cfg(unix)]
 fn design_login_on_the_live_slot(active: &str) {
     force_link_profile_credentials(&crate::profile::ProfileName::from(active))
         .expect("link active");
@@ -4649,6 +4651,7 @@ fn design_login_on_the_live_slot(active: &str) {
     claude_code_saves(&live);
 }
 
+#[cfg(unix)]
 fn switch_to(name: &str) {
     let handle = std::sync::Arc::new(crate::lockorder::RankedMutex::new(
         crate::profile::load_config().expect("load config"),
@@ -5324,6 +5327,7 @@ fn a_rolling_restamp_keeps_a_design_login_the_live_file_held() {
 }
 
 /// A usage chain for a rolling stamp in the tests below.
+#[cfg(unix)]
 fn rolling_chain(access: &str) -> crate::profile::OAuthToken {
     crate::profile::OAuthToken {
         access_token: access.to_string(),

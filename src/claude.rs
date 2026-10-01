@@ -1900,14 +1900,19 @@ pub(crate) enum SignOut {
 
 /// Drop every [`ACCOUNT_SCOPED_CREDENTIAL_KEYS`] entry from `blob`, keeping what
 /// belongs to no Claude account, and report what the caller owes its store.
-/// With `preserve` (`preserve_non_login_keys`, which reads on over an
-/// unreadable profiles.toml) only [`LOGIN_CREDENTIAL_KEYS`] go, so a design
-/// login stays in the store and a store holding it is written back rather than
-/// deleted: on macOS the Keychain item can be that login's only copy. That
-/// holds for every sign-out, not only a switch onto an account that stores no
-/// login: a wrap-off, the Setup tab's `log out` on the active account,
-/// deleting the active profile, and clearing a long-lived token onto an
-/// account that stores no login keep it too.
+/// With `keep_non_login` only [`LOGIN_CREDENTIAL_KEYS`] go, so a design login
+/// stays in the store and a store holding it is written back rather than
+/// deleted: on macOS the Keychain item can be that login's only copy.
+///
+/// `keep_non_login` is the caller's decision for this store, not the
+/// `preserve_non_login_keys` reading: [`sign_out_keeps_non_login_keys`] makes
+/// it, true only with the setting on and no store of the account having taken
+/// the keys. Passing the setting alone would leave a design login in the item
+/// that its account's store also holds, two copies of one rotating chain. With
+/// the decision true it holds for every sign-out, not only a switch onto an
+/// account that stores no login: a wrap-off, the Setup tab's `log out` on the
+/// active account, deleting the active profile, and clearing a long-lived token
+/// onto an account that stores no login keep it too.
 /// A blob that is not an object carries nothing worth preserving.
 #[cfg_attr(
     not(target_os = "macos"),
@@ -1916,11 +1921,14 @@ pub(crate) enum SignOut {
         reason = "the only caller is the macOS Keychain sign-out; the rule is pinned on every platform"
     )
 )]
-pub(crate) fn strip_account_credentials(blob: &mut serde_json::Value, preserve: bool) -> SignOut {
+pub(crate) fn strip_account_credentials(
+    blob: &mut serde_json::Value,
+    keep_non_login: bool,
+) -> SignOut {
     let Some(obj) = blob.as_object_mut() else {
         return SignOut::Delete;
     };
-    let dropped_keys: &[&str] = if preserve {
+    let dropped_keys: &[&str] = if keep_non_login {
         &LOGIN_CREDENTIAL_KEYS
     } else {
         &ACCOUNT_SCOPED_CREDENTIAL_KEYS
@@ -2184,11 +2192,14 @@ fn copy_non_login_keys(target: &mut serde_json::Value, source: &serde_json::Valu
 /// `source`'s. A token (an object with `expiresAt`, `accessToken` or
 /// `refreshToken`, a design login) is one value and never mixed: the copy
 /// that expires later stays, `source`'s on a tie, and one without an expiry
-/// never replaces one that has one. A map of tokens (the MCP logins, one per
-/// server) is merged one level deep, server by server under the same rule,
-/// keeping every server either side holds: a server only the target holds
-/// stays, so a per-server logout reaches the store with the next switch-in's
-/// carry, not through this. Anything else takes `source`'s copy whole.
+/// never replaces one that has one. Two objects that are not tokens are merged
+/// one level deep, keeping every entry either side holds: an entry that is a
+/// token follows the same rule, any other entry takes `source`'s copy, and an
+/// entry only the target holds stays. That is what the MCP logins, a map of
+/// tokens with one per server, need: a server only the target holds stays, so
+/// a per-server logout reaches the store with the next switch-in's carry, not
+/// through this. Where either side is not an object, `source`'s copy wins
+/// whole.
 fn fresher_copy(held: &serde_json::Value, source: &serde_json::Value) -> serde_json::Value {
     if let Some(kept) = fresher_token(held, source) {
         return kept;
