@@ -11760,6 +11760,100 @@ fn apply_codex_switch_moves_the_operator_link_with_the_marker() {
     );
 }
 
+/// codex 0.157 runs every task inside one shared app-server daemon that reads
+/// `auth.json` once, at start. An auto-switch off a spent account restarts one
+/// that started before the switch moved the operator link (its tasks are
+/// stalled on that account anyway). The restart only counts under test.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_restarts_a_codex_daemon_left_on_the_spent_account() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(operator.join("app-server-control")).expect("mkdir control");
+    // A live daemon, started before anything below: sun_path caps at 104
+    // bytes on macOS, so the socket sits at a short path behind the link.
+    let socket = std::path::PathBuf::from(format!("/tmp/clauth-cdxd-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _daemon = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::os::unix::fs::symlink(
+        &socket,
+        operator.join("app-server-control/app-server-control.sock"),
+    )
+    .expect("control link");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join("auth.json");
+    std::os::unix::fs::symlink(&store, operator.join("auth.json")).expect("link the slot");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+    assert_eq!(
+        crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get),
+        before + 1,
+        "the daemon still holding cx1 is restarted"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
+/// A daemon that merely predates the operator's OWN login file (a regular
+/// file, which a switch never moves) runs an account clauth does not manage:
+/// the auto-switch leaves it and its healthy turns alone.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_leaves_a_daemon_on_the_operators_own_login() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let operator = home.home().join(".codex");
+    std::fs::create_dir_all(operator.join("app-server-control")).expect("mkdir control");
+    let socket = std::path::PathBuf::from(format!("/tmp/clauth-cdxo-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let _daemon = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::os::unix::fs::symlink(
+        &socket,
+        operator.join("app-server-control/app-server-control.sock"),
+    )
+    .expect("control link");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    // Written after the daemon started, so by mtime alone it would read stale.
+    std::fs::write(
+        operator.join("auth.json"),
+        crate::testutil::codex_auth_body("me", "me"),
+    )
+    .expect("the operator's own login");
+
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+    assert_eq!(
+        crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get),
+        before,
+        "nothing of clauth's moved, so the daemon keeps its turns"
+    );
+    let _ = std::fs::remove_file(&socket);
+}
+
 /// The codex chain walks at the codex file's OWN weekly line, never the claude
 /// setting: `weekly_switch_threshold = 50.0` in `codex-profiles.toml` makes a
 /// member at 60% weekly exhausted while the claude state sits at its 98

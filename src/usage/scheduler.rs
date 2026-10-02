@@ -3886,12 +3886,25 @@ fn apply_codex_switch(
     };
     match action {
         crate::fallback::SwitchAction::To(target) => {
-            if let Err(e) = crate::actions::switch_codex_profile(target.as_str()) {
-                logline!("clauth: codex auto-switch to '{target}' failed: {e:#}");
-            } else {
-                logline!(
-                    "clauth: codex auto-switched to '{target}' — live at the next codex session"
-                );
+            match crate::actions::switch_codex_profile(target.as_str()) {
+                Err(e) => logline!("clauth: codex auto-switch to '{target}' failed: {e:#}"),
+                Ok(repointed) => {
+                    logline!(
+                        "clauth: codex auto-switched to '{target}' — live at the next codex session"
+                    );
+                    // The chain moves off a spent account, so every task in
+                    // codex's shared app-server daemon is stalled on it anyway:
+                    // restarting it costs their stalled turn and lets them resume
+                    // on `target`. Only when this switch moved clauth's link: a
+                    // daemon that merely predates the operator's own login file
+                    // runs an account clauth does not manage, and its turns are
+                    // healthy.
+                    if repointed.is_some() && crate::codex_daemon::is_stale() {
+                        crate::codex_daemon::restart_in_background(
+                            "codex auto-switch off a spent account",
+                        );
+                    }
+                }
             }
         }
         crate::fallback::SwitchAction::Off => {
