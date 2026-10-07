@@ -231,6 +231,52 @@ fn the_table_carries_the_token_columns_only_under_tokens() {
     );
 }
 
+#[test]
+fn the_table_preserves_distinct_subagent_ids() {
+    let sb = HomeSandbox::new();
+    let ids = ["agent-a1b2c3d4", "agent-e5f6a7b8"];
+    for id in ids {
+        let path = sb
+            .home()
+            .join(".claude/projects/-w-a/parent/subagents")
+            .join(format!("{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", "inspect the same file")]);
+        set_mtime(&path, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000));
+    }
+
+    let groups = build_listing(false);
+    let flat = flatten_newest_first(&groups);
+    assert_eq!(flat.len(), 2);
+    for (session, id) in flat.iter().zip(ids) {
+        let row = session_row(session, false, SystemTime::UNIX_EPOCH);
+        assert_eq!(row.split_whitespace().next(), Some(id), "{row}");
+    }
+    let json = sessions_json(&flat);
+    assert_eq!(json[0]["id"], ids[0]);
+    assert_eq!(json[1]["id"], ids[1]);
+}
+
+#[test]
+fn only_uuid_session_ids_are_shortened() {
+    for id in [
+        "12345678-1234-4567-890a-123456789abc",
+        "ABCDEF01-1234-4567-890A-123456789ABC",
+    ] {
+        assert_eq!(short_id(id), &id[..8]);
+    }
+    for id in [
+        "agent-a1b2c3d4",
+        "workflow-step-one",
+        "12345678-not-a-uuid",
+        "12345678-1234-4567-890a-123456789abg",
+        "12345678-1234-4567-890a-123456789aé",
+        "plain",
+        "",
+    ] {
+        assert_eq!(short_id(id), id);
+    }
+}
+
 // ── the stamp cell: local wall clock + age ──
 
 /// The human row renders `updated` as LOCAL wall clock paired with its

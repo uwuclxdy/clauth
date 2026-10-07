@@ -535,7 +535,14 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime) -> String {
 /// The first block of a uuid session id, enough to eyeball in the table (the
 /// full id is what `clauth resume`/`info` take). A non-uuid stem shows whole.
 fn short_id(id: &str) -> &str {
-    id.split('-').next().unwrap_or(id)
+    if id.len() == 36
+        && id.split('-').map(str::len).eq([8, 4, 4, 4, 12])
+        && id.bytes().all(|b| b == b'-' || b.is_ascii_hexdigit())
+    {
+        &id[..8]
+    } else {
+        id
+    }
 }
 
 /// `first | last` message preview, each bounded so a long line can't blow the
