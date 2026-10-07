@@ -20,11 +20,15 @@
 //! fallback, which is exactly the restore behavior a box had before this leg
 //! existed.
 //!
-//! The report carries `--state working`: every fire happens while Claude Code
-//! is working, so the value is true at fire time. herdr rejects a foreign
-//! state on a pane its own integration has anchored (its detection keeps the
-//! chip) and shows the state only on panes it cannot judge itself, where the
-//! value clears when the agent process exits.
+//! The report is `pane report-agent-session` with no state and no session id.
+//! herdr records a resume argv from any source while no reporter holds the
+//! pane's state and the named agent is the one it detects there, and a session
+//! report without a session id moves neither the pane's state nor its session
+//! owner, so the chip stays herdr's own screen detection. It must never be
+//! `pane report-agent`: herdr 0.9 keeps a state reported from a non-herdr source
+//! as the pane's lifecycle authority, above its own detection, and clauth never
+//! reports `idle` — a `--state working` report pinned the pane at `working` for
+//! the rest of its life, with only a visible blocker showing through.
 //!
 //! The seq is minted epoch-ms and persisted on the conversation's note
 //! record, because herdr drops a report whose seq is not strictly newer than
@@ -43,11 +47,13 @@ use crate::hook_note::{Payload, ScopeLock, load_record, record_path, store_recor
 const SOURCE: &str = "clauth";
 const AGENT: &str = "claude";
 
-/// The state every report carries. The hook fires only while Claude Code is
-/// working (`SessionStart` or an attribution change mid-conversation), so the
-/// value is true at fire time; herdr discards it on panes its own integration
-/// has anchored and clears it with the agent process on the rest.
-const STATE: &str = "working";
+/// How many times one fire sends its report when herdr answers
+/// `resume_not_accepted`, and the gap between sends. A `SessionStart` can beat
+/// herdr's detector, which looks at an unidentified pane every 500 ms; nothing
+/// else re-fires the report on an unchanged account, so the hook retries it.
+/// Bounded at three gaps, about 1.5 s, inside the hook's 10 s budget.
+const RESUME_ATTEMPTS: usize = 4;
+const RESUME_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub(crate) fn report_for_fire(payload: &Payload, current: Option<&str>, attribution_changed: bool) {
     // A subagent's fire is its own scope's reading, never the pane
@@ -108,14 +114,12 @@ fn mint_seq(session_id: &str) -> Option<u64> {
 fn build_report_args(pane_id: &str, session_id: &str, profile: &str, seq: u64) -> Vec<String> {
     vec![
         "pane".into(),
-        "report-agent".into(),
+        "report-agent-session".into(),
         pane_id.into(),
         "--source".into(),
         SOURCE.into(),
         "--agent".into(),
         AGENT.into(),
-        "--state".into(),
-        STATE.into(),
         "--seq".into(),
         seq.to_string(),
         "--".into(),
@@ -139,18 +143,30 @@ fn report(bin: &Path, args: &[String]) {
         return;
     };
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    match crate::herdr::bounded_output(bin, &argv, &[]) {
-        Some(output) if output.status.success() => {}
-        Some(output) => {
-            let status = output.status;
-            crate::logline::to_logfile(format_args!(
-                "clauth: herdr pane report-agent exited {status} (resume command not reported)"
-            ));
-        }
-        None => {
-            crate::logline::to_logfile(format_args!(
-                "clauth: herdr pane report-agent failed to spawn or timed out (resume command not reported)"
-            ));
+    for attempt in 1..=RESUME_ATTEMPTS {
+        match crate::herdr::bounded_output(bin, &argv, &[]) {
+            Some(output) if output.status.success() => return,
+            // herdr has not detected Claude in the pane yet. The refused
+            // report recorded nothing, so the same seq is still newer.
+            Some(output)
+                if attempt < RESUME_ATTEMPTS
+                    && String::from_utf8_lossy(&output.stderr).contains("resume_not_accepted") =>
+            {
+                std::thread::sleep(RESUME_RETRY_GAP);
+            }
+            Some(output) => {
+                let status = output.status;
+                crate::logline::to_logfile(format_args!(
+                    "clauth: herdr pane report-agent-session exited {status} after {attempt} attempt(s) (resume command not reported)"
+                ));
+                return;
+            }
+            None => {
+                crate::logline::to_logfile(format_args!(
+                    "clauth: herdr pane report-agent-session failed to spawn or timed out (resume command not reported)"
+                ));
+                return;
+            }
         }
     }
 }

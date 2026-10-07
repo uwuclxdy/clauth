@@ -2167,6 +2167,37 @@ pub(crate) fn exit1_shim(dir: &Path, name: &str) -> PathBuf {
     )
 }
 
+/// herdr's refusal of a resume report it cannot attach yet (no agent detected
+/// in the pane), as its CLI prints it: the error object on stderr, exit 1.
+#[cfg(unix)]
+const RESUME_NOT_ACCEPTED: &str = r#"echo '{"error":{"code":"resume_not_accepted","message":"resume_argv requires the reporter to hold the pane"},"id":"cli:request"}' >&2"#;
+
+/// Logs its argv, refuses the first call the way herdr does before it has
+/// detected the pane's agent, and accepts every call after it.
+#[cfg(unix)]
+pub(crate) fn refuse_once_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        &format!(
+            "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\n\
+             if [ ! -e \"$(dirname \"$0\")/refused\" ]; then\n\
+             : > \"$(dirname \"$0\")/refused\"\n{RESUME_NOT_ACCEPTED}\nexit 1\nfi"
+        ),
+    )
+}
+
+/// Logs its argv and refuses every call the way herdr does before it has
+/// detected the pane's agent.
+#[cfg(unix)]
+pub(crate) fn refuse_always_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        &format!("echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\n{RESUME_NOT_ACCEPTED}\nexit 1"),
+    )
+}
+
 /// Logs its argv, then sleeps past a bounded caller's kill deadline. `exec` so
 /// the kill takes the whole process.
 #[cfg(unix)]

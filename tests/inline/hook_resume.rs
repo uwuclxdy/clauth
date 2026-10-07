@@ -16,8 +16,8 @@ use std::time::Duration;
 use super::*;
 use crate::hook_note::{Payload, load_record, record_path, store_record};
 use crate::testutil::{
-    EnvPin, HomeSandbox, echo_shim, exit1_shim, hang_shim, herdr_pane_env, report_lines, seq_of,
-    wait_for_lines,
+    EnvPin, HomeSandbox, echo_shim, exit1_shim, hang_shim, herdr_pane_env, refuse_always_shim,
+    refuse_once_shim, report_lines, seq_of, wait_for_lines,
 };
 
 /// A main-scope payload carrying only what these tests vary.
@@ -36,7 +36,7 @@ fn payload(event: &str, session: &str) -> Payload {
 /// seq itself is pinned by the range and monotonicity assertions.
 fn expected_line(pane: &str, sid: &str, profile: &str, seq: u64) -> String {
     format!(
-        "pane report-agent {pane} --source clauth --agent claude --state working \
+        "pane report-agent-session {pane} --source clauth --agent claude \
          --seq {seq} -- clauth resume {sid} --profile {profile}"
     )
 }
@@ -77,14 +77,12 @@ fn an_attribution_change_reports_the_new_profile() {
 fn the_report_argv_is_pinned() {
     let expected: Vec<String> = [
         "pane",
-        "report-agent",
+        "report-agent-session",
         "w1:p1",
         "--source",
         "clauth",
         "--agent",
         "claude",
-        "--state",
-        "working",
         "--seq",
         "42",
         "--",
@@ -98,6 +96,23 @@ fn the_report_argv_is_pinned() {
     .map(|s| s.to_string())
     .collect();
     assert_eq!(build_report_args("w1:p1", "sid", "prof", 42), expected);
+}
+
+/// herdr 0.9 stores a `pane report-agent` state from a non-herdr source as the
+/// pane's lifecycle authority, above its own screen detection. clauth never
+/// reports `idle`, so a `--state working` report pinned the pane at `working`
+/// for the rest of its life. The resume command needs no state: herdr records
+/// it from a session report while no reporter holds the pane.
+#[test]
+fn the_report_never_claims_a_lifecycle_state() {
+    let args = build_report_args("w1:p1", "sid", "prof", 42);
+    assert_eq!(args[1], "report-agent-session");
+    let before_resume = &args[..args.iter().position(|a| a == "--").unwrap()];
+    assert!(!before_resume.iter().any(|a| a == "--state"), "{args:?}");
+    assert!(
+        !before_resume.iter().any(|a| a == "--agent-session-id"),
+        "{args:?}"
+    );
 }
 
 #[test]
@@ -197,6 +212,43 @@ fn a_failing_herdr_report_is_swallowed() {
     // all proves the failing status was swallowed.
     let lines = wait_for_lines(home.home(), 1, WAIT);
     assert_eq!(lines.len(), 1);
+}
+
+/// A `SessionStart` can reach herdr before its detector has seen Claude in the
+/// pane; herdr then answers `resume_not_accepted`. Nothing re-fires the report
+/// on an unchanged account, so the hook retries the same report itself.
+#[test]
+fn a_report_refused_before_detection_is_retried_until_accepted() {
+    let home = HomeSandbox::new();
+    let shim = refuse_once_shim(home.home(), "herdr");
+    let _env = herdr_pane_env(&home, Some("w1:p1"), Some(&shim));
+    let fire = payload("SessionStart", "sidrace");
+    report_for_fire(&fire, Some("prof"), false);
+    let lines = report_lines(home.home());
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(
+        lines[0], lines[1],
+        "the retry resends the same report, seq included"
+    );
+    assert_eq!(
+        lines[1],
+        expected_line("w1:p1", "sidrace", "prof", seq_of(&lines[1]))
+    );
+}
+
+/// The retry is bounded: a pane where herdr never detects Claude costs the
+/// hook a fixed number of reports and well under its own timeout.
+#[test]
+fn a_refused_report_retries_a_bounded_number_of_times() {
+    let home = HomeSandbox::new();
+    let shim = refuse_always_shim(home.home(), "herdr");
+    let _env = herdr_pane_env(&home, Some("w1:p1"), Some(&shim));
+    let fire = payload("SessionStart", "sidnever");
+    let started = std::time::Instant::now();
+    report_for_fire(&fire, Some("prof"), false);
+    let elapsed = started.elapsed();
+    assert_eq!(report_lines(home.home()).len(), RESUME_ATTEMPTS);
+    assert!(elapsed < Duration::from_secs(4), "took {elapsed:?}");
 }
 
 #[test]
