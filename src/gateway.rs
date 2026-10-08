@@ -953,7 +953,7 @@ pub(crate) fn displayed_gateway_bind(record: &GatewayRecord) -> Result<GatewayBi
 /// off linux, which a UI-thread read must not. A record a dead daemon left
 /// under a pid the holder reuses passes this match, so it feeds display reads
 /// only, never the plan or the move ([`inherited_env`]).
-fn recorded_env_for_holder_pid() -> Option<Vec<(OsString, OsString)>> {
+pub(crate) fn recorded_env_for_holder_pid() -> Option<Vec<(OsString, OsString)>> {
     if !crate::daemon::singleton_held().ok()? {
         return None;
     }
@@ -1430,6 +1430,16 @@ fn spawned_env_value(
     key: &str,
     inherited: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Option<OsString> {
+    spawned_env_var(env, key, inherited).map(|(_, value)| value)
+}
+
+/// [`spawned_env_value`] with the name the winning variable is spelled as in
+/// the spawned env, for a surface that names the variable.
+pub(crate) fn spawned_env_var(
+    env: &GatewayEnv,
+    key: &str,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Option<(OsString, OsString)> {
     let mut spawned: BTreeMap<OsString, OsString> = inherited
         .into_iter()
         .map(|(name, value)| (spawned_env_name(name), value))
@@ -1439,10 +1449,9 @@ fn spawned_env_value(
             .iter()
             .map(|(name, value)| (spawned_env_name(OsString::from(name)), value.clone())),
     );
-    spawned.into_iter().rev().find_map(|(name, value)| {
+    spawned.into_iter().rev().find(|(name, _)| {
         name.to_str()
             .is_some_and(|name| name.eq_ignore_ascii_case(key))
-            .then_some(value)
     })
 }
 
@@ -2060,12 +2069,8 @@ fn apply_admin_step(record: &GatewayRecord, step: AdminNeed) -> Result<AdminEdit
     // Even when the entry is already there: shunt resolves `${file:}` at
     // load, so the check needs the file, and a deleted one is re-minted.
     ensure_admin_token()?;
-    let config = record.config();
-    let original =
-        std::fs::read(config).with_context(|| format!("failed to read {}", config.display()))?;
-    let text = std::str::from_utf8(&original)
-        .with_context(|| format!("{} is not UTF-8", config.display()))?;
-    let Some(candidate) = plan_admin_edit(text, &key_ref, step)? else {
+    let (original, text) = read_config_for_edit(record.config())?;
+    let Some(candidate) = plan_admin_edit(&text, &key_ref, step)? else {
         return Ok(AdminEdit::AlreadyPresent);
     };
     write_checked(record, &original, &candidate)?;
@@ -2082,6 +2087,16 @@ fn admin_key_ref() -> Result<String> {
     }
 }
 
+/// The config's bytes, the original [`write_checked`] compares against, and
+/// their text, which an edit must be: UTF-8.
+pub(crate) fn read_config_for_edit(config: &Path) -> Result<(Vec<u8>, String)> {
+    let original =
+        std::fs::read(config).with_context(|| format!("failed to read {}", config.display()))?;
+    let text = String::from_utf8(original.clone())
+        .with_context(|| format!("{} is not UTF-8", config.display()))?;
+    Ok((original, text))
+}
+
 fn read_config_text(config: &Path) -> Result<String> {
     std::fs::read_to_string(config).with_context(|| format!("failed to read {}", config.display()))
 }
@@ -2089,15 +2104,20 @@ fn read_config_text(config: &Path) -> Result<String> {
 /// The user's config may hold literal upstream keys, so a parse error names
 /// the line and never quotes it the way the parser's own message does.
 fn parse_config(text: &str) -> Result<DocumentMut> {
-    text.parse::<DocumentMut>().map_err(|e| {
-        match e.span().and_then(|span| text.get(..span.start)) {
-            Some(head) => anyhow!(
-                "the shunt config does not parse as TOML (line {})",
-                head.matches('\n').count() + 1
-            ),
-            None => anyhow!("the shunt config does not parse as TOML"),
-        }
-    })
+    text.parse::<DocumentMut>()
+        .map_err(|e| config_parse_error(text, &e))
+}
+
+/// The error for a config `text` that does not parse: the line, never the
+/// parser's own message, which quotes the text.
+pub(crate) fn config_parse_error(text: &str, e: &toml_edit::TomlError) -> anyhow::Error {
+    match e.span().and_then(|span| text.get(..span.start)) {
+        Some(head) => anyhow!(
+            "the shunt config does not parse as TOML (line {})",
+            head.matches('\n').count() + 1
+        ),
+        None => anyhow!("the shunt config does not parse as TOML"),
+    }
 }
 
 fn need_in(doc: &DocumentMut, key_ref: &str) -> Result<AdminNeed, ConfigEditRefusal> {
@@ -2258,8 +2278,14 @@ fn insert_admin_table(doc: &mut DocumentMut, key_ref: &str) -> Result<(), Config
 /// original's mode bits, `shunt check`ed under the gateway's env, and renamed
 /// over the original only if the check passed and the original still holds
 /// the bytes the candidate was built from. Any other outcome removes the
-/// staging file and leaves the original byte-identical.
-fn write_checked(record: &GatewayRecord, original: &[u8], candidate: &str) -> Result<()> {
+/// staging file and leaves the original byte-identical. Every clauth edit of
+/// the adopted config lands here: the admin entry and the config editor
+/// (`crate::gateway_edit`).
+pub(crate) fn write_checked(
+    record: &GatewayRecord,
+    original: &[u8],
+    candidate: &str,
+) -> Result<()> {
     let config = record.config();
     let meta = std::fs::symlink_metadata(config)
         .with_context(|| format!("failed to inspect {}", config.display()))?;
