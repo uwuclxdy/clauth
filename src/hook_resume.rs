@@ -14,11 +14,11 @@
 //!
 //! Fires on `SessionStart` and on a real attribution change — the two events
 //! that can change the resume command (the session id or the profile moved) —
-//! never on every tool call. Outside a herdr pane (no `HERDR_PANE_ID`, or no
-//! herdr binary), without an attributable account, and on any failure of the
-//! bounded report spawn, the leg is silence: herdr's builtin plan stays as the
-//! fallback, which is exactly the restore behavior a box had before this leg
-//! existed.
+//! and, while herdr has refused the last report, on every main-scope fire.
+//! Outside a herdr pane (no `HERDR_PANE_ID`, or no herdr binary), without an
+//! attributable account, and on any failure of the bounded report spawn, the
+//! leg is silence: herdr's builtin plan stays as the fallback, which is
+//! exactly the restore behavior a box had before this leg existed.
 //!
 //! The report is `pane report-agent-session` with no state and no session id.
 //! herdr records a resume argv from any source while no reporter holds the
@@ -26,9 +26,24 @@
 //! report without a session id moves neither the pane's state nor its session
 //! owner, so the chip stays herdr's own screen detection. It must never be
 //! `pane report-agent`: herdr 0.9 keeps a state reported from a non-herdr source
-//! as the pane's lifecycle authority, above its own detection, and clauth never
-//! reports `idle` — a `--state working` report pinned the pane at `working` for
-//! the rest of its life, with only a visible blocker showing through.
+//! as the pane's lifecycle authority, above its own detection, until the agent
+//! exits, and refuses every later state report from that source once its own
+//! Claude Code integration has reported the session — a `--state working`
+//! report that landed first pinned the pane at `working` for the rest of its
+//! life, with only a visible blocker showing through.
+//!
+//! A `SessionStart` can reach herdr before its detector has seen Claude in the
+//! pane; herdr then answers `resume_not_accepted` and records nothing. The
+//! hook never waits for detection inside a fire, which would hold the
+//! conversation's start: the refusal arms a re-send on the conversation's
+//! note record, and the next main-scope fire (a prompt or a tool call) sends
+//! the report again with a fresh seq, until one is accepted. herdr answers the
+//! same code for causes that never clear (another source holding the pane's
+//! state, a non-claude agent detected there), so on such a pane every prompt
+//! and tool call re-sends: one bounded spawn each, logged once when armed.
+//! Only that code arms it; any other failure disarms it, so a broken or hung
+//! herdr is never re-spawned per tool call, and one failed re-send leaves the
+//! report to the next attribution change.
 //!
 //! The seq is minted epoch-ms and persisted on the conversation's note
 //! record, because herdr drops a report whose seq is not strictly newer than
@@ -47,24 +62,26 @@ use crate::hook_note::{Payload, ScopeLock, load_record, record_path, store_recor
 const SOURCE: &str = "clauth";
 const AGENT: &str = "claude";
 
-/// How many times one fire sends its report when herdr answers
-/// `resume_not_accepted`, and the gap between sends. A `SessionStart` can beat
-/// herdr's detector, which looks at an unidentified pane every 500 ms; nothing
-/// else re-fires the report on an unchanged account, so the hook retries it.
-/// Bounded at three gaps, about 1.5 s, inside the hook's 10 s budget.
-const RESUME_ATTEMPTS: usize = 4;
-const RESUME_RETRY_GAP: std::time::Duration = std::time::Duration::from_millis(500);
+/// herdr's error code for a resume argv it cannot attach to the pane yet.
+const NOT_ACCEPTED: &str = "resume_not_accepted";
+
+/// How long the record's mint and re-send writes wait on the scope lock; see
+/// [`ScopeLock::acquire_within`].
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// What one report came back with, as far as the re-send cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Accepted,
+    /// herdr refused the argv as not attachable yet and recorded nothing.
+    NotAccepted,
+    Failed,
+}
 
 pub(crate) fn report_for_fire(payload: &Payload, current: Option<&str>, attribution_changed: bool) {
     // A subagent's fire is its own scope's reading, never the pane
     // conversation's attribution.
     if payload.agent_id.is_some() {
-        return;
-    }
-    // Only a `SessionStart` or a real attribution change can move the resume
-    // command — its session id or its profile changed — so every other fire
-    // (per tool call, per prompt) is a no-op.
-    if payload.event != "SessionStart" && !attribution_changed {
         return;
     }
     // No attributable account: nothing to name, herdr's builtin plan stays.
@@ -78,14 +95,33 @@ pub(crate) fn report_for_fire(payload: &Payload, current: Option<&str>, attribut
     else {
         return;
     };
+    let Ok(path) = record_path(&payload.session_id, None) else {
+        return;
+    };
+    // Only a `SessionStart` or a real attribution change can move the resume
+    // command — its session id or its profile changed — and only an armed
+    // re-send still owes one, so every other fire (per tool call, per prompt)
+    // is a no-op.
+    let armed = load_record(&path).is_some_and(|record| record.resume_pending);
+    if payload.event != "SessionStart" && !attribution_changed && !armed {
+        return;
+    }
     let Some(bin) = crate::herdr::resolved_bin() else {
         return;
     };
-    let Some(seq) = mint_seq(&payload.session_id) else {
+    let Some(seq) = mint_seq(&path) else {
         return;
     };
     let args = build_report_args(&pane_id, &payload.session_id, profile, seq);
-    report(&bin, &args);
+    let refused = report(&bin, &args) == Sent::NotAccepted;
+    if refused != armed {
+        if refused {
+            crate::logline::to_logfile(format_args!(
+                "clauth: herdr has not accepted the resume command yet; re-sending on each fire until it does"
+            ));
+        }
+        arm_resend(&path, refused);
+    }
 }
 
 /// Mint the report seq for this conversation's main scope: epoch-ms, forced
@@ -95,16 +131,27 @@ pub(crate) fn report_for_fire(payload: &Payload, current: Option<&str>, attribut
 /// fires — the record is what turns the wall clock into a per-session clock.
 /// `None` when the record cannot be persisted: an unrememberable seq cannot
 /// promise monotonicity, and silence keeps herdr's existing argv standing.
-fn mint_seq(session_id: &str) -> Option<u64> {
-    let Ok(path) = record_path(session_id, None) else {
-        return None;
-    };
-    let _hold = ScopeLock::acquire_within(std::time::Duration::from_millis(500));
-    let mut record = load_record(&path).unwrap_or_default();
+fn mint_seq(path: &Path) -> Option<u64> {
+    let _hold = ScopeLock::acquire_within(LOCK_WAIT);
+    let mut record = load_record(path).unwrap_or_default();
     let seq = crate::usage::now_ms().max(record.resume_seq.unwrap_or(0).saturating_add(1));
     record.resume_seq = Some(seq);
-    store_record(&path, &record).ok()?;
+    store_record(path, &record).ok()?;
     Some(seq)
+}
+
+/// Arm or disarm the next fire's re-send. A failed write is a logged silence:
+/// an arm lost costs the report until the next attribution change, a disarm
+/// lost costs one redundant accepted report.
+fn arm_resend(path: &Path, armed: bool) {
+    let _hold = ScopeLock::acquire_within(LOCK_WAIT);
+    let mut record = load_record(path).unwrap_or_default();
+    record.resume_pending = armed;
+    if let Err(e) = store_record(path, &record) {
+        crate::logline::to_logfile(format_args!(
+            "clauth: resume report re-send state not stored: {e}"
+        ));
+    }
 }
 
 /// The report argv, pane id first — herdr's hand-rolled parser reads the
@@ -131,42 +178,38 @@ fn build_report_args(pane_id: &str, session_id: &str, profile: &str, seq: u64) -
     ]
 }
 
-/// One bounded spawn of the herdr CLI; every failure is a logged silence, the
-/// same posture the account note keeps. [`crate::herdr::bounded_output`]
+/// One bounded spawn of the herdr CLI; every failure but herdr's
+/// not-yet-accepted refusal is a logged silence, the same posture the account
+/// note keeps. The caller logs that refusal once, when it arms the re-send.
+/// [`crate::herdr::bounded_output`]
 /// kills a child that hangs past its deadline, so a stuck herdr costs the
 /// hook at most that bound.
-fn report(bin: &Path, args: &[String]) {
+fn report(bin: &Path, args: &[String]) -> Sent {
     let Some(bin) = bin.to_str() else {
         crate::logline::to_logfile(format_args!(
             "clauth: herdr bin path is not valid UTF-8; resume command not reported"
         ));
-        return;
+        return Sent::Failed;
     };
     let argv: Vec<&str> = args.iter().map(String::as_str).collect();
-    for attempt in 1..=RESUME_ATTEMPTS {
-        match crate::herdr::bounded_output(bin, &argv, &[]) {
-            Some(output) if output.status.success() => return,
-            // herdr has not detected Claude in the pane yet. The refused
-            // report recorded nothing, so the same seq is still newer.
-            Some(output)
-                if attempt < RESUME_ATTEMPTS
-                    && String::from_utf8_lossy(&output.stderr).contains("resume_not_accepted") =>
-            {
-                std::thread::sleep(RESUME_RETRY_GAP);
+    match crate::herdr::bounded_output(bin, &argv, &[]) {
+        Some(output) if output.status.success() => Sent::Accepted,
+        Some(output) => {
+            let status = output.status;
+            let out = crate::daemon::api::panes::HerdrOut::from(output);
+            if crate::daemon::api::agent::error_code(&out).as_deref() == Some(NOT_ACCEPTED) {
+                return Sent::NotAccepted;
             }
-            Some(output) => {
-                let status = output.status;
-                crate::logline::to_logfile(format_args!(
-                    "clauth: herdr pane report-agent-session exited {status} after {attempt} attempt(s) (resume command not reported)"
-                ));
-                return;
-            }
-            None => {
-                crate::logline::to_logfile(format_args!(
-                    "clauth: herdr pane report-agent-session failed to spawn or timed out (resume command not reported)"
-                ));
-                return;
-            }
+            crate::logline::to_logfile(format_args!(
+                "clauth: herdr pane report-agent-session exited {status} (resume command not reported)"
+            ));
+            Sent::Failed
+        }
+        None => {
+            crate::logline::to_logfile(format_args!(
+                "clauth: herdr pane report-agent-session failed to spawn or timed out (resume command not reported)"
+            ));
+            Sent::Failed
         }
     }
 }
