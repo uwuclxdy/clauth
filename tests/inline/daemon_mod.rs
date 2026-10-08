@@ -2480,6 +2480,169 @@ fn the_daemon_scan_ignores_a_keyless_provider_members_cached_reading() {
     }
 }
 
+// ── no_usage_source_members (boot-time warning's pure collection, #110) ───────
+
+/// Install a long-lived mint sidecar for `name`: the half that makes a
+/// credential-less member one clauth cannot MEASURE rather than one that is
+/// simply logged out. The daemon has no per-frame cache to read it from, so it
+/// reads the file itself, once, at boot. The dir is created the way
+/// `save_profile` would, since these fixtures never persist their profiles.
+fn arm_session_token(name: &str) {
+    let name = crate::profile::ProfileName::from(name);
+    std::fs::create_dir_all(crate::profile::profile_dir(&name).expect("profile dir"))
+        .expect("mkdir profile");
+    crate::claude::write_session_token(&name, "oat-mint", 0).expect("write the sidecar");
+}
+
+/// Only an enabled member whose sessions run on a long-lived token with no
+/// OAuth pair is named: that is the one shape no leg ever reads while something
+/// still serves from it. A pair, an api key, a disabled flag (the walk never
+/// switches to it), or no login at all keeps a member out.
+#[test]
+fn no_usage_source_members_names_only_enabled_members_clauth_cannot_measure() {
+    let _home = HomeSandbox::new();
+    let name = |n: &str| crate::profile::ProfileName::from(n);
+    let mut keyed = blank_profile(&name("keyed"));
+    keyed.api_key = Some("sk-test".into());
+    let mut off = blank_profile(&name("off"));
+    off.disabled = true;
+    // Every member below is credential-less; the sidecar is what sorts them.
+    for armed in ["st-a", "keyed", "off", "st-b"] {
+        arm_session_token(armed);
+    }
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec![
+                "polled".into(),
+                "st-a".into(),
+                "keyed".into(),
+                "off".into(),
+                "st-b".into(),
+                "out".into(),
+            ],
+            ..AppState::default()
+        },
+        profiles: vec![
+            profile_with_creds("polled", "at-polled"),
+            blank_profile(&name("st-a")),
+            keyed,
+            off,
+            blank_profile(&name("st-b")),
+            blank_profile(&name("out")),
+        ],
+    };
+    assert_eq!(
+        super::no_usage_source_members(&config),
+        ["st-a", "st-b"],
+        "`out` holds no login at all: nothing serves from it, so it is the \
+         logged-out shape rather than this one"
+    );
+}
+
+/// The warning reaches the log as one line naming every such member, with the
+/// fix spelled out for each of them rather than left as a `<name>` placeholder
+/// beside a list that just named them (#116 review). Says nothing when the
+/// chain has none.
+#[test]
+fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
+    let _home = HomeSandbox::new();
+    let name = |n: &str| crate::profile::ProfileName::from(n);
+    arm_session_token("st-a");
+    arm_session_token("st-b");
+    let config = |chain: Vec<&str>| AppConfig {
+        state: AppState {
+            fallback_chain: chain.into_iter().map(Into::into).collect(),
+            ..AppState::default()
+        },
+        profiles: vec![
+            profile_with_creds("polled", "at-polled"),
+            blank_profile(&name("st-a")),
+            blank_profile(&name("st-b")),
+        ],
+    };
+
+    let logged = |chain: Vec<&str>| -> Vec<String> {
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            super::warn_if_chain_has_no_usage_source(&config(chain));
+        }
+        lines.snapshot()
+    };
+
+    assert_eq!(
+        logged(vec!["polled", "st-a", "st-b"]),
+        [
+            "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
+             won't switch away from it on its own. log in the same accounts with `clauth \
+             login st-a`, `clauth login st-b` so clauth can read their usage"
+        ],
+    );
+    // One member reads as one account, which is the wording the member card
+    // carries too: the same fn, told a one-name list.
+    assert_eq!(
+        logged(vec!["polled", "st-a"]),
+        [
+            "clauth daemon: can't read the usage of st-a. once one is active, clauth won't \
+             switch away from it on its own. log in the same account with `clauth login \
+             st-a` so clauth can read its usage"
+        ],
+    );
+    assert!(
+        logged(vec!["polled"]).is_empty(),
+        "a chain clauth can measure in full logs nothing"
+    );
+}
+
+/// A daemon can boot with such a member ALREADY active: the chain walked onto
+/// it before this process started, or the operator put it there. Then the line
+/// says so, because the hazard is the state of the machine and not a forecast.
+/// Seen in a real run, where the TUI had walked the chain onto the unmeasurable
+/// member after the account ahead of it went auth-broken.
+#[test]
+fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
+    let _home = HomeSandbox::new();
+    let name = |n: &str| crate::profile::ProfileName::from(n);
+    arm_session_token("st-a");
+    let config = |active: Option<&str>| AppConfig {
+        state: AppState {
+            active_profile: active.map(Into::into),
+            fallback_chain: vec!["polled".into(), "st-a".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            profile_with_creds("polled", "at-polled"),
+            blank_profile(&name("st-a")),
+        ],
+    };
+    let logged = |active: Option<&str>| -> Vec<String> {
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            super::warn_if_chain_has_no_usage_source(&config(active));
+        }
+        lines.snapshot()
+    };
+
+    assert_eq!(
+        logged(Some("st-a")),
+        [
+            "clauth daemon: can't read the usage of st-a. 'st-a' is active now, and clauth \
+             won't switch away from it on its own. log in the same account with `clauth \
+             login st-a` so clauth can read its usage"
+        ],
+    );
+    // The measurable member being active leaves the forecast wording, and so
+    // does an empty active slot.
+    for active in [Some("polled"), None] {
+        assert!(
+            logged(active)[0].contains("once one is active,"),
+            "not yet active: {:?}",
+            logged(active)
+        );
+    }
+}
+
 /// The standby arm tightens the tree BEFORE it parks, never after the takeover.
 /// launchd creates `daemon.log` at the umask (0o644) before exec and a park is
 /// unbounded in time, so a walk deferred to the promotion leaves a

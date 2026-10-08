@@ -453,6 +453,7 @@ pub(crate) fn serve(
 
     let config = load_config()?;
     warn_if_spend_is_uncapped(&config);
+    warn_if_chain_has_no_usage_source(&config);
     let mut daemon = Daemon::new(config, dir.join(STATUS_FILE));
     daemon.boot();
 
@@ -586,6 +587,59 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
              billing starts, not when it stops",
             uncapped.join(", "),
             crate::fallback::uncapped_spend_fix(),
+        );
+    }
+}
+
+/// Every enabled chain member clauth cannot measure (see
+/// [`crate::fallback::no_usage_source`]): the pure collection
+/// [`warn_if_chain_has_no_usage_source`] logs, split out like
+/// [`uncapped_spenders`] so the filter is testable without capturing log
+/// output. A disabled member is left out: the walk never switches to it.
+fn no_usage_source_members(config: &crate::profile::AppConfig) -> Vec<&str> {
+    config
+        .state
+        .fallback_chain
+        .iter()
+        .filter_map(|name| config.find(name))
+        .filter(|p| !p.is_disabled())
+        // The sidecar read a render path must not make per frame costs nothing
+        // here: this runs once at boot against an owned `AppConfig`
+        // (`load_config`), so no config guard is held while it reads the files.
+        .filter(|p| crate::fallback::no_usage_source(p, crate::claude::has_session_token(&p.name)))
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// Say so at boot when the chain holds a member clauth cannot measure: once the
+/// chain lands there it stays ([`crate::fallback::no_usage_hazard`]). The TUI
+/// says it when the member is added and on its card; a headless run, or a chain
+/// edited by hand in `profiles.toml`, hears it here at the next daemon start (a
+/// reload of the file stays quiet, like the uncapped-spend warning).
+fn warn_if_chain_has_no_usage_source(config: &crate::profile::AppConfig) {
+    let members = no_usage_source_members(config);
+    if !members.is_empty() {
+        // A daemon can boot with such a member ALREADY active (the chain walked
+        // onto it before this process started, or the operator put it there),
+        // and then the hazard is the state of the machine, not a forecast. The
+        // lead is this line's own because it speaks about a list where the
+        // card speaks about one member; the sentence after it is the shared
+        // one, so the two cannot drift.
+        let lead = match config.state.active_profile.as_ref() {
+            Some(active) if members.contains(&active.as_str()) => {
+                format!("'{active}' is active now, and")
+            }
+            _ => "once one is active,".to_string(),
+        };
+        logline!(
+            "clauth daemon: can't read the usage of {}. {} {}. {}",
+            members.join(", "),
+            lead,
+            crate::fallback::no_usage_hazard(),
+            // Spelled out, not `<name>`: this line already named them, and the
+            // operator can paste what it prints. Same copy the member card
+            // carries.
+            crate::fallback::no_usage_fix(&members),
         );
     }
 }
