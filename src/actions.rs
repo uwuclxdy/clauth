@@ -1660,7 +1660,7 @@ fn codex_operator_home() -> Result<std::path::PathBuf> {
 }
 
 /// The home codex reads with no `CODEX_HOME` set: `~/.codex`.
-fn default_codex_operator_home() -> Result<std::path::PathBuf> {
+pub(crate) fn default_codex_operator_home() -> Result<std::path::PathBuf> {
     Ok(crate::profile::home_dir()?.join(".codex"))
 }
 
