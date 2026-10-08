@@ -470,17 +470,69 @@ fn emit_sessions_table(groups: &[WorkspaceGroup], tokens: bool) {
     // One clock read for the whole table: every row's age is relative to the
     // same instant, and `session_row` stays pure (its `now` is a parameter,
     // never a read hidden inside).
-    let now = SystemTime::now();
+    for line in table_lines(groups, tokens, SystemTime::now()) {
+        outln!("{line}");
+    }
+}
+
+fn table_lines(groups: &[WorkspaceGroup], tokens: bool, now: SystemTime) -> Vec<String> {
+    let cols = Columns::fit(groups.iter().flat_map(|g| &g.sessions), now);
+    let mut lines = Vec::new();
     for group in groups {
         let ws = if group.workspace.is_empty() {
             "(unknown workspace)"
         } else {
             &group.workspace
         };
-        outln!("{ws}");
-        for s in &group.sessions {
-            outln!("{}", session_row(s, tokens, now));
-        }
+        lines.push(ws.to_string());
+        lines.extend(
+            group
+                .sessions
+                .iter()
+                .map(|s| session_row(s, tokens, now, cols)),
+        );
+    }
+    lines
+}
+
+/// The padded columns' widths, measured over every row of the table, across
+/// workspace groups, so one wide cell widens its column for all rows rather
+/// than shifting its own row out of line. An id wider than
+/// [`Columns::ID_CAP`] is the one exception.
+#[derive(Debug, Clone, Copy)]
+struct Columns {
+    id: usize,
+    profile: usize,
+    age: usize,
+    tokens: usize,
+    cost: usize,
+}
+
+impl Columns {
+    /// The narrowest each column gets: a short uuid prefix, a typical profile
+    /// name, and room for a ten-digit token total and a four-digit cost.
+    const FLOOR: Self = Self {
+        id: 8,
+        profile: 12,
+        age: 0,
+        tokens: 10,
+        cost: 8,
+    };
+
+    /// The widest the id column grows: a subagent transcript's `agent-<17 hex>`
+    /// stem. A named subagent's longer stem shows whole and pushes only its
+    /// own row, rather than taking preview width from every row in the table.
+    const ID_CAP: usize = 23;
+
+    fn fit<'a>(sessions: impl IntoIterator<Item = &'a SessionInfo>, now: SystemTime) -> Self {
+        let width = |cell: &str| cell.chars().count();
+        sessions.into_iter().fold(Self::FLOOR, |cols, s| Self {
+            id: cols.id.max(width(short_id(&s.id)).min(Self::ID_CAP)),
+            profile: cols.profile.max(width(profile_cell(s))),
+            age: cols.age.max(width(&age_cell(s, now))),
+            tokens: cols.tokens.max(width(&tokens_cell(s))),
+            cost: cols.cost.max(width(&cost_cell(s))),
+        })
     }
 }
 
@@ -493,12 +545,14 @@ fn emit_sessions_table(groups: &[WorkspaceGroup], tokens: bool) {
 /// its cost are blank when the annotation found none — never `0`, which
 /// would read as a real figure — and absent entirely when `tokens` never
 /// asked for them.
-fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime) -> String {
+fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime, cols: Columns) -> String {
     let usage = if tokens {
         format!(
-            "  {tokens:>10}  {cost:>8}",
-            tokens = s.tokens.map(|t| t.to_string()).unwrap_or_default(),
-            cost = s.cost.map(|c| format!("${c:.2}")).unwrap_or_default(),
+            "  {tokens:>tokens_w$}  {cost:>cost_w$}",
+            tokens = tokens_cell(s),
+            tokens_w = cols.tokens,
+            cost = cost_cell(s),
+            cost_w = cols.cost,
         )
     } else {
         String::new()
@@ -512,6 +566,26 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime) -> String {
     // dwarfs any OS's); the dash is the table's no-data glyph, never a UTC
     // fallback — a bare stamp reads as local.
     let updated = crate::format::local_stamp(secs).unwrap_or_else(|| "-".to_string());
+    let mut row = format!(
+        "  {id:<id_w$}  {profile:<profile_w$}  {updated} · {age:<age_w$}{usage}  {preview}",
+        id = short_id(&s.id),
+        id_w = cols.id,
+        profile = profile_cell(s),
+        profile_w = cols.profile,
+        age = age_cell(s, now),
+        age_w = cols.age,
+        preview = preview_pair(s),
+    );
+    // An empty preview would leave the padding as trailing blanks.
+    row.truncate(row.trim_end().len());
+    row
+}
+
+fn profile_cell(s: &SessionInfo) -> &str {
+    s.last_ran_profile.as_deref().unwrap_or("-")
+}
+
+fn age_cell(s: &SessionInfo, now: SystemTime) -> String {
     let age_secs = now
         .duration_since(s.updated)
         .map(|d| d.as_secs() as i64)
@@ -519,17 +593,19 @@ fn session_row(s: &SessionInfo, tokens: bool, now: SystemTime) -> String {
     // `humanize_duration` spells ≤0 `now`, so the ` ago` pairing must skip
     // the non-positive ages: a sub-second-fresh file or a future mtime would
     // render `now ago`.
-    let age = if age_secs <= 0 {
+    if age_secs <= 0 {
         "now".to_string()
     } else {
         format!("{} ago", crate::usage::humanize_duration(age_secs))
-    };
-    format!(
-        "  {id:<8}  {profile:<12}  {updated} · {age}{usage}  {preview}",
-        id = short_id(&s.id),
-        profile = s.last_ran_profile.as_deref().unwrap_or("-"),
-        preview = preview_pair(s),
-    )
+    }
+}
+
+fn tokens_cell(s: &SessionInfo) -> String {
+    s.tokens.map(|t| t.to_string()).unwrap_or_default()
+}
+
+fn cost_cell(s: &SessionInfo) -> String {
+    s.cost.map(|c| format!("${c:.2}")).unwrap_or_default()
 }
 
 /// The first block of a uuid session id, enough to eyeball in the table (the

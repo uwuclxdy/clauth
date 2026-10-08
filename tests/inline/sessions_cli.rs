@@ -217,14 +217,14 @@ fn the_table_carries_the_token_columns_only_under_tokens() {
     let session = &groups[0].sessions[0];
     let now = SystemTime::UNIX_EPOCH + Duration::from_secs(3_000 + 3_600);
 
-    let plain = session_row(session, false, now);
+    let plain = session_row(session, false, now, Columns::FLOOR);
     assert!(
         !plain.contains("150") && !plain.contains('$'),
         "the default row carries neither figure: {plain}"
     );
     assert!(plain.contains("hello"), "it still carries the preview");
 
-    let annotated = session_row(session, true, now);
+    let annotated = session_row(session, true, now, Columns::FLOOR);
     assert!(
         annotated.contains("150") && annotated.contains("$1.05"),
         "--tokens adds both cells: {annotated}"
@@ -248,7 +248,7 @@ fn the_table_preserves_distinct_subagent_ids() {
     let flat = flatten_newest_first(&groups);
     assert_eq!(flat.len(), 2);
     for (session, id) in flat.iter().zip(ids) {
-        let row = session_row(session, false, SystemTime::UNIX_EPOCH);
+        let row = session_row(session, false, SystemTime::UNIX_EPOCH, Columns::FLOOR);
         assert_eq!(row.split_whitespace().next(), Some(id), "{row}");
     }
     let json = sessions_json(&flat);
@@ -268,6 +268,7 @@ fn only_uuid_session_ids_are_shortened() {
         "agent-a1b2c3d4",
         "workflow-step-one",
         "12345678-not-a-uuid",
+        "1234567812344567890a123456789abc----",
         "12345678-1234-4567-890a-123456789abg",
         "12345678-1234-4567-890a-123456789aé",
         "plain",
@@ -275,6 +276,135 @@ fn only_uuid_session_ids_are_shortened() {
     ] {
         assert_eq!(short_id(id), id);
     }
+}
+
+/// A subagent id and a long profile name each widen their column for every
+/// row, across workspace groups: the stamp cell starts at one offset in the
+/// whole table. The widths are hand-counted: the agent id is 23 chars, the
+/// profile 17, so the uuid prefix pads 15 and the `-` profile pads 16.
+#[test]
+fn the_table_columns_widen_to_their_widest_cell_in_every_row() {
+    let sb = HomeSandbox::new();
+    let uuid = "12345678-1234-4567-890a-123456789abc";
+    let agent = "agent-a0c3ac273daf72f57";
+    let uuid_path = sb
+        .home()
+        .join(format!(".claude/projects/-w-a/{uuid}.jsonl"));
+    write_jsonl(&uuid_path, &[user_line(uuid, "/ws/a", "parent")]);
+    set_mtime(
+        &uuid_path,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(4_000),
+    );
+    let agent_path = sb.home().join(format!(
+        ".claude/projects/-w-b/parent/subagents/{agent}.jsonl"
+    ));
+    write_jsonl(&agent_path, &[user_line(agent, "/ws/b", "child")]);
+    set_mtime(
+        &agent_path,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(3_000),
+    );
+
+    let mut groups = build_listing(false);
+    assert_eq!(groups.len(), 2, "two workspaces, two groups");
+    let parent = groups
+        .iter_mut()
+        .flat_map(|g| &mut g.sessions)
+        .find(|s| s.id == uuid)
+        .unwrap();
+    parent.last_ran_profile = Some("work-account-long".to_string());
+
+    let lines = table_lines(&groups, false, SystemTime::UNIX_EPOCH);
+    let parent_row = lines.iter().find(|l| l.contains("parent")).unwrap();
+    let child_row = lines.iter().find(|l| l.contains("child")).unwrap();
+    let parent_cells = format!("  12345678{}  work-account-long  ", " ".repeat(15));
+    let child_cells = format!("  agent-a0c3ac273daf72f57  -{}  ", " ".repeat(16));
+    assert!(parent_row.starts_with(&parent_cells), "{parent_row:?}");
+    assert!(child_row.starts_with(&child_cells), "{child_row:?}");
+}
+
+/// A 5-char stem pads to the id floor of 8, the `-` profile to 12.
+#[test]
+fn a_table_with_no_wide_cell_keeps_the_floor_widths() {
+    let sb = HomeSandbox::new();
+    let path = sb.home().join(".claude/projects/-w-a/notes.jsonl");
+    write_jsonl(&path, &[user_line("notes", "/ws/a", "only")]);
+    set_mtime(&path, SystemTime::UNIX_EPOCH + Duration::from_secs(3_000));
+
+    let lines = table_lines(&build_listing(false), false, SystemTime::UNIX_EPOCH);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let cells = format!("  notes{}  -{}  ", " ".repeat(3), " ".repeat(11));
+    assert!(lines[1].starts_with(&cells), "{:?}", lines[1]);
+}
+
+/// A named subagent's 45-char stem shows whole but widens the id column only
+/// to the 23-char cap, so the uuid row pads 15, not 37.
+#[test]
+fn the_id_column_stops_widening_at_its_cap() {
+    let sb = HomeSandbox::new();
+    let uuid = "12345678-1234-4567-890a-123456789abc";
+    let named = "agent-ap4-validation-persist-9802277861dd8fcf";
+    let uuid_path = sb
+        .home()
+        .join(format!(".claude/projects/-w-a/{uuid}.jsonl"));
+    write_jsonl(&uuid_path, &[user_line(uuid, "/ws/a", "parent")]);
+    set_mtime(
+        &uuid_path,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(4_000),
+    );
+    let named_path = sb.home().join(format!(
+        ".claude/projects/-w-a/parent/subagents/{named}.jsonl"
+    ));
+    write_jsonl(&named_path, &[user_line(named, "/ws/a", "child")]);
+    set_mtime(
+        &named_path,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(3_000),
+    );
+
+    let lines = table_lines(&build_listing(false), false, SystemTime::UNIX_EPOCH);
+    let parent_row = lines.iter().find(|l| l.contains("parent")).unwrap();
+    let child_row = lines.iter().find(|l| l.contains("child")).unwrap();
+    let parent_cells = format!("  12345678{}  -{}  ", " ".repeat(15), " ".repeat(11));
+    let child_cells = format!("  {named}  -{}  ", " ".repeat(11));
+    assert!(parent_row.starts_with(&parent_cells), "{parent_row:?}");
+    assert!(child_row.starts_with(&child_cells), "{child_row:?}");
+}
+
+/// Under `--tokens`, a short and a long age, an 11-digit token total and a
+/// 9-char cost each widen their column for both rows. Ages hand-derived:
+/// 90 000 s is `1d 1h`, 5 s is `5s`; so the age column is 9 wide, tokens 11,
+/// cost 9.
+#[test]
+fn the_age_tokens_and_cost_columns_widen_to_their_widest_cell() {
+    let sb = HomeSandbox::new();
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(93_000);
+    for (id, text, updated) in [("aaaa-1111", "alpha", 3_000), ("bbbb-2222", "beta", 92_995)] {
+        let path = sb.home().join(format!(".claude/projects/-w-a/{id}.jsonl"));
+        write_jsonl(&path, &[user_line(id, "/ws/a", text)]);
+        set_mtime(&path, SystemTime::UNIX_EPOCH + Duration::from_secs(updated));
+    }
+    let mut groups = build_listing(false);
+    for s in &mut groups[0].sessions {
+        (s.tokens, s.cost) = if s.id == "aaaa-1111" {
+            (Some(150), Some(1.05))
+        } else {
+            (Some(12_345_678_901), Some(12_345.67))
+        };
+    }
+
+    let lines = table_lines(&groups, true, now);
+    let alpha = lines.iter().find(|l| l.contains("alpha")).unwrap();
+    let beta = lines.iter().find(|l| l.contains("beta")).unwrap();
+    let alpha_tail = format!(
+        "· 1d 1h ago  {}150  {}$1.05  alpha | alpha",
+        " ".repeat(8),
+        " ".repeat(4)
+    );
+    let beta_tail = format!(
+        "· 5s ago{}  12345678901  $12345.67  beta | beta",
+        " ".repeat(3)
+    );
+    assert!(alpha.ends_with(&alpha_tail), "{alpha:?}");
+    assert!(beta.ends_with(&beta_tail), "{beta:?}");
 }
 
 // ── the stamp cell: local wall clock + age ──
@@ -299,7 +429,7 @@ fn the_table_stamp_renders_local_wall_clock_with_a_relative_age() {
 
     let groups = build_listing(false);
     let session = &groups[0].sessions[0];
-    let row = session_row(session, false, now);
+    let row = session_row(session, false, now, Columns::FLOOR);
 
     let local = chrono::DateTime::from_timestamp(1_782_000_000, 0)
         .unwrap()
@@ -348,14 +478,14 @@ fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
 
     // Zero age: `now` sits exactly on the mtime, the same whole-second a
     // sub-second-fresh file truncates to.
-    let zero = session_row(session, false, updated);
+    let zero = session_row(session, false, updated, Columns::FLOOR);
     assert!(zero.contains("· now"), "zero age renders `now`: {zero}");
     assert!(!zero.contains("now ago"), "zero age never stutters: {zero}");
 
     // Negative age: a future mtime (the clock behind the file) is the same
     // ≤0 branch, not `now ago`.
     let behind = updated - Duration::from_secs(60);
-    let future = session_row(session, false, behind);
+    let future = session_row(session, false, behind, Columns::FLOOR);
     assert!(
         future.contains("· now"),
         "a future mtime renders `now`: {future}"
@@ -367,7 +497,7 @@ fn the_stamp_age_renders_now_for_non_positive_ages_and_ago_for_positive() {
 
     // Positive age: the full pairing survives the ≤0 branch.
     let ahead = updated + Duration::from_secs(11_520);
-    let positive = session_row(session, false, ahead);
+    let positive = session_row(session, false, ahead, Columns::FLOOR);
     assert!(
         positive.contains("· 3h 12m ago"),
         "a positive age keeps the full pairing: {positive}"
@@ -390,7 +520,7 @@ fn the_human_row_and_json_disagree_on_the_stamp_shape_by_design() {
 
     let groups = build_listing(false);
     let session = &groups[0].sessions[0];
-    let human = session_row(session, false, now);
+    let human = session_row(session, false, now, Columns::FLOOR);
     let json_updated = session_json_row(session)["updated"]
         .as_str()
         .expect("updated is a string")
