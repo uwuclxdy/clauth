@@ -4521,3 +4521,35 @@ fn a_default_serve_table_carries_a_stray_key() {
         "the carried [serve] table lands after the marker:\n{after}"
     );
 }
+
+/// A config.toml an older clauth wrote spells `auto_start` as its pre-rename
+/// alias `kick_timer`. The round-trip that decides "modelled" parses the alias
+/// into `auto_start` and re-emits it under that name, so `kick_timer` reads as
+/// unmodelled and was carried beside the render's own `auto_start`. Serde
+/// counts an alias and its field as one field, so the next load failed with a
+/// duplicate `auto_start` and the profile was unloadable until hand-edited.
+#[test]
+fn an_aliased_key_on_disk_is_never_carried_beside_its_field() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alias"]);
+    let name = ProfileName::from("alias");
+    let mut profile = crate::testutil::blank_profile(&name);
+    save_profile(&profile).expect("first save");
+    let path = profile_config_path(&name).expect("config path");
+    let rendered = std::fs::read_to_string(&path).expect("read");
+    // Off, the render writes only the commented `# auto_start = true` hint.
+    assert!(!rendered.contains("\nauto_start"), "{rendered}");
+    std::fs::write(&path, rendered + "kick_timer = true\n").expect("plant the pre-rename spelling");
+
+    profile.auto_start = true;
+    save_profile(&profile).expect("save over the aliased file");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let back = load_profile(&name).unwrap_or_else(|e| panic!("reload failed: {e:#}\n{after}"));
+    assert!(back.auto_start);
+    let table: toml::Table = after.parse().expect("parses");
+    assert!(
+        !table.contains_key("kick_timer"),
+        "the alias is rewritten under its field's name:\n{after}"
+    );
+}
