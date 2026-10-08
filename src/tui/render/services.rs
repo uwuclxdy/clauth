@@ -228,7 +228,11 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // The plugin detail walks its fixable problems while descended; its fix
     // line carries the caret + hover tint then.
-    let problem_focus = if focused && check.label == "plugin" && !check.problems.is_empty() {
+    let problem_focus = if focused
+        && check.label == "plugin"
+        && !app.services.diagnostic_focus
+        && !check.problems.is_empty()
+    {
         Some(app.services.problem_cursor)
     } else {
         None
@@ -258,6 +262,11 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
+    if check.label == "plugin" && app.services.diagnostic_focus {
+        draw_diagnostic_lines(frame, inner, app, lines);
+        return;
+    }
+
     // The plugin detail's problem walk scrolls to keep the focused line on
     // screen (the herdr-options `draw_scrolled_lines` shape). `.get` rather
     // than an index: a fix landing under the focused cursor can shrink the
@@ -267,7 +276,15 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         && let Some(problem) = check.problems.get(app.services.problem_cursor)
     {
         let line = problem.line;
-        draw_scrolled_lines(frame, inner, lines, (line, line + 1), None);
+        app.services.detail_viewport.set(inner.height);
+        app.services.detail_max_scroll.set(
+            lines
+                .len()
+                .saturating_sub(inner.height as usize)
+                .min(u16::MAX as usize) as u16,
+        );
+        let offset = draw_scrolled_lines(frame, inner, lines, (line, line + 1), None);
+        app.services.displayed_scroll.set(offset as u16);
         return;
     }
 
@@ -275,8 +292,10 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let viewport = inner.height as usize;
 
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
+    app.services.detail_viewport.set(inner.height);
     app.services.detail_max_scroll.set(max_scroll);
     let scroll = app.services.detail_scroll.min(max_scroll);
+    app.services.displayed_scroll.set(scroll);
 
     frame.render_widget(
         Paragraph::new(lines)
@@ -285,6 +304,23 @@ fn draw_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         inner,
     );
     draw_scrollbar(frame, inner, total, scroll as usize, viewport);
+}
+
+fn draw_diagnostic_lines(frame: &mut Frame<'_>, inner: Rect, app: &App, lines: Vec<Line<'static>>) {
+    let total = lines.len();
+    let viewport = inner.height as usize;
+    let max = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
+    app.services.detail_viewport.set(inner.height);
+    app.services.detail_max_scroll.set(max);
+    let offset = app.services.detail_scroll.min(max);
+    app.services.displayed_scroll.set(offset);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((offset, 0)),
+        inner,
+    );
+    draw_scrollbar(frame, inner, total, offset as usize, viewport);
 }
 
 /// The `shunt` detail: [`Check::detail`]'s field lines through the shared
@@ -613,7 +649,8 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
     let mut caret: Option<(u16, usize)> = None;
 
     for (i, row) in HERDR_OPTIONS.iter().enumerate() {
-        let selected = focused && i == app.services.herdr_options_cursor;
+        let selected =
+            focused && !app.services.diagnostic_focus && i == app.services.herdr_options_cursor;
         let row_editing = if *row == HerdrOption::TagRefresh {
             editing
         } else {
@@ -664,7 +701,19 @@ fn draw_herdr_detail(frame: &mut Frame<'_>, inner: Rect, app: &App, mut lines: V
         }
     }
 
+    if app.services.diagnostic_focus {
+        draw_diagnostic_lines(frame, inner, app, lines);
+        return;
+    }
+    app.services.detail_viewport.set(inner.height);
+    app.services.detail_max_scroll.set(
+        lines
+            .len()
+            .saturating_sub(inner.height as usize)
+            .min(u16::MAX as usize) as u16,
+    );
     let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.services.form_offset));
+    app.services.displayed_scroll.set(offset as u16);
     // A caret scrolled off the top has no cell to sit in; leaving the cursor
     // unset is better than parking it on an unrelated row.
     if let Some((cx, row)) = caret

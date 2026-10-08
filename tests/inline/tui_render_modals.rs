@@ -449,6 +449,26 @@ fn assert_tab_rows(tab: Tab, expected: &[(&str, &str)]) {
 }
 
 #[test]
+fn services_help_names_diagnostic_paging_without_mislabeling_arrows() {
+    assert_tab_rows(
+        Tab::Services,
+        &[
+            (
+                "↑ ↓",
+                "pick row · scroll shunt detail · walk plugin problems · walk herdr options",
+            ),
+            ("page up / page down", "read plugin / herdr diagnostics"),
+            ("↵", "open detail · activate an option"),
+            ("space", "activate the focused herdr option"),
+            ("+ / -", "step the tag refresh"),
+            ("f", "apply the focused fix"),
+            ("r", "re-run all checks"),
+            ("esc", "back to the list · close the editor"),
+        ],
+    );
+}
+
+#[test]
 fn fallback_tab_key_grammar_rows_pin_exact_order_and_copy() {
     assert_tab_rows(
         Tab::Fallback,

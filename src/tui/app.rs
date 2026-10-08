@@ -2103,6 +2103,9 @@ pub(crate) struct ServicesState {
     pub(crate) selector_offset: std::cell::Cell<usize>,
     pub(crate) form_offset: std::cell::Cell<usize>,
     pub(crate) detail_scroll: u16,
+    pub(crate) diagnostic_focus: bool,
+    pub(crate) displayed_scroll: std::cell::Cell<u16>,
+    pub(crate) detail_viewport: std::cell::Cell<u16>,
     /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
     /// clamped by the key handler — same pattern as `StatusState`).
     pub(crate) detail_max_scroll: std::cell::Cell<u16>,
@@ -2232,6 +2235,9 @@ impl Default for ServicesState {
             selector_offset: std::cell::Cell::new(0),
             form_offset: std::cell::Cell::new(0),
             detail_scroll: 0,
+            diagnostic_focus: false,
+            displayed_scroll: std::cell::Cell::new(0),
+            detail_viewport: std::cell::Cell::new(0),
             detail_max_scroll: std::cell::Cell::new(0),
             fetching: false,
             error: None,
@@ -2290,9 +2296,14 @@ impl ServicesState {
             ServicesFocus::Detail => {
                 let check = self.selected_check()?;
                 if check.label == "plugin" {
+                    if self.diagnostic_focus {
+                        return None;
+                    }
                     check.problems.get(self.problem_cursor).map(|p| &p.fix)
                 } else if check.label == "shunt" {
                     self.focused_shunt_focus().and_then(ShuntFocus::fix)
+                } else if check.label == "herdr" && self.diagnostic_focus {
+                    None
                 } else {
                     self.selected_fix()
                 }
@@ -4981,11 +4992,13 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Up if len > 0 => {
                     app.services.cursor = (app.services.cursor + len - 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
                 KeyCode::Down if len > 0 => {
                     app.services.cursor = (app.services.cursor + 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
                 KeyCode::Enter if len > 0 => {
@@ -5001,6 +5014,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     {
                         app.services.focus = ServicesFocus::Detail;
                         app.services.detail_scroll = 0;
+                        app.services.diagnostic_focus = false;
                         settle_shunt_focus(app);
                     }
                 }
@@ -5013,7 +5027,23 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
         }
         ServicesFocus::Detail => {
             let label = app.services.selected_check().map(|c| c.label);
-            if label == Some("herdr") {
+            if matches!(label, Some("herdr" | "plugin"))
+                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            {
+                let max = app.services.detail_max_scroll.get();
+                let viewport = app.services.detail_viewport.get().max(1);
+                let origin = if app.services.diagnostic_focus {
+                    app.services.detail_scroll.min(max)
+                } else {
+                    app.services.displayed_scroll.get().min(max)
+                };
+                app.services.diagnostic_focus = true;
+                app.services.detail_scroll = if key.code == KeyCode::PageDown {
+                    origin.saturating_add(viewport).min(max)
+                } else {
+                    origin.saturating_sub(viewport)
+                };
+            } else if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
             } else if label == Some("plugin")
                 && app
@@ -5056,9 +5086,11 @@ fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
         .unwrap_or(0);
     match key.code {
         KeyCode::Up if len > 0 => {
+            app.services.diagnostic_focus = false;
             app.services.problem_cursor = (app.services.problem_cursor + len - 1) % len;
         }
         KeyCode::Down if len > 0 => {
+            app.services.diagnostic_focus = false;
             app.services.problem_cursor = (app.services.problem_cursor + 1) % len;
         }
         KeyCode::Char('f') => apply_service_fix(app),
@@ -5408,12 +5440,20 @@ fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
     let cursor = app.services.herdr_options_cursor;
     let rows = HERDR_OPTIONS.len();
     match key.code {
-        KeyCode::Up => app.services.herdr_options_cursor = (cursor + rows - 1) % rows,
-        KeyCode::Down => app.services.herdr_options_cursor = (cursor + 1) % rows,
+        KeyCode::Up => {
+            app.services.diagnostic_focus = false;
+            app.services.herdr_options_cursor = (cursor + rows - 1) % rows;
+        }
+        KeyCode::Down => {
+            app.services.diagnostic_focus = false;
+            app.services.herdr_options_cursor = (cursor + 1) % rows;
+        }
         KeyCode::Char('f') => apply_service_fix(app),
-        KeyCode::Enter | KeyCode::Char(' ') => activate_herdr_option(app, HERDR_OPTIONS[cursor]),
-        KeyCode::Char('+') => step_herdr_tag_refresh(app, 1),
-        KeyCode::Char('-') => step_herdr_tag_refresh(app, -1),
+        KeyCode::Enter | KeyCode::Char(' ') if !app.services.diagnostic_focus => {
+            activate_herdr_option(app, HERDR_OPTIONS[cursor]);
+        }
+        KeyCode::Char('+') if !app.services.diagnostic_focus => step_herdr_tag_refresh(app, 1),
+        KeyCode::Char('-') if !app.services.diagnostic_focus => step_herdr_tag_refresh(app, -1),
         _ => {}
     }
 }

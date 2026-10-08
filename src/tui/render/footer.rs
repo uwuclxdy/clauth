@@ -542,6 +542,9 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         } else {
             vec![("↑↓", "scroll")]
         };
+        if walks_problems && app.services.detail_max_scroll.get() > 0 {
+            hints.push(("page up/down", "read"));
+        }
         hints.push(("r", "refresh"));
         if let Some(v) = verb {
             hints.push(("f", v));
@@ -550,10 +553,19 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         return hints;
     }
 
+    if app.services.diagnostic_focus {
+        let mut hints = vec![("↑↓", "row")];
+        if app.services.detail_max_scroll.get() > 0 {
+            hints.push(("page up/down", "read"));
+        }
+        hints.extend([("r", "refresh"), ("a", "actions"), ("?", "help")]);
+        return hints;
+    }
+
     // The herdr options rows: `r` and `f` keep working while the options rows
     // hold the cursor, so they keep their hints (f only when the check offers
     // a fix).
-    match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
+    let mut hints = match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
         Some(HerdrOption::TagRefresh) => {
             let mut hints = vec![
                 ("↑↓", "row"),
@@ -598,7 +610,11 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
+    };
+    if app.services.detail_max_scroll.get() > 0 {
+        hints.insert(1, ("page up/down", "read"));
     }
+    hints
 }
 
 /// Shrink a rect by `pad` columns on each side (clamped), leaving the row intact.

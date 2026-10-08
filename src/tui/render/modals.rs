@@ -996,8 +996,9 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
             &[
                 (
                     "\u{2191} \u{2193}",
-                    "pick row · scroll detail · walk plugin problems · walk herdr options",
+                    "pick row · scroll shunt detail · walk plugin problems · walk herdr options",
                 ),
+                ("page up / page down", "read plugin / herdr diagnostics"),
                 ("\u{21b5}", "open detail · activate an option"),
                 ("space", "activate the focused herdr option"),
                 ("+ / -", "step the tag refresh"),

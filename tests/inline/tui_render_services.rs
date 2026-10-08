@@ -636,6 +636,147 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
     }
 }
 
+#[test]
+fn plugin_diagnostics_and_fix_remain_reachable_after_page_scroll() {
+    use crate::tui::app::{ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut check = plugin_check_with_problems();
+    check
+        .detail
+        .extend((0..28).map(|i| format!("diagnostic line {i:02}")));
+    let mut app = app_with(check);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    let first = draw_frame(&app, 80, 14);
+    assert!(!first.join("\n").contains("diagnostic line 27"));
+    let initial_offset = app.services.displayed_scroll.get();
+    assert!(initial_offset <= app.services.detail_max_scroll.get());
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.services.detail_scroll,
+        initial_offset
+            .saturating_add(app.services.detail_viewport.get())
+            .min(app.services.detail_max_scroll.get()),
+        "paging starts at the visible problem, not a stale scroll field"
+    );
+    let _ = draw_frame(&app, 80, 14);
+    let once = app.services.detail_scroll;
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.services.detail_scroll,
+        once.saturating_add(app.services.detail_viewport.get())
+            .min(app.services.detail_max_scroll.get()),
+        "a second page press before redraw must move"
+    );
+    for _ in 0..5 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+        let _ = draw_frame(&app, 80, 14);
+    }
+    let last = draw_frame(&app, 80, 14);
+    assert!(
+        last.join("\n").contains("diagnostic line 27"),
+        "last diagnostic must be readable"
+    );
+    assert!(
+        app.services.focused_fix().is_none(),
+        "an offscreen fix has no action target"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        app.modals.is_empty(),
+        "offscreen fix must not open a confirmation"
+    );
+    assert!(
+        last.join("\n").contains('┃'),
+        "overflow thumb must reach bottom"
+    );
+    assert_eq!(
+        app.services.detail_scroll,
+        app.services.detail_max_scroll.get()
+    );
+    for _ in 0..5 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+        let _ = draw_frame(&app, 80, 14);
+    }
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    let after = draw_frame(&app, 80, 14).join("\n");
+    assert!(
+        after.contains("❯ f  wire mcp server"),
+        "arrow returns to the selectable fix: {after}"
+    );
+}
+
+#[test]
+fn herdr_diagnostics_and_options_remain_reachable_after_page_scroll() {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let warnings: Vec<String> = (0..28)
+        .map(|i| format!("registry warning {i:02}"))
+        .collect();
+    let mut registry = entry(true, Some("0.8.0"), vec![]);
+    registry.warnings = warnings;
+    let probe = probe(Some("0.8.0"), Some(registry), None);
+    let mut app = herdr_options_app(config(true, None, SidebarState::Templated));
+    app.tab = crate::tui::app::Tab::Services;
+    app.services.herdr = Some(Some(probe.clone()));
+    app.services.checks = vec![herdr_check(&probe, app.services.herdr_config.as_ref())];
+    let first = draw_frame(&app, 80, 14).join("\n");
+    assert!(!first.contains("registry warning 27"));
+    let initial_offset = app.services.displayed_scroll.get();
+    assert!(
+        initial_offset > 0,
+        "options must start below the warning body"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(
+        app.services.detail_scroll,
+        initial_offset.saturating_sub(app.services.detail_viewport.get()),
+        "PageUp starts at the displayed options, not at an unused scroll field"
+    );
+    let next = draw_frame(&app, 80, 14).join("\n");
+    assert!(
+        next.contains("registry warning 27"),
+        "one viewport reveals the last warning: {next}"
+    );
+    assert!(
+        app.services.focused_fix().is_none(),
+        "hidden herdr fix has no action target"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char('f')));
+    assert!(
+        app.modals.is_empty(),
+        "hidden herdr fix must not open a confirmation"
+    );
+    let settings = app.config().state.herdr.clone();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Char(' ')));
+    assert_eq!(
+        app.config().state.herdr,
+        settings,
+        "a hidden option cannot be toggled"
+    );
+    for _ in 0..6 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+        let _ = draw_frame(&app, 80, 14);
+    }
+    let end = draw_frame(&app, 80, 14).join("\n");
+    assert!(
+        end.contains("delegate row text"),
+        "last action remains reachable: {end}"
+    );
+    assert_eq!(
+        app.services.detail_scroll,
+        app.services.detail_max_scroll.get()
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Up));
+    let focused = draw_frame(&app, 80, 14).join("\n");
+    assert!(
+        focused.contains("❯"),
+        "arrow restores option focus: {focused}"
+    );
+}
+
 /// A fix landing under a focused cursor can shrink the problem set; the render
 /// must read the cursor through `.get` and never panic on a stale cursor.
 #[test]
