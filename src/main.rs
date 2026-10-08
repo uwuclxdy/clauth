@@ -16,6 +16,7 @@ mod gateway_edit;
 mod harness;
 mod herdr;
 mod hook_context;
+mod hook_jobs;
 mod hook_note;
 mod hook_resume;
 mod jobs_cli;

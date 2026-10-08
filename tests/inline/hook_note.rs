@@ -157,6 +157,41 @@ fn two_earned_notes_join_into_one_envelope() {
         .expect("one JSON document, never two");
 }
 
+/// A resume fire carries the uncollected-results leg's note into the envelope:
+/// the leg is wired into the fire, not only correct on its own. Equality on
+/// the whole list also pins every other leg silent on this fixture.
+#[test]
+fn a_resume_fire_carries_the_uncollected_results_note() {
+    let _home = HomeSandbox::new();
+    let dir = crate::mcp::jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = crate::usage::now_ms();
+    std::fs::write(
+        dir.join("d-a.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-a",
+            "profile": "DS1",
+            "state": "done",
+            "started_at": now - 1_000,
+            "done_at": now - 500,
+            "envelope": { "result": "ok" },
+            "host_session": "s1",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut fire = payload("SessionStart", "s1");
+    fire.source = Some("resume".to_string());
+
+    assert_eq!(
+        leg_notes(&fire, None),
+        vec![
+            "clauth note: a background delegate this session started has a result waiting uncollected: `d-a` on `DS1`. `monitor` with its job_id collects it."
+                .to_string()
+        ]
+    );
+}
+
 #[test]
 fn the_first_fire_is_a_baseline_and_a_move_is_announced_once() {
     let _home = HomeSandbox::new();

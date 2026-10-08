@@ -166,8 +166,8 @@ impl Note<'_> {
 }
 
 /// The fields of a hook payload this subcommand reads; everything else is
-/// ignored. `pub(crate)` because the context leg (`hook_context`) reads the
-/// same payload.
+/// ignored. `pub(crate)` because the other legs (`hook_context`, `hook_jobs`,
+/// `hook_resume`) read the same payload.
 pub(crate) struct Payload {
     /// Echoed back in the output envelope, so the host routes the context to the
     /// event it came from.
@@ -417,16 +417,12 @@ pub(crate) fn run() -> Result<()> {
     if let Some(note) = fire.note {
         notes.push(note);
     }
-    if let Some(read) = read_nudge(&payload, config.get().and_then(|loaded| loaded.as_ref()))
-        && let Some(note) = nudge_note(&payload, &read)
-    {
-        notes.push(note);
-    }
-    if let Some(note) = crate::hook_context::note(&payload) {
-        notes.push(note);
-    }
+    notes.extend(leg_notes(
+        &payload,
+        config.get().and_then(|loaded| loaded.as_ref()),
+    ));
     // One envelope, whatever fired: two JSON documents on stdout would parse
-    // as none, and one `additionalContext` field carries both notes when both
+    // as none, and one `additionalContext` field carries every note that
     // earned the turn.
     if !notes.is_empty() {
         outln!("{}", joined_envelope(&payload.event, &notes));
@@ -447,8 +443,23 @@ pub(crate) fn run() -> Result<()> {
     Ok(())
 }
 
+/// The notes every leg after the account note earns on this fire, in envelope
+/// order. Split from [`run`] so the wiring is assertable without stdin or
+/// stdout; `config` is whatever the account note's resolve already loaded.
+fn leg_notes(payload: &Payload, config: Option<&crate::profile::AppConfig>) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(read) = read_nudge(payload, config)
+        && let Some(note) = nudge_note(payload, &read)
+    {
+        notes.push(note);
+    }
+    notes.extend(crate::hook_context::note(payload));
+    notes.extend(crate::hook_jobs::note(payload));
+    notes
+}
+
 /// [`envelope`] over the fire's earned notes joined — whatever earned the turn,
-/// one note or two, renders as ONE `additionalContext` field and so ONE JSON
+/// however many notes, renders as ONE `additionalContext` field and so ONE JSON
 /// document on stdout (two documents would parse as none). Split from the
 /// print for the same reason [`envelope`] is: the join is assertable without
 /// capturing stdout.
