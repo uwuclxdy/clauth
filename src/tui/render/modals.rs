@@ -884,8 +884,21 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         state.message.clone(),
         theme::body(),
     ))];
+    // A detail may be several lines, and each is PROSE: split on the newlines
+    // the caller wrote, then word-wrap. Left to the modal, a long line goes
+    // through `chunk_line`, which cuts at the cell boundary and keeps every
+    // character, so the space at the cut became a one-column indent on the
+    // continuation row (seen at 80 columns in a real terminal). The bound is
+    // the modal's own geometry: it never grows past `area.width - 4`, and its
+    // inner width is 6 cells narrower than that, so wrapping here can only
+    // prevent the chunking, never make the modal wider.
     if let Some(detail) = &state.detail {
-        lines.push(Line::from(prose::spans(detail, theme::dim())));
+        let inner = (area.width.saturating_sub(10) as usize).max(8);
+        for line in detail.lines() {
+            for row in prose::wrap(line, inner, theme::dim()) {
+                lines.push(Line::from(row));
+            }
+        }
     }
     // The daemon-start confirm's detail is two lines, which the one-line
     // `detail` cannot hold.

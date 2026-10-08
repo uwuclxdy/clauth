@@ -1332,6 +1332,104 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
     );
 }
 
+/// \#116 round 4: the no-usage add confirm carries TWO detail lines, the hazard
+/// and then the fix, and the modal has to draw them as two rows. A detail that
+/// long on one row is chunked mid-word by `draw_modal_scrolled`, which is how
+/// the dialog came to name the cost and leave the command to the card. Found by
+/// a mutation arm: collapsing the two lines again passed every other test here.
+#[test]
+fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // Built the way `handle_fallback_add_key` builds it, so the copy is the
+    // production copy and not a transcription.
+    let state = ConfirmState {
+        message: "clauth can't read this account's usage.".into(),
+        detail: Some(format!(
+            "{}{}.\n{}",
+            crate::fallback::no_usage_hazard_lead(false),
+            crate::fallback::no_usage_hazard(),
+            crate::tui::render::prose::mark_commands(&crate::fallback::no_usage_fix(&["blind"]))
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
+    };
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is on no row:\n{}", rows.join("\n")))
+    };
+    let hazard = row_of("once it's active, clauth won't switch away from it on its own.");
+    let fix =
+        row_of("log in the same account with clauth login blind so clauth can read its usage");
+    assert_eq!(
+        fix,
+        hazard + 1,
+        "the fix sits on its own row right under the hazard:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// \#116 round 5: at 80 columns the fix line wraps, and its continuation has to
+/// start in the SAME column as its first row. Left to the modal, `chunk_line`
+/// cuts at the cell boundary and keeps every character, so the space at the cut
+/// became a one-column indent (seen in a real terminal). The detail is
+/// word-wrapped before it reaches the modal, which this pins.
+#[test]
+fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "clauth can't read this account's usage.".into(),
+        detail: Some(format!(
+            "{}{}.\n{}.",
+            crate::fallback::no_usage_hazard_lead(false),
+            crate::fallback::no_usage_hazard(),
+            crate::tui::render::prose::mark_commands(&crate::fallback::no_usage_fix(&["blind"]))
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
+    };
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    // The column of the TEXT, not of the modal's border: the border sits on
+    // every row, so comparing leading spaces would pass whatever the wrap did.
+    let first = rows
+        .iter()
+        .position(|r| r.contains("log in the same account"))
+        .unwrap_or_else(|| panic!("the fix line is on no row:\n{}", rows.join("\n")));
+    let rest = rows
+        .iter()
+        .skip(first + 1)
+        .position(|r| r.contains("usage."))
+        .map(|at| at + first + 1)
+        .unwrap_or_else(|| {
+            panic!(
+                "the fix line does not wrap at 80 columns:\n{}",
+                rows.join("\n")
+            )
+        });
+    let col = |row: &str, needle: &str| row.find(needle).expect("needle is on this row");
+    assert_eq!(
+        col(&rows[rest], "usage."),
+        col(&rows[first], "log in the same account"),
+        "the continuation starts in the same column as its first row:\n{}",
+        rows[first..=rest].join("\n")
+    );
+}
+
 /// The Usage help section documents the note key while an account exists; on
 /// an empty roster the row is gone, so the shadow filter leaves the global
 /// `n new account` row standing, matching the empty state's promise.

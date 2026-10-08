@@ -17310,9 +17310,22 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
-            let would_mix = {
+            // The sidecar fact from the cache, BEFORE the config guard: the
+            // predicate needs it, and reading `session-token.json` here would be
+            // a disk read under the lock (`collect_session_tokens` is built to
+            // keep those apart).
+            let session_token = app.installs_session_token(&name);
+            let (would_mix, no_usage, active) = {
                 let cfg = app.config();
-                chain_would_mix(&cfg, &name)
+                (
+                    chain_would_mix(&cfg, &name),
+                    cfg.find(&name)
+                        .is_some_and(|p| crate::fallback::no_usage_source(p, session_token)),
+                    // A candidate can already be the active account: it is the
+                    // chain it is missing from, not the active slot. Then the
+                    // hazard is not a future one.
+                    cfg.is_active(&name),
+                )
             };
             if would_mix {
                 app.open_modal(Modal::Confirm(ConfirmState {
@@ -17320,6 +17333,32 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                               api account."
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
+                    choice: false,
+                    scroll: ConfirmScroll::default(),
+                    on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
+                }));
+            } else if no_usage {
+                // The walk counts a member without a reading as having headroom
+                // and, once it is active, never moves off it. Said once here,
+                // where the operator still decides; the card's marker keeps
+                // saying it.
+                app.open_modal(Modal::Confirm(ConfirmState {
+                    message: "clauth can't read this account's usage.".into(),
+                    // Two lines: what it costs, then the way out. The dialog
+                    // named the hazard and left the operator to find the fix on
+                    // the card, which is the wrong order for the one surface
+                    // that asks a question.
+                    // The period is added HERE, not in the shared fix line:
+                    // this dialog speaks in sentences and its other two lines
+                    // end in one, while the card's hint and the daemon's log
+                    // line carry the same copy without a full stop, like every
+                    // other hint and log line beside them.
+                    detail: Some(format!(
+                        "{}{}.\n{}.",
+                        crate::fallback::no_usage_hazard_lead(active),
+                        crate::fallback::no_usage_hazard(),
+                        prose::mark_commands(&crate::fallback::no_usage_fix(&[name.as_str()]))
+                    )),
                     choice: false,
                     scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),

@@ -16195,6 +16195,116 @@ fn fallback_add_enter_commits_directly_when_add_would_not_mix() {
     );
 }
 
+/// A blank profile whose sessions run on a long-lived mint and which holds no
+/// OAuth pair: the shape `no_usage_source` is true for. The sidecar is written
+/// into the sandbox home, so `App::new` reads it through the very
+/// `session_tokens` cache the add path asks, which makes the path from the file
+/// to the confirm measured rather than assumed. The caller holds a
+/// `HomeSandbox`.
+fn unmeasured_profile(name: &str) -> crate::profile::Profile {
+    let p = crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    std::fs::create_dir_all(crate::profile::profile_dir(&p.name).expect("profile dir"))
+        .expect("mkdir profile");
+    crate::claude::write_session_token(&p.name, "oat-mint", 0).expect("write the sidecar");
+    p
+}
+
+/// Drive the `+ add` Enter on the first candidate of a chain holding `chain`.
+fn add_first_candidate(profiles: Vec<crate::profile::Profile>, chain: Vec<&str>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            fallback_chain: chain.into_iter().map(Into::into).collect(),
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = super::Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    // `+ add` follows the members; its picker's first row is the first candidate.
+    let add_row = app.config().state.fallback_chain.len();
+    app.chain_cursor = add_row;
+    app.fallback_detail_cursor = 0;
+    super::handle_fallback_add_key(&mut app, crate::testutil::key(super::KeyCode::Enter));
+    app
+}
+
+fn raised_confirm(app: &App) -> &super::ConfirmState {
+    app.modals
+        .last()
+        .and_then(|m| match m {
+            super::Modal::Confirm(s) => Some(s),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected a confirm modal, got {:?}", app.modals))
+}
+
+// #110: adding a member clauth cannot measure asks first, with the production
+// copy read back off the raised modal, and the member stays out until the
+// confirm runs.
+#[test]
+fn fallback_add_enter_raises_confirm_modal_when_the_candidate_has_no_usage_source() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let app = add_first_candidate(
+        vec![
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("alice")),
+            unmeasured_profile("st"),
+        ],
+        vec!["alice"],
+    );
+    let confirm = raised_confirm(&app);
+    assert!(
+        matches!(&confirm.on_confirm, super::ConfirmAction::AddChainCandidate(n) if n == "st"),
+        "confirm carries AddChainCandidate(\"st\"), got {:?}",
+        confirm.on_confirm
+    );
+    assert_eq!(confirm.message, "clauth can't read this account's usage.");
+    // Two lines: the hazard in the tense this candidate is in, then the way
+    // out. The dialog named the cost and left the fix to the card, which is the
+    // wrong order for the one surface that asks a question.
+    assert_eq!(
+        confirm.detail.as_deref(),
+        Some(
+            "once it's active, clauth won't switch away from it on its own.\nlog in the \
+             same account with \u{e001}clauth login st\u{e002} so clauth can read its usage."
+        ),
+    );
+    // The dialog speaks in sentences, all the way down: the fix line was the
+    // one line without a full stop. The shared copy stays without one, because
+    // the card's hint and the daemon's log line sit beside hints and log lines
+    // that carry none.
+    for line in std::iter::once(confirm.message.as_str())
+        .chain(confirm.detail.as_deref().unwrap_or_default().lines())
+    {
+        assert!(line.ends_with('.'), "every line ends in a period: {line:?}");
+    }
+    assert!(
+        !crate::fallback::no_usage_fix(&["st"]).ends_with('.'),
+        "and the shared fix line still carries none"
+    );
+    assert!(
+        !app.config().state.fallback_chain.iter().any(|n| n == "st"),
+        "the candidate must not enter the chain until the confirm runs"
+    );
+}
+
+// An add that would mix kinds AND lands a member clauth cannot measure keeps
+// the mix modal: it is the one about sessions getting stuck, and the
+// unmeasured member's marker still shows once it is in.
+#[test]
+fn fallback_add_enter_keeps_the_mix_modal_when_both_warnings_apply() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut keyed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("keyed"));
+    keyed.api_key = Some("sk-test".to_string());
+    let app = add_first_candidate(vec![keyed, unmeasured_profile("st")], vec!["keyed"]);
+    assert_eq!(
+        raised_confirm(&app).message,
+        "mixing api-key and oauth accounts can leave sessions stuck on the api account.",
+    );
+}
+
 // ── `[ daemon ]` header chip at startup ─────────────────────────────────────
 
 /// The chip's health must be PROBED at construct, never seeded with a constant.
