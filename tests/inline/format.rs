@@ -828,3 +828,33 @@ fn start_lines_match_the_approved_copy() {
         "--auto found no chain member with headroom"
     );
 }
+
+/// \#116 round 4: two surfaces speak about a missing reading and they mean
+/// DIFFERENT things. This cell means "not read yet", which is true of any
+/// account whose first poll is pending; the Fallback pill (`DIAG_NO_USAGE`)
+/// means clauth cannot read that account at all. The pill wore this cell's
+/// words for two rounds, and in a real terminal it was read as this cell's
+/// meaning. Nothing pinned the split: a mutation that reused one constant for
+/// both passed the whole suite, which is why this test exists.
+#[test]
+fn the_explain_age_cell_says_not_yet_where_the_fallback_pill_says_cannot() {
+    let absent = StartCandidate {
+        name: crate::profile::ProfileName::from("blind"),
+        block: None,
+        age: OauthAge::Absent,
+        stale: false,
+        fresh: false,
+        demand: Vec::new(),
+        now: 1_782_000_000,
+    };
+    assert_eq!(
+        start_age_cell(&absent),
+        "no usage yet",
+        "the age cell keeps its own words"
+    );
+    assert_ne!(
+        start_age_cell(&absent),
+        DIAG_NO_USAGE,
+        "and they are not the pill's, which says what clauth cannot do"
+    );
+}

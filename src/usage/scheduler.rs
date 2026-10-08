@@ -3514,6 +3514,19 @@ pub(crate) fn polled_third_party_names(config: &crate::profile::AppConfig) -> Ha
         .collect()
 }
 
+/// The OAuth pair `/usage` polls a profile with, `None` when it holds none:
+/// the credential test [`collect_token_seeds`] applies, hoisted so the startup
+/// seed and the RENDER layer read the same rule instead of restating it (the
+/// OAuth leg's twin of [`third_party_credentialed`]). A profile this answers
+/// `None` for never enters the poll work-list, so no leg ever writes it a
+/// reading, which is what [`crate::fallback::no_usage_source`] reads it for.
+///
+/// Disabled-ness is deliberately not part of it, exactly as there: a separate
+/// axis, and both work lists filter it themselves.
+pub(crate) fn usage_poll_pair(p: &crate::profile::Profile) -> Option<&crate::profile::OAuthToken> {
+    p.credentials.as_ref()?.claude_ai_oauth.as_ref()
+}
+
 /// The in-memory fields `collect_tokens` needs from one enabled OAuth profile,
 /// snapshotted under the config guard so the anchor + stored-token disk reads
 /// (`build_token_entries`) run AFTER the guard drops — the Config lock is a
@@ -3534,7 +3547,7 @@ pub(crate) fn collect_token_seeds(config: &crate::profile::AppConfig) -> Vec<Tok
     config
         .enabled_profiles()
         .filter_map(|p| {
-            let oauth = p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
+            let oauth = usage_poll_pair(p)?;
             Some(TokenSeed {
                 name: p.name.clone(),
                 access_token: oauth.access_token.clone(),
@@ -3604,12 +3617,7 @@ pub(crate) fn collect_oauth_seed_names(config: &crate::profile::AppConfig) -> Ve
     config
         .profiles
         .iter()
-        .filter(|p| {
-            p.credentials
-                .as_ref()
-                .and_then(|c| c.claude_ai_oauth.as_ref())
-                .is_some()
-        })
+        .filter(|p| usage_poll_pair(p).is_some())
         .map(|p| p.name.to_string())
         .collect()
 }

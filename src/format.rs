@@ -720,6 +720,14 @@ pub(crate) const DIAG_MONTHLY_SPENT: &str = "30d spent";
 pub(crate) const DIAG_MONTHLY_SOFT: &str =
     "monthly quota past the weekly switch line, still serving";
 pub(crate) const DIAG_STALE: &str = "stale data";
+/// The Fallback pill for a member clauth cannot measure: it says what clauth
+/// CANNOT DO, not what has not happened yet. "no usage yet" read as "the first
+/// poll is still coming" in a real terminal, which is the opposite of this
+/// state, and it is also what the `--explain` age cell prints for an account
+/// whose first poll really is coming. The verb is the one the add confirm and
+/// the daemon line already use ("can't read ... usage"), so the three surfaces
+/// say one thing.
+pub(crate) const DIAG_NO_USAGE: &str = "can't read usage";
 
 /// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
 /// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) and the
@@ -818,6 +826,9 @@ fn start_age_cell(row: &StartCandidate) -> String {
             }
         }
         OauthAge::Undated => "usage undated (stale)".to_string(),
+        // NOT `DIAG_NO_USAGE`: here the absence really is "not read yet",
+        // which is what this cell has always said and what it still means for
+        // an account whose first poll is pending.
         OauthAge::Absent => "no usage yet".to_string(),
     }
 }

@@ -1666,6 +1666,7 @@ fn fallback_flow_lines(
                     &key_rejected,
                     readings.usage_of(&p.name),
                     readings.status_of(&p.name),
+                    app.installs_session_token(&p.name),
                 )
             });
             let switch_eta = switch_to

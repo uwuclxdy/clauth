@@ -992,6 +992,153 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
     assert_eq!(can.style.fg, theme::danger().fg, "canceled reads dead");
 }
 
+/// Stale and no-usage are two hazards, so they take two shapes (#116 review):
+/// a stale reading is a measurement that went old and the walk will leave such
+/// an active once it is deep-stuck; an unmeasured member is never read at all
+/// and the walk never leaves it.
+///
+/// The shape is SOLID (`◆`): a run in a real terminal showed the dotted `◌`
+/// reading as a light grey ring, because a hairline glyph carries almost none
+/// of this palette's pastel amber, and `◌` is the Usage tab's queued-refresh
+/// dot besides. The pill carries the warning hue too, so the card is charged
+/// even where the 1-cell mark is off screen.
+#[test]
+fn stale_and_no_usage_split_on_shape_and_on_hue() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let stale = reason_marker(&BlockedReason::Stale);
+    let none = reason_marker(&BlockedReason::NoUsage);
+    assert_eq!(none.content, "◆", "its own shape, and a solid one");
+    assert_ne!(none.content, stale.content, "not stale's shape");
+    assert_eq!(none.style.fg, theme::warning().fg, "warning, not faint");
+    assert_ne!(none.style.fg, stale.style.fg, "not stale's hue either");
+    // The 5h glyph is the one other round shape on the card; it cannot co-occur
+    // with this rung (it needs a reading past the line, this rung fires only
+    // when no reading is acting), but it must still read as a different mark.
+    assert_ne!(
+        none.content,
+        reason_marker(&BlockedReason::FiveHour {
+            pct: 99.0,
+            resets_in: None
+        })
+        .content,
+        "distinct from the 5h mark"
+    );
+    let pill = |r: &BlockedReason| -> String {
+        reason_pill_spans(r, ResetFmt::default())
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    // The word says what clauth CANNOT DO. `no usage yet` read as "the first
+    // poll is still coming", which is this state's opposite, and it is what
+    // `start --auto --explain` prints for an account whose poll really is
+    // pending. The verb is the add confirm's and the daemon line's.
+    assert_eq!(pill(&BlockedReason::NoUsage), "[ can't read usage ]");
+    assert_ne!(pill(&BlockedReason::NoUsage), pill(&BlockedReason::Stale));
+    // The label itself is charged, not just the 1-cell mark in the selector:
+    // the card showed this pill in the neutral grey of its own `status` label,
+    // one row under a red `[ auth broken ]`.
+    let label = |r: &BlockedReason| {
+        reason_pill_spans(r, ResetFmt::default())
+            .into_iter()
+            .find(|s| s.content.contains("read usage") || s.content.contains("stale"))
+            .expect("the label span")
+            .style
+    };
+    assert_eq!(
+        label(&BlockedReason::NoUsage).fg,
+        theme::warning().fg,
+        "the pill label carries the warning hue"
+    );
+    assert_ne!(
+        label(&BlockedReason::NoUsage).fg,
+        label(&BlockedReason::Stale).fg,
+        "and stale stays dim"
+    );
+}
+
+/// \#110: a member clauth cannot measure opens its card on the `can't read
+/// usage` pill, and the line under it names the hazard and then the fix. Both
+/// pinned by EQUALITY, as `key_rejected_copy_is_pinned_by_equality` does: a
+/// `contains` let either end drift and stay green (#116 review). The card is
+/// rendered wide enough that the hint is one line, so the pin reads as the
+/// operator sees it.
+///
+/// The hazard is pinned in BOTH tenses. A run in a real terminal met the card
+/// of a member the chain had already walked onto, and it still said "once it's
+/// active": the one state the warning exists for was the one state it spoke
+/// about in the conditional.
+#[test]
+fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
+    // The fixture reading is DROPPED rather than blanked: a member nothing
+    // polls has no entry in the snapshot at all. The sidecar half arrives on
+    // the card itself, the way the render path hands it over from
+    // `App::session_tokens`.
+    let card = |session_token: bool, active: &str| {
+        let (blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        let (cfg, readings) = config_with(
+            vec![
+                profile("ok", 95.0, 10.0, 7200),
+                (blind, ReadingsSnapshot::default()),
+            ],
+            Some(active),
+            vec!["ok", "blind"],
+        );
+        member_detail(
+            &cfg,
+            &crate::profile::ProfileName::from("blind"),
+            MemberCard {
+                width: 160,
+                session_token,
+                ..Default::default()
+            },
+            &HashSet::new(),
+            &readings,
+        )
+        .0
+    };
+    let lines = card(true, "ok");
+    assert_eq!(
+        line_text(&lines[0]),
+        "status          [ can't read usage ]",
+        "the pill row, with nothing after the pill"
+    );
+    assert_eq!(
+        line_text(&lines[1]),
+        "└ once it's active, clauth won't switch away from it on its own: log in the same \
+         account with clauth login blind so clauth can read its usage",
+        "the hazard in the future tense while another member is active"
+    );
+    // The gauge row keeps upstream's own word: with the pill saying what clauth
+    // cannot do, this is no longer a second phrasing of one fact.
+    let gauge = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.starts_with("5h usage"))
+        .expect("the 5h row");
+    assert!(
+        gauge.ends_with("no data yet"),
+        "the gauge row says there is no figure: {gauge:?}"
+    );
+
+    // The same member, now the active one: the hazard is the state of the
+    // machine, not a forecast.
+    assert_eq!(
+        line_text(&card(true, "blind")[1]),
+        "└ it's active, and clauth won't switch away from it on its own: log in the same \
+         account with clauth login blind so clauth can read its usage",
+        "the hazard in the present tense once the chain has landed here"
+    );
+
+    // The same fixture without the sidecar: nothing serves from it, so this is
+    // the logged-out shape and the card opens on its gauge instead of the pill.
+    assert_ne!(
+        line_text(&card(false, "ok")[0]),
+        line_text(&lines[0]),
+        "without a session token the card carries no no-usage pill"
+    );
+}
+
 /// A disabled chain member — still configured in `fallback_chain` on disk,
 /// only the walk skips it (see `Profile::is_disabled`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
@@ -1099,7 +1246,8 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
             None,
             &HashSet::new(),
             readings.usage.get(p.name.as_str()),
-            readings.status_of(p.name.as_str())
+            readings.status_of(p.name.as_str()),
+            false
         ),
         Some(BlockedReason::Disabled),
         "disabled ranks first, above canceled and auth broken"
@@ -1129,7 +1277,8 @@ fn blocked_reason_ranks_disabled_above_canceled_and_auth_broken() {
                     .unwrap()
                     .name
                     .as_str()
-            )
+            ),
+            false
         ),
         Some(BlockedReason::Canceled),
         "without the disabled bit the canceled rung wins"
@@ -1166,7 +1315,8 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
                     .unwrap()
                     .name
                     .as_str()
-            )
+            ),
+            false
         ),
         None,
         "a disabled ACTIVE member has headroom and reports no block"
@@ -1196,7 +1346,8 @@ fn blocked_reason_never_reports_disabled_for_the_active_profile() {
                     .unwrap()
                     .name
                     .as_str()
-            )
+            ),
+            false
         ),
         Some(BlockedReason::Disabled),
         "a disabled NON-active member reports the block"
@@ -1346,7 +1497,8 @@ fn the_spent_fix_names_a_monthly_quota() {
                 resets_in: None,
                 monthly: true,
             },
-            &crate::profile::ProfileName::from("acct")
+            &crate::profile::ProfileName::from("acct"),
+            false,
         ),
         "monthly quota is spent"
     );
@@ -1382,7 +1534,8 @@ fn the_soft_fix_names_a_monthly_quota() {
                 pct: 99.0,
                 monthly: true,
             },
-            &crate::profile::ProfileName::from("acct")
+            &crate::profile::ProfileName::from("acct"),
+            false,
         ),
         "monthly quota past the weekly switch line, still serving"
     );
@@ -1846,10 +1999,11 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
             monthly: false,
         },
         BlockedReason::Stale,
+        BlockedReason::NoUsage,
     ];
     let mut seen: Vec<String> = Vec::new();
     for reason in all {
-        let fix = reason_fix(&reason, &crate::profile::ProfileName::from("acct"));
+        let fix = reason_fix(&reason, &crate::profile::ProfileName::from("acct"), false);
         assert!(!fix.trim().is_empty(), "{reason:?} has no fix copy");
         assert_eq!(
             fix,
@@ -1862,7 +2016,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         );
         seen.push(fix);
     }
-    assert_eq!(seen.len(), 10, "every variant contributed a distinct fix");
+    assert_eq!(seen.len(), 11, "every variant contributed a distinct fix");
 }
 
 /// F2: the key-rejected copy is cloudy's verbatim, pinned by equality — the
@@ -1873,6 +2027,7 @@ fn key_rejected_copy_is_pinned_by_equality() {
     let fix = reason_fix(
         &BlockedReason::KeyRejected,
         &crate::profile::ProfileName::from("acct"),
+        false,
     );
     assert_eq!(
         fix, "re-enter the api key on the setup tab",
@@ -2558,6 +2713,56 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
     );
 }
 
+/// The selector marks a member clauth cannot measure with `◆` in the same
+/// last content column every other marker holds. The fixture installs the
+/// sidecar in the app's own cache, which is where the render path reads it: a
+/// `NotLongLived` mis-fill is NOT this shape (the split stays disengaged, so
+/// `credentials.json` is still what switches install), and a member with no
+/// sidecar at all is the logged-out shape, not this one.
+#[test]
+fn the_selector_marks_a_member_clauth_cannot_measure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let pane = |status: Option<crate::claude::SessionTokenStatus>| {
+        let (blind, _unpolled) = profile("blind", 95.0, 0.0, 7200);
+        let (cfg, readings) = config_with(
+            vec![
+                profile("ok", 95.0, 10.0, 7200),
+                (blind, ReadingsSnapshot::default()),
+            ],
+            Some("ok"),
+            vec!["ok", "blind"],
+        );
+        let mut app = app_with_readings(cfg, &readings);
+        if let Some(status) = status {
+            app.session_tokens.insert("blind".into(), status);
+        }
+        chain_selector_pane(&app, 100, 5)
+    };
+    assert_eq!(
+        pane(Some(crate::claude::SessionTokenStatus::LongLived(None))),
+        vec![
+            "╭─ CHAIN ────────────────────╮".to_string(),
+            "│ ❯  #1 ok                   │".to_string(),
+            "│    #2 blind              ◆ │".to_string(),
+            "│                            │".to_string(),
+            "╰────────────────────────────╯".to_string(),
+        ],
+    );
+    let unmarked = vec![
+        "╭─ CHAIN ────────────────────╮".to_string(),
+        "│ ❯  #1 ok                   │".to_string(),
+        "│    #2 blind                │".to_string(),
+        "│                            │".to_string(),
+        "╰────────────────────────────╯".to_string(),
+    ];
+    assert_eq!(pane(None), unmarked, "no sidecar, no mark");
+    assert_eq!(
+        pane(Some(crate::claude::SessionTokenStatus::NotLongLived)),
+        unmarked,
+        "a mis-fill installs nothing, so it is not this shape either"
+    );
+}
+
 /// The narrow counterpart: a name too long for the row gives up the cells the
 /// marker needs, rather than the marker being appended past the pane for
 /// ratatui to discard — which rendered a BLOCKED account identically to a
@@ -3032,7 +3237,7 @@ fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
     use crate::testutil::{assert_prose_part, lines_buffer};
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
 
-    let fix = reason_fix(&BlockedReason::AuthBroken, &ProfileName::from("a"));
+    let fix = reason_fix(&BlockedReason::AuthBroken, &ProfileName::from("a"), false);
     assert_prose_part(
         &lines_buffer(rail_hint_lines(&fix, 60, false), 60),
         "re-login with clauth login a",

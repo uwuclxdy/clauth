@@ -501,6 +501,113 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
         .is_some_and(|p| p.is_canceled())
 }
 
+/// True when clauth has no way to read `profile`'s usage while something is
+/// still serving sessions from it: the `claude setup-token` shape (#110), a
+/// long-lived session token with no OAuth pair beside it. `/usage` needs that
+/// pair's `user:profile` scope, so the scheduler never polls such a member, and
+/// the walk, finding no reading, counts it as having headroom (see
+/// [`no_usage_hazard`] for what that does once it is active).
+///
+/// The poll test is [`crate::usage::usage_poll_pair`], the one
+/// [`crate::usage::collect_tokens`] keys its work-list on, read here rather
+/// than restated: the marker and the poller cannot drift apart, and if a leg
+/// ever starts polling this shape the marker retires itself.
+///
+/// `has_session_token` is the sidecar fact a `&Profile` cannot answer, since it
+/// lives on disk: the caller supplies it so no render path stats a file per
+/// frame (the TUI reads its per-frame `App::session_tokens` cache, the daemon
+/// [`crate::claude::has_session_token`] once at boot). The long-lived state is
+/// the one every switch keys on, expiry or not: an expired token stops serving,
+/// it does not make the account measurable.
+///
+/// Three shapes are deliberately NOT this:
+/// * a member with no login at all, which serves nothing and carries its own
+///   logged-out state,
+/// * an api-key account, with or without an endpoint (the kind the TUI's
+///   `chain_would_mix` splits on): it spends a balance or a provider's own
+///   windows, and a window nobody publishes has no line to cross,
+/// * a member routed elsewhere by `[env] ANTHROPIC_BASE_URL`, whose requests
+///   never reach the pool an Anthropic login would measure.
+///   [`Profile::routing_endpoint`] reads both halves, where
+///   [`Profile::is_oauth`] reads the managed field alone and would flag such a
+///   member, then tell the operator to add a login whose windows the walk would
+///   be reading for another pool's traffic.
+///
+/// Pure (no disk read), so a render path can ask it per frame.
+pub(crate) fn no_usage_source(profile: &Profile, has_session_token: bool) -> bool {
+    has_session_token
+        && profile.routing_endpoint().is_none()
+        && profile.api_key.is_none()
+        && crate::usage::usage_poll_pair(profile).is_none()
+}
+
+/// What a member without a usage source ([`no_usage_source`]) does to the
+/// chain, and the one place that copy lives: shared by the add confirm, the
+/// member card and the daemon boot warning so the three cannot drift apart.
+///
+/// Two ways in, and they differ. The exhaustion walk reaches such a member only
+/// once no freshly read member is clear, because its fresh-first pass runs
+/// before the any-clear one. The scoped hop has no fresh-first pass at all: a
+/// per-model weekly line crossed on an otherwise-healthy active walks the clear
+/// list in chain order, and an unmeasured member reads clear (no reading, so no
+/// aggregate gate and no scoped window bites), so that hop lands on it ahead of
+/// a fresh member with room.
+///
+/// Either way it stays: once it is active the scan finds no reading to act on
+/// (`reading_is_actionable` wants a `Fresh` status, and nothing polls this
+/// member), so only a dead login or the operator moves the chain off it.
+///
+/// This is the INVARIANT half, the same words on every surface. The lead in
+/// front of it carries the tense, which differs per surface and per state:
+/// [`no_usage_hazard_lead`] for a surface looking at one member, and the
+/// daemon's own wording for a line that speaks about a list.
+pub(crate) fn no_usage_hazard() -> &'static str {
+    "clauth won't switch away from it on its own"
+}
+
+/// The lead that puts [`no_usage_hazard`] in the right tense for the member a
+/// surface is showing. A run in a real terminal found the card saying "once
+/// it's active" about the member that WAS active: the chain had walked onto it
+/// after the account ahead of it went auth-broken. That is the state the whole
+/// warning exists for, and it was the one state where the sentence read as a
+/// hypothetical.
+///
+/// Kept beside the invariant rather than in the render layer so a third surface
+/// cannot invent a third tense.
+pub(crate) fn no_usage_hazard_lead(active: bool) -> &'static str {
+    if active {
+        "it's active, and "
+    } else {
+        "once it's active, "
+    }
+}
+
+/// The one fix line for a member clauth cannot measure ([`no_usage_source`]):
+/// the login that gives `/usage` a pair to poll, while sessions keep running on
+/// the session token. Shared by the member card and the daemon boot line the
+/// way [`uncapped_spend_fix`] is, so the two cannot drift; `names` carries every
+/// member the line is about, which is why the daemon's line spells them out
+/// instead of leaving a placeholder beside a list that just named them.
+///
+/// `clauth login <name>` and not `--setup-token`: the login has to be for the
+/// SAME account the token was minted from, and nothing on the profile ties the
+/// two together, so the line says which account rather than implying clauth
+/// could check. The command sits in backticks, the form shared copy uses
+/// ([`crate::tui::render::prose::mark_commands`] marks it where it renders).
+pub(crate) fn no_usage_fix(names: &[&str]) -> String {
+    let logins = names
+        .iter()
+        .map(|n| format!("`clauth login {n}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (account, whose) = if names.len() == 1 {
+        ("account", "its")
+    } else {
+        ("accounts", "their")
+    };
+    format!("log in the same {account} with {logins} so clauth can read {whose} usage")
+}
+
 /// Recent burn rate (%/h) for `name`'s 5h window: durable per-profile history
 /// (`usage_history.jsonl`, a plain disk read — no shared lock, so this is safe
 /// to call without touching the order in `lockorder.rs`, but never while
@@ -745,6 +852,15 @@ pub(crate) enum BlockedReason {
     /// Last read wasn't live (cached / endpoint-429): the numbers are old, so the
     /// chain distrusts this member's apparent headroom.
     Stale,
+    /// No reading at all, on a member clauth cannot measure
+    /// ([`no_usage_source`]): the walk counts it as having headroom, so a switch
+    /// here lands blind and nothing switches off it ([`no_usage_hazard`]).
+    /// Lowest rung, because it blocks nothing and every rung above says more.
+    /// Like `Stale` it is never fresh, so the EXHAUSTION walk takes it only in
+    /// the pass that accepts any freshness, at its place in that pass's order.
+    /// The scoped hop runs no freshness pass at all and can land on it ahead of
+    /// a freshly read member with room (see [`no_usage_hazard`]).
+    NoUsage,
 }
 
 /// Seconds until `window` resets, clamped at 0, or `None` when it carries no
@@ -765,7 +881,11 @@ fn reset_secs(window: &UsageWindow, now: i64) -> Option<i64> {
 /// `Some(until)` epoch secs when the member is switch-grade kick-rejected
 /// ([`crate::usage::switch_grade_kick_lifts`]), else `None`. `key_rejected`
 /// is the key-rejected member set the caller read once outside the config
-/// guard (never a per-candidate disk read here).
+/// guard (never a per-candidate disk read here). `session_token` is the same
+/// kind of fact for the sidecar: whether a long-lived `session-token.json` is
+/// what switches install for this member, which lives on disk and so is read
+/// once per frame by the caller (`App::session_tokens`), never stat-ed per
+/// candidate here.
 pub(crate) fn blocked_reason(
     config: &AppConfig,
     profile: &Profile,
@@ -773,6 +893,7 @@ pub(crate) fn blocked_reason(
     key_rejected: &HashSet<ProfileName>,
     usage: Option<&UsageInfo>,
     status: Option<FetchStatus>,
+    session_token: bool,
 ) -> Option<BlockedReason> {
     // Disabled first, and only for a NON-active member: `snapshot_chain` and
     // the chain walks skip a disabled member as a CANDIDATE but deliberately never
@@ -781,7 +902,15 @@ pub(crate) fn blocked_reason(
     if profile.is_disabled() && !config.is_active(&profile.name) {
         return Some(BlockedReason::Disabled);
     }
-    health_blocked_reason(config, profile, kick_lift, key_rejected, usage, status)
+    health_blocked_reason(
+        config,
+        profile,
+        kick_lift,
+        key_rejected,
+        usage,
+        status,
+        session_token,
+    )
 }
 
 /// [`blocked_reason`] minus the `Disabled` rung: the worst reason this member's
@@ -798,6 +927,7 @@ pub(crate) fn health_blocked_reason(
     key_rejected: &HashSet<ProfileName>,
     usage: Option<&UsageInfo>,
     status: Option<FetchStatus>,
+    session_token: bool,
 ) -> Option<BlockedReason> {
     // Canceled subscription first (dead-first): a 403-ing account outranks a
     // login that could still refresh. Mirrors the walk's `is_canceled` skip.
@@ -881,6 +1011,22 @@ pub(crate) fn health_blocked_reason(
     }
     if matches!(status, Some(FetchStatus::Cached | FetchStatus::RateLimited)) {
         return Some(BlockedReason::Stale);
+    }
+    // Keyed on the SHAPE, not on the reading: nothing polls this member (the
+    // gate is `usage_poll_pair`, the one `collect_tokens` keys on), so a reading
+    // it carries is never a current one. A log-out does not leave one behind
+    // either: `usage::forget` drops the half's name-keyed store entries beside
+    // its on-disk cache (`forget_memory` / `forget_disk`, driven by the
+    // `ForgetPlan` the change site builds), so the figure goes with the login.
+    // Gating on `usage.is_none()` would still ask the wrong question — what has
+    // been READ, rather than whether anything polls this member at all.
+    //
+    // Lowest rung by design, and that is what keeps it honest: every rung above
+    // reads a reading, so when one of them fires, the card and the walk are
+    // acting on the same figure, and when none does, the walk is counting this
+    // member as having room, which is the state the operator has to see.
+    if no_usage_source(profile, session_token) {
+        return Some(BlockedReason::NoUsage);
     }
     None
 }
@@ -1433,7 +1579,7 @@ fn ordered_walk<'u>(
 /// Why a chain member is ineligible for a START (not a mid-session switch),
 /// rendered as one label per arm. [`start_block`]'s ladder mirrors
 /// [`health_blocked_reason`]'s precedence, minus the rungs a start does not
-/// decide on (budget, staleness) and plus the two a start alone knows
+/// decide on (budget, staleness, no usage) and plus the two a start alone knows
 /// (`NotOauth`, the narrowed per-model demand).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StartBlock {

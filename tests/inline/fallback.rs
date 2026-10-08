@@ -2757,7 +2757,8 @@ fn blocked_reason_reports_canceled_first() {
             None,
             &HashSet::new(),
             readings.usage.get(profile.name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::Canceled),
     );
@@ -2775,7 +2776,8 @@ fn blocked_reason_reports_canceled_first() {
             None,
             &HashSet::new(),
             readings.usage.get(profile.name.as_str()),
-            None
+            None,
+            false
         ),
         None
     );
@@ -4997,7 +4999,8 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                 None,
                 &HashSet::new(),
                 readings.usage.get(cand.name.as_str()),
-                None
+                None,
+                false
             ),
             Some(BlockedReason::Disabled | BlockedReason::Canceled | BlockedReason::AuthBroken)
         )
@@ -5031,7 +5034,8 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                         .name
                         .as_str()
                 ),
-                None
+                None,
+                false
             )
         );
     };
@@ -5070,7 +5074,8 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                     .name
                     .as_str()
             ),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::Disabled)
     );
@@ -5097,7 +5102,8 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                     .name
                     .as_str()
             ),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::AuthBroken)
     );
@@ -5126,7 +5132,8 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                     .name
                     .as_str()
             ),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::Canceled)
     );
@@ -5164,7 +5171,8 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                     .name
                     .as_str()
             ),
-            None
+            None,
+            false
         ),
         None
     );
@@ -5207,7 +5215,8 @@ fn candidate_exclusion_and_dead_first_chip_stay_coupled() {
                         .name
                         .as_str()
                 ),
-                None
+                None,
+                false
             ),
             Some(BlockedReason::FiveHour { .. })
         ),
@@ -5239,15 +5248,24 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
             | BlockedReason::FiveHour { .. }
             | BlockedReason::ScopedSpent { .. }
             | BlockedReason::WeeklySoft { .. }
-            | BlockedReason::Stale => false,
+            | BlockedReason::Stale
+            | BlockedReason::NoUsage => false,
         }
     }
+
+    // The sidecar half of the ladder's lowest rung. Every fixture here is
+    // credential-less, so `no_usage_source` would hold for ALL of them with a
+    // long-lived token installed: each arm passes `NO_TOKEN` to be judged by its
+    // own rung, and the `NoUsage` arm passes `TOKEN` to reach that rung at all.
+    const TOKEN: bool = true;
+    const NO_TOKEN: bool = false;
 
     // Confirms the fixture actually triggers `expected` AND that the walk's
     // skip agrees with `dead_first` on it, for the resolvable non-active
     // "cand" behind a healthy active "keep".
     let assert_variant = |config: &AppConfig,
                           kick_lift: Option<i64>,
+                          session_token: bool,
                           expected: &dyn Fn(&BlockedReason) -> bool,
                           label: &str,
                           readings: &TestReadings| {
@@ -5261,6 +5279,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
             &HashSet::new(),
             readings.usage.get(cand.name.as_str()),
             readings.status.get(cand.name.as_str()).copied(),
+            session_token,
         )
         .unwrap_or_else(|| panic!("{label}: blocked_reason returned None"));
         assert!(expected(&reason), "{label}: got {reason:?}");
@@ -5292,6 +5311,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::Disabled),
         "Disabled",
         &readings,
@@ -5308,6 +5328,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::Canceled),
         "Canceled",
         &readings,
@@ -5322,6 +5343,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::AuthBroken),
         "AuthBroken",
         &readings,
@@ -5338,6 +5360,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::WeeklySpent { .. }),
         "WeeklySpent",
         &readings,
@@ -5356,6 +5379,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         Some(until),
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::KickRejected { .. }),
         "KickRejected",
         &readings,
@@ -5370,6 +5394,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::BudgetSpent),
         "BudgetSpent",
         &readings,
@@ -5383,6 +5408,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::FiveHour { .. }),
         "FiveHour",
         &readings,
@@ -5408,6 +5434,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::ScopedSpent { .. }),
         "ScopedSpent",
         &readings,
@@ -5424,6 +5451,7 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::WeeklySoft { .. }),
         "WeeklySoft",
         &readings,
@@ -5441,8 +5469,23 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
     assert_variant(
         &config,
         None,
+        NO_TOKEN,
         &|r| matches!(r, BlockedReason::Stale),
         "Stale",
+        &readings,
+    );
+
+    // NoUsage: a member clauth cannot measure, with no reading. Display-only.
+    let (config, readings) = config_with_chain(
+        vec![keeper(), profile_with_usage("cand", Some(90.0), None)],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        TOKEN,
+        &|r| matches!(r, BlockedReason::NoUsage),
+        "NoUsage",
         &readings,
     );
 }
@@ -5458,7 +5501,8 @@ fn blocked_reason_none_for_a_live_member_with_headroom() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         None
     );
@@ -5477,7 +5521,8 @@ fn blocked_reason_auth_broken_outranks_every_other_block() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::AuthBroken)
     );
@@ -5489,7 +5534,7 @@ fn blocked_reason_weekly_hard_carries_the_7d_reset_countdown() {
     let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None),
+            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
             Some(BlockedReason::WeeklySpent { resets_in: Some(secs), monthly: false })
                 if (3500..=3600).contains(&secs)
         ),
@@ -5500,7 +5545,8 @@ fn blocked_reason_weekly_hard_carries_the_7d_reset_countdown() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         )
     );
 }
@@ -5517,7 +5563,8 @@ fn blocked_reason_weekly_hard_outranks_a_5h_block() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::WeeklySpent { .. })
     ));
@@ -5537,7 +5584,8 @@ fn a_monthly_only_member_past_the_soft_line_carries_the_monthly_label() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::WeeklySoft {
             pct: 99.0,
@@ -5560,6 +5608,7 @@ fn a_monthly_only_member_at_the_hard_cap_carries_the_monthly_label() {
         &HashSet::new(),
         readings.usage.get(cfg.profiles[0].name.as_str()),
         None,
+        false,
     );
     assert_eq!(
         reason.as_ref().map(|r| match r {
@@ -5585,7 +5634,8 @@ fn blocked_reason_budget_spent_when_billing_and_over_ceiling() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::BudgetSpent)
     );
@@ -5609,7 +5659,8 @@ fn blocked_reason_budget_spent_is_moot_with_free_5h_quota() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         None
     );
@@ -5621,7 +5672,7 @@ fn blocked_reason_five_hour_reports_utilization_and_reset() {
     let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None),
+            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
             Some(BlockedReason::FiveHour { pct, resets_in: Some(secs) })
                 if (pct - 97.0).abs() < f64::EPSILON && (3500..=3600).contains(&secs)
         ),
@@ -5632,7 +5683,8 @@ fn blocked_reason_five_hour_reports_utilization_and_reset() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         )
     );
 }
@@ -5643,7 +5695,7 @@ fn blocked_reason_weekly_soft_below_the_hard_cap_still_shows() {
     let p = profile_with_usage("a", Some(95.0), Some(both_windows(40.0, 99.0)));
     let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(matches!(
-        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None),
+        blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
         Some(BlockedReason::WeeklySoft { pct, monthly: false }) if (pct - 99.0).abs() < f64::EPSILON
     ));
 }
@@ -5660,7 +5712,8 @@ fn blocked_reason_five_hour_outranks_a_soft_weekly_block() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::FiveHour { .. })
     ));
@@ -5686,7 +5739,7 @@ fn blocked_reason_scoped_spent_names_the_worst_gated_window() {
     let (cfg, readings) = config_with_chain(vec![p], "a");
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None),
+            blocked_reason(&cfg, &cfg.profiles[0], None, &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
             Some(BlockedReason::ScopedSpent { label, pct })
                 if label == "7d opus" && (pct - 100.0).abs() < f64::EPSILON
         ),
@@ -5697,7 +5750,8 @@ fn blocked_reason_scoped_spent_names_the_worst_gated_window() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         )
     );
 }
@@ -5724,7 +5778,8 @@ fn blocked_reason_scoped_gate_off_never_claims_a_scoped_block() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::WeeklySoft { .. })
     ));
@@ -5748,7 +5803,8 @@ fn blocked_reason_weekly_gate_off_drops_the_soft_chip() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         None
     );
@@ -5766,7 +5822,8 @@ fn blocked_reason_stale_when_the_last_read_was_cached() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            readings.status.get(cfg.profiles[0].name.as_str()).copied()
+            readings.status.get(cfg.profiles[0].name.as_str()).copied(),
+            false
         ),
         Some(BlockedReason::Stale)
     );
@@ -5785,7 +5842,8 @@ fn blocked_reason_a_real_block_outranks_stale_data() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            readings.status.get(cfg.profiles[0].name.as_str()).copied()
+            readings.status.get(cfg.profiles[0].name.as_str()).copied(),
+            false
         ),
         Some(BlockedReason::FiveHour { .. })
     ));
@@ -5805,7 +5863,8 @@ fn blocked_reason_failed_fetch_is_not_flagged_stale() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            readings.status.get(cfg.profiles[0].name.as_str()).copied()
+            readings.status.get(cfg.profiles[0].name.as_str()).copied(),
+            false
         ),
         None
     );
@@ -5821,7 +5880,7 @@ fn blocked_reason_kick_rejected_when_switch_grade_with_headroom() {
     let until = now_epoch_secs() + 3600;
     assert!(
         matches!(
-            blocked_reason(&cfg, &cfg.profiles[0], Some(until), &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None),
+            blocked_reason(&cfg, &cfg.profiles[0], Some(until), &HashSet::new(), readings.usage.get(cfg.profiles[0].name.as_str()), None, false),
             Some(BlockedReason::KickRejected { lifts_in }) if (3500..=3600).contains(&lifts_in)
         ),
         "got {:?}",
@@ -5831,7 +5890,8 @@ fn blocked_reason_kick_rejected_when_switch_grade_with_headroom() {
             Some(until),
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         )
     );
 }
@@ -5851,7 +5911,8 @@ fn blocked_reason_kick_rejected_outranks_a_5h_block() {
             Some(until),
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::KickRejected { .. })
     ));
@@ -5870,7 +5931,8 @@ fn blocked_reason_weekly_hard_outranks_a_kick_block() {
             Some(until),
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::WeeklySpent { .. })
     ));
@@ -6532,7 +6594,8 @@ fn blocked_reason_scoped_override_is_inert_while_weekly_gate_is_off() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         None,
         "a gated-off override must not put the chip on the card"
@@ -6557,7 +6620,8 @@ fn blocked_reason_scoped_override_is_inert_while_weekly_gate_is_off() {
                 None,
                 &HashSet::new(),
                 readings.usage.get(cfg.profiles[0].name.as_str()),
-                None
+                None,
+                false
             ),
             Some(BlockedReason::ScopedSpent { .. })
         ),
@@ -6587,7 +6651,8 @@ fn blocked_reason_five_hour_outranks_scoped_spent() {
             None,
             &HashSet::new(),
             readings.usage.get(cfg.profiles[0].name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::FiveHour { .. })
     ));
@@ -8367,7 +8432,8 @@ fn health_blocked_reason_reports_a_key_rejected_member() {
             None,
             &key_rejected,
             readings.usage.get(profile.name.as_str()),
-            None
+            None,
+            false
         ),
         Some(BlockedReason::KeyRejected),
         "a key-rejected member's chip must carry the KeyRejected rung"
@@ -9014,4 +9080,260 @@ fn codex_members_never_arm_the_credit_gate() {
     let state = codex_state("cx1", &["cx1", "cx2"], false, None);
     let snap = crate::fallback::snapshot_codex_chain(&state, 60_000).expect("snapshot");
     assert!(snap.chain.iter().all(|m| !m.check_credit_cap));
+}
+
+// ── members clauth cannot measure (#110) ────────────────────────────────────
+// A member whose sessions run on a long-lived `claude setup-token` mint with no
+// OAuth pair beside it has no usage source: `/usage` needs that pair's scope.
+// The Fallback marker names it; the walk is left exactly as it was.
+
+/// `f` with an OAuth login, the one subscription shape `/usage` can poll.
+/// A fixture marker in the `mark_fresh` family: the login sits on the profile
+/// half, so it composes with the reading the fixture carries beside it.
+fn with_oauth_login(mut f: Fixture) -> Fixture {
+    f.profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    f
+}
+
+/// The predicate is a conjunction of the profile shape and the sidecar fact the
+/// caller holds, so every shape is asked BOTH ways: a session token with no
+/// OAuth pair IS this marker, and a member holding no login at all is NOT (it
+/// serves nothing, and carries its own logged-out state).
+#[test]
+fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
+    // The predicate reads the profile alone (no reading, no store), so each
+    // shape is taken off its fixture's profile half.
+    let bare = |n: &str| profile_with_usage(n, None, None).profile;
+    assert!(
+        no_usage_source(&bare("st"), true),
+        "a long-lived token with no pair: the setup-token shape, nothing to poll"
+    );
+    assert!(
+        !no_usage_source(&bare("out"), false),
+        "no login at all is not this marker: nothing serves from it either"
+    );
+    let mut empty = bare("e");
+    empty.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: None,
+    });
+    assert!(
+        no_usage_source(&empty, true),
+        "a credentials record without an OAuth login polls nothing either"
+    );
+    assert!(
+        !no_usage_source(
+            &with_oauth_login(profile_with_usage("o", None, None)).profile,
+            true
+        ),
+        "the pair is what `/usage` polls, sidecar beside it or not"
+    );
+    let mut direct_key = bare("k");
+    direct_key.api_key = Some("sk-test".into());
+    assert!(
+        !no_usage_source(&direct_key, true),
+        "an api key without an endpoint is still an api-key account"
+    );
+    let mut endpoint = bare("p");
+    endpoint.base_url = Some("https://api.example.test".into());
+    endpoint.api_key = Some("sk-test".into());
+    assert!(
+        !no_usage_source(&endpoint, true),
+        "a provider endpoint answers through its own leg"
+    );
+    let mut keyless = bare("c");
+    keyless.base_url = Some("https://api.example.test".into());
+    assert!(
+        !no_usage_source(&keyless, true),
+        "an endpoint without a key (a console-only Alibaba member) is no subscription"
+    );
+    // The `[env] ANTHROPIC_BASE_URL` half `is_oauth` cannot see (#116 review):
+    // such a member routes its requests to another pool, so the login this
+    // marker asks for would feed the walk windows that pool never spends.
+    let mut env_routed = bare("env");
+    env_routed.env.insert(
+        "ANTHROPIC_BASE_URL".to_string(),
+        "https://api.example.test".to_string(),
+    );
+    assert!(
+        !no_usage_source(&env_routed, true),
+        "an env-routed member is measured where its requests go, not here"
+    );
+    let mut blank_env = bare("blank");
+    blank_env
+        .env
+        .insert("ANTHROPIC_BASE_URL".to_string(), "   ".to_string());
+    assert!(
+        no_usage_source(&blank_env, true),
+        "an entry blank once trimmed is no override, as `routing_endpoint` reads it"
+    );
+}
+
+/// The rung fires on the SHAPE, not on the reading the caller happens to hold,
+/// and every rung above it still outranks it.
+#[test]
+fn no_usage_marks_a_member_clauth_cannot_measure_whatever_reading_it_holds() {
+    let keeper = || {
+        mark_fresh(with_oauth_login(profile_with_util(
+            "keep",
+            Some(90.0),
+            Some(10.0),
+        )))
+    };
+    let reason = |cand: Fixture, session_token: bool| {
+        let (config, readings) = config_with_chain(vec![keeper(), cand], "keep");
+        let cand = config
+            .find(&crate::profile::ProfileName::from("cand"))
+            .expect("cand");
+        blocked_reason(
+            &config,
+            cand,
+            None,
+            &HashSet::new(),
+            readings.usage.get(cand.name.as_str()),
+            readings.status.get(cand.name.as_str()).copied(),
+            session_token,
+        )
+    };
+    assert_eq!(
+        reason(profile_with_usage("cand", Some(90.0), None), true),
+        Some(BlockedReason::NoUsage),
+    );
+    assert_eq!(
+        reason(profile_with_usage("cand", Some(90.0), None), false),
+        None,
+        "without a session token it is the logged-out shape, which is not this rung"
+    );
+    // Why the rung reads no reading at all: whether anything polls this member
+    // is a question of its shape, so a figure it carries is never a current
+    // one, and a guard on `usage.is_none()` would ask what has been READ
+    // instead — which let a leftover figure hide the marker while the hazard
+    // stayed live.
+    assert_eq!(
+        reason(profile_with_util("cand", Some(90.0), Some(40.0)), true),
+        Some(BlockedReason::NoUsage),
+        "a leftover reading from a login since removed does not retire it"
+    );
+    assert_eq!(
+        reason(
+            with_oauth_login(profile_with_usage("cand", Some(90.0), None)),
+            true
+        ),
+        None,
+        "an OAuth member not read yet is not marked: its first poll is coming"
+    );
+    // Lowest rung by design, and that is what keeps it honest: a leftover
+    // reading over the line names the figure the walk is acting on too.
+    assert!(
+        matches!(
+            reason(profile_with_util("cand", Some(90.0), Some(95.0)), true),
+            Some(BlockedReason::FiveHour { .. })
+        ),
+        "a reading past the line is what the walk reads, so it names the pill"
+    );
+    assert_eq!(
+        reason(
+            mark_disabled(profile_with_usage("cand", Some(90.0), None)),
+            true
+        ),
+        Some(BlockedReason::Disabled),
+        "lowest rung: every other reason outranks it"
+    );
+    let (config, readings) = {
+        let (mut config, readings) = config_with_chain(
+            vec![keeper(), profile_with_usage("cand", Some(90.0), None)],
+            "keep",
+        );
+        config.state.auth_broken = vec![ProfileName::from("cand")];
+        (config, readings)
+    };
+    assert_eq!(
+        health_blocked_reason(
+            &config,
+            &config.profiles[1],
+            None,
+            &HashSet::new(),
+            readings.usage.get("cand"),
+            readings.status.get("cand").copied(),
+            true,
+        ),
+        Some(BlockedReason::AuthBroken),
+        "a health rung outranks it too"
+    );
+}
+
+// The marker is display-only: the walk treats an unmeasured member like any
+// member it holds no fresh reading for. `a` is spent, `blind` (unmeasured)
+// sits before `c` (measured headroom). With nothing fresh, the walk lands on
+// `blind` in chain order; once `c` reads fresh, its pass comes first. A walk
+// that demoted members it cannot measure would land on `c` in the first case.
+// One walk answers both surfaces: the scheduler's pass and the TUI's
+// projection run `next_auto_switch_target_with_usage` over a snapshot.
+//
+// What the hazard copy promises about the ACTIVE member is pinned where it is
+// decided, at the scheduler's `reading_is_actionable` gate
+// (`scheduler::an_unmeasured_active_is_never_switched_away_from`), not here.
+#[test]
+fn the_walk_treats_an_unmeasured_member_like_any_member_without_a_fresh_reading() {
+    let chain = |c: Fixture| {
+        config_with_chain(
+            vec![
+                with_oauth_login(profile_with_util("a", Some(95.0), Some(100.0))),
+                profile_with_usage("blind", Some(95.0), None),
+                c,
+            ],
+            "a",
+        )
+    };
+
+    let (config, readings) = chain(with_oauth_login(profile_with_util(
+        "c",
+        Some(95.0),
+        Some(10.0),
+    )));
+    let blind = config
+        .find(&crate::profile::ProfileName::from("blind"))
+        .expect("blind");
+    assert_eq!(
+        blocked_reason(
+            &config,
+            blind,
+            None,
+            &HashSet::new(),
+            readings.usage.get(blind.name.as_str()),
+            readings.status.get(blind.name.as_str()).copied(),
+            true,
+        ),
+        Some(BlockedReason::NoUsage),
+        "the fixture carries the marker the walk must ignore"
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &readings.usage),
+        Some(SwitchAction::To("blind".into())),
+        "the walk reaches the unmeasured member once nothing fresh has room"
+    );
+
+    let (config, readings) = chain(mark_fresh(with_oauth_login(profile_with_util(
+        "c",
+        Some(95.0),
+        Some(10.0),
+    ))));
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    // `snapshot_chain` leaves `fresh` empty by contract; the scan fills it from
+    // the status store, the fixture from its `mark_fresh` set.
+    snap.fresh = readings.fresh.clone();
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &readings.usage),
+        Some(SwitchAction::To("c".into())),
+        "a freshly read member with room comes first"
+    );
 }

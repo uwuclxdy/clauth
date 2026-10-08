@@ -22,8 +22,8 @@ use super::format::{spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
-    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when,
-    draw_scrollbar, draw_scrolled_lines, field_window, follow_scroll_offset,
+    DIAG_KICK, DIAG_NO_USAGE, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN,
+    bold_when, draw_scrollbar, draw_scrolled_lines, field_window, follow_scroll_offset,
     follow_scroll_offset_tail, head_cols, key_cell, meta_line, place_caret, right_meta_fits,
     title_label,
 };
@@ -2039,7 +2039,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
 /// each appear twice because they split their two senses on hue alone (see
 /// `chain::reason_marker` for why), and a legend naming one sense per glyph
-/// would be worse than none.
+/// would be worse than none. `×` appears twice at one hue: the card's pill
+/// tells its two senses apart.
 fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
     let reason = |r: BlockedReason, desc| (reason_marker(&r), desc);
     vec![
@@ -2087,6 +2088,7 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
             DIAG_WEEKLY_SOFT,
         ),
         reason(BlockedReason::Stale, DIAG_STALE),
+        reason(BlockedReason::NoUsage, DIAG_NO_USAGE),
         (super::services::fix_mark(), "has a fix"),
     ]
 }

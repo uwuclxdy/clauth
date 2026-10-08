@@ -5662,6 +5662,25 @@ impl App {
             .collect()
     }
 
+    /// Whether a switch to `name` would install a long-lived session token: the
+    /// sidecar half of [`crate::fallback::no_usage_source`], answered off the
+    /// per-frame [`Self::session_tokens`] cache. The ONE reader of that cache
+    /// for this question, so the Fallback marker, the member card, the Overview
+    /// chain row and the add confirm cannot read it four different ways.
+    ///
+    /// Same verdict [`crate::claude::has_session_token`] gives off disk, which
+    /// is what a daemon (no cache, one read at boot) asks instead: a
+    /// `NotLongLived` mis-fill is `false` here exactly as it is there, because
+    /// the split stays disengaged and `credentials.json` remains what switches
+    /// install. An expired long-lived token is still `true`: it stops serving,
+    /// it does not make the account measurable.
+    pub(crate) fn installs_session_token(&self, name: &ProfileName) -> bool {
+        matches!(
+            self.session_tokens.get(name.as_str()),
+            Some(crate::claude::SessionTokenStatus::LongLived(_))
+        )
+    }
+
     /// Landing, armed at construction. The FIRST herdr launch opens the
     /// Services tab and, once the herdr probe lands, puts the herdr selector row
     /// under the cursor with its detail pane descended; construction marks the

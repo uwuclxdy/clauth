@@ -621,6 +621,58 @@ fn healthy_chain_hides_resumes_hint() {
     assert!(resumes_line(&lines).is_none());
 }
 
+/// \#116 review: the Overview's chain rows carry the blocked-reason markers the
+/// Fallback rows do, so a member clauth cannot measure reads `◆` here too. The
+/// arm had no render pin, which means it could have been deleted and every test
+/// would have stayed green. The Overview's ACCOUNT rows carry no
+/// blocked-reason mark at all, which is why the wiki names the chain rows.
+#[test]
+fn an_unmeasured_chain_member_is_marked_on_the_overview_chain_row() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // No reading for `blind`: nothing polls a member whose sessions run on a
+    // long-lived token with no OAuth pair behind it.
+    let rows = |armed: bool| {
+        let (ok, ok_readings) = profile("ok", 95.0, 10.0, 3600);
+        let (blind, _unpolled) = profile("blind", 95.0, 0.0, 3600);
+        let (config, readings) = config_with(
+            vec![(ok, ok_readings), (blind, ReadingsSnapshot::default())],
+            Some("ok"),
+            vec!["ok", "blind"],
+        );
+        let mut app = App::new(config);
+        if armed {
+            app.session_tokens.insert(
+                "blind".into(),
+                crate::claude::SessionTokenStatus::LongLived(None),
+            );
+        }
+        fallback_flow_lines(&app, 60, &readings).0
+    };
+
+    let lines = rows(true);
+    let row = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("blind"))
+        .expect("the chain row for the unmeasured member");
+    assert!(row.contains('◆'), "the row carries the marker: {row:?}");
+    let marker = lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .find(|s| s.content == "◆")
+        .expect("the marker span");
+    assert_eq!(
+        marker.style.fg,
+        theme::warning().fg,
+        "at the warning hue, not stale's faint"
+    );
+    assert!(
+        !rows(false).iter().map(line_text).any(|t| t.contains('◆')),
+        "the same absent reading without a session token is the logged-out shape"
+    );
+}
+
 // ── overview row state cues ──────────────────────────────────────────────
 
 /// Marker column: a broken login (×) outranks both the bell (!) and the

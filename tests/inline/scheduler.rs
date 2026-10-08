@@ -3810,6 +3810,104 @@ fn scan_auto_switch_walks_off_a_broken_active_without_a_fresh_read() {
     );
 }
 
+/// \#110: what the "clauth won't switch away from it on its own" copy promises,
+/// pinned where the promise is actually kept. A member clauth cannot measure
+/// never gets a `Fresh` status, because nothing polls it, and
+/// [`reading_is_actionable`] is what every scan asks before it may act on an
+/// active's reading. So the chain stays on such a member however much room a
+/// sibling has. Pinned here rather than on the walk core: by the time the walk
+/// runs it has been handed a snapshot that already passed this gate, so a change
+/// to the gate would leave a walk-core test green while the copy went false.
+///
+/// The sidecar is not part of this gate and the fixture needs none: what decides
+/// is the ABSENCE of an actionable reading, which is the same absence whether a
+/// long-lived token or nothing at all is serving the member's sessions.
+#[test]
+fn an_unmeasured_active_is_never_switched_away_from() {
+    use super::{FetchStatus, PendingSwitch, PendingSwitchOff, StatusStore, scan_auto_switch};
+    use crate::profile::{AppConfig, AppState, Profile};
+    use crate::usage::{UsageInfo, UsageStore, UsageWindow, epoch_secs_to_iso, now_epoch_secs};
+
+    let live = |utilization: f64| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization,
+            resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+        }),
+        ..Default::default()
+    };
+    let config_handle = || -> crate::profile::ConfigHandle {
+        Arc::new(RankedMutex::new(AppConfig {
+            state: AppState {
+                active_profile: Some("blind".into()),
+                profiles: vec!["blind".into(), "c".into()],
+                fallback_chain: vec!["blind".into(), "c".into()],
+                ..AppState::default()
+            },
+            profiles: vec![
+                Profile::new("blind".to_string(), None, None),
+                Profile::new("c".to_string(), None, None),
+            ],
+        }))
+    };
+    // One scan with `blind` active and `c` clear, read live, waiting behind it.
+    // `blind` carries whatever reading the arm names, or none at all.
+    let queued = |blind: Option<(f64, FetchStatus)>| -> Vec<String> {
+        let mut readings = HashMap::from([("c".to_string(), live(10.0))]);
+        let mut statuses = HashMap::from([("c".to_string(), FetchStatus::Fresh)]);
+        if let Some((utilization, status)) = blind {
+            readings.insert("blind".to_string(), live(utilization));
+            statuses.insert("blind".to_string(), status);
+        }
+        let store: UsageStore = Arc::new(RankedMutex::new(readings));
+        let status: StatusStore = Arc::new(RankedMutex::new(statuses));
+        let pending: PendingSwitch = Arc::new(RankedMutex::new(HashSet::new()));
+        let pending_off: PendingSwitchOff = Arc::new(RankedMutex::new(false));
+        scan_auto_switch(
+            &config_handle(),
+            &store,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &status,
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &Arc::new(RankedMutex::new(HashMap::new())),
+            &pending,
+            &pending_off,
+        );
+        let mut targets: Vec<String> = pending
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|d| d.target.clone())
+            .collect();
+        targets.sort();
+        targets
+    };
+
+    assert!(
+        queued(None).is_empty(),
+        "an active with no reading at all has no exhaustion evidence and no \
+         actionable status, so nothing moves the chain off it"
+    );
+    // The leftover reading a removed login leaves behind, maxed and stale: the
+    // gate refuses it (not `Fresh`, and not a deep-stuck `RateLimited`), so even
+    // a figure that says "spent" cannot drive the switch.
+    assert!(
+        queued(Some((100.0, FetchStatus::Cached))).is_empty(),
+        "a reading nothing refreshed is not one a switch may act on"
+    );
+    // The same chain and the same figure, with the status a real poll would
+    // have written: now it switches. So the two arms above are held by the
+    // gate, not by a chain with nowhere to go.
+    assert_eq!(
+        queued(Some((100.0, FetchStatus::Fresh))),
+        ["c"],
+        "with an actionable reading the identical chain does switch"
+    );
+}
+
 /// The scan fills `ChainSnapshot::fresh`, which `snapshot_chain` cannot: config
 /// carries no freshness, which lives in the status store. Without this fill
 /// the store twin's fresh-preference pass matches nothing and silently degrades

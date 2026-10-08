@@ -28,14 +28,14 @@ use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resum
 use super::global_config::reminder_text;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
-    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT, DIAG_STALE,
-    DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when, cycle_row_lines,
-    draw_scrolled_lines_with_footnote, draw_selector_list, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, pill,
-    place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
-    wrap_words,
+    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_MONTHLY_SOFT, DIAG_MONTHLY_SPENT,
+    DIAG_NO_USAGE, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, MIN_VALUE_W, bold_when,
+    cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
+    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
+    name_color, pill, place_caret, rail_hint_lines, section_box, section_box_verbatim, select_line,
+    value_caret, wrap_words,
 };
-use super::prose::{cmd, key};
+use super::prose::{cmd, key, mark_commands};
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
     soonest_resume, spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
@@ -131,6 +131,7 @@ fn draw_chain_selector(
                                     key_rejected,
                                     readings.usage_of(&p.name),
                                     readings.status_of(&p.name),
+                                    app.installs_session_token(&p.name),
                                 )
                             });
                             let rail_w = rail.width();
@@ -270,6 +271,7 @@ fn draw_chain_detail(
                     width: inner_w,
                     kick_lift,
                     sessions: app.live_sessions.member(&name),
+                    session_token: app.installs_session_token(&name),
                 },
                 key_rejected,
                 readings,
@@ -443,11 +445,32 @@ fn draw_chain_detail(
 /// full). Absent when the member has headroom.
 ///
 /// `Disabled` and `Canceled` deliberately SHARE `⊖` and split on hue alone
-/// (faint vs danger), the one place this app departs from the
-/// shape-names-the-state rule: the two co-occur on nearly every real account
-/// (an operator disables a subscription once it's canceled), and the Overview
-/// account row picks the canceled arm where this ladder picks the disabled one,
-/// so distinct shapes made the same account wear two glyphs on one screen.
+/// (faint vs danger), a departure from the shape-names-the-state rule: the two
+/// co-occur on nearly every real account (an operator disables a subscription
+/// once it's canceled), and the Overview account row picks the canceled arm
+/// where this ladder picks the disabled one, so distinct shapes made the same
+/// account wear two glyphs on one screen.
+///
+/// `NoUsage` takes `◆` at the warning hue. It first wore `Stale`'s faint `⋯`
+/// (wrong: the two part on what the walk does with them, since a deep-stuck
+/// stale active gets walked off and an unmeasured one never does, see
+/// [`crate::fallback::no_usage_hazard`]), then the dotted `◌` at the warning
+/// hue, which a run in a real terminal settled: on the pastel amber this
+/// palette uses, a dotted ring reads as a light GREY ring, because a hairline
+/// glyph carries almost no hue and the amber differs from body text mostly in
+/// hue (12.9:1 against the background, 1.14:1 against the text). The red `×`
+/// one row above drowned it.
+///
+/// It was also already spoken for: `◌` is the Usage tab's queued-refresh dot
+/// (`◌ refresh in Ns`), so the legend's one-shape-one-sense rule was broken
+/// across tabs, which no test here could see.
+///
+/// So the shape is solid, which is what lets a 1-cell mark carry a pastel at
+/// all. `◆` and not `▲`, which would read as a rising figure beside the usage
+/// gauges, and not `■`, which is the gauge's own block shape (`▰▱`). No other
+/// marker is a diamond, and it stays distinct from `◔` (the 5h mark), which
+/// cannot co-occur with this rung anyway: that one needs a reading past its
+/// line, this one fires only when no reading is acting at all.
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::Disabled => ("⊖", theme::faint()),
@@ -464,6 +487,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::ScopedSpent { .. } => ("⊘", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
         BlockedReason::Stale => ("⋯", theme::faint()),
+        BlockedReason::NoUsage => ("◆", theme::warning()),
     };
     Span::styled(glyph, style)
 }
@@ -521,6 +545,12 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             Some("still serving".to_string()),
         ),
         BlockedReason::Stale => (DIAG_STALE.to_string(), theme::dim().bold(), None),
+        // Warning, not dim: the same run found the card's only charged cue was
+        // the marker in the selector, while the pill sat in the neutral grey of
+        // the `status` label beside a red `[ auth broken ]` one row up. The hue
+        // says "charged", the word says what, and the line under it says what
+        // it costs.
+        BlockedReason::NoUsage => (DIAG_NO_USAGE.to_string(), theme::warning().bold(), None),
     };
     let mut spans = pill(label, style);
     if let Some(suffix) = suffix {
@@ -535,7 +565,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
 /// ladder has no notion of), so bridging the two just to share strings would
 /// couple two ladders that are allowed to diverge. Same register: short,
 /// lowercase, names the concrete next action.
-fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> String {
+fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName, active: bool) -> String {
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
@@ -564,6 +594,18 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
             }
         }
         BlockedReason::Stale => "last usage check failed".to_string(),
+        // The hazard rides this line, the way the uncapped-spend warning states
+        // its own on the `max spend` row: the pill and the fix alone never say
+        // what being unmeasured COSTS, and a member added by hand in
+        // `profiles.toml` (or before this landed) never sees the add confirm
+        // that says it. Both halves come from the shared copy, so the card, the
+        // confirm and the daemon's boot line cannot drift apart.
+        BlockedReason::NoUsage => format!(
+            "{}{}: {}",
+            crate::fallback::no_usage_hazard_lead(active),
+            crate::fallback::no_usage_hazard(),
+            mark_commands(&crate::fallback::no_usage_fix(&[name.as_str()]))
+        ),
     }
 }
 
@@ -740,6 +782,12 @@ struct MemberCard<'a> {
     width: usize,
     kick_lift: Option<i64>,
     sessions: crate::live_sessions::MemberSessions,
+    /// Whether a switch to this member would install a long-lived session
+    /// token: the sidecar half of [`crate::fallback::no_usage_source`], read
+    /// from `App::session_tokens` rather than from the file, so the card never
+    /// stats a sidecar per frame. Defaults to `false`, the shape of a member
+    /// whose sessions run on its stored login.
+    session_token: bool,
 }
 
 /// The lines each `FALLBACK_ROWS` row occupies in [`member_detail`]'s output,
@@ -887,6 +935,7 @@ fn member_detail(
         width,
         kick_lift,
         sessions,
+        session_token,
     } = card;
     let Some(profile) = cfg.find(name) else {
         return (
@@ -915,6 +964,10 @@ fn member_detail(
     // Both come out of the one ladder (`blocked_reason` delegates to
     // `health_blocked_reason`), so the pills can't disagree with the marker.
     let fmt = ResetFmt::from_state(&cfg.state);
+    // The tense of the no-usage hazard: a member the chain has already walked
+    // onto has it NOW, and that is the card an operator is most likely looking
+    // at when they go looking for it.
+    let active = cfg.is_active(name);
     let mut pills: Vec<(Vec<Span<'static>>, String)> = Vec::new();
     if let Some(reason) = blocked_reason(
         cfg,
@@ -923,8 +976,12 @@ fn member_detail(
         key_rejected,
         readings.usage_of(&profile.name),
         readings.status_of(&profile.name),
+        session_token,
     ) {
-        pills.push((reason_pill_spans(&reason, fmt), reason_fix(&reason, name)));
+        pills.push((
+            reason_pill_spans(&reason, fmt),
+            reason_fix(&reason, name, active),
+        ));
         if reason == BlockedReason::Disabled
             && let Some(health) = health_blocked_reason(
                 cfg,
@@ -933,9 +990,13 @@ fn member_detail(
                 key_rejected,
                 readings.usage_of(&profile.name),
                 readings.status_of(&profile.name),
+                session_token,
             )
         {
-            pills.push((reason_pill_spans(&health, fmt), reason_fix(&health, name)));
+            pills.push((
+                reason_pill_spans(&health, fmt),
+                reason_fix(&health, name, active),
+            ));
         }
     }
     if !pills.is_empty() {
@@ -960,6 +1021,10 @@ fn member_detail(
     // gives and the figure reads whole.
     let (figure, figure_style) = match pct {
         Some(v) => (format!("{} used", format_pct(v)), theme::util(v)),
+        // Upstream's own word, kept: with the pill reworded to say what clauth
+        // cannot DO, this line is no longer a second phrasing of the same fact.
+        // It says there is no figure for the gauge, which is true for an
+        // unmeasurable member and for one whose first poll is pending alike.
         None => ("no data yet".to_string(), theme::faint()),
     };
     let key_w = DETAIL_KEY_W + DETAIL_KEY_GUTTER;

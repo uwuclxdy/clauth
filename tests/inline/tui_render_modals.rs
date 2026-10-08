@@ -1021,7 +1021,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 17].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 18].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
@@ -1055,14 +1055,17 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
                 .to_string(),
             "│    ⋯                   stale data                                       │"
                 .to_string(),
+            "│    ◆                   can't read usage                                 │"
+                .to_string(),
             "│    f                   has a fix                                        │"
                 .to_string(),
         ],
     );
 
-    // Every mark's own hue, read off the rendered cell. The two repeated glyphs
-    // are the whole point: same shape, different color, different meaning.
-    let expected: [Color; 15] = [
+    // Every mark's own hue, read off the rendered cell. `⊖` and `⊘` are the
+    // whole point: same shape, different color, different meaning. `×` keeps
+    // one color for both its meanings.
+    let expected: [Color; 16] = [
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
@@ -1077,13 +1080,14 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         crate::tui::theme::warning_color(),
         crate::tui::theme::warning_color(),
         crate::tui::theme::text_faint_color(),
+        crate::tui::theme::warning_color(),
         crate::tui::theme::accent_color(),
     ];
     // `left + 5`: the modal border, its 2-cell padding, and the row's own
     // 2-space gutter all sit ahead of the mark.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let got: Vec<Color> = (0..15)
+    let got: Vec<Color> = (0..16)
         .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());
