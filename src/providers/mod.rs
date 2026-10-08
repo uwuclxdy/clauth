@@ -322,8 +322,8 @@ pub(crate) fn api_origin(base_url: &str) -> Option<String> {
 /// Epoch-ms → ISO-8601 UTC: the reset-instant shape every provider's windows
 /// arrive in (z.ai `nextResetTime`, Alibaba `per1WeekResetTime`, MiniMax
 /// `end_time`), one helper so the conversions cannot drift apart.
-pub(crate) fn ms_to_iso(ms: i64) -> String {
-    crate::usage::epoch_secs_to_iso(ms / 1000)
+pub(crate) fn ms_to_iso(ms: impl Into<i128>) -> String {
+    crate::usage::epoch_secs_to_iso((ms.into() / 1000) as i64)
 }
 
 /// Fetch usage for a third-party target. `hint` is the endpoint path that last
