@@ -1,6 +1,7 @@
 //! The managed shunt gateway's engine: the `~/.clauth/gateway.toml` record,
 //! the admin token file, config discovery, bind resolution, the env file
-//! reader, the admin-key edit behind its `shunt check` gate, the `/health`
+//! reader and the client-token variable laid over it, the admin-key edit
+//! behind its `shunt check` gate, the `/health`
 //! version floor, the standalone-store move and the admin pool read naming
 //! the `chatgpt_oauth` providers with no login.
 //!
@@ -14,7 +15,7 @@
 
 #![expect(
     dead_code,
-    reason = "`GatewayEnv::get` and `CheckStderr::text` are surfaces no caller reaches yet"
+    reason = "`GatewayEnv::get`, `CheckStderr::text` and the client-token reads (`client_auth`, `unmanaged_token_names`) are surfaces no caller reaches yet"
 )]
 
 use std::collections::{BTreeMap, HashSet};
@@ -31,6 +32,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use toml_edit::{Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value};
 
+use crate::gateway_tokens::{
+    BaseSource, ClientTokenRefusal, ClientTokens, StoreDigest, TokensState, parse_pairs,
+};
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::profile::{
     atomic_write_600, clauth_dir, home_dir, mkdir_700, read_toml_file, tmp_sibling,
@@ -303,7 +307,8 @@ pub(crate) fn remove_hold() -> Result<()> {
 // ── the daemon's start-time env ─────────────────────────────────────────────
 
 /// `~/.clauth/gateway-env.json`: the env the running daemon inherited for the
-/// keys the store move reads, recorded at its start with the
+/// keys the store move and the client-token reads read, recorded at its start
+/// with the
 /// [`DaemonIdentity`] of the daemon that wrote them, so a reader can tell the
 /// running daemon's record from a dead one's.
 const ENV_FILE: &str = "gateway-env.json";
@@ -323,33 +328,101 @@ fn daemon_env_path() -> Result<PathBuf> {
 
 /// The daemon's start-time env record. Each value is stored as its
 /// platform-native bytes ([`env_value_bytes`]), never lossy-converted, so a
-/// non-UTF-8 `HOME` survives the record.
+/// non-UTF-8 `HOME` survives the record. It holds no credential: of the
+/// inherited client-tokens variable it keeps the client names alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DaemonEnvRecord {
     identity: DaemonIdentity,
     /// Each key from [`INHERITED_KEYS`] the daemon inherited, as its
     /// platform-native bytes; an unset key is absent.
     env: Vec<(String, Vec<u8>)>,
+    /// Each `SHUNT_SERVER__AUTH__*` key the daemon inherited, in any case, as
+    /// its platform-native bytes: a header name, a variable name, issuer
+    /// settings, no secret. A record from before this field holds none.
+    #[serde(default)]
+    auth_env: Vec<(String, Vec<u8>)>,
+    /// Per tokens variable the record answers for, what the daemon's
+    /// inherited value of it holds as shunt reads it ([`TokensState`]): unset,
+    /// the client names, or a value shunt cannot parse, never the value. The
+    /// variables: shunt's default, and the one the daemon's env layer, the
+    /// adopted config and its env file named at the daemon's start.
+    #[serde(default)]
+    tokens: Vec<(String, TokensState)>,
 }
 
 /// Write the daemon's start-time env record, naming the daemon that holds the
 /// singleton now. The daemon calls this at start; the store plan and move read
-/// it through [`inherited_env`]. Best-effort at its call site: a daemon that
-/// cannot write the record still runs, and the plan refuses until it restarts.
+/// it through [`inherited_env`], the client-token reads through
+/// [`TokensInherited::of_gateway`]. Best-effort at its call site: a daemon
+/// that cannot write the record still runs, and those reads refuse until it
+/// restarts.
 pub(crate) fn write_daemon_env() -> Result<()> {
-    write_daemon_env_from(|key| std::env::var_os(key))
+    write_daemon_env_from(&std::env::vars_os().collect::<Vec<_>>())
 }
 
-/// [`write_daemon_env`] over an injected env source, so a test drives the
-/// capture (its key list and bytes) without reading the process's own env.
-fn write_daemon_env_from(var: impl Fn(&str) -> Option<OsString>) -> Result<()> {
+/// [`write_daemon_env`] over an injected env, so a test drives the capture
+/// (its key list and bytes) without reading the process's own env.
+fn write_daemon_env_from(vars: &[(OsString, OsString)]) -> Result<()> {
+    let var = |key: &str| inherited_value(vars, key).map(OsStr::to_os_string);
+    // Every key figment reads into `[server.auth]`, in any case, as the
+    // spawn's env layer reads it ([`spawned_env_var`]).
+    let auth_env: Vec<(String, Vec<u8>)> = vars
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.to_str()?;
+            is_auth_env_key(name).then(|| (name.to_string(), env_value_bytes(value)))
+        })
+        .collect();
+    // Names only, never a value; recorded with no gateway adopted too, so a
+    // gateway adopted while this daemon runs is answered for.
+    let adopted = GatewayRecord::load().ok().flatten();
+    let tokens = start_tokens_vars(adopted.as_ref(), &auth_env)
+        .into_iter()
+        .map(|variable| {
+            // `std::env::var`, as shunt reads the variable, takes a non-UTF-8
+            // value as unset.
+            let state = var(&variable)
+                .and_then(|value| value.into_string().ok())
+                .map_or(TokensState::Unset, |value| parse_pairs(&value));
+            (variable, state)
+        })
+        .collect();
     write_env_record(DaemonEnvRecord {
         identity: current_holder_identity()?,
         env: INHERITED_KEYS
             .iter()
             .filter_map(|key| var(key).map(|value| ((*key).to_string(), env_value_bytes(&value))))
             .collect(),
+        auth_env,
+        tokens,
     })
+}
+
+/// The tokens variables a daemon starting over `auth` (its inherited
+/// `SHUNT_SERVER__AUTH__*` keys) records: shunt's default, and the variable
+/// named over that env by its env layer, or with an adopted gateway (`record`)
+/// by the config and env file as they read now. A variable named later (a
+/// config edit) is unrecorded until the daemon restarts.
+fn start_tokens_vars(record: Option<&GatewayRecord>, auth: &[(String, Vec<u8>)]) -> Vec<String> {
+    let mut vars = vec![SHUNT_DEFAULT_TOKENS_ENV.to_string()];
+    let inherited: Vec<(OsString, OsString)> = auth
+        .iter()
+        .filter_map(|(key, bytes)| Some((OsString::from(key), env_value_from_bytes(bytes).ok()?)))
+        .collect();
+    // Best-effort: an unreadable file names nothing here, and a read under it
+    // then refuses as unrecorded rather than guess.
+    let env = record
+        .and_then(|record| env_file_env(record).ok())
+        .unwrap_or_default();
+    let doc = record
+        .and_then(|record| read_config_doc(record).ok())
+        .unwrap_or_default();
+    if let Ok(named) = client_tokens_var(&doc, &env, inherited)
+        && !vars.iter().any(|var| var_os_key(var) == var_os_key(&named))
+    {
+        vars.push(named);
+    }
+    vars
 }
 
 fn write_env_record(record: DaemonEnvRecord) -> Result<()> {
@@ -389,21 +462,98 @@ fn read_env_record() -> Result<Option<DaemonEnvRecord>> {
 /// plan and move with [`StoreMoveRefusal::DaemonEnvUnrecorded`], never silently
 /// reading the caller's env under a live daemon.
 fn recorded_env_for_live_daemon() -> Result<Option<Vec<(OsString, OsString)>>> {
+    match live_daemon_record()? {
+        None => Ok(None),
+        Some(record) => recorded_pairs(&record.env)
+            .map(Some)
+            .map_err(|_| StoreMoveRefusal::DaemonEnvUnrecorded.into()),
+    }
+}
+
+/// The record of the daemon holding the singleton now: `None` when no daemon
+/// holds it, [`StoreMoveRefusal::DaemonEnvUnrecorded`] when one does (or its
+/// presence cannot be read) but no record names it.
+fn live_daemon_record() -> Result<Option<DaemonEnvRecord>> {
     // One presence probe: `current_holder_identity` reads the flock. No daemon
     // holds it -> this process's own env is the inherited one. A holder (or
-    // presence unreadable) needs a record naming it, else the plan refuses.
+    // presence unreadable) needs a record naming it, else the read refuses.
     let current = match current_holder_identity() {
         Err(NoHolder::NotHeld) => return Ok(None),
         Err(NoHolder::Unreadable(_)) => return Err(StoreMoveRefusal::DaemonEnvUnrecorded.into()),
         Ok(identity) => identity,
     };
     match read_env_record() {
-        Ok(Some(record)) if record.identity.is_named_by(&current) => recorded_pairs(&record)
-            .map(Some)
-            .map_err(|_| StoreMoveRefusal::DaemonEnvUnrecorded.into()),
+        Ok(Some(record)) if record.identity.is_named_by(&current) => Ok(Some(record)),
         // Missing, stale, unreadable or unparseable: refuse until this daemon
         // restarts and records its env.
         _ => Err(StoreMoveRefusal::DaemonEnvUnrecorded.into()),
+    }
+}
+
+/// The env the gateway inherits, as the client-token reads see it.
+pub(crate) enum TokensInherited {
+    /// Every variable of a process env: the daemon's own at the spawn, or,
+    /// with no daemon, this process's, which `start daemon` hands on.
+    Process(Vec<(OsString, OsString)>),
+    /// The running daemon's record: the auth keys it captured, and per tokens
+    /// variable it answers for, the client names its value held, never a
+    /// value.
+    Recorded {
+        pairs: Vec<(OsString, OsString)>,
+        tokens: Vec<(String, TokensState)>,
+    },
+}
+
+impl TokensInherited {
+    /// The env of this process, the gateway's when the daemon spawns it.
+    pub(crate) fn own() -> Self {
+        Self::Process(std::env::vars_os().collect())
+    }
+
+    /// The env the running gateway inherits, seen from another process (the
+    /// TUI, the CLI) by the store move's three-way rule, with the record
+    /// matched to the holder by pid alone ([`holder_record_by_pid`]): no
+    /// daemon, this process's env; a daemon its record names, that record; a
+    /// holder with no record naming it refuses with
+    /// [`TokensEnvRefusal::DaemonUnrecorded`].
+    pub(crate) fn of_gateway() -> Result<Self> {
+        Ok(match holder_record_by_pid()? {
+            None => Self::own(),
+            Some(record) => Self::Recorded {
+                pairs: recorded_pairs(&record.auth_env)
+                    .map_err(|_| TokensEnvRefusal::DaemonUnrecorded)?,
+                tokens: record.tokens,
+            },
+        })
+    }
+
+    fn pairs(&self) -> &[(OsString, OsString)] {
+        match self {
+            Self::Process(pairs) | Self::Recorded { pairs, .. } => pairs,
+        }
+    }
+
+    /// What the inherited value of `variable` holds, with the value itself
+    /// where this view has it (a process env); `Err` for a record that does
+    /// not answer for `variable`.
+    fn tokens_of(&self, variable: &str) -> Result<(Option<String>, TokensState), TokensEnvRefusal> {
+        match self {
+            Self::Process(pairs) => {
+                // `std::env::var`, as shunt reads it, takes a non-UTF-8 value
+                // as unset.
+                let value = inherited_value(pairs, variable)
+                    .and_then(|value| value.to_str().map(str::to_string));
+                let state = value.as_deref().map_or(TokensState::Unset, parse_pairs);
+                Ok((value, state))
+            }
+            Self::Recorded { tokens, .. } => tokens
+                .iter()
+                .find(|(var, _)| var_os_key(var) == var_os_key(variable))
+                .map(|(_, state)| (None, state.clone()))
+                .ok_or_else(|| TokensEnvRefusal::VariableUnrecorded {
+                    variable: variable.to_string(),
+                }),
+        }
     }
 }
 
@@ -422,9 +572,8 @@ pub(crate) fn inherited_env() -> Result<(Vec<(OsString, OsString)>, CodexHomeSou
 
 /// The recorded env as (key, value) pairs, each value back to an [`OsString`]
 /// losslessly; a value that does not decode (a corrupt record) refuses.
-fn recorded_pairs(record: &DaemonEnvRecord) -> Result<Vec<(OsString, OsString)>> {
-    record
-        .env
+fn recorded_pairs(pairs: &[(String, Vec<u8>)]) -> Result<Vec<(OsString, OsString)>> {
+    pairs
         .iter()
         .map(|(name, bytes)| Ok((OsString::from(name), env_value_from_bytes(bytes)?)))
         .collect()
@@ -598,24 +747,25 @@ fn is_yaml(path: &Path) -> bool {
 
 // ── the admin token ─────────────────────────────────────────────────────────
 
-/// An admin token (the gateway's, or a clauth proxy's), alone in a
-/// clauth-owned 0600 file. No `Display`, a `Debug` that never prints the
-/// value, and no `PartialEq` outside tests, where a plain compare would be a
-/// timing side channel.
+/// A token clauth mints ([`mint_token`]): the gateway's admin token or a
+/// clauth proxy's, each alone in a clauth-owned 0600 file, or a gateway
+/// client token (`crate::gateway_tokens`). No `Display`, a `Debug` that never
+/// prints the value, and no `PartialEq` outside tests, where a plain compare
+/// would be a timing side channel.
 #[derive(Clone)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
-pub(crate) struct AdminToken(String);
+pub(crate) struct SecretToken(String);
 
-impl AdminToken {
+impl SecretToken {
     /// The token itself, for the admin API's header.
     pub(crate) fn expose(&self) -> &str {
         &self.0
     }
 }
 
-impl std::fmt::Debug for AdminToken {
+impl std::fmt::Debug for SecretToken {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AdminToken(<redacted>)")
+        f.write_str("SecretToken(<redacted>)")
     }
 }
 
@@ -624,7 +774,7 @@ pub(crate) fn admin_token_path() -> Result<PathBuf> {
 }
 
 /// The gateway's admin token, minted on first use.
-pub(crate) fn ensure_admin_token() -> Result<AdminToken> {
+pub(crate) fn ensure_admin_token() -> Result<SecretToken> {
     let path = admin_token_path()?;
     ensure_token_file(&path, |token| {
         if token.len() < MIN_ADMIN_KEY_LEN {
@@ -643,25 +793,30 @@ pub(crate) fn ensure_admin_token() -> Result<AdminToken> {
 pub(crate) fn ensure_token_file(
     path: &Path,
     accept: impl FnOnce(&str) -> Result<()>,
-) -> Result<AdminToken> {
+) -> Result<SecretToken> {
     with_state_lock(|_held| match std::fs::read_to_string(path) {
         Ok(text) => {
             // shunt trims a `${file:}` reference's contents too, and a clauth
             // proxy trims the token file it is handed.
             let token = text.trim();
             accept(token)?;
-            Ok(AdminToken(token.to_string()))
+            Ok(SecretToken(token.to_string()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let mut seed = [0u8; 32];
-            getrandom::fill(&mut seed).map_err(|e| anyhow!("CSPRNG failure: {e}"))?;
-            let token = AdminToken(hex::encode(seed));
+            let token = mint_token()?;
             atomic_write_600(path, token.expose())
                 .with_context(|| format!("failed to write {}", path.display()))?;
             Ok(token)
         }
         Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
     })
+}
+
+/// A fresh token: 32 CSPRNG bytes, hex.
+pub(crate) fn mint_token() -> Result<SecretToken> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).map_err(|e| anyhow!("CSPRNG failure: {e}"))?;
+    Ok(SecretToken(hex::encode(seed)))
 }
 
 // ── discovery ───────────────────────────────────────────────────────────────
@@ -827,15 +982,16 @@ fn parse_bind(value: &str, source: &'static str) -> Result<SocketAddr, BindRefus
     Ok(addr)
 }
 
-/// The bind value shunt's figment env layer hands `[server].bind`, mirrored
-/// from figment 0.10.19 `value/parse.rs` `value()` on the string branches:
+/// The string shunt's figment env layer hands a config key (`[server].bind`,
+/// `[server.auth].tokens_env`), mirrored from figment 0.10.19
+/// `value/parse.rs` `value()` on the string branches:
 /// the leading whitespace skip is ASCII-only, a value figment's `[`-array
 /// branch cannot parse falls back to the raw untrimmed string, and a value
 /// wholly wrapped in one pair of double quotes unwraps its inner text. clauth
 /// mirrors only the plain pair and returns `None` for a quoted value holding a
 /// backslash (figment would unescape it), which the caller refuses rather than
 /// misread.
-fn normalize_bind_value(value: &str) -> Option<String> {
+fn figment_env_string(value: &str) -> Option<String> {
     // figment's leading `skip_while(is_whitespace)` is ASCII-only.
     let rest = value.trim_ascii_start();
     if let Some(rest) = rest.strip_prefix('"') {
@@ -911,7 +1067,7 @@ fn gateway_bind_in(
 /// [`resolve_bind`]: one plain pair of quotes unwrapped, a quoted value
 /// holding an escape refused rather than misread.
 pub(crate) fn read_bind_env(value: &str) -> Result<String, BindRefusal> {
-    normalize_bind_value(value).ok_or(BindRefusal::QuotedEscape { source: BIND_ENV })
+    figment_env_string(value).ok_or(BindRefusal::QuotedEscape { source: BIND_ENV })
 }
 
 /// The raw `SHUNT_SERVER__BIND` an adopt's probe reads ([`gateway_probe`] on
@@ -930,7 +1086,7 @@ pub(crate) fn inherited_bind_env() -> Result<Option<String>> {
 /// same env means a `SHUNT_SERVER__BIND` set only in the caller's shell cannot
 /// make the proof and the move disagree.
 pub(crate) fn gateway_probe(record: &GatewayRecord) -> Result<SocketAddr> {
-    let env = gateway_env(record)?;
+    let env = file_env(record)?;
     Ok(gateway_bind_in(record, &env, inherited_env()?.0)?.probe)
 }
 
@@ -940,7 +1096,7 @@ pub(crate) fn gateway_probe(record: &GatewayRecord) -> Result<SocketAddr> {
 /// so no process is spawned. With no holder, or no record naming it, the
 /// files alone decide.
 pub(crate) fn displayed_gateway_bind(record: &GatewayRecord) -> Result<GatewayBind> {
-    let env = gateway_env(record)?;
+    let env = file_env(record)?;
     gateway_bind_in(
         record,
         &env,
@@ -954,15 +1110,28 @@ pub(crate) fn displayed_gateway_bind(record: &GatewayRecord) -> Result<GatewayBi
 /// under a pid the holder reuses passes this match, so it feeds display reads
 /// only, never the plan or the move ([`inherited_env`]).
 pub(crate) fn recorded_env_for_holder_pid() -> Option<Vec<(OsString, OsString)>> {
-    if !crate::daemon::singleton_held().ok()? {
-        return None;
+    let record = holder_record_by_pid().ok()??;
+    recorded_pairs(&record.env).ok()
+}
+
+/// The record of the daemon holding the singleton, matched by pid alone, so
+/// no process is spawned: `None` when no daemon holds it,
+/// [`TokensEnvRefusal::DaemonUnrecorded`] when one does (or its presence or
+/// pid cannot be read) but no record names its pid. The client-token reads
+/// take it: they run on the TUI's UI thread. A record under a reused pid is
+/// read only between a daemon taking the singleton and writing its own
+/// record at start, or after that write failed.
+fn holder_record_by_pid() -> Result<Option<DaemonEnvRecord>, TokensEnvRefusal> {
+    match crate::daemon::singleton_held() {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(_) => return Err(TokensEnvRefusal::DaemonUnrecorded),
     }
-    let pid = crate::daemon::holder_pid()?;
-    let record = read_env_record().ok()??;
-    if record.identity.pid != pid {
-        return None;
+    let pid = crate::daemon::holder_pid().ok_or(TokensEnvRefusal::DaemonUnrecorded)?;
+    match read_env_record() {
+        Ok(Some(record)) if record.identity.pid == pid => Ok(Some(record)),
+        _ => Err(TokensEnvRefusal::DaemonUnrecorded),
     }
-    recorded_pairs(&record).ok()
 }
 
 /// Whether `url` (a profile's `base_url`) names the gateway bound at `bind`:
@@ -1150,9 +1319,31 @@ impl std::error::Error for ConfigBindRefused {}
 pub(crate) struct GatewayEnv {
     vars: Vec<(String, OsString)>,
     skipped: Vec<usize>,
+    /// The digest of the client-token store bytes these pairs were built
+    /// from (`None`: no store file), which the daemon compares against the
+    /// store's current bytes to restart a running gateway on a change.
+    client_tokens: Option<StoreDigest>,
+    /// The variable these pairs carry clauth's client tokens in; `None` with
+    /// no token stored, when the variable is left as shunt finds it. The
+    /// daemon restarts a running gateway when it changes.
+    tokens_variable: Option<String>,
+    /// Variables a spawn removes from the env it inherits: a check run from
+    /// another process drops that process's own `SHUNT_SERVER__AUTH__*`
+    /// keys, which the gateway's env does not hold.
+    unset: Vec<String>,
 }
 
 impl GatewayEnv {
+    /// The client-token store digest these pairs were built from.
+    pub(crate) fn client_tokens_digest(&self) -> Option<StoreDigest> {
+        self.client_tokens
+    }
+
+    /// The variable these pairs carry clauth's client tokens in.
+    pub(crate) fn tokens_variable(&self) -> Option<&str> {
+        self.tokens_variable.as_deref()
+    }
+
     /// The value a spawn would see for `key`.
     pub(crate) fn get(&self, key: &str) -> Option<&OsStr> {
         self.vars
@@ -1174,8 +1365,12 @@ impl GatewayEnv {
         &self.skipped
     }
 
-    /// Lay these pairs over `command`'s inherited env.
+    /// Lay these pairs over `command`'s inherited env, after removing the
+    /// variables it must not inherit.
     pub(crate) fn apply(&self, command: &mut Command) {
+        for key in &self.unset {
+            command.env_remove(key);
+        }
         command.envs(self.vars.iter().map(|(key, value)| (key, value)));
     }
 
@@ -1185,6 +1380,15 @@ impl GatewayEnv {
     /// reads the last spelling in file order.
     fn set(&mut self, key: String, value: OsString) {
         self.vars.retain(|(name, _)| *name != key);
+        self.vars.push((key, value));
+    }
+
+    /// Set `key` as the last assignment, replacing every pair the gateway's
+    /// `std::env::var` would read as `key` ([`var_os_key`]): only the exact
+    /// spelling on unix, every case variant on Windows.
+    fn set_as_read(&mut self, key: String, value: OsString) {
+        self.vars
+            .retain(|(name, _)| var_os_key(name) != var_os_key(&key));
         self.vars.push((key, value));
     }
 
@@ -1500,33 +1704,546 @@ fn standalone_var<'a>(
     inherited: &'a [(OsString, OsString)],
     key: &str,
 ) -> Option<&'a OsStr> {
-    env_value_folded(&named.vars, key, var_os_key).or_else(|| {
-        inherited
-            .iter()
-            .rev()
-            .find(|(name, _)| {
-                name.to_str()
-                    .is_some_and(|name| var_os_key(name) == var_os_key(key))
-            })
-            .map(|(_, value)| value.as_os_str())
-    })
+    env_value_folded(&named.vars, key, var_os_key).or_else(|| inherited_value(inherited, key))
+}
+
+/// The value `std::env::var_os` reads for `key` from the env `vars`: the
+/// last entry whose name matches it, exactly on unix, in any case on
+/// Windows.
+fn inherited_value<'a>(vars: &'a [(OsString, OsString)], key: &str) -> Option<&'a OsStr> {
+    vars.iter()
+        .rev()
+        .find(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| var_os_key(name) == var_os_key(key))
+        })
+        .map(|(_, value)| value.as_os_str())
 }
 
 /// The env the gateway runs with, over its inherited one: the record's env
-/// file, then every store env, which win, so an env file can never point
-/// the managed gateway at a standalone store or at another owner's login.
-/// The env file's skipped lines ride along.
+/// file, then clauth's client tokens joined onto the value shunt reads
+/// without clauth ([`TokensBase`]), then every store env, which win, so an
+/// env file can never point the managed gateway at a standalone store or at
+/// another owner's login. The env file's skipped lines ride along. With no
+/// client token stored the variable is not set and the config is not read.
+/// The daemon's own env is the inherited one: the spawn's, and the check the
+/// daemon runs before a restart.
 pub(crate) fn gateway_env(record: &GatewayRecord) -> Result<GatewayEnv> {
-    let mut env = match &record.env_file {
-        Some(path) => read_env_file(path)?,
-        None => GatewayEnv::default(),
+    gateway_env_in(record, || Ok(TokensInherited::own()))
+}
+
+/// [`gateway_env`] for a `shunt check` run from another process (the TUI's
+/// [`write_checked`]): the inherited env is the running gateway's, by
+/// [`TokensInherited::of_gateway`], so the check sees what the daemon's spawn
+/// would. Under a daemon's record the check, a child of this process, also
+/// gets the daemon's `SHUNT_SERVER__AUTH__*` keys and none of this process's
+/// own, and the tokens variable is set even with no token stored, so this
+/// process's own value never reaches it.
+fn checked_env(record: &GatewayRecord) -> Result<GatewayEnv> {
+    gateway_env_in(record, TokensInherited::of_gateway)
+}
+
+/// [`gateway_env`] over the inherited env `inherited` yields, read only when
+/// a token is stored or under a daemon's record, so tests inject one instead
+/// of reading the process's own.
+fn gateway_env_in(
+    record: &GatewayRecord,
+    inherited: impl FnOnce() -> Result<TokensInherited>,
+) -> Result<GatewayEnv> {
+    let mut env = env_file_env(record)?;
+    let tokens = ClientTokens::load()?;
+    let layer = if tokens.is_empty() {
+        // Best-effort: the spawn passes the inherited value through on its
+        // own; only a daemon's record must be laid for a check run elsewhere,
+        // and a read that fails leaves the env as it was.
+        inherited()
+            .ok()
+            .filter(|view| matches!(view, TokensInherited::Recorded { .. }))
+            .and_then(|view| tokens_layer(record, &env, &tokens, &view).ok())
+    } else {
+        Some(tokens_layer(record, &env, &tokens, &inherited()?)?)
     };
+    if let Some(layer) = layer {
+        for (key, value) in layer.set {
+            env.set_as_read(key, value);
+        }
+        env.unset = layer.unset;
+        if !tokens.is_empty() {
+            env.tokens_variable = layer.variable;
+        }
+    }
+    env.client_tokens = tokens.digest();
+    pin_stores(&mut env)?;
+    Ok(env)
+}
+
+/// What [`tokens_layer`] lays over the env file's pairs.
+struct TokensLayer {
+    /// `None` when the variable could not be read (a check's best effort).
+    variable: Option<String>,
+    set: Vec<(String, OsString)>,
+    unset: Vec<String>,
+}
+
+/// The tokens variable over `env` (the env file's pairs) as the gateway gets
+/// it: the store's pairs joined onto the value shunt reads without clauth
+/// ([`TokensBase`]); with no token stored (a daemon's record alone reaches
+/// here), that value as the record keeps it. A base that does not parse, or
+/// that names a stored client, refuses only where shunt reads the variable
+/// (`[server.auth]` in the config or the env layer); elsewhere it passes
+/// through joined, since shunt never reads it.
+fn tokens_layer(
+    record: &GatewayRecord,
+    env: &GatewayEnv,
+    tokens: &ClientTokens,
+    view: &TokensInherited,
+) -> Result<TokensLayer> {
+    let mut set = Vec::new();
+    let mut unset = Vec::new();
+    // The daemon's recorded `[server.auth]` keys, and the removal of this
+    // process's own, go in whatever the variable's read gives: they are what
+    // the spawn's env holds.
+    if let TokensInherited::Recorded { pairs, .. } = view {
+        let in_file = |name: &str| env.keys().any(|key| key.eq_ignore_ascii_case(name));
+        for (name, value) in pairs {
+            if let Some(name) = name.to_str()
+                && !in_file(name)
+            {
+                set.push((name.to_string(), value.clone()));
+            }
+        }
+        unset = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .filter(|name| {
+                is_auth_env_key(name)
+                    && !in_file(name)
+                    && !pairs
+                        .iter()
+                        .any(|(recorded, _)| recorded.as_os_str() == name.as_str())
+            })
+            .collect();
+    }
+    // With no token stored only a daemon's record reaches here, for a check:
+    // a variable that cannot be read leaves the rest of the layer standing,
+    // and one the record does not answer for is set empty, so this process's
+    // own value never reaches the check.
+    let doc = match read_config_doc(record) {
+        Ok(doc) => doc,
+        Err(_) if tokens.is_empty() => {
+            return Ok(TokensLayer {
+                variable: None,
+                set,
+                unset,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let base = match TokensBase::read_in(&doc, record, env, view) {
+        Ok(base) => base,
+        Err(TokensEnvRefusal::VariableUnrecorded { variable }) if tokens.is_empty() => {
+            set.push((variable.clone(), OsString::new()));
+            return Ok(TokensLayer {
+                variable: Some(variable),
+                set,
+                unset,
+            });
+        }
+        Err(_) if tokens.is_empty() => {
+            return Ok(TokensLayer {
+                variable: None,
+                set,
+                unset,
+            });
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let reads_tokens = config_auth(&doc).is_some() || env_layer_auth(env, view.pairs());
+    let own = match (&base.value, &base.unmanaged) {
+        (Some(value), Some((_, source))) => Some((value.clone(), source)),
+        // A daemon's record keeps names alone: the check gets them with a
+        // stand-in token each (only a view of another process's gateway is
+        // recorded, so the spawn always holds the real value).
+        (None, Some((TokensState::Names(names), source))) => Some((stand_in_pairs(names), source)),
+        (None, Some((TokensState::Unparsed, source))) if reads_tokens && !tokens.is_empty() => {
+            return Err(ClientTokenRefusal::UnmanagedUnparsed {
+                op: None,
+                variable: base.variable,
+                source: source.clone(),
+            }
+            .into());
+        }
+        (None, Some((TokensState::Unparsed | TokensState::Unset, _))) | (_, None) => None,
+    };
+    let value = if tokens.is_empty() {
+        match (&base.value, own) {
+            // The env file sets it: its own pair stands.
+            (Some(_), _) => None,
+            (None, Some((value, _))) => Some(value),
+            // Set empty, which shunt reads as unset, so the caller's own
+            // value cannot stand in for the daemon's.
+            (None, None) => Some(String::new()),
+        }
+    } else {
+        Some(
+            tokens.spawn_value(
+                own.as_ref()
+                    .map(|(value, source)| (value.as_str(), *source)),
+                &base.variable,
+                reads_tokens,
+            )?,
+        )
+    };
+    if let Some(value) = value {
+        set.push((base.variable.clone(), OsString::from(value)));
+    }
+    Ok(TokensLayer {
+        variable: Some(base.variable),
+        set,
+        unset,
+    })
+}
+
+/// The record's env file as the gateway reads it; empty with none.
+fn env_file_env(record: &GatewayRecord) -> Result<GatewayEnv> {
+    match &record.env_file {
+        Some(path) => read_env_file(path),
+        None => Ok(GatewayEnv::default()),
+    }
+}
+
+/// The adopted config, parsed.
+fn read_config_doc(record: &GatewayRecord) -> Result<DocumentMut> {
+    parse_config(&read_config_text(record.config())?)
+}
+
+/// The config's `[server.auth]`, in any form.
+fn config_auth(doc: &DocumentMut) -> Option<&Item> {
+    doc.get("server").and_then(|server| server.get("auth"))
+}
+
+/// Whether `name` is a key shunt's figment env layer reads into
+/// `[server.auth]`: its prefix in any case.
+fn is_auth_env_key(name: &str) -> bool {
+    name.get(..AUTH_ENV_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(AUTH_ENV_PREFIX))
+}
+
+/// Whether the spawn env (the env file's pairs over `inherited`) sets a
+/// `SHUNT_SERVER__AUTH__*` key, which builds `[server.auth]` alone.
+fn env_layer_auth(env: &GatewayEnv, inherited: &[(OsString, OsString)]) -> bool {
+    inherited
+        .iter()
+        .filter_map(|(name, _)| name.to_str())
+        .chain(env.keys())
+        .any(is_auth_env_key)
+}
+
+/// The token a `shunt check` run from another process carries for each
+/// client a daemon's record names: the record keeps names, never a token, and
+/// shunt's grammar asks only for a non-empty one, so the check reads the
+/// same names the spawn hands shunt. Never laid in an env the gateway runs
+/// with.
+const CHECK_STAND_IN_TOKEN: &str = "clauth-check-stand-in";
+
+fn stand_in_pairs(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| format!("{name}:{CHECK_STAND_IN_TOKEN}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The record's env file with every store env laid over it, and no client
+/// token: what the bind, the drain bound and the store move read, none of
+/// which a token changes.
+pub(crate) fn file_env(record: &GatewayRecord) -> Result<GatewayEnv> {
+    let mut env = env_file_env(record)?;
+    pin_stores(&mut env)?;
+    Ok(env)
+}
+
+fn pin_stores(env: &mut GatewayEnv) -> Result<()> {
     for (key, path) in store_env()? {
         env.drop_case_variants_of(key);
         env.set(key.to_string(), path.into_os_string());
     }
-    Ok(env)
+    Ok(())
 }
+
+/// The variable the spawn env would carry clauth's tokens in now, read over
+/// the daemon's own env; `None` with no token stored, when the variable is
+/// left as shunt finds it.
+pub(crate) fn spawn_tokens_variable(record: &GatewayRecord) -> Result<Option<String>> {
+    if ClientTokens::load()?.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(client_tokens_var(
+        &read_config_doc(record)?,
+        &env_file_env(record)?,
+        std::env::vars_os(),
+    )?))
+}
+
+/// The tokens variable as shunt reads it without clauth: its name
+/// ([`client_tokens_var`]), what its value holds and where that value came
+/// from (the env file's, else the one the gateway inherits; `None` when
+/// neither sets it), and the value itself when this process holds it: the
+/// env file's or a process env's, never a daemon record's, which keeps names.
+struct TokensBase {
+    variable: String,
+    unmanaged: Option<(TokensState, BaseSource)>,
+    value: Option<String>,
+}
+
+impl TokensBase {
+    fn read_in(
+        doc: &DocumentMut,
+        record: &GatewayRecord,
+        env: &GatewayEnv,
+        inherited: &TokensInherited,
+    ) -> Result<Self, TokensEnvRefusal> {
+        let variable = client_tokens_var(doc, env, inherited.pairs().iter().cloned())?;
+        if let (Some(value), Some(path)) = (
+            env_value_folded(&env.vars, &variable, var_os_key),
+            &record.env_file,
+        ) {
+            // Env-file values are UTF-8: the reader refuses any other.
+            let value = value.to_string_lossy().into_owned();
+            return Ok(Self {
+                unmanaged: Some((parse_pairs(&value), BaseSource::EnvFile(path.clone()))),
+                value: Some(value),
+                variable,
+            });
+        }
+        let (value, state) = inherited.tokens_of(&variable)?;
+        let unmanaged = match (&value, state) {
+            (None, TokensState::Unset) => None,
+            (_, state) => Some((state, BaseSource::Inherited)),
+        };
+        Ok(Self {
+            variable,
+            unmanaged,
+            value,
+        })
+    }
+}
+
+/// The env override shunt's figment layer maps onto `[server.auth].tokens_env`.
+pub(crate) const TOKENS_ENV_ENV: &str = "SHUNT_SERVER__AUTH__TOKENS_ENV";
+
+/// shunt's `tokens_env` when neither the env layer nor `[server.auth]` names
+/// one (`default_tokens_env`, shunt `config.rs`).
+pub(crate) const SHUNT_DEFAULT_TOKENS_ENV: &str = "SHUNT_CLIENT_TOKENS";
+
+const CONFIG_TOKENS_ENV: &str = "[server.auth].tokens_env";
+
+/// Any env key shunt's figment layer reads into `[server.auth]`, which alone
+/// makes the table present.
+const AUTH_ENV_PREFIX: &str = "SHUNT_SERVER__AUTH__";
+
+/// What the client-token ops read of the gateway's config, its env file and
+/// the env the gateway inherits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClientAuth {
+    /// The variable shunt reads its client tokens from.
+    pub(crate) variable: String,
+    /// What the value shunt reads without clauth holds (the env file's, else
+    /// the inherited one), and where it came from; `None` when no source sets
+    /// the variable. Names, never a token.
+    pub(crate) unmanaged: Option<(TokensState, BaseSource)>,
+    /// The config has `[server.auth]`.
+    pub(crate) in_config: bool,
+    /// The spawn env sets a `SHUNT_SERVER__AUTH__*` key, which builds
+    /// `[server.auth]` from the env layer alone.
+    pub(crate) in_env: bool,
+    /// The config has a `[[server.auth.jwt]]` entry, with which shunt runs on
+    /// no client token at all.
+    pub(crate) jwt: bool,
+}
+
+impl ClientAuth {
+    /// shunt refuses to run with no client token ("refusing to run open").
+    pub(crate) fn requires_tokens(&self) -> bool {
+        (self.in_config || self.in_env) && !self.jwt
+    }
+}
+
+/// [`ClientAuth`] for the adopted config and its env file over the env the
+/// running gateway inherits, seen from this process
+/// ([`TokensInherited::of_gateway`]).
+pub(crate) fn client_auth(record: &GatewayRecord) -> Result<ClientAuth> {
+    client_auth_in(record, &TokensInherited::of_gateway()?)
+}
+
+/// [`client_auth`] for a guard (a token's removal, a profile's delete or
+/// rename): `None` when the config does not exist, so no gateway can start
+/// on it and there is nothing to guard. Every other failure hides the answer
+/// and is returned: a config that cannot be read or does not parse (a
+/// running gateway keeps serving on it, and once it is fixed shunt refuses
+/// to run open), a daemon with no record, an unrecorded variable, an env file
+/// that does not read, a `tokens_env` clauth cannot read.
+pub(crate) fn guard_client_auth(record: &GatewayRecord) -> Result<Option<ClientAuth>> {
+    // The config first: its absence answers before anything else is read.
+    let Some(text) = read_config_if_present(record.config())? else {
+        return Ok(None);
+    };
+    let doc = parse_config(&text)?;
+    let inherited = TokensInherited::of_gateway()?;
+    let env = env_file_env(record)?;
+    client_auth_from(&doc, record, &env, &inherited).map(Some)
+}
+
+/// [`guard_client_auth`] for the adopted gateway: `None` with none adopted.
+/// A record that does not load (a YAML config included) is returned: the
+/// daemon keeps a running gateway under it.
+pub(crate) fn adopted_guard_client_auth() -> Result<Option<ClientAuth>> {
+    match GatewayRecord::load()? {
+        Some(record) => guard_client_auth(&record),
+        None => Ok(None),
+    }
+}
+
+/// The client names the value shunt reads without clauth holds, for the
+/// gateway's card: tokens clauth does not manage, never a token. A value
+/// shunt cannot parse refuses, naming where it came from, never reading as
+/// holding no pair.
+pub(crate) fn unmanaged_token_names(record: &GatewayRecord) -> Result<Vec<String>> {
+    let auth = client_auth(record)?;
+    match auth.unmanaged {
+        Some((TokensState::Names(names), _)) => Ok(names),
+        Some((TokensState::Unparsed, source)) => Err(ClientTokenRefusal::UnmanagedUnparsed {
+            op: None,
+            variable: auth.variable,
+            source,
+        }
+        .into()),
+        Some((TokensState::Unset, _)) | None => Ok(Vec::new()),
+    }
+}
+
+fn client_auth_in(record: &GatewayRecord, inherited: &TokensInherited) -> Result<ClientAuth> {
+    client_auth_from(
+        &read_config_doc(record)?,
+        record,
+        &env_file_env(record)?,
+        inherited,
+    )
+}
+
+fn client_auth_from(
+    doc: &DocumentMut,
+    record: &GatewayRecord,
+    env: &GatewayEnv,
+    inherited: &TokensInherited,
+) -> Result<ClientAuth> {
+    let base = TokensBase::read_in(doc, record, env, inherited)?;
+    let auth = config_auth(doc);
+    let jwt = match auth.and_then(|auth| auth.get("jwt")) {
+        Some(Item::ArrayOfTables(entries)) => !entries.is_empty(),
+        Some(Item::Value(Value::Array(entries))) => !entries.is_empty(),
+        _ => false,
+    };
+    Ok(ClientAuth {
+        variable: base.variable,
+        unmanaged: base.unmanaged,
+        in_config: auth.is_some(),
+        in_env: env_layer_auth(env, inherited.pairs()),
+        jwt,
+    })
+}
+
+/// The variable shunt reads its client tokens from: `SHUNT_SERVER__AUTH__TOKENS_ENV`
+/// as the spawn env laying `env` over `inherited` hands figment (matched in
+/// any case, as the bind's override is), else `[server.auth].tokens_env`,
+/// else shunt's `SHUNT_CLIENT_TOKENS`, so a later `[server.auth]` with no key
+/// finds the variable the spawn already set.
+fn client_tokens_var(
+    doc: &DocumentMut,
+    env: &GatewayEnv,
+    inherited: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<String, TokensEnvRefusal> {
+    let (name, source) = match spawned_env_value(env, TOKENS_ENV_ENV, inherited) {
+        Some(value) => {
+            let value = value
+                .into_string()
+                .map_err(|_| TokensEnvRefusal::NotAName {
+                    source: TOKENS_ENV_ENV,
+                })?;
+            let name = figment_env_string(&value).ok_or(TokensEnvRefusal::QuotedEscape)?;
+            (name, TOKENS_ENV_ENV)
+        }
+        None => match doc
+            .get("server")
+            .and_then(|server| server.get("auth"))
+            .and_then(|auth| auth.get("tokens_env"))
+        {
+            None => return Ok(SHUNT_DEFAULT_TOKENS_ENV.to_string()),
+            Some(item) => {
+                let name = item.as_str().ok_or(TokensEnvRefusal::NotAName {
+                    source: CONFIG_TOKENS_ENV,
+                })?;
+                if name.contains("${") {
+                    return Err(TokensEnvRefusal::ConfigReference);
+                }
+                (name.to_string(), CONFIG_TOKENS_ENV)
+            }
+        },
+    };
+    // `std::env::var` panics on such a name, and a spawn cannot set it.
+    if name.is_empty() || name.contains(['=', '\0']) {
+        return Err(TokensEnvRefusal::NotAName { source });
+    }
+    Ok(name)
+}
+
+/// The tokens variable could not be read as shunt reads it. Names where it
+/// came from, never a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TokensEnvRefusal {
+    NotAName {
+        source: &'static str,
+    },
+    /// `[server.auth].tokens_env` holds a `${...}` reference, which shunt
+    /// substitutes before it reads the name and clauth does not.
+    ConfigReference,
+    /// The env override is quoted with a backslash inside, which figment
+    /// unescapes and clauth does not.
+    QuotedEscape,
+    /// A daemon holds the singleton but no record names it.
+    DaemonUnrecorded,
+    /// The running daemon's record answers for other tokens variables.
+    VariableUnrecorded {
+        variable: String,
+    },
+}
+
+impl std::fmt::Display for TokensEnvRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TokensEnvRefusal::NotAName { source } => write!(
+                f,
+                "{source} is not a variable name clauth can set; set it to a plain variable name like {SHUNT_DEFAULT_TOKENS_ENV}"
+            ),
+            TokensEnvRefusal::ConfigReference => write!(
+                f,
+                "{CONFIG_TOKENS_ENV} is a ${{...}} reference, which clauth does not resolve; write the variable's name there by hand, or set {TOKENS_ENV_ENV} in the gateway's env file"
+            ),
+            TokensEnvRefusal::QuotedEscape => write!(
+                f,
+                "{TOKENS_ENV_ENV} holds a backslash inside its quotes, which figment would unescape and clauth does not; write the value literally"
+            ),
+            TokensEnvRefusal::DaemonUnrecorded => f.write_str(
+                "the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; restart the daemon, then try again",
+            ),
+            TokensEnvRefusal::VariableUnrecorded { variable } => write!(
+                f,
+                "the running daemon recorded no value for {variable}, the variable shunt reads its client tokens from; restart the daemon so it records it"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TokensEnvRefusal {}
 
 /// The working directory `shunt check` and the gateway run in: the adopted
 /// config's own directory, so wherever the caller was started, the check and
@@ -1939,7 +2656,7 @@ pub(crate) enum ConfigEditRefusal {
 
 /// `shunt check`'s stderr, its first [`CHECK_STDERR_LIMIT`] bytes. shunt's
 /// config errors quote substituted values, which may come from the env
-/// file, so `Debug` never prints it (the [`AdminToken`] precedent).
+/// file, so `Debug` never prints it (the [`SecretToken`] precedent).
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CheckStderr(String);
 
@@ -2099,6 +2816,20 @@ pub(crate) fn read_config_for_edit(config: &Path) -> Result<(Vec<u8>, String)> {
 
 fn read_config_text(config: &Path) -> Result<String> {
     std::fs::read_to_string(config).with_context(|| format!("failed to read {}", config.display()))
+}
+
+/// [`read_config_text`], with a config that does not exist as `None`.
+fn read_config_if_present(config: &Path) -> Result<Option<String>> {
+    match read_config_text(config) {
+        Ok(text) => Ok(Some(text)),
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The user's config may hold literal upstream keys, so a parse error names
@@ -2295,7 +3026,7 @@ pub(crate) fn write_checked(
         }
         .into());
     }
-    let env = gateway_env(record)?;
+    let env = checked_env(record)?;
     let (staged, mut file) = Staged::create(config)
         .with_context(|| format!("failed to stage an edit beside {}", config.display()))?;
     file.write_all(candidate.as_bytes())
@@ -2429,8 +3160,9 @@ fn run_check(
 }
 
 /// `shunt check` on the adopted config as it now stands, through the same
-/// [`run_check`] the edit path uses (env and cwd built exactly as
-/// [`write_checked`]'s check does), with the caller's `cancel` so a daemon
+/// [`run_check`] the edit path uses (cwd as [`write_checked`]'s; env the
+/// spawn's own, [`gateway_env`], since the daemon runs it before a restart),
+/// with the caller's `cancel` so a daemon
 /// shutdown preempts a wedged check instead of waiting [`CHECK_TIMEOUT`] out.
 /// Refusals carry the same [`ConfigEditRefusal`] the edit path maps.
 pub(crate) fn check_adopted_config(
@@ -3068,10 +3800,7 @@ fn plan_standalone_stores_in(
     source: CodexHomeSource,
 ) -> Result<StoreMovePlan> {
     let inherited: Vec<(OsString, OsString)> = inherited.into_iter().collect();
-    let named = match &record.env_file {
-        Some(path) => read_env_file(path)?,
-        None => GatewayEnv::default(),
-    };
+    let named = env_file_env(record)?;
     let codex = CodexOwnership::compute(&named, &inherited, source)?;
     let to_root = managed_store_root()?;
     let (moved, kept) = plan_stores(&named, &inherited, &codex, &to_root)?;
@@ -3164,7 +3893,7 @@ fn move_standalone_stores_in(
     // The take-over's precondition: the proof must name the address the
     // record's config says to probe, else a proof minted at another address
     // could gate a move while a standalone is live there.
-    let probe = gateway_bind_in(record, &gateway_env(record)?, inherited.iter().cloned())?.probe;
+    let probe = gateway_bind_in(record, &file_env(record)?, inherited.iter().cloned())?.probe;
     if silent.addr() != probe {
         return Err(StoreMoveRefusal::SilentMismatch {
             silent: silent.addr(),
@@ -3815,10 +4544,10 @@ fn managed_codex_auth_file() -> Result<PathBuf> {
 /// The gateway's admin token for a read, trimmed the way [`ensure_token_file`]
 /// reads it. Never mints one: the Services card's pool read must not write,
 /// so a missing token file is [`ChatgptOauthProvidersError::NoAdminToken`].
-fn read_admin_token() -> Result<AdminToken> {
+fn read_admin_token() -> Result<SecretToken> {
     let path = admin_token_path()?;
     match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(AdminToken(text.trim().to_string())),
+        Ok(text) => Ok(SecretToken(text.trim().to_string())),
         Err(cause) if cause.kind() == std::io::ErrorKind::NotFound => {
             Err(ChatgptOauthProvidersError::NoAdminToken.into())
         }
@@ -3830,7 +4559,7 @@ fn read_admin_token() -> Result<AdminToken> {
 /// [`pool_agent`]'s bounds: the body for status 200, or a
 /// [`ChatgptOauthProvidersError`] for every other outcome. The error never
 /// carries the response body, a header value or the token.
-fn pool_body(addr: SocketAddr, token: &AdminToken) -> Result<Vec<u8>> {
+fn pool_body(addr: SocketAddr, token: &SecretToken) -> Result<Vec<u8>> {
     let agent = pool_agent();
     let url = format!("http://{addr}/admin/api/pool");
     let mut response = match agent.get(&url).header("x-api-key", token.expose()).call() {

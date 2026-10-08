@@ -18,7 +18,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::gateway::{
-    AdminToken, Bounded, MIN_ADMIN_KEY_LEN, ensure_token_file, run_bounded, run_bounded_cancellable,
+    Bounded, MIN_ADMIN_KEY_LEN, SecretToken, ensure_token_file, run_bounded,
+    run_bounded_cancellable,
 };
 use crate::lock::{StateLockHeld, with_state_lock};
 use crate::plugin_probe::is_executable;
@@ -727,7 +728,7 @@ pub(crate) fn disable(raw: &str) -> Result<()> {
 }
 
 /// The proxy's admin token, minted on first use.
-pub(crate) fn ensure_proxy_token(service: &Service) -> Result<AdminToken> {
+pub(crate) fn ensure_proxy_token(service: &Service) -> Result<SecretToken> {
     let path = admin_token_path(service)?;
     ensure_token_file(&path, |token| {
         if token.len() < MIN_ADMIN_KEY_LEN {

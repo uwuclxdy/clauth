@@ -13,6 +13,7 @@ mod fallback;
 mod format;
 mod gateway;
 mod gateway_edit;
+mod gateway_tokens;
 mod harness;
 mod herdr;
 mod hook_context;

@@ -6,6 +6,7 @@ use super::*;
 use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
 use crate::testutil::hold_rotation_lock;
+use crate::testutil::no_shunt_env;
 use crate::testutil::through_handle;
 use crate::testutil::write_codex_state;
 
@@ -6759,5 +6760,461 @@ fn a_link_that_cannot_follow_fails_the_switch_whole() {
             .map(|n| n.as_str()),
         Some("cx1"),
         "marker unmoved — the switch failed whole, not half"
+    );
+}
+
+// ── the gateway's client tokens follow their profile ────────────────────────
+
+/// An adopted gateway over `config` whose env file holds `env_text`, saved as
+/// the record the token store's guards read.
+fn adopt_gateway(
+    home: &HomeSandbox,
+    config: &str,
+    env_text: &str,
+) -> crate::gateway::GatewayRecord {
+    let etc = home.home().join("etc");
+    std::fs::create_dir_all(&etc).expect("etc");
+    let path = etc.join("shunt.toml");
+    std::fs::write(&path, config).expect("config");
+    let env_file = home.home().join("tokens.env");
+    std::fs::write(&env_file, env_text).expect("env file");
+    let mut record = crate::gateway::GatewayRecord::new(path).expect("adoptable");
+    record.env_file = Some(env_file);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .expect("save the record");
+    record
+}
+
+fn blank_profiles(names: &[&str]) -> AppConfig {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in names {
+        create_blank_profile(&mut config, (*name).to_string(), None, None, None)
+            .expect("create profile");
+    }
+    config
+}
+
+fn stored_tokens() -> String {
+    std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("dir")
+            .join("gateway-client-tokens.toml"),
+    )
+    .unwrap_or_default()
+}
+
+/// Deleting a profile revokes its client token: the store loses the entry,
+/// so the gateway restarts once without it.
+#[test]
+fn deleting_a_profile_revokes_its_gateway_client_token() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    let mut config = blank_profiles(&["keep", "gone"]);
+    let keep = crate::gateway_tokens::add_client_token(&record, "keep")
+        .expect("add")
+        .expose()
+        .to_string();
+    crate::gateway_tokens::add_client_token(&record, "gone").expect("add");
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("gone"),
+        false,
+        &rotation_guard("gone"),
+    )
+    .expect("delete");
+    assert_eq!(stored_tokens(), format!("[tokens]\nkeep = \"{keep}\"\n"));
+}
+
+/// A delete that would remove the last token while the gateway requires one
+/// refuses before anything is removed, a clean no-op like the live-session
+/// refusal; with no `[server.auth]` the same delete revokes it.
+#[test]
+fn deleting_the_profile_holding_the_last_token_refuses_while_the_gateway_requires_one() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    let mut config = blank_profiles(&["only"]);
+    let only = crate::gateway_tokens::add_client_token(&record, "only")
+        .expect("add")
+        .expose()
+        .to_string();
+    let dir = home.home().join(".clauth").join("profiles").join("only");
+    assert!(dir.exists(), "the profile has a directory");
+
+    let refused = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("only"),
+        false,
+        &rotation_guard("only"),
+    );
+    assert_eq!(
+        refused.map_err(|e| format!("{e:#}")),
+        Err("cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first".to_string())
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("only"))
+            .is_some(),
+        "the record stays"
+    );
+    assert!(dir.exists(), "the directory stays");
+    assert_eq!(stored_tokens(), format!("[tokens]\nonly = \"{only}\"\n"));
+
+    adopt_gateway(&home, "[server]\n", "");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("only"),
+        false,
+        &rotation_guard("only"),
+    )
+    .expect("an open gateway lets the last token go");
+    assert_eq!(stored_tokens(), "[tokens]\n");
+}
+
+/// Renaming a profile moves its token to the new name, the same key, so the
+/// profile's api key keeps working after the restart; a new name the env
+/// file's value already uses refuses before anything moves.
+#[test]
+fn renaming_a_profile_moves_its_token_to_the_new_name() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "SHUNT_CLIENT_TOKENS=taken:t1\n");
+    let mut config = blank_profiles(&["old"]);
+    let token = crate::gateway_tokens::add_client_token(&record, "old")
+        .expect("add")
+        .expose()
+        .to_string();
+
+    let refused = rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("old"),
+        &crate::profile::ProfileName::from("taken"),
+        &rotation_guard("old"),
+    );
+    assert_eq!(
+        refused.map_err(|e| format!("{e:#}")),
+        Err(format!(
+            "cannot rename profile \"old\" to \"taken\": the gateway's env file {} already names a client \"taken\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file first",
+            home.home().join("tokens.env").display()
+        ))
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("old"))
+            .is_some(),
+        "the refused rename moved nothing"
+    );
+
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("old"),
+        &crate::profile::ProfileName::from("new"),
+        &rotation_guard("old"),
+    )
+    .expect("rename");
+    assert_eq!(stored_tokens(), format!("[tokens]\nnew = \"{token}\"\n"));
+}
+
+fn delete(config: &mut AppConfig, name: &str) -> std::result::Result<(), String> {
+    delete_profile(
+        config,
+        &crate::profile::ProfileName::from(name),
+        false,
+        &rotation_guard(name),
+    )
+    .map_err(|e| format!("{e:#}"))
+}
+
+fn rename(config: &mut AppConfig, old: &str, new: &str) -> std::result::Result<(), String> {
+    rename_profile(
+        config,
+        &crate::profile::ProfileName::from(old),
+        &crate::profile::ProfileName::from(new),
+        &rotation_guard(old),
+    )
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// A delete reads the gateway only when its token is the store's last:
+/// with another token left, a gateway read that would refuse if made (its
+/// env file gone) blocks nothing, and the token is revoked.
+#[test]
+fn a_delete_with_other_tokens_left_reads_nothing_of_the_gateway() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    let mut config = blank_profiles(&["a", "b"]);
+    crate::gateway_tokens::add_client_token(&record, "a").expect("add");
+    let b = crate::gateway_tokens::add_client_token(&record, "b")
+        .expect("add")
+        .expose()
+        .to_string();
+    std::fs::remove_file(home.home().join("tokens.env")).expect("remove the env file");
+    assert_eq!(delete(&mut config, "a"), Ok(()));
+    assert_eq!(stored_tokens(), format!("[tokens]\nb = \"{b}\"\n"));
+}
+
+/// Deleting the profile holding the last token: an absent config has
+/// nothing to protect, so the delete proceeds, before the env file or a
+/// daemon record is read; a read that hides whether the gateway would be
+/// left with no token refuses, opening on the op and naming the fix, before
+/// anything is removed. That includes a config that does not parse and a
+/// record naming YAML, both of which a running gateway keeps serving on, and
+/// an unreadable env file or a daemon that recorded no env.
+#[test]
+fn deleting_the_last_token_reads_the_gateway_and_refuses_only_what_it_cannot_tell() {
+    let missing_env = |home: &HomeSandbox| {
+        format!(
+            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token (failed to read env file {}: No such file or directory (os error 2)); fix that, or add another client token first",
+            home.home().join("tokens.env").display()
+        )
+    };
+    let unread = |cause: &str| {
+        format!(
+            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token ({cause}); fix that, or add another client token first"
+        )
+    };
+    let unrecorded = unread(
+        "the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; restart the daemon, then try again",
+    );
+    let mut got = Vec::new();
+    let mut want = Vec::new();
+    for case in [
+        "config missing",
+        "config missing, daemon unrecorded",
+        "config and env file missing",
+        "config not TOML",
+        "record names YAML",
+        "env file missing",
+        "daemon unrecorded",
+    ] {
+        let home = HomeSandbox::new();
+        let _env = no_shunt_env(&home);
+        let record = adopt_gateway(&home, "[server.auth]\n", "");
+        let mut config = blank_profiles(&["only"]);
+        crate::gateway_tokens::add_client_token(&record, "only").expect("add");
+        let mut held = None;
+        let expected = match case {
+            "config missing" => {
+                std::fs::remove_file(record.config()).expect("remove the config");
+                Ok(())
+            }
+            "config missing, daemon unrecorded" => {
+                std::fs::remove_file(record.config()).expect("remove the config");
+                held = Some(crate::daemon::hold_daemon_lock());
+                std::fs::write(
+                    home.home().join(".clauth").join("clauthd.pid"),
+                    format!("{}\n", std::process::id()),
+                )
+                .expect("pid file");
+                Ok(())
+            }
+            "config and env file missing" => {
+                std::fs::remove_file(record.config()).expect("remove the config");
+                std::fs::remove_file(home.home().join("tokens.env")).expect("remove");
+                Ok(())
+            }
+            "config not TOML" => {
+                std::fs::write(record.config(), "[server.auth]\nheader = \"x").expect("config");
+                Err(unread("the shunt config does not parse as TOML (line 2)"))
+            }
+            "record names YAML" => {
+                let yaml = home.home().join("etc").join("shunt.yaml");
+                let record_file = home.home().join(".clauth").join("gateway.toml");
+                std::fs::write(
+                    &record_file,
+                    format!("config = {:?}\n", yaml.display().to_string()),
+                )
+                .expect("hand-edit the record");
+                Err(unread(&format!(
+                    "invalid gateway record {}: the shunt config must be TOML, and {} is YAML",
+                    record_file.display(),
+                    yaml.display()
+                )))
+            }
+            "env file missing" => {
+                std::fs::remove_file(home.home().join("tokens.env")).expect("remove");
+                Err(missing_env(&home))
+            }
+            _ => {
+                held = Some(crate::daemon::hold_daemon_lock());
+                std::fs::write(
+                    home.home().join(".clauth").join("clauthd.pid"),
+                    format!("{}\n", std::process::id()),
+                )
+                .expect("pid file");
+                Err(unrecorded.clone())
+            }
+        };
+        let outcome = delete(&mut config, "only");
+        let kept = config
+            .find(&crate::profile::ProfileName::from("only"))
+            .is_some();
+        got.push((
+            case,
+            outcome,
+            kept,
+            stored_tokens().starts_with("[tokens]\nonly"),
+        ));
+        let refused = expected.is_err();
+        want.push((case, expected, refused, refused));
+        drop(held);
+    }
+    assert_eq!(got, want);
+}
+
+/// A store clauth cannot parse refuses a delete and a rename of a profile,
+/// opening on the op and naming the file and the fix, never a parser
+/// message (it would quote a token).
+#[test]
+fn an_unparseable_store_refuses_delete_and_rename_naming_the_file() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["a"]);
+    let store = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("gateway-client-tokens.toml");
+    std::fs::write(&store, "[tokens]\na = \"tok-secret\n").expect("store");
+    let unreadable = format!(
+        "clauth's client-token store {} does not parse; delete it and add the tokens again",
+        store.display()
+    );
+    assert_eq!(
+        (delete(&mut config, "a"), rename(&mut config, "a", "b")),
+        (
+            Err(format!("cannot delete profile \"a\": {unreadable}")),
+            Err(format!(
+                "cannot rename profile \"a\" to \"b\": {unreadable}"
+            ))
+        )
+    );
+}
+
+/// A rename whose new name the store already holds a token under (a hand
+/// edit; a consistent store never does) refuses before anything moves,
+/// never overwriting that token; a gateway read the rename cannot make
+/// refuses opening on the op.
+#[test]
+fn a_rename_refuses_a_held_name_and_a_gateway_it_cannot_read() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["old", "plain"]);
+    let old = crate::gateway_tokens::add_client_token(&record, "old")
+        .expect("add")
+        .expose()
+        .to_string();
+    let stale = crate::gateway_tokens::add_client_token(&record, "new")
+        .expect("add")
+        .expose()
+        .to_string();
+    assert_eq!(
+        rename(&mut config, "old", "new"),
+        Err("cannot rename profile \"old\" to \"new\": clauth's client-token store already holds a token for \"new\"; remove that token first".to_string())
+    );
+    assert_eq!(
+        stored_tokens(),
+        format!("[tokens]\nnew = \"{stale}\"\nold = \"{old}\"\n")
+    );
+
+    let held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("pid file");
+    assert_eq!(
+        rename(&mut config, "old", "fresh"),
+        Err("cannot rename profile \"old\" to \"fresh\": clauth cannot tell whether the new name clashes with a client the gateway already names (the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; restart the daemon, then try again); fix that, then try again".to_string())
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("old"))
+            .is_some(),
+        "the refused rename moved nothing"
+    );
+    assert_eq!(
+        rename(&mut config, "plain", "plain2"),
+        Ok(()),
+        "a profile holding no token renames without reading the gateway"
+    );
+    drop(held);
+}
+
+/// A store that cannot be read refuses a delete and a rename of a profile,
+/// opening on the op, typed, naming the file and the fix.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_store_refuses_delete_and_rename_naming_the_file() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    if std::fs::metadata(record.config()).expect("stat").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can read any file");
+        return;
+    }
+    let mut config = blank_profiles(&["a"]);
+    crate::gateway_tokens::add_client_token(&record, "a").expect("add");
+    let store = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("gateway-client-tokens.toml");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let unread = format!(
+        "clauth's client-token store {} cannot be read (Permission denied (os error 13)); repair its permissions or remove it",
+        store.display()
+    );
+    let outcome = (delete(&mut config, "a"), rename(&mut config, "a", "b"));
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).expect("chmod back");
+    assert_eq!(
+        outcome,
+        (
+            Err(format!("cannot delete profile \"a\": {unread}")),
+            Err(format!("cannot rename profile \"a\" to \"b\": {unread}"))
+        )
+    );
+}
+
+/// Deleting the profile holding the last token over a config that exists but
+/// cannot be read refuses: a running gateway keeps serving on it, so its
+/// absence is no answer. Unix only, and skipped under root, which reads any
+/// file.
+#[cfg(unix)]
+#[test]
+fn deleting_the_last_token_refuses_over_an_unreadable_config() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    if std::fs::metadata(record.config()).expect("stat").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can read any file");
+        return;
+    }
+    let mut config = blank_profiles(&["only"]);
+    crate::gateway_tokens::add_client_token(&record, "only").expect("add");
+    std::fs::set_permissions(record.config(), std::fs::Permissions::from_mode(0o000))
+        .expect("chmod");
+    let outcome = delete(&mut config, "only");
+    std::fs::set_permissions(record.config(), std::fs::Permissions::from_mode(0o600))
+        .expect("chmod back");
+    assert_eq!(
+        outcome,
+        Err(format!(
+            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token (failed to read {}: Permission denied (os error 13)); fix that, or add another client token first",
+            record.config().display()
+        ))
+    );
+    assert!(
+        stored_tokens().starts_with("[tokens]\nonly"),
+        "the refused delete revoked nothing"
     );
 }

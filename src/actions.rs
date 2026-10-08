@@ -1047,6 +1047,9 @@ pub(crate) fn rename_profile(
         config.canonical_name(new).is_none_or(|n| n == old.as_str()),
         "rename target '{new}' already names an account"
     );
+    // The gateway's client token follows the profile; a clash with a client
+    // the gateway's own env names is read here, outside the flock.
+    let token_planned = crate::gateway_tokens::refuse_profile_rename(old.as_str(), new.as_str())?;
     with_state_lock(|held| {
         // Same gate delete and disable carry, same predicate and copy: a live
         // session's runtime tree, markers and env paths all live under this
@@ -1086,6 +1089,14 @@ pub(crate) fn rename_profile(
                 );
             }
         }
+        // Before the first move: a failed store write leaves everything as it
+        // was, and a retry after a later failure finds the token already moved.
+        crate::gateway_tokens::rename_profile_token(
+            old.as_str(),
+            new.as_str(),
+            token_planned,
+            held,
+        )?;
         if old_dir.exists() {
             std::fs::rename(&old_dir, &new_dir)
                 .with_context(|| format!("failed to rename profile directory to '{new}'"))?;
@@ -1119,6 +1130,8 @@ pub(crate) fn delete_profile(
     force: bool,
     _rotation: &RotationGuard,
 ) -> Result<()> {
+    // The gateway reads the last-token guard needs happen outside the flock.
+    let token = crate::gateway_tokens::plan_profile_delete(name.as_str())?;
     with_state_lock(|held| {
         // Refuse to pull an account out from under a running `clauth start`
         // session (either flavor), checked before any removal so a refused
@@ -1127,6 +1140,9 @@ pub(crate) fn delete_profile(
         if !force && crate::runtime::has_live_session(name) {
             bail!("'{name}' has a live session, pass --force to delete it anyway");
         }
+        // Same discipline: the gateway's last client token refuses here,
+        // before anything is removed; `force` waives the session gate alone.
+        crate::gateway_tokens::refuse_profile_delete(token.as_ref(), name.as_str(), held)?;
 
         let was_active = config.is_active(name);
         // An active API profile's base_url + api_key (and model-tier keys) live in
@@ -1160,6 +1176,11 @@ pub(crate) fn delete_profile(
         if dir.exists() {
             std::fs::remove_dir_all(&dir)
                 .with_context(|| format!("failed to delete profile directory for '{name}'"))?;
+        }
+        // Revoked with the record, after the irreversible removal succeeded:
+        // a failure here keeps the profile in state, and the retry revokes.
+        if token.is_some() {
+            crate::gateway_tokens::revoke_profile_token(name.as_str(), held)?;
         }
         config.remove(name, held);
         save_app_state(&config.state)?;

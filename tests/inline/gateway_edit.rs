@@ -5830,3 +5830,60 @@ fn a_block_under_a_bare_sub_table_glued_to_the_next_entry_is_that_entrys() {
         format!("{head}# c\n[[models]]\nid = \"m2\"\n[models.headers]\n")
     );
 }
+
+// ── require client tokens ───────────────────────────────────────────────────
+
+/// `[server.auth]` lands empty at the file's end after one blank line,
+/// whatever shape `[server]` takes, every other byte and comment kept and
+/// the file's line endings and final-newline state followed; a config with
+/// the table in any form changes nothing; an inline `server` takes no header.
+#[test]
+fn require_client_tokens_appends_an_empty_auth_table_and_keeps_every_other_byte() {
+    let _home = HomeSandbox::new();
+    for (text, expected) in [
+        (
+            "# shunt\n[server]\nbind = \"127.0.0.1:3001\" # loopback\n",
+            "# shunt\n[server]\nbind = \"127.0.0.1:3001\" # loopback\n\n[server.auth]\n",
+        ),
+        ("", "[server.auth]\n"),
+        ("# only a comment", "# only a comment\n\n[server.auth]"),
+        (
+            "server.bind = \"127.0.0.1:3001\"\n",
+            "server.bind = \"127.0.0.1:3001\"\n\n[server.auth]\n",
+        ),
+        ("[server.admin]\n\n", "[server.admin]\n\n[server.auth]\n"),
+        (
+            "[[upstreams]]\nname = \"a\"\n# glued under the entry\n",
+            "[[upstreams]]\nname = \"a\"\n# glued under the entry\n\n[server.auth]\n",
+        ),
+        (
+            "[server]\r\nbind = \"127.0.0.1:3001\"\r\n",
+            "[server]\r\nbind = \"127.0.0.1:3001\"\r\n\r\n[server.auth]\r\n",
+        ),
+    ] {
+        assert_eq!(
+            planned(text, Edit::RequireClientTokens),
+            expected,
+            "{text:?}"
+        );
+    }
+    for text in [
+        "[server.auth]\n",
+        "[server]\nauth.header = \"x-token\"\n",
+        "[server]\nauth = { tokens_env = \"T\" }\n",
+        "[[server.auth.jwt]]\nissuer = \"https://idp.example\"\n",
+        "server = { auth = {} }\n",
+    ] {
+        assert!(
+            matches!(plan(text, &Edit::RequireClientTokens), Ok(None)),
+            "{text:?} already has [server.auth]"
+        );
+    }
+    assert_eq!(
+        refused(
+            "server = { bind = \"127.0.0.1:3001\" }\n",
+            Edit::RequireClientTokens
+        ),
+        "cannot require client tokens: the config spells \"server\" in a shape clauth does not edit; edit the config by hand"
+    );
+}

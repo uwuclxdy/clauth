@@ -51,6 +51,7 @@ use crate::gateway::{
     VERSION_FLOOR, check_version_floor, gateway_bind, gateway_cwd, gateway_env,
     gateway_shutdown_timeout, probe_health,
 };
+use crate::gateway_tokens::StoreDigest;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{atomic_write_600, clauth_dir, open_append_600};
@@ -457,9 +458,19 @@ pub(crate) trait Supervised: Clone + Send + 'static {
     fn respawn_inputs_changed(&self, a: &Self::Record, b: &Self::Record) -> bool;
 
     /// Capture the spawn-time restart facts a respawn round re-reads (the
-    /// gateway's restart-only settings); the default for a kind with none.
-    fn spawn_mark(&self, _record: &Self::Record) -> Self::SpawnMark {
+    /// gateway's restart-only settings, and the digest of the client-token
+    /// store its `prepared` env was built from); the default for a kind with
+    /// none.
+    fn spawn_mark(&self, _record: &Self::Record, _prepared: &Self::Prepared) -> Self::SpawnMark {
         Default::default()
+    }
+
+    /// Why a spawn input the record does not hold changed since the spawn
+    /// (the gateway's client-token store), asking for the same immediate
+    /// respawn as a [`Supervised::respawn_inputs_changed`] change; `None`
+    /// keeps the child, as does an unreadable input, which is no evidence.
+    fn respawn_input_why(&self, _mark: &Self::SpawnMark) -> Option<String> {
+        None
     }
 
     /// Whether `mark`, captured at spawn, changed: `Some(change)` asks for a
@@ -947,6 +958,10 @@ impl<K: Supervised> Supervisor<K> {
                     );
                     return None;
                 }
+                if let Some(why) = self.kind.respawn_input_why(&running.spawn_mark) {
+                    self.begin_stop(AfterStop::Respawn { why }, tick);
+                    return None;
+                }
                 if let Some(change) = self.kind.respawn_mark_why(record, &mut running.spawn_mark) {
                     match self.kind.gate_respawn(
                         record,
@@ -1211,7 +1226,7 @@ impl<K: Supervised> Supervisor<K> {
                 self.log_skipped(&record, &prepared);
                 // Read before the spawn, so a save landing while the child
                 // boots can only cause a needless restart, never a missed one.
-                let spawn_mark = self.kind.spawn_mark(&record);
+                let spawn_mark = self.kind.spawn_mark(&record, &prepared);
                 let child = match self.kind.spawn(&record, &prepared, log) {
                     Ok(child) => child,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1876,13 +1891,27 @@ fn walk<'a>(doc: &'a toml::Value, keys: &[&str]) -> Result<Option<&'a toml::Valu
     Ok(None)
 }
 
+/// The setting a changed client-tokens variable names in a restart line.
+const TOKENS_VARIABLE_SETTING: &str = "[server.auth].tokens_env";
+
+/// What a running gateway was spawned over beyond its record: its config's
+/// restart-only facts (`None`: unreadable at spawn), the digest of the
+/// client-token store bytes its env was built from (`None`: no store), and
+/// the variable that env carried the tokens in (`None`: no token stored).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GatewayMark {
+    facts: Option<RestartFacts>,
+    client_tokens: Option<StoreDigest>,
+    tokens_variable: Option<String>,
+}
+
 impl Supervised for Gateway {
     type Slot = GatewaySlot;
     type Handle = GatewayHandle;
     type Record = GatewayRecord;
     type Probe = Health;
     type Prepared = GatewayEnv;
-    type SpawnMark = Option<RestartFacts>;
+    type SpawnMark = GatewayMark;
 
     fn publish(&self, handle: &GatewayHandle, slot: GatewaySlot) {
         match handle.lock() {
@@ -2104,35 +2133,62 @@ impl Supervised for Gateway {
         spawn_inputs(a) != spawn_inputs(b)
     }
 
-    fn spawn_mark(&self, record: &GatewayRecord) -> Option<RestartFacts> {
-        RestartFacts::read(record.config())
+    fn spawn_mark(&self, record: &GatewayRecord, env: &GatewayEnv) -> GatewayMark {
+        GatewayMark {
+            facts: RestartFacts::read(record.config()),
+            client_tokens: env.client_tokens_digest(),
+            tokens_variable: env.tokens_variable().map(str::to_string),
+        }
+    }
+
+    fn respawn_input_why(&self, mark: &GatewayMark) -> Option<String> {
+        // shunt reads its client tokens from its env at spawn alone, so a
+        // store change reaches it only through a respawn: a spawn input
+        // clauth writes, compared like the record's (the `env_file` path
+        // precedent), ungated.
+        crate::gateway_tokens::store_digest()
+            .ok()
+            .filter(|now| *now != mark.client_tokens)
+            .map(|_| "its client tokens changed".to_string())
     }
 
     fn respawn_mark_why(
         &self,
         record: &GatewayRecord,
-        mark: &mut Option<RestartFacts>,
+        mark: &mut GatewayMark,
     ) -> Option<RestartChange> {
         let current = RestartFacts::read(record.config())?;
-        if let Some(spawned) = mark.as_ref() {
-            let settings = current.changed_since(spawned);
-            if settings.is_empty() {
-                None
-            } else {
-                Some(RestartChange { settings })
-            }
+        let mut settings = if let Some(spawned) = mark.facts.as_ref() {
+            current.changed_since(spawned)
         } else {
             // The spawn-time read failed (an unreadable config, or one whose
             // fact path crossed a non-table). Adopt the first readable round's
             // facts as the baseline: shunt could not have booted on an
             // unreadable config, so outside a save race this costs nothing,
             // and from here a change restarts like any other child.
-            *mark = Some(current);
+            mark.facts = Some(current);
             logline!(
                 "clauth daemon: {}'s config could not be read at spawn; adopting the current config as its restart baseline",
                 self.name()
             );
+            Vec::new()
+        };
+        // A hand edit naming another variable for the client tokens
+        // (`[server.auth].tokens_env`, or its env-layer override in the env
+        // file) changes the env the gateway must be spawned with: shunt
+        // reads the variable at spawn alone. A config edit like the
+        // restart-only settings, so its restart passes the same `shunt check`
+        // gate and refused-check memo; an unreadable read is no evidence.
+        if crate::gateway::spawn_tokens_variable(record)
+            .ok()
+            .is_some_and(|now| now != mark.tokens_variable)
+        {
+            settings.push(TOKENS_VARIABLE_SETTING);
+        }
+        if settings.is_empty() {
             None
+        } else {
+            Some(RestartChange { settings })
         }
     }
 

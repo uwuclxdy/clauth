@@ -38,7 +38,7 @@ use toml_edit::{Array, Document, InlineTable, Item, Key, Table, TableLike, Value
 
 use crate::gateway::{
     BIND_ENV, BindRefusal, ConfigBindRefused, GatewayRecord, StoreMoveRefusal, config_parse_error,
-    gateway_env, inherited_env, read_config_for_edit, recorded_env_for_holder_pid, resolve_bind,
+    file_env, inherited_env, read_config_for_edit, recorded_env_for_holder_pid, resolve_bind,
     spawned_env_var, write_checked,
 };
 
@@ -173,7 +173,7 @@ impl RouteView {
 /// `bind` edit reads the daemon's env strictly.
 pub(crate) fn read_view(record: &GatewayRecord) -> Result<ConfigView> {
     let (_, text) = read_config_for_edit(record.config())?;
-    let env = gateway_env(record)?;
+    let env = file_env(record)?;
     let inherited = match crate::daemon::singleton_held() {
         Ok(false) => inherited_env().map(|(pairs, _)| pairs).unwrap_or_default(),
         Ok(true) | Err(_) => recorded_env_for_holder_pid().unwrap_or_default(),
@@ -363,6 +363,11 @@ pub(crate) enum Edit {
         name: String,
         accounts: Vec<String>,
     },
+    /// Add an empty `[server.auth]`: shunt's defaults read the client tokens
+    /// from `SHUNT_CLIENT_TOKENS` under `x-shunt-token`, the variable the
+    /// spawn env sets when no key names another. A config that has the table
+    /// in any form is left as it is.
+    RequireClientTokens,
 }
 
 impl Edit {
@@ -409,6 +414,7 @@ impl Edit {
             Edit::SetAccounts { name, .. } => {
                 format!("cannot set the accounts of upstream {name:?}")
             }
+            Edit::RequireClientTokens => "cannot require client tokens".to_string(),
         }
     }
 
@@ -481,7 +487,7 @@ pub(crate) fn apply_edit(record: &GatewayRecord, edit: &Edit) -> Result<Applied>
 /// `SHUNT_SERVER__BIND`: read from the env file over the daemon's inherited
 /// env, a daemon with no record naming it refusing.
 fn refuse_overridden_bind(record: &GatewayRecord, op: String) -> Result<()> {
-    let env = gateway_env(record)?;
+    let env = file_env(record)?;
     let inherited = match inherited_env() {
         Ok((pairs, _)) => pairs,
         Err(e) => {
@@ -2540,7 +2546,8 @@ impl<'a> Ctx<'a> {
             | Edit::AddRoute(_)
             | Edit::RemoveUpstream { .. }
             | Edit::RemoveModel { .. }
-            | Edit::RemoveRoute { .. } => false,
+            | Edit::RemoveRoute { .. }
+            | Edit::RequireClientTokens => false,
         }
     }
 
@@ -3144,6 +3151,7 @@ impl<'a> Ctx<'a> {
                 self.refuse_legacy()?;
                 return self.set_accounts(name, accounts);
             }
+            Edit::RequireClientTokens => self.require_client_tokens()?,
         };
         Ok(Change {
             candidate: splice(self.text(), splices)?,
@@ -3274,6 +3282,19 @@ impl<'a> Ctx<'a> {
                     format!("{key} = {}", basic(value)),
                 ])]
             })),
+        }
+    }
+
+    /// `[server.auth]` as a new table at the file's end, unless `server`
+    /// already has `auth` in any form; an inline `server = { … }` cannot take
+    /// a header.
+    fn require_client_tokens(&self) -> Result<Vec<Splice>, EditRefusal> {
+        match self.server()? {
+            Some((tab, _)) if tab.get("auth").is_some() => Ok(Vec::new()),
+            Some((Tab::Inline(..), path)) => Err(self.shape(path)),
+            Some((Tab::Std(_), _)) | None => {
+                Ok(vec![self.new_table_at_end(&["[server.auth]".to_string()])])
+            }
         }
     }
 
@@ -4610,6 +4631,11 @@ mod semantic {
                     }
                     None | Some(_) => return None,
                 }
+            }
+            Edit::RequireClientTokens => {
+                table_at(&mut doc, "server")?
+                    .entry("auth")
+                    .or_insert_with(|| Value::Table(Table::new()));
             }
         }
         Some(doc)

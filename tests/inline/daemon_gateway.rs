@@ -23,6 +23,8 @@ use super::*;
 use super::Supervised as _;
 use crate::gateway::GatewayRecord;
 use crate::testutil::HomeSandbox;
+#[cfg(unix)]
+use crate::testutil::no_shunt_env;
 
 #[cfg(unix)]
 #[path = "../support/gateway_stub.rs"]
@@ -1184,6 +1186,273 @@ fn a_config_gaining_the_admin_table_restarts_the_gateway_once_without_a_restart_
         stub::terms(&rig.dir),
         [first.pid],
         "the receiver side: exactly one SIGTERM, not two"
+    );
+}
+
+/// The client-token pairs a run saw, as `KEY=VALUE`.
+#[cfg(unix)]
+fn tokens_env(call: &stub::Invocation) -> Vec<String> {
+    call.env
+        .iter()
+        .filter(|pair| pair.starts_with("SHUNT_CLIENT_TOKENS="))
+        .cloned()
+        .collect()
+}
+
+/// A client-token store change after the child spawned restarts it once with
+/// the normal stop: one SIGTERM to the old run, one spawn carrying the new
+/// pairs, no crash counted and `restarts` unchanged. A store op that writes
+/// nothing restarts nothing. The first stub ignores SIGTERM, so the `terms`
+/// pin counts every signal it got.
+#[cfg(unix)]
+#[test]
+fn a_client_token_store_change_restarts_the_gateway_once_without_a_restart_count() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    rig.touch("ignore-term");
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    let add = |profile: &str| {
+        crate::gateway_tokens::add_client_token(&record, profile)
+            .expect("add")
+            .expose()
+            .to_string()
+    };
+    let kerry = add("kerry");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let first = rig.only_call();
+    assert_eq!(
+        tokens_env(&first),
+        [format!("SHUNT_CLIENT_TOKENS=kerry:{kerry}")]
+    );
+
+    assert!(
+        !crate::gateway_tokens::remove_client_token(&record, "nobody").expect("remove"),
+        "a profile holding no token"
+    );
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a store op that writes nothing keeps the child"
+    );
+
+    let alice = add("alice");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a store change restarts the child"
+    );
+    stub::wait_until("the first stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
+    supervisor.step(t0.after(secs(15)));
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(15)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(
+        tokens_env(&calls[1]),
+        [format!("SHUNT_CLIENT_TOKENS=alice:{alice},kerry:{kerry}")]
+    );
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [first.pid],
+        "the receiver side: exactly one SIGTERM, not two"
+    );
+
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(16)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert_eq!(
+        rig.calls().len(),
+        2,
+        "the new run's own store restarts nothing"
+    );
+}
+
+/// A hand edit naming another tokens variable (`[server.auth].tokens_env`)
+/// while a token is stored changes the variable shunt reads them from, which
+/// it reads at spawn alone: the gateway restarts once and the new run carries
+/// the pairs in the new variable. An edit leaving the variable as it was
+/// restarts nothing.
+#[cfg(unix)]
+#[test]
+fn a_changed_tokens_variable_restarts_the_gateway_once() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    rig.arm_check_stub();
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    let kerry = crate::gateway_tokens::add_client_token(&record, "kerry")
+        .expect("add")
+        .expose()
+        .to_string();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let base = format!(
+        "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_CLIENT_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "the same variable spelled out restarts nothing"
+    );
+
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_OTHER_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "another variable restarts the child"
+    );
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(4)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(
+        calls[1]
+            .env
+            .iter()
+            .filter(|pair| pair.contains("_TOKENS="))
+            .cloned()
+            .collect::<Vec<_>>(),
+        [format!("SHUNT_OTHER_TOKENS=kerry:{kerry}")]
+    );
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// A tokens-variable change is a config hand edit, so its restart passes the
+/// same `shunt check` gate the restart-only settings do: a refused check
+/// keeps the serving child and is memoized; the fixed edit restarts it once.
+#[cfg(unix)]
+#[test]
+fn a_tokens_variable_change_shunt_check_refuses_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    crate::gateway_tokens::add_client_token(&record, "kerry").expect("add");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+    let base = format!(
+        "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_OTHER_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a refused check keeps the child"
+    );
+    assert!(stub::alive(pid), "the child serves on");
+    assert_eq!(rig.check_runs(), 1, "one check on the refused bytes");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(rig.check_runs(), 1, "unchanged bytes are not re-checked");
+
+    fs::remove_file(rig.dir.join("check-fail")).expect("clear the refusal");
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_THIRD_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(4)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a passing check restarts the child"
+    );
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(5)),
+        GatewayState::Starting,
+    );
+    assert_eq!(rig.calls().len(), 2, "respawned exactly once");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// A store name the env file's own value now holds (the env file edited
+/// after the add) keeps the gateway down, the slot naming the name and never
+/// a value: shunt refuses a duplicate name whole.
+#[cfg(unix)]
+#[test]
+fn a_store_name_the_env_file_now_holds_keeps_the_gateway_down_naming_it() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    crate::gateway_tokens::add_client_token(&record, "kerry").expect("add");
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n[server.auth]\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    fs::write(
+        &rig.env_file,
+        "GATEWAY_TEST_SECRET=from-env-file\nSHUNT_CLIENT_TOKENS=kerry:k0-secret\n",
+    )
+    .expect("env file");
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    let slot = rig.slot();
+    assert_eq!(slot.state, GatewayState::Misconfigured);
+    assert_eq!(
+        slot.reason,
+        Some(format!(
+            "the gateway's env file {} and clauth's client-token store both name a client \"kerry\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file, or remove clauth's token for that profile",
+            rig.env_file.display()
+        ))
+    );
+    assert!(
+        stub::invocations(&rig.dir).is_empty(),
+        "nothing was spawned"
     );
 }
 

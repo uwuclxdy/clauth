@@ -2148,6 +2148,26 @@ pub(crate) fn herdr_pane_env<'a>(
     )
 }
 
+/// Unset every `SHUNT_*` variable the gateway's client-token reads take
+/// from this process's env: shunt's default tokens variable and the env-layer
+/// `[server.auth]` keys, in both spellings a shell is likely to export, so a
+/// shell exporting one changes no result. Borrows the sandbox: the env is a
+/// process-global serialized by `HOME_TEST_LOCK`, which the sandbox holds.
+pub(crate) fn no_shunt_env(home: &HomeSandbox) -> EnvPin<'_> {
+    EnvPin::new(
+        home,
+        &[
+            ("SHUNT_CLIENT_TOKENS", None),
+            ("SHUNT_SERVER__AUTH__HEADER", None),
+            ("SHUNT_SERVER__AUTH__TOKENS_ENV", None),
+            ("SHUNT_SERVER__AUTH__JWT", None),
+            ("shunt_server__auth__header", None),
+            ("shunt_server__auth__tokens_env", None),
+            ("shunt_server__auth__jwt", None),
+        ],
+    )
+}
+
 /// Shim that appends its full argv to `report.log` beside itself and exits 0.
 /// `$0` resolves to the shim itself, so the log needs no embedded path; a
 /// report test spawns the shim as `HERDR_BIN_PATH` (or on `PATH`) and reads

@@ -10,7 +10,8 @@ use std::net::{SocketAddr, TcpListener};
 
 use super::*;
 use crate::testutil::{
-    EnvPin, HomeSandbox, request_header, request_path, serve_endpoints, serve_endpoints_raw,
+    EnvPin, HomeSandbox, no_shunt_env, request_header, request_path, serve_endpoints,
+    serve_endpoints_raw,
 };
 
 fn write(path: &Path, text: &str) {
@@ -324,7 +325,13 @@ fn the_admin_token_is_minted_once_owner_only_and_long_enough() {
 fn the_admin_token_debug_never_prints_it() {
     let _home = HomeSandbox::new();
     let token = ensure_admin_token().expect("mint");
-    assert_eq!(format!("{token:?}"), "AdminToken(<redacted>)");
+    assert_eq!(format!("{token:?}"), "SecretToken(<redacted>)");
+    let client = mint_token().expect("mint");
+    assert_eq!(
+        format!("{client:?}"),
+        "SecretToken(<redacted>)",
+        "a client token is the same redacted type"
+    );
 }
 
 #[test]
@@ -717,7 +724,7 @@ fn the_displayed_bind_reads_the_daemon_recorded_bind_matched_by_pid() {
     let held = crate::daemon::hold_daemon_lock();
     let pid_file = home.home().join(".clauth").join("clauthd.pid");
     fs::write(&pid_file, format!("{}\n", std::process::id())).unwrap();
-    write_daemon_env_from(|key| (key == BIND_ENV).then(|| OsString::from("192.168.1.5:3067")))
+    write_daemon_env_from(&env_pairs(&[(BIND_ENV, "192.168.1.5:3067")]))
         .expect("record the daemon env");
     assert_eq!(
         configured(&record),
@@ -1004,6 +1011,14 @@ fn the_inherited_drain_env_value_is_normalized_too() {
 
 // ── env ─────────────────────────────────────────────────────────────────────
 
+/// A process env as `(name, value)` pairs, for the daemon record's capture.
+fn env_pairs(pairs: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
+    pairs
+        .iter()
+        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+        .collect()
+}
+
 fn env_of(pairs: &[(&str, &str)], skipped: &[usize]) -> GatewayEnv {
     GatewayEnv {
         vars: pairs
@@ -1011,6 +1026,9 @@ fn env_of(pairs: &[(&str, &str)], skipped: &[usize]) -> GatewayEnv {
             .map(|(k, v)| ((*k).to_string(), OsString::from(v)))
             .collect(),
         skipped: skipped.to_vec(),
+        client_tokens: None,
+        tokens_variable: None,
+        unset: Vec::new(),
     }
 }
 
@@ -1224,6 +1242,919 @@ fn the_gateway_env_is_the_env_file_then_the_stores() {
             "CLAUDE_CREDENTIALS",
         ]
     );
+}
+
+// ── client tokens in the spawn env ──────────────────────────────────────────
+
+/// [`with_env_file`] with `config` as the config's text.
+fn with_config(home: &HomeSandbox, config: &str, env_text: &str) -> GatewayRecord {
+    let record = with_env_file(home, env_text);
+    write(record.config(), config);
+    record
+}
+
+fn spawn_env(
+    record: &GatewayRecord,
+    inherited: &[(&str, &str)],
+) -> std::result::Result<GatewayEnv, String> {
+    let pairs = inherited
+        .iter()
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
+        .collect();
+    gateway_env_in(record, || Ok(TokensInherited::Process(pairs))).map_err(|e| format!("{e:#}"))
+}
+
+fn add_token(record: &GatewayRecord, profile: &str) -> String {
+    crate::gateway_tokens::add_client_token(record, profile)
+        .expect("add a client token")
+        .expose()
+        .to_string()
+}
+
+/// The env file's own pairs come first, then the store's in name order,
+/// joined with `,`; with no store the env file's value passes through
+/// untouched; and the env carries the digest of the store bytes it read.
+#[test]
+fn the_spawn_env_joins_the_env_files_own_pairs_then_the_store() {
+    use sha2::{Digest as _, Sha256};
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(
+        &home,
+        "[server]\n",
+        "SHUNT_CLIENT_TOKENS=alice:a1\nOTHER=x\n",
+    );
+    let env = spawn_env(&record, &[]).expect("env");
+    assert_eq!(env.get("SHUNT_CLIENT_TOKENS"), Some(OsStr::new("alice:a1")));
+    assert_eq!(env.client_tokens_digest(), None, "no store, no digest");
+
+    let kerry = add_token(&record, "kerry");
+    let env = spawn_env(&record, &[]).expect("env");
+    assert_eq!(
+        env.get("SHUNT_CLIENT_TOKENS"),
+        Some(OsString::from(format!("alice:a1,kerry:{kerry}")).as_os_str())
+    );
+    let store = home
+        .home()
+        .join(".clauth")
+        .join("gateway-client-tokens.toml");
+    assert_eq!(
+        env.client_tokens_digest(),
+        Some(<[u8; 32]>::from(Sha256::digest(
+            fs::read(&store).expect("store")
+        ))),
+        "the digest of the store bytes the env was built from"
+    );
+
+    let bob = add_token(&record, "bob");
+    assert_eq!(
+        spawn_env(&record, &[])
+            .expect("env")
+            .get("SHUNT_CLIENT_TOKENS"),
+        Some(OsString::from(format!("alice:a1,bob:{bob},kerry:{kerry}")).as_os_str())
+    );
+
+    write(record.env_file.as_deref().expect("env file"), "OTHER=x\n");
+    assert_eq!(
+        spawn_env(&record, &[])
+            .expect("env")
+            .get("SHUNT_CLIENT_TOKENS"),
+        Some(OsString::from(format!("bob:{bob},kerry:{kerry}")).as_os_str()),
+        "no env-file pair: the store's alone"
+    );
+}
+
+/// The variable is `SHUNT_SERVER__AUTH__TOKENS_ENV` from the spawn env in
+/// any case (the env file's over the inherited env), as figment reads it,
+/// else `[server.auth].tokens_env`, else shunt's `SHUNT_CLIENT_TOKENS`.
+#[test]
+fn the_tokens_variable_is_the_env_layer_then_the_configs_key_then_shunts_default() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    let kerry = add_token(&record, "kerry");
+    let pair = OsString::from(format!("kerry:{kerry}"));
+    let keyed = "[server.auth]\ntokens_env = \"CFG_TOKENS\"\n";
+    for (config, env_text, inherited, variable) in [
+        ("[server]\n", "", &[][..], "SHUNT_CLIENT_TOKENS"),
+        (keyed, "", &[][..], "CFG_TOKENS"),
+        (
+            keyed,
+            "shunt_server__auth__tokens_env=ENV_TOKENS\n",
+            &[][..],
+            "ENV_TOKENS",
+        ),
+        (
+            keyed,
+            "",
+            &[("SHUNT_SERVER__AUTH__TOKENS_ENV", "\"QUOTED_TOKENS\"")][..],
+            "QUOTED_TOKENS",
+        ),
+        (
+            keyed,
+            "SHUNT_SERVER__AUTH__TOKENS_ENV=FILE_TOKENS\n",
+            &[("SHUNT_SERVER__AUTH__TOKENS_ENV", "INHERITED_TOKENS")][..],
+            "FILE_TOKENS",
+        ),
+    ] {
+        write(record.config(), config);
+        write(record.env_file.as_deref().expect("env file"), env_text);
+        let env = spawn_env(&record, inherited).expect("env");
+        assert_eq!(
+            env.get(variable),
+            Some(pair.as_os_str()),
+            "{config:?} {env_text:?}"
+        );
+        for other in ["SHUNT_CLIENT_TOKENS", "CFG_TOKENS"] {
+            if other != variable {
+                assert_eq!(env.get(other), None, "{other} beside {variable}");
+            }
+        }
+    }
+}
+
+/// A tokens variable clauth cannot set refuses the spawn env, naming where it
+/// came from and the fix; with no client token stored nothing reads it.
+#[test]
+fn a_tokens_variable_clauth_cannot_set_refuses_by_where_it_came_from() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server.auth]\ntokens_env = \"${TOK}\"\n", "");
+    assert!(
+        spawn_env(&record, &[]).is_ok(),
+        "no client token stored: the variable is not read"
+    );
+    write(record.config(), "[server]\n");
+    add_token(&record, "kerry");
+    let not_a_name = |source: &str| {
+        format!(
+            "{source} is not a variable name clauth can set; set it to a plain variable name like SHUNT_CLIENT_TOKENS"
+        )
+    };
+    for (config, env_text, message) in [
+        (
+            "[server.auth]\ntokens_env = \"${TOK}\"\n",
+            "",
+            "[server.auth].tokens_env is a ${...} reference, which clauth does not resolve; write the variable's name there by hand, or set SHUNT_SERVER__AUTH__TOKENS_ENV in the gateway's env file".to_string(),
+        ),
+        (
+            "[server.auth]\ntokens_env = 7\n",
+            "",
+            not_a_name("[server.auth].tokens_env"),
+        ),
+        (
+            "[server]\n",
+            "SHUNT_SERVER__AUTH__TOKENS_ENV=\n",
+            not_a_name("SHUNT_SERVER__AUTH__TOKENS_ENV"),
+        ),
+        (
+            "[server]\n",
+            "SHUNT_SERVER__AUTH__TOKENS_ENV='\"A\\B\"'\n",
+            "SHUNT_SERVER__AUTH__TOKENS_ENV holds a backslash inside its quotes, which figment would unescape and clauth does not; write the value literally".to_string(),
+        ),
+    ] {
+        write(record.config(), config);
+        write(record.env_file.as_deref().expect("env file"), env_text);
+        assert_eq!(
+            spawn_env(&record, &[]).map(|_| ()),
+            Err(message),
+            "{config:?} {env_text:?}"
+        );
+    }
+}
+
+/// A store name the env file's own value also holds (the env file edited
+/// after the add) fails the spawn env closed rather than hand shunt a
+/// duplicate it refuses whole; the refusal names the names, never a value.
+#[test]
+fn a_store_name_the_env_file_also_holds_refuses_the_spawn_env_by_name() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server.auth]\n", "");
+    add_token(&record, "kerry");
+    let env_file = record.env_file.clone().expect("env file");
+    write(
+        &env_file,
+        "SHUNT_CLIENT_TOKENS=kerry:k0-secret,bob:b0-secret\n",
+    );
+    assert_eq!(
+        spawn_env(&record, &[]).map(|_| ()),
+        Err(format!(
+            "the gateway's env file {} and clauth's client-token store both name a client \"kerry\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file, or remove clauth's token for that profile",
+            env_file.display()
+        ))
+    );
+    write(&env_file, "");
+    add_token(&record, "bob");
+    write(
+        &env_file,
+        "SHUNT_CLIENT_TOKENS=kerry:k0-secret,bob:b0-secret\n",
+    );
+    assert_eq!(
+        spawn_env(&record, &[]).map(|_| ()),
+        Err(format!(
+            "the gateway's env file {} and clauth's client-token store both name clients \"bob\", \"kerry\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove those entries from the env file, or remove clauth's token for those profiles",
+            env_file.display()
+        ))
+    );
+}
+
+/// The join's base is the value shunt reads without clauth: the env file's,
+/// else the one the gateway inherits, the daemon's own env at the spawn.
+#[test]
+fn the_spawn_joins_onto_the_inherited_value_when_the_env_file_sets_none() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "OTHER=x\n");
+    let _pin = EnvPin::new(
+        &home,
+        &[("SHUNT_CLIENT_TOKENS", Some(OsStr::new("alice:a1")))],
+    );
+    let kerry = add_token(&record, "kerry");
+    assert_eq!(
+        gateway_env(&record)
+            .expect("env")
+            .get("SHUNT_CLIENT_TOKENS"),
+        Some(OsString::from(format!("alice:a1,kerry:{kerry}")).as_os_str()),
+        "the inherited pairs stay"
+    );
+    write(
+        record.env_file.as_deref().expect("env file"),
+        "SHUNT_CLIENT_TOKENS=bob:b1\n",
+    );
+    assert_eq!(
+        gateway_env(&record)
+            .expect("env")
+            .get("SHUNT_CLIENT_TOKENS"),
+        Some(OsString::from(format!("bob:b1,kerry:{kerry}")).as_os_str()),
+        "the env file's value outranks the inherited one, as shunt reads it"
+    );
+}
+
+/// With no daemon the TUI reads the inherited value from its own env, as
+/// `start daemon` would hand it on: a name it holds refuses the add.
+#[test]
+fn with_no_daemon_an_add_refuses_a_name_the_inherited_value_holds() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    let _pin = EnvPin::new(
+        &home,
+        &[("SHUNT_CLIENT_TOKENS", Some(OsStr::new("alice:a1-secret")))],
+    );
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "alice")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err("cannot add a client token for profile \"alice\": the environment the gateway inherits already names a client \"alice\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from that environment first".to_string())
+    );
+}
+
+/// Under a running daemon the TUI reads the daemon's recorded inherited
+/// value, never its own env; a record written before the daemon recorded the
+/// tokens variable refuses until the daemon restarts.
+#[test]
+fn under_a_daemon_the_tui_reads_the_daemons_recorded_inherited_value() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let _pin = EnvPin::new(&home, &[("SHUNT_CLIENT_TOKENS", None)]);
+    let held = crate::daemon::hold_daemon_lock();
+    let pid_file = home.home().join(".clauth").join("clauthd.pid");
+    fs::write(&pid_file, format!("{}\n", std::process::id())).unwrap();
+    write_daemon_env_from(&env_pairs(&[("SHUNT_CLIENT_TOKENS", "alice:a1-secret")]))
+        .expect("record the daemon env");
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "alice")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err("cannot add a client token for profile \"alice\": the environment the gateway inherits already names a client \"alice\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from that environment first".to_string())
+    );
+
+    let path = home.home().join(".clauth").join("gateway-env.json");
+    let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let fields = old.as_object_mut().expect("an object");
+    fields.remove("auth_env");
+    fields.remove("tokens");
+    fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "kerry")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err("cannot add a client token for profile \"kerry\": the running daemon recorded no value for SHUNT_CLIENT_TOKENS, the variable shunt reads its client tokens from; restart the daemon so it records it".to_string())
+    );
+    drop(held);
+}
+
+/// The unmanaged token names read by shunt's grammar from the variable the
+/// spawn sets, never a value: entries trimmed, the name before the first
+/// `:`, empty entries skipped.
+#[test]
+fn the_unmanaged_token_names_follow_shunts_grammar() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let _pin = EnvPin::new(&home, &[("SHUNT_CLIENT_TOKENS", None), ("CFG", None)]);
+    let record = with_config(
+        &home,
+        "[server]\n",
+        "SHUNT_CLIENT_TOKENS=\" alice : a1 ,bob:b:2,,\"\nCFG=carol:c3\n",
+    );
+    assert_eq!(
+        unmanaged_token_names(&record).expect("names"),
+        ["alice", "bob"]
+    );
+    write(record.config(), "[server.auth]\ntokens_env = \"CFG\"\n");
+    assert_eq!(unmanaged_token_names(&record).expect("names"), ["carol"]);
+    let mut bare = record.clone();
+    bare.env_file = None;
+    assert_eq!(
+        unmanaged_token_names(&bare).expect("names"),
+        Vec::<String>::new()
+    );
+}
+
+/// A tokens value shunt's grammar refuses (shunt refuses the whole load on
+/// it) is never read as holding no pair: every reader refuses, naming where
+/// the value came from and never the value. Each outcome is collected so one
+/// wrong reader does not hide another.
+#[test]
+fn a_tokens_value_shunt_cannot_parse_is_never_read_as_holding_no_pair() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let _pin = EnvPin::new(&home, &[("SHUNT_CLIENT_TOKENS", None)]);
+    let record = with_config(&home, "[server.auth]\n", "");
+    let env_file = record.env_file.clone().expect("env file");
+    let unparsed = format!(
+        "the gateway's env file {} holds a SHUNT_CLIENT_TOKENS value shunt cannot parse, and shunt refuses to start on it; fix that value first",
+        env_file.display()
+    );
+    let fmt = |r: Result<()>| r.map_err(|e| format!("{e:#}"));
+    let mut got = Vec::new();
+    let mut want = Vec::new();
+    for bad in ["broken-secret", "a:1,a:2", ",,", "ci:"] {
+        write(&env_file, &format!("SHUNT_CLIENT_TOKENS={bad}\n"));
+        got.push((
+            bad,
+            "names",
+            fmt(unmanaged_token_names(&record).map(|_| ())),
+        ));
+        want.push((bad, "names", Err(unparsed.clone())));
+        got.push((
+            bad,
+            "add",
+            fmt(crate::gateway_tokens::add_client_token(&record, "kerry").map(|_| ())),
+        ));
+        want.push((
+            bad,
+            "add",
+            Err(format!(
+                "cannot add a client token for profile \"kerry\": {unparsed}"
+            )),
+        ));
+    }
+    // A token stored before the env file turned unparseable: the spawn join
+    // and the last token's remove refuse, and the open config's require too.
+    write(&env_file, "");
+    add_token(&record, "kerry");
+    write(&env_file, "SHUNT_CLIENT_TOKENS=broken-secret\n");
+    got.push((
+        "broken-secret",
+        "spawn",
+        fmt(gateway_env(&record).map(|_| ())),
+    ));
+    want.push(("broken-secret", "spawn", Err(unparsed.clone())));
+    got.push((
+        "broken-secret",
+        "remove",
+        fmt(crate::gateway_tokens::remove_client_token(&record, "kerry").map(|_| ())),
+    ));
+    want.push((
+        "broken-secret",
+        "remove",
+        Err(format!("cannot remove the last client token: {unparsed}")),
+    ));
+    write(record.config(), "[server]\n");
+    let store = home
+        .home()
+        .join(".clauth")
+        .join("gateway-client-tokens.toml");
+    fs::remove_file(&store).expect("empty the store");
+    got.push((
+        "broken-secret",
+        "require",
+        fmt(crate::gateway_tokens::require_client_tokens(&record).map(|_| ())),
+    ));
+    want.push((
+        "broken-secret",
+        "require",
+        Err(format!("cannot require client tokens: {unparsed}")),
+    ));
+    assert_eq!(got, want);
+}
+
+/// Under a running daemon whose inherited tokens value does not parse, the
+/// TUI's add refuses on the record's state, naming the inherited env.
+#[test]
+fn under_a_daemon_an_unparseable_inherited_value_refuses_the_add() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let _pin = EnvPin::new(&home, &[("SHUNT_CLIENT_TOKENS", None)]);
+    let held = crate::daemon::hold_daemon_lock();
+    fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+    write_daemon_env_from(&env_pairs(&[("SHUNT_CLIENT_TOKENS", "no-colon-secret")]))
+        .expect("record the daemon env");
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "kerry")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err("cannot add a client token for profile \"kerry\": the environment the gateway inherits holds a SHUNT_CLIENT_TOKENS value shunt cannot parse, and shunt refuses to start on it; fix that value first".to_string())
+    );
+    drop(held);
+}
+
+/// A daemon starting with no gateway adopted still records shunt's default
+/// tokens variable (names only), so a gateway adopted while it runs reads it.
+#[test]
+fn a_daemon_with_no_adopted_gateway_records_shunts_default_variable() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[("SHUNT_CLIENT_TOKENS", Some(OsStr::new("ci:abc")))],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    let value: serde_json::Value = serde_json::from_slice(
+        &fs::read(home.home().join(".clauth").join("gateway-env.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        value["tokens"],
+        serde_json::json!([["SHUNT_CLIENT_TOKENS", {"names": ["ci"]}]])
+    );
+    drop(held);
+}
+
+/// A gateway adopted while a daemon that started without one runs: the
+/// record answers for shunt's default variable and the one the daemon's env
+/// layer names, so the add reads the daemon's inherited names instead of
+/// refusing the variable as unrecorded.
+#[test]
+fn a_gateway_adopted_under_a_running_daemon_takes_client_tokens() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[
+            (
+                "SHUNT_SERVER__AUTH__TOKENS_ENV",
+                Some(OsStr::new("FOO_TOKENS")),
+            ),
+            ("FOO_TOKENS", Some(OsStr::new("alice:a1-secret"))),
+        ],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "alice")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err(clash_inherited("alice", "FOO_TOKENS"))
+    );
+    assert!(
+        crate::gateway_tokens::add_client_token(&record, "kerry").is_ok(),
+        "a name the daemon's value does not hold takes a token"
+    );
+    drop(held);
+}
+
+/// With the tokens variable unrecorded (a config naming another one after
+/// the daemon started) and no token stored, the TUI's check env still lays
+/// the daemon's recorded `[server.auth]` keys, removes the TUI's own, and sets
+/// the variable empty so the TUI's own value never reaches the check.
+#[test]
+fn the_check_env_keeps_the_daemons_auth_keys_when_its_variable_is_unrecorded() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[(
+            "SHUNT_SERVER__AUTH__HEADER",
+            Some(OsStr::new("daemon-header")),
+        )],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    write(
+        record.config(),
+        "[server.auth]\ntokens_env = \"LATER_TOKENS\"\n",
+    );
+    let _tui_env = EnvPin::new(
+        &home,
+        &[
+            ("SHUNT_SERVER__AUTH__JWT", Some(OsStr::new("tui-only"))),
+            ("LATER_TOKENS", Some(OsStr::new("tui-secret"))),
+        ],
+    );
+    let env = checked_env(&record).expect("the check env");
+    let mut command = Command::new("true");
+    env.apply(&mut command);
+    let mut laid: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .filter_map(|(name, value)| {
+            let name = name.to_string_lossy().into_owned();
+            (name.starts_with("SHUNT_SERVER__AUTH__") || name == "LATER_TOKENS")
+                .then(|| (name, value.map(|v| v.to_string_lossy().into_owned())))
+        })
+        .collect();
+    laid.sort();
+    assert_eq!(
+        laid,
+        [
+            ("LATER_TOKENS".to_string(), Some(String::new())),
+            (
+                "SHUNT_SERVER__AUTH__HEADER".to_string(),
+                Some("daemon-header".to_string())
+            ),
+            ("SHUNT_SERVER__AUTH__JWT".to_string(), None),
+        ]
+    );
+    drop(held);
+}
+
+/// With a `tokens_env` clauth cannot read (a `${…}` reference) and no token
+/// stored, the TUI's check env still lays the daemon's recorded
+/// `[server.auth]` keys and removes the TUI's own: only the variable, whose
+/// name is unknown, goes unset.
+#[test]
+fn the_check_env_keeps_the_daemons_auth_keys_when_its_variable_cannot_be_read() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[(
+            "SHUNT_SERVER__AUTH__HEADER",
+            Some(OsStr::new("daemon-header")),
+        )],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    write(record.config(), "[server.auth]\ntokens_env = \"${TOK}\"\n");
+    let _tui_env = EnvPin::new(
+        &home,
+        &[("SHUNT_SERVER__AUTH__JWT", Some(OsStr::new("tui-only")))],
+    );
+    let env = checked_env(&record).expect("the check env");
+    let mut command = Command::new("true");
+    env.apply(&mut command);
+    let mut laid: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .filter_map(|(name, value)| {
+            let name = name.to_string_lossy().into_owned();
+            name.starts_with("SHUNT_SERVER__AUTH__")
+                .then(|| (name, value.map(|v| v.to_string_lossy().into_owned())))
+        })
+        .collect();
+    laid.sort();
+    assert_eq!(
+        laid,
+        [
+            (
+                "SHUNT_SERVER__AUTH__HEADER".to_string(),
+                Some("daemon-header".to_string())
+            ),
+            ("SHUNT_SERVER__AUTH__JWT".to_string(), None),
+        ]
+    );
+    drop(held);
+}
+
+/// A store entry shunt's grammar cannot carry (a hand edit) refuses the
+/// spawn only where shunt reads the tokens; elsewhere it joins as it is.
+#[test]
+fn a_store_entry_shunt_cannot_carry_refuses_only_where_shunt_reads_the_tokens() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    let store = home
+        .home()
+        .join(".clauth")
+        .join("gateway-client-tokens.toml");
+    write(&store, "[tokens]\nkerry = \"a,b\"\n");
+    let spawned = |record: &GatewayRecord| {
+        gateway_env(record)
+            .map(|env| {
+                env.get("SHUNT_CLIENT_TOKENS")
+                    .map(|value| value.to_string_lossy().into_owned())
+            })
+            .map_err(|e| format!("{e:#}"))
+    };
+    let open = spawned(&record);
+    write(record.config(), "[server.auth]\n");
+    assert_eq!(
+        (open, spawned(&record)),
+        (
+            Ok(Some("kerry:a,b".to_string())),
+            Err(format!(
+                "clauth's client-token store {} holds an entry for profile \"kerry\" that shunt cannot read; remove that profile's token and add it again",
+                store.display()
+            ))
+        )
+    );
+}
+
+/// The daemon's record keeps the inherited tokens variable's client names,
+/// never a token, in no spelling: `docs/security.md` holds it to "no
+/// credential".
+#[test]
+fn the_daemon_record_keeps_client_names_never_a_token() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    save_record(&with_config(&home, "[server]\n", ""));
+    let held = crate::daemon::hold_daemon_lock();
+    fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+    write_daemon_env_from(&env_pairs(&[("SHUNT_CLIENT_TOKENS", "ci:abc")]))
+        .expect("record the daemon env");
+    let bytes = fs::read(home.home().join(".clauth").join("gateway-env.json")).unwrap();
+    let text = String::from_utf8(bytes.clone()).expect("JSON text");
+    assert!(!text.contains("abc"), "the token's text appears nowhere");
+    assert!(
+        !text.replace(char::is_whitespace, "").contains("97,98,99"),
+        "nor its bytes as a JSON byte array"
+    );
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value.as_object_mut().expect("an object").remove("identity");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "env": [],
+            "auth_env": [],
+            "tokens": [["SHUNT_CLIENT_TOKENS", {"names": ["ci"]}]],
+        })
+    );
+    drop(held);
+}
+
+/// Adopt `record`, so a daemon starting now records the tokens variable its
+/// config names.
+fn save_record(record: &GatewayRecord) {
+    GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .expect("save the record");
+}
+
+/// Pose a daemon holding the singleton under this process's pid, and write
+/// its env record from this process's env as it stands.
+fn daemon_record_now(home: &HomeSandbox) -> std::fs::File {
+    let held = crate::daemon::hold_daemon_lock();
+    fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+    write_daemon_env().expect("record the daemon env");
+    held
+}
+
+fn clash_inherited(profile: &str, variable: &str) -> String {
+    format!(
+        "cannot add a client token for profile {profile:?}: the environment the gateway inherits already names a client {profile:?} in {variable}, and shunt refuses a duplicate name; remove that entry from that environment first"
+    )
+}
+
+/// A daemon inheriting the env-layer override in another case
+/// (`shunt_server__auth__tokens_env`, which figment and the spawn read)
+/// records it, so the TUI derives the variable the spawn does.
+#[test]
+fn the_record_captures_a_case_variant_auth_key_the_spawn_reads() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[
+            (
+                "shunt_server__auth__tokens_env",
+                Some(OsStr::new("FOO_TOKENS")),
+            ),
+            ("FOO_TOKENS", Some(OsStr::new("alice:a1-secret"))),
+        ],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "alice")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err(clash_inherited("alice", "FOO_TOKENS"))
+    );
+    drop(held);
+}
+
+/// The TUI matches the daemon's record to the singleton holder by pid alone:
+/// the start-time half spawns `ps` or PowerShell off linux, which a read on
+/// the UI thread must not. A record naming the holder's pid under another
+/// start time still reads.
+#[test]
+fn the_tui_matches_the_daemons_record_by_pid_alone() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[("SHUNT_CLIENT_TOKENS", Some(OsStr::new("alice:a1-secret")))],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    let path = home.home().join(".clauth").join("gateway-env.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    value["identity"]["start"] = serde_json::Value::from("not-this-process-start");
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "alice")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err(clash_inherited("alice", "SHUNT_CLIENT_TOKENS"))
+    );
+    drop(held);
+}
+
+/// The `shunt check` env the TUI builds under a daemon carries the
+/// `[server.auth]` keys the daemon's spawn would, from the daemon's record,
+/// and none of the TUI's own: a recorded override is laid, a TUI-only key is
+/// removed, and the variable carries the recorded names with stand-in tokens
+/// beside the store's pairs.
+#[test]
+fn the_check_env_carries_the_daemons_auth_keys_never_the_tuis() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[
+            (
+                "SHUNT_SERVER__AUTH__TOKENS_ENV",
+                Some(OsStr::new("FOO_TOKENS")),
+            ),
+            ("FOO_TOKENS", Some(OsStr::new("alice:a1-secret"))),
+        ],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    let _tui_env = EnvPin::new(
+        &home,
+        &[
+            ("SHUNT_SERVER__AUTH__HEADER", Some(OsStr::new("tui-only"))),
+            ("FOO_TOKENS", Some(OsStr::new("tui-secret"))),
+        ],
+    );
+    let kerry = add_token(&record, "kerry");
+    let env = checked_env(&record).expect("the check env");
+    let mut command = Command::new("true");
+    env.apply(&mut command);
+    let mut laid: Vec<(String, Option<String>)> = command
+        .get_envs()
+        .filter_map(|(name, value)| {
+            let name = name.to_string_lossy().into_owned();
+            (name.starts_with("SHUNT_SERVER__AUTH__") || name == "FOO_TOKENS")
+                .then(|| (name, value.map(|v| v.to_string_lossy().into_owned())))
+        })
+        .collect();
+    laid.sort();
+    assert_eq!(
+        laid,
+        [
+            (
+                "FOO_TOKENS".to_string(),
+                Some(format!("alice:clauth-check-stand-in,kerry:{kerry}"))
+            ),
+            ("SHUNT_SERVER__AUTH__HEADER".to_string(), None),
+            (
+                "SHUNT_SERVER__AUTH__TOKENS_ENV".to_string(),
+                Some("FOO_TOKENS".to_string())
+            ),
+        ]
+    );
+    drop(held);
+}
+
+/// Under a daemon whose inherited tokens variable is unset, the check env
+/// sets it empty, so the TUI's own value never reaches the check.
+#[test]
+fn the_check_env_never_carries_the_tuis_own_tokens_value() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    save_record(&record);
+    let held = daemon_record_now(&home);
+    let _tui_env = EnvPin::new(
+        &home,
+        &[("SHUNT_CLIENT_TOKENS", Some(OsStr::new("tui-secret")))],
+    );
+    let env = checked_env(&record).expect("the check env");
+    let mut command = Command::new("true");
+    env.apply(&mut command);
+    assert_eq!(
+        command
+            .get_envs()
+            .filter(|(name, _)| *name == OsStr::new("SHUNT_CLIENT_TOKENS"))
+            .map(|(_, value)| value.map(|v| v.to_string_lossy().into_owned()))
+            .collect::<Vec<_>>(),
+        [Some(String::new())]
+    );
+    drop(held);
+}
+
+/// With no `[server.auth]`, shunt never reads the tokens variable, so a
+/// malformed or colliding base passes through joined, refusing nothing; with
+/// the table the same base refuses the spawn.
+#[test]
+fn the_spawn_refuses_a_bad_base_only_where_shunt_reads_the_tokens() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server]\n", "");
+    let env_file = record.env_file.clone().expect("env file");
+    let kerry = add_token(&record, "kerry");
+    let unparsed = format!(
+        "the gateway's env file {} holds a SHUNT_CLIENT_TOKENS value shunt cannot parse, and shunt refuses to start on it; fix that value first",
+        env_file.display()
+    );
+    let collision = format!(
+        "the gateway's env file {} and clauth's client-token store both name a client \"kerry\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file, or remove clauth's token for that profile",
+        env_file.display()
+    );
+    let mut got = Vec::new();
+    let mut want = Vec::new();
+    for (base, refusal) in [
+        ("broken-secret", &unparsed),
+        ("kerry:k0-secret", &collision),
+    ] {
+        write(&env_file, &format!("SHUNT_CLIENT_TOKENS={base}\n"));
+        for (config, outcome) in [
+            ("[server]\n", Ok(Some(format!("{base},kerry:{kerry}")))),
+            ("[server.auth]\n", Err(refusal.clone())),
+        ] {
+            write(record.config(), config);
+            got.push((
+                base,
+                config,
+                gateway_env(&record)
+                    .map(|env| {
+                        env.get("SHUNT_CLIENT_TOKENS")
+                            .map(|value| value.to_string_lossy().into_owned())
+                    })
+                    .map_err(|e| format!("{e:#}")),
+            ));
+            want.push((base, config, outcome));
+        }
+    }
+    assert_eq!(got, want);
+}
+
+/// A daemon starting over a config that names its own tokens variable
+/// records that variable's names, so the TUI reads them and never refuses
+/// the variable as unrecorded.
+#[test]
+fn a_daemon_records_the_variable_its_config_names() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = with_config(&home, "[server.auth]\ntokens_env = \"CFG_TOKENS\"\n", "");
+    save_record(&record);
+    let daemon_env = EnvPin::new(
+        &home,
+        &[("CFG_TOKENS", Some(OsStr::new("alice:a1-secret")))],
+    );
+    let held = daemon_record_now(&home);
+    drop(daemon_env);
+    assert_eq!(
+        crate::gateway_tokens::add_client_token(&record, "alice")
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}")),
+        Err(clash_inherited("alice", "CFG_TOKENS"))
+    );
+    drop(held);
 }
 
 /// The store-source lookup follows `var_os`'s name rule, exercised under both
@@ -2346,6 +3277,8 @@ fn write_env_record_naming_self(
     write_env_record(DaemonEnvRecord {
         identity,
         env: record_env(codex_home, home_env),
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write the env record");
 }
@@ -3928,6 +4861,8 @@ fn the_env_record_reads_only_the_live_holders_record() {
             "CODEX_HOME".to_string(),
             env_value_bytes(OsStr::new("/live")),
         )],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     };
     write_env_record(live.clone()).expect("write");
     assert_eq!(
@@ -3948,6 +4883,8 @@ fn the_env_record_reads_only_the_live_holders_record() {
             "CODEX_HOME".to_string(),
             env_value_bytes(OsStr::new("/other")),
         )],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write");
     assert_eq!(
@@ -3967,6 +4904,8 @@ fn the_env_record_reads_only_the_live_holders_record() {
             "CODEX_HOME".to_string(),
             env_value_bytes(OsStr::new("/other")),
         )],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write");
     assert_eq!(
@@ -3998,6 +4937,8 @@ fn the_card_reads_the_live_daemons_recorded_bind() {
             start: Some(start.clone()),
         },
         env,
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     };
 
     write_env_record(record(
@@ -4055,6 +4996,8 @@ fn a_record_naming_this_process_without_the_singleton_held_falls_back() {
             "CODEX_HOME".to_string(),
             env_value_bytes(OsStr::new("/live")),
         )],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write");
     assert_eq!(recorded_env_for_live_daemon().expect("no daemon"), None);
@@ -4095,12 +5038,14 @@ fn the_daemon_env_record_is_0600_and_unset_values_round_trip_as_unset() {
     write_env_record(DaemonEnvRecord {
         identity: record.identity.clone(),
         env: Vec::new(),
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write unset");
     let unset = read_env_record().expect("read").expect("present");
     assert!(unset.env.is_empty());
     assert_eq!(
-        recorded_pairs(&unset).expect("a test record decodes"),
+        recorded_pairs(&unset.env).expect("a test record decodes"),
         Vec::new()
     );
 }
@@ -4118,13 +5063,13 @@ fn the_daemon_env_capture_records_exactly_the_four_inherited_keys() {
     )
     .expect("stamp the holder pid");
 
-    write_daemon_env_from(|key| match key {
-        "CODEX_HOME" => Some(OsString::from("/codex")),
-        "HOME" => Some(OsString::from("/home")),
-        "USERPROFILE" => Some(OsString::from("/winhome")),
-        "SHUNT_SERVER__BIND" => Some(OsString::from("127.0.0.1:3001")),
-        _ => None,
-    })
+    write_daemon_env_from(&env_pairs(&[
+        ("CODEX_HOME", "/codex"),
+        ("HOME", "/home"),
+        ("USERPROFILE", "/winhome"),
+        ("SHUNT_SERVER__BIND", "127.0.0.1:3001"),
+        ("UNRELATED", "/not-recorded"),
+    ]))
     .expect("write");
 
     let record = read_env_record().expect("read").expect("present");
@@ -4438,11 +5383,13 @@ fn a_non_utf8_env_value_round_trips_through_the_record_losslessly() {
             start: Some("s".to_string()),
         },
         env: vec![("HOME".to_string(), env_value_bytes(value))],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write");
     let record = read_env_record().expect("read").expect("present");
     assert_eq!(
-        recorded_pairs(&record).expect("a test record decodes"),
+        recorded_pairs(&record.env).expect("a test record decodes"),
         vec![(OsString::from("HOME"), OsString::from(value))]
     );
 }
@@ -4468,6 +5415,8 @@ fn an_odd_length_env_value_is_refused_not_truncated() {
         },
         // One byte is an odd length, which the Windows decoder refuses.
         env: vec![("CODEX_HOME".to_string(), vec![0x61])],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write");
 
@@ -4613,6 +5562,8 @@ fn a_record_with_userprofile_resolves_a_store_default() {
             "USERPROFILE".to_string(),
             env_value_bytes(winhome.as_os_str()),
         )],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write");
 
@@ -4656,6 +5607,8 @@ fn the_gateway_probe_reads_the_same_env_as_the_plan() {
                 env_value_bytes(OsStr::new("127.0.0.1:3999")),
             ),
         ],
+        auth_env: Vec::new(),
+        tokens: Vec::new(),
     })
     .expect("write");
 
