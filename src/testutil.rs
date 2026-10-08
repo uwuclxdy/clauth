@@ -2168,9 +2168,9 @@ pub(crate) fn exit1_shim(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// herdr's refusal of a resume report it cannot attach yet (no agent detected
-/// in the pane), as its CLI prints it: the error object on stderr, exit 1.
+/// in the pane), as its CLI prints it: the whole response on stderr, exit 1.
 #[cfg(unix)]
-const RESUME_NOT_ACCEPTED: &str = r#"echo '{"error":{"code":"resume_not_accepted","message":"resume_argv requires the reporter to hold the pane"},"id":"cli:request"}' >&2"#;
+const RESUME_NOT_ACCEPTED: &str = r#"echo '{"error":{"code":"resume_not_accepted","message":"resume_argv requires the reporter to hold the pane; report its state with pane.report_agent first"},"id":"cli:request"}' >&2"#;
 
 /// Logs its argv, refuses the first call the way herdr does before it has
 /// detected the pane's agent, and accepts every call after it.
@@ -2183,6 +2183,21 @@ pub(crate) fn refuse_once_shim(dir: &Path, name: &str) -> PathBuf {
             "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\n\
              if [ ! -e \"$(dirname \"$0\")/refused\" ]; then\n\
              : > \"$(dirname \"$0\")/refused\"\n{RESUME_NOT_ACCEPTED}\nexit 1\nfi"
+        ),
+    )
+}
+
+/// Logs its argv and answers every call with herdr's error envelope for
+/// `code` on stderr, exit 1.
+#[cfg(unix)]
+pub(crate) fn herdr_error_shim(dir: &Path, name: &str, code: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        &format!(
+            "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\n\
+             echo '{{\"error\":{{\"code\":\"{code}\",\"message\":\"refused\"}},\"id\":\"cli:request\"}}' >&2\n\
+             exit 1"
         ),
     )
 }

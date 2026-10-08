@@ -28,6 +28,16 @@ pub(crate) struct HerdrOut {
     pub(crate) stderr: Vec<u8>,
 }
 
+impl From<std::process::Output> for HerdrOut {
+    fn from(out: std::process::Output) -> Self {
+        Self {
+            success: out.status.success(),
+            stdout: out.stdout,
+            stderr: out.stderr,
+        }
+    }
+}
+
 /// What the seam answered for one herdr call.
 pub(crate) enum HerdrProbeOut {
     /// No binary resolved: herdr is not installed on this host.
@@ -58,11 +68,7 @@ pub(crate) fn real_probe() -> PaneProbe {
             // started inside a herdr pane still serves the default session
             // (owner ruling 2026-09-15, row 7; threat-model HB-4).
             crate::herdr::daemon_bounded_output_deadline(&bin.to_string_lossy(), args, deadline)
-                .map(|out| HerdrOut {
-                    success: out.status.success(),
-                    stdout: out.stdout,
-                    stderr: out.stderr,
-                }),
+                .map(HerdrOut::from),
         ),
     })
 }

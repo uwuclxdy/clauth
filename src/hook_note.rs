@@ -242,6 +242,10 @@ pub(crate) struct NoteRecord {
     /// parsing.
     #[serde(default)]
     pub(crate) resume_seq: Option<u64>,
+    /// herdr refused this scope's last resume report as not yet attachable
+    /// (`resume_not_accepted`), so the next main-scope fire re-sends it.
+    #[serde(default)]
+    pub(crate) resume_pending: bool,
 }
 
 /// The headroom nudge's memory for this scope: which 5h window the last verdict
@@ -853,8 +857,10 @@ fn touch_record(path: &Path) {
 /// The deadline is also what keeps a NESTED acquisition soft — `flock` blocks a
 /// second fd in the same process, so a future caller that takes this around
 /// something already holding it degrades after the wait instead of hanging.
-/// Today there is no such nesting: `note_for_inner`, `nudge_note` and
-/// `gc_conversation_records` are the only holders and none reaches another.
+/// Today there is no such nesting: `note_for_inner`, `nudge_note`,
+/// `gc_conversation_records`, `hook_context::context_note` and the
+/// resume-report leg's seq mint and re-send arm are the only holders and none
+/// reaches another.
 /// `nudge_note` holds across the same shape as `note_for_inner` — a record read,
 /// the verdict, an `atomic_write_600` and a log-file append — and its
 /// expensive reads (the config load, the cache reads, the chain-walk replay)
@@ -878,10 +884,11 @@ impl ScopeLock {
         Self::acquire_within(Duration::from_secs(2))
     }
 
-    /// The same hold with a shorter wait, for a leg whose product is optional:
-    /// the resume-command report's mint degrades to silence under contention,
-    /// and a maxed stack of full waits must not push a hook fire past the
-    /// manifest's 10 s host timeout on the very fires the leg reports on.
+    /// The same hold with a shorter wait, for a leg whose product is optional
+    /// (the resume-command report): a maxed stack of full waits must not push
+    /// a hook fire past the manifest's 10 s host timeout on the very fires the
+    /// leg reports on. Past the wait it proceeds unlocked, like
+    /// [`Self::acquire`], so a contended write can lose a peer's field update.
     pub(crate) fn acquire_within(wait: Duration) -> Self {
         let held = (|| {
             let dir = records_dir().ok()?;
