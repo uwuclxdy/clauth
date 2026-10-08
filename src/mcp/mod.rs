@@ -3531,8 +3531,9 @@ fn delegate_session_id(resume: Option<&str>) -> std::result::Result<String, Stri
 
 /// Compose a delegate's environment on `command`: drop inherited provider
 /// routing + the outgoing activation's custom env keys
-/// ([`crate::runtime::scrub_profile_env`]), layer the caller's `env`, then
-/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
+/// ([`crate::runtime::scrub_profile_env`]), clauth's harness homes and the
+/// pane's herdr session ([`crate::herdr::strip_session_env`]), layer the
+/// caller's `env`, then clauth's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
 /// and the delegate session id can't be overridden, and
 /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when the caller didn't set
 /// it.
@@ -3548,6 +3549,7 @@ fn apply_delegate_env(
     // aligned with `start`'s (same scrub, same home pin).
     let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
     engine.scrub_env(command, stale_env_keys);
+    crate::herdr::strip_session_env(command);
     command.envs(caller_env);
     if !caller_env.contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
         command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);

@@ -1119,6 +1119,41 @@ fn delegate_env_strips_inherited_provider_routing() {
     );
 }
 
+/// A delegate is not the pane's agent: with the parent pane's herdr session
+/// inherited, its own hooks (herdr's Claude Code integration and clauth's
+/// resume leg) re-anchor the parent pane on the delegate's conversation.
+#[test]
+fn delegate_env_strips_the_parent_panes_herdr_session() {
+    let mut cmd = Command::new("claude");
+    apply_delegate_env(
+        &mut cmd,
+        &HashMap::new(),
+        &[],
+        std::path::Path::new("/cfg"),
+        0,
+        "s",
+    );
+    let envs = crate::testutil::env_overrides(&cmd);
+    for key in [
+        "HERDR_ENV",
+        "HERDR_SOCKET_PATH",
+        "HERDR_PANE_ID",
+        "HERDR_TAB_ID",
+        "HERDR_WORKSPACE_ID",
+    ] {
+        assert_eq!(envs.get(key), Some(&None), "{key} must be stripped");
+    }
+    // The strip runs before the caller's `env`, so a deliberate re-add wins.
+    let mut caller = HashMap::new();
+    caller.insert("HERDR_PANE_ID".to_string(), "w1:p1".to_string());
+    let mut cmd = Command::new("claude");
+    apply_delegate_env(&mut cmd, &caller, &[], std::path::Path::new("/cfg"), 0, "s");
+    assert_eq!(
+        crate::testutil::env_overrides(&cmd).get("HERDR_PANE_ID"),
+        Some(&Some("w1:p1".to_string()))
+    );
+}
+
 #[test]
 fn delegate_env_strips_active_profile_custom_env() {
     // the active profile's custom env keys are scrubbed from the inherited
