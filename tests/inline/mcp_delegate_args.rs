@@ -765,8 +765,8 @@ fn a_background_handle_notes_where_the_result_file_will_land() {
 }
 
 /// Every background job record names the directory its run works in, the
-/// account of the session that spawned it, and that session's host (the id the
-/// server started under, the server's parent process), single target and
+/// account of the session that spawned it, and that session's host (its
+/// conversation id, the server's parent process), single target and
 /// fan-out alike.
 /// The spawning session is a `clauth start` runtime of `kerry`, delegating to
 /// other accounts; the `cwd` does not exist, so `run_delegate` refuses after
@@ -785,6 +785,21 @@ fn a_background_job_records_its_cwd_the_spawning_account_and_its_host() {
             Some(std::ffi::OsStr::new("host-sess-9")),
         )],
     );
+    // The host's own session record, moved by a `/clear` past the id the
+    // server started under: the record's id is the one stamped.
+    #[cfg(unix)]
+    let (host_pid, host_session) = {
+        let pid = std::os::unix::process::parent_id();
+        std::fs::create_dir_all(runtime.join("sessions")).expect("sessions dir");
+        std::fs::write(
+            runtime.join("sessions").join(format!("{pid}.json")),
+            format!(r#"{{"pid":{pid},"sessionId":"host-sess-after-clear"}}"#),
+        )
+        .expect("write host record");
+        (pid, "host-sess-after-clear")
+    };
+    #[cfg(not(unix))]
+    let (host_pid, host_session) = (0, "host-sess-9");
     let cwd = home
         .home()
         .join("does-not-exist")
@@ -821,16 +836,12 @@ fn a_background_job_records_its_cwd_the_spawning_account_and_its_host() {
         .into_iter()
         .map(|r| (r.profile, r.cwd, r.spawned_by, r.host_session, r.host_pid))
         .collect();
-    #[cfg(unix)]
-    let host_pid = std::os::unix::process::parent_id();
-    #[cfg(not(unix))]
-    let host_pid = 0;
     let want = |profile: &str| {
         (
             profile.to_string(),
             Some(cwd.clone()),
             Some("kerry".to_string()),
-            Some("host-sess-9".to_string()),
+            Some(host_session.to_string()),
             host_pid,
         )
     };

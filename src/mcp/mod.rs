@@ -4467,8 +4467,8 @@ impl DelegateOrigin {
     /// a resume whose workspace does not resolve falls through to the caller's
     /// `cwd`, since `run_delegate` refuses that run anyway. The account is whichever profile
     /// owns this server's session credentials (`which::resolve_active`, the
-    /// `which` tool's own answer). The host is the session id this server
-    /// started under and the process that spawned it.
+    /// `which` tool's own answer). The host is the process that spawned this
+    /// server and the conversation it is in at this call ([`host_session`]).
     fn resolve(config: &AppConfig, resume: Option<&str>, cwd: Option<&str>) -> Self {
         let workspace = resume.and_then(|id| resolve_resume_workspace(id).ok());
         Self {
@@ -4476,12 +4476,48 @@ impl DelegateOrigin {
                 .and_then(|dir| std::path::absolute(dir).ok())
                 .map(|dir| dir.to_string_lossy().into_owned()),
             spawned_by: crate::which::resolve_active(config).map(|(name, _)| name),
-            host_session: std::env::var("CLAUDE_CODE_SESSION_ID")
-                .ok()
-                .filter(|id| !id.is_empty()),
+            host_session: host_session(host_pid()),
             host_pid: host_pid(),
         }
     }
+}
+
+/// The conversation the host process `pid` is in now: its Claude Code session
+/// record's `sessionId`, which a `/clear` moves while this server's
+/// `CLAUDE_CODE_SESSION_ID` keeps the startup id. The env id is the fallback
+/// where no record answers for `pid`, and its absence (a server launched
+/// outside Claude Code) stamps nothing, so a stale record a reused pid left
+/// behind is never read for a server Claude Code did not start.
+fn host_session(pid: u32) -> Option<String> {
+    let started_under = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|id| !id.is_empty())?;
+    let sessions = crate::which::session_config_dir_or_global().map(|dir| dir.join("sessions"));
+    Some(
+        sessions
+            .and_then(|dir| session_record_id(&dir, pid))
+            .unwrap_or(started_under),
+    )
+}
+
+/// The `sessionId` the Claude Code session record `<pid>.json` in `dir`
+/// carries, when that record names `pid` itself and a non-empty id.
+fn session_record_id(dir: &std::path::Path, pid: u32) -> Option<String> {
+    let path = dir.join(format!("{pid}.json"));
+    // Claude Code rewrites the record in place, so one read can land mid-write
+    // and the stamp is never re-taken: a second read decides.
+    let record = (0..2)
+        .find_map(|_| serde_json::from_slice::<SessionRecord>(&std::fs::read(&path).ok()?).ok())?;
+    (record.pid == pid && !record.session_id.is_empty()).then_some(record.session_id)
+}
+
+/// The fields of a Claude Code session record (`<config dir>/sessions/<pid>.json`)
+/// clauth reads.
+#[derive(serde::Deserialize)]
+struct SessionRecord {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    pid: u32,
 }
 
 /// The `claude` process hosting this server, resolved once ([`serve`] primes
@@ -4522,12 +4558,6 @@ fn session_host_pid() -> Option<u32> {
 /// answer ambiguous, and a wrong pid would hide this process's delegates.
 #[cfg(any(not(unix), test))]
 fn session_record_pid(dir: &std::path::Path, session_id: &str) -> Option<u32> {
-    #[derive(serde::Deserialize)]
-    struct SessionRecord {
-        #[serde(rename = "sessionId")]
-        session_id: String,
-        pid: u32,
-    }
     let mut matching = std::fs::read_dir(dir)
         .ok()?
         .flatten()

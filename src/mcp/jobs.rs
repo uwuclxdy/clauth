@@ -209,11 +209,13 @@ pub(crate) struct JobRecord {
     /// session's credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spawned_by: Option<String>,
-    /// The Claude Code session id the spawning `clauth mcp` server started
-    /// under (`CLAUDE_CODE_SESSION_ID` in its environment): the host identity
-    /// a reader matches when either side's pid is unknown, valid until the
-    /// host's first `/clear`. `None` on a record an older server wrote and on
-    /// a server launched outside Claude Code.
+    /// The Claude Code conversation the spawning server's host was in when the
+    /// job was minted: the host's session record id, which a `/clear` moves,
+    /// else the server's startup `CLAUDE_CODE_SESSION_ID`. The host identity a
+    /// reader matches when either side's pid is unknown. A record an older
+    /// server wrote carries the startup id, valid until the host's first
+    /// `/clear`. `None` on a record older still and on a server launched
+    /// outside Claude Code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) host_session: Option<String>,
     /// The `claude` process hosting the spawning conversation (the server's

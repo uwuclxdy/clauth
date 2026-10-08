@@ -339,8 +339,9 @@ fn live_delegates(session_id: &str) -> usize {
 /// Whether `record` was spawned by the process hosting `session_id`. The pid
 /// decides wherever both sides know it, since `/clear` moves the session id
 /// while the process and its server live on. Otherwise a record carrying
-/// `host_session` counts only when it equals `session_id`, which holds until
-/// the host's first `/clear`; one without it (an older server still running
+/// `host_session` counts only when it equals `session_id`: the conversation
+/// the job was minted in where the host's session record answered, else the
+/// server's startup id; one without it (an older server still running
 /// across a self-update, a server launched outside Claude Code) counts: an
 /// over-count only delays a close, an under-count orphans a paid run.
 fn spawned_here(
