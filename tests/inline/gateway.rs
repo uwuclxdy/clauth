@@ -1877,8 +1877,7 @@ fn a_store_entry_shunt_cannot_carry_refuses_only_where_shunt_reads_the_tokens() 
 }
 
 /// The daemon's record keeps the inherited tokens variable's client names,
-/// never a token, in no spelling: `docs/security.md` holds it to "no
-/// credential".
+/// never a token, in no spelling: the record holds no credential.
 #[test]
 fn the_daemon_record_keeps_client_names_never_a_token() {
     let home = HomeSandbox::new();
