@@ -8,6 +8,19 @@ mod codex_headers;
 // One caller (`main.rs`), so reached by path rather than re-exported item by item.
 pub(crate) mod codex_reset;
 mod fetch;
+// #110: usage read off an inference response's headers, one parse per
+// provider. Nothing calls it until the probe and its store write land, which
+// wait on the usage-store rework. `expect`, not `allow`: once nothing in the
+// module is dead any more, the expectation goes unfulfilled and `-D warnings`
+// fails the build until this attribute goes.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "#110: the usage probe reads it once the usage-store rework lands"
+    )
+)]
+mod probe;
 mod scheduler;
 
 pub(crate) use burn::{
