@@ -17,6 +17,18 @@ use utoipa::PartialSchema;
 use utoipa::openapi::RefOr;
 use utoipa::openapi::schema::Schema;
 
+#[test]
+fn iso_from_ms_preserves_unsigned_timestamp_range() {
+    for ms in [0, 999, 1_000, 1_789_257_600_999, i64::MAX as u64, u64::MAX] {
+        assert_eq!(
+            iso_from_ms(ms),
+            crate::usage::epoch_secs_to_iso((ms / 1000) as i64)
+        );
+    }
+    assert_eq!(iso_from_ms(0), "1970-01-01T00:00:00+00:00");
+    assert_eq!(iso_from_ms(1_000), "1970-01-01T00:00:01+00:00");
+}
+
 /// The typed body as a `Value`, for the tests that assert published values;
 /// key order and byte shape are pinned by the `*_bytes` tests.
 fn status_value(

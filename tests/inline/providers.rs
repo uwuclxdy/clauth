@@ -4,6 +4,14 @@
 
 use super::*;
 
+#[test]
+fn epoch_millisecond_conversion_preserves_signed_inputs() {
+    for ms in [i64::MIN, -1_001, -999, 0, 999, 1_000, i64::MAX] {
+        assert_eq!(ms_to_iso(ms), crate::usage::epoch_secs_to_iso(ms / 1000));
+    }
+    assert_eq!(ms_to_iso(-1_001_i64), "1970-01-01T00:00:00+00:00");
+}
+
 // ── Provider::from_base_url ───────────────────────────────────────────────────
 
 #[test]
