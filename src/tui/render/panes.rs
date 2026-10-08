@@ -341,7 +341,7 @@ impl QueueView {
 /// imports stay put.
 pub(super) use crate::format::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
-    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
+    DIAG_KICK, DIAG_NO_USAGE, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
 };
 
 /// Status pill `[ label ]`: brackets in `TEXT_DIM`, the label in the

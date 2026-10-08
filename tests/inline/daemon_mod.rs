@@ -1419,6 +1419,82 @@ fn uncapped_spenders_excludes_disabled_includes_enabled_sibling() {
     );
 }
 
+// ── no_usage_source_members (boot-time warning's pure collection, #110) ───────
+
+/// Only an enabled subscription member with no OAuth login is named: that is
+/// the one shape no leg ever reads. A login, an api key, or a disabled flag
+/// (the walk never switches to it) keeps a member out.
+#[test]
+fn no_usage_source_members_names_only_enabled_members_clauth_cannot_measure() {
+    let name = |n: &str| crate::profile::ProfileName::from(n);
+    let mut keyed = blank_profile(&name("keyed"));
+    keyed.api_key = Some("sk-test".into());
+    let mut off = blank_profile(&name("off"));
+    off.disabled = true;
+    let config = AppConfig {
+        state: AppState {
+            fallback_chain: vec![
+                "polled".into(),
+                "st-a".into(),
+                "keyed".into(),
+                "off".into(),
+                "st-b".into(),
+            ],
+            ..AppState::default()
+        },
+        profiles: vec![
+            profile_with_creds("polled", "at-polled"),
+            blank_profile(&name("st-a")),
+            keyed,
+            off,
+            blank_profile(&name("st-b")),
+        ],
+    };
+    assert_eq!(super::no_usage_source_members(&config), ["st-a", "st-b"]);
+}
+
+/// The warning reaches the log as one line naming every such member, and says
+/// nothing when the chain has none.
+#[test]
+fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
+    let name = |n: &str| crate::profile::ProfileName::from(n);
+    let config = |chain: Vec<&str>| AppConfig {
+        state: AppState {
+            fallback_chain: chain.into_iter().map(Into::into).collect(),
+            ..AppState::default()
+        },
+        profiles: vec![
+            profile_with_creds("polled", "at-polled"),
+            blank_profile(&name("st-a")),
+            blank_profile(&name("st-b")),
+        ],
+    };
+
+    let lines = crate::logline::LogLines::new();
+    {
+        let _capture = lines.capture_here();
+        super::warn_if_chain_has_no_usage_source(&config(vec!["polled", "st-a", "st-b"]));
+    }
+    assert_eq!(
+        lines.snapshot(),
+        [
+            "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
+             won't switch away from it on its own. add an oauth login with `clauth login \
+             <name>` so clauth can read it"
+        ],
+    );
+
+    let quiet = crate::logline::LogLines::new();
+    {
+        let _capture = quiet.capture_here();
+        super::warn_if_chain_has_no_usage_source(&config(vec!["polled"]));
+    }
+    assert!(
+        quiet.snapshot().is_empty(),
+        "a chain clauth can measure in full logs nothing"
+    );
+}
+
 /// The standby arm tightens the tree BEFORE it parks, never after the takeover.
 /// launchd creates `daemon.log` at the umask (0o644) before exec and a park is
 /// unbounded in time, so a walk deferred to the promotion leaves a

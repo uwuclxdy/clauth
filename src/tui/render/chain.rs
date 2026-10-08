@@ -28,11 +28,11 @@ use super::format::{ResetFmt, fixed_split, relative_age, reset_pill, reset_resum
 use super::global_config::default_reminder;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
-    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
-    bold_when, cycle_row_lines, draw_scrolled_lines, draw_selector_list, head_cols,
-    help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
-    name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
-    wrap_words,
+    DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_NO_USAGE, DIAG_STALE, DIAG_WEEKLY_SOFT,
+    DIAG_WEEKLY_SPENT, bold_when, cycle_row_lines, draw_scrolled_lines, draw_selector_list,
+    head_cols, help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style,
+    master_detail, name_color, pill, rail_hint_lines, section_box, section_box_verbatim,
+    select_line, value_caret, wrap_words,
 };
 use super::prose::{cmd, key};
 use crate::fallback::{
@@ -354,11 +354,16 @@ fn draw_chain_detail(
 /// full). Absent when the member has headroom.
 ///
 /// `Disabled` and `Canceled` deliberately SHARE `⊖` and split on hue alone
-/// (faint vs danger), the one place this app departs from the
-/// shape-names-the-state rule: the two co-occur on nearly every real account
-/// (an operator disables a subscription once it's canceled), and the Overview
-/// account row picks the canceled arm where this ladder picks the disabled one,
-/// so distinct shapes made the same account wear two glyphs on one screen.
+/// (faint vs danger), a departure from the shape-names-the-state rule: the two
+/// co-occur on nearly every real account (an operator disables a subscription
+/// once it's canceled), and the Overview account row picks the canceled arm
+/// where this ladder picks the disabled one, so distinct shapes made the same
+/// account wear two glyphs on one screen.
+///
+/// `Stale` and `NoUsage` share `⋯` at one hue, the way `AuthBroken` and
+/// `KeyRejected` share `×`: the walk treats them alike (neither is ever fresh,
+/// so both wait for the pass that accepts any freshness), and the pill says
+/// which.
 pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
     let (glyph, style) = match reason {
         BlockedReason::Disabled => ("⊖", theme::faint()),
@@ -375,6 +380,7 @@ pub(super) fn reason_marker(reason: &BlockedReason) -> Span<'static> {
         BlockedReason::ScopedSpent { .. } => ("⊘", theme::warning()),
         BlockedReason::WeeklySoft { .. } => ("~", theme::warning()),
         BlockedReason::Stale => ("⋯", theme::faint()),
+        BlockedReason::NoUsage => ("⋯", theme::faint()),
     };
     Span::styled(glyph, style)
 }
@@ -424,6 +430,7 @@ fn reason_pill_spans(reason: &BlockedReason, fmt: ResetFmt) -> Vec<Span<'static>
             Some("still serving".to_string()),
         ),
         BlockedReason::Stale => (DIAG_STALE.to_string(), theme::dim().bold(), None),
+        BlockedReason::NoUsage => (DIAG_NO_USAGE.to_string(), theme::dim().bold(), None),
     };
     let mut spans = pill(label, style);
     if let Some(suffix) = suffix {
@@ -455,6 +462,13 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
         }
         BlockedReason::WeeklySoft { .. } => DIAG_WEEKLY_SOFT.to_string(),
         BlockedReason::Stale => "last usage check failed".to_string(),
+        // The split `clauth login --setup-token` describes: an OAuth login
+        // beside the setup token gives `/usage` a pair to poll, while sessions
+        // keep running on the setup token.
+        BlockedReason::NoUsage => format!(
+            "add an oauth login with {} so clauth can read its usage",
+            cmd(&format!("clauth login {name}"))
+        ),
     }
 }
 

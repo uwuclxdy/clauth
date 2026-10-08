@@ -447,6 +447,7 @@ pub(crate) fn serve(
 
     let config = load_config()?;
     warn_if_spend_is_uncapped(&config);
+    warn_if_chain_has_no_usage_source(&config);
     let mut daemon = Daemon::new(config, dir.join(STATUS_FILE));
     daemon.boot();
 
@@ -568,6 +569,40 @@ fn warn_if_spend_is_uncapped(config: &crate::profile::AppConfig) {
              billing starts, not when it stops",
             uncapped.join(", "),
             crate::fallback::uncapped_spend_fix(),
+        );
+    }
+}
+
+/// Every enabled chain member clauth cannot measure (see
+/// [`crate::fallback::no_usage_source`]): the pure collection
+/// [`warn_if_chain_has_no_usage_source`] logs, split out like
+/// [`uncapped_spenders`] so the filter is testable without capturing log
+/// output. A disabled member is left out: the walk never switches to it.
+fn no_usage_source_members(config: &crate::profile::AppConfig) -> Vec<&str> {
+    config
+        .state
+        .fallback_chain
+        .iter()
+        .filter_map(|name| config.find(name))
+        .filter(|p| !p.is_disabled())
+        .filter(|p| crate::fallback::no_usage_source(p))
+        .map(|p| p.name.as_str())
+        .collect()
+}
+
+/// Say so at boot when the chain holds a member clauth cannot measure: once the
+/// chain lands there it stays ([`crate::fallback::no_usage_hazard`]). The TUI
+/// says it when the member is added and on its card; a headless run, or a chain
+/// edited by hand in `profiles.toml`, hears it here at the next daemon start (a
+/// reload of the file stays quiet, like the uncapped-spend warning).
+fn warn_if_chain_has_no_usage_source(config: &crate::profile::AppConfig) {
+    let members = no_usage_source_members(config);
+    if !members.is_empty() {
+        logline!(
+            "clauth daemon: can't read the usage of {}. once one is active, {}. add an oauth \
+             login with `clauth login <name>` so clauth can read it",
+            members.join(", "),
+            crate::fallback::no_usage_hazard(),
         );
     }
 }

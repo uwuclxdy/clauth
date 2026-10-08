@@ -8513,9 +8513,13 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
-            let would_mix = {
+            let (would_mix, no_usage) = {
                 let cfg = app.config();
-                chain_would_mix(&cfg, &name)
+                (
+                    chain_would_mix(&cfg, &name),
+                    cfg.find(&name)
+                        .is_some_and(crate::fallback::no_usage_source),
+                )
             };
             if would_mix {
                 app.open_modal(Modal::Confirm(ConfirmState {
@@ -8523,6 +8527,20 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                               api account."
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
+                    choice: false,
+                    on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
+                }));
+            } else if no_usage {
+                // The walk counts a member without a reading as having headroom
+                // and, once it is active, never moves off it. Said once here,
+                // where the operator still decides; the card's marker keeps
+                // saying it.
+                app.open_modal(Modal::Confirm(ConfirmState {
+                    message: "clauth can't read this account's usage.".into(),
+                    detail: Some(format!(
+                        "once it's active, {}.",
+                        crate::fallback::no_usage_hazard()
+                    )),
                     choice: false,
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
                 }));

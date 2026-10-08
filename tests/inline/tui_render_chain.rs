@@ -683,6 +683,61 @@ fn disabled_and_canceled_share_the_marker_shape_and_split_on_hue() {
     assert_eq!(can.style.fg, theme::danger().fg, "canceled reads dead");
 }
 
+/// Stale and no-usage share `⋯` at one hue, as auth-broken and key-rejected
+/// share `×`: both say the headroom on screen is no current measurement, and
+/// the pill says which.
+#[test]
+fn stale_and_no_usage_share_the_marker_and_split_on_the_pill() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let stale = reason_marker(&BlockedReason::Stale);
+    let none = reason_marker(&BlockedReason::NoUsage);
+    assert_eq!(none.content, stale.content, "the stale glyph, reused");
+    assert_eq!(none.style, stale.style, "at the stale hue");
+    let pill = |r: &BlockedReason| -> String {
+        reason_pill_spans(r, ResetFmt::default())
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect()
+    };
+    assert_eq!(pill(&BlockedReason::NoUsage), "[ no usage yet ]");
+    assert_ne!(pill(&BlockedReason::NoUsage), pill(&BlockedReason::Stale));
+}
+
+/// #110: a member clauth cannot measure opens its card on the `no usage yet`
+/// pill (the word `start --auto --explain` prints for an unread account) and
+/// names the fix on the line under it.
+#[test]
+fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
+    let mut blind = profile("blind", 95.0, 0.0, 7200);
+    blind.usage = None;
+    let cfg = config_with(
+        vec![profile("ok", 95.0, 10.0, 7200), blind],
+        Some("ok"),
+        vec!["ok", "blind"],
+    );
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("blind"),
+        MemberCard {
+            width: 80,
+            ..Default::default()
+        },
+        &HashSet::new(),
+    )
+    .0;
+    let pill = line_text(&lines[0]);
+    assert!(
+        pill.ends_with("[ no usage yet ]"),
+        "the pill, with no suffix after it: {pill:?}"
+    );
+    assert!(
+        line_text(&lines[1])
+            .contains("add an oauth login with clauth login blind so clauth can read its usage"),
+        "the fix line names the login that gives clauth a reading: {:?}",
+        line_text(&lines[1])
+    );
+}
+
 /// A disabled chain member — still configured in `fallback_chain` on disk,
 /// only the walk skips it (see `Profile::is_disabled`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
@@ -1366,6 +1421,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         },
         BlockedReason::WeeklySoft { pct: 85.0 },
         BlockedReason::Stale,
+        BlockedReason::NoUsage,
     ];
     let mut seen: Vec<String> = Vec::new();
     for reason in all {
@@ -1382,7 +1438,7 @@ fn every_reason_fix_variant_is_reachable_and_non_empty() {
         );
         seen.push(fix);
     }
-    assert_eq!(seen.len(), 10, "every variant contributed a distinct fix");
+    assert_eq!(seen.len(), 11, "every variant contributed a distinct fix");
 }
 
 /// F2: the key-rejected copy is cloudy's verbatim, pinned by equality — the
@@ -1993,6 +2049,30 @@ fn the_blocked_reason_marker_holds_the_rows_last_content_column() {
             "│    #3 hot                ◔ │".to_string(),
             "│                            │".to_string(),
             "│                            │".to_string(),
+            "│                            │".to_string(),
+            "╰────────────────────────────╯".to_string(),
+        ],
+    );
+}
+
+/// The selector marks a member clauth cannot measure with `⋯` in the same
+/// last content column every other marker holds.
+#[test]
+fn the_selector_marks_a_member_clauth_cannot_measure() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut blind = profile("blind", 95.0, 0.0, 7200);
+    blind.usage = None;
+    let app = App::new(config_with(
+        vec![profile("ok", 95.0, 10.0, 7200), blind],
+        Some("ok"),
+        vec!["ok", "blind"],
+    ));
+    assert_eq!(
+        chain_selector_pane(&app, 100, 5),
+        vec![
+            "╭─ CHAIN ────────────────────╮".to_string(),
+            "│ ❯  #1 ok                   │".to_string(),
+            "│    #2 blind              ⋯ │".to_string(),
             "│                            │".to_string(),
             "╰────────────────────────────╯".to_string(),
         ],

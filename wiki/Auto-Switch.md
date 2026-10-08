@@ -16,6 +16,8 @@ The walk prefers members whose usage was read live over ones showing cached numb
 
 The active account's own exhaustion is judged only on fresh readings, so a rate-limited poll cannot trigger a switch by itself. Two states are the exception, because neither can recover that evidence on its own: a dead account switches away on any reading, and an account whose usage polls have been rate-limited long enough to stop draining switches away too. A deep-stuck account with a last-known window still moves only when that window says it is genuinely spent; one with no window moves because the reading channel can never supply the missing exhaustion evidence. The same rule applies to Anthropic usage polls and to a provider's own usage endpoint.
 
+An account clauth cannot measure gets no reading at all: one that holds only a long-lived setup token, with no OAuth login behind it, since `/usage` needs that login's scope. The walk counts it as having headroom and reaches it once no freshly read member has room. Once it is active, nothing reads it as exhausted, so clauth won't switch away from it on its own. `clauth login <name>` adds an OAuth login beside the setup token, which gives clauth a reading while sessions keep running on the setup token. The Fallback and Overview rows mark such a member `⋯`, its Fallback card reads `no usage yet`, adding one on the Fallback tab asks first, and the daemon names them in its log when it starts.
+
 ## Exhausted
 
 An account is exhausted when either window is past its line.

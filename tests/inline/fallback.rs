@@ -5027,7 +5027,8 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
             | BlockedReason::FiveHour { .. }
             | BlockedReason::ScopedSpent { .. }
             | BlockedReason::WeeklySoft { .. }
-            | BlockedReason::Stale => false,
+            | BlockedReason::Stale
+            | BlockedReason::NoUsage => false,
         }
     }
 
@@ -5210,6 +5211,18 @@ fn every_blocked_reason_variant_stays_coupled_to_candidate_excluded() {
         None,
         &|r| matches!(r, BlockedReason::Stale),
         "Stale",
+    );
+
+    // NoUsage: a member clauth cannot measure, with no reading. Display-only.
+    let config = config_with_chain(
+        vec![keeper(), profile_with_usage("cand", Some(90.0), None)],
+        "keep",
+    );
+    assert_variant(
+        &config,
+        None,
+        &|r| matches!(r, BlockedReason::NoUsage),
+        "NoUsage",
     );
 }
 
@@ -7811,5 +7824,222 @@ fn an_alibaba_member_without_a_console_is_not_key_rejected() {
         start_block(&config, &member, profile, None, false, false, None),
         None,
         "a console-lapsed Alibaba member is not refused by the start walk"
+    );
+}
+
+// ── members clauth cannot measure (#110) ────────────────────────────────────
+// A subscription member with no OAuth login behind it (a `claude setup-token`
+// mint) has no usage source: `/usage` needs that login's scope. The Fallback
+// marker names it; the walk is left exactly as it was.
+
+/// `p` with an OAuth login, the one subscription shape `/usage` can poll.
+fn with_oauth_login(mut p: Profile) -> Profile {
+    p.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    p
+}
+
+#[test]
+fn no_usage_source_is_a_subscription_member_without_an_oauth_login() {
+    assert!(
+        no_usage_source(&profile_with_usage("st", None, None)),
+        "no login at all, the setup-token shape: nothing to poll"
+    );
+    let mut empty = profile_with_usage("e", None, None);
+    empty.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: None,
+    });
+    assert!(
+        no_usage_source(&empty),
+        "a credentials record without an OAuth login polls nothing either"
+    );
+    assert!(
+        !no_usage_source(&with_oauth_login(profile_with_usage("o", None, None))),
+        "an OAuth login is what `/usage` polls"
+    );
+    let mut direct_key = profile_with_usage("k", None, None);
+    direct_key.api_key = Some("sk-test".into());
+    assert!(
+        !no_usage_source(&direct_key),
+        "an api key without an endpoint is still an api-key account"
+    );
+    let mut endpoint = profile_with_usage("p", None, None);
+    endpoint.base_url = Some("https://api.example.test".into());
+    endpoint.api_key = Some("sk-test".into());
+    assert!(
+        !no_usage_source(&endpoint),
+        "a provider endpoint answers through its own leg"
+    );
+    let mut keyless = profile_with_usage("c", None, None);
+    keyless.base_url = Some("https://api.example.test".into());
+    assert!(
+        !no_usage_source(&keyless),
+        "an endpoint without a key (a console-only Alibaba member) is no subscription"
+    );
+}
+
+#[test]
+fn no_usage_marks_only_an_unread_member_clauth_cannot_measure() {
+    let keeper = || {
+        mark_fresh(with_oauth_login(profile_with_util(
+            "keep",
+            Some(90.0),
+            Some(10.0),
+        )))
+    };
+    let reason = |cand: Profile| {
+        let config = config_with_chain(vec![keeper(), cand], "keep");
+        let cand = config
+            .find(&crate::profile::ProfileName::from("cand"))
+            .expect("cand");
+        blocked_reason(&config, cand, None, &HashSet::new())
+    };
+    assert_eq!(
+        reason(profile_with_usage("cand", Some(90.0), None)),
+        Some(BlockedReason::NoUsage),
+    );
+    assert_eq!(
+        reason(profile_with_util("cand", Some(90.0), Some(40.0))),
+        None,
+        "a reading retires the marker, whatever produced it"
+    );
+    assert_eq!(
+        reason(with_oauth_login(profile_with_usage(
+            "cand",
+            Some(90.0),
+            None
+        ))),
+        None,
+        "an OAuth member not read yet is not marked: its first poll is coming"
+    );
+    assert_eq!(
+        reason(mark_disabled(profile_with_usage("cand", Some(90.0), None))),
+        Some(BlockedReason::Disabled),
+        "lowest rung: every other reason outranks it"
+    );
+    let config = {
+        let mut config = config_with_chain(
+            vec![keeper(), profile_with_usage("cand", Some(90.0), None)],
+            "keep",
+        );
+        config.state.auth_broken = vec![ProfileName::from("cand")];
+        config
+    };
+    assert_eq!(
+        health_blocked_reason(&config, &config.profiles[1], None, &HashSet::new()),
+        Some(BlockedReason::AuthBroken),
+        "a health rung outranks it too"
+    );
+}
+
+// The marker is display-only: the walk treats an unmeasured member like any
+// member it holds no fresh reading for. `a` is spent, `blind` (unmeasured)
+// sits before `c` (measured headroom). With nothing fresh, both walks land on
+// `blind` in chain order; once `c` reads fresh, its pass comes first. A walk
+// that demoted members it cannot measure would land on `c` in the first case.
+#[test]
+fn the_walk_treats_an_unmeasured_member_like_any_member_without_a_fresh_reading() {
+    let chain = |c: Profile| {
+        config_with_chain(
+            vec![
+                with_oauth_login(profile_with_util("a", Some(95.0), Some(100.0))),
+                profile_with_usage("blind", Some(95.0), None),
+                c,
+            ],
+            "a",
+        )
+    };
+    let usage_of = |config: &AppConfig| -> HashMap<String, UsageInfo> {
+        config
+            .profiles
+            .iter()
+            .filter_map(|p| Some((p.name.to_string(), p.usage.clone()?)))
+            .collect()
+    };
+
+    let config = chain(with_oauth_login(profile_with_util(
+        "c",
+        Some(95.0),
+        Some(10.0),
+    )));
+    let blind = config
+        .find(&crate::profile::ProfileName::from("blind"))
+        .expect("blind");
+    assert_eq!(
+        blocked_reason(&config, blind, None, &HashSet::new()),
+        Some(BlockedReason::NoUsage),
+        "the fixture carries the marker the walk must ignore"
+    );
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("blind".to_string())),
+    );
+    let snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &usage_of(&config)),
+        Some(SwitchAction::To("blind".into())),
+        "the scheduler's walk lands on the same member"
+    );
+
+    let config = chain(mark_fresh(with_oauth_login(profile_with_util(
+        "c",
+        Some(95.0),
+        Some(10.0),
+    ))));
+    assert_eq!(
+        next_target(&config, None, &HashSet::new()),
+        Some(SwitchAction::To("c".to_string())),
+        "a freshly read member with room comes first"
+    );
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = vec!["c".into()];
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &usage_of(&config)),
+        Some(SwitchAction::To("c".into())),
+    );
+}
+
+// What `no_usage_hazard` tells the operator: once the unmeasured member is
+// active, nothing reads it as exhausted, so neither decision leaves it, even
+// with a fresh member holding room behind it. (`next_target` alone would pick
+// `c`: it only picks a target, the decision gates on the active.)
+#[test]
+fn an_unmeasured_active_member_is_never_switched_away_from() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let config = config_with_chain(
+        vec![
+            profile_with_usage("blind", Some(95.0), None),
+            mark_fresh(with_oauth_login(profile_with_util(
+                "c",
+                Some(95.0),
+                Some(10.0),
+            ))),
+        ],
+        "blind",
+    );
+    assert_eq!(
+        decide_auto_switch(&config, None),
+        None,
+        "the UI-side decision"
+    );
+    let mut snap = snapshot_chain(&config, &HashSet::new()).expect("snapshot");
+    snap.fresh = vec!["c".into()];
+    let usage: HashMap<String, UsageInfo> = config
+        .profiles
+        .iter()
+        .filter_map(|p| Some((p.name.to_string(), p.usage.clone()?)))
+        .collect();
+    assert_eq!(
+        next_auto_switch_target_for_test(&snap, &usage),
+        None,
+        "the scheduler's walk"
     );
 }

@@ -621,6 +621,9 @@ pub(crate) const DIAG_KICK: &str = "claude code blocked";
 pub(crate) const DIAG_WEEKLY_SPENT: &str = "weekly spent";
 pub(crate) const DIAG_WEEKLY_SOFT: &str = "past the weekly switch line, still serving";
 pub(crate) const DIAG_STALE: &str = "stale data";
+/// No usage reading to judge the member on: the `--explain` age cell for an
+/// absent cache, and the Fallback marker for a member clauth cannot measure.
+pub(crate) const DIAG_NO_USAGE: &str = "no usage yet";
 
 /// A seconds age as the relative ladder (`4m ago`, `2h ago`, `3d ago`), open
 /// ended into weeks. The TUI's `relative_age` (`tui/render/format.rs`) calls
@@ -678,7 +681,7 @@ fn start_age_cell(row: &StartCandidate) -> String {
             }
         }
         OauthAge::Undated => "usage undated (stale)".to_string(),
-        OauthAge::Absent => "no usage yet".to_string(),
+        OauthAge::Absent => DIAG_NO_USAGE.to_string(),
     }
 }
 
