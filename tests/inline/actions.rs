@@ -3352,6 +3352,77 @@ fn capture_current_login_refuses_an_existing_name_pointing_at_login() {
     assert_eq!(config.profiles.len(), 1, "no second profile added");
 }
 
+fn creds_file(dir: &std::path::Path, access: &str, refresh: &str) -> std::path::PathBuf {
+    let path = dir.join("moved-credentials.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: access.to_string(),
+                refresh_token: Some(refresh.to_string()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("serialize credentials"),
+    )
+    .expect("write credentials file");
+    path
+}
+
+/// `--from` adopts a credentials file that is nowhere near the live slot: the
+/// profile stores exactly those tokens and nothing is read from `~/.claude`.
+#[test]
+fn capture_login_from_a_file_saves_that_login() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = creds_file(dir.path(), "moved-access", "moved-refresh");
+    let mut config = empty_config();
+
+    let became_active = capture_login(&mut config, "work", Some(&file)).expect("capture");
+
+    assert!(became_active, "the first profile auto-activates");
+    let saved = load_profile(&ProfileName::from("work")).expect("saved profile");
+    assert_eq!(saved.refresh_token(), Some("moved-refresh"));
+    assert_eq!(
+        saved.base_url, None,
+        "no endpoint borrowed from this machine"
+    );
+}
+
+/// A logged-out shell (blank tokens) parses but holds no login to adopt.
+#[test]
+fn capture_login_from_a_logged_out_file_is_refused() {
+    let _home = HomeSandbox::new();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = creds_file(dir.path(), "", "");
+    let mut config = empty_config();
+
+    let err = capture_login(&mut config, "work", Some(&file)).expect_err("empty refused");
+
+    assert!(err.to_string().contains("no login found in"), "{err}");
+    assert!(config.profiles.is_empty(), "nothing saved");
+}
+
+/// A file that is not there is an error naming it, not a silent empty capture.
+#[test]
+fn capture_login_from_a_missing_file_is_refused() {
+    let _home = HomeSandbox::new();
+    let mut config = empty_config();
+
+    let err = capture_login(
+        &mut config,
+        "work",
+        Some(std::path::Path::new("/nonexistent/c.json")),
+    )
+    .expect_err("missing refused");
+
+    assert!(err.to_string().contains("/nonexistent/c.json"), "{err}");
+    assert!(config.profiles.is_empty(), "nothing saved");
+}
+
 /// A capture beside an existing active account neither activates (that is the
 /// first-account arm) nor relinks — the live slot is left exactly as it was.
 /// The live login must be foreign to EVERY profile: one another profile owns

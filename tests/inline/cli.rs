@@ -403,10 +403,22 @@ fn login_bare_name_is_oauth_mode() {
 
 #[test]
 fn capture_parses_with_a_profile_argument() {
-    let Command::Capture { profile } = command(&["capture", "acme"]) else {
+    let Command::Capture { profile, from } = command(&["capture", "acme"]) else {
         panic!("capture must parse");
     };
     assert_eq!(profile, "acme");
+    assert_eq!(from, None);
+}
+
+#[test]
+fn capture_from_takes_a_credentials_file() {
+    let Command::Capture { profile, from } =
+        command(&["capture", "acme", "--from", "/tmp/creds.json"])
+    else {
+        panic!("capture --from must parse");
+    };
+    assert_eq!(profile, "acme");
+    assert_eq!(from, Some(std::path::PathBuf::from("/tmp/creds.json")));
 }
 
 #[test]

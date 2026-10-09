@@ -244,7 +244,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             a.explain,
         ),
         Command::Login(a) => cmd_login(a),
-        Command::Capture { profile } => cmd_capture(&profile),
+        Command::Capture { profile, from } => cmd_capture(&profile, from.as_deref()),
         Command::Delete {
             profile,
             yes,
@@ -1177,11 +1177,14 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
 /// capture itself live in `actions::capture_current_login`, so they are
 /// testable without argv; this wrapper only loads config and reports the
 /// outcome.
-fn cmd_capture(profile: &str) -> Result<()> {
+fn cmd_capture(profile: &str, from: Option<&std::path::Path>) -> Result<()> {
     platform::init();
     let mut config = load_config()?;
     let name = profile.trim();
-    let became_active = actions::capture_current_login(&mut config, name)?;
+    let became_active = match from {
+        Some(path) => actions::capture_login(&mut config, name, Some(path))?,
+        None => actions::capture_current_login(&mut config, name)?,
+    };
     if became_active {
         outln!("clauth: captured into profile '{name}'. It is the active account.");
     } else {

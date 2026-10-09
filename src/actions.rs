@@ -4,6 +4,7 @@
 //! the change under the cross-process state lock.
 
 use std::collections::{BTreeMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -11,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use crate::claude::{
     ClaudeEndpoint, apply_profile_to_claude_settings, clear_claude_credentials,
     force_link_profile_credentials, force_snapshot_active_credentials, link_profile_credentials,
-    live_diverged_and_unsaved, managed_env_key_label, read_claude_credentials,
+    live_diverged_and_unsaved, live_login_is_empty, managed_env_key_label, read_claude_credentials,
     read_claude_endpoint_config, snapshot_active_credentials,
 };
 use crate::harness::Harness;
@@ -1991,6 +1992,20 @@ pub(crate) fn capture_snapshot() -> Result<CaptureSnapshot> {
     })
 }
 
+/// A snapshot read from a credentials file the caller names (`clauth capture
+/// --from`) instead of the live slot. Only the OAuth block travels: the file
+/// says nothing about this machine's endpoint or api key, so those stay unset
+/// rather than borrowing whatever Claude Code runs on here.
+pub(crate) fn capture_snapshot_from(path: &Path) -> Result<CaptureSnapshot> {
+    let credentials: ClaudeCredentials = crate::profile::read_json_file(path)?;
+    Ok(CaptureSnapshot {
+        credentials: Some(credentials),
+        base_url: None,
+        api_key: None,
+        anchor: AnchorAction::Unproven,
+    })
+}
+
 /// An all-empty snapshot (no OAuth login, no endpoint, no key) holds nothing a
 /// profile could authenticate with. Both capture surfaces refuse it rather than
 /// persisting a credential-less profile behind a success message.
@@ -2008,6 +2023,19 @@ pub(crate) fn snapshot_is_empty(snapshot: &CaptureSnapshot) -> bool {
 /// whether the new profile became the active account: the first one
 /// auto-activates, any later one needs an explicit switch.
 pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Result<bool> {
+    capture_login(config, name, None)
+}
+
+/// [`capture_current_login`], optionally from a credentials file instead of the
+/// live slot. The file is Claude Code's own `.credentials.json` format, so a
+/// login copied off another machine or restored from a backup adopts without a
+/// browser round trip. A refresh token is single-use: the source has to stop
+/// refreshing it, or whichever side refreshes second is signed out.
+pub(crate) fn capture_login(
+    config: &mut AppConfig,
+    name: &str,
+    from: Option<&Path>,
+) -> Result<bool> {
     let name = name.trim();
     if let Some(existing) = config.canonical_name(name) {
         bail!(
@@ -2015,8 +2043,20 @@ pub(crate) fn capture_current_login(config: &mut AppConfig, name: &str) -> Resul
         );
     }
     validate_profile_name(name, Harness::Claude, None)?;
-    let snapshot = capture_snapshot()?;
-    if snapshot_is_empty(&snapshot) {
+    let snapshot = match from {
+        Some(path) => capture_snapshot_from(path)?,
+        None => capture_snapshot()?,
+    };
+    if let Some(path) = from {
+        // A logged-out shell (blank tokens) parses fine but holds no login.
+        if snapshot
+            .credentials
+            .as_ref()
+            .is_none_or(live_login_is_empty)
+        {
+            bail!("no login found in {}", path.display());
+        }
+    } else if snapshot_is_empty(&snapshot) {
         bail!("no live login found to capture");
     }
     // The TUI's capture asks before duplicating a login another profile already
