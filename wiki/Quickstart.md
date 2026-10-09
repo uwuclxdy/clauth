@@ -65,7 +65,7 @@ clauth list           # account table with cached usage, no network
 | `clauth start --auto [claude args…]` | `--isolated`, `--with-fallback`, `--explain` | start on the first fallback-chain member with headroom for the models the session will run |
 | `clauth login <profile>` | `--base-url`, `--api-key`, `--setup-token`, `--yes`, `--model` | add an account, or re-authenticate one in place |
 | `clauth login <profile> --codex` | `--browser` | adopt the `codex login` in your `~/.codex` as a codex profile; `--browser` mints a fresh ChatGPT login in the browser instead and leaves `~/.codex` alone ([Codex](Codex#add-an-account)) |
-| `clauth capture <profile>` | | save the login Claude Code is using now as a new profile; the first one becomes the active account |
+| `clauth capture <profile>` | `--from <file>` | save the login Claude Code is using now as a new profile; the first one becomes the active account. `--from` adopts a `.credentials.json` from another machine or a backup instead (see below) |
 | `clauth rolling-token <profile>` | | serve the profile's sessions a rolling token re-stamped from its usage chain |
 | `clauth static-token <profile>` | `--clear`, `--yes` | bare: restore the preserved mint a rolling token superseded; `--clear` removes the long-lived token entirely |
 | `clauth delete <profile>` | `--yes`, `--force` | remove a profile and every credential it holds, a codex profile included ([Codex](Codex#remove)) |
@@ -134,3 +134,9 @@ clauth list           # account table with cached usage, no network
 ### Exit codes
 
 `0` success, `1` failure, `2` usage error (unknown profile, bad flags). `clauth daemon --status` exits `0` when a daemon is running and `1` when none is.
+
+## Moving a login from another machine
+
+`clauth capture <profile> --from <file>` adopts a Claude Code `.credentials.json` you copied off another machine (or out of a backup), with no browser step. That helps when the other box is headless.
+
+A refresh token is single-use, so the old holder has to stop using it first. If both machines keep refreshing the same login, whichever refreshes second is signed out and the profile goes `auth_broken`. On the source machine: quit every `claude` session, then move the file aside (`mv ~/.claude/.credentials.json ~/.claude/.credentials.json.moved`; don't run `claude logout`, which may revoke the login). Copy the file over, run the capture, and delete both copies. The source machine needs its own login after that, which is a separate sign-in and doesn't affect this one.
