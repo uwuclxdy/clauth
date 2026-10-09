@@ -13720,7 +13720,7 @@ fn a_kick_refused_on_a_cleared_login_drops_the_entry_through_run_fetch() {
     );
 }
 
-// ── the refresh chain: fix round 1 ───────────────────────────────────────────
+// ── the refresh chain: fresher-pair readers and catch-up failures ────────────
 
 /// A store whose token the server consumed (the record names both P1 and the
 /// stored P2) is a rewind, never a fresher pair for the carry.

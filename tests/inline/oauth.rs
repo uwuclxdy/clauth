@@ -6961,7 +6961,7 @@ fn a_landed_rotation_moves_the_reload_fingerprint() {
     );
 }
 
-// ── the refresh chain: the send-site rule, the landers, part-1 review pins ───
+// ── the refresh chain: the send-site rule, the landers and the record ────────
 
 fn pn(name: &str) -> crate::profile::ProfileName {
     crate::profile::ProfileName::from(name)
@@ -7584,7 +7584,7 @@ fn a_split_profiles_persist_judges_the_chain_in_credentials_json() {
     assert_eq!(std::fs::read(&sidecar).expect("sidecar"), sidecar_before);
 }
 
-// ── the refresh chain: fix round 1 ───────────────────────────────────────────
+// ── the refresh chain: captures, the gates, the landing's Keychain budget ────
 
 /// A capture re-installs a pair the record names spent (a live slot that lagged
 /// the landed store). The readable record survives the install, so the next
