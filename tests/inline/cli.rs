@@ -4059,23 +4059,13 @@ fn seed_limit_reset_rosters() {
     crate::testutil::write_codex_store("cx", &crate::testutil::codex_auth_body("at.cx", "rt.cx"));
 }
 
-/// Endpoints on a listener that is bound but never accepted: a request would
-/// queue a connection on it, so `accept` answering `WouldBlock` afterwards
-/// proves nothing was sent — at once, with no stub deadline to wait out.
+/// The reset endpoints on [`crate::testutil::deaf_listener`].
 fn untouched_reset_urls() -> (std::net::TcpListener, usage::codex_reset::ResetUrls) {
-    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
-    listener.set_nonblocking(true).expect("nonblocking");
-    let port = listener.local_addr().expect("addr").port();
-    let urls = usage::codex_reset::ResetUrls::under(&format!("http://127.0.0.1:{port}"));
-    (listener, urls)
+    let (listener, base) = crate::testutil::deaf_listener();
+    (listener, usage::codex_reset::ResetUrls::under(&base))
 }
 
-fn assert_nothing_sent(listener: &std::net::TcpListener) {
-    match listener.accept() {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        other => panic!("a request reached the endpoint: {other:?}"),
-    }
-}
+use crate::testutil::assert_nothing_sent;
 
 fn no_prompt(prompt: &str) -> Result<bool> {
     panic!("this path must not prompt, asked: {prompt}")
@@ -4202,4 +4192,77 @@ fn limit_reset_spends_the_credit_it_named_and_only_after_a_yes() {
         Some("acc"),
         "the store's account id rides along"
     );
+}
+
+/// The static-token verbs put the store in front of Claude Code, so each lands
+/// a live stage a failed persist left before it acts: the store holds the
+/// staged pair (`rt-mid`) after the verb, and the stage is gone. The stage's
+/// base is fp("rt-old"), hand-computed: the first 8 bytes of its SHA-256, hex.
+mod static_token_landers {
+    use super::*;
+    use crate::testutil::HomeSandbox;
+
+    fn staged_profile(name: &str, rolling_flag: bool) -> std::path::PathBuf {
+        let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+        profile.rolling_token = rolling_flag;
+        profile.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-old".to_string(),
+                refresh_token: Some("rt-old".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        crate::profile::save_profile(&profile).expect("save profile");
+        let state = crate::profile::AppState {
+            profiles: vec![profile.name.clone()],
+            ..Default::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        let dir = crate::profile::profile_dir(&profile.name).expect("dir");
+        std::fs::write(
+            dir.join("credentials.json.staged"),
+            r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+                "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+        )
+        .expect("write the stage");
+        std::fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+        dir
+    }
+
+    fn store_refresh(dir: &std::path::Path) -> Option<String> {
+        let store: crate::profile::ClaudeCredentials =
+            crate::profile::read_json_file(&dir.join("credentials.json")).expect("read store");
+        store.refresh_token().map(str::to_string)
+    }
+
+    #[test]
+    fn the_clear_lands_a_live_stage_before_it_relinks() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-clear", true);
+
+        cmd_static_token_clear("land-clear", true).expect("the clear succeeds");
+
+        assert_eq!(store_refresh(&dir).as_deref(), Some("rt-mid"));
+        assert!(!dir.join("credentials.json.staged").exists());
+    }
+
+    #[test]
+    fn the_restore_lands_a_live_stage_before_it_relinks() {
+        let _home = HomeSandbox::new();
+        let dir = staged_profile("land-restore", false);
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from("land-restore"),
+            "sk-ant-oat01-chain-land-restore-mint",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("mint");
+
+        cmd_static_token("land-restore").expect("already on the mint is a no-op");
+
+        assert_eq!(store_refresh(&dir).as_deref(), Some("rt-mid"));
+        assert!(!dir.join("credentials.json.staged").exists());
+    }
 }

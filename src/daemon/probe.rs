@@ -34,22 +34,28 @@ use crate::profile::clauth_dir;
 /// How stale `status.json` may be before the `[ daemon ]` header chip flips
 /// green→amber.
 /// The daemon stamps it every ~1s loop tick, but a single tick can legitimately
-/// block on the keychain shell-outs: a rotation's mirror makes three `security`
-/// calls (read, write, read-back verify) at 10 s each, unclamped because it
-/// runs after the lock closure — 30 s worst, past
-/// `runtime::KEYCHAIN_MIRROR_BUDGET`'s 20 s term by design (see
-/// `keychain::SECURITY_TIMEOUT`'s doc). The window therefore sits one margin
-/// ABOVE [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE), so that worst legal
-/// tick reads green throughout and amber means "no tick has completed within
-/// what the watchdog tolerates" — wedging, pre-abort — never "slowest legal
-/// tick".
+/// block on the keychain shell-outs: a queued switch's install gate can land a
+/// rotation, whose tail makes up to four `security` calls (the foreign gate's
+/// item read, then the mirror's read, write and read-back verify) at 10 s
+/// each. The landing's `runtime::KEYCHAIN_MIRROR_BUDGET` arm adopts the 20 s
+/// window the tick itself arms (`lock::SharedSubprocessBudget::arm_clamped`),
+/// which the switch's own shell-outs and both drains' flock waits share too,
+/// so a tick's shell-outs and flock waits stop at 20 s in aggregate. The
+/// window sits one margin ABOVE [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE),
+/// so a tick inside that bound reads green throughout and amber means "no tick
+/// has completed within what the watchdog tolerates" — wedging, pre-abort.
+///
+/// Neither bound covers a switch tick whose install gate also makes a token
+/// call: `oauth::TOKEN_HTTP_DEADLINES` (19 s) runs outside the tick's window,
+/// so such a tick can take 20 + 19 = 39 s, past both this window and the 30 s
+/// watchdog, and reads amber while it runs.
 const DAEMON_STALE_MS: u64 = super::WATCHDOG_DEADLINE.as_millis() as u64 + 5_000;
 
 const _: () = assert!(
     DAEMON_STALE_MS > super::WATCHDOG_DEADLINE.as_millis() as u64,
-    "the staleness window must sit strictly above the watchdog deadline: the \
-     worst legal tick (a keychain mirror spending every security deadline) must \
-     read green, never amber"
+    "the staleness window must sit strictly above the watchdog deadline: a tick \
+     whose shell-outs and flock waits spend the tick's whole 20 s window must read \
+     green, never amber (a token call on top of it is not covered)"
 );
 
 /// The `[ daemon ]` header chip's three display states, derived from the daemon

@@ -7,7 +7,7 @@
 
 use super::*;
 use std::io::{Error, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// A writer that fails every write with `kind`, the way a pipe whose reader has
 /// exited fails a real one.
@@ -127,7 +127,7 @@ fn a_reachable_reader_gets_the_bytes() {
 fn no_bare_print_macro_under_src() {
     const BANNED: [&str; 4] = ["println!", "print!", "eprintln!", "eprint!"];
     let mut offenders = Vec::new();
-    let scanned = rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
+    let scanned = crate::testutil::rs_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"));
     // An unreadable `src/` would leave the scan empty and the assertion below
     // vacuous, which is the one way this test could pass while blind.
     assert!(
@@ -163,21 +163,4 @@ fn calls(code: &str, macro_name: &str) -> bool {
                 .next_back()
                 .is_some_and(|c| c.is_alphanumeric() || c == '_')
     })
-}
-
-/// Every `.rs` file under `dir`, recursively.
-fn rs_files(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            out.extend(rs_files(&path));
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-    out
 }

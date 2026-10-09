@@ -14,6 +14,26 @@ use utoipa::openapi::schema::{
     AdditionalProperties, Array, ArrayItems, Components, Object, Schema, SchemaType, Type,
 };
 
+/// Every `.rs` file under `dir`, recursively: the walk the source-scan tests
+/// share (`out::tests::no_bare_print_macro_under_src`, the Keychain budget
+/// site scan). An unreadable dir yields nothing, so each caller asserts it
+/// read the crate.
+pub(crate) fn rs_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rs_files(&path));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
 /// Required for any test that writes into the per-profile tree or creates
@@ -575,6 +595,24 @@ pub(crate) fn window_exhaustion_429_headers(
     .iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect()
+}
+
+/// A listener bound but never accepted, and its `http://127.0.0.1:PORT` base:
+/// a request would queue a connection on it, so `accept` answering
+/// `WouldBlock` afterwards ([`assert_nothing_sent`]) proves nothing was sent —
+/// at once, with no stub deadline to wait out.
+pub(crate) fn deaf_listener() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    (listener, format!("http://127.0.0.1:{port}"))
+}
+
+pub(crate) fn assert_nothing_sent(listener: &std::net::TcpListener) {
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a request reached the endpoint: {other:?}"),
+    }
 }
 
 pub(crate) fn rotation_fixture_config(
@@ -1164,6 +1202,17 @@ pub(crate) fn write_codex_roster(names: &[&str]) {
         .collect::<Vec<_>>()
         .join(", ");
     write_codex_state(&format!("profiles = [{list}]\n"));
+}
+
+/// Another clauth process inside its state-flock hold: a second open file
+/// description of the lock file, flocked. Call under a [`HomeSandbox`]; drop it
+/// to release.
+pub(crate) fn hold_state_flock() -> std::fs::File {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    holder
 }
 
 /// A locked handle on `name`'s rotation lock from a separate fd, standing in

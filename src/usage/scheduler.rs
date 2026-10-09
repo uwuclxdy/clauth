@@ -762,7 +762,7 @@ fn load_cached_with_status(
 /// instead of serving stale cached usage until the next switch trips
 /// `ensure_installable`. Truth table pinned by the scheduler `*_terminal` tests.
 fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
-    matches!(err, RefreshError::Invalid(_))
+    matches!(err, RefreshError::Invalid { .. })
 }
 
 /// The benign face of a terminal 400: "refresh token not found or invalid" is
@@ -778,10 +778,39 @@ fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
 /// caller's `TokenList` sync instead of quarantining a healthy account.
 /// `None` (unchanged, unreadable, or tokenless) means the 400 was a real
 /// revocation.
+///
+/// A live stage is the chain head, so its pair is the fresh one. Otherwise the
+/// store is fresher only when it is neither spent nor a stage's base: either is
+/// a token the chain already superseded, never an advance. An unreadable spent
+/// record proves nothing fresher.
 fn fresher_disk_pair(name: &ProfileName, spent_refresh: &str) -> Option<RotatedTokens> {
-    let profile = crate::profile::load_profile(name).ok()?;
-    let access = profile.access_token()?.to_string();
-    let refresh = profile.refresh_token()?.to_string();
+    use crate::oauth::{SpentRecord, StageState, StagedPair};
+    let record = SpentRecord::read(name);
+    if matches!(record, SpentRecord::Unreadable) {
+        return None;
+    }
+    let store = crate::oauth::read_raw_store(name).ok()??;
+    let d = store.refresh_token();
+    let stage = StagedPair::read(name);
+    let fresh = match stage
+        .as_ref()
+        .filter(|g| g.state(d, &record) == StageState::Live)
+    {
+        Some(live) => &live.creds,
+        None => {
+            let d = d?;
+            let superseded = record.spent(d) != Some(false)
+                || stage
+                    .as_ref()
+                    .is_some_and(|g| g.base == crate::codex_auth::token_fingerprint(d));
+            if superseded {
+                return None;
+            }
+            &store
+        }
+    };
+    let access = fresh.access_token()?.to_string();
+    let refresh = fresh.refresh_token()?.to_string();
     (refresh != spent_refresh).then_some((access, Some(refresh)))
 }
 
@@ -1067,10 +1096,22 @@ fn fetch_with_rotation(
             true,
             false,
         ));
+    // A live stage's pair is the chain head even while memory and the store lag
+    // it (a persist that could not take the flock), so its expiry is what the
+    // lead window measures; without it a wedged flock re-rotates every tick.
+    let staged_expires_at = crate::oauth::has_stage(name)
+        .then(|| {
+            crate::oauth::live_stage_credentials(
+                name,
+                crate::oauth::read_raw_store(name).ok().flatten().as_ref(),
+            )
+        })
+        .flatten()
+        .and_then(|c| c.access_token_expires_at());
     let proactive = proactive_rotation_due(
         preemptive,
         rolling_token,
-        access_expires_at,
+        access_expires_at.max(staged_expires_at),
         now_ms() as i64,
         interval_ms,
     );
@@ -1188,15 +1229,40 @@ fn fetch_with_rotation(
     if entry.auth_broken {
         return bail_unrotated();
     }
+    let rt = match crate::oauth::send_rule(name, rt, &rotation_guard) {
+        crate::oauth::SendRule::Send(rt) => rt,
+        // The carry's shape: the store's newer login reaches the token list and
+        // the next tick polls with it.
+        crate::oauth::SendRule::Adopt(pair) => {
+            if crate::oauth::adopt_disk_rotation(config, name, &rotation_guard).is_err() {
+                return bail_unrotated();
+            }
+            if let Ok(mut q) = refetch.lock() {
+                q.insert(name.to_string());
+            }
+            return FetchOutcome::cached(name, FetchStatus::Cached, Some(pair), None);
+        }
+        crate::oauth::SendRule::Quarantine => {
+            crate::oauth::mark_auth_broken(config, name, true);
+            return bail_unrotated();
+        }
+        crate::oauth::SendRule::Skip => return bail_unrotated().with_refresh_failed(),
+    };
+    let rt = rt.as_str();
     mark_activity(activity, name, ProfileActivity::Refreshing);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
-    let rotation =
-        crate::oauth::refresh_result(rt, crate::oauth::stored_scopes(config, name).as_deref());
+    let rotation = crate::oauth::settle_refresh_answer(
+        config,
+        name,
+        rt,
+        crate::oauth::refresh_result(rt, crate::oauth::stored_scopes(config, name).as_deref()),
+        &rotation_guard,
+    );
     // This site raised `Refreshing`, so it is the one that may retire it. One
     // hold, so partition never reads the profile idle between the two writes.
     rotation_into_fetch(activity, name);
-    let tok = match rotation {
+    let minted = match rotation {
         Ok(t) => t,
         Err(e) => {
             // A failed refresh on the ACTIVE profile usually means the live
@@ -1246,15 +1312,29 @@ fn fetch_with_rotation(
     };
     // Persist under the AppConfig mutex + state lock — matches every other rotation site
     // so a concurrent `rotate_one_inner` can't interleave, and keeps in-memory AppConfig in sync.
-    let access = tok.access_token.clone();
+    let (access, new_refresh) = minted.pair();
     // The refresh already spent the old single-use token, so this pair is now the
     // only usable one — carry it back even when the persist below fails, or the
-    // caller's live snapshot keeps the dead token and 400s every tick until a
-    // restart adopts the staged sidecar (`auto_start_kick` carries its pair back
-    // for the same reason).
-    let rotated: Option<RotatedTokens> = Some((access.clone(), Some(tok.refresh_token.clone())));
-    if crate::oauth::apply_rotated_tokens_locked(config, name, tok).is_err() {
-        return bail_to_cache(rotated);
+    // caller's live snapshot keeps the dead token and 400s every tick
+    // (`auto_start_kick` carries its pair back for the same reason). A REFUSED
+    // persist carries the store's pair instead, so the token list follows the
+    // store; a store with no login drops the entry.
+    let rotated: Option<RotatedTokens> = Some((access.clone(), new_refresh));
+    match crate::oauth::apply_rotated_tokens_locked(
+        config,
+        name,
+        &minted.sent_fp,
+        &minted.creds,
+        &minted.old_access,
+    ) {
+        Ok(()) => {}
+        Err(crate::oauth::PersistError::Refused { store }) => {
+            return match crate::oauth::PersistError::carried_pair(store.as_deref()) {
+                Some(pair) => bail_to_cache(Some(pair)),
+                None => bail_to_cache(None).with_login_gone(),
+            };
+        }
+        Err(crate::oauth::PersistError::Failed(_)) => return bail_to_cache(rotated),
     }
     // A successful refresh + persist clears any prior auth-broken quarantine
     // (mirrors `ensure_installable`); a no-op when the flag was already clear.
@@ -1308,6 +1388,10 @@ struct FetchOutcome {
     /// into the profile's `refresh_fail` streak by [`apply_outcome`], which is
     /// what ladders the cadence and names the state on the row.
     refresh_failed: bool,
+    /// A rotation's persist refused because the store holds no login any more
+    /// (a logout landed mid-rotation): the drain drops this profile's
+    /// `TokenList` entry rather than poll one more tick on a gone login.
+    login_gone: bool,
     /// A `/profile` reading fetched DESPITE a `/usage` 429 (a canceled account
     /// has been observed to keep 429ing `/usage`). Overlaid onto the cached snapshot by
     /// [`apply_outcome`] so only the tier advances — windows stay cached — and
@@ -1327,6 +1411,7 @@ impl FetchOutcome {
             from_fetch: true,
             retry_after: None,
             refresh_failed: false,
+            login_gone: false,
             plan_override: None,
         }
     }
@@ -1336,6 +1421,13 @@ impl FetchOutcome {
     /// on a live body regardless.
     fn with_refresh_failed(mut self) -> Self {
         self.refresh_failed = true;
+        self
+    }
+
+    /// Mark this outcome as carrying a refused persist whose store holds no
+    /// login: the drain drops the profile's `TokenList` entry.
+    fn with_login_gone(mut self) -> Self {
+        self.login_gone = true;
         self
     }
 
@@ -1356,6 +1448,7 @@ impl FetchOutcome {
             from_fetch: false,
             retry_after,
             refresh_failed: false,
+            login_gone: false,
             plan_override: None,
         }
     }
@@ -2071,6 +2164,7 @@ fn run_fetch(
     // fetch below uses the fresh token, never re-spending) and the returned
     // outcome (so the tick syncs it into the live snapshot).
     let mut kick_rotated: Option<RotatedTokens> = None;
+    let mut kick_login_gone = false;
     if entry.auto_start {
         let now_secs = now_epoch_secs();
         // WHICH leg would fire, read before the kick moves the window. The
@@ -2112,6 +2206,7 @@ fn run_fetch(
                 kicked.blocked,
                 now_secs,
             );
+            kick_login_gone = kicked.login_gone;
             if let Some((access, refresh)) = kicked.rotated.clone() {
                 entry.access_token = access;
                 entry.refresh_token = refresh;
@@ -2160,6 +2255,13 @@ fn run_fetch(
             // limit.)
             crate::usage::note_queue_kick_failed(auto_start_queue, &entry.name, now_secs);
         }
+    }
+
+    if kick_login_gone {
+        // The kick's persist found the login cleared: nothing is left to poll
+        // with, so the tick drops the entry instead of fetching.
+        return FetchOutcome::cached(&entry.name, FetchStatus::Cached, None, None)
+            .with_login_gone();
     }
 
     // Prior plan for the TTL'd `/profile` policy, read from the live store and
@@ -3019,6 +3121,11 @@ fn drain_oauth_completions(
             entry.access_token = new_access.clone();
             entry.refresh_token = new_refresh.clone();
         }
+        if outcome.login_gone
+            && let Ok(mut t) = state.tokens.lock()
+        {
+            t.retain(|e| e.name != outcome.name);
+        }
         // The active profile's 429 ladder caps low (see `next_slot_deferral`);
         // read the flag at apply time so a switch mid-flight lands the right cadence.
         // `auto_start` rides the same lock: the weekly-reset mark below only
@@ -3483,6 +3590,44 @@ pub(crate) struct SchedulerState {
     fetcher: ThirdPartyFetcher,
 }
 
+/// The plight-latch key for a staged pair the catch-up could not land.
+const STAGE_LAND_PLIGHT: &str = "stage-land";
+
+/// The catch-up leg (lease holder only): every configured claude profile with
+/// a staged pair gets it resolved under its rotation guard — a live stage
+/// lands (`oauth::land_staged_pair`), a landed one runs its hooks, an inert
+/// one goes. `try_acquire`, so a busy guard skips that profile this tick and
+/// the tick thread never parks; a state-flock timeout ends the pass, since
+/// every later profile would wait out the same wedged holder. Inline on the
+/// tick thread for the re-stamp leg's reason: the steady state finds no stage
+/// at all, which costs one `stat` per profile.
+fn catch_up_staged_pairs(config: &crate::profile::ConfigHandle) {
+    let names: Vec<ProfileName> = match config.lock() {
+        Ok(cfg) => cfg.profiles.iter().map(|p| p.name.clone()).collect(),
+        Err(_) => return,
+    };
+    for name in names.iter().filter(|n| crate::oauth::has_stage(n)) {
+        let Ok(Some(guard)) = crate::runtime::RotationGuard::try_acquire(name) else {
+            continue;
+        };
+        match crate::oauth::land_staged_pair(config, name, &guard) {
+            Ok(_) => crate::codex_auth::clear_plight_warn(name.as_str(), STAGE_LAND_PLIGHT),
+            Err(e) => {
+                // A failure that persists (a full disk, an unwritable store)
+                // repeats every tick: logged once until a landing clears it.
+                if crate::codex_auth::plight_warn_once(name.as_str(), STAGE_LAND_PLIGHT) {
+                    logline!("clauth: '{name}': saving the waiting token pair failed: {e:#}");
+                }
+                if e.chain()
+                    .any(|c| c.downcast_ref::<crate::lock::StateLockTimeout>().is_some())
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// One scheduler tick: drain forced refetches, partition both legs, publish
 /// countdowns, fan out fetches (OAuth + third-party) that republish each
 /// profile's countdown as it lands, propagate rotated tokens, evaluate
@@ -3517,6 +3662,10 @@ fn tick(state: &SchedulerState) {
     // it never races its own appends, and ahead of the fetch legs so a long-run
     // process re-trims before adding to the file rather than after.
     prune_histories_if_due(&state.last_history_prune, &state.config, now_ms());
+
+    // Land any pair a failed persist left staged before anything below reads
+    // the store or spends from memory: ahead of the re-stamp and fetch legs.
+    catch_up_staged_pairs(&state.config);
 
     // CLA-ROLL: rolling-sidecar freshness scan — renew a rolling-token profile's
     // session bearer hours ahead of its clock death instead of relying on

@@ -614,9 +614,10 @@ fn noninteractive_switch_refuses_a_dead_target_with_login_hint() {
     });
 
     let revoked = |_: &str, _: Option<&str>| {
-        Err(crate::oauth::RefreshError::Invalid(
-            crate::oauth::TokenFailure::Status(400),
-        ))
+        Err(crate::oauth::RefreshError::Invalid {
+            failure: crate::oauth::TokenFailure::Status(400),
+            invalid_grant: true,
+        })
     };
     let err = switch_profile_noninteractive(
         &config,
@@ -726,9 +727,10 @@ fn switch_to_the_active_profile_never_gates() {
     let config = handle(config);
 
     let revoked = |_: &str, _: Option<&str>| {
-        Err(crate::oauth::RefreshError::Invalid(
-            crate::oauth::TokenFailure::Status(400),
-        ))
+        Err(crate::oauth::RefreshError::Invalid {
+            failure: crate::oauth::TokenFailure::Status(400),
+            invalid_grant: true,
+        })
     };
     let (previous, active) = switch_profile_noninteractive(
         &config,

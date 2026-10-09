@@ -1437,15 +1437,18 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     // a rotation in flight that still sees the flag set would re-stamp the
     // sidecar AFTER the removal below, resurrecting the very state this command
     // just reported cleared.
-    let _guard = runtime::RotationGuard::acquire(target)
+    let guard = runtime::RotationGuard::acquire(target)
         .with_context(|| format!("could not lock '{target}' to clear its long-lived token"))?;
+    // The relink below puts the store in front of Claude Code: a staged pair
+    // lands first.
+    oauth::land_stage_for_install(target, &guard)
+        .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
     // Everything the ACTIONS key off is re-read under the guard; the snapshot
     // above fed the prompt's copy and nothing else. The prompt is an unbounded
-    // wait, and a rotation, a switch, or a re-login can all land during it —
-    // `save_profile` persists the WHOLE profile, so writing the pre-prompt
-    // snapshot back would rewind `credentials.json` to a spent refresh token
-    // (the exact hazard `adopt_disk_rotation` names, one layer up), and acting
-    // on the pre-prompt `active` relinks the wrong world in both directions.
+    // wait, and a switch, a re-login or another config edit can all land
+    // during it — `save_profile_config` writes the WHOLE config, so writing
+    // the pre-prompt snapshot back would rewind that edit, and acting on the
+    // pre-prompt `active` relinks the wrong world in both directions.
     let mut on_disk = profile::load_profile(target)?;
     // The other-login REFUSAL re-checks here too — it is the one decision in
     // this function that can strip a profile of its last credential, and the
@@ -1464,7 +1467,7 @@ fn cmd_static_token_clear(name: &str, yes: bool) -> Result<()> {
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
         on_disk.rolling_token = false;
-        profile::save_profile(&on_disk)?;
+        profile::save_profile_config(&on_disk)?;
     }
     // A mis-filled sidecar is EVIDENCE — the anomaly the split exists to
     // detect, and one the operator did not name: the prompt says "the
@@ -1871,7 +1874,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
         && let Some(profile) = cfg.find_mut(&canonical)
     {
         profile.rolling_token = true;
-        profile::save_profile(profile)?;
+        profile::save_profile_config(profile)?;
     }
     let armed =
         oauth::arm_rolling_token(&handle, &canonical, oauth::refresh_result).and_then(|()| {
@@ -1892,7 +1895,7 @@ fn cmd_rolling_token(name: &str) -> Result<()> {
             profile.rolling_token = false;
             // The arming error is the one the operator needs; a rollback that
             // then cannot save its own config write must not replace it.
-            if let Err(save_err) = profile::save_profile(profile) {
+            if let Err(save_err) = profile::save_profile_config(profile) {
                 errln!("{}", rollback_stranded_warning(&canonical, &save_err));
             }
         }
@@ -2055,8 +2058,12 @@ fn cmd_static_token(name: &str) -> Result<()> {
     // Arriving at the error means the lock file could not be created or opened
     // — a filesystem or permissions problem under `~/.clauth` — and the
     // original error says which, so it is kept rather than replaced.
-    let _guard = runtime::RotationGuard::acquire(&canonical)
+    let guard = runtime::RotationGuard::acquire(&canonical)
         .with_context(|| format!("could not lock '{canonical}' to restore its static token"))?;
+    // The relink below puts the install source in front of Claude Code, the
+    // store whenever the mint does not restore: a staged pair lands first.
+    oauth::land_stage_for_install(&canonical, &guard)
+        .map_err(|refused| anyhow::anyhow!("{}", refused.text_with_status()))?;
     // Flag OFF first, before the restore is known to land — DELIBERATE, and
     // load-bearing for every bail arm below, none of which rolls it back. The
     // command's primary effect is the disarm: with the flag still on, the
@@ -2069,13 +2076,12 @@ fn cmd_static_token(name: &str) -> Result<()> {
     //
     // Written from a fresh DISK read, never the pre-acquire config snapshot:
     // the blocking acquire above can WAIT out an in-flight rotation, and
-    // `save_profile` persists the whole profile — writing the snapshot back
-    // would rewind the very rotation it just waited for to a spent refresh
-    // token.
+    // `save_profile_config` writes the whole config — writing the snapshot
+    // back would rewind any config edit that landed meanwhile.
     let mut on_disk = profile::load_profile(&canonical)?;
     if on_disk.rolling_token {
         on_disk.rolling_token = false;
-        profile::save_profile(&on_disk)?;
+        profile::save_profile_config(&on_disk)?;
     }
     let is_active = load_config()?.is_active(&canonical);
     // The flag flip above is already durable, so a restore that ERRORS (the

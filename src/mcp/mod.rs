@@ -561,7 +561,7 @@ fn fold_active_live_usage(
 /// [`delegate_call_endpoint`] layers the caller's own `env` override on top;
 /// a caller wanting one answer for the whole call starts there. Name-keyed
 /// rather than threaded from a resolved `Profile`, because `load_profile`
-/// recovers a staged rotation under the cross-process state flock
+/// recovers a legacy `.pending` rotation sidecar under the cross-process state flock
 /// (`rank::State`, 500), a serialization point no fold path should sit
 /// inside.
 fn target_endpoint(name: &ProfileName) -> Option<String> {

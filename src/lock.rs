@@ -65,8 +65,8 @@ pub(crate) fn state_lock_timeout() -> Duration {
 /// drains must not spend 2 × [`STATE_LOCK_TIMEOUT`] on waits. Flock waits spend
 /// that window exactly like the keychain shell-outs do, so the second drain is
 /// never handed a fresh full timeout once the window is gone. Every other
-/// scope (the macOS GC sweep, the session-seed carry) arms a budget for its
-/// own shell-outs and keeps the full [`state_lock_timeout()`]: a waiter there
+/// scope (each listed at [`SharedSubprocessBudget::arm`]) arms a budget for
+/// its own shell-outs and keeps the full [`state_lock_timeout()`]: a waiter there
 /// must survive a legit slow switch's hold, never clamp to its own budget. A
 /// clamped acquisition past a spent window is handed zero and fails
 /// immediately rather than waiting.
@@ -112,8 +112,9 @@ fn flock_wait_deadline() -> Duration {
 /// the shell-outs: each drain's acquisition clamps its wait to what the window
 /// leaves (via [`SharedSubprocessBudget::arm_clamped`]), so two wedged drains
 /// cannot spend 2 × [`STATE_LOCK_TIMEOUT`] on waits in one tick. A budget
-/// armed for shell-outs alone (the macOS GC sweep, the session-seed carry)
-/// leaves flock waits at the full [`STATE_LOCK_TIMEOUT`]. An acquisition adopts
+/// armed for shell-outs alone (each scope listed at
+/// [`SharedSubprocessBudget::arm`]) leaves flock waits at the full
+/// [`STATE_LOCK_TIMEOUT`]. An acquisition adopts
 /// the wider scope's budget (arm-if-not-armed) rather than replacing it.
 pub(crate) const SUBPROCESS_BUDGET: Duration = Duration::from_secs(20);
 
@@ -183,18 +184,21 @@ thread_local! {
 // Whether this thread's flock waits are clamped to the armed window
 // (`HOLD_DEADLINE`). Set only by [`SharedSubprocessBudget::arm_clamped`] — the
 // daemon's tick is the one scope whose two drains must spend the window on
-// waits; every other budget scope (the macOS GC sweep, the session-seed carry)
-// arms a budget for its own shell-outs and keeps the full
+// waits; every other budget scope (each listed at
+// [`SharedSubprocessBudget::arm`]) arms a budget for its own shell-outs and
+// keeps the full
 // `STATE_LOCK_TIMEOUT` for its flock waits. Arm-if-not-armed like the budget.
 thread_local! {
     static CLAMP_FLOCK_WAIT: Cell<bool> = const { Cell::new(false) };
 }
 
-/// `base`, clamped to what is left of this thread's [`SUBPROCESS_BUDGET`].
-/// Returns `base` untouched when the thread holds no state lock, which is the
-/// right answer rather than a fallback: a caller outside the lock (`oauth.rs`
-/// mirrors a rotation after its lock closure ends) blocks no peer, so nothing is
-/// waiting on it to finish. An exhausted budget clamps to zero, which the
+/// `base`, clamped to what is left of this thread's armed budget: the state
+/// lock's [`SUBPROCESS_BUDGET`], or a [`SharedSubprocessBudget`] a scope armed
+/// (`oauth.rs` mirrors a rotation after its lock closure ends, under the
+/// landing's own). Returns `base` untouched when neither is armed: no
+/// state-flock waiter waits on such a call, and a caller under the rotation guard
+/// counts it per call in `runtime::ROTATION_LOCK_TIMEOUT`'s holder sums. An
+/// exhausted budget clamps to zero, which the
 /// subprocess layer refuses outright rather than spawning: nothing completes in
 /// zero time, and the write path hands its payload to the child before the
 /// deadline is ever checked.
@@ -220,6 +224,88 @@ pub(crate) fn armed_budget_remaining() -> Option<Duration> {
     HOLD_DEADLINE
         .get()
         .map(|d| d.saturating_duration_since(Instant::now()))
+}
+
+/// The point a scope's Keychain calls begin. A test build records here what
+/// the armed window leaves ([`take_keychain_leg_windows`]), so a test pins that
+/// no flock wait or token call before this point spent it; a no-op otherwise.
+fn note_keychain_legs() {
+    #[cfg(test)]
+    KEYCHAIN_LEG_WINDOWS.with(|w| w.borrow_mut().push(armed_budget_remaining()));
+}
+
+/// Run `legs`, a scope's Keychain calls, under one [`SharedSubprocessBudget`]
+/// of `budget` armed at this call, or under the window a wider scope already
+/// armed ([`SharedSubprocessBudget::arm`] adopts it: the daemon tick's window
+/// reaches the landing its switch gate runs). The window is wall-clock from the arm, so
+/// a caller reaches this only once every state-flock wait of its own has
+/// returned, and `legs` takes no flock.
+///
+/// A debug build marks the scope on this thread, and an outermost
+/// [`StateLock`] acquisition asserts none is open, so a flock wait inside the
+/// scope (this call moved up around its caller's own hold, or opened around a
+/// caller that takes one) panics wherever a debug test reaches it. The entry
+/// asserts the converse, no state-flock hold open on this thread, so the scope
+/// opened inside a hold (the `security` calls under the flock) panics too. The
+/// tick-shaped GC sweep and Keychain census arm [`SharedSubprocessBudget::arm`]
+/// directly, not through this helper, and take their per-item holds inside
+/// their window by design, so neither check covers them; a bare
+/// [`SharedSubprocessBudget::arm`] added anywhere else reds the tree-wide site
+/// scan in this module's tests instead; one moved within its file keeps the
+/// count.
+pub(crate) fn with_keychain_budget<T>(budget: Duration, legs: impl FnOnce() -> T) -> T {
+    debug_assert!(
+        DEPTH.get() == 0,
+        "a Keychain budget scope (`lock::with_keychain_budget`) was opened inside a \
+         state-flock hold: its `security` calls would run under the flock every peer \
+         waits on; open the scope after the hold returns"
+    );
+    let _budget = SharedSubprocessBudget::arm(budget);
+    #[cfg(debug_assertions)]
+    let _scope = KeychainScope::open();
+    note_keychain_legs();
+    legs()
+}
+
+// Debug-only per-thread count of open [`with_keychain_budget`] scopes, read by
+// [`StateLock::acquire_with_timeout`]'s entry check.
+#[cfg(debug_assertions)]
+thread_local! {
+    static KEYCHAIN_SCOPES: Cell<u32> = const { Cell::new(0) };
+}
+
+/// One open [`with_keychain_budget`] scope on this thread; closes on drop, a
+/// panic unwind included, so a failed leg leaves no scope behind.
+#[cfg(debug_assertions)]
+struct KeychainScope;
+
+#[cfg(debug_assertions)]
+impl KeychainScope {
+    fn open() -> Self {
+        KEYCHAIN_SCOPES.set(KEYCHAIN_SCOPES.get().saturating_add(1));
+        Self
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for KeychainScope {
+    fn drop(&mut self) {
+        KEYCHAIN_SCOPES.set(KEYCHAIN_SCOPES.get().saturating_sub(1));
+    }
+}
+
+// Test-only per-thread record of [`note_keychain_legs`]: the window each
+// Keychain leg scope on this thread began with, `None` for an unbudgeted one.
+#[cfg(test)]
+thread_local! {
+    static KEYCHAIN_LEG_WINDOWS: std::cell::RefCell<Vec<Option<Duration>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Drain this thread's [`note_keychain_legs`] record, oldest first.
+#[cfg(test)]
+pub(crate) fn take_keychain_leg_windows() -> Vec<Option<Duration>> {
+    KEYCHAIN_LEG_WINDOWS.with(|w| w.take())
 }
 
 // Test-only per-thread counter: increments once per OUTERMOST acquisition, i.e.
@@ -330,6 +416,16 @@ impl StateLock {
                 _armed_budget: false,
             });
         }
+
+        // Before any wait (the thread mutex, then the flock), so a refusal
+        // unwinds with nothing taken.
+        #[cfg(debug_assertions)]
+        debug_assert!(
+            KEYCHAIN_SCOPES.get() == 0,
+            "a state-flock acquisition started inside a Keychain budget scope \
+             (`lock::with_keychain_budget`): its wait spends the window the scope's \
+             `security` calls share, so take the flock before the scope opens"
+        );
 
         // Outermost acquisition: block until we own the thread mutex.
         // `THREAD_LOCK` is `static`, so `.lock()` yields `MutexGuard<'static, _>`
@@ -453,8 +549,8 @@ pub(crate) fn with_state_lock<T>(f: impl FnOnce(&StateLockHeld) -> Result<T>) ->
 /// and disarms nothing on release ([`StateLock`] only clears a budget it armed
 /// itself). The tick also arms via [`SharedSubprocessBudget::arm_clamped`], so
 /// its flock waits spend the same window — a spent window hands the next
-/// acquisition no wait at all. A scope armed via [`arm`](Self::arm) alone (the
-/// macOS GC sweep, the session-seed carry) keeps flock waits at the full
+/// acquisition no wait at all. A scope armed via [`arm`](Self::arm) alone
+/// (each listed in its doc) keeps flock waits at the full
 /// [`STATE_LOCK_TIMEOUT`].
 ///
 /// Arming is ARM-IF-NOT-ARMED, so a guard taken inside an already-budgeted
@@ -475,17 +571,22 @@ impl SharedSubprocessBudget {
     /// Arm a shared budget of `budget`, or adopt the one already armed on
     /// this thread. Flock waits stay at the full [`STATE_LOCK_TIMEOUT`]: a
     /// scope whose shell-outs the budget bounds (the macOS GC sweep, the
-    /// session-seed carry) must not also shrink its own flock wait, which a
-    /// legit slow switch's hold can outlast. Production passes
-    /// [`SUBPROCESS_BUDGET`]; tests pass a short window so the span is
-    /// assertable without real waits.
-    #[cfg_attr(
-        not(target_os = "macos"),
-        allow(
-            dead_code,
-            reason = "its production callers (the macOS GC sweep and session-seed carry) are macOS-gated; the tick arms via arm_clamped"
-        )
-    )]
+    /// Keychain census, a landing's Keychain mirror, a swap's item write or
+    /// sign-out, the convergence's sign-out, the session seed's write or
+    /// sign-out and its retry) must not also shrink
+    /// its own flock wait, which a legit slow switch's hold can outlast.
+    ///
+    /// The window is wall-clock from the arm. A per-item write scope (a
+    /// landing's mirror, a swap's item write or sign-out, the convergence's
+    /// sign-out, the seed's write or sign-out and its retry) therefore arms past
+    /// its flock waits and token calls, never before them
+    /// ([`with_keychain_budget`]). The GC sweep
+    /// (`runtime::gc_stale_runtimes`) and the census
+    /// (`keychain::census_namespaced_items`) are tick-shaped scopes instead:
+    /// each arms once over a whole sweep, before the per-item state-flock
+    /// holds it takes, so those holds' waits spend its window. Production
+    /// passes [`SUBPROCESS_BUDGET`] or a `runtime` budget; tests pass a short
+    /// window so the span is assertable without real waits.
     pub(crate) fn arm(budget: Duration) -> Self {
         let armed_budget = HOLD_DEADLINE.get().is_none();
         if armed_budget {

@@ -595,22 +595,6 @@ impl Profile {
     ) {
         self.credentials.set(credentials, _held);
     }
-
-    /// In-place access to the stored pair for the rotation persist leg, which
-    /// rewrites token fields under the same hold the witness proves.
-    pub(crate) fn credentials_mut(
-        &mut self,
-        _held: &StateLockHeld,
-    ) -> Option<&mut ClaudeCredentials> {
-        #[cfg(not(test))]
-        {
-            self.credentials.0.as_mut()
-        }
-        #[cfg(test)]
-        {
-            self.credentials.as_mut()
-        }
-    }
 }
 
 /// Theme tier stored in `profiles.toml`. Serialized as a lowercase string so
@@ -1840,9 +1824,11 @@ pub(crate) struct ReloadFingerprint {
     /// never shift the fingerprint. The dir walk below already covers a codex
     /// profile's `config.toml`; this is the only codex-specific stat needed.
     codex_toml_mtime: Option<SystemTime>,
-    /// `(profile dir name, config.toml mtime, session-token.json write time)`,
-    /// each `None` when the file is absent, sorted by name so readdir order can't
-    /// spuriously flip equality. The sidecar rides here because a
+    /// `(profile dir name, config.toml mtime, session-token.json write time,
+    /// credentials.json write time)`, each `None` when the file is absent, sorted
+    /// by name so readdir order can't spuriously flip equality. The store rides
+    /// here because a landed rotation writes it and nothing else, and a peer
+    /// holding the old pair in memory must reload it. The sidecar rides here because a
     /// `login --setup-token` re-mint touches nothing else — without it the hot
     /// reload never sees a new/changed long-lived token. Its WRITE time, not its
     /// raw mtime: for a token-mode member that file is the store a swap stamps,
@@ -1857,8 +1843,16 @@ pub(crate) struct ReloadFingerprint {
     /// need content reads on this per-frame path, and the reload it costs is a
     /// milliseconds-scale walk per rolling profile per ~2h — accepted over
     /// giving the fingerprint eyes into credential bytes.
-    config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)>,
+    config_mtimes: Vec<ProfileStamps>,
 }
+
+/// One profile dir's entry in [`ReloadFingerprint::config_mtimes`].
+type ProfileStamps = (
+    String,
+    Option<SystemTime>,
+    Option<SystemTime>,
+    Option<SystemTime>,
+);
 
 /// Filesystem stat of the reload triggers, plus the swap receipt beside a
 /// `session-token.json` that exists — never that file's contents, since this runs
@@ -1867,7 +1861,7 @@ pub(crate) struct ReloadFingerprint {
 /// the empty value instead of erroring.
 pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     let profiles_toml_mtime = app_state_mtime();
-    let mut config_mtimes: Vec<(String, Option<SystemTime>, Option<SystemTime>)> = Vec::new();
+    let mut config_mtimes: Vec<ProfileStamps> = Vec::new();
     if let Ok(root) = profiles_root()
         && let Ok(entries) = std::fs::read_dir(&root)
     {
@@ -1882,7 +1876,9 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
             let token = crate::profile_cache::effective_write_time(
                 &entry.path().join("session-token.json"),
             );
-            config_mtimes.push((name, config_mtime, token));
+            let store =
+                crate::profile_cache::effective_write_time(&entry.path().join("credentials.json"));
+            config_mtimes.push((name, config_mtime, token, store));
         }
     }
     config_mtimes.sort();
@@ -2500,8 +2496,9 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
 /// Residual (name-keyed, deliberate): this answers "is a profile by this name
 /// on disk", which cannot tell "still present" from "deleted, then re-logged-in
 /// under the same name". A stale-chain gate consulting it can therefore act on
-/// the NEW same-name account (e.g. a rotation/adopt persisting a pair minted
-/// from the old chain). Only a full [`reload_fingerprint`] drift check closes
+/// the NEW same-name account (e.g. an adopt persisting a pair from the old
+/// chain; the rotation persist refuses a store its chain does not own, so it
+/// never lands there). Only a full [`reload_fingerprint`] drift check closes
 /// that, and no caller has needed the extra read; treat it as a documented
 /// boundary, not an oversight.
 pub(crate) fn is_configured(name: &ProfileName) -> Result<bool> {
@@ -3198,7 +3195,8 @@ fn usage_cache_is_third_party(
 /// OAuth cache, whose absence renders `unknown` — the honest reading when clauth
 /// cannot classify.
 ///
-/// Deliberately NOT `load_profile(name)`: that path recovers a staged rotation,
+/// Deliberately NOT `load_profile(name)`: that path recovers a legacy `.pending`
+/// rotation sidecar,
 /// which takes the cross-process state flock and rewrites `credentials.json`. A
 /// caller holding a leaf lock (the MCP digest samples at 5 Hz under
 /// `rank::McpDigest`) would invert the lock order, and no caller asking a
@@ -3381,7 +3379,8 @@ pub(crate) fn load_profile(name: &ProfileName) -> Result<Profile> {
     } else {
         None
     };
-    // Adopt a staged rotation that never committed (crash/failed write between OAuth response and save).
+    // A live `.staged` pair loads in place of the store; a legacy `.pending` that
+    // never committed is adopted.
     let credentials = recover_pending_credentials(name, credentials);
 
     let base_url = effective_base_url(
@@ -3553,8 +3552,9 @@ pub(crate) fn preserve_extra_blocks(
 }
 
 /// The profile's stored claude OAuth access token, read from `credentials.json`
-/// directly — never [`load_profile`] (its pending-recovery write-through would
-/// adopt a staged rotation's pair as if committed). `None` on an absent or
+/// directly — never [`load_profile`] (it hands back a live stage's pair, and its
+/// legacy `.pending` write-through adopts a pre-fix rotation's pair as if
+/// committed). `None` on an absent or
 /// unparseable store or a login-less chain. The `/profile` read calls this once
 /// at request time, outside the state flock; its caller then re-checks the sent
 /// token inside the flock ([`stored_token_matches`]).
@@ -3608,7 +3608,7 @@ pub(crate) fn login_changed(
 /// the exact token that fetched it, and a re-login or a concurrent rotation
 /// changes that token.
 ///
-/// Stands down while a staged rotation sidecar exists: writing the
+/// Stands down while a legacy `.pending` rotation sidecar exists: writing the
 /// pre-rotation pair would move `credentials.json` past the sidecar and get
 /// the minted pair discarded by [`recover_pending_credentials`]. The write is
 /// the credentials file alone — a background leg never rewrites `config.toml`
@@ -3618,7 +3618,7 @@ pub(crate) fn login_changed(
 /// uses for its own write-through.
 ///
 /// `Ok(true)` = stamped now; `Ok(false)` = nothing to write (off-roster, a
-/// staged sidecar, no store, no chain, or an already-stamped tier); `Err` =
+/// legacy `.pending` sidecar, no store, no chain, or an already-stamped tier); `Err` =
 /// could not read or persist. The caller holds the state flock and has already
 /// run the stored-token check (the `/profile` read's two ride-alongs share ONE
 /// hold and ONE check).
@@ -3670,44 +3670,68 @@ pub(crate) fn stamp_rate_limit_tier_if_missing(
     })
 }
 
+/// The whole-profile save: the credential store, then `config.toml`. Only a
+/// caller that sets or blanks the login (an install, a capture, an adopt, a
+/// clear) saves through here; a settings edit saves [`save_profile_config`],
+/// because an in-memory pair can lag a rotation another process landed and
+/// writing it back rewinds the store to a spent token.
 pub(crate) fn save_profile(profile: &Profile) -> Result<()> {
-    with_state_lock(|_held| {
+    with_state_lock(|held| {
         mkdir_700(&profile_dir(&profile.name)?)?;
-
         // credentials.json BEFORE config.toml: single-use refresh token must
         // not be lost to a config.toml write failure.
-        let cred_path = profile_credentials_path(&profile.name)?;
-        match profile.credentials.as_ref() {
-            Some(creds) => {
-                let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
-                atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
-                // This profile has a store again, so whatever it parked when it
-                // last lost one goes back where every reader looks for it.
-                crate::claude::restore_parked_mcp_logins(&profile.name, &cred_path);
-            }
-            None if cred_path.exists() => {
-                // Read the MCP-server logins out before the only file carrying
-                // them goes. This is the chokepoint rather than each caller
-                // because every path that stops a profile storing a login lands
-                // here: a recapture onto a third-party endpoint, and blanking an
-                // OAuth login both do.
-                crate::claude::park_mcp_logins_from_store(&profile.name, &cred_path);
-                std::fs::remove_file(&cred_path).context("failed to remove credentials.json")?;
-            }
-            None => {}
-        }
-
-        atomic_write_600(
-            &profile_config_path(&profile.name)?,
-            preserving_config_render(
-                &render_config_toml(profile),
-                &profile_config_path(&profile.name)?,
-            ),
-        )
-        .context("failed to write config.toml")?;
-
-        Ok(())
+        write_profile_credentials(&profile.name, profile.credentials.as_ref(), held)?;
+        write_profile_config(profile)
     })
+}
+
+/// The config leg of [`save_profile`] alone: `config.toml`, never the store.
+pub(crate) fn save_profile_config(profile: &Profile) -> Result<()> {
+    with_state_lock(|_held| {
+        mkdir_700(&profile_dir(&profile.name)?)?;
+        write_profile_config(profile)
+    })
+}
+
+fn write_profile_config(profile: &Profile) -> Result<()> {
+    let config_path = profile_config_path(&profile.name)?;
+    atomic_write_600(
+        &config_path,
+        preserving_config_render(&render_config_toml(profile), &config_path),
+    )
+    .context("failed to write config.toml")
+}
+
+/// The credential leg every store writer shares: `Some` writes the login
+/// through the preserving serializer, so `mcpOAuth` and every other top-level
+/// block the store holds survive, and restores whatever MCP logins the profile
+/// parked; `None` parks those logins and removes the store.
+pub(crate) fn write_profile_credentials(
+    name: &ProfileName,
+    credentials: Option<&ClaudeCredentials>,
+    _held: &StateLockHeld,
+) -> Result<()> {
+    let cred_path = profile_credentials_path(name)?;
+    match credentials {
+        Some(creds) => {
+            let bytes = serialize_credentials_preserving_extra(creds, &cred_path)?;
+            atomic_write_600(&cred_path, bytes).context("failed to write credentials.json")?;
+            // This profile has a store again, so whatever it parked when it
+            // last lost one goes back where every reader looks for it.
+            crate::claude::restore_parked_mcp_logins(name, &cred_path);
+        }
+        None if cred_path.exists() => {
+            // Read the MCP-server logins out before the only file carrying
+            // them goes. This is the chokepoint rather than each caller
+            // because every path that stops a profile storing a login lands
+            // here: a recapture onto a third-party endpoint, and blanking an
+            // OAuth login both do.
+            crate::claude::park_mcp_logins_from_store(name, &cred_path);
+            std::fs::remove_file(&cred_path).context("failed to remove credentials.json")?;
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 /// `render_config_toml`'s output with every key the config already holds that
@@ -3783,9 +3807,10 @@ fn modelled_config_shape(raw: &str) -> std::result::Result<ModelledShape, ()> {
         .ok_or(())
 }
 
-/// Write rotated credentials to a sidecar BEFORE `save_profile`. Single-use
-/// refresh tokens can't be lost to a crash mid-save; `load_profile` adopts
-/// this sidecar on next start if the commit never landed.
+/// Write a legacy `credentials.json.pending` sidecar the way a binary predating
+/// `credentials.json.staged` did: the fixture for the legacy load branch, which
+/// production no longer writes.
+#[cfg(test)]
 pub(crate) fn stage_rotated_credentials(
     name: &ProfileName,
     creds: &ClaudeCredentials,
@@ -3806,59 +3831,83 @@ pub(crate) fn clear_staged_credentials(name: &ProfileName) {
     }
 }
 
-/// Adopt the rotation sidecar when it's at least as new as `credentials.json`
-/// (commit failed or process died mid-save). A stale sidecar is discarded.
+/// What `load_profile` reads as the profile's credentials, given the store's
+/// raw `loaded` value. A live `credentials.json.staged` (a rotation whose
+/// persist never landed, `oauth::live_stage_credentials`) is the chain head
+/// and loads into memory only: read lock-free, never written through, never
+/// deleted, since a loader deciding outside the rotation guard raced installs
+/// and refused the rotation's own persist. A legacy `credentials.json.pending`
+/// from an older binary keeps its mtime rule.
 fn recover_pending_credentials(
     name: &ProfileName,
     loaded: Option<ClaudeCredentials>,
 ) -> Option<ClaudeCredentials> {
-    let Ok(pending_path) = profile_credentials_pending_path(name) else {
+    if let Some(staged) = crate::oauth::live_stage_credentials(name, loaded.as_ref()) {
+        return Some(staged);
+    }
+    let (Ok(pending_path), Ok(cred_path)) = (
+        profile_credentials_pending_path(name),
+        profile_credentials_path(name),
+    ) else {
         return loaded;
     };
-    let Ok(pending_meta) = pending_path.symlink_metadata() else {
+    if pending_path.symlink_metadata().is_err() {
         return loaded; // no sidecar — the common case
-    };
-    let recovered = (|| -> Option<ClaudeCredentials> {
-        let bytes = std::fs::read(&pending_path).ok()?;
-        let pending: ClaudeCredentials = serde_json::from_slice(&bytes).ok()?;
-        pending.claude_ai_oauth.as_ref()?; // must carry an oauth block to matter
-        let cred_path = profile_credentials_path(name).ok()?;
-        // Clean success → credentials.json strictly newer → discard.
-        // Failed/interrupted commit → sidecar newer, tied, or no
-        // credentials.json at all → adopt. A tie means staging and committing
-        // landed in one mtime tick; of the two ways to be wrong, dropping a
-        // rotation that may never have landed is the unrecoverable one.
-        //
-        // The committed side's WRITE time, not its raw mtime: a per-session swap
-        // stamps a store it repoints to without writing it, and reading that
-        // stamp as a commit discards a sidecar staged moments earlier.
-        let adopt = match crate::profile_cache::effective_write_time(&cred_path) {
-            Some(cred_mtime) => pending_meta
-                .modified()
-                .map(|p| p >= cred_mtime)
-                .unwrap_or(true),
-            None => true,
-        };
-        if !adopt {
-            return None;
+    }
+    // A sidecar the rule already discards goes lock-free, as it always did: a
+    // stale one must not make every load of this profile wait on the flock.
+    if adoptable_pending(&pending_path, &cred_path).is_none() {
+        let _ = std::fs::remove_file(&pending_path);
+        return loaded;
+    }
+    // The rule is re-decided inside the flock, and the sidecar goes only once
+    // the write-through it justified has landed in that same hold: a sidecar
+    // deleted beside a write that never happened loses the only live pair.
+    let landed = with_state_lock(|_held| {
+        let adopted = adoptable_pending(&pending_path, &cred_path);
+        if let Some(pending) = &adopted {
+            // Through the preserving serializer, not the staged bytes: staging
+            // holds the rotated login alone, so writing it raw would drop every
+            // non-login block the store carries.
+            let body = serialize_credentials_preserving_extra(pending, &cred_path)?;
+            atomic_write_600(&cred_path, body).context("failed to write credentials.json")?;
         }
-        // Through the preserving serializer, not the staged bytes: staging holds
-        // the rotated login alone, so writing it raw would drop every non-login
-        // block the store carries. One of the writes that reach the store
-        // without going through `save_profile`. Of the others, the tier
-        // backfill above (through its own pending check) and the non-login-key
-        // syncs in `claude.rs` (through `rotation_staged_beside`) stand down
-        // while a rotation is staged; the MCP-login carry, the restore of
-        // parked MCP logins, the `clauth start` watchdog's adopt and the macOS
-        // session-item carry predate that and write without it.
-        let _ = with_state_lock(|_held| {
-            let body = serialize_credentials_preserving_extra(&pending, &cred_path)?;
-            atomic_write_600(&cred_path, body).map_err(Into::into)
-        });
-        Some(pending)
-    })();
-    let _ = std::fs::remove_file(&pending_path);
-    recovered.or(loaded)
+        let _ = std::fs::remove_file(&pending_path);
+        Ok(adopted)
+    });
+    match landed {
+        Ok(adopted) => adopted.or(loaded),
+        // No hold, or a write-through that failed: the sidecar stays for a
+        // later load to land, and this load still answers with the pair the
+        // rule judges live.
+        Err(_) => adoptable_pending(&pending_path, &cred_path).or(loaded),
+    }
+}
+
+/// The legacy sidecar's login when it is at least as new as the store (a
+/// commit that failed or a process that died mid-save), else `None` (no login
+/// in it, or a clean commit superseded it).
+///
+/// Clean success → credentials.json strictly newer → discard. Failed or
+/// interrupted commit → sidecar newer, tied, or no credentials.json at all →
+/// adopt. A tie means staging and committing landed in one mtime tick; of the
+/// two ways to be wrong, dropping a rotation that may never have landed is the
+/// unrecoverable one. The committed side's WRITE time, not its raw mtime: a
+/// per-session swap stamps a store it repoints to without writing it, and
+/// reading that stamp as a commit discards a sidecar staged moments earlier.
+fn adoptable_pending(pending_path: &Path, cred_path: &Path) -> Option<ClaudeCredentials> {
+    let pending_meta = pending_path.symlink_metadata().ok()?;
+    let pending: ClaudeCredentials =
+        serde_json::from_slice(&std::fs::read(pending_path).ok()?).ok()?;
+    pending.claude_ai_oauth.as_ref()?;
+    let adopt = match crate::profile_cache::effective_write_time(cred_path) {
+        Some(cred_mtime) => pending_meta
+            .modified()
+            .map(|p| p >= cred_mtime)
+            .unwrap_or(true),
+        None => true,
+    };
+    adopt.then_some(pending)
 }
 
 pub(crate) fn load_config() -> Result<AppConfig> {

@@ -10,6 +10,30 @@ use crate::lockorder::RankedMutex;
 use crate::profile::{AppState, ClaudeCredentials, OAuthToken, Profile, profile_dir};
 use crate::usage::is_idle;
 
+/// The rotation persist as a spend site drives it, for a test holding a bare
+/// `TokenResponse`: the store's own login with `tok` written in, persisted as
+/// minted from the refresh token the store holds.
+fn persist_rotation(
+    handle: &crate::profile::ConfigHandle,
+    name: &crate::profile::ProfileName,
+    tok: TokenResponse,
+) -> anyhow::Result<()> {
+    let store = read_raw_store(name)?;
+    let sent = store
+        .as_ref()
+        .and_then(ClaudeCredentials::refresh_token)
+        .unwrap_or_default()
+        .to_string();
+    let old_access = store
+        .as_ref()
+        .and_then(ClaudeCredentials::access_token)
+        .unwrap_or_default()
+        .to_string();
+    let creds = minted_credentials(store, tok);
+    apply_rotated_tokens_locked(handle, name, &token_fingerprint(&sent), &creds, &old_access)
+        .map_err(PersistError::into_error)
+}
+
 /// Read an ENTIRE HTTP request (headers + any `Content-Length` body) off a
 /// loopback socket before the caller writes its response. On Windows a
 /// `close()` with unread bytes still in the recv buffer emits an abortive RST
@@ -515,11 +539,9 @@ fn gate_refreshes_an_expiring_token_under_a_live_session() {
     let home = HomeSandbox::new();
     let name = "test-gate-live-session";
     let file = crate::testutil::arm_live_session(home.home(), name);
-    let handle = Arc::new(RankedMutex::new(oauth_config(
-        name,
-        Some("rt-old"),
-        Some(past_expiry()),
-    )));
+    let config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save the store");
+    let handle = Arc::new(RankedMutex::new(config));
     let refresher = |_rt: &str, _scopes: Option<&str>| {
         Ok(TokenResponse {
             access_token: "at-new".to_string(),
@@ -612,11 +634,9 @@ fn gate_installs_as_is_under_a_forced_live_session() {
 fn gate_refreshes_expiring_token_and_installs() {
     let _home = HomeSandbox::new();
     let name = "test-gate-refreshable";
-    let handle = Arc::new(RankedMutex::new(oauth_config(
-        name,
-        Some("rt-old"),
-        Some(past_expiry()),
-    )));
+    let config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save the store");
+    let handle = Arc::new(RankedMutex::new(config));
     let refresher = |_rt: &str, _scopes: Option<&str>| {
         Ok(TokenResponse {
             access_token: "at-new".to_string(),
@@ -660,8 +680,12 @@ fn gate_invalid_refresh_marks_broken_and_refuses() {
         Some("rt-revoked"),
         Some(past_expiry()),
     )));
-    let refresher =
-        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Invalid {
+            failure: TokenFailure::Status(400),
+            invalid_grant: true,
+        })
+    };
     assert!(matches!(
         ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Broken
@@ -734,6 +758,7 @@ fn gate_flagged_profile_refreshes_despite_a_valid_clock() {
     let name = "test-gate-flagged-recovers";
     let mut config = oauth_config(name, Some("rt-relogin"), Some(future_expiry()));
     config.set_auth_broken(&crate::profile::ProfileName::from(name), true);
+    crate::profile::save_profile(&config.profiles[0]).expect("save the store");
     let handle = Arc::new(RankedMutex::new(config));
     let refresher = |_rt: &str, _scopes: Option<&str>| {
         Ok(TokenResponse {
@@ -768,8 +793,12 @@ fn gate_flagged_profile_with_a_dead_chain_stays_broken() {
     let mut config = oauth_config(name, Some("rt-revoked"), Some(future_expiry()));
     config.set_auth_broken(&crate::profile::ProfileName::from(name), true);
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher =
-        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Invalid {
+            failure: TokenFailure::Status(400),
+            invalid_grant: true,
+        })
+    };
     assert!(matches!(
         ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Broken
@@ -1143,6 +1172,38 @@ mod adopt_live_rotation {
         );
         assert_eq!(adopted, None);
         assert_eq!(stored_access(&handle, name), "at-old");
+    }
+
+    /// Memory holds P1, the live slot a later-expiring P2 whose refresh token
+    /// the record names spent (fp("at-mirror-refresh"), hand-computed: the
+    /// first 8 bytes of its SHA-256, hex), and the store the landed P3. The
+    /// adopt refuses: a spent live pair never rewinds the store.
+    #[test]
+    fn refuses_a_live_pair_whose_refresh_token_is_spent() {
+        let _home = HomeSandbox::new();
+        let name = "adopt-spent-live";
+        let handle = setup(name, future_expiry(), future_expiry() + 3_600_000);
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+            .expect("profile dir");
+        std::fs::write(
+            dir.join("credentials.json"),
+            serde_json::to_vec(&creds_with("at-p3", Some(future_expiry() + 7_200_000)))
+                .expect("serialize P3"),
+        )
+        .expect("land P3");
+        std::fs::write(dir.join("auth.spent.json"), r#"["141ccd5b485cec0b"]"#).expect("record P2");
+
+        let adopted = try_adopt_live_rotation(
+            &handle,
+            &crate::profile::ProfileName::from(name),
+            &guard(name),
+            &|_| Some("uuid-1".into()),
+        );
+
+        assert_eq!(adopted, None);
+        let store: crate::profile::ClaudeCredentials =
+            crate::profile::read_json_file(&dir.join("credentials.json")).expect("read store");
+        assert_eq!(store.refresh_token(), Some("at-p3-refresh"));
     }
 
     #[test]
@@ -2249,11 +2310,9 @@ fn the_install_grace_is_ccs_refresh_window_shared_with_the_backup_verdicts() {
 fn gate_under_guard_spends_the_currently_stored_refresh_token() {
     let _home = HomeSandbox::new();
     let name = "test-gate-current-rt";
-    let handle = Arc::new(RankedMutex::new(oauth_config(
-        name,
-        Some("rt-current"),
-        Some(past_expiry()),
-    )));
+    let config = oauth_config(name, Some("rt-current"), Some(past_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save the store");
+    let handle = Arc::new(RankedMutex::new(config));
     let refresher = |rt: &str, _scopes: Option<&str>| {
         assert_eq!(
             rt, "rt-current",
@@ -3178,8 +3237,7 @@ fn the_kick_reserves_the_shared_anthropic_request_slot() {
 
 /// A rotation whose persist fails still hands the minted pair back: the refresh
 /// already spent the old single-use token, so dropping the new one leaves the
-/// caller's snapshot on a dead token that 400s every tick until a restart adopts
-/// the staged sidecar. `opened` stays false — the retry kick never runs — and
+/// caller's snapshot on a dead token that 400s every tick. `opened` stays false — the retry kick never runs — and
 /// that is exactly why `KickResult` sets `rotated` independently of it.
 #[cfg(not(target_os = "macos"))]
 #[test]
@@ -3217,16 +3275,16 @@ fn a_kick_rotation_carries_its_pair_back_when_the_persist_fails() {
         seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
         "the leg must actually rotate before the persist can fail: {seen:?}"
     );
-    // Proof the fixture failed the persist where it claims to: the crash-durable
-    // sidecar is only cleared after a committed save.
-    let pending = crate::profile::profile_subpath(
-        &crate::profile::ProfileName::from(name),
-        "credentials.json.pending",
-    )
-    .expect("pending path");
+    // Proof the fixture failed the persist where it claims to: the store is
+    // still the directory the fixture put in its place, so nothing landed.
     assert!(
-        pending.is_file(),
-        "the staged sidecar must survive, or the save never failed"
+        crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "credentials.json"
+        )
+        .expect("store path")
+        .is_dir(),
+        "the blocked store must be untouched, or the save never failed"
     );
     assert_eq!(
         result.rotated,
@@ -4253,8 +4311,12 @@ fn rolling_gate_dead_chain_restores_static_mint() {
     )
     .expect("feed");
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher =
-        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Invalid {
+            failure: TokenFailure::Status(400),
+            invalid_grant: true,
+        })
+    };
     assert!(matches!(
         ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Ready
@@ -4288,8 +4350,12 @@ fn rolling_gate_dead_chain_without_backup_stays_broken() {
     )
     .expect("feed");
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher =
-        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Invalid {
+            failure: TokenFailure::Status(400),
+            invalid_grant: true,
+        })
+    };
     assert!(matches!(
         ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
         AuthGate::Broken
@@ -4312,7 +4378,7 @@ fn rotation_hook_stamps_enabled_profiles_and_preserves_the_mint() {
     )
     .expect("mint");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -4365,7 +4431,7 @@ fn rotation_hook_disk_disarm_stops_the_stamp() {
     // lock the clear serializes on.
     let _guard =
         RotationGuard::acquire(&crate::profile::ProfileName::from(name)).expect("rotation guard");
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -4403,7 +4469,7 @@ fn rotation_hook_leaves_non_rolling_split_sidecars_alone() {
     )
     .expect("mint");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -4443,7 +4509,7 @@ fn rotation_hook_never_overwrites_a_misfilled_sidecar() {
     )
     .expect("write misfill");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -4613,6 +4679,48 @@ fn rolling_gate_misfill_without_backup_keeps_the_disengaged_vanilla_posture() {
         source.ends_with("credentials.json"),
         "no backup to degrade to — disengaged split behaves as vanilla"
     );
+}
+
+/// The daemon main loop's switch gate never parks on the rolling guard, yet
+/// keeps the switch paths' install arms: the same mis-fill installs through the
+/// plain gate rather than answering the re-stamp leg's mis-fill refusal.
+#[test]
+fn the_main_loop_gate_keeps_the_disengaged_vanilla_posture_on_a_misfill() {
+    let _home = HomeSandbox::new();
+    let name = "test-feed-misfill-main-loop";
+    let config = rolling_config(name, Some("rt-good"), Some(future_expiry()));
+    crate::profile::save_profile(&config.profiles[0]).expect("save profile");
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    std::fs::write(
+        dir.join("session-token.json"),
+        serde_json::to_vec(&ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at-misfill".to_string(),
+                refresh_token: Some("rt-misfill".to_string()),
+                expires_at: Some(future_expiry()),
+                scopes: None,
+                subscription_type: None,
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        })
+        .expect("ser"),
+    )
+    .expect("misfill");
+    let handle = Arc::new(RankedMutex::new(config));
+
+    let gate = ensure_installable_from_main_loop(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        never_refresh,
+    );
+
+    let verdict = match gate {
+        AuthGate::Transient(t) => t.text(),
+        AuthGate::Ready => "Ready".to_string(),
+        AuthGate::Refreshed => "Refreshed".to_string(),
+        AuthGate::Broken => "Broken".to_string(),
+    };
+    assert_eq!(verdict, "Ready");
 }
 
 // ---------------------------------------------------------------------------
@@ -4978,8 +5086,12 @@ fn rolling_gate_dead_chain_with_expired_backup_stays_broken() {
     )
     .expect("stamp");
     let handle = Arc::new(RankedMutex::new(config));
-    let refresher =
-        |_rt: &str, _scopes: Option<&str>| Err(RefreshError::Invalid(TokenFailure::Status(400)));
+    let refresher = |_rt: &str, _scopes: Option<&str>| {
+        Err(RefreshError::Invalid {
+            failure: TokenFailure::Status(400),
+            invalid_grant: true,
+        })
+    };
     assert!(
         matches!(
             ensure_installable(&handle, &crate::profile::ProfileName::from(name), refresher),
@@ -5279,7 +5391,7 @@ fn rotated_tokens_do_not_resurrect_a_deleted_profile() {
         scope: None,
     };
     assert!(
-        apply_rotated_tokens_locked(&stale, &crate::profile::ProfileName::from(name), tok).is_err(),
+        persist_rotation(&stale, &crate::profile::ProfileName::from(name), tok).is_err(),
         "a persist to a deleted profile must refuse"
     );
     assert!(
@@ -5914,7 +6026,7 @@ fn a_rotation_keeps_a_design_login_the_live_file_held() {
     std::fs::rename(&staged, &live_path).expect("Claude Code's rename over the link");
     let handle = Arc::new(RankedMutex::new(config));
 
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &profile,
         TokenResponse {
@@ -5960,7 +6072,7 @@ fn a_rotation_never_puts_an_older_live_copy_over_the_stores() {
     std::fs::rename(&staged, &live_path).expect("Claude Code's rename over the link");
     let handle = Arc::new(RankedMutex::new(config));
 
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &profile,
         TokenResponse {
@@ -6156,6 +6268,7 @@ fn repro_104_rotation_follows_a_regular_file_live_slot_for_a_rolling_profile() {
     let name = "test-repro-104-hook-rolling";
     let mut config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
     config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
     let chain = config.profiles[0]
         .credentials
@@ -6172,7 +6285,7 @@ fn repro_104_rotation_follows_a_regular_file_live_slot_for_a_rolling_profile() {
     let live = live_file_fixture(fed_bearer("at-old"));
     std::fs::write(&live_path, serde_json::to_vec(&live).expect("ser")).expect("write live");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -6206,6 +6319,7 @@ fn repro_104_rotation_follows_a_regular_file_live_slot_for_a_vanilla_profile() {
     let name = "test-repro-104-hook-vanilla";
     let mut config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
     config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
     let claude_dir = crate::profile::claude_dir().expect("claude dir");
     std::fs::create_dir_all(&claude_dir).expect("mkdir");
@@ -6220,7 +6334,7 @@ fn repro_104_rotation_follows_a_regular_file_live_slot_for_a_vanilla_profile() {
     });
     std::fs::write(&live_path, serde_json::to_vec(&live).expect("ser")).expect("write live");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -6252,6 +6366,7 @@ fn repro_104_rotation_leaves_a_static_mint_live_file_byte_identical() {
     let name = "test-repro-104-hook-static";
     let mut config = oauth_config(name, Some("rt-old"), Some(past_expiry()));
     config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
     crate::claude::write_session_token(
         &crate::profile::ProfileName::from(name),
@@ -6273,7 +6388,7 @@ fn repro_104_rotation_leaves_a_static_mint_live_file_byte_identical() {
     let live_bytes = serde_json::to_vec(&live).expect("ser");
     std::fs::write(&live_path, &live_bytes).expect("write live");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -6313,7 +6428,7 @@ fn repro_104_rotation_skips_a_parked_profile() {
     let live = live_file_fixture(fed_bearer("at-old"));
     std::fs::write(&live_path, serde_json::to_vec(&live).expect("ser")).expect("write live");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -6340,6 +6455,7 @@ fn repro_104_rotation_leaves_a_foreign_live_login_alone() {
     let name = "test-repro-104-hook-foreign";
     let mut config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
     config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
     let chain = config.profiles[0]
         .credentials
@@ -6357,7 +6473,7 @@ fn repro_104_rotation_leaves_a_foreign_live_login_alone() {
     live["claudeAiOauth"]["refreshToken"] = serde_json::Value::String("rt-foreign".into());
     std::fs::write(&live_path, serde_json::to_vec(&live).expect("ser")).expect("write live");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -6385,6 +6501,7 @@ fn repro_104_arming_rotation_follows_the_old_pair_live_file() {
     let name = "test-repro-104-hook-arming";
     let mut config = rolling_config(name, Some("rt-old"), Some(past_expiry()));
     config.state.active_profile = Some(crate::profile::ProfileName::from(name));
+    crate::profile::save_app_state(&config.state).expect("persist the active marker");
     crate::profile::save_profile(&config.profiles[0]).expect("save profile");
     let claude_dir = crate::profile::claude_dir().expect("claude dir");
     std::fs::create_dir_all(&claude_dir).expect("mkdir");
@@ -6399,7 +6516,7 @@ fn repro_104_arming_rotation_follows_the_old_pair_live_file() {
     });
     std::fs::write(&live_path, serde_json::to_vec(&live).expect("ser")).expect("write live");
     let handle = Arc::new(RankedMutex::new(config));
-    apply_rotated_tokens_locked(
+    persist_rotation(
         &handle,
         &crate::profile::ProfileName::from(name),
         TokenResponse {
@@ -6421,4 +6538,1387 @@ fn repro_104_arming_rotation_follows_the_old_pair_live_file() {
         "the arming rotation installs the refreshless projection"
     );
     assert!(raw.get("mcpOAuth").is_some(), "blocks survive the follow");
+}
+
+// ── the refresh chain: the rotation persist refuses a store it does not own ──
+
+const MINTED_BODY: &str =
+    r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#;
+
+fn store_path(name: &str) -> std::path::PathBuf {
+    profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json")
+}
+
+/// Another writer's login landing in the store, as raw bytes.
+fn write_store_pair(name: &str, access: &str, refresh: &str) {
+    std::fs::write(
+        store_path(name),
+        format!(r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}"}}}}"#),
+    )
+    .expect("write the store");
+}
+
+/// The store's refresh token read raw, `None` for an absent file or login.
+fn stored_refresh(name: &str) -> Option<String> {
+    let bytes = match std::fs::read(store_path(name)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => panic!("read the store: {e}"),
+    };
+    let creds: ClaudeCredentials = serde_json::from_slice(&bytes).expect("parse the store");
+    creds.refresh_token().map(str::to_string)
+}
+
+fn memory_refresh(config: &crate::profile::ConfigHandle, name: &str) -> Option<String> {
+    #[allow(clippy::expect_used, reason = "test")]
+    let cfg = config.lock().expect("config lock");
+    cfg.find(&crate::profile::ProfileName::from(name))
+        .and_then(|p| p.refresh_token().map(str::to_string))
+}
+
+fn stage_path(name: &str) -> std::path::PathBuf {
+    profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("credentials.json.staged")
+}
+
+/// The stage a failed persist of the fixture's `rt-old` rotation leaves: its base
+/// is the hand-computed first 8 bytes of SHA-256("rt-old"), hex, and its pair the
+/// one that rotation minted.
+fn write_live_stage_over_rt_old(name: &str) {
+    std::fs::write(
+        stage_path(name),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+}
+
+/// A save error left a live stage, then a foreign login landed in the store.
+/// The manual rotate spends its in-memory token and mints a pair, but the store
+/// is no longer this chain's: the persist refuses, the foreign login survives,
+/// the stage goes, and memory follows the store.
+#[test]
+fn a_rotate_persist_refuses_a_foreign_login_over_a_live_stage() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "stage-foreign-rotate";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| (200, MINTED_BODY.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    write_live_stage_over_rt_old(name);
+    write_store_pair(name, "at-foreign", "rt-foreign");
+    let (tx, _rx) = mpsc::channel();
+
+    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string()],
+        "the rotation must reach the token endpoint before its persist decides"
+    );
+    assert_eq!(
+        stored_refresh(name).as_deref(),
+        Some("rt-foreign"),
+        "the foreign login survives the refused persist"
+    );
+    assert!(!stage_path(name).exists(), "the refusal deletes the stage");
+    assert_eq!(
+        memory_refresh(&config, name).as_deref(),
+        Some("rt-foreign"),
+        "memory adopts the store's login under the refusal's hold"
+    );
+    assert!(matches!(result, RotateOutcome::Persisted(false)));
+}
+
+/// The kick's rotation over the same state: the persist refuses, and the pair
+/// the kick hands back is the STORE's, so the caller's token list follows the
+/// store rather than a minted pair nothing persisted.
+#[test]
+fn a_kick_persist_refuses_a_foreign_login_over_a_live_stage() {
+    let home = HomeSandbox::new();
+    let name = "stage-foreign-kick";
+    let (base, server) = crate::testutil::serve_endpoints(5, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (200, MINTED_BODY.to_string())
+        } else {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    write_live_stage_over_rt_old(name);
+    write_store_pair(name, "at-foreign", "rt-foreign");
+
+    let result = auto_start_kick(
+        &config,
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        Some("rt-old"),
+        None,
+        None,
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the kick must rotate before its persist decides: {seen:?}"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-foreign"));
+    assert!(!stage_path(name).exists(), "the refusal deletes the stage");
+    assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-foreign"));
+    assert_eq!(
+        result.rotated,
+        Some(("at-foreign".to_string(), Some("rt-foreign".to_string()))),
+        "a refused persist carries the store's pair, never the minted one"
+    );
+    assert!(!result.opened, "the refusal returns before the retry kick");
+}
+
+/// `clauth login` re-logs the account while a rotation holding a stale
+/// in-memory pair is mid-flight: the rotation's persist must not write the
+/// minted pair over the re-login.
+#[test]
+fn a_relogin_during_a_rotation_survives_the_rotations_persist() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "relogin-mid-rotation";
+    let (base, server) = crate::testutil::serve_endpoints(3, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::overwrite_captured_profile(
+                &mut cfg,
+                &crate::profile::ProfileName::from(name),
+                crate::actions::CaptureSnapshot {
+                    credentials: Some(ClaudeCredentials {
+                        claude_ai_oauth: Some(OAuthToken {
+                            access_token: "at-relogin".to_string(),
+                            refresh_token: Some("rt-relogin".to_string()),
+                            expires_at: None,
+                            scopes: None,
+                            subscription_type: None,
+                            ..OAuthToken::default_extra()
+                        }),
+                    }),
+                    base_url: None,
+                    api_key: None,
+                    anchor: crate::actions::AnchorAction::Unproven,
+                },
+            )
+            .expect("install the re-login");
+        }
+        (200, MINTED_BODY.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let (tx, _rx) = mpsc::channel();
+
+    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert_eq!(
+        stored_refresh(name).as_deref(),
+        Some("rt-relogin"),
+        "the re-login is on disk after the rotation"
+    );
+}
+
+/// A logout lands while a rotation's token call is in flight: the persist
+/// refuses rather than write the minted pair back into the cleared profile.
+#[test]
+fn a_logout_during_a_rotation_stays_logged_out() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "logout-mid-rotation";
+    let (base, server) = crate::testutil::serve_endpoints(3, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::clear_profile_credentials(
+                &mut cfg,
+                &crate::profile::ProfileName::from(name),
+            )
+            .expect("blank the login");
+        }
+        (200, MINTED_BODY.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let (tx, _rx) = mpsc::channel();
+
+    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert!(
+        !store_path(name).exists(),
+        "the cleared login stays absent after the rotation's persist"
+    );
+}
+
+fn spent_record_path(name: &str) -> std::path::PathBuf {
+    profile_dir(&crate::profile::ProfileName::from(name))
+        .expect("profile dir")
+        .join("auth.spent.json")
+}
+
+/// A transient answer (the endpoint never confirmed anything) records nothing,
+/// so the next attempt sends the same token: a network blip stays harmless.
+#[test]
+fn a_transient_refresh_answer_records_nothing() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "spent-transient";
+    let (base, server) = crate::testutil::serve_endpoints_recording(4, |_, _| {
+        (503, r#"{"error":"overloaded"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let (tx, _rx) = mpsc::channel();
+
+    let first = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let second = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert!(matches!(first, RotateOutcome::Persisted(false)));
+    assert!(matches!(second, RotateOutcome::Persisted(false)));
+    let sent: Vec<String> = seen
+        .iter()
+        .map(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(body).expect("token request body")
+                ["refresh_token"]
+                .as_str()
+                .expect("refresh_token field")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(sent, vec!["rt-old".to_string(), "rt-old".to_string()]);
+    assert!(
+        !spent_record_path(name).exists(),
+        "a transient answer proves nothing consumed, so nothing is recorded"
+    );
+}
+
+/// The endpoint's own `invalid_grant` envelope says the server consumed or
+/// revoked the token it judged: the record gains exactly that token's
+/// fingerprint (the hand-computed first 8 bytes of SHA-256("rt-old"), hex).
+#[test]
+fn a_confirmed_invalid_grant_records_the_token_it_judged() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "spent-invalid-grant";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| {
+        (
+            400,
+            r#"{"error": "invalid_grant", "error_description": "Refresh token not found or invalid"}"#
+                .to_string(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let (tx, _rx) = mpsc::channel();
+
+    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert_eq!(
+        std::fs::read_to_string(spent_record_path(name)).expect("the spent record"),
+        r#"["068bfce5d78d07ac"]"#
+    );
+}
+
+/// A bare 401 is terminal on status alone and quarantines, but it proves
+/// nothing about the token having been consumed, so the record stays empty.
+#[test]
+fn a_bare_401_quarantines_without_recording_the_token() {
+    let home = HomeSandbox::new();
+    let name = "spent-bare-401";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| (401, String::new()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    save_disk_profile(name, "rt-old", Some(past_expiry()));
+    let handle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-old"),
+        Some(past_expiry()),
+    )));
+
+    let gate = gate_under_guard(
+        &handle,
+        &crate::profile::ProfileName::from(name),
+        refresh_result,
+        &gate_guard(name),
+        AUTH_GATE_GRACE_MS,
+    );
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert!(matches!(gate, AuthGate::Broken));
+    #[allow(clippy::expect_used, reason = "test")]
+    let flagged = handle
+        .lock()
+        .expect("lock")
+        .is_auth_broken(&crate::profile::ProfileName::from(name));
+    assert!(flagged, "a terminal 401 still quarantines");
+    assert!(
+        !spent_record_path(name).exists(),
+        "a status-only 401 must never become a permanent spent entry"
+    );
+}
+
+/// The profile was deleted (another process) before this rotation took its
+/// guard, and the rotating process's config is stale: the post-answer step
+/// writes into an existing profile dir only, so the rotation recreates nothing.
+#[test]
+fn a_rotation_of_a_deleted_profile_recreates_no_profile_dir() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "spent-deleted";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| (200, MINTED_BODY.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let dir = profile_dir(&crate::profile::ProfileName::from(name)).expect("profile dir");
+    std::fs::remove_dir_all(&dir).expect("delete the profile dir");
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.profiles.retain(|n| n.as_str() != name);
+    crate::profile::save_app_state(&state).expect("save state");
+    let (tx, _rx) = mpsc::channel();
+
+    let _ = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        seen,
+        vec!["/v1/oauth/token".to_string()],
+        "the stale config still spends, so the post-answer step runs"
+    );
+    assert!(!dir.exists(), "no profile dir after the post-answer step");
+}
+
+/// The rotation persist writes the store through the preserving credential
+/// leg: an `mcpOAuth` block (the per-MCP-server logins) beside the login
+/// survives a rotation.
+#[test]
+fn a_rotation_keeps_the_stores_mcp_logins() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "persist-keeps-mcp";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| (200, MINTED_BODY.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    std::fs::write(
+        store_path(name),
+        r#"{"claudeAiOauth":{"accessToken":"at-old","refreshToken":"rt-old"},
+            "mcpOAuth":{"srv":{"accessToken":"mcp-at"}}}"#,
+    )
+    .expect("write the store");
+    let (tx, _rx) = mpsc::channel();
+
+    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert!(matches!(result, RotateOutcome::Persisted(true)));
+    let raw: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(store_path(name)).expect("read")).expect("parse");
+    assert_eq!(raw["claudeAiOauth"]["refreshToken"], "rt-new");
+    assert_eq!(
+        raw["mcpOAuth"],
+        serde_json::json!({"srv": {"accessToken": "mcp-at"}}),
+        "the rotation's store write keeps every non-login block"
+    );
+}
+
+/// A landed rotation writes `credentials.json` and nothing else under the
+/// profile, so the reload fingerprint a peer compares each tick
+/// (`reload_if_changed`, the TUI's `reload_if_state_changed`) must move on
+/// that write alone, or a peer keeps the spent pair in memory.
+#[test]
+fn a_landed_rotation_moves_the_reload_fingerprint() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "persist-fingerprint";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| (200, MINTED_BODY.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    crate::testutil::set_mtime(&store_path(name), an_hour_ago);
+    let before = crate::profile::reload_fingerprint();
+    let (tx, _rx) = mpsc::channel();
+
+    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert!(matches!(result, RotateOutcome::Persisted(true)));
+    assert_ne!(
+        crate::profile::reload_fingerprint(),
+        before,
+        "a peer must see the landed pair as a reason to reload"
+    );
+}
+
+// ── the refresh chain: the send-site rule, the landers, part-1 review pins ───
+
+fn pn(name: &str) -> crate::profile::ProfileName {
+    crate::profile::ProfileName::from(name)
+}
+
+use crate::testutil::hold_state_flock;
+
+/// The `refresh_token` each recorded token request sent, in order.
+fn sent_refresh_tokens(seen: &[(String, String)]) -> Vec<String> {
+    seen.iter()
+        .filter(|(path, _)| path.starts_with("/v1/oauth/token"))
+        .map(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(body).expect("token request body")
+                ["refresh_token"]
+                .as_str()
+                .expect("refresh_token field")
+                .to_string()
+        })
+        .collect()
+}
+
+fn is_flagged(config: &crate::profile::ConfigHandle, name: &str) -> bool {
+    config.lock().expect("config").is_auth_broken(&pn(name))
+}
+
+/// The fixture profile with its access token already expired, loaded fresh, so
+/// the install gate reaches its refresh leg.
+fn expiring_fixture(name: &str) -> crate::profile::ConfigHandle {
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(
+        store_path(name),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at-old","refreshToken":"rt-old","expiresAt":{}}}}}"#,
+            past_expiry()
+        ),
+    )
+    .expect("write the store");
+    Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ))
+}
+
+fn minted(access: &str, refresh: &str) -> TokenResponse {
+    TokenResponse {
+        access_token: access.to_string(),
+        refresh_token: refresh.to_string(),
+        expires_in: 28_800,
+        scope: None,
+    }
+}
+
+/// C4 (rotate): the manual rotate mints P2 but its persist cannot take the
+/// flock, so memory and the store stay on the spent P1. The next manual rotate
+/// sends the stage's P2 token, never P1, and its persist lands.
+#[test]
+fn a_rotate_after_a_wedged_persist_spends_the_staged_token() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-rotate-wedge";
+    let (held_tx, held_rx) = mpsc::channel::<std::fs::File>();
+    let (base, server) = crate::testutil::serve_endpoints_recording(3, move |_, i| {
+        if i == 0 {
+            held_tx
+                .send(hold_state_flock())
+                .expect("hand the holder back");
+            (200, MINTED_BODY.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-p3","refresh_token":"rt-p3","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    let (tx, _rx) = mpsc::channel();
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let first = rotate_one_inner(&config, &pn(name), None, &tx);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(held_rx.try_recv().expect("the token call took the flock"));
+    let second = rotate_one_inner(&config, &pn(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert!(matches!(first, RotateOutcome::Persisted(false)));
+    assert_eq!(
+        sent_refresh_tokens(&seen),
+        vec!["rt-old".to_string(), "rt-new".to_string()],
+        "the spend after a wedged persist sends the staged pair's token"
+    );
+    assert!(matches!(second, RotateOutcome::Persisted(true)));
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-p3"));
+}
+
+/// C4 (gate): the install gate's refresh mints P2 under a wedged flock and
+/// answers Transient; the next manual rotate sends P2's token, never P1.
+#[test]
+fn a_rotate_after_a_wedged_gate_persist_spends_the_staged_token() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-gate-wedge";
+    let (base, server) = crate::testutil::serve_endpoints_recording(2, |_, _| {
+        (
+            200,
+            r#"{"access_token":"at-p3","refresh_token":"rt-p3","expires_in":28800}"#.to_string(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = expiring_fixture(name);
+    let (held_tx, held_rx) = mpsc::channel::<std::fs::File>();
+    let refresher = move |rt: &str, _: Option<&str>| {
+        assert_eq!(rt, "rt-old", "the gate spends the store's token");
+        held_tx
+            .send(hold_state_flock())
+            .expect("hand the holder back");
+        Ok(minted("at-new", "rt-new"))
+    };
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let gate = ensure_installable(&config, &pn(name), refresher);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(held_rx.try_recv().expect("the refresh took the flock"));
+    assert!(
+        matches!(gate, AuthGate::Transient(_)),
+        "a wedged persist is no install"
+    );
+    let (tx, _rx) = mpsc::channel();
+    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(sent_refresh_tokens(&seen), vec!["rt-new".to_string()]);
+}
+
+/// C5: the stage AND the save fail together (a directory where the stage goes,
+/// a wedged flock), so only the record knows P1 was consumed. A fresh load
+/// holds P1 again; its rotate quarantines without sending P1 a second time.
+#[test]
+fn a_spent_token_with_nothing_staged_quarantines_without_a_resend() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-lost-pair";
+    let (held_tx, held_rx) = mpsc::channel::<std::fs::File>();
+    let (base, server) = crate::testutil::serve_endpoints_recording(3, move |_, i| {
+        if i == 0 {
+            held_tx
+                .send(hold_state_flock())
+                .expect("hand the holder back");
+            (200, MINTED_BODY.to_string())
+        } else {
+            (400, r#"{"error":"invalid_grant"}"#.to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::create_dir(stage_path(name)).expect("block the stage path");
+    let (tx, _rx) = mpsc::channel();
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(held_rx.try_recv().expect("the token call took the flock"));
+    let fresh: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("fresh load"),
+    ));
+    assert_eq!(memory_refresh(&fresh, name).as_deref(), Some("rt-old"));
+    let _ = rotate_one_inner(&fresh, &pn(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        sent_refresh_tokens(&seen),
+        vec!["rt-old".to_string()],
+        "the spent P1 is never sent again"
+    );
+    assert!(is_flagged(&fresh, name), "the lost chain quarantines");
+}
+
+/// C13 (quarantine half): the endpoint's `invalid_grant` records the token;
+/// spending it again quarantines with no request at all.
+#[test]
+fn a_token_judged_invalid_is_never_sent_again() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-judged";
+    let (base, server) = crate::testutil::serve_endpoints_recording(3, |_, _| {
+        (400, r#"{"error":"invalid_grant"}"#.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    let (tx, rx) = mpsc::channel();
+
+    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
+    let _ = rotate_one_inner(&config, &pn(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(sent_refresh_tokens(&seen), vec!["rt-old".to_string()]);
+    assert!(is_flagged(&config, name), "the second spend quarantines");
+    let toasts: Vec<bool> = rx
+        .try_iter()
+        .map(|r: OpResult| r.outcome.is_err())
+        .collect();
+    assert_eq!(toasts, vec![true, true], "both legs report the dead chain");
+}
+
+/// C17: memory holds a spent P1, nothing is staged, and the store holds a
+/// different unspent login. The rotate adopts the store, sends nothing, raises
+/// no toast and quarantines nothing.
+#[test]
+fn a_spent_token_adopts_an_unspent_store_without_sending() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-adopt";
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_store_pair(name, "at-foreign", "rt-foreign");
+    let (tx, rx) = mpsc::channel();
+
+    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+
+    crate::testutil::assert_nothing_sent(&listener);
+    assert!(matches!(outcome, RotateOutcome::Persisted(false)));
+    assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-foreign"));
+    assert!(!is_flagged(&config, name), "an adopt is no quarantine");
+    assert!(rx.try_recv().is_err(), "an adopt raises no toast");
+}
+
+/// C18 (gate): an unreadable spent record (a directory at its path) skips the
+/// refresh as Transient: nothing spent, nothing quarantined.
+#[test]
+fn an_unreadable_spent_record_skips_the_gates_spend() {
+    let _home = HomeSandbox::new();
+    let name = "chain-record-dir-gate";
+    let config = expiring_fixture(name);
+    std::fs::create_dir(spent_record_path(name)).expect("block the record");
+
+    let gate = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
+        panic!("an unreadable record must never reach the token endpoint")
+    });
+
+    let AuthGate::Transient(t) = gate else {
+        panic!("an unreadable record skips as Transient");
+    };
+    assert_eq!(
+        t.text(),
+        "could not lock 'chain-record-dir-gate' for a token refresh; check permissions on ~/.clauth"
+    );
+    assert!(!is_flagged(&config, name));
+}
+
+/// C18 (rotate): the manual rotate under the same record sends nothing,
+/// quarantines nothing, and says why.
+#[test]
+fn an_unreadable_spent_record_skips_the_manual_rotate() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-record-dir-rotate";
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::create_dir(spent_record_path(name)).expect("block the record");
+    let (tx, rx) = mpsc::channel();
+
+    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+
+    crate::testutil::assert_nothing_sent(&listener);
+    assert!(matches!(outcome, RotateOutcome::Persisted(false)));
+    assert!(!is_flagged(&config, name));
+    let reported = rx.try_recv().expect("the skip reports").outcome;
+    assert_eq!(
+        reported.expect_err("a skip is no success").to_string(),
+        "could not lock 'chain-record-dir-rotate' for a token refresh; check permissions on ~/.clauth"
+    );
+}
+
+/// C27 (gate): a live stage whose landing cannot take the flock refuses the
+/// install as Transient, so no caller installs the lagging store.
+#[test]
+fn the_install_gate_refuses_while_a_live_stage_cannot_land() {
+    let _home = HomeSandbox::new();
+    let name = "chain-gate-land-wedge";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+    let holder = hold_state_flock();
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let gate = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
+        panic!("the gate never refreshes around a stage it could not land")
+    });
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(holder);
+
+    let AuthGate::Transient(t) = gate else {
+        panic!("a failed land refuses the install");
+    };
+    assert_eq!(
+        t.text(),
+        "another clauth process holds ~/.clauth's state lock · 'chain-gate-land-wedge' left \
+         unchanged: retry in a moment"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-old"));
+    assert!(stage_path(name).exists(), "the stage waits for a landing");
+}
+
+/// The install gate lands a live stage before answering, so what the caller
+/// installs is the chain head and memory follows it.
+#[test]
+fn the_install_gate_lands_a_live_stage_before_ready() {
+    let _home = HomeSandbox::new();
+    let name = "chain-gate-lands";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+
+    let gate = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
+        panic!("a landed stage is installable as it is")
+    });
+
+    assert!(matches!(gate, AuthGate::Ready));
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
+    assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-mid"));
+    assert!(!stage_path(name).exists());
+}
+
+/// F1: the store WRITE fails while its read works (directories squat on the
+/// staging names the persist's atomic write would take next, placed once the
+/// post-answer step has staged and recorded, before the persist's hold): the
+/// stage survives for the catch-up and memory holds the minted pair, the chain
+/// head.
+#[cfg(unix)]
+#[test]
+fn a_store_write_failure_keeps_the_stage_and_moves_memory_to_the_minted_pair() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-write-fails";
+    let (held_tx, held_rx) = mpsc::channel::<std::fs::File>();
+    let (base, server) = crate::testutil::serve_endpoints(2, move |_, _| {
+        held_tx
+            .send(hold_state_flock())
+            .expect("hand the holder back");
+        (200, MINTED_BODY.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    let record = spent_record_path(name);
+    let store = store_path(name);
+    let squatter = std::thread::spawn(move || {
+        let holder = held_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the token call took the flock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !record.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the post-answer step never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // One staging name taken here gives the counter's position; the
+        // persist's write takes one of the next names, each a directory now,
+        // which its stale-temp removal cannot unlink.
+        let probe = crate::profile::tmp_sibling(&store);
+        let probe = probe.to_string_lossy().into_owned();
+        let (stem, seq) = probe.rsplit_once('.').expect("a sequenced staging name");
+        let seq: u64 = seq.parse().expect("the sequence number");
+        for next in seq + 1..=seq + 4096 {
+            std::fs::create_dir(format!("{stem}.{next}")).expect("squat a staging name");
+        }
+        drop(holder);
+    });
+    let (tx, _rx) = mpsc::channel();
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(20)));
+    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+    crate::lock::set_state_lock_timeout_override(None);
+    squatter.join().expect("squatter");
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert!(matches!(outcome, RotateOutcome::Persisted(false)));
+    assert_eq!(
+        stored_refresh(name).as_deref(),
+        Some("rt-old"),
+        "the write failed"
+    );
+    assert!(stage_path(name).exists(), "a save error keeps the stage");
+    assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-new"));
+}
+
+/// F3: a 400 that is not the flat OAuth2 envelope proves nothing consumed, even
+/// when it holds the literal: a nested error object, and an HTML page.
+#[test]
+fn a_rejection_merely_holding_the_literal_is_not_a_confirmed_invalid_grant() {
+    let home = HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, i| {
+        if i == 0 {
+            (
+                400,
+                r#"{"error":{"type":"invalid_grant","message":"x"}}"#.to_string(),
+            )
+        } else {
+            (
+                400,
+                "<html><body>invalid_grant: see the status page</body></html>".to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+
+    let nested = refresh_result("rt-x", None);
+    let page = refresh_result("rt-x", None);
+    let _ = server.join().expect("listener");
+
+    for (shape, answer) in [("nested", nested), ("page", page)] {
+        match answer {
+            Err(RefreshError::Invalid { invalid_grant, .. }) => {
+                assert!(!invalid_grant, "{shape}: not body-confirmed");
+            }
+            Err(RefreshError::Transient(_)) => {}
+            Ok(_) => panic!("{shape}: a 400 is no pair"),
+        }
+    }
+}
+
+/// F4 (a): a rotation that sent a token other than the store's lands while the
+/// store's token is recorded spent (the stage-write-error row).
+#[test]
+fn a_persist_lands_over_a_store_whose_token_is_recorded_spent() {
+    let _home = HomeSandbox::new();
+    let name = "chain-land-spent-store";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let creds = crate::oauth::minted_credentials(None, minted("at-new", "rt-new"));
+
+    let landing =
+        land_pair(&pn(name), "6eebcc2159154314", &creds, "at-old", |_, _| {}).expect("land");
+
+    assert!(matches!(landing, Landing::Landed));
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
+}
+
+/// F4 (b): the same with an empty record and a stage whose base is the store's
+/// token (the record-write-error and two-failed-persists rows).
+#[test]
+fn a_persist_lands_over_a_store_that_is_the_stages_base() {
+    let _home = HomeSandbox::new();
+    let name = "chain-land-base";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    write_live_stage_over_rt_old(name);
+    let creds = crate::oauth::minted_credentials(None, minted("at-new", "rt-new"));
+
+    let landing =
+        land_pair(&pn(name), "6eebcc2159154314", &creds, "at-old", |_, _| {}).expect("land");
+
+    assert!(matches!(landing, Landing::Landed));
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
+}
+
+/// F4 (c, d): a pair answer for a live stage's token re-stages with the base
+/// unchanged (the store has not moved), and the record gains the sent token.
+#[test]
+fn a_pair_for_the_staged_token_keeps_the_base_and_records_the_sent_token() {
+    let _home = HomeSandbox::new();
+    let name = "chain-restage";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+
+    let settled = settle_refresh_answer(
+        &config,
+        &pn(name),
+        "rt-mid",
+        Ok(minted("at-new", "rt-new")),
+        &gate_guard(name),
+    );
+
+    assert!(settled.is_ok());
+    let stage: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(stage_path(name)).expect("stage")).expect("parse");
+    assert_eq!(stage["base"], "068bfce5d78d07ac");
+    assert_eq!(stage["base_access"], "at-old");
+    assert_eq!(stage["creds"]["claudeAiOauth"]["refreshToken"], "rt-new");
+    assert_eq!(
+        std::fs::read_to_string(spent_record_path(name)).expect("record"),
+        r#"["068bfce5d78d07ac","6eebcc2159154314"]"#
+    );
+}
+
+/// F11: an answer echoing the sent refresh token did not rotate it, so the
+/// token stays unrecorded.
+#[test]
+fn a_pair_echoing_the_sent_token_records_nothing() {
+    let _home = HomeSandbox::new();
+    let name = "chain-echo";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+
+    let _ = settle_refresh_answer(
+        &config,
+        &pn(name),
+        "rt-old",
+        Ok(minted("at-new", "rt-old")),
+        &gate_guard(name),
+    );
+
+    assert!(!spent_record_path(name).exists());
+}
+
+/// F10: a re-answered fingerprint moves to the newest end, so eviction runs by
+/// the latest answer.
+#[test]
+fn a_re_answered_token_moves_to_the_newest_end_of_the_record() {
+    let _home = HomeSandbox::new();
+    let name = "chain-reanswer";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(
+        spent_record_path(name),
+        r#"["068bfce5d78d07ac","6eebcc2159154314"]"#,
+    )
+    .expect("record");
+
+    record_spent(&pn(name), "rt-old");
+
+    assert_eq!(
+        std::fs::read_to_string(spent_record_path(name)).expect("record"),
+        r#"["6eebcc2159154314","068bfce5d78d07ac"]"#
+    );
+}
+
+/// F5: a stage is never loaded off an unreadable record: whether its pair is
+/// spent is unknown.
+#[test]
+fn a_stage_with_an_unreadable_record_does_not_load() {
+    let _home = HomeSandbox::new();
+    let name = "chain-stage-record-dir";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    write_live_stage_over_rt_old(name);
+    std::fs::create_dir(spent_record_path(name)).expect("block the record");
+    let store = read_raw_store(&pn(name)).expect("store");
+
+    assert!(live_stage_credentials(&pn(name), store.as_ref()).is_none());
+}
+
+/// F12: a persist for a profile the roster no longer names reports the failed
+/// write to its caller's hold, the same as a write error.
+#[test]
+fn a_persist_for_an_unconfigured_profile_reports_no_landing_in_its_hold() {
+    let _home = HomeSandbox::new();
+    let name = "chain-unconfigured";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.profiles.retain(|n| n.as_str() != name);
+    crate::profile::save_app_state(&state).expect("save state");
+    let creds = crate::oauth::minted_credentials(None, minted("at-new", "rt-new"));
+    let mut reported = Vec::new();
+
+    let landed = land_pair(
+        &pn(name),
+        "068bfce5d78d07ac",
+        &creds,
+        "at-old",
+        |landing, _| reported.push(landing.is_none()),
+    );
+
+    assert!(landed.is_err());
+    assert_eq!(reported, vec![true]);
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-old"));
+}
+
+fn write_split_sidecar(name: &str) {
+    std::fs::write(
+        profile_dir(&pn(name))
+            .expect("dir")
+            .join("session-token.json"),
+        r#"{"claudeAiOauth":{"accessToken":"sk-static","expiresAt":4102444800000}}"#,
+    )
+    .expect("write the session token");
+}
+
+/// C19 (split) + F15: a CLA-SPLIT profile's persist reads `D` from
+/// `credentials.json`, never the session token: it lands on its own chain and
+/// refuses a foreign one, and the session token is untouched either way.
+#[test]
+fn a_split_profiles_persist_judges_the_chain_in_credentials_json() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-split";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, i| {
+        if i == 0 {
+            (200, MINTED_BODY.to_string())
+        } else {
+            (
+                200,
+                r#"{"access_token":"at-p3","refresh_token":"rt-p3","expires_in":28800}"#
+                    .to_string(),
+            )
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    write_split_sidecar(name);
+    let sidecar = profile_dir(&pn(name))
+        .expect("dir")
+        .join("session-token.json");
+    let sidecar_before = std::fs::read(&sidecar).expect("sidecar");
+    let (tx, _rx) = mpsc::channel();
+
+    let own = rotate_one_inner(&config, &pn(name), None, &tx);
+    assert!(matches!(own, RotateOutcome::Persisted(true)));
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-new"));
+
+    write_store_pair(name, "at-foreign", "rt-foreign");
+    let foreign = rotate_one_inner(&config, &pn(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(foreign, RotateOutcome::Persisted(false)));
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-foreign"));
+    assert_eq!(std::fs::read(&sidecar).expect("sidecar"), sidecar_before);
+}
+
+// ── the refresh chain: fix round 1 ───────────────────────────────────────────
+
+/// A capture re-installs a pair the record names spent (a live slot that lagged
+/// the landed store). The readable record survives the install, so the next
+/// spend of that pair quarantines without a request instead of replaying the
+/// consumed token.
+#[test]
+fn a_capture_of_a_recorded_pair_keeps_the_record_and_its_spend_quarantines_unsent() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-recapture";
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    write_store_pair(name, "at-new", "rt-new");
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let mut cfg = crate::profile::load_config().expect("load config");
+
+    crate::actions::overwrite_captured_profile(
+        &mut cfg,
+        &pn(name),
+        crate::actions::CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "at-old".to_string(),
+                    refresh_token: Some("rt-old".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..OAuthToken::default_extra()
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        },
+    )
+    .expect("install the lagging pair");
+
+    assert_eq!(
+        std::fs::read_to_string(spent_record_path(name)).expect("the record survives the install"),
+        r#"["068bfce5d78d07ac"]"#
+    );
+    let fresh: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("fresh load"),
+    ));
+    assert_eq!(memory_refresh(&fresh, name).as_deref(), Some("rt-old"));
+    let (tx, _rx) = mpsc::channel();
+    let _ = rotate_one_inner(&fresh, &pn(name), None, &tx);
+
+    crate::testutil::assert_nothing_sent(&listener);
+    assert!(is_flagged(&fresh, name), "the consumed pair quarantines");
+}
+
+/// The store exists but cannot be parsed when the answer lands, so the persist
+/// fails, and memory moves to its OWN login block with the minted pair written
+/// in, never to an empty block that drops the plan.
+#[test]
+fn a_minted_pair_over_an_unreadable_store_keeps_memorys_login_block() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "chain-store-unreadable";
+    let (base, server) = crate::testutil::serve_endpoints(3, |_, _| (200, MINTED_BODY.to_string()));
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(
+        store_path(name),
+        r#"{"claudeAiOauth":{"accessToken":"at-old","refreshToken":"rt-old","expiresAt":4102444800000,"subscriptionType":"max"}}"#,
+    )
+    .expect("write the store");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ));
+    std::fs::write(store_path(name), "not json").expect("corrupt the store");
+    let (tx, _rx) = mpsc::channel();
+
+    let outcome = rotate_one_inner(&config, &pn(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert!(matches!(outcome, RotateOutcome::Persisted(false)));
+    let cfg = config.lock().expect("config");
+    let oauth = cfg
+        .find(&pn(name))
+        .and_then(|p| p.credentials.as_ref())
+        .and_then(|c| c.claude_ai_oauth.as_ref())
+        .expect("memory holds a login");
+    assert_eq!(oauth.refresh_token.as_deref(), Some("rt-new"));
+    assert_eq!(oauth.access_token, "at-new");
+    assert_eq!(
+        oauth.subscription_type.as_deref(),
+        Some("max"),
+        "memory keeps its own plan beside the minted pair"
+    );
+}
+
+/// An inert stage (the store moved past its base) while another holder has the
+/// profile's rotation lock: the gate judges the stage lock-free, skips the
+/// lander, and answers without waiting on the lock.
+#[test]
+fn the_install_gate_skips_an_inert_stage_without_waiting_on_the_rotation_lock() {
+    use std::sync::mpsc;
+    let _home = HomeSandbox::new();
+    let name = "chain-gate-inert-held";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    write_live_stage_over_rt_old(name);
+    write_store_pair(name, "at-foreign", "rt-foreign");
+    let holder = crate::testutil::hold_rotation_lock(name);
+    let (tx, rx) = mpsc::channel();
+    let gate_config = config.clone();
+    let worker = std::thread::spawn(move || {
+        let gate = ensure_installable(&gate_config, &pn(name), |_: &str, _: Option<&str>| {
+            panic!("a fresh target never refreshes")
+        });
+        tx.send(matches!(gate, AuthGate::Ready)).expect("report");
+    });
+
+    let answered = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(holder);
+    worker.join().expect("gate thread");
+
+    assert_eq!(
+        answered.ok(),
+        Some(true),
+        "the gate answered Ready without waiting on the held rotation lock"
+    );
+}
+
+/// The daemon's main loop never parks behind a held rotation lock to land a
+/// live stage: it answers the busy cause, nothing lands, and the stage waits
+/// for its holder.
+#[test]
+fn the_main_loop_gate_answers_busy_while_a_live_stages_lock_is_held() {
+    use std::sync::mpsc;
+    let _home = HomeSandbox::new();
+    let name = "chain-main-loop-held";
+    let config = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+    let holder = crate::testutil::hold_rotation_lock(name);
+    let (tx, rx) = mpsc::channel();
+    let gate_config = config.clone();
+    let worker = std::thread::spawn(move || {
+        let gate = ensure_installable_from_main_loop(
+            &gate_config,
+            &pn(name),
+            |_: &str, _: Option<&str>| panic!("a busy lander never refreshes"),
+        );
+        let text = match gate {
+            AuthGate::Transient(t) => t.text(),
+            AuthGate::Ready => "Ready".to_string(),
+            AuthGate::Refreshed => "Refreshed".to_string(),
+            AuthGate::Broken => "Broken".to_string(),
+        };
+        tx.send(text).expect("report");
+    });
+
+    let answered = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(holder);
+    worker.join().expect("gate thread");
+
+    assert_eq!(
+        answered.ok().as_deref(),
+        Some("'chain-main-loop-held' has a token rotation in progress, retry in a moment"),
+        "the main loop answers the held lock instead of waiting it out"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-old"));
+    assert!(stage_path(name).exists(), "the stage waits for its holder");
+}
+
+/// The main loop's switch gate onto a rolling-token target never parks behind
+/// a held rotation lock either: the rolling gate's own guard answers the busy
+/// cause, and the switch retries on a later tick.
+#[test]
+fn the_main_loop_gate_answers_busy_while_a_rolling_targets_lock_is_held() {
+    use std::sync::mpsc;
+    let _home = HomeSandbox::new();
+    let name = "chain-main-loop-rolling";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    let mut on_disk = crate::profile::load_profile(&pn(name)).expect("load");
+    on_disk.rolling_token = true;
+    crate::profile::save_profile_config(&on_disk).expect("arm rolling");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ));
+    let holder = crate::testutil::hold_rotation_lock(name);
+    let (tx, rx) = mpsc::channel();
+    let gate_config = config.clone();
+    let worker = std::thread::spawn(move || {
+        let gate = ensure_installable_from_main_loop(
+            &gate_config,
+            &pn(name),
+            |_: &str, _: Option<&str>| panic!("a busy rolling gate never refreshes"),
+        );
+        let text = match gate {
+            AuthGate::Transient(t) => t.text(),
+            AuthGate::Ready => "Ready".to_string(),
+            AuthGate::Refreshed => "Refreshed".to_string(),
+            AuthGate::Broken => "Broken".to_string(),
+        };
+        tx.send(text).expect("report");
+    });
+
+    let answered = rx.recv_timeout(std::time::Duration::from_secs(10));
+    drop(holder);
+
+    assert_eq!(
+        answered.ok().as_deref(),
+        Some("'chain-main-loop-rolling' has a token rotation in progress, retry in a moment"),
+        "the main loop answers the held lock instead of waiting it out"
+    );
+    worker.join().expect("gate thread");
+}
+
+/// A landing that waits out a peer's state-flock hold still hands its Keychain
+/// calls the whole `KEYCHAIN_MIRROR_BUDGET`: the budget is armed past the
+/// hold, so the wait spends none of it.
+#[test]
+fn a_landings_flock_wait_leaves_its_keychain_budget_whole() {
+    let _home = HomeSandbox::new();
+    let name = "chain-budget-after-flock";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    write_live_stage_over_rt_old(name);
+    let guard = crate::runtime::RotationGuard::acquire(&pn(name)).expect("rotation guard");
+    let held = std::time::Duration::from_millis(1500);
+    let holder = hold_state_flock();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(held);
+        drop(holder);
+    });
+    let _ = crate::lock::take_keychain_leg_windows();
+
+    let start = std::time::Instant::now();
+    let landed = land_stage_for_install(&pn(name), &guard);
+    let waited = start.elapsed();
+    releaser.join().expect("releaser");
+
+    assert!(landed.is_ok(), "the stage lands once the peer lets go");
+    assert!(
+        waited >= held,
+        "the landing waited out the peer: {waited:?}"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
+    let windows = crate::lock::take_keychain_leg_windows();
+    assert_eq!(windows.len(), 1, "one landing, one Keychain leg scope");
+    let left = windows[0].expect("the landing's Keychain legs run under a budget");
+    assert!(
+        left > crate::runtime::KEYCHAIN_MIRROR_BUDGET - std::time::Duration::from_millis(500),
+        "the flock wait spent the Keychain budget: {left:?} left"
+    );
+}
+
+/// The rolling arm's token call runs under no Keychain budget: each landing
+/// arms its own past its state-flock hold, so neither a flock wait nor the
+/// token call spends the window its Keychain calls get.
+#[test]
+fn the_rolling_arm_spends_its_refresh_under_no_keychain_budget() {
+    let _home = HomeSandbox::new();
+    let name = "chain-rolling-budget";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    std::fs::write(
+        store_path(name),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"at-old","refreshToken":"rt-old","expiresAt":{},"subscriptionType":"max"}}}}"#,
+            past_expiry()
+        ),
+    )
+    .expect("an expiring chain");
+    let mut on_disk = crate::profile::load_profile(&pn(name)).expect("load");
+    on_disk.rolling_token = true;
+    crate::profile::save_profile_config(&on_disk).expect("arm rolling");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ));
+    let budget = std::sync::Mutex::new(None);
+
+    let _ = arm_rolling_token(&config, &pn(name), |rt: &str, _: Option<&str>| {
+        assert_eq!(rt, "rt-old");
+        *budget.lock().expect("budget slot") = Some(crate::lock::armed_budget_remaining());
+        Ok(minted("at-new", "rt-new"))
+    });
+
+    let seen = budget
+        .into_inner()
+        .expect("budget slot")
+        .expect("the arm reached its refresh");
+    assert_eq!(seen, None, "the refresh runs under no Keychain budget");
+}
+
+/// The install gate reached through the rolling arm lands a live stage before
+/// it stamps from the stored chain.
+#[test]
+fn the_rolling_arm_lands_a_live_stage_before_it_stamps() {
+    let _home = HomeSandbox::new();
+    let name = "chain-rolling-lands";
+    let _ = crate::testutil::rotation_fixture_config(&pn(name));
+    let mut on_disk = crate::profile::load_profile(&pn(name)).expect("load");
+    on_disk.rolling_token = true;
+    crate::profile::save_profile_config(&on_disk).expect("arm rolling");
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    std::fs::write(
+        stage_path(name),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid",
+                     "expiresAt":4102444800000,"subscriptionType":"max"}}}"#,
+    )
+    .expect("write the stage");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("load config"),
+    ));
+
+    let _ = arm_rolling_token(&config, &pn(name), |_: &str, _: Option<&str>| {
+        panic!("a comfortable staged chain stamps without a refresh")
+    });
+
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-mid"));
+    assert!(!stage_path(name).exists(), "the landed stage is gone");
+}
+
+/// The gate's adoption never takes a store whose token the server consumed:
+/// memory holds the minted P2, the store still the spent P1, nothing staged.
+#[test]
+fn the_gate_adoption_never_takes_a_spent_store_over_memory() {
+    let _home = HomeSandbox::new();
+    let name = "chain-adopt-spent";
+    save_disk_profile(name, "rt-old", Some(future_expiry()));
+    std::fs::write(spent_record_path(name), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    let handle: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(oauth_config(
+        name,
+        Some("rt-new"),
+        Some(future_expiry()),
+    )));
+
+    adopt_disk_rotation(&handle, &pn(name), &gate_guard(name)).expect("adopt");
+
+    assert_eq!(memory_refresh(&handle, name).as_deref(), Some("rt-new"));
 }

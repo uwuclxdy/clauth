@@ -6176,3 +6176,47 @@ fn the_keychain_owner_search_asks_the_active_profile_first() {
     assert_eq!(read_value(&sidecar_of("a"))["designOauth"], design_login());
     assert!(read_value(&sidecar_of("b")).get("designOauth").is_none());
 }
+
+/// The start-time arm stamps from the stored chain, so a live stage a failed
+/// persist left lands first: the store holds the staged pair (`rt-mid`) and the
+/// stage is gone. The stage's base is fp("rt-old"), hand-computed: the first 8
+/// bytes of its SHA-256, hex.
+#[test]
+fn arming_from_disk_lands_a_live_stage_before_it_stamps() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("arm-staged");
+    let mut profile = crate::profile::Profile::new(name.to_string(), None, None);
+    profile.rolling_token = true;
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-old".to_string(),
+            refresh_token: Some("rt-old".to_string()),
+            expires_at: Some(crate::usage::now_ms() as i64 + 8 * 3_600_000),
+            scopes: None,
+            subscription_type: Some("max".into()),
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let state = crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..Default::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    std::fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid",
+                     "expiresAt":4102444800000,"subscriptionType":"max"}}}"#,
+    )
+    .expect("write the stage");
+    std::fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+
+    arm_rolling_from_disk(&name);
+
+    let store: ClaudeCredentials =
+        crate::profile::read_json_file(&dir.join("credentials.json")).expect("read store");
+    assert_eq!(store.refresh_token(), Some("rt-mid"));
+    assert!(!dir.join("credentials.json.staged").exists());
+}

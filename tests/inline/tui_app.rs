@@ -4727,6 +4727,51 @@ fn clear_session_token_refuses_while_a_rotation_holds_the_profile() {
     );
 }
 
+/// The clear relinks the store in front of Claude Code, so a live stage a
+/// failed persist left lands first: after the clear the store holds the staged
+/// pair (`rt-mid`) and the stage is gone. The stage's base is fp("rt-old"),
+/// hand-computed: the first 8 bytes of its SHA-256, hex.
+#[test]
+fn clear_session_token_lands_a_live_stage_before_it_relinks() {
+    use super::{ConfigRow, build_draft_existing, run_config_row};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut acct = Profile::new("staged".to_string(), None, None);
+    acct.credentials = Some(split_creds("at-old", Some("rt-old")));
+    crate::profile::save_profile(&acct).expect("save profile");
+    seed_session_token("staged", None);
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("staged"))
+        .expect("profile dir");
+    std::fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+    std::fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+
+    let mut app = app_with(vec![acct]);
+    make_active(&mut app, "staged");
+    app.profile_cursor = 0;
+    app.config_draft = Some(build_draft_existing(
+        &app,
+        &crate::profile::ProfileName::from("staged"),
+    ));
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+    run_config_row(&mut app, ConfigRow::ClearSessionToken);
+
+    let store: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&dir.join("credentials.json")).expect("read the store");
+    assert_eq!(
+        store.refresh_token(),
+        Some("rt-mid"),
+        "toasts: {:?}",
+        app.toasts
+    );
+    assert!(!dir.join("credentials.json.staged").exists());
+}
+
 /// Overview and Usage carry the focused account's own actions plus the
 /// tab-global ones. The hotkeys are pinned, not scanned: `d` survives the
 /// disable↔enable label flip, and `f` keeps refresh-all off `e`/`p`, which the
@@ -11855,9 +11900,10 @@ fn tui_switch_gate_refuses_a_dead_target_before_its_flag_is_set() {
         &mut app,
         crate::profile::ProfileName::from("dead".to_string()),
         |_, _| {
-            Err(crate::oauth::RefreshError::Invalid(
-                crate::oauth::TokenFailure::Status(400),
-            ))
+            Err(crate::oauth::RefreshError::Invalid {
+                failure: crate::oauth::TokenFailure::Status(400),
+                invalid_grant: true,
+            })
         },
     );
     super::drain_switch_gates(&mut app);
@@ -21676,4 +21722,56 @@ fn the_open_alert_editor_shows_its_range_line_in_the_pane() {
     let rows = draw(&app);
     let field = rows.iter().position(|r| r.contains("alert at")).unwrap();
     assert!(rows[field + 1].contains(range), "{}", rows.join("\n"));
+}
+
+// ── settings edits save config.toml only ─────────────────────────────────────
+
+/// The daemon's rotation landed a new pair while the TUI's in-memory profile
+/// still holds the old one. A chain toggle saved from that memory must not
+/// write the old pair back over the store.
+#[test]
+fn a_chain_toggle_never_rewinds_a_pair_another_process_landed() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("a");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let mut app = app_with_unlinked_profiles(vec![profile]);
+    let store = crate::profile::profile_dir(&name)
+        .expect("dir")
+        .join("credentials.json");
+    std::fs::write(
+        &store,
+        r#"{"claudeAiOauth":{"accessToken":"at-2","refreshToken":"rt-2"}}"#,
+    )
+    .expect("the daemon lands its pair");
+    app.tab = Tab::Fallback;
+    app.fallback_focus = super::FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = 4; // FALLBACK_ROWS[4] == LastResort
+
+    super::handle_fallback_detail_key(&mut app, key(KeyCode::Char(' ')));
+
+    assert_eq!(
+        app.config().find(&name).map(|p| p.last_resort),
+        Some(true),
+        "precondition: the toggle ran and saved"
+    );
+    let stored: ClaudeCredentials = crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-2"),
+        "a settings edit saves config.toml only"
+    );
 }

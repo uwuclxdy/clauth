@@ -7218,3 +7218,141 @@ fn deleting_the_last_token_refuses_over_an_unreadable_config() {
         "the refused delete revoked nothing"
     );
 }
+
+// ── settings edits save config.toml only ─────────────────────────────────────
+
+/// Another process (the daemon's rotation) landed a new pair while this
+/// process's in-memory profile still holds the old one. A model edit from that
+/// stale memory must not write the old pair back over the store.
+#[test]
+fn a_model_edit_never_rewinds_a_pair_another_process_landed() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("settings-stale-pair");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("save state");
+    let store = crate::profile::profile_dir(&name)
+        .expect("dir")
+        .join("credentials.json");
+    std::fs::write(
+        &store,
+        r#"{"claudeAiOauth":{"accessToken":"at-2","refreshToken":"rt-2"}}"#,
+    )
+    .expect("another process lands its pair");
+
+    let models = ModelSettings {
+        default: Some("opus".to_string()),
+        ..ModelSettings::default()
+    };
+    edit_profile_model(&mut config, &name, models).expect("edit the model");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-2"),
+        "a settings edit saves config.toml only"
+    );
+}
+
+/// A profile holding a login and an UNPARSEABLE spent record beside it.
+fn profile_with_a_corrupt_spent_record(name: &ProfileName) -> AppConfig {
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("save state");
+    std::fs::write(
+        crate::profile::profile_dir(name)
+            .expect("dir")
+            .join("auth.spent.json"),
+        "not json",
+    )
+    .expect("corrupt the record");
+    config
+}
+
+/// F6: a login install retires the spent record, so an unparseable one never
+/// outlives the next login (it would hold every spend of the new login off).
+#[test]
+fn a_login_install_retires_the_spent_record() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("record-relogin");
+    let mut config = profile_with_a_corrupt_spent_record(&name);
+
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "at-relogin".to_string(),
+                    refresh_token: Some("rt-relogin".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    )
+    .expect("install the re-login");
+
+    assert!(
+        !crate::profile::profile_dir(&name)
+            .expect("dir")
+            .join("auth.spent.json")
+            .exists()
+    );
+}
+
+/// F6: a clear retires it too.
+#[test]
+fn a_login_clear_retires_the_spent_record() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("record-clear");
+    let mut config = profile_with_a_corrupt_spent_record(&name);
+
+    clear_profile_credentials(&mut config, &name).expect("clear");
+
+    assert!(
+        !crate::profile::profile_dir(&name)
+            .expect("dir")
+            .join("auth.spent.json")
+            .exists()
+    );
+}

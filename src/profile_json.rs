@@ -95,7 +95,7 @@ pub(crate) fn usage_cache_file(p: &Profile) -> &'static str {
 /// [`usage_cache_file`] for a caller holding only a name, resolved through the
 /// side-effect-free `stored_usage_cache_is_third_party` rather than a full
 /// profile load: one caller samples this under a leaf lock at 5 Hz, where
-/// recovering a staged rotation would take the state flock and invert the lock
+/// recovering a legacy `.pending` rotation sidecar would take the state flock and invert the lock
 /// order.
 pub(crate) fn usage_cache_file_for(name: &ProfileName) -> &'static str {
     cache_file_of(crate::profile::stored_usage_cache_is_third_party(name))

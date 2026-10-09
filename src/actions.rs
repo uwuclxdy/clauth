@@ -22,7 +22,7 @@ use crate::out::{out, outln};
 use crate::profile::{
     AccountId, AppConfig, ClaudeCredentials, ConfigHandle, ConsoleCredential, DivergenceChoice,
     ModelSettings, Profile, ProfileName, load_app_state, load_profile, profile_dir, save_app_state,
-    save_profile,
+    save_profile, save_profile_config,
 };
 use crate::providers::Provider;
 use crate::runtime::RotationGuard;
@@ -771,7 +771,7 @@ pub(crate) fn edit_profile_endpoint(
             profile.console = None;
         }
         profile.provider = provider;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -805,7 +805,7 @@ pub(crate) fn store_console_login(
         let profile = config.find_mut(name).context("profile not found")?;
         profile.console = Some(console);
         profile.third_party_usage = None;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
         crate::profile_cache::remove_profile_cache(
             name,
             crate::profile_cache::THIRD_PARTY_CACHE_FILE,
@@ -825,7 +825,7 @@ pub(crate) fn edit_profile_model(
     with_state_lock(|_held| {
         let profile = config.find_mut(name).context("profile not found")?;
         profile.models = models;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
 
         if config.is_active(name) {
             // A model-only edit never touches the generic `env` map, so passing
@@ -867,7 +867,7 @@ pub(crate) fn edit_profile_preferred_days(
         }
         let mut fresh = load_profile(name)?;
         fresh.preferred_days = edit(&fresh.preferred_days);
-        save_profile(&fresh)?;
+        save_profile_config(&fresh)?;
         if let Some(profile) = config.find_mut(name) {
             profile.preferred_days = fresh.preferred_days.clone();
         }
@@ -916,7 +916,7 @@ pub(crate) fn edit_profile_preset(
             );
         }
         profile.provider = provider;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -942,7 +942,7 @@ pub(crate) fn edit_profile_env(
         // settings when it appears in `prev` but not in the new `profile.env`.
         let old_env_keys: Vec<String> = profile.env.keys().cloned().collect();
         profile.env = env;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
 
         if config.is_active(name) {
             let profile = config.find(name).context("profile not found")?;
@@ -1768,7 +1768,7 @@ pub(crate) fn disable_profile(config: &mut AppConfig, name: &ProfileName) -> Res
         }
         let profile = config.find_mut(name).context("profile not found")?;
         profile.disabled = true;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
         Ok(true)
     })
 }
@@ -1788,7 +1788,7 @@ pub(crate) fn enable_profile(config: &mut AppConfig, name: &ProfileName) -> Resu
             return Ok(false);
         }
         profile.disabled = false;
-        save_profile(profile)?;
+        save_profile_config(profile)?;
         Ok(true)
     })
 }
@@ -2081,6 +2081,7 @@ pub(crate) fn capture_into_profile(
             &name,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         );
+        crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(credentials, held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2144,6 +2145,7 @@ pub(crate) fn create_profile_from_login(
             &name,
             crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
         );
+        crate::oauth::retire_unreadable_spent_record(&name);
         profile.set_credentials(Some(credentials), held);
         save_profile(&profile)?;
         config.add(profile);
@@ -2313,6 +2315,7 @@ pub(crate) fn overwrite_captured_profile(
         profile.usage = None;
         profile.fetch_status = None;
         profile.third_party_usage = None;
+        crate::oauth::retire_unreadable_spent_record(&profile.name);
         save_profile(profile)?;
 
         for file in [
@@ -2422,8 +2425,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
         profile.usage = None;
         profile.fetch_status = None;
         profile.third_party_usage = None;
+        crate::oauth::retire_unreadable_spent_record(name);
         save_profile(profile)?;
-        // Drop any uncommitted rotation sidecar too: with credentials.json gone,
+        // Drop any legacy `.pending` rotation sidecar too: with credentials.json gone,
         // `recover_pending_credentials` would treat the sidecar as a failed commit
         // and resurrect the just-deleted login on next load.
         crate::profile::clear_staged_credentials(name);
@@ -2576,7 +2580,7 @@ pub(crate) fn set_member_threshold(
     }
     with_state_lock(|_held| {
         // Fresh roster AND fresh chain off disk, not the in-memory copies: the
-        // daemon's config can lag a concurrent CLI/TUI edit, and `save_profile`
+        // daemon's config can lag a concurrent CLI/TUI edit, and the save
         // would recreate the profile file for a member that is gone, or write
         // a threshold on one the chain just dropped.
         let fresh = load_app_state()?;
@@ -2596,7 +2600,7 @@ pub(crate) fn set_member_threshold(
         // only this leg's field, then mirror it into the in-memory profile.
         let mut fresh = load_profile(name)?;
         fresh.fallback_threshold = Some(value);
-        save_profile(&fresh)?;
+        save_profile_config(&fresh)?;
         if let Some(profile) = config.find_mut(name) {
             profile.fallback_threshold = Some(value);
         }

@@ -885,6 +885,7 @@ fn apply_outcome_records_the_ladder_it_baked_for_the_clamp_to_compose_on() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after: None,
     };
@@ -1574,6 +1575,7 @@ fn failed_unmask_outcome_defers_and_streaks_like_a_429() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after,
     };
@@ -1751,6 +1753,7 @@ fn cached_fallback_does_not_clobber_store() {
             rotated: None,
             from_fetch: false,
             refresh_failed: false,
+            login_gone: false,
             plan_override: None,
             retry_after: None,
         },
@@ -1782,6 +1785,7 @@ fn cached_fallback_does_not_clobber_store() {
             rotated: None,
             from_fetch: false,
             refresh_failed: false,
+            login_gone: false,
             plan_override: None,
             retry_after: None,
         },
@@ -2094,6 +2098,7 @@ fn fresh_body_stamps_fetched_at_and_reads_not_stale() {
             rotated: None,
             from_fetch: true,
             refresh_failed: false,
+            login_gone: false,
             plan_override: None,
             retry_after: None,
         },
@@ -2806,6 +2811,7 @@ fn apply_outcome_marks_the_weekly_reset_re_test() {
         rotated: None,
         from_fetch: true,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after: None,
     };
@@ -3183,6 +3189,7 @@ fn drain_arms_the_weekly_reset_mark_only_for_opted_in_profiles() {
         rotated: None,
         from_fetch: true,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after: None,
     };
@@ -4631,6 +4638,7 @@ fn retry_after_defers_next_fetch_slot() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after,
     };
@@ -4791,6 +4799,7 @@ fn consecutive_rate_limits_back_off_exponentially() {
 
     let rate_limited = |from_fetch: bool, status: FetchStatus| FetchOutcome {
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         name: crate::profile::ProfileName::from("a"),
         info: None,
@@ -4895,6 +4904,7 @@ fn hint_present_429s_still_ride_the_streak_ladder() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after: Some(Duration::from_secs(5)),
     };
@@ -4953,6 +4963,7 @@ fn transient_errors_preserve_rate_limit_streak() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after: None,
     };
@@ -6166,7 +6177,10 @@ fn a_none_derivation_removes_the_mirrored_window() {
 fn dead_refresh_token_is_terminal() {
     // A 4xx from the token endpoint (revoked / expired refresh token) → the login
     // is gone; quarantine so the UI surfaces reauth immediately.
-    let err = RefreshError::Invalid(crate::oauth::TokenFailure::Status(400));
+    let err = RefreshError::Invalid {
+        failure: crate::oauth::TokenFailure::Status(400),
+        invalid_grant: true,
+    };
     assert!(super::refresh_failure_is_terminal(&err));
 }
 
@@ -7797,6 +7811,7 @@ fn apply_outcome_threads_is_active_into_the_deferral() {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after: None,
     };
@@ -7907,6 +7922,7 @@ fn cached_outcome(name: &str) -> super::FetchOutcome {
         rotated: None,
         from_fetch: false,
         refresh_failed: false,
+        login_gone: false,
         plan_override: None,
         retry_after: None,
     }
@@ -10455,8 +10471,8 @@ fn an_unacquirable_rotation_guard_bails_without_spending_the_chain() {
 /// A rotation whose persist fails still hands the minted pair back. The refresh
 /// already spent the old single-use token, so the new pair is the only usable
 /// one: dropping it leaves the caller's `TokenList` on a dead token that 400s
-/// every tick until a restart adopts the staged sidecar, while the in-memory
-/// `AppConfig` has already moved on — the divergence asserted below.
+/// every tick, while the in-memory `AppConfig` has already moved on — the
+/// divergence asserted below.
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
@@ -10491,16 +10507,16 @@ fn a_rotation_carries_its_pair_back_when_the_persist_fails() {
         seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
         "the leg must actually rotate before the persist can fail: {seen:?}"
     );
-    // Proof the fixture failed the persist where it claims to: the crash-durable
-    // sidecar is only cleared after a committed save.
-    let pending = crate::profile::profile_subpath(
-        &crate::profile::ProfileName::from(name),
-        "credentials.json.pending",
-    )
-    .expect("pending path");
+    // Proof the fixture failed the persist where it claims to: the store is
+    // still the directory the fixture put in its place, so nothing landed.
     assert!(
-        pending.is_file(),
-        "the staged sidecar must survive, or the save never failed"
+        crate::profile::profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "credentials.json"
+        )
+        .expect("store path")
+        .is_dir(),
+        "the blocked store must be untouched, or the save never failed"
     );
     assert_eq!(
         outcome.rotated,
@@ -13059,4 +13075,826 @@ fn scan_auto_switch_never_picks_a_key_rejected_member_as_target() {
         pending.lock().unwrap().is_empty(),
         "a key-rejected member must never be chosen as a walk target"
     );
+}
+
+// ── the refresh chain: a wedged persist leaves a stage the next load reads ───
+
+/// The fetch leg's rotation mints a pair, then its persist cannot take the
+/// state flock (another process wedged inside its hold past the deadline). The
+/// minted pair must still be recoverable: a fresh `load_config` afterwards
+/// loads it from the stage, while the store keeps the spent pair and the stage
+/// stays on disk, because a loader writes nothing.
+#[test]
+fn a_flock_wedged_rotation_persist_leaves_a_stage_the_next_load_reads() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "stage-flock-wedge";
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<std::fs::File>();
+    // usage 401 → token 200 (taking the flock as it answers); the persist bails.
+    let (base, server) = crate::testutil::serve_endpoints(5, move |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            let dir = crate::profile::clauth_dir().expect("clauth dir");
+            let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+                .expect("open holder handle");
+            holder.lock().expect("hold the flock");
+            held_tx.send(holder).expect("hand the holder back");
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") && i == 0 {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    crate::lock::set_state_lock_timeout_override(None);
+    let seen = server.join().expect("listener");
+    drop(held_rx.try_recv().expect("the token call took the flock"));
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the leg must rotate before its persist can wedge: {seen:?}"
+    );
+    assert_eq!(
+        outcome.rotated,
+        Some(("at-new".to_string(), Some("rt-new".to_string()))),
+        "a persist error keeps today's carry of the minted pair"
+    );
+    let loaded = crate::profile::load_config().expect("fresh load");
+    assert_eq!(
+        loaded
+            .find(&crate::profile::ProfileName::from(name))
+            .and_then(|p| p.refresh_token().map(str::to_string))
+            .as_deref(),
+        Some("rt-new"),
+        "a fresh load reads the minted pair back from the stage"
+    );
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    let stored: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&dir.join("credentials.json")).expect("read the store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-old"),
+        "the loader wrote nothing: the store still holds the spent pair"
+    );
+    assert!(
+        dir.join("credentials.json.staged").is_file(),
+        "the stage survives the load"
+    );
+}
+
+/// A token-list fixture wired to `config`, driven through the real worker and
+/// drain: what the tick's `TokenList` holds after one fetch of `entry`.
+fn drained_tokens(
+    config: &crate::profile::ConfigHandle,
+    entry: super::TokenEntry,
+) -> Vec<super::TokenEntry> {
+    let mut state = completion_order_state();
+    state.config = config.clone();
+    state.tokens = Arc::new(RankedMutex::new(vec![entry.clone()]));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, |e| {
+        super::fetch_with_rotation(config, &e, None, &refetch, &activity)
+    });
+    state.tokens.lock().unwrap().clone()
+}
+
+/// A foreign login lands while the fetch leg's rotation is in flight: the
+/// persist refuses, the outcome carries the STORE's pair, and after the drain
+/// the token list holds it rather than the minted pair nothing persisted.
+#[test]
+fn a_refused_rotation_persist_hands_the_token_list_the_stores_pair() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "refused-foreign";
+    let (base, server) = crate::testutil::serve_endpoints(5, move |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            let store = crate::profile::profile_dir(&crate::profile::ProfileName::from(name))
+                .expect("dir")
+                .join("credentials.json");
+            std::fs::write(
+                store,
+                r#"{"claudeAiOauth":{"accessToken":"at-foreign","refreshToken":"rt-foreign"}}"#,
+            )
+            .expect("a foreign login lands");
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") && i == 0 {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+
+    let tokens = drained_tokens(
+        &config,
+        rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000)),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the leg must rotate before its persist refuses: {seen:?}"
+    );
+    let pairs: Vec<(String, Option<String>)> = tokens
+        .iter()
+        .map(|e| (e.access_token.clone(), e.refresh_token.clone()))
+        .collect();
+    assert_eq!(
+        pairs,
+        vec![("at-foreign".to_string(), Some("rt-foreign".to_string()))],
+        "the token list follows the store after a refusal"
+    );
+}
+
+/// A logout lands while the fetch leg's rotation is in flight: the persist
+/// refuses on an absent store, and the drain drops the entry rather than poll
+/// one more tick on a gone login.
+#[test]
+fn a_refused_rotation_persist_on_a_cleared_login_drops_the_token_list_entry() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "refused-cleared";
+    let (base, server) = crate::testutil::serve_endpoints(5, move |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::clear_profile_credentials(
+                &mut cfg,
+                &crate::profile::ProfileName::from(name),
+            )
+            .expect("blank the login");
+            (
+                200,
+                r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#
+                    .to_string(),
+            )
+        } else if path.starts_with("/api/oauth/usage") && i == 0 {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    seed_usage_cache(name);
+
+    let tokens = drained_tokens(
+        &config,
+        rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000)),
+    );
+    let seen = server.join().expect("listener");
+
+    assert!(
+        seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "the leg must rotate before its persist refuses: {seen:?}"
+    );
+    assert!(
+        tokens.is_empty(),
+        "a refusal on a cleared login drops the entry: {:?}",
+        tokens.iter().map(|e| e.name.as_str()).collect::<Vec<_>>()
+    );
+}
+
+// ── the refresh chain: the catch-up leg and the send-site rule on a tick ─────
+
+fn chain_pn(name: &str) -> crate::profile::ProfileName {
+    crate::profile::ProfileName::from(name)
+}
+
+use crate::testutil::hold_state_flock;
+
+fn chain_dir(name: &str) -> std::path::PathBuf {
+    crate::profile::profile_dir(&chain_pn(name)).expect("profile dir")
+}
+
+fn chain_store_refresh(name: &str) -> Option<String> {
+    let creds: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&chain_dir(name).join("credentials.json"))
+            .expect("read the store");
+    creds.refresh_token().map(str::to_string)
+}
+
+fn live_slot_access() -> String {
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    let creds: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&live).expect("read the live slot");
+    creds.access_token().expect("live login").to_string()
+}
+
+/// A scheduler state over `config` whose token list is `tokens`, every other
+/// store empty: what `tick` runs on.
+fn chain_state(
+    config: &crate::profile::ConfigHandle,
+    tokens: Vec<super::TokenEntry>,
+) -> super::SchedulerState {
+    let mut state = completion_order_state();
+    state.config = config.clone();
+    state.tokens = Arc::new(RankedMutex::new(tokens));
+    state
+}
+
+/// The fetch leg's rotation mints P2 (`rt-new`) and its persist cannot take the
+/// flock: a live stage over the fixture's spent `rt-old`. Returns the leg's
+/// outcome; the flock is released before returning.
+fn wedge_a_fetch_rotation(
+    config: &crate::profile::ConfigHandle,
+    name: &str,
+    held_rx: &std::sync::mpsc::Receiver<std::fs::File>,
+) -> super::FetchOutcome {
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(300)));
+    let outcome = super::fetch_with_rotation(config, &entry, None, &refetch, &activity);
+    crate::lock::set_state_lock_timeout_override(None);
+    drop(held_rx.try_recv().expect("the token call took the flock"));
+    assert!(
+        chain_dir(name).join("credentials.json.staged").is_file(),
+        "the wedged persist leaves a stage"
+    );
+    outcome
+}
+
+const CHAIN_MINTED: &str =
+    r#"{"access_token":"at-new","refresh_token":"rt-new","expires_in":28800}"#;
+
+/// C1: after a wedged persist, the lease holder's next tick lands the staged
+/// pair before its fetch legs: the store holds P2, the stage is gone, and the
+/// tick sends no refresh token at all (no P1, no second rotation).
+#[test]
+fn the_next_tick_lands_a_pair_a_wedged_persist_staged() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-catch-up";
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<std::fs::File>();
+    let token_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let usage_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (tc, uc) = (token_calls.clone(), usage_calls.clone());
+    let (base, server) = crate::testutil::serve_endpoints(8, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            if tc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                held_tx
+                    .send(hold_state_flock())
+                    .expect("hand the holder back");
+            }
+            (200, CHAIN_MINTED.to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            if uc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    let outcome = wedge_a_fetch_rotation(&config, name, &held_rx);
+    let carried = outcome
+        .rotated
+        .expect("a persist error carries the minted pair");
+    let mut entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    entry.access_token = carried.0;
+    entry.refresh_token = carried.1;
+    let state = chain_state(&config, vec![entry]);
+
+    super::tick(&state);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        seen.iter()
+            .filter(|p| p.starts_with("/v1/oauth/token"))
+            .count(),
+        1,
+        "only the wedged rotation spent a token: {seen:?}"
+    );
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-new"));
+    assert!(!chain_dir(name).join("credentials.json.staged").exists());
+}
+
+/// C3: a second process loaded its config and token list BEFORE the first one's
+/// persist wedged, so it holds the spent P1. Its kick rotates, and the spend
+/// sends the stage's P2 token, never P1.
+#[test]
+fn a_second_process_holding_the_spent_token_sends_the_staged_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-second-process";
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<std::fs::File>();
+    let calls = std::sync::Arc::new([
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ]);
+    let c = calls.clone();
+    let (base, server) = crate::testutil::serve_endpoints_recording(8, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            if c[0].fetch_add(1, Ordering::SeqCst) == 0 {
+                held_tx
+                    .send(hold_state_flock())
+                    .expect("hand the holder back");
+                (200, CHAIN_MINTED.to_string())
+            } else {
+                (
+                    200,
+                    r#"{"access_token":"at-p3","refresh_token":"rt-p3","expires_in":28800}"#
+                        .to_string(),
+                )
+            }
+        } else if path.starts_with("/api/oauth/usage") {
+            c[1].fetch_add(1, Ordering::SeqCst);
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else if path.starts_with("/v1/messages") {
+            if c[2].fetch_add(1, Ordering::SeqCst) == 0 {
+                (401, r#"{"error":"unauthorized"}"#.to_string())
+            } else {
+                (200, "{}".to_string())
+            }
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    let peer: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("the peer's load"),
+    ));
+    let _ = wedge_a_fetch_rotation(&config, name, &held_rx);
+
+    let _ =
+        crate::oauth::auto_start_kick(&peer, &chain_pn(name), "at-old", Some("rt-old"), None, None);
+    let seen = server.join().expect("listener");
+
+    let sent: Vec<String> = seen
+        .iter()
+        .filter(|(p, _)| p.starts_with("/v1/oauth/token"))
+        .map(|(_, body)| {
+            serde_json::from_str::<serde_json::Value>(body).expect("body")["refresh_token"]
+                .as_str()
+                .expect("refresh_token")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(sent, vec!["rt-old".to_string(), "rt-new".to_string()]);
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-p3"));
+}
+
+/// C7: a token list rebuilt from memory after a wedged persist holds the spent
+/// P1 again (memory never moved). The next tick never spends P1: its catch-up
+/// lands P2, the fetch's 401 carries P2 off the store, and the list ends on P2.
+#[test]
+fn a_rebuilt_token_list_never_spends_the_token_a_wedged_persist_left_behind() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-rebuild";
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<std::fs::File>();
+    let token_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tc = token_calls.clone();
+    let (base, server) = crate::testutil::serve_endpoints_recording(8, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            if tc.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                held_tx
+                    .send(hold_state_flock())
+                    .expect("hand the holder back");
+            }
+            (200, CHAIN_MINTED.to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    let _ = wedge_a_fetch_rotation(&config, name, &held_rx);
+    let rebuilt = super::collect_tokens(&config.lock().expect("config"));
+    assert_eq!(rebuilt[0].refresh_token.as_deref(), Some("rt-old"));
+    let state = chain_state(&config, rebuilt);
+
+    super::tick(&state);
+    let seen = server.join().expect("listener");
+
+    let tokens: Vec<String> = seen
+        .iter()
+        .filter(|(p, _)| p.starts_with("/v1/oauth/token"))
+        .map(|(_, body)| body.clone())
+        .collect();
+    assert_eq!(tokens.len(), 1, "only the wedged rotation spent a token");
+    let list: Vec<Option<String>> = state
+        .tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|e| e.refresh_token.clone())
+        .collect();
+    assert_eq!(list, vec![Some("rt-new".to_string())]);
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-new"));
+}
+
+/// C11 (Linux half): the active profile's live slot is a regular file Claude
+/// Code left holding P1. A wedged persist stages P2, another reader loads, and
+/// the catch-up's landing follows the live slot onto P2.
+#[test]
+fn the_catch_up_follows_a_regular_file_live_slot_onto_the_landed_pair() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-live-slot";
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<std::fs::File>();
+    let (base, server) = crate::testutil::serve_endpoints(4, move |path, i| {
+        if path.starts_with("/v1/oauth/token") {
+            held_tx
+                .send(hold_state_flock())
+                .expect("hand the holder back");
+            (200, CHAIN_MINTED.to_string())
+        } else if path.starts_with("/api/oauth/usage") && i == 0 {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    write_live_mirror("at-old", crate::usage::now_ms() as i64 + 1_000);
+    let _ = wedge_a_fetch_rotation(&config, name, &held_rx);
+    let _ = server.join().expect("listener");
+    let fresh: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("a load before the tick"),
+    ));
+    let state = chain_state(&fresh, Vec::new());
+
+    super::tick(&state);
+
+    assert_eq!(live_slot_access(), "at-new");
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-new"));
+}
+
+/// A stage over the fixture's `rt-old`: base fp("rt-old") hand-computed (first 8
+/// bytes of its SHA-256, hex), the old pair's access `at-old`, the staged pair
+/// `at-mid`/`rt-mid` with a plan stamp (what a rolling stamp needs).
+fn write_chain_stage(name: &str) {
+    std::fs::write(
+        chain_dir(name).join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid",
+                     "expiresAt":4102444800000,"subscriptionType":"max"}}}"#,
+    )
+    .expect("write the stage");
+}
+
+fn write_chain_store(name: &str, access: &str, refresh: &str) {
+    std::fs::write(
+        chain_dir(name).join("credentials.json"),
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":4102444800000,"subscriptionType":"max"}}}}"#
+        ),
+    )
+    .expect("write the store");
+}
+
+/// C21: the store already holds the staged pair (a persist died between its
+/// store write and its hooks). The catch-up runs the hooks with the base pair as
+/// the old one, so the live slot still on P1 follows to P2, then the stage goes.
+#[test]
+fn the_catch_up_runs_the_hooks_a_landed_stage_never_ran() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "chain-landed";
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    write_chain_stage(name);
+    write_chain_store(name, "at-mid", "rt-mid");
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac"]"#,
+    )
+    .expect("record P1");
+    write_live_mirror("at-old", crate::usage::now_ms() as i64 + 1_000);
+    let state = chain_state(&config, Vec::new());
+
+    super::tick(&state);
+
+    assert_eq!(
+        live_slot_access(),
+        "at-mid",
+        "the follower ran for the landed pair"
+    );
+    assert!(!chain_dir(name).join("credentials.json.staged").exists());
+}
+
+/// C28: a lingering stage whose pair the server already consumed, and a writer
+/// that rewound the store onto that pair. The catch-up reads it inert: no hook
+/// follows the live slot onto the dead pair, and the stage goes.
+#[test]
+fn the_catch_up_runs_no_hook_for_a_stage_whose_pair_is_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "chain-rewound";
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    write_chain_stage(name);
+    write_chain_store(name, "at-mid", "rt-mid");
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac","6eebcc2159154314"]"#,
+    )
+    .expect("record P1 and the staged pair");
+    write_live_mirror("at-old", crate::usage::now_ms() as i64 + 1_000);
+    let state = chain_state(&config, Vec::new());
+
+    super::tick(&state);
+
+    assert_eq!(live_slot_access(), "at-old", "no hook follows a spent pair");
+    assert!(!chain_dir(name).join("credentials.json.staged").exists());
+}
+
+/// C19 (CLA-ROLL): a rolling-token profile's live stage lands on the catch-up,
+/// and the landing re-stamps the session token from the landed pair.
+#[test]
+fn the_catch_up_restamps_a_rolling_profiles_session_token() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "chain-rolling";
+    let _ = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    let mut on_disk = crate::profile::load_profile(&chain_pn(name)).expect("load");
+    on_disk.rolling_token = true;
+    crate::profile::save_profile_config(&on_disk).expect("arm rolling");
+    write_chain_stage(name);
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac"]"#,
+    )
+    .expect("record P1");
+    let config: crate::profile::ConfigHandle = Arc::new(RankedMutex::new(
+        crate::profile::load_config().expect("load"),
+    ));
+    let state = chain_state(&config, Vec::new());
+    // The rolling scan would stamp from memory on its own: hold it off, so the
+    // stamp under test is the catch-up landing's.
+    state.claude_rolling.lock().unwrap().next_scan_ms = u64::MAX;
+
+    super::tick(&state);
+
+    let sidecar: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&chain_dir(name).join("session-token.json"))
+            .expect("the re-stamped session token");
+    assert_eq!(sidecar.access_token(), Some("at-mid"));
+    assert_eq!(sidecar.refresh_token(), None);
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-mid"));
+}
+
+/// F2: the kick leg through `run_fetch`: a logout lands while the kick's
+/// rotation is in flight, the persist refuses on the absent store, and the
+/// drain drops the entry with no fetch after it — one token request in all.
+#[test]
+fn a_kick_refused_on_a_cleared_login_drops_the_entry_through_run_fetch() {
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso};
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-kick-cleared";
+    let (base, server) = crate::testutil::serve_endpoints(6, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            let mut cfg = crate::profile::load_config().expect("load config");
+            crate::actions::clear_profile_credentials(&mut cfg, &chain_pn(name))
+                .expect("blank the login");
+            (200, CHAIN_MINTED.to_string())
+        } else if path.starts_with("/v1/messages") {
+            (401, r#"{"error":"unauthorized"}"#.to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    let mut entry = rotation_entry(name, Some(crate::usage::now_ms() as i64 + 86_400_000));
+    entry.auto_start = true;
+    let state = chain_state(&config, vec![entry.clone()]);
+    state.store.lock().unwrap().insert(
+        name.to_string(),
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: 0.0,
+                resets_at: Some(epoch_secs_to_iso(crate::usage::now_epoch_secs() - 60)),
+            }),
+            ..UsageInfo::default()
+        },
+    );
+
+    super::fetch_oauth_due_with(&state, vec![entry], REFRESH_INTERVAL_MS, |e| {
+        super::run_fetch(
+            &state.config,
+            e,
+            &state.store,
+            &state.refetch_queue,
+            &state.activity,
+            &state.poll_streaks,
+            &state.kick_blocks,
+            &state.weekly_reset_kicks,
+            &HashSet::new(),
+            &state.auto_start_queue,
+            REFRESH_INTERVAL_MS,
+        )
+    });
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        seen,
+        vec![
+            "/v1/messages?beta=true".to_string(),
+            "/v1/oauth/token".to_string()
+        ],
+        "one kick, one rotation, and no fetch after the refusal"
+    );
+    assert!(
+        state.tokens.lock().unwrap().is_empty(),
+        "a refusal on a cleared login drops the entry"
+    );
+}
+
+// ── the refresh chain: fix round 1 ───────────────────────────────────────────
+
+/// A store whose token the server consumed (the record names both P1 and the
+/// stored P2) is a rewind, never a fresher pair for the carry.
+#[test]
+fn a_spent_store_is_never_a_fresher_pair() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "chain-fresher-spent";
+    let _ = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    write_chain_store(name, "at-mid", "rt-mid");
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac","6eebcc2159154314"]"#,
+    )
+    .expect("record P1 and P2");
+
+    assert_eq!(super::fresher_disk_pair(&chain_pn(name), "rt-old"), None);
+}
+
+/// A store still holding the token a stage superseded (the stage's own pair
+/// since spent, so the stage is inert, the store's token unrecorded) is never a
+/// fresher pair either: the base clause alone decides it.
+#[test]
+fn a_store_token_a_stage_superseded_is_never_a_fresher_pair() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "chain-fresher-base";
+    let _ = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    write_chain_stage(name);
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["6eebcc2159154314"]"#,
+    )
+    .expect("record the staged pair");
+
+    assert_eq!(super::fresher_disk_pair(&chain_pn(name), "rt-other"), None);
+}
+
+/// A process whose memory predates a wedged persist holds P1 expiring inside
+/// the lead window, while a live stage holds P2 expiring much later. The fetch
+/// leg measures the lead against the stage's expiry, so it polls usage with its
+/// access token and rotates nothing (no carry, no token call).
+#[test]
+fn a_live_stage_expiring_later_holds_off_the_proactive_rotation() {
+    let home = crate::testutil::HomeSandbox::new();
+    let name = "chain-proactive-stage";
+    let (base, server) = crate::testutil::serve_endpoints(4, |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            (200, CHAIN_MINTED.to_string())
+        } else if path.starts_with("/api/oauth/usage") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        }
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    let soon = crate::usage::now_ms() as i64 + 60_000;
+    {
+        let mut cfg = config.lock().expect("config");
+        let oauth = cfg
+            .find_mut(&chain_pn(name))
+            .and_then(|p| p.credentials.as_mut())
+            .and_then(|c| c.claude_ai_oauth.as_mut())
+            .expect("memory login");
+        oauth.expires_at = Some(soon);
+    }
+    write_chain_stage(name);
+    seed_usage_cache(name);
+    let entry = rotation_entry(name, Some(soon));
+    let refetch: super::RefetchQueue = Arc::new(RankedMutex::new(HashSet::new()));
+    let activity: super::ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+
+    let outcome = super::fetch_with_rotation(&config, &entry, None, &refetch, &activity);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(
+        outcome.rotated, None,
+        "nothing carried or rotated: {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.starts_with("/v1/oauth/token")),
+        "no token call: {seen:?}"
+    );
+    assert!(
+        seen.iter().any(|p| p.starts_with("/api/oauth/usage")),
+        "the leg polled usage: {seen:?}"
+    );
+}
+
+/// A landing that keeps failing (the roster no longer names the profile on
+/// disk) logs once, not once per tick; a landing clears the latch, so the next
+/// failure is news again.
+#[test]
+fn a_catch_up_that_keeps_failing_logs_once_until_a_landing() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "chain-catch-up-latch";
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    let registered = crate::profile::load_app_state().expect("state");
+    let mut unregistered = registered.clone();
+    unregistered.profiles.retain(|n| n.as_str() != name);
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac"]"#,
+    )
+    .expect("record P1");
+    write_chain_stage(name);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+
+    crate::profile::save_app_state(&unregistered).expect("unregister");
+    super::catch_up_staged_pairs(&config);
+    super::catch_up_staged_pairs(&config);
+    crate::profile::save_app_state(&registered).expect("register");
+    super::catch_up_staged_pairs(&config);
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-mid"));
+    std::fs::write(
+        chain_dir(name).join("credentials.json.staged"),
+        r#"{"base":"6eebcc2159154314","base_access":"at-mid",
+            "creds":{"claudeAiOauth":{"accessToken":"at-p3","refreshToken":"rt-p3"}}}"#,
+    )
+    .expect("a second stage");
+    crate::profile::save_app_state(&unregistered).expect("unregister again");
+    super::catch_up_staged_pairs(&config);
+
+    let failures = lines
+        .snapshot()
+        .iter()
+        .filter(|l| {
+            l.as_str()
+                == "clauth: 'chain-catch-up-latch': saving the waiting token pair failed: failed \
+                    to persist rotated tokens"
+        })
+        .count();
+    assert_eq!(failures, 2, "{:?}", lines.snapshot());
+}
+
+/// The catch-up waits on a peer's state flock WITHOUT holding the config lock,
+/// so a TUI lease holder's UI keeps its config while the landing waits.
+#[test]
+fn the_catch_up_waits_on_the_flock_without_holding_the_config_lock() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = "chain-catch-up-config";
+    let config = crate::testutil::rotation_fixture_config(&chain_pn(name));
+    std::fs::write(
+        chain_dir(name).join("auth.spent.json"),
+        r#"["068bfce5d78d07ac"]"#,
+    )
+    .expect("record P1");
+    write_chain_stage(name);
+    let holder = hold_state_flock();
+    let worker_config = config.clone();
+    let worker = std::thread::spawn(move || {
+        crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(6)));
+        super::catch_up_staged_pairs(&worker_config);
+        crate::lock::set_state_lock_timeout_override(None);
+    });
+
+    // Past this sleep the worker is inside its flock wait, which lasts until
+    // the holder drops.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut free_while_waiting = false;
+    while std::time::Instant::now() < deadline {
+        if config.try_lock().is_ok() && !worker.is_finished() {
+            free_while_waiting = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    drop(holder);
+    worker.join().expect("catch-up thread");
+
+    assert!(
+        free_while_waiting,
+        "the config lock stayed held across the catch-up's flock wait"
+    );
+    assert_eq!(chain_store_refresh(name).as_deref(), Some("rt-mid"));
 }

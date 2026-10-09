@@ -102,13 +102,10 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 /// 30 s `WATCHDOG_DEADLINE` sit against a 20 s mirror, and the daemon's
 /// comment says to bound this shell-out rather than loosen them. Inside a hold
 /// the clamp below still caps the AGGREGATE at that 20 s however many calls
-/// share it; outside one (the rotation mirror, which `oauth.rs` runs after its
-/// lock closure ends) a mirror's worst case is now 30 s against
-/// `runtime::KEYCHAIN_MIRROR_BUDGET`'s 20 — under-covered by exactly the
-/// verification call, deliberately left un-retuned here and reported to the
-/// caller instead. What keeps that gap safe is the verify leg's own failure
-/// mode: an UNVERIFIABLE write completes rather than failing, so the
-/// under-coverage costs a lock-waiter's margin, never a correct switch.
+/// share it; the rotation mirror, which `oauth.rs` runs after its lock closure
+/// ends, spends the `runtime::KEYCHAIN_MIRROR_BUDGET` its landing arms past the
+/// hold, so the landing's four calls (the foreign gate's item read,
+/// [`item_login_state`], then the mirror's three) share 20 s there too.
 ///
 /// This is the PER-CALL ceiling only. What a waiting peer actually feels is the
 /// whole flock hold, and a hold can run more than one mirror
@@ -127,25 +124,24 @@ const SECURITY_BIN: &str = "/usr/bin/security";
 const SECURITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 // `runtime::KEYCHAIN_MIRROR_BUDGET` still equals the READ+WRITE pair — the two
-// invocations a mirror was when it was derived. The read-back verification
-// (`verify_write`) is a third, riding PAST that budget at its own
-// [`SECURITY_TIMEOUT`]. Retuning the budget to cover it means moving this
-// assert to `* 3` and `runtime::ROTATION_LOCK_TIMEOUT`'s floor term with it, in
-// one change — deliberately not done here (the under-coverage is reported to
-// the caller instead; see [`SECURITY_TIMEOUT`]'s doc for why it is safe to
-// leave). It is spelled over there because this module is macOS-gated while
-// that deadline is one number on every host; the check is a compile error
-// rather than a test because the quantity exists only in this build, so this
-// is the only build that can make it.
+// invocations a mirror was when it was derived. A landing now makes up to four
+// under it: the foreign gate's item read (`item_login_state`) before the pair,
+// and the read-back verification (`verify_write`) after it. A landing arms the
+// budget past its hold, so each later call gets what the earlier ones left. It
+// is spelled
+// over there because this module is macOS-gated while that deadline is one
+// number on every host; the check is a compile error rather than a test
+// because the quantity exists only in this build, so this is the only build
+// that can make it.
 //
 // Still deliberately not `lock::SUBPROCESS_BUDGET`, which it coincides with:
 // that bounds one state-flock hold's shell-outs in aggregate, and
-// `oauth::apply_rotated_tokens_locked` runs its mirror after the closure ends,
-// where `security_deadline` clamps nothing.
+// `oauth::land_pair` runs its mirror after the closure ends, under its own
+// budget.
 const _: () = assert!(
     SECURITY_TIMEOUT.as_millis() * 2 == crate::runtime::KEYCHAIN_MIRROR_BUDGET.as_millis(),
     "runtime::KEYCHAIN_MIRROR_BUDGET must stay two SECURITY_TIMEOUTs wide (the read+write pair; \
-     the verify call rides past it)"
+     the gate read and the verify call share it)"
 );
 
 // The in-flight-delete record's age bound
@@ -166,9 +162,12 @@ const _: () = assert!(
 
 /// The deadline for the next `security` invocation: [`SECURITY_TIMEOUT`], clamped
 /// to whatever the state-lock hold this call sits inside has left to spend
-/// (`lock::clamp_to_hold_budget`). Outside a hold — `oauth.rs` mirrors a rotation
-/// after its lock closure ends — it is [`SECURITY_TIMEOUT`] unchanged, because no
-/// peer is waiting on that call to finish.
+/// (`lock::clamp_to_hold_budget`), or to the budget a scope armed past its hold
+/// (`oauth.rs` mirrors a rotation after its lock closure ends, under the
+/// landing's own budget). Under neither it is [`SECURITY_TIMEOUT`] unchanged:
+/// a caller under the rotation guard (a carry's item read, the convergence's
+/// sign-out) counts it per call in `runtime::ROTATION_LOCK_TIMEOUT`'s holder
+/// sums, since a queued start waits on that guard.
 fn security_deadline() -> Duration {
     crate::lock::clamp_to_hold_budget(SECURITY_TIMEOUT)
 }
