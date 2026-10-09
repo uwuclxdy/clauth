@@ -493,7 +493,7 @@ pub(super) fn scroll_offset(total: usize, viewport: usize, focus: (usize, usize)
         .min(total - viewport)
 }
 
-pub(super) fn follow_scroll_offset(
+pub(crate) fn follow_scroll_offset(
     total: usize,
     viewport: usize,
     focus: (usize, usize),
@@ -521,19 +521,42 @@ pub(super) fn follow_scroll_offset(
     }
 }
 
+/// A selector list's scroll state: the offset the render wrote back, the
+/// visible-row count the last render drew, each cursor row's start line, the
+/// end line its block reaches when focused (own lines plus any tooltip), and
+/// the total line count. The key handler reads these at key time, so its page
+/// step tracks a resize, a multi-line row's spans, and the follow the cursor
+/// landing will produce instead of guessing.
+#[derive(Debug, Default)]
+pub(crate) struct ListView {
+    pub(crate) offset: Cell<usize>,
+    pub(crate) viewport: Cell<usize>,
+    pub(crate) total: Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) tips: std::cell::RefCell<Vec<usize>>,
+}
+
 pub(super) fn draw_following_list(
     frame: &mut Frame<'_>,
     inner: Rect,
     rows: Vec<ListItem<'static>>,
     sel: usize,
-    offset: &Cell<usize>,
+    list: &ListView,
 ) {
     let total = rows.len();
     let viewport = inner.height as usize;
+    list.viewport.set(viewport);
+    list.total.set(total);
+    // A flat `List` has one rendered line per row; a caller whose rows carry a
+    // band header or spacer (Overview) overrides these starts after this call.
+    list.starts.replace((0..total).collect());
+    list.block_ends.replace((0..total).map(|i| i + 1).collect());
+    list.tips.replace(vec![0; total]);
     let prior = if viewport == 0 || total <= viewport {
         0
     } else {
-        offset.get().min(total - viewport)
+        list.offset.get().min(total - viewport)
     };
     let mut state = ListState::default().with_offset(prior);
     state.select(Some(sel));
@@ -542,7 +565,7 @@ pub(super) fn draw_following_list(
         inner,
         &mut state,
     );
-    offset.set(state.offset());
+    list.offset.set(state.offset());
     draw_scrollbar(frame, inner, total, state.offset(), viewport);
 }
 
@@ -553,7 +576,7 @@ pub(super) fn draw_selector_list(
     title: &str,
     focused: bool,
     sel: usize,
-    offset: &Cell<usize>,
+    list: &ListView,
     build_rows: impl FnOnce(u16) -> Vec<Line<'static>>,
 ) {
     let block = section_box(title, focused, true);
@@ -562,7 +585,12 @@ pub(super) fn draw_selector_list(
 
     let rows = build_rows(inner.width);
     if rows.is_empty() {
-        offset.set(0);
+        list.offset.set(0);
+        list.viewport.set(0);
+        list.total.set(0);
+        list.starts.replace(Vec::new());
+        list.block_ends.replace(Vec::new());
+        list.tips.replace(Vec::new());
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -572,7 +600,7 @@ pub(super) fn draw_selector_list(
         inner,
         rows.into_iter().map(ListItem::new).collect(),
         sel,
-        offset,
+        list,
     );
 }
 
@@ -892,7 +920,7 @@ pub(super) fn draw_profile_selector(
         "accounts",
         focused,
         sel,
-        &app.usage_selector_offset,
+        &app.usage_selector,
         |w| {
             cfg.profiles
                 .iter()

@@ -45,7 +45,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
         "accounts",
         focused,
         sel,
-        &app.setup_selector_offset,
+        &app.setup_selector,
         |w| {
             let mut rows: Vec<_> = cfg
                 .profiles
@@ -544,6 +544,9 @@ fn draw_settings_rows(
     // Start + end of the focused row's block (row plus its tooltip lines), so a
     // wrapped hint can't scroll off the bottom while its row stays visible.
     let mut focus = (0usize, 1usize);
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut block_ends: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut tips: Vec<usize> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
@@ -557,11 +560,22 @@ fn draw_settings_rows(
             &input,
             inner.width as usize,
         );
-        let alert_tip = (is_editing && *row == ConfigRow::BellThreshold)
-            .then(|| alert_range_tooltip(&input, inner.width as usize));
+        // The tooltip this row carries when focused: its range tooltip while
+        // editing the bell threshold, else its behaviour hint.
+        let tip_lines: Vec<Line<'static>> = if is_editing && *row == ConfigRow::BellThreshold {
+            alert_range_tooltip(&input, inner.width as usize)
+        } else if !is_editing {
+            row_hint(*row, snap)
+                .map(|text| help_tooltip_lines(&text, inner.width as usize))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let tip_len = tip_lines.len() as u16;
         if is_editing {
             edit_caret = Some((line_idx, input, *row));
         }
+        starts.push(line_idx as usize);
         if selected || is_editing {
             focus.0 = line_idx as usize;
         }
@@ -573,25 +587,28 @@ fn draw_settings_rows(
             });
             line_idx += 1;
         }
-        if selected
-            && !is_editing
-            && let Some(text) = row_hint(*row, snap)
-        {
-            let hint = help_tooltip_lines(&text, inner.width as usize);
-            line_idx += hint.len() as u16;
-            lines.extend(hint);
-        }
-        if let Some(tip) = alert_tip {
-            line_idx += tip.len() as u16;
-            lines.extend(tip);
+        if selected || is_editing {
+            line_idx += tip_len;
+            lines.extend(tip_lines);
         }
         if selected || is_editing {
             focus.1 = line_idx as usize;
         }
+        block_ends.push(if selected || is_editing {
+            line_idx as usize
+        } else {
+            (line_idx + tip_len) as usize
+        });
+        tips.push(tip_len as usize);
     }
 
     // The row list outgrows a short terminal (env entries + model overrides are
     // unbounded), so it scrolls to the focused row rather than clipping its tail.
+    app.setup_detail_viewport.set(inner.height as usize);
+    app.setup_detail_total.set(lines.len());
+    app.setup_detail_row_starts.replace(starts);
+    app.setup_detail_block_ends.replace(block_ends);
+    app.setup_detail_tips.replace(tips);
     let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.setup_detail_offset));
 
     // Position the native terminal cursor at the caret when a text/model field is active.

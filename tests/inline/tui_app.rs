@@ -7382,6 +7382,109 @@ fn status_detail_up_steps_back_from_the_published_bound() {
     );
 }
 
+/// The row-start movers are total at their edges: empty starts, a cursor past
+/// the published starts, and a single row.
+#[test]
+fn page_movers_clamp_at_the_edges() {
+    use super::{page_down_cursor_by_rows, page_up_cursor_by_rows};
+
+    // Empty starts: both return 0.
+    assert_eq!(page_down_cursor_by_rows(0, &[], &[], 10, 0, 0), 0);
+    assert_eq!(page_up_cursor_by_rows(0, &[], &[], &[], 10, 0, 0), 0);
+
+    // One row: page down stays at 0, page up stays at 0.
+    assert_eq!(page_down_cursor_by_rows(0, &[0], &[1], 10, 0, 1), 0);
+    assert_eq!(page_up_cursor_by_rows(0, &[0], &[1], &[0], 10, 0, 1), 0);
+
+    // A cursor past the published starts behaves like the last row (no panic).
+    let starts = [0usize, 4, 8];
+    let ends = [4usize, 8, 12];
+    assert_eq!(page_down_cursor_by_rows(9, &starts, &ends, 4, 0, 12), 2);
+    assert_eq!(
+        page_up_cursor_by_rows(9, &starts, &ends, &[0, 0, 0], 4, 0, 12),
+        1
+    );
+}
+
+/// PageDown on a read-only detail steps the current viewport minus one overlap
+/// line, and a resize changes the step on the next press.
+#[test]
+fn status_detail_page_down_advances_the_viewport_minus_one() {
+    use super::{KeyCode, StatusFocus, Tab, handle_key};
+    use crate::profile::{AppConfig, AppState};
+    use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase};
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let incident = Incident {
+        id: "page-test".into(),
+        title: "page test".into(),
+        link: String::new(),
+        phase: UpdatePhase::Monitoring,
+        impact: Impact::Minor,
+        started_ms: 1_780_740_881_000,
+        resolved_ms: None,
+        components: Vec::new(),
+        updates: (0..60)
+            .map(|i| IncidentUpdate {
+                phase: UpdatePhase::Monitoring,
+                at_ms: 1_780_741_000_000 + i as u64 * 60_000,
+                text: format!("L{i:02}"),
+                transitions: Vec::new(),
+            })
+            .collect(),
+    };
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.tab = Tab::Status;
+    app.status.incidents = vec![incident];
+    app.status.cursor = 0;
+    app.status.focus = StatusFocus::Detail;
+
+    let mut term = Terminal::new(TestBackend::new(80, 16)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.status.detail_viewport.get(),
+        10,
+        "the 80x16 detail draws ten rows"
+    );
+    // The last visible timeline line before the page (line 9 of the view).
+    let before = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    let last_visible = (0..60)
+        .rev()
+        .find(|&i| before.contains(&format!("L{i:02}")))
+        .unwrap();
+    assert!(last_visible > 0, "at least two updates are visible");
+
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.status.detail_scroll, 9, "one page = viewport - 1");
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let after = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        after.contains(&format!("L{last_visible:02}")),
+        "the old line 9 ({last_visible:02}) is the new top row"
+    );
+    assert!(
+        !after.contains(&format!("L{:02}", last_visible - 1)),
+        "the line above scrolled off; the old last line is the top"
+    );
+
+    // A taller terminal grows the viewport; the next press steps height - 1.
+    term.backend_mut().resize(80, 20);
+    term.autoresize().unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let taller = app.status.detail_viewport.get();
+    assert_eq!(taller, 14, "the 80x20 detail draws fourteen rows");
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.status.detail_scroll,
+        9 + 13,
+        "the next press advances the new height minus one"
+    );
+}
+
 /// Plugin's detail pane, same defect and same fix as the Status one above.
 #[test]
 fn plugin_detail_up_steps_back_from_the_published_bound() {
@@ -11164,11 +11267,11 @@ fn usage_read_only_detail_keys_keep_account_and_return_to_selector() {
     app.usage_detail_viewport.set(8);
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     assert_eq!(
-        app.usage_detail_scroll, 8,
-        "page moves by the current viewport"
+        app.usage_detail_scroll, 7,
+        "page moves by the viewport minus one overlap line"
     );
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.usage_detail_scroll, 9, "↓ scrolls one real detail line");
+    assert_eq!(app.usage_detail_scroll, 8, "↓ scrolls one real detail line");
     assert_eq!(
         app.profile_cursor, 1,
         "detail scroll does not change account"
@@ -11211,9 +11314,12 @@ fn tokens_models_detail_keys_keep_model_and_return_to_selector() {
     app.model_detail_max_scroll.set(15);
     app.model_detail_viewport.set(6);
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
-    assert_eq!(app.model_detail_scroll, 6, "page moves by current viewport");
+    assert_eq!(
+        app.model_detail_scroll, 5,
+        "page moves by the viewport minus one overlap line"
+    );
     handle_key(&mut app, crate::testutil::key(KeyCode::Down));
-    assert_eq!(app.model_detail_scroll, 7);
+    assert_eq!(app.model_detail_scroll, 6);
     assert_eq!(app.token_model_cursor, 1, "detail scroll retains model");
     handle_key(&mut app, crate::testutil::key(KeyCode::Esc));
     assert_eq!(app.model_detail_focus, StatusFocus::List);
@@ -11655,6 +11761,7 @@ fn capture_overwrite_cancel_changes_nothing() {
         message: "account 'acme' already exists.".to_string(),
         detail: None,
         choice: false, // cancel is the default-focused, safe choice
+        scroll: super::ConfirmScroll::default(),
         on_confirm: super::ConfirmAction::CaptureOverwrite(
             Box::new(snapshot),
             "acme".to_string(),

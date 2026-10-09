@@ -2377,7 +2377,7 @@ fn the_add_picker_names_a_carried_day_list_before_the_add() {
     // At 80 the blurb holds one line, so the candidates open on the fifth.
     let picker = |app: &App| -> Vec<String> {
         add_detail(app, true, 80, &HashSet::new())
-            .0
+            .lines
             .iter()
             .skip(4)
             .map(line_text)
@@ -2431,7 +2431,7 @@ fn the_add_picker_names_the_blocker_before_a_carried_list() {
     let mut app = App::new(cfg);
     app.fallback_detail_cursor = 0;
     let picker: Vec<String> = add_detail(&app, true, 80, &HashSet::new())
-        .0
+        .lines
         .iter()
         .skip(4)
         .map(line_text)

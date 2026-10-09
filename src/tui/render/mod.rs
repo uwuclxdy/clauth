@@ -18,6 +18,7 @@ mod header;
 mod modals;
 mod overview;
 mod panes;
+pub(crate) use panes::{ListView, follow_scroll_offset};
 pub(super) mod prose;
 mod services;
 mod status;

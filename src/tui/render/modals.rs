@@ -161,7 +161,16 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// tail. On any terminal wide enough for the content nothing splits and the
 /// modal renders exactly as before.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
-    draw_modal_scrolled(frame, area, title, lines, 0, None, None);
+    let _ = draw_modal_scrolled(frame, area, title, lines, 0, None, None);
+}
+
+/// The focus-following modal's scroll/viewport cells and, for option lists,
+/// the geometry to publish — bundled so [`draw_modal_focused`] stays under the
+/// argument-count lint.
+struct ModalFollow<'a> {
+    saved: &'a std::cell::Cell<usize>,
+    viewport: &'a std::cell::Cell<usize>,
+    geometry: Option<ModalGeometry<'a>>,
 }
 
 fn draw_modal_focused(
@@ -170,14 +179,43 @@ fn draw_modal_focused(
     title: &str,
     lines: Vec<Line<'_>>,
     focus: std::ops::Range<usize>,
-    saved: &std::cell::Cell<usize>,
+    follow: ModalFollow<'_>,
 ) {
-    draw_modal_scrolled(frame, area, title, lines, 0, Some((focus, saved)), None);
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        0,
+        Some((focus, follow.saved)),
+        None,
+    );
+    follow.viewport.set(d.viewport as usize);
+    if let Some(g) = follow.geometry {
+        let starts: Vec<usize> = (0..g.count).map(|i| d.line_starts[g.base + i]).collect();
+        let block_ends: Vec<usize> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                if i + 1 < g.count {
+                    d.line_starts[g.base + i + 1]
+                } else {
+                    d.total
+                }
+            })
+            .collect();
+        g.total.set(d.total);
+        g.starts.replace(starts);
+        g.block_ends.replace(block_ends);
+    }
 }
 
 /// [`draw_modal`] with the content scrolled to start at row `scroll`, returning
-/// the largest offset the content allows so a caller holding the offset in state
-/// can clamp its key handler against it (the render pass owns the viewport).
+/// a [`ModalDraw`] — the largest offset the content allows (so a caller holding
+/// the offset can clamp its key handler), the visible row count the render
+/// actually drew, the chunked start row of each input line, and the total line
+/// count (so a key handler's page step tracks a resize and each wrapped
+/// option's spans).
 /// `caret` names a text field's caret as `(line index, cell offset)` over the
 /// lines as handed in: the native terminal cursor lands on that cell after the
 /// chunking below folded the line into rows, or nowhere when the row scrolled
@@ -195,6 +233,27 @@ enum ModalExtra<'a> {
     Buttons(Line<'a>),
 }
 
+/// What [`draw_modal_scrolled`] reports back: the scroll bound and viewport,
+/// plus the chunked geometry the page step needs — the start row of each
+/// pre-chunk line and the total chunked line count.
+struct ModalDraw {
+    max_scroll: u16,
+    viewport: u16,
+    line_starts: Vec<usize>,
+    total: usize,
+}
+
+/// The option list a focus-following modal publishes for the page step: the
+/// pre-chunk line index its first option sits on, the option count, and the
+/// cells the chunked starts/ends/total land in.
+struct ModalGeometry<'a> {
+    base: usize,
+    count: usize,
+    starts: &'a std::cell::RefCell<Vec<usize>>,
+    block_ends: &'a std::cell::RefCell<Vec<usize>>,
+    total: &'a std::cell::Cell<usize>,
+}
+
 fn draw_modal_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -203,7 +262,7 @@ fn draw_modal_scrolled(
     scroll: u16,
     focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>)>,
     extra: Option<ModalExtra<'_>>,
-) -> u16 {
+) -> ModalDraw {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
     let button_w = match &extra {
         Some(ModalExtra::Buttons(buttons)) => buttons.width() as u16,
@@ -216,6 +275,7 @@ fn draw_modal_scrolled(
     let line_count = lines.len();
     let mut caret_row = None;
     let mut focus_rows = (0, 0);
+    let mut line_starts: Vec<usize> = Vec::with_capacity(line_count);
     let mut rows: Vec<Line<'static>> = Vec::new();
     for (i, line) in lines.into_iter().enumerate() {
         if matches!(extra, Some(ModalExtra::Caret(at, _)) if at == i) {
@@ -227,6 +287,7 @@ fn draw_modal_scrolled(
         if focus.as_ref().is_some_and(|(range, _)| range.end == i) {
             focus_rows.1 = rows.len();
         }
+        line_starts.push(rows.len());
         rows.extend(chunk_line(line, inner_w));
     }
     if focus
@@ -236,8 +297,16 @@ fn draw_modal_scrolled(
         focus_rows.1 = rows.len();
     }
     let lines = rows;
+    let total = lines.len();
+    // A too-narrow choice (3 spans) stacks into two rows; a narrower one-span
+    // line (an `Acknowledge` confirm's ` ok `) renders as one row — reserve
+    // only what the branch below actually draws.
     let button_rows = match &extra {
-        Some(ModalExtra::Buttons(buttons)) if buttons.width() > inner_w => 3,
+        Some(ModalExtra::Buttons(buttons))
+            if buttons.width() > inner_w && buttons.spans.len() >= 3 =>
+        {
+            3
+        }
         Some(ModalExtra::Buttons(_)) => 2,
         _ => 0,
     };
@@ -276,25 +345,31 @@ fn draw_modal_scrolled(
             ..inner
         };
         if buttons.width() > inner_w {
-            // No button widget can stack the choice while keeping each complete on a narrow screen.
-            let [cancel, _, add] = &buttons.spans[..] else {
-                unreachable!("a choice always has cancel, gap, and affirmative spans");
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(cancel.clone()).alignment(Alignment::Right)),
-                Rect {
-                    height: 1,
-                    ..button_area
-                },
-            );
-            frame.render_widget(
-                Paragraph::new(Line::from(add.clone()).alignment(Alignment::Right)),
-                Rect {
-                    y: button_area.y + 1,
-                    height: 1,
-                    ..button_area
-                },
-            );
+            match &buttons.spans[..] {
+                // No button widget can stack the choice while keeping each
+                // complete on a narrow screen: the cancel/affirmative pair
+                // stacks into two rows.
+                [cancel, _, add] => {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(cancel.clone()).alignment(Alignment::Right)),
+                        Rect {
+                            height: 1,
+                            ..button_area
+                        },
+                    );
+                    frame.render_widget(
+                        Paragraph::new(Line::from(add.clone()).alignment(Alignment::Right)),
+                        Rect {
+                            y: button_area.y + 1,
+                            height: 1,
+                            ..button_area
+                        },
+                    );
+                }
+                // A one-span line (an `Acknowledge` confirm's ` ok `) has no
+                // pair to stack; render it as a plain right-aligned paragraph.
+                _ => frame.render_widget(Paragraph::new(buttons.clone()), button_area),
+            }
         } else {
             frame.render_widget(Paragraph::new(buttons.clone()), button_area);
         }
@@ -313,7 +388,12 @@ fn draw_modal_scrolled(
             ));
         }
     }
-    max_scroll
+    ModalDraw {
+        max_scroll,
+        viewport: viewport as u16,
+        line_starts,
+        total,
+    }
 }
 
 /// Split one styled line into `w`-column rows by character, preserving span
@@ -463,16 +543,28 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             theme::dim(),
         )));
     }
-    lines.push(Line::from(""));
     // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
         Line::from(modal_button(" ok ", true))
     } else {
         choice_buttons(state.choice, destructive, &confirm_label, "   ")
     };
-    lines.push(buttons.alignment(Alignment::Right));
 
-    draw_modal(frame, area, title, lines);
+    // The body scrolls (`↑`/`↓` one line, `PageUp`/`PageDown` one page) while
+    // the buttons stay pinned — the env-collision review screen's shape, so a
+    // short terminal can reach a confirm's detail tail without losing the
+    // decision row.
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        state.scroll.offset,
+        None,
+        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+    );
+    state.scroll.max_scroll.set(d.max_scroll);
+    state.scroll.viewport.set(d.viewport);
 }
 
 fn choice_buttons(
@@ -556,7 +648,17 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
         "DIVERGENCE",
         lines,
         first + cursor..first + cursor + 1,
-        &form.scroll,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: first,
+                count: actions.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
     );
 }
 
@@ -611,7 +713,17 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
         "SAVE LOGIN",
         lines,
         cursor + 2..cursor + 3,
-        &form.scroll,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: 2,
+                count: form.targets.len() + 1,
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
     );
 }
 
@@ -627,7 +739,7 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
             Line::from(Span::styled(consequence, theme::dim())),
         ];
         // Ratatui has no button-group widget; keep the decision outside the scrolling prose.
-        form.max_scroll.set(draw_modal_scrolled(
+        let d = draw_modal_scrolled(
             frame,
             area,
             "CONFIRM",
@@ -638,7 +750,9 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
                 choice_buttons(form.confirm_overwrite, true, "add", " ")
                     .alignment(Alignment::Right),
             )),
-        ));
+        );
+        form.max_scroll.set(d.max_scroll);
+        form.viewport.set(d.viewport as usize);
         return;
     }
     let options = EnvCollisionForm::options();
@@ -695,7 +809,11 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
         "KEY IN USE",
         lines,
         2 + cursor * 2..4 + cursor * 2,
-        &form.scroll,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: None,
+        },
     );
 }
 
@@ -813,7 +931,17 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
         "PRESET",
         lines,
         2 + cursor..3 + cursor,
-        &form.scroll,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: 2,
+                count: form.presets.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
     );
 }
 
@@ -838,8 +966,6 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
             "usage",
             &[
                 ("\u{2191} \u{2193}", "scroll account detail"),
-                ("page up", "scroll account detail up a viewport"),
-                ("page down", "scroll account detail down a viewport"),
                 ("esc", "return to account selector"),
                 ("\u{2190}", "return to account selector"),
                 ("r", "refresh account"),
@@ -896,8 +1022,6 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
             "tokens",
             &[
                 ("\u{2191} \u{2193}", "scroll model detail"),
-                ("page up", "scroll model detail up a viewport"),
-                ("page down", "scroll model detail down a viewport"),
                 ("esc", "return to model selector"),
                 ("\u{2190}", "return to model selector"),
                 ("c", "count cache in token figures"),
@@ -999,7 +1123,10 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
                     "\u{2191} \u{2193}",
                     "pick row · scroll shunt detail · walk plugin problems · walk herdr options",
                 ),
-                ("page up / page down", "read plugin / herdr diagnostics"),
+                (
+                    "page up / page down",
+                    "scroll a page · read plugin / herdr diagnostics",
+                ),
                 ("\u{21b5}", "open detail · activate an option"),
                 ("space", "activate the focused herdr option"),
                 ("+ / -", "step the tag refresh"),
@@ -1062,7 +1189,7 @@ fn draw_check_output(frame: &mut Frame<'_>, area: Rect, body: &str, app: &App) {
     } else {
         lines
     };
-    app.check_output_max_scroll.set(draw_modal_scrolled(
+    let d = draw_modal_scrolled(
         frame,
         area,
         "check output",
@@ -1070,7 +1197,9 @@ fn draw_check_output(frame: &mut Frame<'_>, area: Rect, body: &str, app: &App) {
         app.check_output_scroll,
         None,
         None,
-    ));
+    );
+    app.check_output_max_scroll.set(d.max_scroll);
+    app.check_output_viewport.set(d.viewport);
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -1125,6 +1254,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("x", "dismiss toast / alert"),
         ("q", "back / quit"),
         ("esc", "back within a sub-view (no-op at the top level)"),
+        ("page up / page down", "scroll a page"),
         ("\u{2303}c", "quit from anywhere"),
     ];
     // A key the current tab redefines is documented in its own section above;
@@ -1151,15 +1281,9 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // terminal too short for the whole modal. ↑↓ reaches the legend from there.
     lines.extend(glyph_section("glyphs", glyph_rows()));
     lines.pop(); // trim trailing blank from last section
-    app.help_max_scroll.set(draw_modal_scrolled(
-        frame,
-        area,
-        title,
-        lines,
-        app.help_scroll,
-        None,
-        None,
-    ));
+    let d = draw_modal_scrolled(frame, area, title, lines, app.help_scroll, None, None);
+    app.help_max_scroll.set(d.max_scroll);
+    app.help_viewport.set(d.viewport);
 }
 
 /// Legend for the 1-cell marks the account surfaces carry, with no key of their
@@ -1342,6 +1466,16 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let inner_w = inner.width;
     let total = state.items.len() + usize::from(rule_at.is_some());
     let viewport = inner.height as usize;
+    state.viewport.set(viewport);
+    state.total.set(total);
+    // The rule line sits between the groups, so a cursor row below it renders
+    // one line further down — the same geometry the page step needs.
+    let starts: Vec<usize> = (0..state.items.len())
+        .map(|i| i + usize::from(rule_at.is_some_and(|at| i >= at as usize)))
+        .collect();
+    let block_ends: Vec<usize> = starts.iter().map(|s| s + 1).collect();
+    state.starts.replace(starts);
+    state.block_ends.replace(block_ends);
     let selected = state.cursor.min(state.items.len().saturating_sub(1));
     let focus = selected + usize::from(rule_at.is_some_and(|at| selected >= at as usize));
     let offset = follow_scroll_offset(total, viewport, (focus, focus + 1), state.scroll.get());

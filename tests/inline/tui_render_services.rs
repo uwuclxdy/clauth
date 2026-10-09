@@ -636,6 +636,145 @@ fn the_plugin_detail_walks_problems_and_f_fixes_the_focused_one() {
     }
 }
 
+/// The shunt card pages by the viewport minus one and re-picks the first
+/// actionable line in view (or none) — the same rule a resize applies.
+#[test]
+fn shunt_card_pages_by_viewport_minus_one_and_resettles_focus() {
+    use crate::tui::app::{Check, Health, ServiceFix, ServicesFocus, ShuntFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = Check {
+        label: "shunt",
+        health: Health::Ok,
+        detail: (0..30).map(|i| format!("plan row {i:02}")).collect(),
+        fix: None,
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Enabled { line: 9 },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    let _ = draw_frame(&app, 80, 14);
+    // 30 lines at 80x14 leave an 8-line card: one page = 7 lines.
+    assert_eq!(
+        app.services.shunt_viewport.get(),
+        8,
+        "the card draws 8 lines"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.services.detail_scroll, 7,
+        "the card pages by viewport - 1 = 7"
+    );
+    let rows = draw_frame(&app, 80, 14);
+    // At scroll 7 the first action line in view is `enabled` (row 9).
+    assert_eq!(
+        app.services.focused_shunt_focus().map(|s| s.kind()),
+        Some(crate::tui::app::ShuntFocusLine::Enabled),
+        "focus re-picks the first action line in view"
+    );
+    assert!(
+        rows.join("\n").contains('❯'),
+        "the focused action line carries the caret"
+    );
+    // F11: a page key that leaves the scroll unchanged (already at the end)
+    // keeps the held focus instead of re-picking the first action line.
+    app.services.detail_scroll = app.services.detail_max_scroll.get();
+    app.services
+        .shunt_focus
+        .set(Some(crate::tui::app::ShuntFocusLine::Move));
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.services.detail_scroll,
+        app.services.detail_max_scroll.get(),
+        "the card is already at the bottom"
+    );
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(crate::tui::app::ShuntFocusLine::Move),
+        "the held focus stays when the page did not move"
+    );
+}
+
+#[test]
+fn shunt_page_keeps_held_focus_when_a_resize_fits_the_card() {
+    use crate::tui::app::{Check, Health, ServiceFix, ServicesFocus, ShuntFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = Check {
+        label: "shunt",
+        health: Health::Ok,
+        detail: (0..30).map(|i| format!("plan row {i:02}")).collect(),
+        fix: None,
+        problems: Vec::new(),
+        shunt_focus: vec![
+            ShuntFocus::Fix {
+                line: 5,
+                fix: ServiceFix::MoveStoresIn,
+            },
+            ShuntFocus::Enabled { line: 9 },
+        ],
+        shunt_action_start: Some(0),
+    };
+    let mut app = app_with(check);
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    assert_eq!(app.services.focus, ServicesFocus::Detail);
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    // ↓↓ lands focus on the `enabled` row, two lines into the card.
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(crate::tui::app::ShuntFocusLine::Enabled),
+        "two ↓ land on the enabled row"
+    );
+    // Grow the terminal so the card fits: the rendered offset clamps to 0 while
+    // the stored scroll stays above the new bound.
+    term.backend_mut().resize(80, 50);
+    term.autoresize().unwrap();
+    term.draw(|f| super::super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.services.detail_max_scroll.get(),
+        0,
+        "the grown card fits"
+    );
+    let rendered_before = app
+        .services
+        .detail_scroll
+        .min(app.services.detail_max_scroll.get());
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(crate::tui::app::ShuntFocusLine::Enabled),
+        "a page that moves nothing keeps the held focus"
+    );
+    assert_eq!(
+        app.services
+            .detail_scroll
+            .min(app.services.detail_max_scroll.get()),
+        rendered_before,
+        "the rendered offset stays put"
+    );
+    // PageUp twin: still nothing moves.
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(
+        app.services.shunt_focus.get(),
+        Some(crate::tui::app::ShuntFocusLine::Enabled),
+        "the PageUp twin keeps the held focus too"
+    );
+}
+
 #[test]
 fn plugin_diagnostics_and_fix_remain_reachable_after_page_scroll() {
     use crate::tui::app::{ServicesFocus, handle_key};
@@ -656,7 +795,9 @@ fn plugin_diagnostics_and_fix_remain_reachable_after_page_scroll() {
     assert_eq!(
         app.services.detail_scroll,
         initial_offset
-            .saturating_add(app.services.detail_viewport.get())
+            .saturating_add(
+                crate::tui::app::page_step(app.services.detail_viewport.get() as usize) as u16
+            )
             .min(app.services.detail_max_scroll.get()),
         "paging starts at the visible problem, not a stale scroll field"
     );
@@ -665,8 +806,10 @@ fn plugin_diagnostics_and_fix_remain_reachable_after_page_scroll() {
     handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
     assert_eq!(
         app.services.detail_scroll,
-        once.saturating_add(app.services.detail_viewport.get())
-            .min(app.services.detail_max_scroll.get()),
+        once.saturating_add(
+            crate::tui::app::page_step(app.services.detail_viewport.get() as usize) as u16
+        )
+        .min(app.services.detail_max_scroll.get()),
         "a second page press before redraw must move"
     );
     for _ in 0..5 {
@@ -732,7 +875,9 @@ fn herdr_diagnostics_and_options_remain_reachable_after_page_scroll() {
     handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
     assert_eq!(
         app.services.detail_scroll,
-        initial_offset.saturating_sub(app.services.detail_viewport.get()),
+        initial_offset.saturating_sub(crate::tui::app::page_step(
+            app.services.detail_viewport.get() as usize
+        ) as u16),
         "PageUp starts at the displayed options, not at an unused scroll field"
     );
     let next = draw_frame(&app, 80, 14).join("\n");
@@ -3324,5 +3469,32 @@ fn a_herdr_probe_error_styles_its_backticked_command() {
         "/opt/bin/herdr plugin list --json failed",
         "/opt/bin/herdr plugin list --json",
         false,
+    );
+}
+
+/// A generic detail (any label other than herdr/plugin/shunt) pages its scroll
+/// offset one page — the arm the selectors and forms don't reach. The literal
+/// is the detail pane's visible rows minus one at 80x14.
+#[test]
+fn services_generic_detail_pages_by_hand_pinned_offset() {
+    use crate::tui::app::{Check, Health, ServicesFocus, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let check = Check {
+        label: "future",
+        health: Health::Idle,
+        detail: (0..30).map(|i| format!("detail line {i:02}")).collect(),
+        fix: None,
+        problems: Vec::new(),
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
+    };
+    let mut app = app_with(check);
+    app.services.focus = ServicesFocus::Detail;
+    let _ = draw_frame(&app, 80, 14);
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.services.detail_scroll, 7,
+        "generic detail pages by viewport - 1"
     );
 }

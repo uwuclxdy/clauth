@@ -104,7 +104,11 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         &[]
     };
     if app.config().profiles.is_empty() && codex.is_empty() {
-        app.overview_selector_offset.set(0);
+        app.overview_selector.offset.set(0);
+        app.overview_selector.viewport.set(0);
+        app.overview_selector.starts.replace(Vec::new());
+        app.overview_selector.block_ends.replace(Vec::new());
+        app.overview_selector.total.set(0);
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -144,21 +148,34 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         };
         rows.push(ListItem::new(select_line(line, selected, focused, width)));
     }
+    // One three-way offset: the blank + header the codex band inserts ahead of
+    // its first row, used for both the selection's rendered row and the
+    // cursor-indexed starts the page step reads.
+    let codex_off = if codex.is_empty() {
+        0
+    } else if claude_count > 0 {
+        2
+    } else {
+        1
+    };
     let render_sel = sel
         + if codex.is_empty() || sel < claude_count {
             0
-        } else if claude_count > 0 {
-            2
         } else {
-            1
+            codex_off
         };
-    draw_following_list(
-        frame,
-        list_area,
-        rows,
-        render_sel,
-        &app.overview_selector_offset,
-    );
+    draw_following_list(frame, list_area, rows, render_sel, &app.overview_selector);
+    // The list's rows are flat, but the codex band inserts a blank spacer and a
+    // header ahead of the first codex row, so cursor row -> rendered line is
+    // not the identity. Republish the cursor-indexed starts for the page step.
+    let starts: Vec<usize> = items
+        .iter()
+        .enumerate()
+        .map(|(i, _)| if i < claude_count { i } else { i + codex_off })
+        .collect();
+    let block_ends: Vec<usize> = starts.iter().map(|s| s + 1).collect();
+    app.overview_selector.starts.replace(starts);
+    app.overview_selector.block_ends.replace(block_ends);
 }
 
 #[derive(Debug, Clone, Copy)]

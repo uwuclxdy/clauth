@@ -58,6 +58,7 @@ use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_m
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
 use crate::tui::render::prose::{self, cmd_lit};
+use crate::tui::render::{ListView, follow_scroll_offset};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
@@ -823,7 +824,22 @@ pub(crate) struct ConfirmState {
     pub(crate) detail: Option<String>,
     /// Highlighted choice: false = cancel, true = confirm.
     pub(crate) choice: bool,
+    /// Body scroll state for an overflowing confirm body: `↑`/`↓` scroll one
+    /// line, `PageUp`/`PageDown` one page, while the buttons stay pinned. The
+    /// render publishes the bound and the viewport; the key handler clamps.
+    pub(crate) scroll: ConfirmScroll,
     pub(crate) on_confirm: ConfirmAction,
+}
+
+/// The scroll a confirm modal's body carries. `offset` is the key handler's
+/// own state; `max_scroll` and `viewport` are what the last render drew, so a
+/// resize changes the page step on the next press. `Default` keeps the many
+/// one-line confirms at the top of their (fitting) bodies.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfirmScroll {
+    pub(crate) offset: u16,
+    pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) viewport: std::cell::Cell<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -966,6 +982,10 @@ pub(crate) struct PresetPickerForm {
     pub(crate) presets: Vec<crate::presets::Preset>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -993,6 +1013,10 @@ pub(crate) struct DivergenceForm {
     pub(crate) sibling: Option<ProfileName>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 /// The non-blocking divergence signal behind the accounts-pane banner: set by
@@ -1064,6 +1088,10 @@ pub(crate) struct DivergenceTargetForm {
     pub(crate) targets: Vec<String>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 /// A choice on the env-key collision prompt (3 vertical options).
@@ -1094,6 +1122,7 @@ pub(crate) struct EnvCollisionForm {
     pub(crate) reviewing_overwrite: bool,
     pub(crate) confirm_overwrite: bool,
     pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) viewport: std::cell::Cell<usize>,
     pub(crate) overwrite_needs_review: std::cell::Cell<bool>,
 }
 
@@ -1198,6 +1227,13 @@ pub(crate) struct ActionMenuState {
     pub(crate) context: Option<String>,
     pub(crate) cursor: usize,
     pub(crate) scroll: std::cell::Cell<usize>,
+    /// Visible menu rows from the last render (the page step).
+    pub(crate) viewport: std::cell::Cell<usize>,
+    /// Chunked row starts/ends per item and the total row count, published by
+    /// the render so the page step accounts for the group-rule line.
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 impl ActionMenuState {
@@ -1244,6 +1280,10 @@ impl ActionMenuState {
             context,
             cursor: 0,
             scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
         }
     }
 }
@@ -1610,7 +1650,7 @@ pub(crate) struct StatusState {
     /// Selected incident index in `incidents`.
     pub(crate) cursor: usize,
     pub(crate) focus: StatusFocus,
-    pub(crate) selector_offset: std::cell::Cell<usize>,
+    pub(crate) selector: ListView,
     /// Scroll offset (lines) into the detail timeline.
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last detail render (`total - viewport`).
@@ -1618,6 +1658,8 @@ pub(crate) struct StatusState {
     /// `&App` interior mutability) and the key handler clamps against it — that
     /// stops a held ↓ from inflating `detail_scroll` toward `u16::MAX`.
     pub(crate) detail_max_scroll: std::cell::Cell<u16>,
+    /// Visible detail-timeline rows from the last render (the page step).
+    pub(crate) detail_viewport: std::cell::Cell<u16>,
     /// Newest incident id already signalled, so a refresh only toasts genuinely
     /// new incidents (not the initial load).
     pub(crate) seen_latest: Option<String>,
@@ -1633,9 +1675,10 @@ impl Default for StatusState {
             fetching: false,
             cursor: 0,
             focus: StatusFocus::List,
-            selector_offset: std::cell::Cell::new(0),
+            selector: ListView::default(),
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
+            detail_viewport: std::cell::Cell::new(0),
             seen_latest: None,
         }
     }
@@ -2120,7 +2163,7 @@ pub(crate) struct ServicesState {
     pub(crate) focus: ServicesFocus,
     /// Cursor over the service rows (`0..checks.len()`).
     pub(crate) cursor: usize,
-    pub(crate) selector_offset: std::cell::Cell<usize>,
+    pub(crate) selector: ListView,
     pub(crate) form_offset: std::cell::Cell<usize>,
     pub(crate) detail_scroll: u16,
     pub(crate) diagnostic_focus: bool,
@@ -2259,7 +2302,7 @@ impl Default for ServicesState {
         Self {
             focus: ServicesFocus::List,
             cursor: 0,
-            selector_offset: std::cell::Cell::new(0),
+            selector: ListView::default(),
             form_offset: std::cell::Cell::new(0),
             detail_scroll: 0,
             diagnostic_focus: false,
@@ -2729,23 +2772,44 @@ pub(crate) struct App {
     pub(crate) check_output_scroll: u16,
     /// Max valid `check_output_scroll` from the last `check output` render.
     pub(crate) check_output_max_scroll: std::cell::Cell<u16>,
+    /// Visible `check output`-modal rows from the last render — the key
+    /// handler's page step, published like `help_viewport`.
+    pub(crate) check_output_viewport: std::cell::Cell<u16>,
+    /// Visible help-modal rows from the last render — the key handler's page
+    /// step (`PageUp`/`PageDown`), published like `help_max_scroll`.
+    pub(crate) help_viewport: std::cell::Cell<u16>,
 
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
-    pub(crate) overview_selector_offset: std::cell::Cell<usize>,
+    pub(crate) overview_selector: ListView,
     pub(crate) overview_cursor: usize,
-    pub(crate) usage_selector_offset: std::cell::Cell<usize>,
+    pub(crate) usage_selector: ListView,
     pub(crate) usage_detail_focus: StatusFocus,
     pub(crate) usage_detail_scroll: usize,
     pub(crate) usage_detail_max_scroll: std::cell::Cell<usize>,
     pub(crate) usage_detail_viewport: std::cell::Cell<usize>,
-    pub(crate) setup_selector_offset: std::cell::Cell<usize>,
-    pub(crate) chain_selector_offset: std::cell::Cell<usize>,
-    pub(crate) models_selector_offset: std::cell::Cell<usize>,
+    pub(crate) setup_selector: ListView,
+    pub(crate) chain_selector: ListView,
+    pub(crate) models_selector: ListView,
     pub(crate) setup_detail_offset: std::cell::Cell<usize>,
+    pub(crate) setup_detail_viewport: std::cell::Cell<usize>,
+    pub(crate) setup_detail_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_total: std::cell::Cell<usize>,
     pub(crate) fallback_detail_offset: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_viewport: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_total: std::cell::Cell<usize>,
     pub(crate) global_config_offset: std::cell::Cell<usize>,
+    pub(crate) global_config_viewport: std::cell::Cell<usize>,
+    pub(crate) global_config_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_total: std::cell::Cell<usize>,
     /// Which harness the Overview lists (`c` cycles). A view filter only — see
     /// [`HarnessFilter`].
     pub(crate) harness_filter: HarnessFilter,
@@ -3300,20 +3364,37 @@ impl App {
             help_max_scroll: std::cell::Cell::new(0),
             check_output_scroll: 0,
             check_output_max_scroll: std::cell::Cell::new(0),
+            check_output_viewport: std::cell::Cell::new(0),
+            help_viewport: std::cell::Cell::new(0),
             profile_cursor: 0,
-            overview_selector_offset: std::cell::Cell::new(0),
+            overview_selector: ListView::default(),
             overview_cursor: 0,
-            usage_selector_offset: std::cell::Cell::new(0),
+            usage_selector: ListView::default(),
             usage_detail_focus: StatusFocus::List,
             usage_detail_scroll: 0,
             usage_detail_max_scroll: std::cell::Cell::new(0),
             usage_detail_viewport: std::cell::Cell::new(0),
-            setup_selector_offset: std::cell::Cell::new(0),
-            chain_selector_offset: std::cell::Cell::new(0),
-            models_selector_offset: std::cell::Cell::new(0),
+            setup_selector: ListView::default(),
+            chain_selector: ListView::default(),
+            models_selector: ListView::default(),
             setup_detail_offset: std::cell::Cell::new(0),
+            setup_detail_viewport: std::cell::Cell::new(0),
+            setup_detail_row_starts: std::cell::RefCell::new(Vec::new()),
+            setup_detail_block_ends: std::cell::RefCell::new(Vec::new()),
+            setup_detail_tips: std::cell::RefCell::new(Vec::new()),
+            setup_detail_total: std::cell::Cell::new(0),
             fallback_detail_offset: std::cell::Cell::new(0),
+            fallback_detail_viewport: std::cell::Cell::new(0),
+            fallback_detail_row_starts: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_block_ends: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_tips: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_total: std::cell::Cell::new(0),
             global_config_offset: std::cell::Cell::new(0),
+            global_config_viewport: std::cell::Cell::new(0),
+            global_config_row_starts: std::cell::RefCell::new(Vec::new()),
+            global_config_block_ends: std::cell::RefCell::new(Vec::new()),
+            global_config_tips: std::cell::RefCell::new(Vec::new()),
+            global_config_total: std::cell::Cell::new(0),
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
             fallback_focus: FallbackFocus::Chain,
@@ -4422,7 +4503,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 .and_then(|item| app.main_items().iter().position(|row| *row == item))
                 .unwrap_or(0);
             app.sync_overview_profile_selection();
-            app.overview_selector_offset.set(0);
+            app.overview_selector.offset.set(0);
             return;
         }
         KeyCode::Char('a') => {
@@ -4469,6 +4550,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::RotateAll,
             }));
             return;
@@ -4687,17 +4769,18 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
                             app.model_detail_scroll.min(max).saturating_add(1).min(max)
                     }
                     KeyCode::PageUp => {
-                        app.model_detail_scroll = app
-                            .model_detail_scroll
-                            .min(max)
-                            .saturating_sub(viewport.max(1))
+                        app.model_detail_scroll = page_up_scroll(
+                            app.model_detail_scroll as usize,
+                            max as usize,
+                            viewport as usize,
+                        ) as u16
                     }
                     KeyCode::PageDown => {
-                        app.model_detail_scroll = app
-                            .model_detail_scroll
-                            .min(max)
-                            .saturating_add(viewport.max(1))
-                            .min(max)
+                        app.model_detail_scroll = page_down_scroll(
+                            app.model_detail_scroll as usize,
+                            max as usize,
+                            viewport as usize,
+                        ) as u16
                     }
                     _ => {}
                 }
@@ -4710,6 +4793,16 @@ fn handle_tokens_key(app: &mut App, key: KeyEvent) {
                     }
                     KeyCode::Down if len > 0 => {
                         app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::PageUp if len > 0 => {
+                        app.token_model_cursor =
+                            selector_page_up(app.token_model_cursor, &app.models_selector);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::PageDown if len > 0 => {
+                        app.token_model_cursor =
+                            selector_page_down(app.token_model_cursor, &app.models_selector);
                         app.model_detail_scroll = 0;
                     }
                     KeyCode::Enter if len > 0 => {
@@ -4799,6 +4892,145 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
     app.reload_selected_note();
 }
 
+/// One page = the current viewport minus one overlap line (minimum 1), so a
+/// page down keeps the old bottom line as the new top line. Every scrollable
+/// surface steps by this; `↑`/`↓` stay one row/line and keep their wrapping.
+pub(crate) fn page_step(viewport: usize) -> usize {
+    viewport.saturating_sub(1).max(1)
+}
+
+/// Page down on a read-only scroll offset, clamped to the last render's bound.
+pub(crate) fn page_down_scroll(scroll: usize, max: usize, viewport: usize) -> usize {
+    scroll.min(max).saturating_add(page_step(viewport)).min(max)
+}
+
+/// Page up on a read-only scroll offset, clamped to the last render's bound.
+pub(crate) fn page_up_scroll(scroll: usize, max: usize, viewport: usize) -> usize {
+    scroll.min(max).saturating_sub(page_step(viewport))
+}
+
+/// Page down on a cursor list over its published row geometry: the cursor
+/// lands on the last row whose start line is within one page (`viewport - 1`
+/// lines) below the current row's start, at least one row forward, stopping at
+/// the last row — walking back if the follow that landing produces would push
+/// the old bottom line off the top (a focused row's tooltip moves with the
+/// cursor). `starts[i]` is the rendered line where row `i` begins; `block_ends`
+/// is the line its block reaches when focused; `offset`/`total` are the last
+/// render's scroll and line count.
+pub(crate) fn page_down_cursor_by_rows(
+    cursor: usize,
+    starts: &[usize],
+    block_ends: &[usize],
+    viewport: usize,
+    offset: usize,
+    total: usize,
+) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let last = starts.len() - 1;
+    let cursor = cursor.min(last);
+    if cursor >= last {
+        return last;
+    }
+    let target = starts[cursor] + page_step(viewport);
+    let mut next = cursor + 1;
+    while next < last && starts[next + 1] <= target {
+        next += 1;
+    }
+    while next > cursor + 1 {
+        let end = block_ends
+            .get(next)
+            .copied()
+            .unwrap_or(starts[next] + 1)
+            .max(starts[next] + 1);
+        let predicted = follow_scroll_offset(total, viewport, (starts[next], end), offset);
+        if predicted <= offset + page_step(viewport) {
+            break;
+        }
+        next -= 1;
+    }
+    next
+}
+
+/// Page up mirror of [`page_down_cursor_by_rows`]: the cursor lands on the
+/// first row whose start line is within one page above the current row's
+/// start, at least one row back, stopping at the first row — walking forward
+/// if the follow would push the old top line off the bottom. The landing row's
+/// focused tooltip inserts `tips[prev]` lines above the old top line, so the
+/// continuity bound is `offset + tip - page_step`, not `offset - page_step`.
+pub(crate) fn page_up_cursor_by_rows(
+    cursor: usize,
+    starts: &[usize],
+    block_ends: &[usize],
+    tips: &[usize],
+    viewport: usize,
+    offset: usize,
+    total: usize,
+) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    if cursor == 0 {
+        return 0;
+    }
+    let target = starts[cursor].saturating_sub(page_step(viewport));
+    let mut prev = cursor - 1;
+    while prev > 0 && starts[prev - 1] >= target {
+        prev -= 1;
+    }
+    while prev < cursor - 1 {
+        let end = block_ends
+            .get(prev)
+            .copied()
+            .unwrap_or(starts[prev] + 1)
+            .max(starts[prev] + 1);
+        let predicted = follow_scroll_offset(total, viewport, (starts[prev], end), offset);
+        let tip = tips.get(prev).copied().unwrap_or(0);
+        if predicted
+            >= offset
+                .saturating_add(tip)
+                .saturating_sub(page_step(viewport))
+        {
+            break;
+        }
+        prev += 1;
+    }
+    prev
+}
+
+/// Page down on a [`ListView`] cursor (single-line selector rows), reading the
+/// geometry the render published.
+fn selector_page_down(cursor: usize, list: &ListView) -> usize {
+    let starts = list.starts.borrow();
+    let block_ends = list.block_ends.borrow();
+    page_down_cursor_by_rows(
+        cursor,
+        &starts,
+        &block_ends,
+        list.viewport.get(),
+        list.offset.get(),
+        list.total.get(),
+    )
+}
+
+/// Page up on a [`ListView`] cursor, the mirror of [`selector_page_down`].
+fn selector_page_up(cursor: usize, list: &ListView) -> usize {
+    let starts = list.starts.borrow();
+    let block_ends = list.block_ends.borrow();
+    let tips = list.tips.borrow();
+    page_up_cursor_by_rows(
+        cursor,
+        &starts,
+        &block_ends,
+        &tips,
+        list.viewport.get(),
+        list.offset.get(),
+        list.total.get(),
+    )
+}
+
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
     let count = app.main_items().len();
     match key.code {
@@ -4810,6 +5042,14 @@ fn handle_overview_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Down if count > 0 => {
             app.overview_cursor = (app.overview_cursor + 1) % count;
+            app.sync_overview_profile_selection();
+        }
+        KeyCode::PageUp if count > 0 => {
+            app.overview_cursor = selector_page_up(app.overview_cursor, &app.overview_selector);
+            app.sync_overview_profile_selection();
+        }
+        KeyCode::PageDown if count > 0 => {
+            app.overview_cursor = selector_page_down(app.overview_cursor, &app.overview_selector);
             app.sync_overview_profile_selection();
         }
         KeyCode::Enter => activate_main_item(app),
@@ -4831,17 +5071,10 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
                     app.usage_detail_scroll.min(max).saturating_add(1).min(max)
             }
             KeyCode::PageUp => {
-                app.usage_detail_scroll = app
-                    .usage_detail_scroll
-                    .min(max)
-                    .saturating_sub(viewport.max(1))
+                app.usage_detail_scroll = page_up_scroll(app.usage_detail_scroll, max, viewport)
             }
             KeyCode::PageDown => {
-                app.usage_detail_scroll = app
-                    .usage_detail_scroll
-                    .min(max)
-                    .saturating_add(viewport.max(1))
-                    .min(max)
+                app.usage_detail_scroll = page_down_scroll(app.usage_detail_scroll, max, viewport)
             }
             KeyCode::Char('e') => toggle_show_estimates(app),
             KeyCode::Char('p') => toggle_show_pace(app),
@@ -4857,6 +5090,16 @@ fn handle_usage_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Down => {
             step_profile_cursor(app, 1, count);
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::PageUp => {
+            app.profile_cursor = selector_page_up(app.profile_cursor, &app.usage_selector);
+            app.reload_selected_note();
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::PageDown => {
+            app.profile_cursor = selector_page_down(app.profile_cursor, &app.usage_selector);
+            app.reload_selected_note();
             app.usage_detail_scroll = 0;
         }
         KeyCode::Enter if count > 0 => {
@@ -4977,6 +5220,14 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
                     app.status.cursor = (app.status.cursor + 1).rem_euclid(len.max(1));
                     app.status.detail_scroll = 0;
                 }
+                KeyCode::PageUp if len > 0 => {
+                    app.status.cursor = selector_page_up(app.status.cursor, &app.status.selector);
+                    app.status.detail_scroll = 0;
+                }
+                KeyCode::PageDown if len > 0 => {
+                    app.status.cursor = selector_page_down(app.status.cursor, &app.status.selector);
+                    app.status.detail_scroll = 0;
+                }
                 KeyCode::Enter if len > 0 => {
                     app.status.focus = StatusFocus::Detail;
                     app.status.detail_scroll = 0;
@@ -4999,6 +5250,22 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
                 // run the offset past the end (which would make ↑ look dead).
                 let max = app.status.detail_max_scroll.get();
                 app.status.detail_scroll = app.status.detail_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::PageUp => {
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = page_up_scroll(
+                    app.status.detail_scroll as usize,
+                    max as usize,
+                    app.status.detail_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = page_down_scroll(
+                    app.status.detail_scroll as usize,
+                    max as usize,
+                    app.status.detail_viewport.get() as usize,
+                ) as u16;
             }
             _ => {}
         },
@@ -5035,6 +5302,20 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
+                KeyCode::PageUp if len > 0 => {
+                    app.services.cursor =
+                        selector_page_up(app.services.cursor, &app.services.selector);
+                    app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
+                    app.services.land_on_herdr = false;
+                }
+                KeyCode::PageDown if len > 0 => {
+                    app.services.cursor =
+                        selector_page_down(app.services.cursor, &app.services.selector);
+                    app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
+                    app.services.land_on_herdr = false;
+                }
                 KeyCode::Enter if len > 0 => {
                     // The user has acted: any still-pending herdr landing is
                     // cancelled, whether or not this descends.
@@ -5065,7 +5346,7 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
             {
                 let max = app.services.detail_max_scroll.get();
-                let viewport = app.services.detail_viewport.get().max(1);
+                let viewport = app.services.detail_viewport.get();
                 let origin = if app.services.diagnostic_focus {
                     app.services.detail_scroll.min(max)
                 } else {
@@ -5073,9 +5354,9 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 };
                 app.services.diagnostic_focus = true;
                 app.services.detail_scroll = if key.code == KeyCode::PageDown {
-                    origin.saturating_add(viewport).min(max)
+                    page_down_scroll(origin as usize, max as usize, viewport as usize) as u16
                 } else {
-                    origin.saturating_sub(viewport)
+                    page_up_scroll(origin as usize, max as usize, viewport as usize) as u16
                 };
             } else if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
@@ -5100,6 +5381,22 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                         let max = app.services.detail_max_scroll.get();
                         app.services.detail_scroll =
                             app.services.detail_scroll.saturating_add(1).min(max);
+                    }
+                    KeyCode::PageUp => {
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll = page_up_scroll(
+                            app.services.detail_scroll as usize,
+                            max as usize,
+                            app.services.detail_viewport.get() as usize,
+                        ) as u16;
+                    }
+                    KeyCode::PageDown => {
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll = page_down_scroll(
+                            app.services.detail_scroll as usize,
+                            max as usize,
+                            app.services.detail_viewport.get() as usize,
+                        ) as u16;
                     }
                     KeyCode::Char('f') => apply_service_fix(app),
                     _ => {}
@@ -5144,6 +5441,8 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Up => shunt_step(app, false),
         KeyCode::Down => shunt_step(app, true),
+        KeyCode::PageUp => shunt_page(app, false),
+        KeyCode::PageDown => shunt_page(app, true),
         KeyCode::Char('f') => apply_service_fix(app),
         KeyCode::Enter | KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
             Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
@@ -5267,6 +5566,41 @@ fn shunt_step(app: &mut App, down: bool) {
 /// Whether a rendered row is inside the current viewport.
 fn shunt_in_view(scroll: u16, viewport: usize, r: usize) -> bool {
     r >= scroll as usize && r < scroll as usize + viewport
+}
+
+/// One `PageUp`/`PageDown` on the shunt card: scroll the read-only detail one
+/// page (`viewport - 1` lines), then re-pick the first actionable line in view
+/// (or none) — the same rule a resize applies.
+fn shunt_page(app: &mut App, down: bool) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    if rows.len() != stops.len() {
+        // Geometry not published yet (a key before the first draw) — as in
+        // `shunt_step`, there is nothing to walk over.
+        return;
+    }
+    let max = app.services.detail_max_scroll.get();
+    let viewport = app.services.shunt_viewport.get() as usize;
+    // Compare the RENDERED offset (the stored scroll clamped to the last
+    // render's bound), not the raw stored value: a taller terminal leaves the
+    // stored scroll above the new bound, and a page over a stale number must
+    // not re-pick focus while the rendered view stays put.
+    let before = app.services.detail_scroll.min(max);
+    let paged = if down {
+        page_down_scroll(before as usize, max as usize, viewport) as u16
+    } else {
+        page_up_scroll(before as usize, max as usize, viewport) as u16
+    };
+    app.services.detail_scroll = paged;
+    if paged == before {
+        // The card fits, or is already at this end: the held focus stays.
+        return;
+    }
+    app.services
+        .shunt_focus
+        .set(shunt_first_in_view(&stops, &rows, paged, viewport));
 }
 
 /// The shunt card's descend rule: the first actionable line in view, else
@@ -5419,6 +5753,7 @@ fn apply_service_fix(app: &mut App) {
                         .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::WireMcpServers,
             }));
         }
@@ -5435,6 +5770,7 @@ fn apply_service_fix(app: &mut App) {
                     .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::HealHerdrConfig(path),
             }));
         }
@@ -5447,6 +5783,7 @@ fn apply_service_fix(app: &mut App) {
                         .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::InstallPlugin,
             }));
         }
@@ -5456,6 +5793,7 @@ fn apply_service_fix(app: &mut App) {
                 message: format!("adopt {}?", escape_control(&path.to_string_lossy())),
                 detail: Some("clauth runs shunt on this config and edits it in place.".to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::AdoptConfig(path),
             }));
         }
@@ -5468,6 +5806,7 @@ fn apply_service_fix(app: &mut App) {
                     "clauth needs it to manage pool accounts and read their usage.".to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::AddAdminKey,
             }));
         }
@@ -5477,6 +5816,7 @@ fn apply_service_fix(app: &mut App) {
                 message: "add a [server.admin] table with clauth's key?".to_string(),
                 detail: Some("the gateway restarts once to load it.".to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::AddAdminTable,
             }));
         }
@@ -5498,6 +5838,7 @@ fn open_move_confirm(app: &mut App) {
         message: format!("move {n} {} into clauth?", account_files_word(n)),
         detail: (k > 0).then(|| format!("{k} {} behind, listed on the card.", stays_word(k))),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::MoveStoresIn(plan),
     }));
 }
@@ -5777,6 +6118,7 @@ fn open_herdr_row_text_confirm(app: &mut App) {
             .to_string()
         }),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::HerdrDelegateRowText(path),
     }));
 }
@@ -7566,6 +7908,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::Switch(name.to_string()),
     }));
 }
@@ -7680,6 +8023,10 @@ fn open_divergence_modal(app: &mut App, active: &str) {
         sibling,
         cursor: 0,
         scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
     }));
 }
 
@@ -7779,6 +8126,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
             message: format!("these credentials already belong to '{existing}'."),
             detail: Some("capture anyway?".to_string()),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot), from_divergence),
         }));
         return;
@@ -7941,6 +8289,32 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.global_config_cursor + 1
             };
+        }
+        KeyCode::PageUp => {
+            let starts = app.global_config_row_starts.borrow();
+            let block_ends = app.global_config_block_ends.borrow();
+            let tips = app.global_config_tips.borrow();
+            app.global_config_cursor = page_up_cursor_by_rows(
+                app.global_config_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.global_config_viewport.get(),
+                app.global_config_offset.get(),
+                app.global_config_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            let starts = app.global_config_row_starts.borrow();
+            let block_ends = app.global_config_block_ends.borrow();
+            app.global_config_cursor = page_down_cursor_by_rows(
+                app.global_config_cursor,
+                &starts,
+                &block_ends,
+                app.global_config_viewport.get(),
+                app.global_config_offset.get(),
+                app.global_config_total.get(),
+            );
         }
         KeyCode::Char(' ') => {
             run_global_config_row(app, GLOBAL_CONFIG_ROWS[app.global_config_cursor]);
@@ -8224,6 +8598,14 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.chain_cursor + 1
             };
+            sync_profile_from_chain(app);
+        }
+        KeyCode::PageUp => {
+            app.chain_cursor = selector_page_up(app.chain_cursor, &app.chain_selector);
+            sync_profile_from_chain(app);
+        }
+        KeyCode::PageDown => {
+            app.chain_cursor = selector_page_down(app.chain_cursor, &app.chain_selector);
             sync_profile_from_chain(app);
         }
         KeyCode::Enter => enter_fallback_detail(app),
@@ -8754,6 +9136,34 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            app.fallback_edit = None;
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
+            app.fallback_detail_cursor = page_up_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            app.fallback_edit = None;
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            app.fallback_detail_cursor = page_down_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
         // Continuous fields only — `max spend` (a dollar ceiling) has no
         // natural step unit and stays typed-only.
         KeyCode::Char('+' | '=') if row == FallbackRow::Threshold => adjust_threshold(app, 5.0),
@@ -8796,6 +9206,32 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
+            app.fallback_detail_cursor = page_up_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            app.fallback_detail_cursor = page_down_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
             let would_mix = {
@@ -8809,6 +9245,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
                 }));
             } else {
@@ -9624,14 +10061,30 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 let max = app.help_max_scroll.get();
                 app.help_scroll = app.help_scroll.saturating_add(1).min(max);
             }
+            KeyCode::PageUp => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = page_up_scroll(
+                    app.help_scroll as usize,
+                    max as usize,
+                    app.help_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = page_down_scroll(
+                    app.help_scroll as usize,
+                    max as usize,
+                    app.help_viewport.get() as usize,
+                ) as u16;
+            }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q') => {
                 app.modals.pop();
             }
             _ => {}
         },
         Modal::Confirm(_) => handle_confirm_key(app, key),
-        // The read-only `check output` modal scrolls and closes exactly like
-        // the help modal (`?` is not a close key here: the body may hold one).
+        // The read-only `check output` modal scrolls, pages and closes like the
+        // help modal, bar `?`: the body may hold one, so it is no close key here.
         Modal::CheckOutput(_) => match key.code {
             KeyCode::Up => {
                 let max = app.check_output_max_scroll.get();
@@ -9640,6 +10093,22 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             KeyCode::Down => {
                 let max = app.check_output_max_scroll.get();
                 app.check_output_scroll = app.check_output_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::PageUp => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = page_up_scroll(
+                    app.check_output_scroll as usize,
+                    max as usize,
+                    app.check_output_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = page_down_scroll(
+                    app.check_output_scroll as usize,
+                    max as usize,
+                    app.check_output_viewport.get() as usize,
+                ) as u16;
             }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
                 app.modals.pop();
@@ -10073,6 +10542,49 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
                 state.cursor = (state.cursor + 1) % len;
             }
         }
+        KeyCode::PageUp => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                let next = {
+                    let starts = state.starts.borrow();
+                    let block_ends = state.block_ends.borrow();
+                    page_up_cursor_by_rows(
+                        state.cursor,
+                        &starts,
+                        &block_ends,
+                        &[],
+                        state.viewport.get(),
+                        state.scroll.get(),
+                        state.total.get(),
+                    )
+                };
+                state.cursor = next;
+            }
+        }
+        KeyCode::PageDown => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                let next = {
+                    let starts = state.starts.borrow();
+                    let block_ends = state.block_ends.borrow();
+                    page_down_cursor_by_rows(
+                        state.cursor,
+                        &starts,
+                        &block_ends,
+                        state.viewport.get(),
+                        state.scroll.get(),
+                        state.total.get(),
+                    )
+                };
+                state.cursor = next;
+            }
+        }
         KeyCode::Enter => {
             let Some(Modal::ActionMenu(state)) = app.modals.last() else {
                 return;
@@ -10147,6 +10659,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
                     detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
                     choice: true,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::Acknowledge,
                 }));
             }
@@ -10155,6 +10668,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::RotateOne(name.to_string()),
                 }));
             }
@@ -10240,6 +10754,7 @@ fn open_shunt_stop_confirm(app: &mut App) {
         message: "stop shunt?".to_string(),
         detail: Some(detail),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::StopShunt,
     }));
 }
@@ -10305,6 +10820,7 @@ fn open_daemon_start_confirm(app: &mut App) {
         message: "start daemon?".to_string(),
         detail: None,
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::StartDaemon,
     }));
 }
@@ -10472,6 +10988,14 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
         ConfigFocus::Profiles => match key.code {
             KeyCode::Up => step_profile_cursor(app, -1, sel_len),
             KeyCode::Down => step_profile_cursor(app, 1, sel_len),
+            KeyCode::PageUp => {
+                app.profile_cursor = selector_page_up(app.profile_cursor, &app.setup_selector);
+                app.reload_selected_note();
+            }
+            KeyCode::PageDown => {
+                app.profile_cursor = selector_page_down(app.profile_cursor, &app.setup_selector);
+                app.reload_selected_note();
+            }
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
@@ -10500,6 +11024,34 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                     } else {
                         app.config_action_cursor + 1
                     };
+                }
+                KeyCode::PageUp => {
+                    disarm_armed_action(app);
+                    let starts = app.setup_detail_row_starts.borrow();
+                    let block_ends = app.setup_detail_block_ends.borrow();
+                    let tips = app.setup_detail_tips.borrow();
+                    app.config_action_cursor = page_up_cursor_by_rows(
+                        app.config_action_cursor,
+                        &starts,
+                        &block_ends,
+                        &tips,
+                        app.setup_detail_viewport.get(),
+                        app.setup_detail_offset.get(),
+                        app.setup_detail_total.get(),
+                    );
+                }
+                KeyCode::PageDown => {
+                    disarm_armed_action(app);
+                    let starts = app.setup_detail_row_starts.borrow();
+                    let block_ends = app.setup_detail_block_ends.borrow();
+                    app.config_action_cursor = page_down_cursor_by_rows(
+                        app.config_action_cursor,
+                        &starts,
+                        &block_ends,
+                        app.setup_detail_viewport.get(),
+                        app.setup_detail_offset.get(),
+                        app.setup_detail_total.get(),
+                    );
                 }
                 KeyCode::Enter => run_config_row(app, rows[app.config_action_cursor]),
                 KeyCode::Char('+' | '=')
@@ -10917,6 +11469,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         "the browser login you already captured will be dropped".to_string(),
                     ),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
                 }));
                 return;
@@ -10945,6 +11498,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                     message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::BlankCredentials(name.to_string()),
                 }));
             }
@@ -11361,6 +11915,7 @@ fn begin_oauth_login(app: &mut App, name: String, is_new: bool) {
             message: "replace the captured login?".to_string(),
             detail: Some("the login you already captured will be dropped".to_string()),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::RestartLogin(name, is_new),
         }));
     } else {
@@ -12152,6 +12707,7 @@ fn env_collision_form(
         reviewing_overwrite: false,
         confirm_overwrite: false,
         max_scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
         overwrite_needs_review: std::cell::Cell::new(false),
     }
 }
@@ -12179,6 +12735,20 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
                         .saturating_add(1)
                         .min(state.max_scroll.get() as usize),
                 );
+            }
+            KeyCode::PageUp => {
+                state.scroll.set(page_up_scroll(
+                    state.scroll.get(),
+                    state.max_scroll.get() as usize,
+                    state.viewport.get(),
+                ));
+            }
+            KeyCode::PageDown => {
+                state.scroll.set(page_down_scroll(
+                    state.scroll.get(),
+                    state.max_scroll.get() as usize,
+                    state.viewport.get(),
+                ));
             }
             KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
                 state.confirm_overwrite = !state.confirm_overwrite;
@@ -12503,6 +13073,7 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
                     .to_string(),
             ),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::DeleteLiveSession(name.to_string()),
         }));
         return;
@@ -12563,6 +13134,7 @@ fn toggle_focused_account_disabled(app: &mut App) {
         message: format!("disable '{name}'?"),
         detail: Some(DISABLE_DETAIL.to_string()),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::DisableOne(name.to_string()),
     }));
 }
@@ -12615,6 +13187,10 @@ fn open_preset_picker(app: &mut App) {
         presets: crate::presets::list_presets(),
         cursor: 0,
         scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
     }));
 }
 
@@ -12672,6 +13248,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                                     .to_string(),
                             ),
                             choice: false,
+                            scroll: ConfirmScroll::default(),
                             on_confirm: ConfirmAction::OverwritePreset(name, source),
                         }));
                         return;
@@ -12707,6 +13284,37 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 state.cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
         // Drop a custom preset. Built-ins have no file to drop, so the pick says
         // so rather than no-opping: a list carries no dimmed row here. The toast
         // fires with the picker still mounted so the user can pick another.
@@ -12726,6 +13334,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::DeletePreset(preset.name),
             }));
         }
@@ -12752,6 +13361,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 message: format!("apply '{}' over '{target}'?", preset.name),
                 detail: Some(format!("replaces {}.", clobbered.join(", "))),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name),
             }));
         }
@@ -13021,6 +13631,30 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('y') => state.choice = true,
         KeyCode::Char('n') => state.choice = false,
+        KeyCode::Up => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = state.scroll.offset.min(max).saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = state.scroll.offset.saturating_add(1).min(max);
+        }
+        KeyCode::PageUp => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = page_up_scroll(
+                state.scroll.offset as usize,
+                max as usize,
+                state.scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::PageDown => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = page_down_scroll(
+                state.scroll.offset as usize,
+                max as usize,
+                state.scroll.viewport.get() as usize,
+            ) as u16;
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
         }
@@ -13403,6 +14037,37 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                 state.cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             // Just close — the prompt is on-demand now; the non-blocking
             // banner keeps carrying the signal until the divergence resolves.
@@ -13427,6 +14092,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                              account. the running claude is untouched."
                         )),
                         choice: false,
+                        scroll: ConfirmScroll::default(),
                         on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
                     }));
                 }
@@ -13478,6 +14144,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                     "claude code's freshly written credentials will be overwritten with the account's stored tokens.".to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
             }));
         }
@@ -13524,6 +14191,10 @@ fn open_divergence_target_picker(app: &mut App) {
             targets,
             cursor: preselect,
             scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
         }));
 }
 
@@ -13550,6 +14221,37 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             } else {
                 form.cursor + 1
             };
+        }
+        KeyCode::PageUp => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
@@ -13583,6 +14285,7 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                     "'{target}' becomes the active account; its old credentials are replaced. usage history, env, and model settings are kept."
                 )),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
             }));
         }
@@ -13636,6 +14339,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                         "overwrite its credentials with the captured login? usage history, env, and model settings are kept.".to_string(),
                     ),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::CaptureOverwrite(
                         snapshot,
                         existing,
@@ -13970,6 +14674,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
                 .to_string(),
             ),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
         }));
         return;

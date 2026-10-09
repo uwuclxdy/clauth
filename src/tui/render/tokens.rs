@@ -1456,7 +1456,11 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // `draw_selector_list`'s shared empty state talks about accounts, so
     // render the lens-specific message instead.
     if grouped.is_empty() {
-        app.models_selector_offset.set(0);
+        app.models_selector.offset.set(0);
+        app.models_selector.viewport.set(0);
+        app.models_selector.starts.replace(Vec::new());
+        app.models_selector.block_ends.replace(Vec::new());
+        app.models_selector.total.set(0);
         app.model_detail_max_scroll.set(0);
         app.model_detail_viewport.set(0);
         let block = section_box(&title, true, true);
@@ -1487,7 +1491,7 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
         &title,
         app.model_detail_focus == StatusFocus::List,
         sel,
-        &app.models_selector_offset,
+        &app.models_selector,
         |w| {
             grouped
                 .iter()

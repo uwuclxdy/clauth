@@ -27,6 +27,8 @@ use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_compo
 const KEY_W: usize = 11;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
+/// Rows per rendered incident (a title row + a phase-pill row).
+const STATUS_ROW_LINES: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Each incident renders two rows (title + phase pill) in the list.
@@ -45,7 +47,11 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.status.incidents.is_empty() {
-        app.status.selector_offset.set(0);
+        app.status.selector.offset.set(0);
+        app.status.selector.viewport.set(0);
+        app.status.selector.starts.replace(Vec::new());
+        app.status.selector.block_ends.replace(Vec::new());
+        app.status.selector.total.set(0);
         // The widget already renders the `r to retry` action line, so the hint
         // line only states the condition.
         let widget = if app.status.error.is_some() {
@@ -59,7 +65,7 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let content_w = inner.width as usize;
     let viewport = if inner.height > 1 {
-        inner.height as usize / 2 * 2
+        inner.height as usize / STATUS_ROW_LINES * STATUS_ROW_LINES
     } else {
         inner.height as usize
     };
@@ -67,14 +73,32 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         height: viewport as u16,
         ..inner
     };
-    let total = app.status.incidents.len() * 2;
+    let total = app.status.incidents.len() * STATUS_ROW_LINES;
     let cursor = app.status.cursor.min(app.status.incidents.len() - 1);
-    let focus = (cursor * 2, cursor * 2 + 2);
-    let max_offset = total.saturating_sub(viewport).min(total.saturating_sub(2)) & !1;
-    let offset = follow_scroll_offset(total, viewport, focus, app.status.selector_offset.get())
-        .next_multiple_of(2)
+    let focus = (
+        cursor * STATUS_ROW_LINES,
+        cursor * STATUS_ROW_LINES + STATUS_ROW_LINES,
+    );
+    app.status.selector.viewport.set(viewport);
+    app.status.selector.total.set(total);
+    app.status.selector.starts.replace(
+        (0..app.status.incidents.len())
+            .map(|i| i * STATUS_ROW_LINES)
+            .collect(),
+    );
+    app.status.selector.block_ends.replace(
+        (0..app.status.incidents.len())
+            .map(|i| i * STATUS_ROW_LINES + STATUS_ROW_LINES)
+            .collect(),
+    );
+    let max_offset = total
+        .saturating_sub(viewport)
+        .min(total.saturating_sub(STATUS_ROW_LINES))
+        & !(STATUS_ROW_LINES - 1);
+    let offset = follow_scroll_offset(total, viewport, focus, app.status.selector.offset.get())
+        .next_multiple_of(STATUS_ROW_LINES)
         .min(max_offset);
-    app.status.selector_offset.set(offset);
+    app.status.selector.offset.set(offset);
     let lines: Vec<Line<'static>> = app
         .status
         .incidents
@@ -276,6 +300,7 @@ fn draw_incident_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // too (otherwise a held ↓ inflates `detail_scroll` past the end).
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
     app.status.detail_max_scroll.set(max_scroll);
+    app.status.detail_viewport.set(viewport as u16);
     let scroll = app.status.detail_scroll.min(max_scroll);
 
     frame.render_widget(

@@ -54,7 +54,11 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.services.row_count() == 0 {
-        app.services.selector_offset.set(0);
+        app.services.selector.offset.set(0);
+        app.services.selector.viewport.set(0);
+        app.services.selector.starts.replace(Vec::new());
+        app.services.selector.block_ends.replace(Vec::new());
+        app.services.selector.total.set(0);
         let widget = if app.services.error.is_some() {
             empty_state("check failed", "r", "to retry")
         } else {
@@ -85,7 +89,7 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App) {
         inner,
         rows,
         app.services.cursor,
-        &app.services.selector_offset,
+        &app.services.selector,
     );
 }
 

@@ -99,6 +99,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Start + end of the focused row's block (row plus its tooltip lines), so a
     // wrapped hint can't scroll off the bottom while its row stays visible.
     let mut focus = (0usize, 1usize);
+    let mut starts: Vec<usize> = Vec::with_capacity(GLOBAL_CONFIG_ROWS.len());
+    let mut block_ends: Vec<usize> = Vec::with_capacity(GLOBAL_CONFIG_ROWS.len());
+    let mut tips: Vec<usize> = Vec::with_capacity(GLOBAL_CONFIG_ROWS.len());
     let mut band: Option<&str> = None;
     for (i, row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
         let selected = i == cursor;
@@ -111,6 +114,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             band = Some(row.band());
             lines.push(band_header(row.band(), row.band() == focused_band));
         }
+        starts.push(lines.len());
         if selected {
             focus.0 = lines.len();
         }
@@ -128,6 +132,24 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             row_editing,
             inner.width as usize,
         );
+        // The tooltip this row carries when focused: its range tooltip while
+        // editing, else its behaviour hint. Computed for every row so the page
+        // step can predict the follow the focused tooltip produces.
+        let tip_lines: Vec<Line<'static>> = match row_editing {
+            Some(input) => match *row {
+                GlobalConfigRow::WeeklyThreshold => {
+                    weekly_range_tooltip(input, inner.width as usize)
+                }
+                GlobalConfigRow::ContextNudge => {
+                    context_nudge_range_tooltip(input, inner.width as usize)
+                }
+                _ => refresh_range_tooltip(input, inner.width as usize),
+            },
+            None => row_hint(*row, rows, tunables)
+                .map(|tip| help_tooltip_lines(&tip, inner.width as usize))
+                .unwrap_or_default(),
+        };
+        let tip_len = tip_lines.len();
         match row_editing {
             Some(input) => {
                 // The native terminal cursor owns the caret; the row renders plain
@@ -138,16 +160,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .saturating_add((2 + KEY_W + KEY_GUTTER + head_cols(input)) as u16);
                 caret = Some((cx, lines.len()));
                 lines.extend(row_lines);
-                let tooltip = match *row {
-                    GlobalConfigRow::WeeklyThreshold => {
-                        weekly_range_tooltip(input, inner.width as usize)
-                    }
-                    GlobalConfigRow::ContextNudge => {
-                        context_nudge_range_tooltip(input, inner.width as usize)
-                    }
-                    _ => refresh_range_tooltip(input, inner.width as usize),
-                };
-                lines.extend(tooltip);
+                lines.extend(tip_lines);
             }
             None => {
                 for line in row_lines {
@@ -157,16 +170,27 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         line
                     });
                 }
-                if selected && let Some(tip) = row_hint(*row, rows, tunables) {
-                    lines.extend(help_tooltip_lines(&tip, inner.width as usize));
+                if selected {
+                    lines.extend(tip_lines);
                 }
             }
         }
         if selected {
             focus.1 = lines.len();
         }
+        block_ends.push(if selected {
+            lines.len()
+        } else {
+            lines.len() + tip_len
+        });
+        tips.push(tip_len);
     }
 
+    app.global_config_viewport.set(inner.height as usize);
+    app.global_config_total.set(lines.len());
+    app.global_config_row_starts.replace(starts);
+    app.global_config_block_ends.replace(block_ends);
+    app.global_config_tips.replace(tips);
     let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.global_config_offset));
     // A caret scrolled off the top has no cell to sit in; leaving the cursor
     // unset is better than parking it on an unrelated row.
