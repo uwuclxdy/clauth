@@ -273,7 +273,9 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   profiles/
     work/
       config.toml          # everything in the table above
-      credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
+      credentials.json     # OAuth snapshot
+      credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
+      auth.spent.json      # fingerprints of the last 64 refresh tokens clauth traded in, never the tokens
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       note.txt             # the account's free-form note, edited from the usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
@@ -315,6 +317,6 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
 
 Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. The tree above lists the stable user-facing stores and the transient paths that are unsafe to remove; other clauth-owned temporary or migration files can appear, so an unlisted path is not by itself proof of leftover state. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
-Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
+Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting `credentials.json.staged` before clauth lands it can sign that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 
 The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) clauth builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out. A codex session home follows the same rule with both flavors collapsing: `codex-home-<sid>` and `codex-home-isolated-<sid>` where symlinks work, the bare `codex-home` (the store itself) and `codex-home-isolated` where they do not ([Codex](Codex#windows-and-hosts-without-symlinks)).
