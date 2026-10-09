@@ -39,6 +39,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
         Modal::Login => draw_login_progress(frame, area, app),
+        Modal::CheckOutput(body) => draw_check_output(frame, area, body, app),
     }
 }
 
@@ -1044,6 +1045,32 @@ fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &
             ][..],
         )],
     }
+}
+
+/// The shunt card's `check output` modal: the masked failed-check stderr,
+/// read-only, ↑↓ scrolling like the help modal. The body is already masked,
+/// ANSI-stripped and control-escaped per line at open; its `\n` joins are the
+/// real line structure, split here into rows that `draw_modal_scrolled` wraps
+/// and scrolls.
+fn draw_check_output(frame: &mut Frame<'_>, area: Rect, body: &str, app: &App) {
+    let lines: Vec<Line<'_>> = body
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), theme::body())))
+        .collect();
+    let lines = if lines.is_empty() {
+        vec![Line::from("")]
+    } else {
+        lines
+    };
+    app.check_output_max_scroll.set(draw_modal_scrolled(
+        frame,
+        area,
+        "check output",
+        lines,
+        app.check_output_scroll,
+        None,
+        None,
+    ));
 }
 
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {

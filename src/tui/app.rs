@@ -1333,6 +1333,9 @@ pub(crate) enum Modal {
     /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
     /// to the footer indicator — the login keeps running.
     Login,
+    /// Read-only scrollable text modal for the shunt card's `check output`:
+    /// the masked stderr of the last failed check.
+    CheckOutput(String),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -1727,21 +1730,27 @@ pub(crate) enum ShuntFocus {
     Fix { line: usize, fix: ServiceFix },
     /// The `enabled` toggle row at this detail index.
     Enabled { line: usize },
+    /// The `check output` line at this detail index (a held failed-check
+    /// stderr; ↵/space opens its modal).
+    CheckOutput { line: usize },
 }
 
 impl ShuntFocus {
     /// The detail-line index the focusable sits on.
     pub(crate) fn line(&self) -> usize {
         match self {
-            ShuntFocus::Fix { line, .. } | ShuntFocus::Enabled { line } => *line,
+            ShuntFocus::Fix { line, .. }
+            | ShuntFocus::Enabled { line }
+            | ShuntFocus::CheckOutput { line } => *line,
         }
     }
 
-    /// The fix this line applies, `None` on the `enabled` row.
+    /// The fix this line applies, `None` on the `enabled` and `check output`
+    /// rows.
     pub(crate) fn fix(&self) -> Option<&ServiceFix> {
         match self {
             ShuntFocus::Fix { fix, .. } => Some(fix),
-            ShuntFocus::Enabled { .. } => None,
+            ShuntFocus::Enabled { .. } | ShuntFocus::CheckOutput { .. } => None,
         }
     }
 
@@ -1749,6 +1758,7 @@ impl ShuntFocus {
     pub(crate) fn kind(&self) -> ShuntFocusLine {
         match self {
             ShuntFocus::Enabled { .. } => ShuntFocusLine::Enabled,
+            ShuntFocus::CheckOutput { .. } => ShuntFocusLine::CheckOutput,
             ShuntFocus::Fix {
                 fix: ServiceFix::AdoptConfig(_),
                 ..
@@ -1783,6 +1793,8 @@ pub(crate) enum ShuntFocusLine {
     Admin,
     /// The `f  move stores in` line.
     Move,
+    /// The `check output` line (a held failed-check stderr).
+    CheckOutput,
 }
 
 /// A computed service row. `fix` is the list-focus `f` (the first fixable
@@ -2023,6 +2035,14 @@ pub(crate) enum ShuntActionOutcome {
     AdminAdded,
     AdminFailed {
         error: String,
+        /// The failed check's stderr, held for the shunt card's `check output`
+        /// modal. `None` on a refusal that ran no check (or a non-typed error).
+        check_output: Option<crate::gateway::CheckStderr>,
+        /// The adopted config path this edit ran against. The drain holds
+        /// `check_output` only while it equals the current record's config, so
+        /// a re-adopt landing while the check ran never shows another
+        /// gateway's output on the card.
+        config: std::path::PathBuf,
     },
     /// `stop shunt` landed: the hold file names the running daemon.
     Held,
@@ -2159,6 +2179,13 @@ pub(crate) struct ServicesState {
     /// parse, the herdr config re-read's shape). `None` = no record, or an
     /// unreadable config (no verb offered).
     pub(crate) admin_need: Option<crate::gateway::AdminNeed>,
+    /// The stderr of the last admin edit THIS TUI ran whose `shunt check`
+    /// refused, held for the shunt card's `check output` modal. Cleared when
+    /// an admin edit succeeds (`AdminAdded`), a later admin failure carries no
+    /// check output or edited another config, `admin_need` reads `Neither` or
+    /// `None`, or the gateway record changes. The daemon's own restart
+    /// refusals never land here.
+    pub(crate) check_output: Option<crate::gateway::CheckStderr>,
     /// The cached codex-pool read (`None` = not read, or not due). The read
     /// runs on a worker while the slot is `healthy` and `admin_need` is
     /// `Neither`, and can block up to ~24 s.
@@ -2253,6 +2280,7 @@ impl Default for ServicesState {
             move_plan: None,
             move_plan_probe: ProbeWorker::new(move_plan_probe),
             admin_need: None,
+            check_output: None,
             pool: None,
             pool_probe: ProbeWorker::new(pool_probe),
             shunt_action: ShuntActionWorker::new(run_shunt_action),
@@ -2697,6 +2725,10 @@ pub(crate) struct App {
     /// Interior mutability because the render pass takes `&App`; clamping there
     /// stops a held ↓ from inflating `help_scroll` past the end.
     pub(crate) help_max_scroll: std::cell::Cell<u16>,
+    /// First `check output`-modal row on screen (↑↓ scrolls). Reset on open.
+    pub(crate) check_output_scroll: u16,
+    /// Max valid `check_output_scroll` from the last `check output` render.
+    pub(crate) check_output_max_scroll: std::cell::Cell<u16>,
 
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
@@ -3266,6 +3298,8 @@ impl App {
             modals: Vec::new(),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            check_output_scroll: 0,
+            check_output_max_scroll: std::cell::Cell::new(0),
             profile_cursor: 0,
             overview_selector_offset: std::cell::Cell::new(0),
             overview_cursor: 0,
@@ -5111,14 +5145,11 @@ fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up => shunt_step(app, false),
         KeyCode::Down => shunt_step(app, true),
         KeyCode::Char('f') => apply_service_fix(app),
-        KeyCode::Enter | KeyCode::Char(' ') => {
-            if matches!(
-                app.services.focused_shunt_focus(),
-                Some(ShuntFocus::Enabled { .. })
-            ) {
-                toggle_shunt_enabled(app);
-            }
-        }
+        KeyCode::Enter | KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
+            Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
+            Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
+            Some(ShuntFocus::Fix { .. }) | None => {}
+        },
         _ => {}
     }
 }
@@ -5298,11 +5329,64 @@ fn toggle_shunt_enabled(app: &mut App) {
         Err(e) => {
             app.toast(
                 ToastKind::Danger,
-                format!("save failed\n{}", escape_control(&format!("{e:#}"))),
+                format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
             );
         }
     }
     recompute_services_checks(app, false, ShuntRefresh::Restart);
+}
+
+/// Open the read-only `check output` modal over the held failed-check stderr,
+/// which `crate::gateway::run_check` already masked. The body is split into its
+/// real lines, ANSI CSI sequences stripped (shunt's tracing may emit SGR), and
+/// each line control-escaped here; nothing is re-read or re-masked.
+fn open_check_output_modal(app: &mut App) {
+    let Some(output) = app.services.check_output.clone() else {
+        return;
+    };
+    let body = stderr_display_lines(output.text()).join("\n");
+    app.check_output_scroll = 0;
+    app.open_modal(Modal::CheckOutput(body));
+}
+
+/// The held stderr as display lines: ANSI CSI sequences (`ESC [ … final`) that
+/// shunt's tracing layer may emit are stripped, then each line is
+/// control-escaped so no `\n` or escape byte reaches a cell. The modal's own
+/// `.lines()` split is what turns the joined newlines back into rows.
+fn stderr_display_lines(text: &str) -> Vec<String> {
+    strip_ansi_csi(text).lines().map(escape_control).collect()
+}
+
+/// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
+/// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so the modal shows
+/// text, not terminal escape bytes. Any byte outside those ranges before the
+/// final byte ends the sequence without eating text: the `ESC` is kept and
+/// scanning resumes after it, so a malformed CSI never swallows a line.
+fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(esc) = rest.find('\x1b') {
+        out.push_str(&rest[..esc]);
+        let after = &rest[esc + 1..];
+        if let Some(body) = after.strip_prefix('[') {
+            match body
+                .char_indices()
+                .find(|(_, c)| ('@'..='~').contains(c) || !('\u{20}'..='\u{3f}').contains(c))
+            {
+                Some((at, c)) if ('@'..='~').contains(&c) => rest = &body[at + c.len_utf8()..],
+                _ => {
+                    // No final byte, or a non-parameter byte: not a CSI.
+                    out.push('\x1b');
+                    rest = after;
+                }
+            }
+        } else {
+            out.push('\x1b');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Apply the focused fix. Every mutating fix opens a confirm modal; a diverged
@@ -5951,12 +6035,28 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
             app.services.standalone_probe.start();
         }
     }
-    app.services.shunt_record = crate::gateway::GatewayRecord::load().ok().flatten();
+    let record = crate::gateway::GatewayRecord::load().ok().flatten();
+    if record != app.services.shunt_record {
+        // The last refusal belonged to the record it edited against; a record
+        // change (a re-adopt, a binary/env move) retires it.
+        app.services.check_output = None;
+    }
+    app.services.shunt_record = record;
     app.services.admin_need = app
         .services
         .shunt_record
         .as_ref()
         .and_then(|record| crate::gateway::admin_need(record.config()).ok());
+    match app.services.admin_need {
+        // The admin entry is present (this edit landed, another writer added
+        // it, or a fresh adopt already had it): nothing left to refuse — or
+        // there is no record / the config is unreadable, so no refusal is owed
+        // and the line has no card to sit under.
+        Some(crate::gateway::AdminNeed::Neither) | None => {
+            app.services.check_output = None;
+        }
+        Some(_) => {}
+    }
 
     // The store move plan: on a worker, on tab entry, on `r`, and after any
     // action lands (the outcome drain passes [`ShuntRefresh::Restart`], which
@@ -5999,6 +6099,7 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntR
         app.services.admin_need,
         app.services.move_plan.as_ref(),
         app.services.pool.as_ref(),
+        app.services.check_output.is_some(),
     );
     checks.push(shunt);
 
@@ -6203,13 +6304,32 @@ fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
         ShuntActionOutcome::AdminAdded => {
             // The one toast for both admin steps (the orchestrator's reading,
             // flagged in the report).
+            app.services.check_output = None;
             app.toast(ToastKind::Success, "added clauth's admin key");
         }
-        ShuntActionOutcome::AdminFailed { error } => {
+        ShuntActionOutcome::AdminFailed {
+            error,
+            check_output,
+            config,
+        } => {
             app.toast(
                 ToastKind::Danger,
                 format!("admin key failed\n{}", escape_control(&error)),
             );
+            // Hold the output only for the config this edit ran against: a
+            // re-adopt that landed while the check ran must never show another
+            // gateway's output on this card. A check-output-free refusal (or a
+            // non-typed error) retires the held output the same way.
+            let current = app
+                .services
+                .shunt_record
+                .as_ref()
+                .map(|record| record.config().to_path_buf());
+            app.services.check_output = if Some(&config) == current.as_ref() {
+                check_output
+            } else {
+                None
+            };
         }
         ShuntActionOutcome::Held => {
             app.toast(
@@ -6612,10 +6732,11 @@ pub(crate) fn gateway_health(state: GatewayState) -> Health {
 
 /// The full `shunt` card: [`shunt_check`]'s field lines, then the action
 /// section — the blank line, the `enabled` toggle row, the admin fix (its
-/// explanation line above it), the codex pool note (or `pool` error), and the
-/// MOVE PLAN section. Fills the card's [`Check::shunt_focus`] (the fix lines
-/// and the `enabled` row, the only actionable lines) and its list-focus
-/// [`Check::fix`].
+/// explanation line above it), the `check output` line while a failed check's
+/// stderr is held, the codex pool note (or `pool` error), and the MOVE PLAN
+/// section. Fills the card's [`Check::shunt_focus`] (the fix lines, the
+/// `enabled` row and the `check output` row — the only actionable lines) and
+/// its list-focus [`Check::fix`].
 ///
 /// `daemon_absent` is the header chip's no-daemon liveness (the same
 /// [`crate::daemon::DaemonHealth::Absent`] the `[ daemon ]` chip reads):
@@ -6631,6 +6752,7 @@ pub(crate) fn shunt_card(
     admin_need: Option<crate::gateway::AdminNeed>,
     move_plan: Option<&MovePlanOutcome>,
     pool: Option<&PoolOutcome>,
+    check_output: bool,
 ) -> Check {
     let mut check = shunt_check(slot, supervised, standalone);
 
@@ -6732,6 +6854,14 @@ pub(crate) fn shunt_card(
             });
         }
         Some(crate::gateway::AdminNeed::Neither) | None => {}
+    }
+
+    // The failed check's output, right under the admin fix it came from: an
+    // actionable line whose ↵/space opens the read-only masked-stderr modal.
+    if check_output {
+        let line = check.detail.len();
+        check.detail.push("check output".to_string());
+        check.shunt_focus.push(ShuntFocus::CheckOutput { line });
     }
 
     // The codex pool note, or the `pool` error in its place. Every provider
@@ -6851,9 +6981,9 @@ fn pool_probe() -> PoolOutcome {
 
 /// The production action prober: run one confirmed shunt-card action to
 /// completion. The slow calls — the `/health` probe, the store plan, `shunt
-/// check` — never hold a frame here. Every error keeps its cause chain
-/// (`{e:#}`): a failed write names its path in the context and why it failed
-/// only in the io error under it.
+/// check` — never hold a frame here. Every error keeps its cause chain as
+/// [`error_toast_detail`] (root cause first): a failed write names its path in
+/// the context and why it failed only in the io error under it.
 fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
     match job {
         ShuntActionJob::Adopt { found } => run_adopt(&found),
@@ -6867,13 +6997,13 @@ fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
         ShuntActionJob::Hold => match crate::gateway::write_hold() {
             Ok(()) => ShuntActionOutcome::Held,
             Err(e) => ShuntActionOutcome::HoldFailed {
-                error: format!("{e:#}"),
+                error: error_toast_detail(&e),
             },
         },
         ShuntActionJob::RemoveHold => match crate::gateway::remove_hold() {
             Ok(()) => ShuntActionOutcome::Released,
             Err(e) => ShuntActionOutcome::ReleaseFailed {
-                error: format!("{e:#}"),
+                error: error_toast_detail(&e),
             },
         },
     }
@@ -6887,7 +7017,7 @@ fn run_adopt(found: &std::path::Path) -> ShuntActionOutcome {
         Ok(candidate) => candidate,
         Err(e) => {
             return ShuntActionOutcome::AdoptFailed {
-                error: format!("{e:#}"),
+                error: error_toast_detail(&e),
             };
         }
     };
@@ -6895,7 +7025,7 @@ fn run_adopt(found: &std::path::Path) -> ShuntActionOutcome {
         Ok(addr) => addr,
         Err(e) => {
             return ShuntActionOutcome::AdoptFailed {
-                error: format!("{e:#}"),
+                error: error_toast_detail(&e),
             };
         }
     };
@@ -6931,7 +7061,7 @@ fn run_adopt(found: &std::path::Path) -> ShuntActionOutcome {
             path: escape_control(&found.to_string_lossy()),
         },
         Err(e) => ShuntActionOutcome::AdoptFailed {
-            error: format!("{e:#}"),
+            error: error_toast_detail(&e),
         },
     }
 }
@@ -6947,7 +7077,7 @@ fn run_move(
         Ok(addr) => addr,
         Err(e) => {
             return ShuntActionOutcome::MoveFailed {
-                error: format!("{e:#}"),
+                error: error_toast_detail(&e),
             };
         }
     };
@@ -6967,7 +7097,7 @@ fn run_move(
         }
         Err(e) => {
             return ShuntActionOutcome::MoveFailed {
-                error: format!("{e:#}"),
+                error: error_toast_detail(&e),
             };
         }
     };
@@ -6987,13 +7117,88 @@ fn run_move(
                 // write failed, so the `save failed` toast follows it.
                 Err(e) => ShuntActionOutcome::MovedEnableFailed {
                     n: moved.moved.len(),
-                    error: format!("{e:#}"),
+                    error: error_toast_detail(&e),
                 },
             }
         }
         Err(e) => ShuntActionOutcome::MoveFailed {
-            error: format!("{e:#}"),
+            error: error_toast_detail(&e),
         },
+    }
+}
+
+/// One compact toast line for a typed admin refusal: outcome first, files by
+/// basename. The `CheckFailed` arm appends the `↵ check output` pointer, whose
+/// tail may clip on a 38-cell terminal while the outcome stays in view.
+fn admin_refusal_line(refusal: &crate::gateway::ConfigEditRefusal) -> String {
+    use crate::gateway::{AdminNeed, ConfigEditRefusal as R};
+    let file = |path: &std::path::Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    };
+    match refusal {
+        R::Needs(AdminNeed::AdminTable) => {
+            "the config has no [server.admin] table; adding one enables shunt's admin API and is its own step".to_string()
+        }
+        R::Needs(AdminNeed::WriteKey) => {
+            "the config already has a [server.admin] table; clauth's write key goes into it instead".to_string()
+        }
+        R::Needs(AdminNeed::Neither) => "the config already carries clauth's write key".to_string(),
+        R::ForeignClauthKey => format!(
+            "[server.admin] already has a write key with id {:?} holding another key; clauth adds none beside it; remove that entry, then run the edit again",
+            crate::gateway::WRITE_KEY_ID
+        ),
+        R::UnexpectedShape { what } => {
+            format!("{what}; clauth edits only a [server.admin] table and its write_keys array")
+        }
+        R::TokenPathUnusable { path } => {
+            let why = if path.to_str().is_some() {
+                "holds a `}`"
+            } else {
+                "is not UTF-8"
+            };
+            format!(
+                "the clauth dir path {why} · the admin key cannot be a ${{file:}} reference"
+            )
+        }
+        R::Symlink { path } => {
+            format!("{} is a symlink · clauth would replace the link by renaming over it", file(path))
+        }
+        R::ShuntMissing { binary } => {
+            format!("cannot run {}: no such file · install shunt or point the gateway at its binary", file(binary))
+        }
+        R::CheckFailed {
+            binary,
+            config,
+            code,
+            ..
+        } => {
+            let status = match code {
+                Some(code) => format!("exit {code}"),
+                None => "killed by a signal".to_string(),
+            };
+            format!(
+                "`{} check` refused the edit ({status}) · {} unchanged · {} check output on the shunt card",
+                file(binary),
+                file(config),
+                prose::key("↵"),
+            )
+        }
+        R::ChangedDuringEdit { path } => {
+            format!("{} changed during the check · nothing was written · run the edit again", file(path))
+        }
+        R::CheckTimedOut {
+            binary,
+            config,
+            after,
+        } => format!(
+            "`{} check` ran past {after:?} and was stopped · {} unchanged · run `{} check --config {}` to see why it does not finish, then try again",
+            file(binary),
+            file(config),
+            file(binary),
+            config.display(),
+        ),
     }
 }
 
@@ -7014,8 +7219,31 @@ fn run_admin_edit(
         // nothing was added, so no success toast (the recompute re-reads it).
         Ok(crate::gateway::AdminEdit::AlreadyPresent) => ShuntActionOutcome::NoOp,
         Ok(_) => ShuntActionOutcome::AdminAdded,
-        Err(e) => ShuntActionOutcome::AdminFailed {
-            error: format!("{e:#}"),
+        Err(e) => match e.downcast_ref::<crate::gateway::ConfigEditRefusal>() {
+            Some(refusal) => {
+                use crate::gateway::ConfigEditRefusal as R;
+                let check_output = match refusal {
+                    R::CheckFailed { stderr, .. } => Some(stderr.clone()),
+                    R::Needs(_)
+                    | R::ForeignClauthKey
+                    | R::UnexpectedShape { .. }
+                    | R::TokenPathUnusable { .. }
+                    | R::Symlink { .. }
+                    | R::ShuntMissing { .. }
+                    | R::ChangedDuringEdit { .. }
+                    | R::CheckTimedOut { .. } => None,
+                };
+                ShuntActionOutcome::AdminFailed {
+                    error: admin_refusal_line(refusal),
+                    check_output,
+                    config: record.config().to_path_buf(),
+                }
+            }
+            None => ShuntActionOutcome::AdminFailed {
+                error: error_toast_detail(&e),
+                check_output: None,
+                config: record.config().to_path_buf(),
+            },
         },
     }
 }
@@ -7034,6 +7262,23 @@ pub(crate) fn escape_control(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// A compact toast detail from an `anyhow::Error`: the root cause first (it
+/// must stay on screen), then the rest of the chain outermost-first, joined by
+/// ` · `. Paths stay in full there — they may clip, the cause may not. Logs
+/// and the CLI keep the full `{e:#}` Display.
+fn error_toast_detail(err: &anyhow::Error) -> String {
+    let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+    match chain.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [.., root] => {
+            let mut parts = vec![root.clone()];
+            parts.extend(chain[..chain.len() - 1].iter().cloned());
+            parts.join(" · ")
+        }
+    }
 }
 
 /// The clause an outdated plugin install's version line carries; the services
@@ -9385,6 +9630,22 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
             _ => {}
         },
         Modal::Confirm(_) => handle_confirm_key(app, key),
+        // The read-only `check output` modal scrolls and closes exactly like
+        // the help modal (`?` is not a close key here: the body may hold one).
+        Modal::CheckOutput(_) => match key.code {
+            KeyCode::Up => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = app.check_output_scroll.min(max).saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = app.check_output_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.modals.pop();
+            }
+            _ => {}
+        },
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
@@ -10063,14 +10324,23 @@ fn start_daemon(app: &mut App) {
             return;
         }
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("daemon start failed\n{e:#}"));
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "daemon start failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
             return;
         }
     }
     let exe = match daemon_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("daemon start failed\n{}", escape_control(&e.to_string())),
+            );
             return;
         }
     };
@@ -10088,7 +10358,7 @@ fn start_daemon(app: &mut App) {
             let _ = child.wait();
         }
         Err(e) => {
-            let _ = tx.send(DaemonControlResult::Start(Err(format!("{e:#}"))));
+            let _ = tx.send(DaemonControlResult::Start(Err(error_toast_detail(&e))));
         }
     });
 }
@@ -10110,7 +10380,7 @@ fn stop_daemon(app: &mut App) {
     app.daemon_control_busy = true;
     app.toast(ToastKind::Info, "stopping daemon");
     spawn_worker(move || {
-        let outcome = crate::daemon::stop_running().map_err(|e| format!("{e:#}"));
+        let outcome = crate::daemon::stop_running().map_err(|e| error_toast_detail(&e));
         let _ = tx.send(DaemonControlResult::Stop(outcome));
     });
 }
@@ -10140,7 +10410,10 @@ fn drain_daemon_control(app: &mut App) {
                 ),
             ),
             DaemonControlResult::Start(Err(e)) => {
-                app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+                app.toast(
+                    ToastKind::Danger,
+                    format!("daemon start failed\n{}", escape_control(&e)),
+                );
             }
             DaemonControlResult::Stop(Ok(DaemonStop::Stopped)) => {
                 app.toast(ToastKind::Success, "daemon stopped");
@@ -10155,7 +10428,10 @@ fn drain_daemon_control(app: &mut App) {
                 );
             }
             DaemonControlResult::Stop(Err(e)) => {
-                app.toast(ToastKind::Danger, format!("daemon stop failed\n{e}"));
+                app.toast(
+                    ToastKind::Danger,
+                    format!("daemon stop failed\n{}", escape_control(&e)),
+                );
             }
         }
         reprobe_daemon(app);
@@ -11162,11 +11438,12 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
         let _ = result_tx.send((
             generation,
             res.map(|o| LoginResult::Console(Box::new(o)))
-                // `{e:#}` keeps the whole `anyhow` chain: the outermost context
-                // here is a bare "loopback accept failed" whose io cause is the
-                // only part that says what to do about it. No constructor in
-                // `alibaba_login` embeds the token or an upstream body.
-                .map_err(|e| format!("{e:#}")),
+                // The toast leads with the root cause, then the rest of the
+                // chain outermost-first: the outermost context here is a bare
+                // "loopback accept failed" whose io cause is the only part that
+                // says what to do about it. No constructor in `alibaba_login`
+                // embeds the token or an upstream body.
+                .map_err(|e| error_toast_detail(&e)),
         ));
     });
     open_login_modal(app);

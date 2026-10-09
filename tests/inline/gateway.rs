@@ -2826,7 +2826,10 @@ fn a_check_that_outruns_its_bound_is_stopped_and_writes_nothing() {
 }
 
 /// A check's stderr is kept up to 64 KiB; the rest is drained unread, so a
-/// chatty check never stalls on its pipe and never grows the refusal.
+/// chatty check never stalls on its pipe and never grows the refusal. The
+/// single 70 000-byte line has no newline, so the cap's trailing partial line
+/// is dropped whole, and the held text is the one cut marker line — never a
+/// blank modal.
 #[cfg(unix)]
 #[test]
 fn a_checks_stderr_is_capped() {
@@ -2835,11 +2838,270 @@ fn a_checks_stderr_is_capped() {
     let err = add_admin_write_key(&g.record).expect_err("the check fails");
     match refusal(&err) {
         ConfigEditRefusal::CheckFailed { stderr, .. } => {
-            assert_eq!(stderr.text(), "x".repeat(64 * 1024));
+            assert_eq!(stderr.text(), "output cut; the cut line is withheld");
         }
         other => panic!("a CheckFailed refusal, got {other:?}"),
     }
     assert_eq!(fs::read_to_string(&g.config).expect("read"), USER_CONFIG);
+}
+
+/// The masking set scans the candidate's PARSED string leaves the way shunt
+/// does: a `${` in a comment must not swallow a later real reference, a
+/// TOML-escaped reference resolves, an array element resolves, and a
+/// `${...}` in a KEY (which shunt never substitutes) is not added.
+#[test]
+fn the_masking_set_scans_parsed_string_leaves_not_raw_text() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(
+        &config,
+        "# a comment with ${ a stray\n[server]\nnote = \"\\u0024{ZZ_A}\"\nlist = [\"${ZZ_B}\"]\n\"${ZZ_K}\" = \"key not a value\"\n",
+    );
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = vec![
+        ("ZZ_A".into(), "hunter2.pass+word".into()),
+        ("ZZ_B".into(), "other.secret.value".into()),
+        ("ZZ_K".into(), "key.secret.value".into()),
+    ];
+    let values = check_masking_values(&config, &env, &inherited);
+    assert_eq!(
+        values,
+        [
+            "hunter2.pass+word".to_string(),
+            "other.secret.value".to_string()
+        ],
+    );
+}
+
+/// A `${file:}` naming a non-regular file (a char device) is skipped, never
+/// opened, so the worker can neither block nor steal the terminal.
+#[cfg(unix)]
+#[test]
+fn a_non_regular_file_reference_is_skipped() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(&config, "[server]\nnote = \"${file:/dev/null}\"\n");
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = Vec::new();
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(
+        values.is_empty(),
+        "a non-regular file is skipped: {values:?}"
+    );
+}
+
+/// A secret file's contribution is its whole trimmed contents plus each
+/// non-empty trimmed line, so a single quoted line is masked too.
+#[cfg(unix)]
+#[test]
+fn a_secret_files_lines_are_masked() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("etc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tok = dir.join("tokens.txt");
+    write(&tok, "first.secret.value\nsecond.secret.value\n");
+    let config = home.home().join("etc").join("shunt.toml");
+    write(
+        &config,
+        &format!("[server]\nnote = \"${{file:{}}}\"\n", tok.display()),
+    );
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = Vec::new();
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(
+        values.iter().any(|v| v == "first.secret.value"),
+        "{values:?}"
+    );
+    assert!(
+        values.iter().any(|v| v == "second.secret.value"),
+        "{values:?}"
+    );
+    assert!(
+        values
+            .iter()
+            .any(|v| v == "first.secret.value\nsecond.secret.value"),
+        "{values:?}"
+    );
+}
+
+/// An over-cap secret file contributes the complete lines within its first cap
+/// bytes (the trailing partial line dropped), so its first line is masked.
+#[cfg(unix)]
+#[test]
+fn an_over_cap_files_complete_lines_are_masked() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("etc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let big = dir.join("big.txt");
+    let mut content = "first.line.secret\n".to_string();
+    content.push_str(&"filler\n".repeat(20_000));
+    write(&big, &content);
+    let config = home.home().join("etc").join("shunt.toml");
+    write(
+        &config,
+        &format!("[server]\nnote = \"${{file:{}}}\"\n", big.display()),
+    );
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = Vec::new();
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(
+        values.iter().any(|v| v == "first.line.secret"),
+        "{:?}",
+        values.iter().take(3).collect::<Vec<_>>()
+    );
+}
+
+/// The masking set takes every inherited `SHUNT_*` value (shunt layers them
+/// over the config), except the store-pin keys clauth itself chooses.
+#[test]
+fn the_masking_set_covers_inherited_shunt_env_values() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(&config, "[server]\n");
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = vec![
+        (
+            "SHUNT_PROVIDERS__ACME__SERVICE_TIER".into(),
+            "tier.secret.value".into(),
+        ),
+        ("SHUNT_CLAUDE_ACCOUNTS_DIR".into(), "/store/claude".into()),
+    ];
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(
+        values.iter().any(|v| v == "tier.secret.value"),
+        "{values:?}"
+    );
+    assert!(!values.iter().any(|v| v == "/store/claude"), "{values:?}");
+}
+
+/// `tokens_file` resolves its path the way shunt reads it: `~/` expands over
+/// the check's HOME, and a relative path resolves against the config's
+/// directory.
+#[cfg(unix)]
+#[test]
+fn the_tokens_file_path_resolves_tilde_and_relative() {
+    let home = HomeSandbox::new();
+    let home_dir = home.home().to_path_buf();
+    let etc = home_dir.join("etc");
+    std::fs::create_dir_all(&etc).unwrap();
+    write(&home_dir.join("tok.txt"), "tilde.secret.value\n");
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> =
+        vec![("HOME".into(), home_dir.clone().into_os_string())];
+
+    let config = etc.join("shunt.toml");
+    write(&config, "[server.admin]\ntokens_file = \"~/tok.txt\"\n");
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(
+        values.iter().any(|v| v == "tilde.secret.value"),
+        "{values:?}"
+    );
+
+    write(&etc.join("rel.txt"), "relative.secret.value\n");
+    let config2 = etc.join("other.toml");
+    write(&config2, "[server.admin]\ntokens_file = \"rel.txt\"\n");
+    let values2 = check_masking_values(&config2, &env, &inherited);
+    assert!(
+        values2.iter().any(|v| v == "relative.secret.value"),
+        "{values2:?}"
+    );
+
+    // A `${...}`-shaped path substitutes first, then the file is read.
+    write(&etc.join("var.txt"), "dollar.secret.value\n");
+    let config3 = etc.join("var.toml");
+    write(&config3, "[server.admin]\ntokens_file = \"${TF}\"\n");
+    let inherited3: Vec<(OsString, OsString)> = vec![
+        ("HOME".into(), home_dir.into_os_string()),
+        ("TF".into(), etc.join("var.txt").into_os_string()),
+    ];
+    let values3 = check_masking_values(&config3, &env, &inherited3);
+    assert!(
+        values3.iter().any(|v| v == "dollar.secret.value"),
+        "{values3:?}"
+    );
+}
+
+/// A `$${` escape is a literal `${`, never a reference, in the shared scanner.
+#[test]
+fn a_double_dollar_escape_is_not_a_reference() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(&config, "[server]\nnote = \"$${ZZ_A}\"\n");
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = vec![("ZZ_A".into(), "hunter2.pass+word".into())];
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(
+        !values.iter().any(|v| v == "hunter2.pass+word"),
+        "{values:?}"
+    );
+}
+
+/// A `${file:}` naming a FIFO is skipped by stat without opening it, so the
+/// call returns promptly and the FIFO is never read.
+#[cfg(unix)]
+#[test]
+fn a_fifo_file_reference_is_skipped_without_opening() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("etc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let fifo = dir.join("fifo");
+    std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("mkfifo");
+    assert_eq!(secret_file_segments(fifo.to_str().unwrap()), None);
+}
+
+/// The masking set takes shunt's default token env vars, every config-named
+/// `*_env` key (a `${...}`-valued one resolved first), and their values.
+#[test]
+fn the_masking_set_covers_env_named_secret_vars() {
+    let home = HomeSandbox::new();
+    let config = home.home().join("etc").join("shunt.toml");
+    write(
+        &config,
+        "[server]\n[server.auth]\ntokens_env = \"${TOKENS_NAME}\"\n[server.gateway]\nusers_env = \"MY_USERS\"\n",
+    );
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = vec![
+        ("TOKENS_NAME".into(), "MY_TOKENS".into()),
+        ("MY_TOKENS".into(), "tok.en+val.ue".into()),
+        ("MY_USERS".into(), "user.secret.value".into()),
+        ("SHUNT_CLIENT_TOKENS".into(), "default.tok.value".into()),
+    ];
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(values.iter().any(|v| v == "tok.en+val.ue"), "{values:?}");
+    assert!(
+        values.iter().any(|v| v == "user.secret.value"),
+        "{values:?}"
+    );
+    assert!(
+        values.iter().any(|v| v == "default.tok.value"),
+        "{values:?}"
+    );
+}
+
+/// The masking set reads `[server.admin].tokens_file`'s trimmed contents, the
+/// one `*_file` key shunt reads as a secret file.
+#[test]
+fn the_masking_set_reads_the_tokens_file() {
+    let home = HomeSandbox::new();
+    let dir = home.home().join("etc");
+    std::fs::create_dir_all(&dir).unwrap();
+    let tok = dir.join("tokens.txt");
+    write(&tok, "  ops:tok.en+val.ue  \n");
+    let config = home.home().join("etc").join("shunt.toml");
+    write(
+        &config,
+        &format!("[server.admin]\ntokens_file = \"{}\"\n", tok.display()),
+    );
+    let env = GatewayEnv::default();
+    let inherited: Vec<(OsString, OsString)> = Vec::new();
+    let values = check_masking_values(&config, &env, &inherited);
+    assert!(
+        values.iter().any(|v| v == "ops:tok.en+val.ue"),
+        "{values:?}"
+    );
 }
 
 /// A check that writes more than the cap plus the pipe buffer and then
@@ -2909,6 +3171,41 @@ fn a_check_refusals_debug_never_prints_its_stderr() {
         format!("{refusal:?}"),
         r#"CheckFailed { binary: "/opt/shunt/bin/shunt", config: "/etc/shunt/shunt.toml", code: Some(1), stderr: CheckStderr(<redacted>) }"#
     );
+}
+
+/// `mask_check_output` hides every secret value wherever it appears (the
+/// longest match winning at each position), then any leftover key-shaped
+/// token, and leaves ordinary lines alone. Exact equality per shape.
+#[test]
+fn mask_check_output_hides_env_values_and_key_tokens() {
+    let secrets: Vec<String> = vec![
+        "sk-SECRET-value-123".to_string(),
+        "/home/uwuclxdy".to_string(),
+        "plain.secret.v".to_string(),
+        "plain.secret.value".to_string(),
+    ];
+    for (input, want) in [
+        // An env value inside quotes: the env pass masks it, the token pass
+        // leaves the `sk-` stand-in's 3-char head alone.
+        (
+            "invalid token: found \"sk-SECRET-value-123\"",
+            "invalid token: found \"sk-…\"",
+        ),
+        // A non-key-shaped value appearing twice is masked at both sites.
+        ("plain.secret.v and plain.secret.v", "pla… and pla…"),
+        // Two overlapping values: the longer one wins the match.
+        ("found plain.secret.value", "found pla…"),
+        // An `sk-` key NOT in the env: the token pass catches it.
+        ("missing key sk-ant-api03-abcdef", "missing key sk-…"),
+        // A long hex-ish id (20+ chars, letter + digit).
+        ("id 0123456789abcdef0123456789abcdef", "id 012…"),
+        // A non-`sk-` env value (a path) is masked too.
+        ("home is /home/uwuclxdy today", "home is /ho… today"),
+        // A normal error line is left untouched.
+        ("config error: boom", "config error: boom"),
+    ] {
+        assert_eq!(mask_check_output(input, &secrets), want, "input: {input}");
+    }
 }
 
 #[cfg(unix)]

@@ -5025,7 +5025,7 @@ fn the_daemon_start_confirm_refuses_an_unreadable_lock() {
     assert_eq!(
         toast.body,
         format!(
-            "daemon start failed\nfailed to open the clauth daemon lock file {}: {cause}",
+            "daemon start failed\n{cause} · failed to open the clauth daemon lock file {}",
             lock.display()
         )
     );
@@ -18901,6 +18901,7 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(
         card.detail.last().map(String::as_str),
@@ -18930,6 +18931,7 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         None,
+        false,
     );
     assert!(card.fix.is_none(), "a YAML find gets no adopt");
     assert!(card.shunt_focus.is_empty());
@@ -18959,6 +18961,7 @@ fn the_shunt_card_offers_adopt_only_for_a_toml_find() {
         None,
         None,
         None,
+        false,
     );
     assert!(
         card.fix.is_none(),
@@ -18994,10 +18997,10 @@ fn the_adopt_refuses_an_unparsed_config_before_reading_any_bind() {
     );
 }
 
-/// A card action's error keeps its cause chain: an adopt whose config does not
-/// exist names the path and, under it, why it could not be resolved. The
-/// cause is the OS's own message, read here independently of the code under
-/// test.
+/// A card action's error keeps its cause chain, the root cause first: an
+/// adopt whose config does not exist names why (the OS's own message, read
+/// here independently of the code under test) then the path it failed to
+/// resolve.
 #[test]
 fn a_failed_adopt_keeps_the_cause_under_its_context() {
     let home = crate::testutil::HomeSandbox::new();
@@ -19007,7 +19010,7 @@ fn a_failed_adopt_keeps_the_cause_under_its_context() {
         super::ShuntActionOutcome::AdoptFailed { error } => assert_eq!(
             error,
             format!(
-                "cannot resolve the shunt config {}: {cause}",
+                "{cause} · cannot resolve the shunt config {}",
                 config.display()
             )
         ),
@@ -19149,6 +19152,7 @@ fn an_env_bind_does_not_offer_adopt_for_an_unreadable_config() {
             None,
             None,
             None,
+            false,
         );
         assert!(
             card.fix.is_none(),
@@ -19195,6 +19199,7 @@ fn a_toml_name_linked_onto_yaml_reads_as_yaml() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(
         card.detail,
@@ -19262,6 +19267,7 @@ fn an_unrecorded_daemon_env_offers_no_adopt() {
         None,
         None,
         None,
+        false,
     );
     assert_eq!(
         card.detail,
@@ -19287,7 +19293,17 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
     slot.version = Some("0.49.1".to_string());
 
     // No admin step owed, no pool note, no move due: fields, blank, enabled.
-    let card = super::shunt_card(&slot, true, false, None, Some(&record), None, None, None);
+    let card = super::shunt_card(
+        &slot,
+        true,
+        false,
+        None,
+        Some(&record),
+        None,
+        None,
+        None,
+        false,
+    );
     assert_eq!(
         card.detail,
         vec![
@@ -19320,6 +19336,7 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         Some(crate::gateway::AdminNeed::WriteKey),
         None,
         None,
+        false,
     );
     assert!(
         key_card.detail.iter().any(|l| l == "f  add admin key"),
@@ -19335,6 +19352,7 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         Some(crate::gateway::AdminNeed::AdminTable),
         None,
         None,
+        false,
     );
     assert!(
         table_card.detail.iter().any(|l| l == "f  add admin table"),
@@ -19350,6 +19368,7 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         Some(crate::gateway::AdminNeed::Neither),
         None,
         None,
+        false,
     );
     assert!(
         !neither_card
@@ -19370,6 +19389,7 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         Some(&two),
+        false,
     );
     assert!(
         card.detail
@@ -19392,6 +19412,7 @@ fn the_shunt_card_builds_the_enabled_admin_and_pool_section() {
         None,
         None,
         Some(&err),
+        false,
     );
     assert!(
         card.detail
@@ -19455,6 +19476,7 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
     );
     let start = card.shunt_action_start.unwrap();
     assert_eq!(
@@ -19500,6 +19522,7 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
             "the stores changed since the plan was shown; look at the plan again".to_string(),
         )),
         None,
+        false,
     );
     let start = card.shunt_action_start.unwrap();
     assert_eq!(
@@ -19535,6 +19558,7 @@ fn the_move_plan_names_every_kept_reason_no_home_and_refusal() {
         None,
         Some(&super::MovePlanOutcome::Nothing),
         None,
+        false,
     );
     assert!(
         !card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -19557,6 +19581,7 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         None,
+        false,
     );
     assert!(
         card.detail
@@ -19568,7 +19593,7 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
 
     let mut foreign = shunt_slot(GatewayState::Foreign);
     foreign.answerer = Some(Answerer::Shunt);
-    let card = super::shunt_card(&foreign, true, false, None, None, None, None, None);
+    let card = super::shunt_card(&foreign, true, false, None, None, None, None, None, false);
     assert!(card.detail.iter().any(|l| l == "state: foreign"));
     assert!(card.detail.iter().any(|l| l == "answerer: shunt"));
     let card = super::shunt_card(
@@ -19580,6 +19605,7 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         None,
+        false,
     );
     assert!(card.detail.iter().any(|l| l == "state: below_floor"));
     let card = super::shunt_card(
@@ -19591,6 +19617,7 @@ fn the_held_state_reads_stopped_until_the_daemon_restarts() {
         None,
         None,
         None,
+        false,
     );
     assert!(card.detail.iter().any(|l| l == "state: yaml_refused"));
 }
@@ -19893,12 +19920,756 @@ fn the_shunt_action_toasts_follow_the_outcome() {
         &mut app,
         super::ShuntActionOutcome::AdminFailed {
             error: "boom".to_string(),
+            check_output: None,
+            config: std::path::PathBuf::from("/cfg/shunt.toml"),
         },
     );
     assert!(
         bodies(&app).iter().any(|b| b == "admin key failed\nboom"),
         "{:?}",
         bodies(&app)
+    );
+}
+
+/// The admin-refusal toast carries the compact outcome-and-pointer detail, not
+/// the full-path `Display`: the outcome (`unchanged`) stays on screen at 80 and
+/// 45 columns. The body is the worker's exact `AdminFailed` error, pinned by
+/// equality.
+#[cfg(unix)]
+#[test]
+fn the_admin_refusal_toast_shows_the_compact_outcome() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The real-world shape: a long absolute config path, the exact thing the
+    // old Display led with before the outcome.
+    let config = home.home().join(".config").join("shunt").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    let super::ShuntActionOutcome::AdminFailed { error, .. } = outcome else {
+        panic!("the failing check refuses, got {outcome:?}");
+    };
+    assert_eq!(
+        error,
+        format!(
+            "`shunt check` refused the edit (exit 1) · shunt.toml unchanged · {} check output on the shunt card",
+            crate::tui::render::prose::key("↵"),
+        )
+    );
+
+    let mut app = bare_app();
+    app.toast(
+        super::ToastKind::Danger,
+        format!("admin key failed\n{}", super::escape_control(&error)),
+    );
+    for (width, height) in [(80u16, 24u16), (45u16, 24u16)] {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+            .expect("terminal");
+        term.draw(|f| crate::tui::render::draw(f, &app))
+            .expect("draw");
+        let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+        assert!(
+            text.contains("unchanged"),
+            "the outcome clause clips at {width} columns:\n{text}"
+        );
+    }
+}
+
+/// Every `admin_refusal_line` arm pins its compact toast by EQUALITY against a
+/// fixture fixing every interpolated value (distinct basenames, a duration),
+/// so each arm's outcome clause is bound. The `CheckFailed` arm is pinned by
+/// `the_admin_refusal_toast_shows_the_compact_outcome` (driven through
+/// `run_admin_edit`, its exit code fixed).
+#[test]
+fn every_admin_refusal_line_arm_pins_its_compact_toast() {
+    use crate::gateway::{AdminNeed, ConfigEditRefusal as R};
+    use std::path::PathBuf;
+
+    let cases: Vec<(R, String)> = vec![
+        (
+            R::Needs(AdminNeed::AdminTable),
+            "the config has no [server.admin] table; adding one enables shunt's admin API and is its own step"
+                .to_string(),
+        ),
+        (
+            R::Needs(AdminNeed::WriteKey),
+            "the config already has a [server.admin] table; clauth's write key goes into it instead"
+                .to_string(),
+        ),
+        (
+            R::Needs(AdminNeed::Neither),
+            "the config already carries clauth's write key".to_string(),
+        ),
+        (
+            R::ForeignClauthKey,
+            "[server.admin] already has a write key with id \"clauth\" holding another key; clauth adds none beside it; remove that entry, then run the edit again"
+                .to_string(),
+        ),
+        (
+            R::UnexpectedShape {
+                what: "[server] is not a table",
+            },
+            "[server] is not a table; clauth edits only a [server.admin] table and its write_keys array"
+                .to_string(),
+        ),
+        (
+            R::TokenPathUnusable {
+                path: PathBuf::from("/home/t/.clauth/{stray}/gateway-admin-token"),
+            },
+            "the clauth dir path holds a `}` · the admin key cannot be a ${file:} reference"
+                .to_string(),
+        ),
+        (
+            R::Symlink {
+                path: PathBuf::from("/cfg/linked.toml"),
+            },
+            "linked.toml is a symlink · clauth would replace the link by renaming over it".to_string(),
+        ),
+        (
+            R::ShuntMissing {
+                binary: PathBuf::from("/opt/shunt/bin/shunt"),
+            },
+            "cannot run shunt: no such file · install shunt or point the gateway at its binary".to_string(),
+        ),
+        (
+            R::ChangedDuringEdit {
+                path: PathBuf::from("/cfg/shunt.toml"),
+            },
+            "shunt.toml changed during the check · nothing was written · run the edit again".to_string(),
+        ),
+        (
+            R::CheckTimedOut {
+                binary: PathBuf::from("/opt/shunt/bin/shunt"),
+                config: PathBuf::from("/cfg/shunt.toml"),
+                after: std::time::Duration::from_secs(2),
+            },
+            "`shunt check` ran past 2s and was stopped · shunt.toml unchanged · run `shunt check --config /cfg/shunt.toml` to see why it does not finish, then try again"
+                .to_string(),
+        ),
+    ];
+    for (refusal, want) in cases {
+        assert_eq!(super::admin_refusal_line(&refusal), want);
+    }
+}
+
+/// The `check output` line on the shunt card opens a read-only modal whose
+/// cells hold the masked stderr: the env value is gone, its stand-in shows.
+#[cfg(unix)]
+#[test]
+fn the_check_output_line_opens_a_masked_modal() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\necho 'config error: super-secret-value-xyz' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let env_file = home.home().join("tokens.env");
+    std::fs::write(&env_file, "GATEWAY_TEST_SECRET=super-secret-value-xyz\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    record.env_file = Some(env_file);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    // Run the failing edit and land its outcome the way the drain does. The
+    // first recompute loads the record, so the drain's recompute sees the same
+    // record and keeps the held output.
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    super::handle_shunt_action_outcome(&mut app, outcome);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    // The card carries the walkable `check output` stop.
+    let card = app
+        .services
+        .checks
+        .iter()
+        .find(|c| c.label == "shunt")
+        .expect("the shunt card");
+    assert!(
+        card.shunt_focus
+            .iter()
+            .any(|f| matches!(f, super::ShuntFocus::CheckOutput { .. })),
+        "the card carries the check output stop: {:?}",
+        card.shunt_focus
+    );
+
+    // ↵ on the focused `check output` line opens the masked modal.
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_focus
+        .set(Some(super::ShuntFocusLine::CheckOutput));
+    super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
+        panic!("the check output modal opened, got {:?}", app.modals.last());
+    };
+    assert_eq!(body, "config error: sup…");
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(
+        text.contains("sup…"),
+        "the masked stand-in renders:\n{text}"
+    );
+    assert!(
+        !text.contains("super-secret-value-xyz"),
+        "the env value never renders:\n{text}"
+    );
+}
+
+/// The held stderr is masked at `CheckFailed` build time against the check's
+/// OWN env, never the env re-read at modal-open: a value (8-19 bytes, not
+/// `sk-`, not a 20+ mixed token) removed from the env file before the modal
+/// opens still shows its stand-in, and the raw value never sits in the held
+/// text.
+#[cfg(unix)]
+#[test]
+fn the_held_output_is_masked_against_the_checks_env_not_the_open_env() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    // `plainsecret` is 11 bytes: 8+, not `sk-`, not a 20+ mixed-alnum token —
+    // only the check-time env pass can mask it.
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\necho 'config error: plainsecret' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let env_file = home.home().join("tokens.env");
+    std::fs::write(&env_file, "GATEWAY_TEST_SECRET=plainsecret\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    record.env_file = Some(env_file.clone());
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    let super::ShuntActionOutcome::AdminFailed {
+        check_output: Some(output),
+        ..
+    } = &outcome
+    else {
+        panic!("the failing check refuses with stderr, got {outcome:?}");
+    };
+    assert!(
+        !output.text().contains("plainsecret"),
+        "the held text is masked at build time: {}",
+        output.text()
+    );
+
+    // Remove the env file, then open the modal: the check-time env was already
+    // applied, so the stand-in still renders and the value never does.
+    std::fs::remove_file(&env_file).unwrap();
+    super::handle_shunt_action_outcome(&mut app, outcome);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_focus
+        .set(Some(super::ShuntFocusLine::CheckOutput));
+    super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
+        panic!("the check output modal opened, got {:?}", app.modals.last());
+    };
+    assert_eq!(body, "config error: pla…");
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(
+        text.contains("pla…"),
+        "the masked stand-in renders:\n{text}"
+    );
+    assert!(
+        !text.contains("plainsecret"),
+        "the env value never renders:\n{text}"
+    );
+}
+
+/// A later refusal that ran no check (or a non-typed error) retires the held
+/// output, and a config that became unreadable clears it too: the `check
+/// output` line goes away instead of showing an earlier refusal's stderr.
+#[cfg(unix)]
+#[test]
+fn a_check_output_free_refusal_and_an_unreadable_config_clear_the_held_output() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let has_output = |app: &App| {
+        app.services
+            .checks
+            .iter()
+            .find(|c| c.label == "shunt")
+            .is_some_and(|c| {
+                c.shunt_focus
+                    .iter()
+                    .any(|f| matches!(f, super::ShuntFocus::CheckOutput { .. }))
+            })
+    };
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    // A failing check holds its output.
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    super::handle_shunt_action_outcome(&mut app, outcome);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(has_output(&app), "the check failure holds its output");
+
+    // A later refusal with no stderr (a non-typed error) clears it.
+    super::handle_shunt_action_outcome(
+        &mut app,
+        super::ShuntActionOutcome::AdminFailed {
+            error: "boom".to_string(),
+            check_output: None,
+            config: std::path::PathBuf::from("/cfg/shunt.toml"),
+        },
+    );
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        !has_output(&app),
+        "a check-output-free refusal clears the held output"
+    );
+
+    // Hold it again, then make the config unreadable: `admin_need` is `None`.
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    super::handle_shunt_action_outcome(&mut app, outcome);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(has_output(&app), "the output is re-held");
+    std::fs::remove_file(&config).unwrap();
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    assert!(
+        !has_output(&app),
+        "an unreadable config clears the held output"
+    );
+}
+
+/// A `${file:}` reference in the candidate config is masked against the
+/// referenced file's trimmed contents, so a file-held credential the check
+/// quotes never reaches the modal. Red by assertion on round 3: round 3 masked
+/// only the gateway-env overlay, never the reference's file contents.
+#[cfg(unix)]
+#[test]
+fn a_config_file_reference_is_masked_against_the_files_contents() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\necho 'file.secret.contents' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let secret = home.home().join("etc").join("secret.txt");
+    std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+    std::fs::write(&secret, "  file.secret.contents  \n").unwrap();
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:3067\"\nnote = \"${{file:{}}}\"\n",
+            secret.display()
+        ),
+    )
+    .unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    let super::ShuntActionOutcome::AdminFailed {
+        check_output: Some(output),
+        ..
+    } = &outcome
+    else {
+        panic!("the failing check refuses with stderr, got {outcome:?}");
+    };
+    assert!(
+        !output.text().contains("file.secret.contents"),
+        "the file reference's contents are masked: {}",
+        output.text()
+    );
+    assert!(
+        output.text().contains("fil…"),
+        "the file reference's stand-in renders: {}",
+        output.text()
+    );
+}
+
+/// A `${VAR}` reference in the candidate config is masked against the value
+/// the check's inherited env resolves it to (not just the gateway-env
+/// overlay), so an exported credential the config names never reaches the
+/// modal. Driven through the inherited-env seam.
+#[cfg(unix)]
+#[test]
+fn a_config_var_reference_is_masked_against_the_checks_inherited_env() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\necho \"config error: invalid '$ZZ_PROBE_INHERITED'\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(
+        &config,
+        "[server]\nbind = \"127.0.0.1:3067\"\nnote = \"${ZZ_PROBE_INHERITED}\"\n",
+    )
+    .unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let _override = crate::gateway::InheritedEnvOverride::set(vec![(
+        "ZZ_PROBE_INHERITED".into(),
+        "hunter2.pass+word".into(),
+    )]);
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    let super::ShuntActionOutcome::AdminFailed {
+        check_output: Some(output),
+        ..
+    } = &outcome
+    else {
+        panic!("the failing check refuses with stderr, got {outcome:?}");
+    };
+    assert!(
+        !output.text().contains("hunter2.pass+word"),
+        "the inherited reference's value is masked: {}",
+        output.text()
+    );
+    assert!(
+        output.text().contains("hun…"),
+        "the inherited reference's stand-in renders: {}",
+        output.text()
+    );
+}
+
+/// A value that straddles the 64 KiB stderr cap is dropped with its trailing
+/// partial line, so no prefix of it survives. Red by assertion on round 3,
+/// which masked the post-cut bytes only.
+#[cfg(unix)]
+#[test]
+fn a_value_straddling_the_stderr_cap_is_dropped_with_its_partial_line() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nhead -c 65530 /dev/zero | tr '\\000' . >&2\nprintf '\\n' >&2\nprintf 'pass.word.1234.xyz' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let env_file = home.home().join("tokens.env");
+    std::fs::write(&env_file, "GATEWAY_TEST_SECRET=pass.word.1234.xyz\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    record.env_file = Some(env_file);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    let super::ShuntActionOutcome::AdminFailed {
+        check_output: Some(output),
+        ..
+    } = &outcome
+    else {
+        panic!("the failing check refuses with stderr, got {outcome:?}");
+    };
+    assert!(
+        !output.text().contains("pass"),
+        "the straddled value's prefix is dropped: {}",
+        output.text()
+    );
+}
+
+/// Multi-line stderr with an ANSI SGR sequence renders as separate rows with
+/// no literal `\n` and no escape byte in the cells. Red by assertion on round
+/// 3, which escaped the whole body into one row of literal `\n`/`\u{1b}`.
+#[cfg(unix)]
+#[test]
+fn multi_line_stderr_with_sgr_renders_as_separate_rows() {
+    use ratatui::crossterm::event::KeyCode;
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\nprintf 'Error: config check failed\\r\\n\\r\\nCaused by:\\r\\n    \\033[31mbad thing\\033[0m\\r\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    super::handle_shunt_action_outcome(&mut app, outcome);
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    app.services.focus = super::ServicesFocus::Detail;
+    app.services
+        .shunt_focus
+        .set(Some(super::ShuntFocusLine::CheckOutput));
+    super::handle_services_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let super::Modal::CheckOutput(body) = app.modals.last().expect("a modal opened") else {
+        panic!("the check output modal opened, got {:?}", app.modals.last());
+    };
+    assert_eq!(
+        body,
+        "Error: config check failed\n\nCaused by:\n    bad thing"
+    );
+
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let text = rows.join("\n");
+    let error_row = rows
+        .iter()
+        .position(|r| r.contains("Error: config check failed"))
+        .expect("the first line renders");
+    let bad_row = rows
+        .iter()
+        .position(|r| r.contains("bad thing"))
+        .expect("the cause renders");
+    assert!(
+        error_row != bad_row,
+        "the two lines are separate rows:\n{text}"
+    );
+    assert!(!text.contains("\\u{1b}"), "no escape byte renders:\n{text}");
+    assert!(!text.contains("\\n"), "no literal `\\n` renders:\n{text}");
+}
+
+/// A malformed CSI sequence (a non-parameter byte before the final byte) eats
+/// no text: the ESC is kept for `escape_control` and scanning resumes after it.
+#[test]
+fn a_malformed_csi_sequence_eats_no_text() {
+    let input = "broken \x1b[ 12;\nnext line Error here";
+    assert_eq!(super::strip_ansi_csi(input), input);
+}
+
+/// A `{e:#}`-built toast shows its root cause on screen at a 45-column
+/// terminal: the cause leads, the path may clip. Red by assertion on round 3,
+/// whose `{e:#}` chain led with the path and clipped the cause.
+#[cfg(unix)]
+#[test]
+fn an_error_chain_toast_shows_its_root_cause_at_45_columns() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    std::fs::remove_file(&config).unwrap();
+
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    let super::ShuntActionOutcome::AdminFailed { error, .. } = outcome else {
+        panic!("the missing config fails the edit, got {outcome:?}");
+    };
+    assert!(
+        error.starts_with("No such file or directory"),
+        "the root cause leads: {error}"
+    );
+
+    let mut app = bare_app();
+    app.toast(
+        super::ToastKind::Danger,
+        format!("admin key failed\n{}", super::escape_control(&error)),
+    );
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(45, 24)).expect("terminal");
+    term.draw(|f| crate::tui::render::draw(f, &app))
+        .expect("draw");
+    let text = crate::testutil::buffer_rows(term.backend().buffer()).join("\n");
+    assert!(
+        text.contains("os error 2"),
+        "the root cause is on screen at 45 columns:\n{text}"
+    );
+}
+
+/// The drain holds `check_output` only when the edited config equals the
+/// current record's config: a re-adopt that landed while the check ran never
+/// shows another gateway's output on this card. Red by assertion on round 3,
+/// whose drain held the output unconditionally.
+#[cfg(unix)]
+#[test]
+fn the_drain_drops_check_output_when_the_edited_config_is_not_the_current_record() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nexit 1\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config_a = home.home().join("etc").join("a.toml");
+    std::fs::create_dir_all(config_a.parent().unwrap()).unwrap();
+    std::fs::write(&config_a, "[server]\n").unwrap();
+    let mut record_a = crate::gateway::GatewayRecord::new(config_a.clone()).unwrap();
+    record_a.binary = Some(stub.clone());
+    let config_b = home.home().join("etc").join("b.toml");
+    std::fs::write(&config_b, "[server]\n").unwrap();
+    let mut record_b = crate::gateway::GatewayRecord::new(config_b.clone()).unwrap();
+    record_b.binary = Some(stub);
+
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record_a.clone());
+        Ok(())
+    })
+    .unwrap();
+    let mut app = bare_app();
+    app.tab = super::Tab::Services;
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    let outcome = super::run_admin_edit(&record_a, crate::gateway::AdminNeed::AdminTable);
+
+    // Re-adopt B while the check ran; a recompute lands the new record.
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record_b.clone());
+        Ok(())
+    })
+    .unwrap();
+    super::recompute_services_checks(&mut app, false, super::ShuntRefresh::Keep);
+
+    super::handle_shunt_action_outcome(&mut app, outcome);
+    assert!(
+        app.services.check_output.is_none(),
+        "the drain drops output for a stale config"
+    );
+}
+
+/// A signal-killed check names the signal (not an exit code) in the toast, by
+/// equality.
+#[cfg(unix)]
+#[test]
+fn a_signal_killed_check_names_the_signal_in_the_toast() {
+    let home = crate::testutil::HomeSandbox::new();
+    let stub = home.home().join("bin").join("shunt");
+    std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+    std::fs::write(&stub, "#!/bin/sh\nkill -9 $$\n").unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[server]\n").unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config.clone()).unwrap();
+    record.binary = Some(stub);
+
+    let outcome = super::run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable);
+    let super::ShuntActionOutcome::AdminFailed { error, .. } = outcome else {
+        panic!("the signal-killed check fails the edit, got {outcome:?}");
+    };
+    assert_eq!(
+        error,
+        format!(
+            "`shunt check` refused the edit (killed by a signal) · shunt.toml unchanged · {} check output on the shunt card",
+            crate::tui::render::prose::key("↵"),
+        )
     );
 }
 
@@ -19978,6 +20749,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         None,
         None,
         None,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -20024,6 +20796,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -20057,6 +20830,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -20083,6 +20857,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(crate::gateway::AdminNeed::WriteKey),
         None,
         None,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -20111,6 +20886,7 @@ fn the_shunt_confirms_carry_the_approved_copy() {
         Some(crate::gateway::AdminNeed::AdminTable),
         None,
         None,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -20158,6 +20934,7 @@ fn a_running_gateway_shows_no_move_plan() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
     );
     assert!(
         !card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -20180,6 +20957,7 @@ fn a_running_gateway_shows_no_move_plan() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
     );
     assert!(
         card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -20217,6 +20995,7 @@ fn the_move_confirm_counts_n_and_k_separately() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
     );
     let mut app = bare_app();
     app.tab = super::Tab::Services;
@@ -20424,7 +21203,7 @@ fn a_failed_enabled_toggle_keeps_the_cause_under_its_context() {
             .collect::<Vec<_>>(),
         vec![(
             super::ToastKind::Danger,
-            format!("save failed\nfailed to read {}: {cause}", record.display())
+            format!("save failed\n{cause} · failed to read {}", record.display())
         )]
     );
 }
@@ -20498,6 +21277,7 @@ fn the_shunt_card_escapes_control_and_bidi_in_a_provider_name() {
         None,
         None,
         Some(&super::PoolOutcome::Providers(vec![provider.to_string()])),
+        false,
     );
     assert!(
         card.detail
@@ -20534,6 +21314,7 @@ fn a_dead_daemon_reads_the_card_off_over_a_stale_healthy_slot() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan)),
         None,
+        false,
     );
     assert!(
         card.detail.iter().any(|l| l == "MOVE PLAN"),
@@ -20827,6 +21608,7 @@ fn a_landed_add_admin_key_re_settles_focus_to_the_enabled_row() {
         Some(crate::gateway::AdminNeed::WriteKey),
         None,
         None,
+        false,
     )];
     app.services.shunt_record = Some(record.clone());
     app.services.shunt_action.prober = Some(admin_landing_prober);
@@ -20898,6 +21680,7 @@ fn a_landed_move_re_settles_focus_to_the_enabled_row() {
         None,
         Some(&super::MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
     )];
     app.services.shunt_record = Some(record.clone());
     app.services.move_plan = Some(super::MovePlanOutcome::Plan(plan));
@@ -21260,16 +22043,16 @@ fn the_capture_refusal_styles_the_owners_switch_command() {
     );
 }
 
-/// The move and both admin edits keep the cause chain too: with the adopted
-/// config gone, each names the path it failed to read and, under it, the OS's
-/// own reason.
+/// The move and both admin edits keep the cause chain too, the root cause
+/// first: with the adopted config gone, each names why (the OS's own reason)
+/// then the path it failed to read.
 #[test]
 fn a_failed_move_or_admin_edit_keeps_the_cause_under_its_context() {
     let home = crate::testutil::HomeSandbox::new();
     let record = crate::testutil::write_adopted_record(&home, false, "[server]\n");
     std::fs::remove_file(record.config()).unwrap();
     let cause = std::fs::read_to_string(record.config()).expect_err("removed");
-    let expected = format!("failed to read {}: {cause}", record.config().display());
+    let expected = format!("{cause} · failed to read {}", record.config().display());
     let plan = crate::gateway::StoreMovePlan {
         moved: Vec::new(),
         kept: Vec::new(),
@@ -21283,7 +22066,7 @@ fn a_failed_move_or_admin_edit_keeps_the_cause_under_its_context() {
         crate::gateway::AdminNeed::AdminTable,
     ] {
         match super::run_admin_edit(&record, step) {
-            super::ShuntActionOutcome::AdminFailed { error } => {
+            super::ShuntActionOutcome::AdminFailed { error, .. } => {
                 assert_eq!(error, expected, "{step:?}")
             }
             other => panic!("expected {step:?} to fail, got {other:?}"),

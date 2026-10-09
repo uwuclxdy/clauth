@@ -489,6 +489,7 @@ fn shunt_focus_line(focus: &ShuntFocus, text: &str, selected: bool, app: &App) -
             spans.extend(toggle_value(on, inert));
             Line::from(spans)
         }
+        ShuntFocus::CheckOutput { .. } => problem_line(text, selected),
     }
 }
 

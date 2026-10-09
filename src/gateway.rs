@@ -15,7 +15,7 @@
 
 #![expect(
     dead_code,
-    reason = "`GatewayEnv::get`, `CheckStderr::text` and the client-token reads (`client_auth`, `unmanaged_token_names`) are surfaces no caller reaches yet"
+    reason = "`GatewayEnv::get` and the client-token reads (`client_auth`, `unmanaged_token_names`) are surfaces no caller reaches yet"
 )]
 
 use std::collections::{BTreeMap, HashSet};
@@ -2654,14 +2654,17 @@ pub(crate) enum ConfigEditRefusal {
     },
 }
 
-/// `shunt check`'s stderr, its first [`CHECK_STDERR_LIMIT`] bytes. shunt's
-/// config errors quote substituted values, which may come from the env
-/// file, so `Debug` never prints it (the [`SecretToken`] precedent).
+/// `shunt check`'s stderr, its first [`CHECK_STDERR_LIMIT`] bytes, already
+/// masked by [`mask_check_output`] against the full set [`check_masking_values`]
+/// names. shunt's config errors quote substituted values, which may come from
+/// the env file, so `Debug` never prints it (the [`SecretToken`] precedent) and
+/// the held text is masked, never raw.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct CheckStderr(String);
 
 impl CheckStderr {
-    /// The text, for a surface that shows the user their own check's output.
+    /// The masked text, for a surface that shows the user their own check's
+    /// output. Already masked; a caller control-escapes it before rendering.
     pub(crate) fn text(&self) -> &str {
         &self.0
     }
@@ -2671,6 +2674,608 @@ impl std::fmt::Debug for CheckStderr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CheckStderr(<redacted>)")
     }
+}
+
+/// Mask a `shunt check` stderr against `secrets` (everything the check could
+/// have substituted into the config): every value of 8+ bytes is replaced
+/// wherever it appears, then any token the first pass left behind that is 20+
+/// chars of `[A-Za-z0-9_-]` holding both a letter and a digit, or that starts
+/// with `sk-`, is replaced the same way. A replaced value shows its first 3
+/// chars and an ellipsis. Run once at [`CheckStderr`] build time (in
+/// [`run_check`]), so the held text is masked before it can be read anywhere.
+fn mask_check_output(text: &str, secrets: &[String]) -> String {
+    let long: Vec<String> = secrets
+        .iter()
+        .filter(|value| value.len() >= 8)
+        .cloned()
+        .collect();
+    let env_masked = mask_secret_values(text, &long);
+    mask_secret_tokens(&env_masked)
+}
+
+/// The values a failed check's stderr is masked against — everything the
+/// check could have substituted into the config and might quote: the
+/// gateway-env overlay minus the store pins, every inherited `SHUNT_*` value
+/// (shunt layers them over the config, `config.rs:3659-3660`, and treats them
+/// as secret-bearing, `secrets.rs:389-394`), the candidate's `${VAR}`/
+/// `${file:}` reference resolutions, every `*_env`-named var's value, and the
+/// `tokens_file` contents. Overlay values win over inherited ones, as the
+/// spawned command sees them; minimum length 8 bytes is applied later, in
+/// [`mask_check_output`].
+fn check_masking_values(
+    candidate: &Path,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+) -> Vec<String> {
+    let mut values: Vec<String> = env
+        .vars
+        .iter()
+        .filter(|(key, _)| !is_store_pin(key))
+        .map(|(_, value)| value.to_string_lossy().into_owned())
+        .collect();
+    for (name, _) in inherited.iter().filter(|(name, _)| {
+        name.to_str()
+            .is_some_and(|key| key.starts_with("SHUNT_") && !is_store_pin(key))
+    }) {
+        let Some(key) = name.to_str() else {
+            continue;
+        };
+        if let Some(value) = spawned_env_value(env, key, inherited.iter().cloned()) {
+            values.push(value.to_string_lossy().into_owned());
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(candidate)
+        && let Ok(doc) = text.parse::<toml_edit::DocumentMut>()
+    {
+        collect_reference_values(&doc, env, inherited, &mut values);
+        for name in secret_env_names(&doc, env, inherited) {
+            if let Some(value) = spawned_env_value(env, &name, inherited.iter().cloned()) {
+                values.push(value.to_string_lossy().into_owned());
+            }
+        }
+        secret_file_values(&doc, env, inherited, candidate, &mut values);
+    }
+    values
+}
+
+/// Whether `key` is a store-pin env name clauth sets itself in
+/// [`gateway_env`]: a clauth-chosen account/auth store path, never a
+/// credential. Exempted from masking so a shunt error naming a store path
+/// reads the path, not a masked stub of it.
+fn is_store_pin(key: &str) -> bool {
+    STORES.iter().any(|store| store.env == key)
+}
+
+/// The values the candidate config's `${VAR}`/`${file:}` references resolve
+/// to, over its PARSED string leaves the way shunt scans them (shunt
+/// `config/secrets.rs:5-11`: every string leaf, nested tables and array
+/// elements, never keys): `$${` is an escape, `${VAR}` names a variable
+/// (`[A-Za-z_][A-Za-z0-9_]*`, `resolve_string`/`is_valid_var_name` `:577-683`)
+/// resolved over the check's inherited env with the gateway-env overlay
+/// winning, and `${file:/abs}` is a whole-value file reference whose contents
+/// shunt trims (`:641`). Each resolved value is a credential the check could
+/// quote in its stderr.
+fn collect_reference_values(
+    doc: &toml_edit::DocumentMut,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    out: &mut Vec<String>,
+) {
+    for (_, child) in doc.iter() {
+        collect_reference_item(child, env, inherited, out);
+    }
+}
+
+fn collect_reference_item(
+    item: &toml_edit::Item,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    out: &mut Vec<String>,
+) {
+    match item {
+        toml_edit::Item::Value(value) => collect_reference_value(value, env, inherited, out),
+        toml_edit::Item::Table(table) => {
+            for (_, child) in table.iter() {
+                collect_reference_item(child, env, inherited, out);
+            }
+        }
+        toml_edit::Item::ArrayOfTables(tables) => {
+            for table in tables.iter() {
+                for (_, child) in table.iter() {
+                    collect_reference_item(child, env, inherited, out);
+                }
+            }
+        }
+        toml_edit::Item::None => {}
+    }
+}
+
+fn collect_reference_value(
+    value: &toml_edit::Value,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    out: &mut Vec<String>,
+) {
+    match value {
+        toml_edit::Value::String(s) => scan_reference_string(s.value(), env, inherited, out),
+        toml_edit::Value::Array(arr) => {
+            for child in arr.iter() {
+                collect_reference_value(child, env, inherited, out);
+            }
+        }
+        toml_edit::Value::InlineTable(table) => {
+            for (_, child) in table.iter() {
+                collect_reference_value(child, env, inherited, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// One decoded string leaf, scanned with the shared reference grammar.
+fn scan_reference_string(
+    text: &str,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    out: &mut Vec<String>,
+) {
+    scan_references(text, env, inherited, out, None);
+}
+
+/// The one reference scanner both callers share (shunt
+/// `config/secrets.rs::resolve_string` grammar): `$${` unescapes to `${`, a
+/// `${VAR}` resolves over the check's inherited env with the gateway-env
+/// overlay winning, and a whole-value `${file:/abs}` reads the file. Every
+/// resolved credential — a var's value, or a file's whole trimmed contents
+/// plus each non-empty trimmed line — is appended to `resolved`; the
+/// reconstructed string (prose plus each value's whole form) is appended to
+/// `reconstructed` when one is wanted.
+fn scan_references(
+    text: &str,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    resolved: &mut Vec<String>,
+    mut reconstructed: Option<&mut String>,
+) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' && i + 2 < bytes.len() && bytes[i + 1] == b'$' && bytes[i + 2] == b'{' {
+            if let Some(reconstructed) = &mut reconstructed {
+                reconstructed.push_str("${");
+            }
+            i += 3;
+            continue;
+        }
+        if bytes[i] == b'$' && i + 1 < bytes.len() && bytes[i + 1] == b'{' {
+            let content_start = i + 2;
+            let Some(rel_end) = text[content_start..].find('}') else {
+                break;
+            };
+            let content_end = content_start + rel_end;
+            let content = &text[content_start..content_end];
+            let after_close = content_end + 1;
+            if content.is_empty() {
+                i = after_close;
+                continue;
+            }
+            if let Some(colon) = content.find(':') {
+                let file_path = &content[colon + 1..];
+                if &content[..colon] == "file"
+                    && std::path::Path::new(file_path).is_absolute()
+                    && let Some((whole, lines)) = secret_file_segments(file_path)
+                {
+                    if let Some(whole) = whole {
+                        if let Some(reconstructed) = &mut reconstructed {
+                            reconstructed.push_str(&whole);
+                        }
+                        resolved.push(whole);
+                    }
+                    resolved.extend(lines);
+                }
+                i = after_close;
+                continue;
+            }
+            if is_shunt_var_name(content)
+                && let Some(value) = spawned_env_value(env, content, inherited.iter().cloned())
+            {
+                let value = value.to_string_lossy().into_owned();
+                if let Some(reconstructed) = &mut reconstructed {
+                    reconstructed.push_str(&value);
+                }
+                resolved.push(value);
+            }
+            i = after_close;
+            continue;
+        }
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
+        if let Some(reconstructed) = &mut reconstructed {
+            reconstructed.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+}
+
+/// shunt's variable-name grammar (`config/secrets.rs::is_valid_var_name`):
+/// ASCII letter or `_`, then ASCII alphanumerics or `_`.
+fn is_shunt_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+const SECRET_FILE_READ_CAP: usize = 64 * 1024;
+
+/// A secret file's masking-set contribution, under the bounds the check itself
+/// is read under: only a regular file (a FIFO or device is never opened, so
+/// the worker can neither block nor steal the terminal) and at most
+/// [`SECRET_FILE_READ_CAP`] bytes. `Some(whole)` is the whole trimmed contents
+/// when it fit; `None` when the cap cut it, in which case only the complete
+/// lines within the first cap bytes contribute (the trailing partial line is
+/// dropped). Lines past the cap are not in the set — a recorded residual, not
+/// a bound on what the stderr can quote.
+fn secret_file_segments(path: &str) -> Option<(Option<String>, Vec<String>)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    use std::io::Read as _;
+    let mut bytes = Vec::with_capacity(SECRET_FILE_READ_CAP + 1);
+    std::fs::File::open(path)
+        .ok()?
+        .take(SECRET_FILE_READ_CAP as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let over_cap = bytes.len() > SECRET_FILE_READ_CAP;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if over_cap {
+        drop_trailing_partial_line(&mut text);
+    }
+    let whole = if over_cap {
+        None
+    } else {
+        Some(text.trim().to_string())
+    };
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            lines.push(line.to_string());
+        }
+    }
+    Some((whole, lines))
+}
+
+/// The env-var names whose values the check could substitute, read the way
+/// shunt reads them: the two token defaults (`SHUNT_CLIENT_TOKENS`
+/// `config.rs:488-489`, `SHUNT_ADMIN_TOKENS` `:748-749`) plus every `*_env`
+/// key's value anywhere in the tree (`tokens_env`, `users_env` `:872`,
+/// `jwt_secret_env` `:869`, `client_secret_env` `:739`/`:851`, `api_key_env`
+/// `:1757`, `token_env` `:2004`), each read with `std::env::var`
+/// (`config.rs:521`/`:792`/`:1031`/`:1038`/`:1412`, `auth/mod.rs:264`/`:354`/
+/// `:388`/`:429`). A `${...}`-shaped value resolves first (shunt substitutes
+/// it, `config.rs:3632`), then its result is the var name.
+fn secret_env_names(
+    doc: &toml_edit::DocumentMut,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+) -> Vec<String> {
+    let mut names = vec![
+        "SHUNT_CLIENT_TOKENS".to_string(),
+        "SHUNT_ADMIN_TOKENS".to_string(),
+    ];
+    for (_, child) in doc.iter() {
+        collect_env_names_item(child, env, inherited, &mut names);
+    }
+    names
+}
+
+fn collect_env_names_item(
+    item: &toml_edit::Item,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    out: &mut Vec<String>,
+) {
+    match item {
+        toml_edit::Item::Value(value) => collect_env_names_value(value, env, inherited, out),
+        toml_edit::Item::Table(table) => {
+            for (key, child) in table.iter() {
+                if is_secret_env_key(key) {
+                    if let Some(value) = child.as_str() {
+                        out.push(resolve_env_name(value, env, inherited));
+                    }
+                } else {
+                    collect_env_names_item(child, env, inherited, out);
+                }
+            }
+        }
+        toml_edit::Item::ArrayOfTables(tables) => {
+            for table in tables.iter() {
+                for (key, child) in table.iter() {
+                    if is_secret_env_key(key) {
+                        if let Some(value) = child.as_str() {
+                            out.push(resolve_env_name(value, env, inherited));
+                        }
+                    } else {
+                        collect_env_names_item(child, env, inherited, out);
+                    }
+                }
+            }
+        }
+        toml_edit::Item::None => {}
+    }
+}
+
+fn collect_env_names_value(
+    value: &toml_edit::Value,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    out: &mut Vec<String>,
+) {
+    match value {
+        toml_edit::Value::Array(arr) => {
+            for child in arr.iter() {
+                collect_env_names_value(child, env, inherited, out);
+            }
+        }
+        toml_edit::Value::InlineTable(table) => {
+            for (key, child) in table.iter() {
+                if is_secret_env_key(key) {
+                    if let Some(value) = child.as_str() {
+                        out.push(resolve_env_name(value, env, inherited));
+                    }
+                } else {
+                    collect_env_names_value(child, env, inherited, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_secret_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "tokens_env"
+            | "users_env"
+            | "jwt_secret_env"
+            | "client_secret_env"
+            | "api_key_env"
+            | "token_env"
+    )
+}
+
+/// Resolve a `*_env` key's value to the env-var name it names, mirroring
+/// shunt's substitute pass (`config/secrets.rs::resolve_string`): a `${VAR}`
+/// resolves over the check's env, a `${file:/abs}` over the file, and `$${`
+/// is a literal `${`. The result is the var name `std::env::var` then reads.
+fn resolve_env_name(value: &str, env: &GatewayEnv, inherited: &[(OsString, OsString)]) -> String {
+    let mut name = String::new();
+    scan_references(value, env, inherited, &mut Vec::new(), Some(&mut name));
+    name
+}
+
+/// The contents of the config's `tokens_file` (`[server.admin].tokens_file`,
+/// shunt `config.rs:684`, read at `:798`) — the only `*_file` key shunt reads
+/// as a secret file. Its path is resolved the way shunt resolves it: a
+/// `${...}`-shaped value substitutes first (through the shared scanner, mirroring
+/// shunt's substitute pass `config.rs:3632`), `~/` expands over the check's
+/// HOME (`config.rs:2125` `expand_tilde`), and a relative path resolves
+/// against the config's directory (shunt's cwd under `--config`); the contents
+/// then read under [`secret_file_segments`]'s bounds.
+fn secret_file_values(
+    doc: &toml_edit::DocumentMut,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    config: &Path,
+    out: &mut Vec<String>,
+) {
+    let Some(server) = doc.get("server").and_then(|v| v.as_table_like()) else {
+        return;
+    };
+    let Some(admin) = server.get("admin").and_then(|v| v.as_table_like()) else {
+        return;
+    };
+    let Some(path) = admin.get("tokens_file").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let mut substituted = String::new();
+    scan_references(
+        path,
+        env,
+        inherited,
+        &mut Vec::new(),
+        Some(&mut substituted),
+    );
+    let resolved = resolve_secret_file_path(&substituted, env, inherited, config);
+    if let Some((whole, lines)) = secret_file_segments(&resolved) {
+        if let Some(whole) = whole {
+            out.push(whole);
+        }
+        out.extend(lines);
+    }
+}
+
+/// A `tokens_file` path as shunt would read it: the `${...}` already
+/// substituted by the caller, `~/` expanded over the check's HOME (falling
+/// back to `USERPROFILE`, shunt `config.rs:2125`), and a relative path joined
+/// onto the config's directory.
+fn resolve_secret_file_path(
+    path: &str,
+    env: &GatewayEnv,
+    inherited: &[(OsString, OsString)],
+    config: &Path,
+) -> String {
+    let expanded = expand_secret_tilde(path, env, inherited);
+    let resolved = std::path::Path::new(&expanded);
+    if resolved.is_absolute() {
+        expanded
+    } else {
+        config
+            .parent()
+            .map(|dir| dir.join(resolved))
+            .map(|joined| joined.to_string_lossy().into_owned())
+            .unwrap_or(expanded)
+    }
+}
+
+/// `~/`-expand a path over the check's HOME (then `USERPROFILE`), mirroring
+/// shunt's `expand_tilde` (`config.rs:2125`) but over the spawned env rather
+/// than the caller's own.
+fn expand_secret_tilde(path: &str, env: &GatewayEnv, inherited: &[(OsString, OsString)]) -> String {
+    let Some(suffix) = path.strip_prefix("~/") else {
+        return path.to_string();
+    };
+    let home = spawned_env_value(env, "HOME", inherited.iter().cloned())
+        .filter(|home| !home.is_empty())
+        .or_else(|| {
+            spawned_env_value(env, "USERPROFILE", inherited.iter().cloned())
+                .filter(|home| !home.is_empty())
+        });
+    match home {
+        Some(home) => std::path::PathBuf::from(home)
+            .join(suffix)
+            .to_string_lossy()
+            .into_owned(),
+        None => path.to_string(),
+    }
+}
+
+/// The full inherited env a spawned `shunt check` would see before the
+/// [`GatewayEnv`] overlay, as (name, value) pairs, for resolving the candidate
+/// config's `${VAR}` references the way shunt does. The test-build fence lives
+/// here: a test injects values through [`InheritedEnvOverride`] without
+/// mutating the test binary's own process env.
+fn check_inherited_env() -> Vec<(OsString, OsString)> {
+    #[cfg(not(test))]
+    {
+        std::env::vars_os().collect()
+    }
+    #[cfg(test)]
+    {
+        let mut env: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        if let Some(over) = INHERITED_ENV_OVERRIDE.with(|slot| slot.borrow().clone()) {
+            env.extend(over);
+        }
+        env
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static INHERITED_ENV_OVERRIDE: std::cell::RefCell<Option<Vec<(OsString, OsString)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test seam: the inherited env a spawned `shunt check` sees (before the
+/// [`GatewayEnv`] overlay), for driving the masking resolution over injected
+/// values without mutating the test binary's own process env. Applied to the
+/// spawned command too, so the check's own `${VAR}` resolution agrees. Restores
+/// the previous override on drop; `!Send` (the `PhantomData<*const ()>`) so it
+/// cannot be dropped on a thread other than the one that set it.
+#[cfg(test)]
+#[cfg_attr(
+    not(unix),
+    expect(dead_code, reason = "used only by the unix gate tests")
+)]
+pub(crate) struct InheritedEnvOverride {
+    prev: Option<Vec<(OsString, OsString)>>,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl InheritedEnvOverride {
+    pub(crate) fn set(pairs: Vec<(OsString, OsString)>) -> Self {
+        let prev = INHERITED_ENV_OVERRIDE.with(|slot| slot.borrow_mut().replace(pairs));
+        Self {
+            prev,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for InheritedEnvOverride {
+    fn drop(&mut self) {
+        INHERITED_ENV_OVERRIDE.with(|slot| *slot.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Replace every occurrence of every `secrets` value, the longest match at each
+/// position (so a longer value that extends a shorter one wins).
+fn mask_secret_values(text: &str, secrets: &[String]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let hit = secrets
+            .iter()
+            .filter(|secret| rest.starts_with(secret.as_str()))
+            .max_by_key(|secret| secret.len());
+        match hit {
+            Some(secret) => {
+                out.push_str(&mask_stand_in(secret));
+                rest = &rest[secret.len()..];
+            }
+            None => {
+                let Some(ch) = rest.chars().next() else {
+                    break;
+                };
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
+/// Replace every maximal `[A-Za-z0-9_-]` run that [`maskable_token`] flags.
+fn mask_secret_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while !rest.is_empty() {
+        let run = rest
+            .bytes()
+            .take_while(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+            .count();
+        if run > 0 {
+            let token = &rest[..run];
+            if maskable_token(token) {
+                out.push_str(&mask_stand_in(token));
+            } else {
+                out.push_str(token);
+            }
+            rest = &rest[run..];
+        } else {
+            let Some(ch) = rest.chars().next() else {
+                break;
+            };
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
+}
+
+/// Whether a token the env pass left behind must be masked: 20+ chars holding
+/// both a letter and a digit, or starting with `sk-` and carrying at least one
+/// char after the prefix (so the env stand-in's bare `sk-` head is not masked
+/// a second time).
+fn maskable_token(token: &str) -> bool {
+    (token.len() >= 20
+        && token.bytes().any(|b| b.is_ascii_alphabetic())
+        && token.bytes().any(|b| b.is_ascii_digit()))
+        || (token.starts_with("sk-") && token.len() > 3)
+}
+
+/// `value`'s visible stand-in: its first 3 characters and an ellipsis.
+fn mask_stand_in(value: &str) -> String {
+    let head: String = value.chars().take(3).collect();
+    format!("{head}…")
 }
 
 impl std::fmt::Display for ConfigEditRefusal {
@@ -3128,7 +3733,12 @@ fn run_check(
         .arg("--config")
         .arg(candidate)
         .current_dir(cwd);
+    #[cfg(test)]
+    if let Some(over) = INHERITED_ENV_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        command.envs(over);
+    }
     env.apply(&mut command);
+    let inherited = check_inherited_env();
     let bound = check_timeout();
     let exited = match run_bounded_impl(&mut command, binary, bound, None, cancel)? {
         Bounded::Missing => {
@@ -3150,13 +3760,41 @@ fn run_check(
     if exited.status.success() {
         return Ok(());
     }
+    let stderr_bytes = exited.stderr();
+    let truncated = stderr_bytes.len() == CHECK_STDERR_LIMIT;
+    let mut raw = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    if truncated {
+        drop_trailing_partial_line(&mut raw);
+        if !raw.is_empty() {
+            raw.push('\n');
+        }
+        raw.push_str(CUT_LINE);
+    }
+    let raw = raw.trim().to_string();
+    let secrets = check_masking_values(candidate, env, &inherited);
     Err(ConfigEditRefusal::CheckFailed {
         binary: binary.to_path_buf(),
         config: config.to_path_buf(),
         code: exited.status.code(),
-        stderr: CheckStderr(String::from_utf8_lossy(&exited.stderr()).trim().to_string()),
+        stderr: CheckStderr(mask_check_output(&raw, &secrets)),
     }
     .into())
+}
+
+/// The one line a capped check appends so a cut output never reads as an
+/// empty or silently-truncated one: the last captured line is withheld, never
+/// a blank modal.
+const CUT_LINE: &str = "output cut; the cut line is withheld";
+
+/// Drop the tail of `text` after its last line break, so a value cut by the
+/// stderr cap can never survive as its uncut prefix. The cut is always at the
+/// very end of the captured bytes, so the partial line is the last one; a cut
+/// mid-UTF-8 is already folded to a replacement char inside that dropped line.
+fn drop_trailing_partial_line(text: &mut String) {
+    match text.rfind('\n') {
+        Some(at) => text.truncate(at),
+        None => text.clear(),
+    }
 }
 
 /// `shunt check` on the adopted config as it now stands, through the same

@@ -2094,6 +2094,7 @@ fn shunt_card_app(
         admin_need,
         move_plan.as_ref(),
         pool.as_ref(),
+        false,
     );
     let mut app = app_with(card);
     app.services.shunt_record = record;
@@ -2930,6 +2931,7 @@ fn a_card_change_pushing_every_stop_off_screen_resettles_to_none() {
         Some(crate::gateway::AdminNeed::WriteKey),
         Some(&MovePlanOutcome::Plan(plan)),
         None,
+        false,
     )];
 
     // The next render publishes the new geometry and re-settles focus to none
@@ -3090,6 +3092,7 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
         Some(crate::gateway::AdminNeed::WriteKey),
         Some(&MovePlanOutcome::Plan(plan.clone())),
         None,
+        false,
     )];
     let _ = draw_frame(&app, 120, 14);
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), None);
@@ -3107,6 +3110,7 @@ fn bringing_the_stops_back_into_view_resettles_the_none_focus_then_walks_from_it
         Some(crate::gateway::AdminNeed::WriteKey),
         Some(&MovePlanOutcome::Plan(plan)),
         None,
+        false,
     )];
     let _ = draw_frame(&app, 120, 14);
     assert_eq!(caret_stop(&draw_frame(&app, 120, 14)), Some("enabled"));
@@ -3249,6 +3253,7 @@ fn a_stopless_card_still_scrolls_one_line_per_press() {
         None,
         None,
         None,
+        false,
     );
     assert!(card.shunt_focus.is_empty(), "fixture: no actionable line");
     let mut app = app_with(card);
