@@ -6972,9 +6972,12 @@ fn a_delete_with_other_tokens_left_reads_nothing_of_the_gateway() {
 #[test]
 fn deleting_the_last_token_reads_the_gateway_and_refuses_only_what_it_cannot_tell() {
     let missing_env = |home: &HomeSandbox| {
+        // Error 2 is a missing file on unix and Windows alike; each words it
+        // its own way.
         format!(
-            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token (failed to read env file {}: No such file or directory (os error 2)); fix that, or add another client token first",
-            home.home().join("tokens.env").display()
+            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token (failed to read env file {}: {}); fix that, or add another client token first",
+            home.home().join("tokens.env").display(),
+            std::io::Error::from_raw_os_error(2)
         )
     };
     let unread = |cause: &str| {
