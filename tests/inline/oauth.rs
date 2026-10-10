@@ -6759,6 +6759,86 @@ fn a_logout_during_a_rotation_stays_logged_out() {
     );
 }
 
+/// A reconciled switch snapshots a diverged live login into the outgoing
+/// profile while that profile's rotation is mid-flight: the rotation's persist
+/// keeps the snapshot, drops the stage an earlier failed persist left, and
+/// memory adopts the snapshot's pair.
+#[test]
+fn a_reconciled_switch_during_a_rotation_keeps_its_snapshot() {
+    use std::sync::mpsc;
+    let home = HomeSandbox::new();
+    let name = "sink-mid-rotation";
+    let (base, server) = crate::testutil::serve_endpoints(3, move |path, _| {
+        if path.starts_with("/v1/oauth/token") {
+            let switched = std::sync::Arc::new(RankedMutex::new(
+                crate::profile::load_config().expect("load"),
+            ));
+            crate::actions::switch_profile_reconciled(
+                &switched,
+                &crate::profile::ProfileName::from("sink-target"),
+            )
+            .expect("the reconciled switch");
+        }
+        (200, MINTED_BODY.to_string())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = crate::testutil::rotation_fixture_config(&crate::profile::ProfileName::from(name));
+    write_live_stage_over_rt_old(name);
+    let mut target = Profile::new("sink-target".to_string(), None, None);
+    target.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "at-target".to_string(),
+            refresh_token: Some("rt-target".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&target).expect("save the target");
+    let mut state = config.lock().expect("config lock").state.clone();
+    state
+        .profiles
+        .push(crate::profile::ProfileName::from("sink-target"));
+    crate::profile::save_app_state(&state).expect("save app state");
+    let live = crate::profile::claude_dir()
+        .expect("claude dir")
+        .join(".credentials.json");
+    std::fs::create_dir_all(live.parent().expect("parent")).expect("mkdir .claude");
+    std::fs::write(
+        &live,
+        r#"{"claudeAiOauth":{"accessToken":"at-live","refreshToken":"rt-live"}}"#,
+    )
+    .expect("write the diverged live login");
+    let (tx, _rx) = mpsc::channel();
+
+    let result = rotate_one_inner(&config, &crate::profile::ProfileName::from(name), None, &tx);
+    let seen = server.join().expect("listener");
+
+    assert_eq!(seen, vec!["/v1/oauth/token".to_string()]);
+    assert_eq!(
+        crate::profile::load_config()
+            .expect("load")
+            .state
+            .active_profile
+            .as_deref(),
+        Some("sink-target"),
+        "the switch ran inside the token call"
+    );
+    assert_eq!(
+        stored_refresh(name).as_deref(),
+        Some("rt-live"),
+        "the snapshot is on disk after the rotation"
+    );
+    assert!(!stage_path(name).exists(), "the refusal deletes the stage");
+    assert_eq!(
+        memory_refresh(&config, name).as_deref(),
+        Some("rt-live"),
+        "memory adopts the snapshot under the refusal's hold"
+    );
+    assert!(matches!(result, RotateOutcome::Persisted(false)));
+}
+
 fn spent_record_path(name: &str) -> std::path::PathBuf {
     profile_dir(&crate::profile::ProfileName::from(name))
         .expect("profile dir")
