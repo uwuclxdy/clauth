@@ -7176,6 +7176,138 @@ fn a_rotate_after_a_wedged_gate_persist_spends_the_staged_token() {
     assert_eq!(sent_refresh_tokens(&seen), vec!["rt-new".to_string()]);
 }
 
+fn gate_verdict(gate: &AuthGate) -> String {
+    match gate {
+        AuthGate::Transient(t) => t.text(),
+        AuthGate::Ready => "Ready".to_string(),
+        AuthGate::Refreshed => "Refreshed".to_string(),
+        AuthGate::Broken => "Broken".to_string(),
+    }
+}
+
+/// Runs the switch gate on an expiring `name` (quarantined when `flagged`)
+/// whose refresh lets `install` change the store mid-call, before the
+/// refresh's persist decides.
+fn gate_with_install_mid_refresh(
+    name: &'static str,
+    flagged: bool,
+    install: impl Fn() + Send + 'static,
+) -> (AuthGate, crate::profile::ConfigHandle, HomeSandbox) {
+    let home = HomeSandbox::new();
+    let (deaf, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let config = expiring_fixture(name);
+    if flagged {
+        mark_auth_broken(&config, &pn(name), true);
+    }
+    let refresher = move |rt: &str, _: Option<&str>| {
+        assert_eq!(rt, "rt-old", "the gate spends the store's token");
+        install();
+        Ok(minted("at-new", "rt-new"))
+    };
+    let gate = ensure_installable(&config, &pn(name), refresher);
+    crate::testutil::assert_nothing_sent(&deaf);
+    drop(_endpoints);
+    (gate, config, home)
+}
+
+fn relogin_into(name: &str, expires_at: i64) {
+    let mut cfg = crate::profile::load_config().expect("load config");
+    crate::actions::overwrite_captured_profile(
+        &mut cfg,
+        &pn(name),
+        crate::actions::CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(OAuthToken {
+                    access_token: "at-relogin".to_string(),
+                    refresh_token: Some("rt-relogin".to_string()),
+                    expires_at: Some(expires_at),
+                    scopes: None,
+                    subscription_type: None,
+                    ..OAuthToken::default_extra()
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        },
+    )
+    .expect("install the re-login");
+}
+
+/// A re-login lands while the switch gate refreshes the old login: the persist
+/// keeps the re-login, and the gate answers for it as a fresh gate would, so
+/// an unexpired re-login installs as-is instead of failing the switch.
+#[test]
+fn a_relogin_during_the_gates_refresh_installs_as_is() {
+    let name = "gate-relogin-fresh";
+    let (gate, config, _home) = gate_with_install_mid_refresh(name, false, move || {
+        relogin_into(name, crate::usage::now_ms() as i64 + 86_400_000);
+    });
+
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-relogin"));
+    assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-relogin"));
+}
+
+/// The same race on a quarantined target: the re-login clears the quarantine
+/// on disk, and the gate drops its own stale flag with it rather than refusing
+/// the fresh login.
+#[test]
+fn a_relogin_during_a_quarantined_gates_refresh_installs_as_is() {
+    let name = "gate-flagged-relogin";
+    let (gate, config, _home) = gate_with_install_mid_refresh(name, true, move || {
+        relogin_into(name, crate::usage::now_ms() as i64 + 86_400_000);
+    });
+
+    assert_eq!(gate_verdict(&gate), "Ready");
+    assert!(
+        !config
+            .lock()
+            .expect("config lock")
+            .is_auth_broken(&pn(name)),
+        "the quarantine lifts with the fresh login"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-relogin"));
+}
+
+/// The same race with a re-login that is itself already expiring: the gate
+/// refuses for now, and the store keeps the re-login for the retry to spend.
+#[test]
+fn an_expiring_relogin_during_the_gates_refresh_refuses_for_a_retry() {
+    let name = "gate-relogin-expiring";
+    let (gate, config, _home) = gate_with_install_mid_refresh(name, false, move || {
+        relogin_into(name, past_expiry());
+    });
+
+    assert_eq!(
+        gate_verdict(&gate),
+        "refreshed 'gate-relogin-expiring' but failed to persist the rotated tokens: retry in a moment"
+    );
+    assert_eq!(stored_refresh(name).as_deref(), Some("rt-relogin"));
+    assert_eq!(memory_refresh(&config, name).as_deref(), Some("rt-relogin"));
+}
+
+/// A log out lands while the gate refreshes: the store stays empty, and the
+/// gate answers as it does for a logged-out profile with no race at all.
+#[test]
+fn a_logout_during_the_gates_refresh_answers_as_a_logged_out_gate_does() {
+    let name = "gate-logout-mid";
+    let (gate, config, _home) = gate_with_install_mid_refresh(name, false, move || {
+        let mut cfg = crate::profile::load_config().expect("load config");
+        crate::actions::clear_profile_credentials(&mut cfg, &pn(name)).expect("log out");
+    });
+    let raced = gate_verdict(&gate);
+    assert!(!store_path(name).exists(), "the log out stays");
+    assert_eq!(memory_refresh(&config, name), None);
+
+    let calm = ensure_installable(&config, &pn(name), |_: &str, _: Option<&str>| {
+        panic!("a logged-out profile has nothing to refresh")
+    });
+    assert_eq!(raced, gate_verdict(&calm));
+    assert_eq!(raced, "Ready");
+}
+
 /// C5: the stage AND the save fail together (a directory where the stage goes,
 /// a wedged flock), so only the record knows P1 was consumed. A fresh load
 /// holds P1 again; its rotate quarantines without sending P1 a second time.

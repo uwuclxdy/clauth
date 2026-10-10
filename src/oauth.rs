@@ -3971,19 +3971,38 @@ fn gate_under_guard(
 
     match settle_refresh_answer(config, name, &rt, refresher(&rt, scopes.as_deref()), guard) {
         Ok(minted) => {
-            if apply_rotated_tokens_locked(
+            let persist_failed = || {
+                AuthGate::Transient(crate::format::Transient::new(
+                    crate::format::Cause::PersistFailed(name.to_string()),
+                    crate::format::Retry::Wait,
+                ))
+            };
+            match apply_rotated_tokens_locked(
                 config,
                 name,
                 &minted.sent_fp,
                 &minted.creds,
                 &minted.old_access,
-            )
-            .is_err()
-            {
-                return AuthGate::Transient(crate::format::Transient::new(
-                    crate::format::Cause::PersistFailed(name.to_string()),
-                    crate::format::Retry::Wait,
-                ));
+            ) {
+                Ok(()) => {}
+                // The store moved under the refresh (an install or a log out)
+                // and memory now holds it: answer for that login as a fresh
+                // gate would, never as a failed save. The server just accepted
+                // the old chain, so a standing quarantine describes neither
+                // that chain nor whatever replaced it.
+                Err(PersistError::Refused { .. }) => {
+                    mark_auth_broken(config, name, false);
+                    return match oauth_shape(config, name) {
+                        Err(gate) => gate,
+                        Ok((expires_at, _, _, flagged))
+                            if !horizon_expiring(expires_at, flagged, fresh_horizon_ms) =>
+                        {
+                            AuthGate::Ready
+                        }
+                        Ok(_) => persist_failed(),
+                    };
+                }
+                Err(PersistError::Failed(_)) => return persist_failed(),
             }
             // A successful refresh clears any prior quarantine.
             mark_auth_broken(config, name, false);
