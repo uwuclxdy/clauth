@@ -18,31 +18,31 @@
 //!
 //! The daemon recreates its control-socket link at every start and removes it
 //! on a clean exit, so that link's mtime is when it started, and the operator
-//! slot's link mtime is when a switch last repointed it.
+//! slot's link mtime is when a switch last repointed it. Every check takes the
+//! codex home the switch actually moved (the repointed slot's directory), so an
+//! operator's own `CODEX_HOME` is judged and restarted, never `~/.codex` in its
+//! place. The restart needs a unix control socket, so on windows nothing is
+//! ever stale and the restart is a no-op.
 
 use std::path::Path;
+#[cfg(unix)]
 use std::process::Command;
 use std::time::SystemTime;
 
 /// The daemon's control socket, relative to the operator's codex home.
 const CONTROL_SOCKET: &str = "app-server-control/app-server-control.sock";
 /// The daemon binary codex manages for itself, relative to the codex home.
+#[cfg(unix)]
 const MANAGED_BIN: &str = "packages/app-server-daemon/current/bin/codex";
 /// How long a restart may run before its child is killed and the attempt is
 /// logged as hung.
-#[cfg(not(test))]
+#[cfg(all(unix, not(test)))]
 const RESTART_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A daemon runs under the operator's codex home and started before the
-/// operator's login last moved.
-pub(crate) fn is_stale() -> bool {
-    crate::actions::default_codex_operator_home().is_ok_and(|home| is_stale_at(&home))
-}
-
-/// [`is_stale`] for an explicit codex home. File stats only, until the answer
-/// would be "stale": only then is the socket connected to, which rules out a
-/// crashed daemon's leftover link, and a caller asking when nothing moved
-/// never touches the daemon.
+/// A daemon runs under codex home `home` and started before `home`'s login
+/// last moved. File stats only, until the answer would be "stale": only then
+/// is the socket connected to, which rules out a crashed daemon's leftover
+/// link, and a caller asking when nothing moved never touches the daemon.
 pub(crate) fn is_stale_at(home: &Path) -> bool {
     let socket = home.join(CONTROL_SOCKET);
     let Some(started) = std::fs::symlink_metadata(&socket)
@@ -78,14 +78,19 @@ fn answers(_socket: &Path) -> bool {
     false
 }
 
-/// True when the operator's login moved after the daemon started. Pure, so the
+/// True when the operator's login moved after the daemon started, or in the
+/// same filesystem timestamp tick: a needless restart costs a turn that
+/// resumes, a missed one leaves every task on the old account. Pure, so the
 /// ordering rule is tested without a daemon.
 pub(crate) fn login_is_newer(daemon_started: SystemTime, login_moved: Option<SystemTime>) -> bool {
-    login_moved.is_some_and(|moved| moved > daemon_started)
+    login_moved.is_some_and(|moved| moved >= daemon_started)
 }
 
-/// The command that restarts the daemon: codex's own managed binary when it is
-/// installed, else `codex` from PATH. Building it spawns nothing.
+/// The command that restarts `home`'s daemon: codex's own managed binary when
+/// it is installed, else `codex` from PATH, with `CODEX_HOME` pinned to `home`
+/// because codex finds its daemon from its own `CODEX_HOME`. Building it
+/// spawns nothing.
+#[cfg(unix)]
 pub(crate) fn restart_command(home: &Path) -> Command {
     let managed = home.join(MANAGED_BIN);
     let program = if managed.is_file() {
@@ -94,22 +99,25 @@ pub(crate) fn restart_command(home: &Path) -> Command {
         "codex".into()
     };
     let mut cmd = Command::new(program);
-    cmd.args(["app-server", "daemon", "restart"]);
+    cmd.args(["app-server", "daemon", "restart"])
+        .env("CODEX_HOME", home);
     cmd
 }
 
-/// Restart the daemon on a thread of its own and log the outcome. Running
+/// Restart `home`'s daemon on a thread of its own and log the outcome. Running
 /// tasks lose their current turn and stay resumable. `why` names the trigger in
 /// the log line. Under test it only counts, per thread, so no test can restart
 /// a real daemon and a test's count is its own.
-pub(crate) fn restart_in_background(why: &'static str) {
+pub(crate) fn restart_in_background(home: std::path::PathBuf, why: &'static str) {
     #[cfg(test)]
     {
-        let _ = why;
+        let _ = (home, why);
         TEST_RESTARTS.with(|n| n.set(n.get() + 1));
     }
-    #[cfg(not(test))]
-    restart_now(why);
+    #[cfg(all(unix, not(test)))]
+    restart_now(home, why);
+    #[cfg(all(not(unix), not(test)))]
+    let _ = (home, why);
 }
 
 #[cfg(test)]
@@ -119,6 +127,7 @@ thread_local! {
 }
 
 /// How a restart child ended.
+#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Waited {
     /// It exited; `ok` is a zero status, `status` its display form.
@@ -131,6 +140,7 @@ pub(crate) enum Waited {
 
 /// Wait for `child`, killing it once `deadline` passes, so a hung `codex`
 /// never keeps the restart thread forever.
+#[cfg(unix)]
 pub(crate) fn wait_with_deadline(
     child: &mut std::process::Child,
     deadline: std::time::Duration,
@@ -155,7 +165,25 @@ pub(crate) fn wait_with_deadline(
     }
 }
 
+/// One restart at a time: two switches inside one restart's window, or a
+/// restart queued behind another, would otherwise run two
+/// `codex app-server daemon restart`s at once.
+#[cfg(unix)]
+static RESTARTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Run `restart` while holding [`RESTARTS`], unless `home`'s daemon no longer
+/// predates its login by then: a restart that waited behind another usually
+/// finds the daemon already reloaded, and skips. `None` when it skipped.
+#[cfg(unix)]
+pub(crate) fn restart_serialized<T>(home: &Path, restart: impl FnOnce() -> T) -> Option<T> {
+    let _one = RESTARTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    is_stale_at(home).then(restart)
+}
+
 /// The daemon-log line for a restart's outcome. Pure, so the wording is tested.
+#[cfg(unix)]
 pub(crate) fn restart_log_line(
     why: &str,
     waited: &Waited,
@@ -168,7 +196,7 @@ pub(crate) fn restart_log_line(
             )
         }
         Waited::Exited { status, .. } => {
-            format!("clauth: codex app-server restart ({why}) exited {status}")
+            format!("clauth: codex app-server restart ({why}) failed with {status}")
         }
         Waited::Killed => format!(
             "clauth: codex app-server restart ({why}) ran past {}s and was killed",
@@ -180,27 +208,32 @@ pub(crate) fn restart_log_line(
     }
 }
 
-#[cfg(not(test))]
-fn restart_now(why: &'static str) {
+#[cfg(all(unix, not(test)))]
+fn restart_now(home: std::path::PathBuf, why: &'static str) {
     use crate::logline::logline;
-    let Ok(home) = crate::actions::default_codex_operator_home() else {
-        logline!("clauth: codex app-server restart ({why}) skipped: no home directory");
-        return;
-    };
     let spawned = std::thread::Builder::new()
         .name("clauth-codex-daemon-restart".into())
         .spawn(move || {
-            let spawned = restart_command(&home)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-            match spawned {
-                Ok(mut child) => {
-                    let waited = wait_with_deadline(&mut child, RESTART_DEADLINE);
-                    logline!("{}", restart_log_line(why, &waited, RESTART_DEADLINE));
+            let ran = restart_serialized(&home, || {
+                match restart_command(&home)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        let waited = wait_with_deadline(&mut child, RESTART_DEADLINE);
+                        logline!("{}", restart_log_line(why, &waited, RESTART_DEADLINE));
+                    }
+                    Err(e) => {
+                        logline!("clauth: codex app-server restart ({why}) could not run: {e}");
+                    }
                 }
-                Err(e) => logline!("clauth: codex app-server restart ({why}) could not run: {e}"),
+            });
+            if ran.is_none() {
+                logline!(
+                    "clauth: codex app-server restart ({why}) skipped: the daemon already runs the active login"
+                );
             }
         });
     if let Err(e) = spawned {
@@ -208,9 +241,10 @@ fn restart_now(why: &'static str) {
     }
 }
 
-/// The CLI's note after a codex switch while a stale daemon runs.
-pub(crate) fn switch_note() -> Option<&'static str> {
-    is_stale().then_some(
+/// The CLI's note after a codex switch moved `home`'s login while a daemon
+/// started before that move runs there.
+pub(crate) fn switch_note(home: &Path) -> Option<&'static str> {
+    is_stale_at(home).then_some(
         "clauth: codex's app-server daemon still holds the previous login, so running and \
          resumed codex tasks keep using it. Run `codex app-server daemon restart` to apply \
          the switch (running tasks stop their current turn and stay resumable).",

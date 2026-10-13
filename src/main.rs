@@ -1758,7 +1758,7 @@ fn cmd_switch(name: &str) -> Result<()> {
                 outln!("clauth: {} now follows '{canonical}'", slot.display());
                 // Only a moved link can leave codex's daemon behind: an
                 // operator's own login file is not ours to call stale.
-                if let Some(note) = crate::codex_daemon::switch_note() {
+                if let Some(note) = slot.parent().and_then(crate::codex_daemon::switch_note) {
                     outln!("{note}");
                 }
             }

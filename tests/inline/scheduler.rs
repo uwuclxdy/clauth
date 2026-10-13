@@ -11839,6 +11839,8 @@ fn apply_codex_switch_restarts_a_codex_daemon_left_on_the_spent_account() {
         crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
     }
     let operator = home.home().join(".codex");
+    // Pinned, so an exported CODEX_HOME never points the switch at a real login.
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
     std::fs::create_dir_all(operator.join("app-server-control")).expect("mkdir control");
     // A live daemon, started before anything below: sun_path caps at 104
     // bytes on macOS, so the socket sits at a short path behind the link.
@@ -11886,6 +11888,7 @@ fn apply_codex_switch_leaves_a_daemon_on_the_operators_own_login() {
         crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
     }
     let operator = home.home().join(".codex");
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &operator);
     std::fs::create_dir_all(operator.join("app-server-control")).expect("mkdir control");
     let socket = std::path::PathBuf::from(format!("/tmp/clauth-cdxo-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&socket);
@@ -11913,6 +11916,99 @@ fn apply_codex_switch_leaves_a_daemon_on_the_operators_own_login() {
         "nothing of clauth's moved, so the daemon keeps its turns"
     );
     let _ = std::fs::remove_file(&socket);
+}
+
+/// A live daemon under `codex_home`, started now: its control link points at
+/// a socket at a short path (sun_path caps at 104 bytes on macOS).
+#[cfg(unix)]
+fn codex_daemon_at(
+    codex_home: &std::path::Path,
+    tag: &str,
+) -> (std::os::unix::net::UnixListener, std::path::PathBuf) {
+    std::fs::create_dir_all(codex_home.join("app-server-control")).expect("mkdir control");
+    let socket =
+        std::path::PathBuf::from(format!("/tmp/clauth-cdx{tag}-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let daemon = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    std::os::unix::fs::symlink(
+        &socket,
+        codex_home.join("app-server-control/app-server-control.sock"),
+    )
+    .expect("control link");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    (daemon, socket)
+}
+
+/// Restarts one auto-switch off cx1 asks for, with the operator's own
+/// `CODEX_HOME` set. `~/.codex` holds a clauth link to cx1 and a daemon that
+/// predates it (`default_stale`) or started after it; the operator's home
+/// holds a clauth link to cx1 and, with `own_daemon`, a daemon (any daemon
+/// there predates the switch about to move its link).
+#[cfg(unix)]
+fn restarts_with_own_codex_home(default_stale: bool, own_daemon: bool) -> usize {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = third_party_state(crate::providers::fetch_third_party_usage);
+    let codex = seed_codex_walk(
+        &state,
+        "active_profile = \"cx1\"\nprofiles = [\"cx1\", \"cx2\"]\nfallback_chain = [\"cx1\", \"cx2\"]\n",
+        &[("cx1", CODEX_SPENT), ("cx2", CODEX_IDLE)],
+    );
+    for name in ["cx1", "cx2"] {
+        crate::testutil::write_codex_store(name, &crate::testutil::codex_auth_body(name, name));
+    }
+    let store = crate::profile::profile_dir(&crate::profile::ProfileName::from("cx1"))
+        .expect("dir")
+        .join("auth.json");
+    let own = home.home().join("my-codex");
+    let _codex_home = crate::testutil::CodexHomeSandbox::new(&home, &own);
+    let mut sockets = Vec::new();
+    let default_home = home.home().join(".codex");
+    std::fs::create_dir_all(&default_home).expect("mkdir ~/.codex");
+    if !default_stale {
+        std::os::unix::fs::symlink(&store, default_home.join("auth.json")).expect("slot");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    sockets.push(codex_daemon_at(&default_home, "d"));
+    if default_stale {
+        std::os::unix::fs::symlink(&store, default_home.join("auth.json")).expect("slot");
+    }
+    std::fs::create_dir_all(&own).expect("mkdir CODEX_HOME");
+    if own_daemon {
+        sockets.push(codex_daemon_at(&own, "m"));
+    }
+    std::os::unix::fs::symlink(&store, own.join("auth.json")).expect("own slot");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    let before = crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get);
+    super::apply_codex_switch(&state, &codex, REFRESH_INTERVAL_MS);
+    assert_eq!(codex_active().as_deref(), Some("cx2"));
+    assert!(
+        std::fs::read_link(own.join("auth.json"))
+            .expect("own slot")
+            .ends_with("cx2/auth.json"),
+        "the switch moves the CODEX_HOME slot"
+    );
+    for (_, socket) in &sockets {
+        let _ = std::fs::remove_file(socket);
+    }
+    crate::codex_daemon::TEST_RESTARTS.with(std::cell::Cell::get) - before
+}
+
+/// An operator's own `CODEX_HOME` is the home the switch moves, so it is the
+/// home judged: its daemon, stranded by the switch, restarts even with
+/// `~/.codex` current.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_restarts_the_stale_daemon_under_codex_home() {
+    assert_eq!(restarts_with_own_codex_home(false, true), 1);
+}
+
+/// ... and with no daemon under the moved home, a stale-looking `~/.codex`
+/// daemon the switch never touched keeps its turns.
+#[cfg(unix)]
+#[test]
+fn apply_codex_switch_leaves_the_default_homes_daemon_alone_under_codex_home() {
+    assert_eq!(restarts_with_own_codex_home(true, false), 0);
 }
 
 /// The codex chain walks at the codex file's OWN weekly line, never the claude

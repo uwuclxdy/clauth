@@ -7,7 +7,9 @@ use std::time::Duration;
 fn a_login_moved_after_the_daemon_started_is_newer() {
     let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
     assert!(login_is_newer(t0, Some(t0 + Duration::from_millis(1))));
-    assert!(!login_is_newer(t0, Some(t0)));
+    // One timestamp tick for both reads as moved: a needless restart costs a
+    // resumable turn, a missed one strands every task on the old account.
+    assert!(login_is_newer(t0, Some(t0)));
     assert!(!login_is_newer(t0, Some(t0 - Duration::from_secs(60))));
     assert!(!login_is_newer(t0, None));
 }
@@ -90,7 +92,9 @@ fn a_long_home_still_finds_its_daemon() {
 }
 
 /// Building the restart spawns nothing, so its shape is checked directly:
-/// codex's own managed binary when installed, else `codex` from PATH.
+/// codex's own managed binary when installed, else `codex` from PATH, and
+/// `CODEX_HOME` pinned to the home judged stale, since codex finds its daemon
+/// from its own `CODEX_HOME`.
 #[test]
 fn the_restart_runs_codexs_managed_binary_else_path() {
     let home = tempfile::tempdir().unwrap();
@@ -100,9 +104,17 @@ fn the_restart_runs_codexs_managed_binary_else_path() {
             .collect::<Vec<_>>()
     };
 
+    let codex_home = |c: &Command| {
+        c.get_envs()
+            .find(|(k, _)| *k == "CODEX_HOME")
+            .and_then(|(_, v)| v)
+            .map(std::ffi::OsStr::to_os_string)
+    };
+
     let bare = restart_command(home.path());
     assert_eq!(bare.get_program(), "codex");
     assert_eq!(args(&bare), ["app-server", "daemon", "restart"]);
+    assert_eq!(codex_home(&bare).as_deref(), Some(home.path().as_os_str()));
 
     let managed = home.path().join(MANAGED_BIN);
     std::fs::create_dir_all(managed.parent().unwrap()).unwrap();
@@ -110,25 +122,64 @@ fn the_restart_runs_codexs_managed_binary_else_path() {
     let cmd = restart_command(home.path());
     assert_eq!(cmd.get_program(), managed.as_os_str());
     assert_eq!(args(&cmd), ["app-server", "daemon", "restart"]);
+    assert_eq!(codex_home(&cmd).as_deref(), Some(home.path().as_os_str()));
 }
 
-/// The CLI note reads the operator's own codex home: present only while a
-/// daemon there predates the login's last move.
+/// The CLI note reads the codex home whose login the switch moved: present
+/// only while a daemon there predates that move.
 #[test]
-fn the_switch_note_follows_the_operators_daemon() {
-    let home = crate::testutil::HomeSandbox::new();
-    assert_eq!(switch_note(), None, "no daemon, no note");
+fn the_switch_note_follows_the_moved_homes_daemon() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(switch_note(home.path()), None, "no daemon, no note");
 
-    let operator = home.home().join(".codex");
-    std::fs::create_dir_all(operator.join("app-server-control")).unwrap();
+    std::fs::create_dir_all(home.path().join("app-server-control")).unwrap();
     let (_l, sock) = listener("note");
-    std::os::unix::fs::symlink(&sock, operator.join(CONTROL_SOCKET)).unwrap();
+    std::os::unix::fs::symlink(&sock, home.path().join(CONTROL_SOCKET)).unwrap();
     std::thread::sleep(Duration::from_millis(20));
-    std::os::unix::fs::symlink("profiles/x/auth.json", operator.join("auth.json")).unwrap();
+    std::os::unix::fs::symlink("profiles/x/auth.json", home.path().join("auth.json")).unwrap();
 
-    let note = switch_note().expect("a daemon older than the login");
-    assert!(note.contains("codex app-server daemon restart"), "{note}");
+    assert_eq!(
+        switch_note(home.path()),
+        Some(
+            "clauth: codex's app-server daemon still holds the previous login, so running and \
+             resumed codex tasks keep using it. Run `codex app-server daemon restart` to apply \
+             the switch (running tasks stop their current turn and stay resumable)."
+        )
+    );
     let _ = std::fs::remove_file(sock);
+}
+
+/// A restart runs only while the daemon still predates the login, one at a
+/// time: one queued behind another finds the daemon reloaded and skips, so two
+/// switches inside one restart's window never run two restarts at once.
+#[test]
+fn restarts_run_one_at_a_time_and_a_queued_one_skips_a_reloaded_daemon() {
+    let (_l, sock) = listener("serial");
+    let current = home_with(&["login", "daemon"], &sock);
+    assert_eq!(restart_serialized(current.path(), || "ran"), None);
+
+    let home = home_with(&["daemon", "login"], &sock);
+    let path = home.path().to_path_buf();
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let first = std::thread::spawn({
+        let path = path.clone();
+        move || {
+            restart_serialized(&path, || {
+                held_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+                // The restarted daemon recreates its control link.
+                let link = path.join(CONTROL_SOCKET);
+                std::fs::remove_file(&link).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+                std::os::unix::fs::symlink(&sock, &link).unwrap();
+                "first"
+            })
+        }
+    });
+    held_rx.recv().unwrap();
+    assert_eq!(restart_serialized(&path, || "second"), None);
+    assert_eq!(first.join().unwrap(), Some("first"));
+    let _ = std::fs::remove_file(path.join(CONTROL_SOCKET));
 }
 
 /// A hung `codex` must not keep the restart thread forever: the waiter kills a
@@ -167,19 +218,24 @@ fn each_restart_outcome_reads_as_what_happened() {
         ok: true,
         status: "exit status: 0".into(),
     };
-    assert!(
-        restart_log_line("auto", &ok, limit).contains("restarted codex's app-server daemon (auto)")
+    assert_eq!(
+        restart_log_line("auto", &ok, limit),
+        "clauth: restarted codex's app-server daemon (auto) so it loads the active login"
     );
     let failed = Waited::Exited {
         ok: false,
         status: "exit status: 3".into(),
     };
-    assert!(restart_log_line("auto", &failed, limit).ends_with("exited exit status: 3"));
-    assert!(
-        restart_log_line("auto", &Waited::Killed, limit).contains("ran past 60s and was killed")
+    assert_eq!(
+        restart_log_line("auto", &failed, limit),
+        "clauth: codex app-server restart (auto) failed with exit status: 3"
     );
-    assert!(
-        restart_log_line("auto", &Waited::Unwaitable("EINTR".into()), limit)
-            .contains("could not be waited on: EINTR")
+    assert_eq!(
+        restart_log_line("auto", &Waited::Killed, limit),
+        "clauth: codex app-server restart (auto) ran past 60s and was killed"
+    );
+    assert_eq!(
+        restart_log_line("auto", &Waited::Unwaitable("EINTR".into()), limit),
+        "clauth: codex app-server restart (auto) could not be waited on: EINTR"
     );
 }

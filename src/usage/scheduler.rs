@@ -3998,20 +3998,30 @@ fn apply_codex_switch(
             match crate::actions::switch_codex_profile(target.as_str()) {
                 Err(e) => logline!("clauth: codex auto-switch to '{target}' failed: {e:#}"),
                 Ok(repointed) => {
-                    logline!(
-                        "clauth: codex auto-switched to '{target}' — live at the next codex session"
-                    );
                     // The chain moves off a spent account, so every task in
                     // codex's shared app-server daemon is stalled on it anyway:
                     // restarting it costs their stalled turn and lets them resume
-                    // on `target`. Only when this switch moved clauth's link: a
-                    // daemon that merely predates the operator's own login file
-                    // runs an account clauth does not manage, and its turns are
-                    // healthy.
-                    if repointed.is_some() && crate::codex_daemon::is_stale() {
-                        crate::codex_daemon::restart_in_background(
-                            "codex auto-switch off a spent account",
-                        );
+                    // on `target`. Only when this switch moved clauth's link, and
+                    // in the codex home whose link it moved: a daemon that merely
+                    // predates the operator's own login file runs an account
+                    // clauth does not manage, and its turns are healthy.
+                    let stale_home = repointed
+                        .as_deref()
+                        .and_then(std::path::Path::parent)
+                        .filter(|home| crate::codex_daemon::is_stale_at(home));
+                    match stale_home {
+                        Some(home) => {
+                            logline!(
+                                "clauth: codex auto-switched to '{target}' — restarting codex's app-server daemon so its tasks resume on it"
+                            );
+                            crate::codex_daemon::restart_in_background(
+                                home.to_path_buf(),
+                                "codex auto-switch off a spent account",
+                            );
+                        }
+                        None => logline!(
+                            "clauth: codex auto-switched to '{target}' — live at the next codex session"
+                        ),
                     }
                 }
             }
