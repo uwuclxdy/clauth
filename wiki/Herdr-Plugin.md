@@ -111,7 +111,7 @@ The options render whether the TUI runs inside herdr or standalone. herdr mode d
 
 The dashboard's [Services tab](Interface-And-Keys#services-tab) carries a `herdr` row, shown only if herdr is installed. It reports the herdr version, whether the plugin is linked or installed and whether it is enabled, the key you bound and its spelling, and whether the sidebar row is templated. A registry entry whose checkout has been moved or deleted reads as danger, since herdr keeps the entry and the plugin cannot run.
 
-<kbd>f</kbd> on that row appends whichever of the keybinding and the sidebar row is missing, behind a confirm that defaults to cancel. It is the same write `clauth herdr install` performs, so it is the repair for a config edited by hand since. If your config spells one of those tables in a way clauth cannot extend by appending, it says so and leaves that half to you rather than guessing.
+<kbd>f</kbd> on that row, then <kbd>⏎</kbd>, appends whichever of the keybinding and the sidebar row is missing, behind a confirm that defaults to cancel. It is the same write `clauth herdr install` performs, so it is the repair for a config edited by hand since. If your config spells one of those tables in a way clauth cannot extend by appending, it says so and leaves that half to you rather than guessing.
 
 ## What this plugin cannot do, by design of herdr's plugin v1
 

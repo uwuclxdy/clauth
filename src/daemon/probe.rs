@@ -34,22 +34,28 @@ use crate::profile::clauth_dir;
 /// How stale `status.json` may be before the `[ daemon ]` header chip flips
 /// green→amber.
 /// The daemon stamps it every ~1s loop tick, but a single tick can legitimately
-/// block on the keychain shell-outs: a rotation's mirror makes three `security`
-/// calls (read, write, read-back verify) at 10 s each, unclamped because it
-/// runs after the lock closure — 30 s worst, past
-/// `runtime::KEYCHAIN_MIRROR_BUDGET`'s 20 s term by design (see
-/// `keychain::SECURITY_TIMEOUT`'s doc). The window therefore sits one margin
-/// ABOVE [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE), so that worst legal
-/// tick reads green throughout and amber means "no tick has completed within
-/// what the watchdog tolerates" — wedging, pre-abort — never "slowest legal
-/// tick".
+/// block on the keychain shell-outs: a queued switch's install gate can land a
+/// rotation, whose tail makes up to four `security` calls (the foreign gate's
+/// item read, then the mirror's read, write and read-back verify) at 10 s
+/// each. The landing's `runtime::KEYCHAIN_MIRROR_BUDGET` arm adopts the 20 s
+/// window the tick itself arms (`lock::SharedSubprocessBudget::arm_clamped`),
+/// which the switch's own shell-outs and both drains' flock waits share too,
+/// so a tick's shell-outs and flock waits stop at 20 s in aggregate. The
+/// window sits one margin ABOVE [`WATCHDOG_DEADLINE`](super::WATCHDOG_DEADLINE),
+/// so a tick inside that bound reads green throughout and amber means "no tick
+/// has completed within what the watchdog tolerates" — wedging, pre-abort.
+///
+/// Neither bound covers a switch tick whose install gate also makes a token
+/// call: `oauth::TOKEN_HTTP_DEADLINES` (19 s) runs outside the tick's window,
+/// so such a tick can take 20 + 19 = 39 s, past both this window and the 30 s
+/// watchdog, and reads amber while it runs.
 const DAEMON_STALE_MS: u64 = super::WATCHDOG_DEADLINE.as_millis() as u64 + 5_000;
 
 const _: () = assert!(
     DAEMON_STALE_MS > super::WATCHDOG_DEADLINE.as_millis() as u64,
-    "the staleness window must sit strictly above the watchdog deadline: the \
-     worst legal tick (a keychain mirror spending every security deadline) must \
-     read green, never amber"
+    "the staleness window must sit strictly above the watchdog deadline: a tick \
+     whose shell-outs and flock waits spend the tick's whole 20 s window must read \
+     green, never amber (a token call on top of it is not covered)"
 );
 
 /// The `[ daemon ]` header chip's three display states, derived from the daemon
@@ -61,7 +67,7 @@ const _: () = assert!(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonHealth {
     /// No daemon: `clauthd.lock` is free (never started, or the holder died).
-    /// The chip is dim; the TUI self-fetches under its own lease.
+    /// The chip is faint; the TUI self-fetches under its own lease.
     Absent,
     /// A daemon holds the lock but its feed is stale/unwritten — wedging,
     /// pre-abort, or just-booted before the first `status.json` write. Amber.
@@ -261,9 +267,9 @@ impl StandbySlot {
 
 /// How many times a non-[`Claim::Active`] outcome is re-tried before it stands.
 /// **Every presence probe TAKES the flock it tests** — [`daemon_health`] (TUI
-/// header, 1 Hz), [`singleton_held`] (`clauth daemon --status` at whatever rate a
-/// supervisor polls, plus once per `clauth start --with-fallback`, which refuses
-/// when no daemon is there to decide its switches) and [`standby_waiting`] (the
+/// header, 1 Hz), [`singleton_held`] (every caller deciding on a daemon's
+/// presence, `clauth daemon --status` at whatever rate a supervisor polls
+/// among them) and [`standby_waiting`] (the
 /// slot file) try-lock a free file and release it microseconds later — so a single
 /// lost try-lock does not prove a daemon is there. A real holder keeps its lock for the process
 /// lifetime, so anything that clears on the next attempt was a reader. Without
@@ -693,8 +699,8 @@ fn stamp_pid() -> std::io::Result<()> {
 }
 
 /// The pid the running daemon stamped into the [`PID_FILE`] sidecar, when one is
-/// fully written. Informational only — its one caller reaches it past a true
-/// [`singleton_held`], and the header chip answers off [`daemon_health`], so
+/// fully written. Informational only — its callers reach it past a held flock
+/// ([`singleton_held`] true, or [`daemon_health`] not absent), so
 /// presence is proven by the flock either way and a pid left behind by a dead
 /// daemon is never read as one being up.
 ///
@@ -703,7 +709,7 @@ fn stamp_pid() -> std::io::Result<()> {
 /// [`stamp_pid`] reaching `set_len(0)` — a handful of instructions — the dead
 /// predecessor's pid is still whole and readable, so `--status` can print a pid
 /// the OS has since recycled onto something unrelated. The sidecar is never read
-/// unless [`singleton_held`] is already true, so a lingering pid from a fully
+/// unless the flock is held, so a lingering pid from a fully
 /// dead daemon is out of reach; only this in-handover window can surface a stale
 /// one, and truncate-first keeps it to a handful of instructions.
 pub(crate) fn holder_pid() -> Option<u32> {

@@ -32,6 +32,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -39,16 +40,18 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use super::log_rotate::{LOG_KEEP_BYTES, LOG_MAX_BYTES, rotate_log_if_large};
 use super::probe::{DaemonLock, REPLACE_WAIT, terminate_pid};
 use super::proxies::ProxySupervision;
 use crate::gateway::{
-    GatewayEnv, GatewayRecord, HEALTH_PROBE_TIMEOUT, Health, NotToml, VERSION_FLOOR,
-    check_version_floor, gateway_bind, gateway_cwd, gateway_env, gateway_shutdown_timeout,
-    probe_health,
+    DaemonIdentity, GatewayEnv, GatewayRecord, HEALTH_PROBE_TIMEOUT, Health, NotToml,
+    VERSION_FLOOR, check_version_floor, gateway_bind, gateway_cwd, gateway_env,
+    gateway_shutdown_timeout, probe_health,
 };
+use crate::gateway_tokens::StoreDigest;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{atomic_write_600, clauth_dir, open_append_600};
@@ -59,6 +62,13 @@ use crate::usage::{epoch_secs_to_iso, now_ms};
 /// second, a state change shows within one feed write, and an exit is noticed
 /// within one.
 pub(crate) const SUPERVISE_POLL: Duration = Duration::from_secs(1);
+
+/// How soon a still-refused `shunt check` of a changed restart-only setting is
+/// re-run. The memo is keyed on the config's bytes alone, so a refusal fixed
+/// through the check's other inputs — the env file, a `${file:}` key file,
+/// the shunt binary — reads as unchanged bytes; this bound is the only way
+/// such a fix eventually re-checks and lets the restart through.
+const REFUSED_RECHECK: Duration = Duration::from_secs(60);
 
 /// How often a running child, a foreign answerer on its port, or a start
 /// that could not spawn is looked at again. A healthy probe is a loopback
@@ -120,6 +130,9 @@ pub(crate) enum GatewayState {
     Absent,
     /// The record's `disabled` flag is on.
     Disabled,
+    /// The TUI wrote a hold naming this daemon: the gateway is held off until
+    /// the next daemon start.
+    Held,
     /// The adopted config is gone from disk.
     NoConfig,
     /// The record names a YAML config, which clauth cannot edit in place.
@@ -298,7 +311,7 @@ pub(crate) fn slot_or_record(published: Option<&GatewaySlot>) -> GatewaySlot {
 /// The slot with no supervisor to ask: the record's own verdict, or
 /// `unobserved` for a record the gateway would run on.
 pub(crate) fn unsupervised_slot() -> GatewaySlot {
-    match Gateway.intent() {
+    match Gateway::new().intent() {
         Intent::Idle(slot) => slot,
         Intent::Run(record) => GatewaySlot::for_record(GatewayState::Unobserved, &record),
         Intent::Unchanged => GatewaySlot::of(GatewayState::Unobserved),
@@ -306,6 +319,19 @@ pub(crate) fn unsupervised_slot() -> GatewaySlot {
 }
 
 // ── the machine ─────────────────────────────────────────────────────────────
+
+/// What gating a [`Supervised::respawn_mark_why`] change asks for: whether the
+/// kind's own check of the record clears the respawn now.
+pub(crate) enum GateRespawn {
+    /// Stop and respawn at once.
+    Respawn,
+    /// Keep the child and log `reason`, already the full message body.
+    Keep { reason: String },
+    /// Keep the child silently: the same config bytes already refused and
+    /// re-checked too soon, a shutdown cancelled the check, or the refusal
+    /// line is unchanged from the one already logged for this child.
+    KeepMemoized,
+}
 
 /// One supervised kind: the per-kind decisions the generic machine defers to.
 /// [`Gateway`] implements it for the shunt gateway,
@@ -321,6 +347,9 @@ pub(crate) trait Supervised: Clone + Send + 'static {
     type Probe: Send + 'static;
     /// Spawn-ready inputs built by [`Supervised::prepare`].
     type Prepared: Clone + Send;
+    /// The spawn-time restart facts a respawn round re-reads and compares;
+    /// `()` for a kind with none.
+    type SpawnMark: Clone + Send + Default + 'static;
 
     /// Publish `slot` into `handle`.
     fn publish(&self, handle: &Self::Handle, slot: Self::Slot);
@@ -427,6 +456,55 @@ pub(crate) trait Supervised: Clone + Send + 'static {
 
     /// Whether `a` and `b` differ on what a running child was spawned over.
     fn respawn_inputs_changed(&self, a: &Self::Record, b: &Self::Record) -> bool;
+
+    /// Capture the spawn-time restart facts a respawn round re-reads (the
+    /// gateway's restart-only settings, and the digest of the client-token
+    /// store its `prepared` env was built from); the default for a kind with
+    /// none.
+    fn spawn_mark(&self, _record: &Self::Record, _prepared: &Self::Prepared) -> Self::SpawnMark {
+        Default::default()
+    }
+
+    /// Why a spawn input the record does not hold changed since the spawn
+    /// (the gateway's client-token store), asking for the same immediate
+    /// respawn as a [`Supervised::respawn_inputs_changed`] change; `None`
+    /// keeps the child, as does an unreadable input, which is no evidence.
+    fn respawn_input_why(&self, _mark: &Self::SpawnMark) -> Option<String> {
+        None
+    }
+
+    /// Whether `mark`, captured at spawn, changed: `Some(change)` asks for a
+    /// respawn, `None` keeps the child (unchanged, or an unreadable re-read,
+    /// which is no evidence). `mark` is mutable so a kind can adopt the first
+    /// readable round's facts as the baseline when the spawn-time read failed.
+    /// Defaults to `None`.
+    fn respawn_mark_why(
+        &self,
+        _record: &Self::Record,
+        _mark: &mut Self::SpawnMark,
+    ) -> Option<RestartChange> {
+        None
+    }
+
+    /// Whether a [`Supervised::respawn_mark_why`] change should respawn now.
+    /// `change` names the settings that changed, for the refusal line.
+    /// `Respawn` stops and respawns; `Keep` keeps the child and logs `reason`
+    /// (already the full message body); `KeepMemoized` keeps it silently. The
+    /// `memo` carries the last refusal's config-bytes digest and instant, so
+    /// an unchanged re-read is not re-checked until [`REFUSED_RECHECK`] has
+    /// passed, and the refusal line last logged, so a re-check that refuses
+    /// with the same text stays silent. Defaults to `Respawn`: a kind with no
+    /// restart-only fact never reaches the gate.
+    fn gate_respawn(
+        &self,
+        _record: &Self::Record,
+        _change: &RestartChange,
+        _memo: &mut RefusedCheck,
+        _now: Instant,
+        _cancel: &AtomicBool,
+    ) -> GateRespawn {
+        GateRespawn::Respawn
+    }
 
     /// Classify a probe answer against the running child.
     fn classify_child(
@@ -548,7 +626,25 @@ pub(crate) struct Running<K: Supervised> {
     contract: Option<String>,
     stop_bound: Duration,
     pub(crate) identity: Identity<K>,
+    spawn_mark: K::SpawnMark,
+    /// The last refused `shunt check` of a changed restart-only setting: its
+    /// config-bytes digest, the instant it refused, and the refusal line
+    /// logged. Cleared with the child it belongs to.
+    refused_check: RefusedCheck,
     stop: Option<Stop<K>>,
+}
+
+/// The state [`Supervised::gate_respawn`] carries about a child's last
+/// refused `shunt check`, so the memo survives the round and the re-check
+/// bound and log dedup are enforced per child.
+#[derive(Default)]
+pub(crate) struct RefusedCheck {
+    /// The digest of the config bytes whose check last refused.
+    digest: Option<[u8; 32]>,
+    /// When the check last refused.
+    at: Option<Instant>,
+    /// The refusal line last logged for this child.
+    line: Option<String>,
 }
 
 impl<K: Supervised> Running<K> {
@@ -575,8 +671,9 @@ enum AfterStop<K: Supervised> {
     /// The child was refused (below floor, a contract major mismatch, a
     /// manifest refusal); publish `slot` and hold until something changes.
     Refused { why: String, slot: K::Slot },
-    /// The record's spawn inputs changed; spawn it afresh on them at once.
-    Respawn,
+    /// A respawn input changed (the record's, or a restart-only fact of the
+    /// kind); spawn afresh at once.
+    Respawn { why: String },
     /// The daemon is exiting.
     Shutdown,
 }
@@ -803,7 +900,7 @@ impl<K: Supervised> Supervisor<K> {
                 );
                 return;
             }
-            std::thread::sleep(STOP_POLL);
+            std::thread::sleep(STOP_POLL.min(deadline - now));
         }
     }
 
@@ -848,15 +945,44 @@ impl<K: Supervised> Supervisor<K> {
             // the last one clauth knows.
             Intent::Idle(_) => {}
             Intent::Unchanged => {}
-            Intent::Run(record)
+            Intent::Run(record) => {
                 if self
                     .kind
-                    .respawn_inputs_changed(record, &running.identity.record) =>
-            {
-                self.begin_stop(AfterStop::Respawn, tick);
-                return None;
+                    .respawn_inputs_changed(record, &running.identity.record)
+                {
+                    self.begin_stop(
+                        AfterStop::Respawn {
+                            why: self.kind.respawn_why(),
+                        },
+                        tick,
+                    );
+                    return None;
+                }
+                if let Some(why) = self.kind.respawn_input_why(&running.spawn_mark) {
+                    self.begin_stop(AfterStop::Respawn { why }, tick);
+                    return None;
+                }
+                if let Some(change) = self.kind.respawn_mark_why(record, &mut running.spawn_mark) {
+                    match self.kind.gate_respawn(
+                        record,
+                        &change,
+                        &mut running.refused_check,
+                        tick.at,
+                        &self.cancel,
+                    ) {
+                        GateRespawn::Respawn => {
+                            self.begin_stop(AfterStop::Respawn { why: change.why() }, tick);
+                            return None;
+                        }
+                        GateRespawn::Keep { reason } => {
+                            logline!("clauth daemon: {reason}");
+                        }
+                        GateRespawn::KeepMemoized => {}
+                    }
+                    // A refused or memoized change keeps the child and its
+                    // health probe: only a cleared check stops it here.
+                }
             }
-            Intent::Run(_) => {}
         }
         if tick.at >= running.next_probe {
             Some(StepWants::Child {
@@ -929,7 +1055,7 @@ impl<K: Supervised> Supervisor<K> {
         let why = match &then {
             AfterStop::Idle(slot) => self.kind.idle_stop_why(slot),
             AfterStop::Refused { why, .. } => why.clone(),
-            AfterStop::Respawn => self.kind.respawn_why(),
+            AfterStop::Respawn { why } => why.clone(),
             AfterStop::Shutdown => "the daemon is exiting".to_string(),
         };
         logline!(
@@ -979,9 +1105,9 @@ impl<K: Supervised> Supervisor<K> {
                 self.held = Some(running.identity);
                 self.set(slot, tick);
             }
-            Some(AfterStop::Respawn) => {
+            Some(AfterStop::Respawn { .. }) => {
                 logline!(
-                    "clauth daemon: {} (pid {}) stopped ({report}); starting it on the changed record",
+                    "clauth daemon: {} (pid {}) stopped ({report}); starting it afresh",
                     self.kind.name(),
                     running.pid
                 );
@@ -1098,6 +1224,9 @@ impl<K: Supervised> Supervisor<K> {
             ForeignVerdict::Spawn => {
                 let stop_bound = self.kind.stop_bound(&record, &prepared);
                 self.log_skipped(&record, &prepared);
+                // Read before the spawn, so a save landing while the child
+                // boots can only cause a needless restart, never a missed one.
+                let spawn_mark = self.kind.spawn_mark(&record, &prepared);
                 let child = match self.kind.spawn(&record, &prepared, log) {
                     Ok(child) => child,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1134,6 +1263,8 @@ impl<K: Supervised> Supervisor<K> {
                     contract: None,
                     stop_bound,
                     identity,
+                    spawn_mark,
+                    refused_check: RefusedCheck::default(),
                     stop: None,
                 };
                 if let Err(e) = Self::write_marker(&self.kind, &running.marker(None)) {
@@ -1299,12 +1430,9 @@ pub(crate) fn stop_left_behind(path: &Path, name: &str, now_ms: u64) -> Option<L
             return None;
         }
     };
-    let start = match marker.start.clone() {
-        Some(start) if process_start_time(marker.pid).as_ref() == Some(&start) => start,
-        _ => {
-            remove_marker_at(path);
-            return None;
-        }
+    let Some(start) = live_start(&marker) else {
+        remove_marker_at(path);
+        return None;
     };
     let deadline_ms = match marker.stop_deadline_ms {
         // A stop already asked for: a second SIGTERM makes the child skip its
@@ -1346,6 +1474,27 @@ pub(crate) fn stop_left_behind_gateway() {
     }
 }
 
+/// Whether a gateway child a daemon left behind still serves: live, and no
+/// stop asked of it (a stopping child is on its way out). The TUI's no-daemon
+/// warning tells a gateway nothing will start from one still serving
+/// unsupervised. Reads the marker only; never signals, rewrites or removes it,
+/// and an unreadable marker reads as no child. Spawns a process on macOS and
+/// Windows ([`process_start_time`]), so the TUI runs it on a worker.
+pub(crate) fn left_behind_gateway_runs() -> bool {
+    gateway_marker_path()
+        .ok()
+        .and_then(|path| read_marker_at(&path).ok().flatten())
+        .is_some_and(|marker| marker.stop_deadline_ms.is_none() && live_start(&marker).is_some())
+}
+
+/// The marker's start time when its pid is a live process started then, the
+/// only proof the pid is still the child a daemon spawned and not a recycled
+/// one.
+fn live_start(marker: &ChildMarker) -> Option<String> {
+    let start = marker.start.clone()?;
+    (process_start_time(marker.pid).as_ref() == Some(&start)).then_some(start)
+}
+
 /// The gateway's child marker path.
 fn gateway_marker_path() -> Result<PathBuf> {
     Ok(clauth_dir()?.join(CHILD_MARKER_FILE))
@@ -1353,9 +1502,439 @@ fn gateway_marker_path() -> Result<PathBuf> {
 
 // ── the gateway kind ────────────────────────────────────────────────────────
 
-/// The shunt gateway kind.
+/// What a round found in the gateway hold file.
+enum Hold {
+    /// No hold, or this reader is not a daemon: nothing to do.
+    None,
+    /// The hold names this daemon: hold the gateway off.
+    Mine,
+    /// The hold names another instance or does not parse: removed, ignored.
+    Ignored,
+}
+
+/// A hold fault the daemon logs, so a standing fault is logged once per
+/// change, never once per round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Gateway;
+enum HoldFault {
+    /// The hold file could not be read.
+    Read,
+    /// A foreign hold could not be removed.
+    Remove,
+    /// This daemon's own start time could not be read, so no hold can be
+    /// judged against it.
+    OwnStart,
+}
+
+/// The shunt gateway kind. `me` is this daemon's own identity
+/// ([`DaemonIdentity`]), `None` where no daemon supervises (the single-shot
+/// record-only slot), so a hold is only ever honoured or removed by a live
+/// daemon.
+#[derive(Debug, Clone)]
+pub(crate) struct Gateway {
+    me: Option<DaemonIdentity>,
+    /// The last hold fault logged, so a standing fault raises one line per
+    /// change instead of one per round (the supervisor's slot-reason
+    /// precedent).
+    hold_fault: Arc<Mutex<Option<HoldFault>>>,
+    /// The last env-record fault logged ([`crate::gateway::refresh_daemon_env`]),
+    /// one line per change, as `hold_fault`.
+    env_fault: Arc<Mutex<Option<String>>>,
+}
+
+impl Gateway {
+    /// No daemon: the record-only reader consults no hold.
+    pub(crate) fn new() -> Self {
+        Gateway {
+            me: None,
+            hold_fault: Arc::new(Mutex::new(None)),
+            env_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// This daemon's own identity, learned once at start.
+    pub(crate) fn for_daemon() -> Self {
+        let pid = std::process::id();
+        Gateway {
+            me: Some(DaemonIdentity {
+                pid,
+                start: process_start_time(pid),
+            }),
+            hold_fault: Arc::new(Mutex::new(None)),
+            env_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A gateway over an injected identity, for the hold's identity edges.
+    #[cfg(test)]
+    pub(crate) fn for_test(me: Option<DaemonIdentity>) -> Self {
+        Gateway {
+            me,
+            hold_fault: Arc::new(Mutex::new(None)),
+            env_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Raise `message` when the hold fault changed since the last round; a
+    /// `None` fault (a clean round) clears the remembered fault.
+    fn note(&self, fault: Option<HoldFault>, message: String) {
+        let mut last = self
+            .hold_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last != fault {
+            if !message.is_empty() {
+                logline!("{message}");
+            }
+            *last = fault;
+        }
+    }
+
+    /// Keep this daemon's env record answering for the tokens variable the
+    /// gateway's config names now, so the TUI's client-token reads never wait
+    /// for a daemon restart.
+    fn refresh_env(&self) {
+        let Some(me) = &self.me else {
+            return;
+        };
+        let fault = crate::gateway::refresh_daemon_env(me)
+            .err()
+            .map(|e| format!("{e:#}"));
+        let mut last = self
+            .env_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last != fault {
+            if let Some(fault) = &fault {
+                logline!(
+                    "clauth daemon: {fault}{}",
+                    crate::gateway::ENV_RECORD_FAULT_TAIL
+                );
+            }
+            *last = fault;
+        }
+    }
+
+    /// What the gateway hold file asks of this round.
+    fn hold(&self) -> Hold {
+        let Some(me) = &self.me else {
+            return Hold::None;
+        };
+        let path = match crate::gateway::hold_path() {
+            Ok(path) => path,
+            Err(e) => {
+                logline!("clauth daemon: cannot find the gateway hold path: {e:#}");
+                return Hold::None;
+            }
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.note(None, String::new());
+                return Hold::None;
+            }
+            Err(e) => {
+                self.note(
+                    Some(HoldFault::Read),
+                    format!("clauth daemon: cannot read {}: {e}", path.display()),
+                );
+                return Hold::None;
+            }
+        };
+        if me.start.is_none() {
+            // A hold exists but this daemon cannot be identified against it:
+            // leave it for a daemon that can, and name the true cause.
+            self.note(
+                Some(HoldFault::OwnStart),
+                format!(
+                    "clauth daemon: cannot read this daemon's own start time; leaving the gateway hold {} in place",
+                    path.display()
+                ),
+            );
+            return Hold::None;
+        }
+        if serde_json::from_slice::<DaemonIdentity>(&bytes).is_ok_and(|hold| me.is_named_by(&hold))
+        {
+            self.note(None, String::new());
+            return Hold::Mine;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                self.note(None, String::new());
+                logline!(
+                    "clauth daemon: ignoring {}: it names another daemon instance or does not parse; removed",
+                    path.display()
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.note(None, String::new());
+            }
+            Err(e) => self.note(
+                Some(HoldFault::Remove),
+                format!("clauth daemon: failed to remove {}: {e}", path.display()),
+            ),
+        }
+        Hold::Ignored
+    }
+}
+
+// ── restart-only facts ─────────────────────────────────────────────────────
+
+/// The restart-only settings shunt cannot hot-apply, read from the adopted
+/// config's TOML as written. The list mirrors shunt's
+/// `warn_on_restart_only_changes` — every `previous.X != next.X` there — plus
+/// the boot-fixed settings the warner omits, read at shunt's own spawn sites:
+/// `[server.pool]`'s `usage_refresh_seconds` and `state_path`, and
+/// `[server.status]` (its presence, whether `sources` is non-empty, and its
+/// `refresh_seconds`).
+///
+/// Each value fact is the SHA-256 of the canonical serialization of the raw
+/// TOML value at its key path (a sorted-key serialization, so whitespace,
+/// comments and key order never count, and a `${…}` reference compares as its
+/// text); a presence fact stays a boolean, and `[server.status].sources` is
+/// the boolean "non-empty". The mark keeps the digest, never the raw value, so
+/// a `[sentry]` dsn or an `[otel]` header never lives in the daemon heap and
+/// NaN compares equal to itself instead of restarting every round. An absent
+/// key vs an explicit shunt-default value is a change, because clauth does not
+/// re-derive shunt's defaults. The compare is conservative: a respelling shunt
+/// reads as the same value (an int-vs-float respelling, `-0.0`, a value its
+/// spawn site clamps or treats as off), or an unknown key inside a member
+/// table, restarts once where shunt's typed compare would see no change — a
+/// needless restart is safer than an edit that silently stays unapplied.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RestartFacts {
+    values: Vec<FactValue>,
+}
+
+/// One restart-only fact's value: the digest of the value at a key path
+/// (`None` = absent), a table's presence, or an array's non-emptiness.
+#[derive(Debug, Clone, PartialEq)]
+enum FactValue {
+    Value(Option<[u8; 32]>),
+    Present(bool),
+    NonEmpty(bool),
+}
+
+/// How a [`FactSpec`] reads its fact.
+#[derive(Clone, Copy)]
+enum FactKind {
+    /// The value at the key path, compared by digest.
+    Value,
+    /// The key's presence, whatever its type.
+    Present,
+    /// Whether the key holds a non-empty array.
+    NonEmpty,
+}
+
+/// A restart-only setting: its document walk and its log key path.
+struct FactSpec {
+    keys: &'static [&'static str],
+    path: &'static str,
+    kind: FactKind,
+}
+
+/// The restart-only settings in the warner's order, then the boot-fixed trio.
+static FACT_SPECS: &[FactSpec] = &[
+    FactSpec {
+        keys: &["server", "bind"],
+        path: "server.bind",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "max_concurrent_requests"],
+        path: "server.max_concurrent_requests",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "shutdown_timeout_seconds"],
+        path: "server.shutdown_timeout_seconds",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "access_control"],
+        path: "[server.access_control]",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "limits", "max_request_header_bytes"],
+        path: "server.limits.max_request_header_bytes",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "limits", "max_url_length"],
+        path: "server.limits.max_url_length",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "rate_limits"],
+        path: "[server.rate_limits]",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "admin"],
+        path: "[server.admin]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "gateway"],
+        path: "[server.gateway]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "spend"],
+        path: "[server.spend]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "spend", "state_path"],
+        path: "server.spend.state_path",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "codex_endpoint"],
+        path: "[server.codex_endpoint]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "usage"],
+        path: "[server.usage]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "oauth_usage"],
+        path: "[server.oauth_usage]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["sentry"],
+        path: "[sentry]",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["otel"],
+        path: "[otel]",
+        kind: FactKind::Value,
+    },
+    // The boot-fixed trio, which the warner omits.
+    FactSpec {
+        keys: &["server", "pool", "usage_refresh_seconds"],
+        path: "server.pool.usage_refresh_seconds",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "pool", "state_path"],
+        path: "server.pool.state_path",
+        kind: FactKind::Value,
+    },
+    FactSpec {
+        keys: &["server", "status"],
+        path: "[server.status]",
+        kind: FactKind::Present,
+    },
+    FactSpec {
+        keys: &["server", "status", "sources"],
+        path: "[server.status].sources",
+        kind: FactKind::NonEmpty,
+    },
+    FactSpec {
+        keys: &["server", "status", "refresh_seconds"],
+        path: "server.status.refresh_seconds",
+        kind: FactKind::Value,
+    },
+];
+
+impl RestartFacts {
+    /// The restart-only facts of `config`, or `None` when the file cannot be
+    /// read, does not parse as TOML, or a fact's path crosses a non-table.
+    fn read(config: &Path) -> Option<RestartFacts> {
+        let text = std::fs::read_to_string(config).ok()?;
+        let doc: toml::Value = toml::from_str(&text).ok()?;
+        let mut values = Vec::with_capacity(FACT_SPECS.len());
+        for spec in FACT_SPECS {
+            let value = match (walk(&doc, spec.keys).ok()?, spec.kind) {
+                (Some(value), FactKind::Value) => FactValue::Value(Some(digest_of(value))),
+                (Some(_), FactKind::Present) => FactValue::Present(true),
+                (Some(value), FactKind::NonEmpty) => FactValue::NonEmpty(non_empty(value)),
+                (None, FactKind::Value) => FactValue::Value(None),
+                (None, FactKind::Present) => FactValue::Present(false),
+                (None, FactKind::NonEmpty) => FactValue::NonEmpty(false),
+            };
+            values.push(value);
+        }
+        Some(RestartFacts { values })
+    }
+
+    /// The log key paths of every fact that differs from `spawned`, in
+    /// fact-set order.
+    fn changed_since(&self, spawned: &RestartFacts) -> Vec<&'static str> {
+        self.values
+            .iter()
+            .zip(&spawned.values)
+            .zip(FACT_SPECS)
+            .filter(|((current, spawned), _)| current != spawned)
+            .map(|(_, spec)| spec.path)
+            .collect()
+    }
+}
+
+/// The SHA-256 of a value's canonical serialization: the [`toml::Value`]
+/// `Display`, which emits sorted table keys and a sign-discarded `nan`, so two
+/// equal values (NaN included) digest alike and no value text is kept.
+fn digest_of(value: &toml::Value) -> [u8; 32] {
+    <[u8; 32]>::from(Sha256::digest(value.to_string().as_bytes()))
+}
+
+/// Whether `value` is a non-empty array (the `[server.status].sources` fact).
+fn non_empty(value: &toml::Value) -> bool {
+    matches!(value, toml::Value::Array(items) if !items.is_empty())
+}
+
+/// The restart-only settings that changed since a child spawned, as log-ready
+/// key paths in fact-set order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RestartChange {
+    settings: Vec<&'static str>,
+}
+
+impl RestartChange {
+    /// The stop line's cause, e.g. `its config changed server.bind`.
+    fn why(&self) -> String {
+        format!("its config changed {}", self.settings.join(", "))
+    }
+}
+
+/// The value at `keys` in `doc`: `Ok(None)` for an absent key, `Ok(Some(v))`
+/// for the terminal value, `Err(())` when an intermediate key exists but is
+/// not a table (no evidence about any fact).
+fn walk<'a>(doc: &'a toml::Value, keys: &[&str]) -> Result<Option<&'a toml::Value>, ()> {
+    let mut current = doc;
+    for (index, key) in keys.iter().enumerate() {
+        let Some(next) = current.get(*key) else {
+            return Ok(None);
+        };
+        if index + 1 == keys.len() {
+            return Ok(Some(next));
+        }
+        if !next.is_table() {
+            return Err(());
+        }
+        current = next;
+    }
+    Ok(None)
+}
+
+/// The setting a changed client-tokens variable names in a restart line.
+const TOKENS_VARIABLE_SETTING: &str = "[server.auth].tokens_env";
+
+/// What a running gateway was spawned over beyond its record: its config's
+/// restart-only facts (`None`: unreadable at spawn), the digest of the
+/// client-token store bytes its env was built from (`None`: no store), and
+/// the variable that env carried the tokens in (`None`: no token stored).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GatewayMark {
+    facts: Option<RestartFacts>,
+    client_tokens: Option<StoreDigest>,
+    tokens_variable: Option<String>,
+}
 
 impl Supervised for Gateway {
     type Slot = GatewaySlot;
@@ -1363,6 +1942,7 @@ impl Supervised for Gateway {
     type Record = GatewayRecord;
     type Probe = Health;
     type Prepared = GatewayEnv;
+    type SpawnMark = GatewayMark;
 
     fn publish(&self, handle: &GatewayHandle, slot: GatewaySlot) {
         match handle.lock() {
@@ -1372,6 +1952,8 @@ impl Supervised for Gateway {
     }
 
     fn intent(&self) -> Intent<GatewaySlot, GatewayRecord> {
+        self.refresh_env();
+        let hold = self.hold();
         let record = match GatewayRecord::load() {
             Ok(Some(record)) => record,
             Ok(None) => return Intent::Idle(GatewaySlot::of(GatewayState::Absent)),
@@ -1390,6 +1972,9 @@ impl Supervised for Gateway {
         };
         if record.disabled {
             return Intent::Idle(GatewaySlot::for_record(GatewayState::Disabled, &record));
+        }
+        if matches!(hold, Hold::Mine) {
+            return Intent::Idle(GatewaySlot::for_record(GatewayState::Held, &record));
         }
         match record.config().try_exists() {
             Ok(true) => Intent::Run(record),
@@ -1472,7 +2057,10 @@ impl Supervised for Gateway {
     fn idle_stops_child(&self, slot: &GatewaySlot) -> bool {
         matches!(
             slot.state,
-            GatewayState::Absent | GatewayState::Disabled | GatewayState::NoConfig
+            GatewayState::Absent
+                | GatewayState::Disabled
+                | GatewayState::NoConfig
+                | GatewayState::Held
         )
     }
 
@@ -1577,6 +2165,106 @@ impl Supervised for Gateway {
         spawn_inputs(a) != spawn_inputs(b)
     }
 
+    fn spawn_mark(&self, record: &GatewayRecord, env: &GatewayEnv) -> GatewayMark {
+        GatewayMark {
+            facts: RestartFacts::read(record.config()),
+            client_tokens: env.client_tokens_digest(),
+            tokens_variable: env.tokens_variable().map(str::to_string),
+        }
+    }
+
+    fn respawn_input_why(&self, mark: &GatewayMark) -> Option<String> {
+        // shunt reads its client tokens from its env at spawn alone, so a
+        // store change reaches it only through a respawn: a spawn input
+        // clauth writes, compared like the record's (the `env_file` path
+        // precedent), ungated.
+        crate::gateway_tokens::store_digest()
+            .ok()
+            .filter(|now| *now != mark.client_tokens)
+            .map(|_| "its client tokens changed".to_string())
+    }
+
+    fn respawn_mark_why(
+        &self,
+        record: &GatewayRecord,
+        mark: &mut GatewayMark,
+    ) -> Option<RestartChange> {
+        let current = RestartFacts::read(record.config())?;
+        let mut settings = if let Some(spawned) = mark.facts.as_ref() {
+            current.changed_since(spawned)
+        } else {
+            // The spawn-time read failed (an unreadable config, or one whose
+            // fact path crossed a non-table). Adopt the first readable round's
+            // facts as the baseline: shunt could not have booted on an
+            // unreadable config, so outside a save race this costs nothing,
+            // and from here a change restarts like any other child.
+            mark.facts = Some(current);
+            logline!(
+                "clauth daemon: {}'s config could not be read at spawn; adopting the current config as its restart baseline",
+                self.name()
+            );
+            Vec::new()
+        };
+        // A hand edit naming another variable for the client tokens
+        // (`[server.auth].tokens_env`, or its env-layer override in the env
+        // file) changes the env the gateway must be spawned with: shunt
+        // reads the variable at spawn alone. A config edit like the
+        // restart-only settings, so its restart passes the same `shunt check`
+        // gate and refused-check memo; an unreadable read is no evidence.
+        if crate::gateway::spawn_tokens_variable(record)
+            .ok()
+            .is_some_and(|now| now != mark.tokens_variable)
+        {
+            settings.push(TOKENS_VARIABLE_SETTING);
+        }
+        if settings.is_empty() {
+            None
+        } else {
+            Some(RestartChange { settings })
+        }
+    }
+
+    fn gate_respawn(
+        &self,
+        record: &GatewayRecord,
+        change: &RestartChange,
+        memo: &mut RefusedCheck,
+        now: Instant,
+        cancel: &AtomicBool,
+    ) -> GateRespawn {
+        let digest = std::fs::read(record.config())
+            .ok()
+            .map(|bytes| <[u8; 32]>::from(Sha256::digest(&bytes)));
+        if let Some(digest) = &digest
+            && memo.digest.as_ref() == Some(digest)
+            && memo
+                .at
+                .is_some_and(|at| now.saturating_duration_since(at) < REFUSED_RECHECK)
+        {
+            return GateRespawn::KeepMemoized;
+        }
+        match crate::gateway::check_adopted_config(record, cancel) {
+            Ok(()) => GateRespawn::Respawn,
+            Err(e) => {
+                // A shutdown set the flag while the check ran: it was
+                // cancelled, not refused, so nothing is logged or memoized.
+                if cancel.load(Ordering::Acquire) {
+                    return GateRespawn::KeepMemoized;
+                }
+                memo.digest = digest;
+                memo.at = Some(now);
+                let reason = refusal_line(&self.name(), change, &e);
+                // A re-check that refuses with the same text stays silent:
+                // the refusal was already logged for this child.
+                if memo.line.as_deref() == Some(reason.as_str()) {
+                    return GateRespawn::KeepMemoized;
+                }
+                memo.line = Some(reason.clone());
+                GateRespawn::Keep { reason }
+            }
+        }
+    }
+
     fn classify_child(
         &self,
         running: &Running<Gateway>,
@@ -1676,12 +2364,53 @@ impl Supervised for Gateway {
     }
 }
 
+/// The refusal line for a changed restart-only setting whose check refused, in
+/// the daemon's own words: what the child waits on and why. Never the check's
+/// stderr, which can quote env-file values.
+fn refusal_line(name: &str, change: &RestartChange, e: &anyhow::Error) -> String {
+    let changed = format!("{name}'s config changed {}", change.settings.join(", "));
+    match e.downcast_ref::<crate::gateway::ConfigEditRefusal>() {
+        Some(crate::gateway::ConfigEditRefusal::ShuntMissing { binary }) => format!(
+            "{changed}, but {binary} is not there to check it; keeping the running gateway until the check passes",
+            binary = binary.display()
+        ),
+        Some(crate::gateway::ConfigEditRefusal::CheckTimedOut {
+            binary,
+            config,
+            after,
+        }) => format!(
+            "{changed}, but `{binary} check --config {config}` ran past {after:?} and was stopped; keeping the running gateway until the check passes; run that command to see why it does not finish",
+            binary = binary.display(),
+            config = config.display()
+        ),
+        Some(crate::gateway::ConfigEditRefusal::CheckFailed {
+            binary,
+            config,
+            code,
+            ..
+        }) => {
+            let status = match code {
+                Some(code) => format!("exit {code}"),
+                None => "killed by a signal".to_string(),
+            };
+            format!(
+                "{changed}, but `{binary} check --config {config}` refused it ({status}); keeping the running gateway until the check passes; run that command to see why",
+                binary = binary.display(),
+                config = config.display()
+            )
+        }
+        _ => format!(
+            "{changed}, but its check could not run: {e:#}; keeping the running gateway until the check passes"
+        ),
+    }
+}
+
 /// The gateway's `new` constructor, keeping the one-argument call shape the
 /// tests use.
 impl Supervisor<Gateway> {
     #[cfg(test)]
     pub(crate) fn new(handle: GatewayHandle) -> Self {
-        Self::build(Gateway, handle)
+        Self::build(Gateway::for_daemon(), handle)
     }
 }
 
@@ -1722,7 +2451,7 @@ pub(crate) struct ChildMarker {
     pub(crate) stop_deadline_ms: Option<u64>,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 pub(crate) fn write_marker(marker: &ChildMarker) -> Result<()> {
     let path = gateway_marker_path()?;
     write_marker_at(&path, marker)
@@ -1890,7 +2619,7 @@ pub(crate) fn start(
     handle: GatewayHandle,
     _singleton: &DaemonLock,
 ) -> Result<SupervisorThread<Gateway>> {
-    start_kind(Gateway, handle, "clauth-gateway")
+    start_kind(Gateway::for_daemon(), handle, "clauth-gateway")
 }
 
 /// End a supervisor on a shutdown request: stop the child within `deadline`,

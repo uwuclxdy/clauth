@@ -17,6 +17,20 @@ use utoipa::PartialSchema;
 use utoipa::openapi::RefOr;
 use utoipa::openapi::schema::Schema;
 
+#[test]
+fn iso_from_ms_preserves_unsigned_timestamp_range() {
+    for (ms, iso) in [
+        (0, "1970-01-01T00:00:00+00:00"),
+        (999, "1970-01-01T00:00:00+00:00"),
+        (1_000, "1970-01-01T00:00:01+00:00"),
+        (1_789_257_600_999, "2026-09-13T00:00:00+00:00"),
+        (i64::MAX as u64, "292278994-08-17T07:12:55+00:00"),
+        (u64::MAX, "584556019-04-03T14:25:51+00:00"),
+    ] {
+        assert_eq!(iso_from_ms(ms), iso, "ms = {ms}");
+    }
+}
+
 /// The typed body as a `Value`, for the tests that assert published values;
 /// key order and byte shape are pinned by the `*_bytes` tests.
 fn status_value(
@@ -2090,6 +2104,7 @@ fn status_body_never_leaks_a_credential() {
             tier: crate::usage::PlanTier::Pro,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
+            email: None,
         }),
         five_hour: Some(window(utilization, 3)),
         seven_day: Some(window(13.0, 72)),
@@ -2456,6 +2471,7 @@ fn status_schema_agrees_with_the_serialized_body() {
             tier: crate::usage::PlanTier::Pro,
             subscription_status: Some("active".to_string()),
             codex_plan: None,
+            email: None,
         }),
         five_hour: Some(window(42.0, 3)),
         seven_day: Some(window(13.0, 72)),

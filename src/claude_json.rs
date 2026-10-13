@@ -37,14 +37,41 @@ const PER_PROFILE_FIELDS: &[&str] = &[
     "passesEligibilityCache",
     "passesLastSeenRemaining",
     "cachedExtraUsageDisabledReason",
+    // The usage cache stamps `accountUuid` alone, the artifact roster also
+    // stamps `organizationUuid`. Two organizations under one account share an
+    // `accountUuid`, so syncing `cachedUsageUtilization` made every profile
+    // read whichever copy was written last as its own 5h/7d usage.
+    "cachedUsageUtilization",
+    "cachedArtifactRoster",
+    "artifactRosterDenied",
+    // Org-scoped config and feature-flag caches Claude Code keeps beside them.
+    "groveConfigCache",
+    "promoStartupStatusCache",
+    "metricsStatusCacheByPrincipal",
+    "metricsStatusCache",
+    "clientDataCacheSlots",
+    "clientDataCache",
+    "cachedGrowthBookFeatures",
+    "cachedGrowthBookFeaturesAt",
+    "cachedExperimentFeatures",
+    "cachedExperimentData",
     // Account/org-scoped model caches Claude Code writes into `.claude.json`.
     // Syncing them would bleed one account's model access, org default, and
     // per-model cost/option tables into every other account. Each profile
     // re-fetches its own on first boot, so per-profile is lossless.
     "orgModelDefaultCache",
+    "lastSeenOrgDefaultUpdatedAt",
     "modelAccessCache",
     "additionalModelCostsCache",
     "additionalModelOptionsCache",
+    "additionalModelOptionsAnsweredAt",
+    // The rest of what Claude Code clears on OAuth logout (verified on
+    // 2.1.287): the GitHub connection status stamps both uuids, the
+    // auto-compact windows come with the bootstrap's model caches, and a shared
+    // prefetch stamp would make one profile skip its own startup prefetches.
+    "githubWebConnectionStatusCache",
+    "autoCompactWindowsCache",
+    "startupPrefetchedAt",
     // `/login`-managed API key and the per-key approval ledger. `primaryApiKey`
     // is a RAW KEY: Claude Code writes it into this file (verified on 2.1.215 —
     // the same accessor that reads `numStartups` and `oauthAccount`) and reads

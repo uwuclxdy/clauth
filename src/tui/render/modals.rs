@@ -12,7 +12,8 @@ use crate::profile::DivergenceChoice;
 use super::super::app::{
     ActionMenuState, App, ConfirmAction, ConfirmState, DivergenceAction, DivergenceForm,
     DivergenceTargetForm, EnvCollisionChoice, EnvCollisionForm, InputState, LoginMethod,
-    LoginStage, Modal, NamePromptForm, PresetPickerForm, Tab,
+    LoginStage, Modal, NamePromptForm, PresetPickerForm, StatusFocus, Tab, TokenPickerForm,
+    TokenView, token_model_count,
 };
 use super::super::theme;
 use super::chain::reason_marker;
@@ -20,9 +21,10 @@ use super::format::spinner_frame;
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
-    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrolled_lines,
-    head_cols, key_cell, meta_line,
+    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, bold_when, draw_scrollbar,
+    draw_scrolled_lines, follow_scroll_offset, head_cols, key_cell, meta_line,
 };
+use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) {
@@ -33,10 +35,12 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, modal: &Modal) 
         Modal::NamePrompt(form) => draw_name_prompt(frame, area, form),
         Modal::PresetPicker(form) => draw_preset_picker(frame, area, form),
         Modal::DivergenceTarget(form) => draw_divergence_target(frame, area, form),
+        Modal::TokenPicker(form) => draw_token_picker(frame, area, form),
         Modal::Help => draw_help(frame, area, app),
         Modal::ActionMenu(state) => draw_action_menu(frame, area, state),
         Modal::EnvCollision(form) => draw_env_collision(frame, area, form),
         Modal::Login => draw_login_progress(frame, area, app),
+        Modal::CheckOutput(body) => draw_check_output(frame, area, body, app),
     }
 }
 
@@ -111,7 +115,15 @@ fn draw_login_progress(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         lines.pop();
     }
-    draw_modal_scrolled(frame, area, "LOGIN", lines, 0, caret);
+    draw_modal_scrolled(
+        frame,
+        area,
+        "LOGIN",
+        lines,
+        0,
+        None,
+        caret.map(|(row, col)| ModalExtra::Caret(row, col)),
+    );
 }
 
 /// The login modal's code field, in place of the `p  paste code` row: an edit
@@ -150,12 +162,61 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 /// tail. On any terminal wide enough for the content nothing splits and the
 /// modal renders exactly as before.
 fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_>>) {
-    draw_modal_scrolled(frame, area, title, lines, 0, None);
+    let _ = draw_modal_scrolled(frame, area, title, lines, 0, None, None);
+}
+
+/// The focus-following modal's scroll/viewport cells and, for option lists,
+/// the geometry to publish — bundled so [`draw_modal_focused`] stays under the
+/// argument-count lint.
+struct ModalFollow<'a> {
+    saved: &'a std::cell::Cell<usize>,
+    viewport: &'a std::cell::Cell<usize>,
+    geometry: Option<ModalGeometry<'a>>,
+}
+
+fn draw_modal_focused(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    lines: Vec<Line<'_>>,
+    focus: std::ops::Range<usize>,
+    follow: ModalFollow<'_>,
+) {
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        0,
+        Some((focus, follow.saved)),
+        None,
+    );
+    follow.viewport.set(d.viewport as usize);
+    if let Some(g) = follow.geometry {
+        let starts: Vec<usize> = (0..g.count).map(|i| d.line_starts[g.base + i]).collect();
+        let block_ends: Vec<usize> = starts
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                if i + 1 < g.count {
+                    d.line_starts[g.base + i + 1]
+                } else {
+                    d.total
+                }
+            })
+            .collect();
+        g.total.set(d.total);
+        g.starts.replace(starts);
+        g.block_ends.replace(block_ends);
+    }
 }
 
 /// [`draw_modal`] with the content scrolled to start at row `scroll`, returning
-/// the largest offset the content allows so a caller holding the offset in state
-/// can clamp its key handler against it (the render pass owns the viewport).
+/// a [`ModalDraw`] — the largest offset the content allows (so a caller holding
+/// the offset can clamp its key handler), the visible row count the render
+/// actually drew, the chunked start row of each input line, and the total line
+/// count (so a key handler's page step tracks a resize and each wrapped
+/// option's spans).
 /// `caret` names a text field's caret as `(line index, cell offset)` over the
 /// lines as handed in: the native terminal cursor lands on that cell after the
 /// chunking below folded the line into rows, or nowhere when the row scrolled
@@ -168,29 +229,89 @@ fn draw_modal(frame: &mut Frame<'_>, area: Rect, title: &str, lines: Vec<Line<'_
 /// itself — "keep rows `scroll..scroll + viewport` on screen" — which resolves
 /// to exactly `scroll` once clamped. A modal that fits scrolls by 0 and draws
 /// no bar, so it renders as before.
+enum ModalExtra<'a> {
+    Caret(usize, usize),
+    Buttons(Line<'a>),
+}
+
+/// What [`draw_modal_scrolled`] reports back: the scroll bound and viewport,
+/// plus the chunked geometry the page step needs — the start row of each
+/// pre-chunk line and the total chunked line count.
+struct ModalDraw {
+    max_scroll: u16,
+    viewport: u16,
+    line_starts: Vec<usize>,
+    total: usize,
+}
+
+/// The option list a focus-following modal publishes for the page step: the
+/// pre-chunk line index its first option sits on, the option count, and the
+/// cells the chunked starts/ends/total land in.
+struct ModalGeometry<'a> {
+    base: usize,
+    count: usize,
+    starts: &'a std::cell::RefCell<Vec<usize>>,
+    block_ends: &'a std::cell::RefCell<Vec<usize>>,
+    total: &'a std::cell::Cell<usize>,
+}
+
 fn draw_modal_scrolled(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     lines: Vec<Line<'_>>,
     scroll: u16,
-    caret: Option<(usize, usize)>,
-) -> u16 {
+    focus: Option<(std::ops::Range<usize>, &std::cell::Cell<usize>)>,
+    extra: Option<ModalExtra<'_>>,
+) -> ModalDraw {
     let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let w = (content_w + 6)
+    let button_w = match &extra {
+        Some(ModalExtra::Buttons(buttons)) => buttons.width() as u16,
+        _ => 0,
+    };
+    let w = (content_w.max(button_w) + 6)
         .max(title.chars().count() as u16 + 4)
         .min(area.width.saturating_sub(4));
     let inner_w = (w.saturating_sub(6) as usize).max(1);
+    let line_count = lines.len();
     let mut caret_row = None;
+    let mut focus_rows = (0, 0);
+    let mut line_starts: Vec<usize> = Vec::with_capacity(line_count);
     let mut rows: Vec<Line<'static>> = Vec::new();
     for (i, line) in lines.into_iter().enumerate() {
-        if caret.is_some_and(|(at, _)| at == i) {
+        if matches!(extra, Some(ModalExtra::Caret(at, _)) if at == i) {
             caret_row = Some(rows.len());
         }
+        if focus.as_ref().is_some_and(|(range, _)| range.start == i) {
+            focus_rows.0 = rows.len();
+        }
+        if focus.as_ref().is_some_and(|(range, _)| range.end == i) {
+            focus_rows.1 = rows.len();
+        }
+        line_starts.push(rows.len());
         rows.extend(chunk_line(line, inner_w));
     }
+    if focus
+        .as_ref()
+        .is_some_and(|(range, _)| range.end >= line_count)
+    {
+        focus_rows.1 = rows.len();
+    }
     let lines = rows;
-    let h = (lines.len() as u16 + 4).min(area.height.saturating_sub(4));
+    let total = lines.len();
+    // A too-narrow choice (3 spans) stacks into two rows; a narrower one-span
+    // line (an `Acknowledge` confirm's ` ok `) renders as one row — reserve
+    // only what the branch below actually draws.
+    let button_rows = match &extra {
+        Some(ModalExtra::Buttons(buttons))
+            if buttons.width() > inner_w && buttons.spans.len() >= 3 =>
+        {
+            3
+        }
+        Some(ModalExtra::Buttons(_)) => 2,
+        _ => 0,
+    };
+    let h = (lines.len() as u16 + 4 + button_rows).min(area.height.saturating_sub(4));
 
     let rect = centered(area, w, h);
     frame.render_widget(Clear, rect);
@@ -198,7 +319,7 @@ fn draw_modal_scrolled(
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let viewport = inner.height as usize;
+    let viewport = inner.height.saturating_sub(button_rows) as usize;
     // A terminal short enough to leave no inner rows at all draws nothing, and
     // `total - 0` would publish the whole content as a reachable offset.
     let max_scroll = if viewport == 0 {
@@ -206,9 +327,55 @@ fn draw_modal_scrolled(
     } else {
         lines.len().saturating_sub(viewport).min(u16::MAX as usize) as u16
     };
-    let scroll = scroll.min(max_scroll) as usize;
-    draw_scrolled_lines(frame, inner, lines, (scroll, scroll + viewport));
-    if let (Some((_, cell)), Some(row)) = (caret, caret_row) {
+    let scroll = if let Some((_, saved)) = focus {
+        let offset = follow_scroll_offset(lines.len(), viewport, focus_rows, saved.get());
+        saved.set(offset);
+        offset
+    } else {
+        scroll.min(max_scroll) as usize
+    };
+    let body = Rect {
+        height: viewport as u16,
+        ..inner
+    };
+    draw_scrolled_lines(frame, body, lines, (scroll, scroll + viewport), None);
+    if let Some(ModalExtra::Buttons(buttons)) = &extra {
+        let button_area = Rect {
+            y: inner.y + inner.height.saturating_sub(button_rows.saturating_sub(1)),
+            height: button_rows.saturating_sub(1),
+            ..inner
+        };
+        if buttons.width() > inner_w {
+            match &buttons.spans[..] {
+                // No button widget can stack the choice while keeping each
+                // complete on a narrow screen: the cancel/affirmative pair
+                // stacks into two rows.
+                [cancel, _, add] => {
+                    frame.render_widget(
+                        Paragraph::new(Line::from(cancel.clone()).alignment(Alignment::Right)),
+                        Rect {
+                            height: 1,
+                            ..button_area
+                        },
+                    );
+                    frame.render_widget(
+                        Paragraph::new(Line::from(add.clone()).alignment(Alignment::Right)),
+                        Rect {
+                            y: button_area.y + 1,
+                            height: 1,
+                            ..button_area
+                        },
+                    );
+                }
+                // A one-span line (an `Acknowledge` confirm's ` ok `) has no
+                // pair to stack; render it as a plain right-aligned paragraph.
+                _ => frame.render_widget(Paragraph::new(buttons.clone()), button_area),
+            }
+        } else {
+            frame.render_widget(Paragraph::new(buttons.clone()), button_area);
+        }
+    }
+    if let (Some(ModalExtra::Caret(_, cell)), Some(row)) = (extra, caret_row) {
         // A caret right after a row's last cell stays on that row, in the
         // right padding, rather than folding onto a row the chunking never
         // made: a content-sized modal is exactly as wide as its widest line,
@@ -222,7 +389,12 @@ fn draw_modal_scrolled(
             ));
         }
     }
-    max_scroll
+    ModalDraw {
+        max_scroll,
+        viewport: viewport as u16,
+        line_starts,
+        total,
+    }
 }
 
 /// Split one styled line into `w`-column rows by character, preserving span
@@ -322,7 +494,9 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
 
     // Destructive/global ops carry a DANGER cue on their confirm button.
     // `CaptureOverwrite` replaces an existing profile's credentials in
-    // place — irreversible like the other destructive actions here.
+    // place — irreversible like the other destructive actions here. A bind
+    // restart drains in-flight requests and bounces N live sessions' gateway,
+    // the same blast radius `StopShunt` is marked destructive for.
     let destructive = matches!(
         state.on_confirm,
         ConfirmAction::Switch(_)
@@ -333,12 +507,30 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
             | ConfirmAction::AdoptDivergence(..)
             | ConfirmAction::BlankCredentials(_)
             | ConfirmAction::DeleteLiveSession(_)
+            | ConfirmAction::AddAdminTable
+            | ConfirmAction::StopShunt
+            | ConfirmAction::RestartBind { .. }
+            | ConfirmAction::RemoveEntry { .. }
+            | ConfirmAction::RemoveToken { .. }
+            | ConfirmAction::AddToken { .. }
     );
 
     // `AddChainCandidate` names the candidate in its confirm button so the
-    // operator sees the exact add they are agreeing to, not a generic label.
+    // operator sees the exact add they are agreeing to, not a generic label;
+    // the shunt card's actions name their own verb too (adopt / move / add).
     let confirm_label = match &state.on_confirm {
         ConfirmAction::AddChainCandidate(name) => format!("add '{name}'"),
+        ConfirmAction::AdoptConfig(_) => "adopt".to_string(),
+        ConfirmAction::MoveStoresIn(_) => "move".to_string(),
+        ConfirmAction::AddAdminKey | ConfirmAction::AddAdminTable => "add".to_string(),
+        ConfirmAction::StartDaemon => "start".to_string(),
+        ConfirmAction::StopShunt => "stop".to_string(),
+        ConfirmAction::RestartBind { .. } => "restart".to_string(),
+        ConfirmAction::RenameField { .. } => "rename".to_string(),
+        ConfirmAction::RemoveEntry { .. } | ConfirmAction::RemoveToken { .. } => {
+            "remove".to_string()
+        }
+        ConfirmAction::AddToken { .. } => "overwrite".to_string(),
         _ => "confirm".to_string(),
     };
 
@@ -347,25 +539,64 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         theme::body(),
     ))];
     if let Some(detail) = &state.detail {
-        lines.push(Line::from(Span::styled(detail.clone(), theme::dim())));
+        lines.push(Line::from(prose::spans(detail, theme::dim())));
     }
-    lines.push(Line::from(""));
+    // The daemon-start confirm's detail is two lines, which the one-line
+    // `detail` cannot hold.
+    if matches!(state.on_confirm, ConfirmAction::StartDaemon) {
+        lines.push(Line::from(prose::spans(
+            concat!(
+                "spawns the clauth daemon detached: ",
+                cmd_lit!("clauth daemon")
+            ),
+            theme::dim(),
+        )));
+        lines.push(Line::from(Span::styled(
+            "logfile at ~/.clauth/daemon.log.",
+            theme::dim(),
+        )));
+    }
+    // The token-add confirm's third line names only what the overwrite
+    // replaces, `None` when the profile had neither a base url nor a key.
+    if let ConfirmAction::AddToken { replace, .. } = &state.on_confirm
+        && let Some(replace) = replace
+    {
+        lines.push(Line::from(prose::spans(replace, theme::dim())));
+    }
     // An acknowledge-only notice has nothing to cancel — a single focused `ok`.
     let buttons = if matches!(state.on_confirm, ConfirmAction::Acknowledge) {
         Line::from(modal_button(" ok ", true))
     } else {
-        choice_buttons(state.choice, destructive, &confirm_label)
+        choice_buttons(state.choice, destructive, &confirm_label, "   ")
     };
-    lines.push(buttons.alignment(Alignment::Right));
 
-    draw_modal(frame, area, title, lines);
+    // The body scrolls (`↑`/`↓` one line, `PageUp`/`PageDown` one page) while
+    // the buttons stay pinned — the env-collision review screen's shape, so a
+    // short terminal can reach a confirm's detail tail without losing the
+    // decision row.
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        title,
+        lines,
+        state.scroll.offset,
+        None,
+        Some(ModalExtra::Buttons(buttons.alignment(Alignment::Right))),
+    );
+    state.scroll.max_scroll.set(d.max_scroll);
+    state.scroll.viewport.set(d.viewport);
 }
 
-fn choice_buttons(choice: bool, destructive_confirm: bool, confirm_label: &str) -> Line<'static> {
+fn choice_buttons(
+    choice: bool,
+    destructive_confirm: bool,
+    confirm_label: &str,
+    gap: &'static str,
+) -> Line<'static> {
     let label = format!(" {confirm_label} ");
     Line::from(vec![
         modal_button(" cancel ", !choice),
-        Span::raw("   "),
+        Span::raw(gap),
         if destructive_confirm {
             danger_button(&label, choice)
         } else {
@@ -387,7 +618,7 @@ fn modal_button(label: &str, focused: bool) -> Span<'static> {
 
 /// Destructive variant of `modal_button`: DANGER fg unfocused, inverse DANGER block
 /// focused. Same bar-less house style as `modal_button` (no `▐`/`▌`).
-fn danger_button(label: &str, focused: bool) -> Span<'static> {
+pub(super) fn danger_button(label: &str, focused: bool) -> Span<'static> {
     if focused {
         Span::styled(
             label.to_string(),
@@ -430,7 +661,25 @@ fn draw_divergence(frame: &mut Frame<'_>, area: Rect, form: &DivergenceForm) {
         ));
     }
 
-    draw_modal(frame, area, "DIVERGENCE", lines);
+    let first = lines.len() - actions.len();
+    draw_modal_focused(
+        frame,
+        area,
+        "DIVERGENCE",
+        lines,
+        first + cursor..first + cursor + 1,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: first,
+                count: actions.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
 }
 
 fn divergence_action_text(action: &DivergenceAction, active: &str) -> String {
@@ -478,10 +727,96 @@ fn draw_divergence_target(frame: &mut Frame<'_>, area: Rect, form: &DivergenceTa
         lines.push(option_line(cursor == i + 1, format!("overwrite '{name}'")));
     }
 
-    draw_modal(frame, area, "SAVE LOGIN", lines);
+    draw_modal_focused(
+        frame,
+        area,
+        "SAVE LOGIN",
+        lines,
+        cursor + 2..cursor + 3,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: 2,
+                count: form.targets.len() + 1,
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
+}
+
+fn draw_token_picker(frame: &mut Frame<'_>, area: Rect, form: &TokenPickerForm) {
+    let cursor = form.cursor.min(form.targets.len().saturating_sub(1));
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::styled("which profile sends it?", theme::dim())),
+        Line::from(""),
+    ];
+    for (i, (name, has_token)) in form.targets.iter().enumerate() {
+        lines.push(token_picker_row(cursor == i, name, *has_token));
+    }
+
+    draw_modal_focused(
+        frame,
+        area,
+        "ADD TOKEN",
+        lines,
+        cursor + 2..cursor + 3,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: 2,
+                count: form.targets.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
+}
+
+/// One profile row of the token picker: the shared `option_line` shape (the
+/// Divergence/target-picker row), plus a dim `  has a token` suffix for a
+/// profile already holding one.
+fn token_picker_row(selected: bool, name: &str, has_token: bool) -> Line<'static> {
+    let mut line = option_line(selected, name.to_string());
+    if has_token {
+        line.push_span(Span::styled("  has a token", theme::dim()));
+    }
+    line
 }
 
 fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm) {
+    if form.reviewing_overwrite {
+        let (_, consequence) = env_collision_option_text(EnvCollisionChoice::Overwrite, form);
+        let lines = vec![
+            Line::from(Span::styled(
+                format!("add '{}' to '{}' ?", form.key, form.profile),
+                theme::body(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(consequence, theme::dim())),
+        ];
+        // Ratatui has no button-group widget; keep the decision outside the scrolling prose.
+        let d = draw_modal_scrolled(
+            frame,
+            area,
+            "CONFIRM",
+            lines,
+            form.scroll.get().min(u16::MAX as usize) as u16,
+            None,
+            Some(ModalExtra::Buttons(
+                choice_buttons(form.confirm_overwrite, true, "add", " ")
+                    .alignment(Alignment::Right),
+            )),
+        );
+        form.max_scroll.set(d.max_scroll);
+        form.viewport.set(d.viewport as usize);
+        return;
+    }
     let options = EnvCollisionForm::options();
     let cursor = form.cursor.min(options.len() - 1);
 
@@ -518,7 +853,30 @@ fn draw_env_collision(frame: &mut Frame<'_>, area: Rect, form: &EnvCollisionForm
         ]));
     }
 
-    draw_modal(frame, area, "KEY IN USE", lines);
+    let content_w = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+    let width = (content_w + 6)
+        .max("KEY IN USE".len() as u16 + 4)
+        .min(area.width.saturating_sub(4));
+    let inner_w = width.saturating_sub(6).max(1) as usize;
+    let viewport = area.height.saturating_sub(8) as usize;
+    let selected_rows = lines[2..4]
+        .iter()
+        .map(|line| chunk_line(line.clone(), inner_w).len())
+        .sum::<usize>();
+    form.overwrite_needs_review
+        .set(selected_rows > viewport && cursor == 0);
+    draw_modal_focused(
+        frame,
+        area,
+        "KEY IN USE",
+        lines,
+        2 + cursor * 2..4 + cursor * 2,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: None,
+        },
+    );
 }
 
 fn env_collision_option_text(
@@ -624,23 +982,37 @@ fn draw_preset_picker(frame: &mut Frame<'_>, area: Rect, form: &PresetPickerForm
     }
     // `d` reaches nothing else from here, so the picker has to teach it.
     lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "d deletes a saved preset",
+    lines.push(Line::from(prose::spans(
+        concat!(key_lit!("d"), " deletes a saved preset"),
         theme::dim(),
     )));
 
-    draw_modal(frame, area, "PRESET", lines);
+    draw_modal_focused(
+        frame,
+        area,
+        "PRESET",
+        lines,
+        2 + cursor..3 + cursor,
+        ModalFollow {
+            saved: &form.scroll,
+            viewport: &form.viewport,
+            geometry: Some(ModalGeometry {
+                base: 2,
+                count: form.presets.len(),
+                starts: &form.starts,
+                block_ends: &form.block_ends,
+                total: &form.total,
+            }),
+        },
+    );
 }
 
 /// Per-tab rows for the KEYS help modal, beneath the shared `tabs`/`global`
 /// sections. A standalone builder (not inlined into `draw_help`) so tests can
 /// enumerate every tab's real content without rendering a frame — see
 /// `every_sub_focus_tab_documents_esc_in_help`.
-fn tab_specific_rows(
-    tab: Tab,
-    has_accounts: bool,
-) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
-    match tab {
+fn tab_specific_rows(app: &App) -> Vec<(&'static str, &'static [(&'static str, &'static str)])> {
+    match app.tab {
         Tab::Overview => vec![(
             "accounts",
             &[
@@ -652,10 +1024,23 @@ fn tab_specific_rows(
         // `n` is the note editor only while an account exists to hold one; on
         // an empty roster the global `n new account` row must survive the
         // shadow filter below, matching the empty state's `n to create one`.
-        Tab::Usage if has_accounts => vec![(
+        Tab::Usage if app.usage_detail_focus == StatusFocus::Detail => vec![(
+            "usage",
+            &[
+                ("\u{2191} \u{2193}", "scroll account detail"),
+                ("esc", "return to account selector"),
+                ("\u{2190}", "return to account selector"),
+                ("r", "refresh account"),
+                ("n", "edit the account's note"),
+                ("e", "toggle estimates"),
+                ("p", "toggle pace marker"),
+            ][..],
+        )],
+        Tab::Usage if app.profile_count() > 0 => vec![(
             "usage",
             &[
                 ("\u{2191} \u{2193}", "pick account to inspect"),
+                ("\u{21b5}", "open account detail"),
                 ("r", "refresh account"),
                 ("n", "edit the account's note"),
                 ("e", "toggle estimates"),
@@ -670,18 +1055,74 @@ fn tab_specific_rows(
                 ("p", "toggle pace marker"),
             ][..],
         )],
-        Tab::Tokens => vec![(
+        Tab::Tokens if app.token_view == TokenView::Dashboard && token_model_count(app) == 0 => {
+            vec![(
+                "tokens",
+                &[
+                    ("\u{2191} \u{2193}", "move between cards"),
+                    ("page up / page down", "move a page of cards"),
+                    ("c", "count cache in token figures"),
+                    (
+                        "t",
+                        "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                    ),
+                    ("r", "reload on-disk stats"),
+                ][..],
+            )]
+        }
+        Tab::Tokens if app.token_view == TokenView::Dashboard => vec![(
             "tokens",
             &[
+                ("\u{2191} \u{2193}", "move between cards"),
+                ("page up / page down", "move a page of cards"),
                 ("\u{21b5}", "open per-model breakdown"),
-                ("\u{2191} \u{2193}", "pick model (in breakdown)"),
                 ("c", "count cache in token figures"),
                 (
                     "t",
                     "cycle period \u{b7} lifetime / daily / weekly / monthly",
                 ),
                 ("r", "reload on-disk stats"),
+            ][..],
+        )],
+        Tab::Tokens if app.model_detail_focus == StatusFocus::Detail => vec![(
+            "tokens",
+            &[
+                ("\u{2191} \u{2193}", "scroll model detail"),
+                ("esc", "return to model selector"),
+                ("\u{2190}", "return to model selector"),
+                ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
+                ("r", "reload on-disk stats"),
+            ][..],
+        )],
+        Tab::Tokens if token_model_count(app) == 0 => vec![(
+            "tokens",
+            &[
+                ("\u{2191} \u{2193}", "pick model"),
                 ("esc", "back to dashboard"),
+                ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
+                ("r", "reload on-disk stats"),
+            ][..],
+        )],
+        Tab::Tokens => vec![(
+            "tokens",
+            &[
+                ("\u{2191} \u{2193}", "pick model"),
+                ("\u{21b5}", "open model detail"),
+                ("esc", "back to dashboard"),
+                ("c", "count cache in token figures"),
+                (
+                    "t",
+                    "cycle period \u{b7} lifetime / daily / weekly / monthly",
+                ),
+                ("r", "reload on-disk stats"),
             ][..],
         )],
         Tab::Setup => vec![(
@@ -689,18 +1130,31 @@ fn tab_specific_rows(
             &[
                 ("\u{2191} \u{2193}", "pick account / + new, then a row"),
                 ("\u{21b5}", "open settings · edit field · flip toggle"),
-                ("\u{21b5} on a field", "edit inline; \u{21b5} again saves"),
+                (
+                    "\u{21b5} on a field",
+                    concat!("edit inline; ", key_lit!("\u{21b5}"), " again saves"),
+                ),
                 ("space", "cycle the model preset (model row)"),
-                ("env", "+ add env · \u{21b5} edits a value"),
+                ("+ / -", "step alert at by 5"),
+                (
+                    "env",
+                    concat!("+ add env · ", key_lit!("\u{21b5}"), " edits a value"),
+                ),
                 (
                     "a",
                     "duplicate the account \u{b7} save it as a preset \u{b7} apply one",
                 ),
                 (
                     "disable / enable",
-                    "\u{21b5} arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+                    concat!(
+                        key_lit!("\u{21b5}"),
+                        " arms disable, again confirms \u{b7} enable is one press \u{b7} inert while active or a live session is open",
+                    ),
                 ),
-                ("delete", "\u{21b5} once to arm, again to confirm"),
+                (
+                    "delete",
+                    concat!(key_lit!("\u{21b5}"), " once to arm, again to confirm"),
+                ),
                 ("esc", "stop editing / back to account list"),
             ][..],
         )],
@@ -711,7 +1165,11 @@ fn tab_specific_rows(
                 ("space", "cycle the focused setting"),
                 (
                     "\u{21b5}",
-                    "same as space · type a value on refresh or weekly limit",
+                    concat!(
+                        "same as ",
+                        key_lit!("space"),
+                        " · type a value on refresh or weekly limit",
+                    ),
                 ),
             ][..],
         )],
@@ -729,12 +1187,16 @@ fn tab_specific_rows(
             &[
                 (
                     "\u{2191} \u{2193}",
-                    "pick row · scroll detail · walk plugin problems · walk herdr options",
+                    "pick row · scroll shunt detail · walk plugin problems · walk herdr fix + options · walk delegates",
                 ),
-                ("\u{21b5}", "open detail · activate an option"),
+                (
+                    "page up / page down",
+                    "scroll a page · read plugin / herdr diagnostics · page delegates",
+                ),
+                ("\u{21b5}", "open detail · activate · open fix"),
                 ("space", "activate the focused herdr option"),
                 ("+ / -", "step the tag refresh"),
-                ("f", "apply the focused fix"),
+                ("f", "next fix"),
                 ("r", "re-run all checks"),
                 ("esc", "back to the list · close the editor"),
             ][..],
@@ -749,7 +1211,10 @@ fn tab_specific_rows(
                     "open \u{00b7} edit threshold \u{00b7} edit weekly at \u{00b7} edit max spend \u{00b7} toggle gates / last resort \u{00b7} remove \u{00b7} add",
                 ),
                 ("+ / -", "step rotate at / weekly at by 5"),
-                ("\u{21b5} on rotate at", "type a value, \u{21b5} saves"),
+                (
+                    "\u{21b5} on rotate at",
+                    concat!("type a value, ", key_lit!("\u{21b5}"), " saves"),
+                ),
                 ("\u{21b5} on weekly at", "type a %, empty clears"),
                 (
                     "space on preferred days",
@@ -757,7 +1222,17 @@ fn tab_specific_rows(
                 ),
                 (
                     "\u{21b5} on preferred days",
-                    "pick days: \u{2190} \u{2192} walk \u{00b7} space toggles and saves \u{00b7} \u{21b5} esc q leave \u{00b7} \u{2191} \u{2193} leave and move",
+                    concat!(
+                        "pick days: ",
+                        key_lit!("\u{2190} \u{2192}"),
+                        " walk \u{00b7} ",
+                        key_lit!("space"),
+                        " toggles and saves \u{00b7} ",
+                        key_lit!("\u{21b5} esc q"),
+                        " leave \u{00b7} ",
+                        key_lit!("\u{2191} \u{2193}"),
+                        " leave and move",
+                    ),
                 ),
                 ("esc", "back / cancel edit"),
             ][..],
@@ -765,15 +1240,62 @@ fn tab_specific_rows(
     }
 }
 
+/// The shunt card's `check output` modal: the masked failed-check stderr,
+/// read-only, ↑↓ scrolling like the help modal. The body is already masked,
+/// ANSI-stripped and control-escaped per line at open; its `\n` joins are the
+/// real line structure, split here into rows that `draw_modal_scrolled` wraps
+/// and scrolls.
+fn draw_check_output(frame: &mut Frame<'_>, area: Rect, body: &str, app: &App) {
+    let lines: Vec<Line<'_>> = body
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), theme::body())))
+        .collect();
+    let lines = if lines.is_empty() {
+        vec![Line::from("")]
+    } else {
+        lines
+    };
+    let d = draw_modal_scrolled(
+        frame,
+        area,
+        "check output",
+        lines,
+        app.check_output_scroll,
+        None,
+        None,
+    );
+    app.check_output_max_scroll.set(d.max_scroll);
+    app.check_output_viewport.set(d.viewport);
+}
+
 fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let title = "KEYS";
 
-    let tab_specific = tab_specific_rows(app.tab, app.profile_count() > 0);
+    let tab_specific = tab_specific_rows(app);
 
-    let nav: &[(&str, &str)] = &[(
-        "\u{2190} \u{2192} \u{00b7} tab",
-        "previous / next tab (shift tab: previous)",
-    )];
+    // In a descended read-only pane, arrows do not switch tabs; Tab/BackTab still do.
+    let nav: &[(&str, &str)] = if (app.tab == Tab::Usage
+        && app.usage_detail_focus == StatusFocus::Detail)
+        || (app.tab == Tab::Tokens
+            && app.token_view == TokenView::Models
+            && app.model_detail_focus == StatusFocus::Detail)
+    {
+        &[
+            ("\u{2190}", "return to selector"),
+            ("\u{2192}", "stays on detail"),
+            ("tab", "next tab"),
+            ("shift tab", "previous tab"),
+        ]
+    } else {
+        &[(
+            "\u{2190} \u{2192} \u{00b7} tab",
+            concat!(
+                "previous / next tab (",
+                key_lit!("shift tab"),
+                ": previous)"
+            ),
+        )]
+    };
 
     // The modal's own keys, in their own section. Not folded into `global`
     // below: every tab binds ↑↓ for its own list, so the shadow filter there
@@ -798,6 +1320,7 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ("x", "dismiss toast / alert"),
         ("q", "back / quit"),
         ("esc", "back within a sub-view (no-op at the top level)"),
+        ("page up / page down", "scroll a page"),
         ("\u{2303}c", "quit from anywhere"),
     ];
     // A key the current tab redefines is documented in its own section above;
@@ -824,20 +1347,15 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // terminal too short for the whole modal. ↑↓ reaches the legend from there.
     lines.extend(glyph_section("glyphs", glyph_rows()));
     lines.pop(); // trim trailing blank from last section
-    app.help_max_scroll.set(draw_modal_scrolled(
-        frame,
-        area,
-        title,
-        lines,
-        app.help_scroll,
-        None,
-    ));
+    let d = draw_modal_scrolled(frame, area, title, lines, app.help_scroll, None, None);
+    app.help_max_scroll.set(d.max_scroll);
+    app.help_viewport.set(d.viewport);
 }
 
 /// Legend for the 1-cell marks the account surfaces carry, with no key of their
 /// own to document them: the Overview row's leading `●` and `⇄`, the Overview
-/// chain's projected-switch `↲`, and every blocked-reason marker on the
-/// Fallback chain.
+/// chain's projected-switch `↲`, every blocked-reason marker on the Fallback
+/// chain, and the Services selector's trailing `f`.
 ///
 /// Each blocked-reason row takes its glyph AND its hue from [`reason_marker`]
 /// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
@@ -882,6 +1400,7 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
         ),
         reason(BlockedReason::WeeklySoft { pct: 0.0 }, DIAG_WEEKLY_SOFT),
         reason(BlockedReason::Stale, DIAG_STALE),
+        (super::services::fix_mark(), "has a fix"),
     ]
 }
 
@@ -915,13 +1434,12 @@ const HELP_KEY_W: usize = 18;
 const HELP_KEY_GUTTER: usize = 2;
 
 fn help_row(key: &str, desc: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("  {}", key_cell(key, HELP_KEY_W, HELP_KEY_GUTTER)),
-            Style::default().fg(theme::accent_color()).bold(),
-        ),
-        Span::styled(desc.to_string(), Style::default().fg(theme::text_color())),
-    ])
+    let mut spans = vec![Span::styled(
+        format!("  {}", key_cell(key, HELP_KEY_W, HELP_KEY_GUTTER)),
+        Style::default().fg(theme::accent_color()).bold(),
+    )];
+    spans.extend(prose::spans(desc, Style::default().fg(theme::text_color())));
+    Line::from(spans)
 }
 
 /// A legend row, aligned to the same description column the key rows open at.
@@ -949,7 +1467,7 @@ fn labelled_input(label: &str, input: &InputState, focused: bool) -> Line<'stati
     };
     labelled_line(
         label,
-        Span::styled(input.value.clone(), value_style),
+        Span::styled(crate::tui::app::escape_control(&input.value), value_style),
         focused,
     )
 }
@@ -1012,9 +1530,28 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
+    let inner_w = inner.width;
+    let total = state.items.len() + usize::from(rule_at.is_some());
+    let viewport = inner.height as usize;
+    state.viewport.set(viewport);
+    state.total.set(total);
+    // The rule line sits between the groups, so a cursor row below it renders
+    // one line further down — the same geometry the page step needs.
+    let starts: Vec<usize> = (0..state.items.len())
+        .map(|i| i + usize::from(rule_at.is_some_and(|at| i >= at as usize)))
+        .collect();
+    let block_ends: Vec<usize> = starts.iter().map(|s| s + 1).collect();
+    state.starts.replace(starts);
+    state.block_ends.replace(block_ends);
+    let selected = state.cursor.min(state.items.len().saturating_sub(1));
+    let focus = selected + usize::from(rule_at.is_some_and(|at| selected >= at as usize));
+    let offset = follow_scroll_offset(total, viewport, (focus, focus + 1), state.scroll.get());
+    state.scroll.set(offset);
+    draw_scrollbar(frame, inner, total, offset, viewport);
     if let Some(at) = rule_at {
-        let y = inner.y + at;
-        if y < inner.y + inner.height {
+        let y = (at as usize).saturating_sub(offset);
+        if (at as usize) >= offset && y < viewport {
+            let y = inner.y + y as u16;
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     "─".repeat(inner.width as usize),
@@ -1030,15 +1567,15 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         }
     }
 
-    let inner_w = inner.width;
     for (i, item) in state.items.iter().enumerate() {
         let focused = i == state.cursor;
         // Rows below the rule sit one further down; the cursor never lands on
         // it, so `items` stays the only index anything else needs.
-        let y = inner.y + i as u16 + u16::from(rule_at.is_some_and(|at| i as u16 >= at));
-        if y >= inner.y + inner.height {
-            break;
+        let row = i + usize::from(rule_at.is_some_and(|at| i >= at as usize));
+        if row < offset || row >= offset + viewport {
+            continue;
         }
+        let y = inner.y + (row - offset) as u16;
         let row_area = Rect {
             y,
             height: 1,
@@ -1056,22 +1593,23 @@ fn draw_action_menu(frame: &mut Frame<'_>, area: Rect, state: &ActionMenuState) 
         } else {
             Span::styled("  ", Style::default())
         };
-        let label_len = item.label.chars().count() as u16;
+        let hotkey_width = usize::from(inner_w >= GUTTER + HOTKEY_W + 3);
+        let label_width = (inner_w as usize).saturating_sub(GUTTER as usize + 3 + hotkey_width);
+        let label = crate::format::truncate(item.label, label_width);
+        let label_len = label.chars().count() as u16;
         let pad = inner_w
             .saturating_sub(GUTTER)
             .saturating_sub(label_len)
-            .saturating_sub(HOTKEY_W);
+            .saturating_sub(hotkey_width as u16);
         let padding = Span::styled(" ".repeat(pad as usize), Style::default());
-        let hotkey_span = match item.hotkey {
-            Some(c) => Span::styled(c.to_string(), Style::default().fg(theme::text_dim_color())),
-            None => Span::styled(
-                " ".to_string(),
-                Style::default().fg(theme::text_dim_color()),
-            ),
-        };
+        let hotkey_span = Span::styled(
+            if hotkey_width == 0 { None } else { item.hotkey }
+                .map_or_else(String::new, |c| c.to_string()),
+            Style::default().fg(theme::text_dim_color()),
+        );
         let line = Line::from(vec![
             glyph,
-            Span::styled(item.label.to_string(), label_style),
+            Span::styled(label, label_style),
             padding,
             hotkey_span,
         ])

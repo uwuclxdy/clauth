@@ -336,6 +336,7 @@ fn a_body_with_no_window_is_never_stale() {
             tier: PlanTier::Free,
             subscription_status: None,
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     };
@@ -512,6 +513,7 @@ fn tier_label_reports_the_tier_of_a_canceled_account() {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     };
@@ -539,6 +541,7 @@ fn tier_label_never_substitutes_canceled_for_a_paid_tier() {
             tier: PlanTier::Max(Some(20)),
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     };
@@ -563,6 +566,7 @@ fn tier_label_reports_the_real_tier_when_not_canceled() {
             tier: PlanTier::Max(Some(5)),
             subscription_status: None,
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     };
@@ -596,6 +600,7 @@ fn tier_label_is_none_for_a_converted_profile() {
             tier: PlanTier::Max(Some(5)),
             subscription_status: None,
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     };

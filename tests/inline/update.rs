@@ -309,3 +309,34 @@ fn pinned_public_key_parses_when_set() {
         PublicKey::from_base64(key).expect("pinned MINISIGN_PUBLIC_KEY must be a valid key");
     }
 }
+
+// ── is_newer ───────────────────────────────────────────────────────────────
+
+/// `MAJOR.MINOR.PATCH` compares as numbers: `0.9.0` sorts after `0.17.0` as
+/// text and `0.100.0` before it, so a text comparison flips both. A leading
+/// `v` is a tag prefix; an unparseable side is never newer.
+#[test]
+fn is_newer_compares_versions_as_numbers() {
+    let cases = [
+        ("0.17.0", "0.9.0", true, "a newer minor with more digits"),
+        ("0.9.0", "0.17.0", false, "an older minor with fewer digits"),
+        (
+            "0.100.0",
+            "0.17.0",
+            true,
+            "a newer minor that sorts first as text",
+        ),
+        ("0.17.1", "0.17.0", true, "a newer patch"),
+        ("0.17.0", "0.17.0", false, "the same version"),
+        ("v0.18.0", "0.17.0", true, "a tag's leading v"),
+        ("dev", "0.17.0", false, "an unparseable tag"),
+        ("0.17.0", "dev", false, "an unparseable current version"),
+    ];
+    for (tag, current, expected, case) in cases {
+        assert_eq!(
+            is_newer(tag, current),
+            expected,
+            "{case}: is_newer({tag:?}, {current:?})"
+        );
+    }
+}

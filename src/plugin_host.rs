@@ -1,5 +1,5 @@
 //! The agentgear [`PluginHost`] derive plus the four lifecycle wrappers clauth
-//! calls: the Services tab's one-key install, the SessionStart self-heal hook, the
+//! calls: the Services tab's install fix, the SessionStart self-heal hook, the
 //! `clauth start` pre-flight, and the throttled detached heal `clauth mcp` and
 //! the daemon share. The hook cannot be the migration trigger — a marketplace
 //! that fails to load means the plugin never loads, so the hook never fires —
@@ -37,7 +37,7 @@ use agentgear::{Outcome, PluginHost, Scope, Source};
 #[plugin(name = "clauth", tree = "$CARGO_MANIFEST_DIR/plugins")]
 pub(crate) struct ClauthPlugin;
 
-/// The Services tab's one-key install: a user-scope install from the embedded
+/// The Services tab's install fix: a user-scope install from the embedded
 /// tree. The single spelling site — the tab's confirm handler and its pin test
 /// both go through here, so `Scope::User` + `Source::Embedded` live in one
 /// place and the copy-paste hint they replace has no other home to drift into.

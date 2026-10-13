@@ -9,12 +9,14 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{
     App, ConfigFocus, ConfigRow, FallbackHint, FooterAlert, GLOBAL_CONFIG_ROWS, GlobalConfigRow,
-    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServicesFocus, StatusFocus, Tab,
-    TokenView, build_action_menu, config_rows, fallback_hint, fix_verb, has_sub_focus,
-    herdr_config_writable, keyboard_owner,
+    HERDR_OPTIONS, HerdrOption, KeyOwner, LoginSession, Modal, ServiceFix, ServicesFocus,
+    ShuntFieldEdit, ShuntFieldKey, ShuntFocus, ShuntSaveKey, StatusFocus, Tab, TokenView,
+    build_action_menu, config_rows, fallback_hint, field_locked, fix_verb, has_sub_focus,
+    herdr_config_writable, is_cycle_field, keyboard_owner, token_model_count,
 };
 use super::super::theme;
 use super::format::spinner_frame;
+use super::prose;
 
 const TAB_NAV: (&str, &str) = ("←→", "tabs");
 
@@ -22,6 +24,26 @@ const TAB_NAV: (&str, &str) = ("←→", "tabs");
 /// puts the field back to its saved value, and says so in the field's own
 /// terms, since beside a login in flight a bare `cancel` reads as the login's.
 const TYPED_FIELD: &[(&str, &str)] = &[("↵", "save"), ("←→", "caret"), ("esc", "revert")];
+
+/// A shunt cycle row's pending pick: no caret to walk, so it sheds `←→ caret`.
+const SHUNT_PICK: &[(&str, &str)] = &[("↵", "save"), ("esc", "revert")];
+
+/// A draft field's typed editor: nothing saves until the form's own
+/// `save <kind>` row, so `↵` reads `done` (the Setup `+ new` form's word); its
+/// `esc` restores the draft value (unlike that form's `esc done`), so it keeps
+/// `esc revert`.
+const DRAFT_FIELD: &[(&str, &str)] = &[("↵", "done"), ("←→", "caret"), ("esc", "revert")];
+
+/// A draft cycle row's pending pick: the `done` word, no caret to walk.
+const DRAFT_PICK: &[(&str, &str)] = &[("↵", "done"), ("esc", "revert")];
+
+/// A field editor whose row is saving is locked: only the editing keys (`esc`,
+/// typing, `↵`, `space`) are inert, so the footer names the non-edit keys that
+/// still act — `↑↓` moves off the row and `q` backs out (closing the editor) —
+/// and drops every edit hint. `?` and `x` fall through the owner, so `? help`
+/// is derived from what the owner claims and `x` (dismiss a toast) keeps its
+/// app-wide no-bar-hint convention.
+const LOCKED: &[(&str, &str)] = &[("↑↓", "row"), ("q", "back")];
 
 /// The `+ new` form's typed field: ⏎ and esc both end the edit and keep the
 /// typed value; nothing saves until the form's own `create account` row.
@@ -51,7 +73,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         // collapses, others handle their own keys), so the hint flips to
         // `q back` for the whole stack; the login modal's open code field is
         // the exception, where `q` is data and ↵ submits.
-        let keys = match owner.and_then(owner_hints) {
+        let keys = match owner.and_then(|o| owner_hints(o, app)) {
             Some(hints) => LoginKeys::Owner(hints),
             None => match app.modals.last() {
                 Some(Modal::Login) if session.paste_field.is_some() => LoginKeys::Paste,
@@ -73,10 +95,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // the whole row: `q` only where the editor itself binds it, `? help` only
     // where it lets `?` through. Every owner takes the arrows, so `←→ tabs`
     // rides only while nothing owns the keyboard.
-    let mut hints: Vec<(&str, &str)> = match owner.zip(owner.and_then(owner_hints)) {
+    let mut hints: Vec<(&str, &str)> = match owner.zip(owner.and_then(|o| owner_hints(o, app))) {
         Some((owner, own)) => {
             let mut hints = own.to_vec();
-            if !owner.claims(KeyCode::Char('?')) {
+            if !owner.claims(app, KeyCode::Char('?')) {
                 let at = hints
                     .iter()
                     .position(|(key, _)| *key == "q")
@@ -87,14 +109,25 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         None => owner
             .is_none()
-            .then_some(TAB_NAV)
+            .then_some(
+                if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+                    || (app.tab == Tab::Tokens
+                        && app.token_view == TokenView::Models
+                        && app.model_detail_focus == StatusFocus::Detail)
+                {
+                    ("←", "back")
+                } else {
+                    TAB_NAV
+                },
+            )
             .into_iter()
             .chain(tab_hints(app))
             .collect(),
     };
 
     // `a` opens nothing where the menu is empty: a tab with no action of its
-    // own while a daemon start or stop is in flight. Reading the real menu
+    // own while a daemon start or stop is in flight and no shunt verb
+    // applies. Reading the real menu
     // keeps the hint honest per row instead of leaving each arm's literal to
     // drift.
     if build_action_menu(app).items.is_empty() {
@@ -125,7 +158,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// bar the `? help` that [`draw`] derives from what the owner claims. `None`
 /// for the modal stack, which has no hint set of its own: the screen's hints
 /// stay under it.
-fn owner_hints(owner: KeyOwner) -> Option<&'static [(&'static str, &'static str)]> {
+fn owner_hints(owner: KeyOwner, app: &App) -> Option<&'static [(&'static str, &'static str)]> {
     match owner {
         KeyOwner::Modal => None,
         KeyOwner::SetupField
@@ -136,6 +169,23 @@ fn owner_hints(owner: KeyOwner) -> Option<&'static [(&'static str, &'static str)
         | KeyOwner::HerdrTag => Some(TYPED_FIELD),
         KeyOwner::NewAccountField => Some(NEW_ACCOUNT_FIELD),
         KeyOwner::NoteEditor => Some(NOTE_EDITOR_FIELD),
+        // The shunt field editor reuses the typed field's grammar; a pending
+        // cycle pick has no caret to walk, so it sheds `←→ caret`. While the
+        // row's save checks, its editor is locked: the edit keys are inert
+        // (no `esc revert` / `↵ save`), `↑↓` still moves off the row and `q`
+        // ascends, and the outcome surfaces as a toast or the `└` line.
+        KeyOwner::ShuntField => match app.services.shunt_field_edit.as_ref() {
+            Some(state) if field_locked(app, &state.key) => Some(LOCKED),
+            Some(state) if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => {
+                if matches!(state.key, ShuntFieldKey::Draft { .. }) {
+                    Some(DRAFT_PICK)
+                } else {
+                    Some(SHUNT_PICK)
+                }
+            }
+            Some(state) if matches!(state.key, ShuntFieldKey::Draft { .. }) => Some(DRAFT_FIELD),
+            _ => Some(TYPED_FIELD),
+        },
         // `←→` walk the chips and each space saves, so nothing reads as a
         // commit; `q` leaves the picker. ⏎ leaves it too, so it takes no group
         // of its own beside `q back`: three screen-specific groups at most.
@@ -173,8 +223,16 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         // The hint derives from the key's behavior on this frame: with no
         // accounts, `n` still starts a new account (the empty state's promise)
         // and the note editor does not exist yet.
+        Tab::Usage if app.usage_detail_focus == StatusFocus::Detail => &[
+            ("↑↓", "scroll"),
+            ("r", "refresh account"),
+            ("n", "note"),
+            ("a", "actions"),
+            ("?", "help"),
+        ],
         Tab::Usage if app.profile_count() > 0 => &[
             ("↑↓", "account"),
+            ("↵", "detail"),
             ("r", "refresh account"),
             ("n", "note"),
             ("a", "actions"),
@@ -182,6 +240,13 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         ],
         Tab::Usage => &[("↑↓", "account"), ("a", "actions"), ("?", "help")],
         Tab::Tokens => match app.token_view {
+            TokenView::Dashboard if token_model_count(app) == 0 => &[
+                ("r", "reload"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
             TokenView::Dashboard => &[
                 ("↵", "models"),
                 ("r", "reload"),
@@ -190,8 +255,23 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("a", "actions"),
                 ("?", "help"),
             ],
+            TokenView::Models if app.model_detail_focus == StatusFocus::Detail => &[
+                ("↑↓", "scroll"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
+            TokenView::Models if token_model_count(app) == 0 => &[
+                ("↑↓", "model"),
+                ("c", "count cache"),
+                ("t", "period"),
+                ("a", "actions"),
+                ("?", "help"),
+            ],
             TokenView::Models => &[
                 ("↑↓", "model"),
+                ("↵", "detail"),
                 ("c", "count cache"),
                 ("t", "period"),
                 ("a", "actions"),
@@ -207,13 +287,21 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("?", "help"),
             ],
             ConfigFocus::Actions => {
-                // Row-aware: the `model` row cycles on space; env rows edit a value
-                // or open the add-env key editor.
+                // Row-aware: the `model` row cycles on space; `alert at` steps on
+                // `+`/`-`; env rows edit a value or open the add-env key editor.
                 match config_rows(app).get(app.config_action_cursor) {
                     Some(ConfigRow::Model) => &[
                         ("↑↓", "row"),
                         ("space", "cycle"),
                         ("↵", "custom"),
+                        ("a", "actions"),
+                        ("?", "help"),
+                    ],
+                    Some(ConfigRow::BellThreshold) => &[
+                        ("↑↓", "row"),
+                        ("+", "raise"),
+                        ("-", "lower"),
+                        ("↵", "type"),
                         ("a", "actions"),
                         ("?", "help"),
                     ],
@@ -396,25 +484,22 @@ fn shed_to_width(hints: &mut Vec<(&str, &str)>, width: usize) {
     }
 }
 
-/// Services tab hints. `f` only fixes a row (or, on the plugin detail, a
-/// problem) that actually offers one — never advertised where pressing it is a
-/// no-op, and its label is the fix's verb. `pub(super)` so the Services render
-/// tests pin each focus state's whole hint list by equality.
+/// Services tab hints under the fix grammar: `↵ <verb>` on a focused fix line
+/// (dropped while an in-flight shunt action gates it), `f next fix` only while
+/// the press would move focus to a fix line. `pub(super)` so the Services
+/// render tests pin each focus state's whole hint list by equality.
 pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.services.focus {
         ServicesFocus::List => {
             let mut hints = vec![("↑↓", "row")];
-            // The delegates detail binds no key, so ⏎ does not descend into it.
-            if !app
-                .services
-                .selected_check()
-                .is_some_and(|c| c.label == "delegates")
-            {
+            // `↵` descends only where the handler descends (a job-less
+            // delegates row advertises no inert `↵`) — one shared predicate.
+            if app.services.enter_descends() {
                 hints.push(("↵", "detail"));
             }
             hints.push(("r", "refresh"));
-            if let Some(fix) = app.services.focused_fix() {
-                hints.push(("f", fix_verb(fix)));
+            if app.services.f_moves() {
+                hints.push(NEXT_FIX);
             }
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
@@ -423,12 +508,143 @@ pub(super) fn services_hints(app: &App) -> Vec<(&'static str, &'static str)> {
     }
 }
 
+/// The `f` hint under the fix grammar: the key walks, it never applies.
+const NEXT_FIX: (&str, &str) = ("f", "next fix");
+
+/// True for the four fixes an in-flight shunt action gates (a second shunt
+/// press starts nothing); the plugin and herdr fixes keep working, so their
+/// `↵` hint stays while a shunt action runs.
+fn shunt_fix(fix: &ServiceFix) -> bool {
+    matches!(
+        fix,
+        ServiceFix::AdoptConfig(_)
+            | ServiceFix::MoveStoresIn
+            | ServiceFix::AddAdminKey
+            | ServiceFix::AddAdminTable
+    )
+}
+
 /// Services detail hints, row-aware: the herdr options rows name their own
 /// keys, the plugin detail walks its fixable problems, every other detail
 /// scrolls.
 fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
-    let verb = app.services.focused_fix().map(fix_verb);
+    let verb = app
+        .services
+        .focused_fix()
+        .filter(|fix| !(app.services.shunt_action.running && shunt_fix(fix)))
+        .map(fix_verb);
+    let next_fix = app.services.f_moves().then_some(NEXT_FIX);
     let label = app.services.selected_check().map(|c| c.label);
+
+    // The delegates detail walks its job list while descended. Every group
+    // derives from the same count the handler steps over: ↑↓ and page keys
+    // move the selection only with ≥2 jobs, so a press that cannot move
+    // anything advertises nothing.
+    if label == Some("delegates") {
+        let mut hints = Vec::new();
+        if app.services.delegates_selection_moves() {
+            hints.push(("↑↓", "row"));
+            hints.push(("page up/down", "read"));
+        }
+        hints.extend([("r", "refresh"), ("a", "actions"), ("?", "help")]);
+        return hints;
+    }
+
+    // The shunt detail walks its actionable lines one at a time: `↑↓ row`
+    // while a press would move focus (there are ≥2 stops), `↑↓ scroll` while
+    // a press would only scroll the read-only text, and no `↑↓` at all when
+    // neither applies (a fitting one-stop card, audit N4). `space/↵` act only
+    // on the focused line, and drop while an action runs or nothing holds
+    // focus; `f next fix` stays while the walk can move — derived from the
+    // same gates the handlers read, never copied per branch.
+    if label == Some("shunt") {
+        let focus = app.services.focused_shunt_focus();
+        let stops = app
+            .services
+            .selected_check()
+            .map(|c| c.shunt_focus.len())
+            .unwrap_or(0);
+        let scroll = app
+            .services
+            .detail_scroll
+            .min(app.services.detail_max_scroll.get());
+        let mut hints = Vec::new();
+        if stops > 1 {
+            hints.push(("↑↓", "row"));
+        } else if scroll > 0 || scroll < app.services.detail_max_scroll.get() {
+            hints.push(("↑↓", "scroll"));
+        }
+        hints.push(("r", "refresh"));
+        // Each hint derives from the same predicate its handler acts on: a fix
+        // line's `↵` and the `enabled` toggle read `shunt_action.running` and
+        // drop with it; a field row's edit hints read `saving(&key)` and drop
+        // while its save checks (the row is busy — `↵`/`space` are inert);
+        // expanding an entry and opening the check output never read either,
+        // so those stay.
+        match focus {
+            Some(ShuntFocus::Fix { fix, .. }) if !app.services.shunt_action.running => {
+                hints.push(("↵", fix_verb(fix)));
+            }
+            Some(ShuntFocus::Enabled { .. }) if !app.services.shunt_action.running => {
+                hints.push(("space/↵", "toggle"));
+            }
+            Some(ShuntFocus::CheckOutput { .. }) => hints.push(("space/↵", "open")),
+            Some(ShuntFocus::Entry { key })
+                if !app.services.saving(&ShuntSaveKey::Remove(key.clone())) =>
+            {
+                hints.push((
+                    "space/↵",
+                    if app.services.shunt_expanded.contains(key) {
+                        "collapse"
+                    } else {
+                        "expand"
+                    },
+                ));
+            }
+            Some(ShuntFocus::Field { key }) if !field_locked(app, key) => {
+                if is_cycle_field(key) {
+                    hints.push(("space", "cycle"));
+                    hints.push(("↵", "custom"));
+                } else {
+                    hints.push(("↵", "edit value"));
+                }
+            }
+            Some(ShuntFocus::Add { kind })
+                if !app.services.saving(&ShuntSaveKey::SaveAdd(*kind)) =>
+            {
+                hints.push((
+                    "space/↵",
+                    if app.services.shunt_drafts.is_open(*kind) {
+                        "collapse"
+                    } else {
+                        "add"
+                    },
+                ));
+            }
+            Some(ShuntFocus::SaveAdd { kind })
+                if !app.services.saving(&ShuntSaveKey::SaveAdd(*kind)) =>
+            {
+                hints.push(("↵", "save"));
+            }
+            Some(ShuntFocus::Remove { key })
+                if !app.services.saving(&ShuntSaveKey::Remove(key.clone())) =>
+            {
+                hints.push(("↵", "remove"));
+            }
+            Some(ShuntFocus::Token { key })
+                if !app.services.saving(&ShuntSaveKey::Token(key.clone())) =>
+            {
+                hints.push(("↵", "remove"));
+            }
+            Some(ShuntFocus::AddToken) if !app.services.saving(&ShuntSaveKey::AddToken) => {
+                hints.push(("↵", "add"));
+            }
+            _ => {}
+        }
+        hints.extend(next_fix);
+        hints.extend([("a", "actions"), ("?", "help")]);
+        return hints;
+    }
 
     if label != Some("herdr") {
         let walks_problems = label == Some("plugin")
@@ -441,18 +657,41 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         } else {
             vec![("↑↓", "scroll")]
         };
+        if walks_problems && app.services.detail_max_scroll.get() > 0 {
+            hints.push(("page up/down", "read"));
+        }
         hints.push(("r", "refresh"));
         if let Some(v) = verb {
-            hints.push(("f", v));
+            hints.push(("↵", v));
         }
+        hints.extend(next_fix);
         hints.extend([("a", "actions"), ("?", "help")]);
         return hints;
     }
 
-    // The herdr options rows: `r` and `f` keep working while the options rows
-    // hold the cursor, so they keep their hints (f only when the check offers
-    // a fix).
-    match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
+    if app.services.diagnostic_focus {
+        let mut hints = vec![("↑↓", "row")];
+        if app.services.detail_max_scroll.get() > 0 {
+            hints.push(("page up/down", "read"));
+        }
+        hints.push(("r", "refresh"));
+        hints.extend(next_fix);
+        hints.extend([("a", "actions"), ("?", "help")]);
+        return hints;
+    }
+
+    // The herdr heal line holds focus: `↵` opens its confirm. Otherwise the
+    // options rows name their own keys; `r` and `f` keep working there, `f`
+    // advertised only while the check offers a fix line to walk to.
+    let mut hints = match HERDR_OPTIONS.get(app.services.herdr_options_cursor) {
+        _ if verb.is_some() => {
+            let mut hints = vec![("↑↓", "row")];
+            hints.extend(verb.map(|v| ("↵", v)));
+            hints.push(("r", "refresh"));
+            hints.extend(next_fix);
+            hints.extend([("a", "actions"), ("?", "help")]);
+            hints
+        }
         Some(HerdrOption::TagRefresh) => {
             let mut hints = vec![
                 ("↑↓", "row"),
@@ -461,17 +700,13 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("↵", "type"),
                 ("r", "refresh"),
             ];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
         Some(HerdrOption::DelegateRowText) if herdr_config_writable(app) => {
             let mut hints = vec![("↑↓", "row"), ("space/↵", "rewrite row"), ("r", "refresh")];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
@@ -479,9 +714,7 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
         // no-op there.
         Some(HerdrOption::DelegateRowText) => {
             let mut hints = vec![("↑↓", "row"), ("r", "refresh")];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
@@ -491,13 +724,15 @@ fn services_detail_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                 ("space/↵", "cycle / toggle"),
                 ("r", "refresh"),
             ];
-            if let Some(v) = verb {
-                hints.push(("f", v));
-            }
+            hints.extend(next_fix);
             hints.extend([("a", "actions"), ("?", "help")]);
             hints
         }
+    };
+    if app.services.detail_max_scroll.get() > 0 {
+        hints.insert(1, ("page up/down", "read"));
     }
+    hints
 }
 
 /// Shrink a rect by `pad` columns on each side (clamped), leaving the row intact.
@@ -513,10 +748,11 @@ fn inset_x(area: Rect, pad: u16) -> Rect {
 /// `! <message>` — glyph in `WARNING`, message in `TEXT_DIM`.
 fn draw_alert(frame: &mut Frame<'_>, area: Rect, alert: &FooterAlert) {
     let FooterAlert::Warn(msg) = alert;
-    let spans = vec![
-        Span::styled("! ", Style::default().fg(theme::warning_color())),
-        Span::styled(msg.as_str(), theme::dim()),
-    ];
+    let mut spans = vec![Span::styled(
+        "! ",
+        Style::default().fg(theme::warning_color()),
+    )];
+    spans.extend(prose::spans(msg, theme::dim()));
     frame.render_widget(
         Paragraph::new(Line::from(spans))
             .style(theme::base())

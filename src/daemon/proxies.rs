@@ -344,6 +344,7 @@ impl Supervised for Proxy {
     type Record = ProxyRecord;
     type Probe = ProxyProbe;
     type Prepared = Manifest;
+    type SpawnMark = ();
 
     fn publish(&self, handle: &ProxySlots, slot: ProxySlot) {
         match handle.lock() {
@@ -889,10 +890,10 @@ fn manage(slots: ProxySlots, stop: Receiver<()>) {
 }
 
 /// One coordinator round: read the registry, start a supervisor per enabled
-/// row that has none, reap a removed row's supervisor off-thread, log an
-/// unreadable registry once per distinct error, and reclaim orphans. Split out
-/// of [`manage`] so a test drives rounds deterministically, never by a wall
-/// clock.
+/// row that has none, reap a removed row's supervisor off-thread, drop every
+/// slot no supervisor it owns published, log an unreadable registry once per
+/// distinct error, and reclaim orphans. Split out of [`manage`] so a test
+/// drives rounds deterministically, never by a wall clock.
 fn manage_round(coordinator: &mut Coordinator, slots: &ProxySlots, now_ms: u64) {
     match Registry::load() {
         Ok(registry) => {
@@ -915,7 +916,7 @@ fn manage_round(coordinator: &mut Coordinator, slots: &ProxySlots, now_ms: u64) 
                     }
                 }
             }
-            reap_removed(slots, coordinator, &registry);
+            reap_removed(coordinator, &registry);
         }
         // An unreadable registry never changes what runs: the supervisors and
         // this coordinator keep their last good set, logged once per distinct
@@ -928,6 +929,7 @@ fn manage_round(coordinator: &mut Coordinator, slots: &ProxySlots, now_ms: u64) 
             }
         }
     }
+    sweep_unowned_slots(slots, &coordinator.threads);
     // Finished reapers drop their handle; keep the map bounded so a daemon
     // that removes rows for its whole life does not accumulate join handles.
     coordinator.reaping.retain(|_, join| !join.is_finished());
@@ -936,11 +938,10 @@ fn manage_round(coordinator: &mut Coordinator, slots: &ProxySlots, now_ms: u64) 
 
 /// Reap a removed row's supervisor once the registry no longer names its
 /// service: hand its stop to a detached joiner (so a draining child never
-/// blocks the coordinator's round) and drop its published slot, so no idle
-/// thread re-reads the registry forever and no `absent` slot lingers. The
-/// joiner is recorded by service, so the orphan sweep skips the service until
-/// its reaper has sent the one SIGTERM.
-fn reap_removed(slots: &ProxySlots, coordinator: &mut Coordinator, registry: &Registry) {
+/// blocks the coordinator's round). The joiner is recorded by service, so the
+/// orphan sweep skips the service until its reaper has sent the one SIGTERM.
+/// Its published slot leaves the map through the round's slot sweep, not here.
+fn reap_removed(coordinator: &mut Coordinator, registry: &Registry) {
     let removed: Vec<Service> = coordinator
         .threads
         .keys()
@@ -970,7 +971,6 @@ fn reap_removed(slots: &ProxySlots, coordinator: &mut Coordinator, registry: &Re
         }
         #[cfg(not(unix))]
         drop(supervisor);
-        drop_slot(slots, &service);
     }
 }
 
@@ -991,14 +991,19 @@ fn take_reaper_park(service: &Service) -> Option<std::sync::mpsc::Receiver<()>> 
         .remove(service)
 }
 
-fn drop_slot(slots: &ProxySlots, service: &Service) {
+/// Remove every published slot whose service the coordinator no longer owns.
+/// A removed row's supervisor can republish its slot after
+/// [`reap_removed`]: its stop runs off-thread and its in-flight round
+/// publishes last, so a one-shot drop races it. Retaining only `threads`'
+/// services every round removes any such late publish by the next round. Keyed
+/// on ownership, never the registry, so a re-enabled service's fresh slot
+/// survives: its new supervisor is in `threads`.
+fn sweep_unowned_slots(slots: &ProxySlots, threads: &BTreeMap<Service, SupervisorThread<Proxy>>) {
     match slots.lock() {
-        Ok(mut map) => {
-            map.remove(service);
-        }
-        Err(poisoned) => {
-            poisoned.into_inner().remove(service);
-        }
+        Ok(mut map) => map.retain(|service, _| threads.contains_key(service)),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .retain(|service, _| threads.contains_key(service)),
     }
 }
 

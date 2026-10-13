@@ -1,6 +1,8 @@
 //! Shared widgets: the bordered section box every pane uses, and the account
 //! picker shared by the Usage and Setup tabs.
 
+use std::cell::Cell;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -10,6 +12,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Padding, Paragraph, Wra
 
 use super::super::app::{App, InputState};
 use super::super::theme;
+use super::prose;
 use crate::profile::AppConfig;
 
 /// Account-picker column width for a master-detail tab: ~30% of the body,
@@ -72,8 +75,11 @@ pub(super) fn master_detail(area: Rect, items: usize) -> (Rect, Rect) {
 /// Display columns occupied by the text before the caret in `input`.
 /// `InputState::cursor` is a byte offset; every edited field is ASCII-only in
 /// practice, so the char count of the pre-caret slice equals display columns.
+/// The slice is control-escaped like the editor body [`value_caret`] renders,
+/// so a control/bidi character the saved value carried keeps the caret column
+/// aligned with the escaped display.
 pub(super) fn head_cols(input: &InputState) -> usize {
-    input.value[..input.cursor.min(input.value.len())]
+    crate::tui::app::escape_control(&input.value[..input.cursor.min(input.value.len())])
         .chars()
         .count()
 }
@@ -101,7 +107,7 @@ pub(super) fn key_cell(key: &str, width: usize, gutter: usize) -> String {
 /// One segment of a cycle row: the active option renders `[label]` while the
 /// row holds the cursor (the bracket pair is the focus cue — the row widens by
 /// 2 on focus), bare `label` otherwise. Active → `ACCENT`, rest `TEXT_FAINT`.
-pub(super) fn cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
+fn cycle_option(label: &str, active: bool, row_selected: bool) -> Span<'static> {
     let style = if active {
         theme::accent()
     } else {
@@ -123,66 +129,93 @@ const STACK_INDENT: usize = 2;
 /// `custom` value matching no option trails the run the same 2 cells out,
 /// never bracketed (the refresh row's appended value): `ACCENT` while it is the
 /// row's value, `TEXT_FAINT` while it is only a stop the cycle can return to.
+/// A `reminder` (the off-default `default: X` note) trails last, 3 cells out,
+/// `TEXT_FAINT`.
 ///
 /// A run too wide for `width` breaks between chips onto continuation lines
-/// indented to the value column, never inside a chip. The custom value shares
-/// the run's last line only when it fits there whole, else opens a line of its
-/// own, breaking between its words where even that cannot hold it, so it never
-/// reads as one more word of the run. When the value column cannot hold the
-/// widest chip at all, the whole run drops under the key instead: stacked
-/// rather than clipped. The widest chip counts its brackets whether or not the
-/// row holds the cursor, so focus never flips a row between the two layouts.
+/// indented to the value column, never inside a chip. The custom value and the
+/// reminder each share the line before them only when they fit there whole,
+/// else open a line of their own, breaking between their words where even that
+/// cannot hold them, so neither reads as one more word of the run. When the
+/// value column cannot hold the widest option at all, the whole run drops under
+/// the key instead: stacked rather than clipped. A custom value or reminder
+/// with a word the value column cannot hold drops alone the same way, and the
+/// options keep the value column. Every fit counts the active option's
+/// brackets whether or not the row holds the cursor, so focus never moves a
+/// break or flips a row between the layouts.
 pub(super) fn cycle_row_lines(
     lead: Vec<Span<'static>>,
     options: &[(&str, bool)],
     custom: Option<(&str, bool)>,
+    reminder: Option<&str>,
     row_selected: bool,
     width: usize,
 ) -> Vec<Line<'static>> {
     let value_col: usize = lead.iter().map(Span::width).sum();
-    // Each chip with the gap that opens it: the options 2 cells apart, the
-    // custom value's words 1 apart after its own 2-cell lead.
-    let mut chips: Vec<(usize, Span<'static>)> = options
+    let widest_option = options
         .iter()
-        .map(|(label, active)| (2, cycle_option(label, *active, row_selected)))
-        .collect();
-    let run = chips.len();
-    let mut whole = 0;
-    if let Some((value, active)) = custom {
-        let style = if active {
-            theme::accent()
-        } else {
-            theme::faint()
-        };
-        whole = value.chars().count();
-        chips.extend(value.split_whitespace().enumerate().map(|(i, word)| {
-            let gap = if i == 0 { 2 } else { 1 };
-            (gap, Span::styled(word.to_string(), style))
-        }));
-    }
-    let widest = options
-        .iter()
-        .map(|(label, _)| label.chars().count() + 2)
-        .chain(chips[run..].iter().map(|(_, word)| word.width()))
+        .map(|(label, _)| Span::raw(*label).width() + 2)
         .max()
         .unwrap_or(0);
-    let stacked = value_col + widest > width;
-    let indent = if stacked { STACK_INDENT } else { value_col };
-    let blank = || Line::from(Span::raw(" ".repeat(indent)));
+    let stacked = value_col + widest_option > width;
+    let run_indent = if stacked { STACK_INDENT } else { value_col };
+    // Each chip with the gap that opens it, the cells it holds whether or not
+    // the row is focused, the room it asks of its line, and the indent its
+    // lines open at: the options 2 cells apart, a trailing group's words 1
+    // apart after its own lead, its first word asking room for the whole group.
+    let mut chips: Vec<(usize, Span<'static>, usize, usize, usize)> = options
+        .iter()
+        .map(|(label, active)| {
+            let chip = cycle_option(label, *active, row_selected);
+            let fit = chip.width() + if *active && !row_selected { 2 } else { 0 };
+            (2, chip, fit, fit, run_indent)
+        })
+        .collect();
+    let mut trail = |text: &str, lead_gap: usize, style: Style| {
+        let whole = Span::raw(text).width();
+        let widest_word = text
+            .split_whitespace()
+            .map(|w| Span::raw(w).width())
+            .max()
+            .unwrap_or(0);
+        let indent = if run_indent + widest_word > width {
+            STACK_INDENT
+        } else {
+            run_indent
+        };
+        chips.extend(text.split_whitespace().enumerate().map(|(i, word)| {
+            let chip = Span::styled(word.to_string(), style);
+            let fit = chip.width();
+            let (gap, ask) = if i == 0 { (lead_gap, whole) } else { (1, fit) };
+            (gap, chip, fit, ask, indent)
+        }));
+    };
+    if let Some((value, active)) = custom {
+        trail(
+            value,
+            2,
+            if active {
+                theme::accent()
+            } else {
+                theme::faint()
+            },
+        );
+    }
+    if let Some(text) = reminder {
+        trail(text, 3, theme::faint());
+    }
+    let blank = |indent: usize| Line::from(Span::raw(" ".repeat(indent)));
 
     let mut out = vec![Line::from(lead)];
     let mut used = value_col;
     if stacked {
-        out.push(blank());
-        used = indent;
+        out.push(blank(run_indent));
+        used = run_indent;
     }
     let mut fresh = true;
-    for (i, (gap, chip)) in chips.into_iter().enumerate() {
-        let w = chip.width();
-        // The custom value's first word asks room for the whole value.
-        let custom_wraps = i == run && used + gap + whole > width;
-        if !fresh && (custom_wraps || used + gap + w > width) {
-            out.push(blank());
+    for (gap, chip, fit, ask, indent) in chips {
+        if !fresh && used + gap + ask > width {
+            out.push(blank(indent));
             used = indent;
             fresh = true;
         }
@@ -193,7 +226,7 @@ pub(super) fn cycle_row_lines(
             }
             line.spans.push(chip);
         }
-        used += w;
+        used += fit;
         fresh = false;
     }
     out
@@ -346,23 +379,30 @@ pub(super) fn picker_row(
     select_line(line, selected, focused, width)
 }
 
+/// The empty state's two text lines (dim hint, hotkey-accented action), shared
+/// by the bordered [`empty_state`] widget and a caller that renders them bare
+/// so a pinned footnote composes with them.
+pub(super) fn empty_state_lines(hint: &str, hotkey: &str, action: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(hint.to_string(), theme::dim())),
+        Line::from(prose::spans(
+            &format!("{} {action}", prose::key(hotkey)),
+            theme::dim(),
+        )),
+    ]
+}
+
 /// Empty-state widget: rounded frame in `LINE`, hint on first line `TEXT_DIM`,
 /// hotkey `ACCENT` + action on second line.
 pub(super) fn empty_state(hint: &str, hotkey: &str, action: &str) -> Paragraph<'static> {
-    Paragraph::new(vec![
-        Line::from(Span::styled(hint.to_string(), theme::dim())),
-        Line::from(vec![
-            Span::styled(hotkey.to_string(), theme::accent()),
-            Span::styled(format!(" {action}"), theme::dim()),
-        ]),
-    ])
-    .block(
-        Block::bordered()
-            .border_set(border::ROUNDED)
-            .border_style(Style::default().fg(theme::line_color())),
-    )
-    .style(theme::base())
-    .wrap(Wrap { trim: false })
+    Paragraph::new(empty_state_lines(hint, hotkey, action))
+        .block(
+            Block::bordered()
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(theme::line_color())),
+        )
+        .style(theme::base())
+        .wrap(Wrap { trim: false })
 }
 
 /// Renders a scrollbar into the 1-cell right-padding column of a panel.
@@ -417,20 +457,25 @@ const SCROLL_PAD: usize = 3;
 /// Returns the applied offset so a caller placing the native terminal cursor can
 /// shift its row by it.
 ///
-/// These panes rebuild one `Vec<Line>` per frame and hold no offset in `App`, so
-/// the scroll is derived from the focused block each draw. Without it a pane
-/// taller than its viewport silently drops its bottom rows — no scrollbar, no
-/// clue anything is missing, which is how a hint tooltip and a whole settings
-/// row went missing on a 24-row terminal.
+/// The scroll follows the focused block without clipping wrapped hints. A
+/// stateful form passes its own offset; other callers derive one each draw.
 pub(super) fn draw_scrolled_lines(
     frame: &mut Frame<'_>,
     inner: Rect,
     lines: Vec<Line<'static>>,
     focus: (usize, usize),
+    saved: Option<&Cell<usize>>,
 ) -> usize {
     let total = lines.len();
     let viewport = inner.height as usize;
-    let offset = scroll_offset(total, viewport, focus);
+    let offset = saved.map_or_else(
+        || scroll_offset(total, viewport, focus),
+        |saved| {
+            let offset = follow_scroll_offset(total, viewport, focus, saved.get());
+            saved.set(offset);
+            offset
+        },
+    );
     frame.render_widget(
         Paragraph::new(lines)
             .style(theme::base())
@@ -441,15 +486,159 @@ pub(super) fn draw_scrolled_lines(
     offset
 }
 
+/// The footnote's wrapped lines: raw text cut to the content width, each line
+/// `TEXT_FAINT`.
+pub(super) fn footnote_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap_words(text, width)
+        .into_iter()
+        .map(|seg| Line::from(Span::styled(seg, theme::faint())))
+        .collect()
+}
+
+/// How a pinned footnote splits the pane interior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FootnoteLayout {
+    /// No footnote: the scroll area is the whole interior.
+    Absent,
+    /// Footnote pinned below the scroll area with `margin` blank rows above it.
+    Pinned { scroll: usize, margin: usize },
+    /// Interior too short to pin: the footnote renders as the scroll content's
+    /// last line instead.
+    Inline,
+}
+
+/// The split a pinned footnote produces for an `inner_h`-row interior and a
+/// `footnote_h`-line footnote: pinned with a margin while the scroll area keeps
+/// 3 rows, margin dropped next, inlined past that. `footnote_h == 0` is absent.
+pub(super) fn footnote_layout(inner_h: usize, footnote_h: usize) -> FootnoteLayout {
+    if footnote_h == 0 {
+        FootnoteLayout::Absent
+    } else if inner_h >= footnote_h + 1 + 3 {
+        FootnoteLayout::Pinned {
+            scroll: inner_h - footnote_h - 1,
+            margin: 1,
+        }
+    } else if inner_h >= footnote_h + 3 {
+        FootnoteLayout::Pinned {
+            scroll: inner_h - footnote_h,
+            margin: 0,
+        }
+    } else {
+        FootnoteLayout::Inline
+    }
+}
+
+/// Split `inner` for a `foot_h`-line footnote: the scroll area and the footnote
+/// area (absent when the footnote is inlined into the content or missing). The
+/// one place the pinned geometry lives — the scrolled-footnote helper and a
+/// bare empty state both read it.
+pub(super) fn footnote_split(inner: Rect, foot_h: usize) -> (Rect, Option<Rect>) {
+    match footnote_layout(inner.height as usize, foot_h) {
+        FootnoteLayout::Pinned { scroll, margin } => {
+            let scroll_area = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: scroll as u16,
+            };
+            let foot_area = Rect {
+                x: inner.x,
+                y: inner.y + scroll as u16 + margin as u16,
+                width: inner.width,
+                height: foot_h as u16,
+            };
+            (scroll_area, Some(foot_area))
+        }
+        FootnoteLayout::Absent | FootnoteLayout::Inline => (inner, None),
+    }
+}
+
+/// What a [`draw_scrolled_lines_with_footnote`] frame drew: the applied offset,
+/// the scroll viewport (a pinned footnote shrinks it) and the total line count
+/// (an inline footnote is part of the scroll content, so it counts).
+pub(super) struct ScrolledDraw {
+    pub(crate) offset: usize,
+    pub(crate) viewport: usize,
+    pub(crate) total: usize,
+}
+
+/// A pane note pinned under a scrolled form (cloudy-tui "Pinned footnote"):
+/// one blank margin row above the wrapped note, the scroll area shrunk by the
+/// footnote's height plus that margin, the overflow scrollbar spanning the
+/// scroll area only. `footnote` is the raw one-fragment text; it wraps at the
+/// content width, renders `TEXT_FAINT`, never scrolls, never takes focus and
+/// never carries a key. `None` leaves the scroll area at the full height.
+///
+/// Short pane: when the scroll area would fall under 3 rows the margin drops
+/// first, and past that the footnote renders as the scroll content's last line
+/// instead of pinning — there the focused block's follow carries it, so walking
+/// to the last row still reaches it.
+pub(super) fn draw_scrolled_lines_with_footnote(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+    saved: Option<&Cell<usize>>,
+    footnote: Option<&str>,
+) -> ScrolledDraw {
+    let foot: Vec<Line<'static>> = footnote
+        .map(|text| footnote_lines(text, inner.width as usize))
+        .unwrap_or_default();
+    match footnote_layout(inner.height as usize, foot.len()) {
+        FootnoteLayout::Absent => {
+            let total = lines.len();
+            let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
+            ScrolledDraw {
+                offset,
+                viewport: inner.height as usize,
+                total,
+            }
+        }
+        FootnoteLayout::Inline => {
+            let pre = lines.len();
+            let mut lines = lines;
+            lines.extend(foot);
+            let viewport = inner.height as usize;
+            // When the focused block ends at the old last line AND the block
+            // plus the footnote fit in the viewport together, extend the block
+            // over the footnote so the follow reaches it; otherwise the block
+            // wins — the cursor stays visible and the footnote stays below the
+            // fold at that pane height.
+            let focus = if focus.1 == pre && lines.len() - focus.0 <= viewport {
+                (focus.0, lines.len())
+            } else {
+                focus
+            };
+            let total = lines.len();
+            let offset = draw_scrolled_lines(frame, inner, lines, focus, saved);
+            ScrolledDraw {
+                offset,
+                viewport,
+                total,
+            }
+        }
+        FootnoteLayout::Pinned { .. } => {
+            let total = lines.len();
+            let (scroll_area, foot_area) = footnote_split(inner, foot.len());
+            let offset = draw_scrolled_lines(frame, scroll_area, lines, focus, saved);
+            if let Some(area) = foot_area {
+                frame.render_widget(Paragraph::new(foot).style(theme::base()), area);
+            }
+            ScrolledDraw {
+                offset,
+                viewport: scroll_area.height as usize,
+                total,
+            }
+        }
+    }
+}
+
 /// Smallest offset that keeps the focused block (`focus.0` inclusive, `focus.1`
 /// exclusive) plus a [`SCROLL_PAD`] band on screen, clamped to the content.
 ///
 /// The block, not just its first line: a row's help tooltip wraps to the pane
-/// width, so a narrow pane can push a 4-line hint past the viewport while the
-/// row it explains sits comfortably on screen. Capping at `focus.0` keeps the
-/// row itself visible when its block is taller than the whole viewport. The
-/// focus alone determines the offset, so no cross-frame state is needed and the
-/// view can never drift out of sync with the cursor.
+/// width. Capping at `focus.0` keeps the row visible when the block is taller
+/// than the viewport. Stateless callers keep their existing focus-derived view.
 pub(super) fn scroll_offset(total: usize, viewport: usize, focus: (usize, usize)) -> usize {
     if viewport == 0 || total <= viewport {
         return 0;
@@ -461,6 +650,82 @@ pub(super) fn scroll_offset(total: usize, viewport: usize, focus: (usize, usize)
         .min(total - viewport)
 }
 
+pub(crate) fn follow_scroll_offset(
+    total: usize,
+    viewport: usize,
+    focus: (usize, usize),
+    prior: usize,
+) -> usize {
+    if viewport == 0 || total <= viewport {
+        return 0;
+    }
+    let max = total - viewport;
+    let offset = prior.min(max);
+    let pad = SCROLL_PAD.min(viewport.saturating_sub(1) / 2);
+    let minimum = focus.1.saturating_sub(viewport).min(focus.0);
+    let maximum = focus.0.min(max);
+    if focus.0 < offset.saturating_add(pad) {
+        focus.0.saturating_sub(pad).max(minimum).min(maximum)
+    } else if focus.1.saturating_add(pad) > offset.saturating_add(viewport) {
+        focus
+            .1
+            .saturating_add(pad)
+            .saturating_sub(viewport)
+            .max(minimum)
+            .min(maximum)
+    } else {
+        offset.clamp(minimum, maximum)
+    }
+}
+
+/// A selector list's scroll state: the offset the render wrote back, the
+/// visible-row count the last render drew, each cursor row's start line, the
+/// end line its block reaches when focused (own lines plus any tooltip), and
+/// the total line count. The key handler reads these at key time, so its page
+/// step tracks a resize, a multi-line row's spans, and the follow the cursor
+/// landing will produce instead of guessing.
+#[derive(Debug, Default)]
+pub(crate) struct ListView {
+    pub(crate) offset: Cell<usize>,
+    pub(crate) viewport: Cell<usize>,
+    pub(crate) total: Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) tips: std::cell::RefCell<Vec<usize>>,
+}
+
+pub(super) fn draw_following_list(
+    frame: &mut Frame<'_>,
+    inner: Rect,
+    rows: Vec<ListItem<'static>>,
+    sel: usize,
+    list: &ListView,
+) {
+    let total = rows.len();
+    let viewport = inner.height as usize;
+    list.viewport.set(viewport);
+    list.total.set(total);
+    // A flat `List` has one rendered line per row; a caller whose rows carry a
+    // band header or spacer (Overview) overrides these starts after this call.
+    list.starts.replace((0..total).collect());
+    list.block_ends.replace((0..total).map(|i| i + 1).collect());
+    list.tips.replace(vec![0; total]);
+    let prior = if viewport == 0 || total <= viewport {
+        0
+    } else {
+        list.offset.get().min(total - viewport)
+    };
+    let mut state = ListState::default().with_offset(prior);
+    state.select(Some(sel));
+    frame.render_stateful_widget(
+        List::new(rows).style(theme::base()).scroll_padding(3),
+        inner,
+        &mut state,
+    );
+    list.offset.set(state.offset());
+    draw_scrollbar(frame, inner, total, state.offset(), viewport);
+}
+
 /// Bordered selector list; `build_rows` receives the inner width for the selection bar.
 pub(super) fn draw_selector_list(
     frame: &mut Frame<'_>,
@@ -468,6 +733,7 @@ pub(super) fn draw_selector_list(
     title: &str,
     focused: bool,
     sel: usize,
+    list: &ListView,
     build_rows: impl FnOnce(u16) -> Vec<Line<'static>>,
 ) {
     let block = section_box(title, focused, true);
@@ -476,19 +742,23 @@ pub(super) fn draw_selector_list(
 
     let rows = build_rows(inner.width);
     if rows.is_empty() {
+        list.offset.set(0);
+        list.viewport.set(0);
+        list.total.set(0);
+        list.starts.replace(Vec::new());
+        list.block_ends.replace(Vec::new());
+        list.tips.replace(Vec::new());
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
 
-    let total = rows.len();
-    let list =
-        List::new(rows.into_iter().map(ListItem::new).collect::<Vec<_>>()).style(theme::base());
-    let mut state = ListState::default();
-    state.select(Some(sel));
-    frame.render_stateful_widget(list, inner, &mut state);
-
-    let viewport = inner.height as usize;
-    draw_scrollbar(frame, inner, total, state.offset(), viewport);
+    draw_following_list(
+        frame,
+        inner,
+        rows.into_iter().map(ListItem::new).collect(),
+        sel,
+        list,
+    );
 }
 
 /// A `├`/`└` fix-hint line: glyph + text at col 0/2, anchored to the caller's
@@ -505,52 +775,82 @@ pub(super) fn rail_hint_lines(text: &str, width: usize, more_follow: bool) -> Ve
     const LEAD_W: usize = 2; // glyph + 1 space, text at col 2
     let lead = if more_follow { "├ " } else { "└ " };
     let cont = if more_follow { "│ " } else { "  " };
-    wrap_words(text, width.saturating_sub(LEAD_W).max(8))
+    prose::wrap(text, width.saturating_sub(LEAD_W).max(8), theme::faint())
         .into_iter()
         .enumerate()
         .map(|(i, seg)| {
-            Line::from(vec![
-                Span::styled(if i == 0 { lead } else { cont }, theme::line()),
-                Span::styled(seg, theme::faint()),
-            ])
+            let mut spans = vec![Span::styled(
+                if i == 0 { lead } else { cont },
+                theme::line(),
+            )];
+            spans.extend(seg);
+            Line::from(spans)
         })
         .collect()
 }
 
-/// Greedy word-wrap to `width` chars; long words are hard-split. Shared by the
-/// status-tab timeline, the tooltip sub-lines, and the chain add-pane prose.
+/// Chunk `text` into `width`-cell runs, splitting between graphemes by their
+/// display width and never on whitespace: every byte lands in exactly one
+/// chunk. A path whose name holds spaces keeps them.
+pub(super) fn chunk_graphemes(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut chunk = String::new();
+    let mut chunk_w = 0;
+    for grapheme in Span::raw(text).styled_graphemes(Style::default()) {
+        let grapheme_w = Span::raw(grapheme.symbol).width();
+        if !chunk.is_empty() && chunk_w + grapheme_w > width {
+            lines.push(std::mem::take(&mut chunk));
+            chunk_w = 0;
+        }
+        chunk.push_str(grapheme.symbol);
+        chunk_w += grapheme_w;
+    }
+    if !chunk.is_empty() {
+        lines.push(chunk);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Greedy word-wrap to `width` cells, measured the way the buffer renders: by
+/// grapheme, a wide one taking two; long words are hard-split between
+/// graphemes.
 pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
     let mut lines = Vec::new();
     let mut line = String::new();
+    let mut line_w = 0;
     for word in text.split_whitespace() {
-        if word.chars().count() > width {
+        let word_w = Span::raw(word).width();
+        if word_w > width {
             if !line.is_empty() {
                 lines.push(std::mem::take(&mut line));
             }
-            let mut chunk = String::new();
-            for ch in word.chars() {
-                if chunk.chars().count() == width {
-                    lines.push(std::mem::take(&mut chunk));
-                }
-                chunk.push(ch);
-            }
-            if !chunk.is_empty() {
-                line = chunk;
-            }
+            let mut chunks = chunk_graphemes(word, width);
+            let last = chunks.pop().unwrap_or_default();
+            lines.extend(chunks);
+            line = last;
+            line_w = Span::raw(&line).width();
             continue;
         }
-        let extra = if line.is_empty() { 0 } else { 1 };
-        if line.chars().count() + extra + word.chars().count() > width {
+        let extra = usize::from(!line.is_empty());
+        if line_w + extra + word_w > width {
             lines.push(std::mem::take(&mut line));
             line.push_str(word);
+            line_w = word_w;
         } else {
             if !line.is_empty() {
                 line.push(' ');
             }
             line.push_str(word);
+            line_w += extra + word_w;
         }
     }
     if !line.is_empty() {
@@ -566,31 +866,44 @@ pub(super) fn wrap_words(text: &str, width: usize) -> Vec<String> {
 /// the reason renders `faint`; continuation lines indent under the text so the
 /// hint reads as one block instead of clipping off the pane edge.
 pub(super) fn help_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    tooltip_lines(text, width, theme::line(), theme::faint())
+    tooltip_lines(text, width, 1, theme::line(), theme::faint())
+}
+
+/// [`help_tooltip_lines`] with the `└` leader at `lead_indent` (the column the
+/// `└` opens at): a caller whose line explains a label at col 2 passes 2, so
+/// the `└` sits under the text it explains.
+pub(super) fn help_tooltip_lines_at(
+    text: &str,
+    width: usize,
+    lead_indent: usize,
+) -> Vec<Line<'static>> {
+    tooltip_lines(text, width, lead_indent, theme::line(), theme::faint())
 }
 
 /// Invalid-input twin of [`help_tooltip_lines`]: both the leader and the
 /// reason render in `DANGER`.
 pub(super) fn invalid_tooltip_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    tooltip_lines(text, width, theme::danger(), theme::danger())
+    tooltip_lines(text, width, 1, theme::danger(), theme::danger())
 }
 
 fn tooltip_lines(
     text: &str,
     width: usize,
+    lead_indent: usize,
     leader_style: Style,
     text_style: Style,
 ) -> Vec<Line<'static>> {
-    const LEAD_W: usize = 3; // " └ " and the matching continuation indent
-    wrap_words(text, width.saturating_sub(LEAD_W).max(8))
+    let lead_w = lead_indent + 2; // the `└ ` and its indent
+    let lead = format!("{}└ ", " ".repeat(lead_indent));
+    let cont = " ".repeat(lead_w);
+    prose::wrap(text, width.saturating_sub(lead_w).max(8), text_style)
         .into_iter()
         .enumerate()
-        .map(|(i, seg)| {
-            let lead = if i == 0 { " └ " } else { "   " };
-            Line::from(vec![
-                Span::styled(lead, leader_style),
-                Span::styled(seg, text_style),
-            ])
+        .map(move |(i, seg)| {
+            let leader = if i == 0 { lead.clone() } else { cont.clone() };
+            let mut spans = vec![Span::styled(leader, leader_style)];
+            spans.extend(seg);
+            Line::from(spans)
         })
         .collect()
 }
@@ -607,10 +920,12 @@ pub(super) fn label_style(focused: bool) -> Style {
 }
 
 /// Render a typed editor's buffer with uniform `BG_SUNKEN` styling (DANGER fg
-/// when invalid). The native terminal cursor — set via
-/// `frame.set_cursor_position` — owns the caret glyph, so no simulated block
-/// cursor. Shared by the chain threshold/max-spend editors, the Config-tab
-/// refresh/weekly editors, and the Plugin-tab herdr tag-refresh editor.
+/// when invalid), the value control-escaped so a control/bidi character the
+/// saved value carried cannot inject into the terminal or reorder the line.
+/// The native terminal cursor — set via `frame.set_cursor_position` — owns the
+/// caret glyph, so no simulated block cursor. Shared by the chain
+/// threshold/max-spend editors, the Config-tab refresh/weekly editors, the
+/// Plugin-tab herdr tag-refresh editor, and the shunt card's field editor.
 pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static>> {
     let body = if invalid {
         theme::danger()
@@ -618,7 +933,10 @@ pub(super) fn value_caret(input: &InputState, invalid: bool) -> Vec<Span<'static
         theme::body()
     }
     .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
+    vec![Span::styled(
+        crate::tui::app::escape_control(&input.value),
+        body,
+    )]
 }
 
 /// Rounded box with contract-compliant chrome.
@@ -792,19 +1110,27 @@ pub(super) fn draw_profile_selector(
 ) {
     let cfg = app.config();
     let sel = selected.min(cfg.profiles.len().saturating_sub(1));
-    draw_selector_list(frame, area, "accounts", focused, sel, |w| {
-        cfg.profiles
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                // A disabled account can never be active, so dim wins outright.
-                let ns = if p.is_disabled() {
-                    theme::dim()
-                } else {
-                    name_color(cfg.is_active(&p.name))
-                };
-                picker_row(i == sel, focused, p.name.to_string(), ns, w)
-            })
-            .collect()
-    });
+    draw_selector_list(
+        frame,
+        area,
+        "accounts",
+        focused,
+        sel,
+        &app.usage_selector,
+        |w| {
+            cfg.profiles
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    // A disabled account can never be active, so dim wins outright.
+                    let ns = if p.is_disabled() {
+                        theme::dim()
+                    } else {
+                        name_color(cfg.is_active(&p.name))
+                    };
+                    picker_row(i == sel, focused, p.name.to_string(), ns, w)
+                })
+                .collect()
+        },
+    );
 }

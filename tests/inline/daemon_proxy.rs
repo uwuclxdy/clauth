@@ -18,7 +18,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use super::*;
 #[cfg(unix)]
-use crate::daemon::gateway::{DAEMON_STOP_BUDGET, Supervisor, Tick, start_kind};
+use crate::daemon::gateway::{DAEMON_STOP_BUDGET, Supervised as _, Supervisor, Tick, start_kind};
 #[cfg(unix)]
 use crate::testutil::HomeSandbox;
 
@@ -1283,7 +1283,103 @@ fn the_proxy_memoizes_and_the_gateway_does_not() {
         .memoizes()
     );
     assert!(
-        !Gateway.memoizes(),
+        !Gateway::new().memoizes(),
         "the gateway never reads its memo back and must not hold the env file's values"
     );
+}
+
+/// A slot no supervisor owns leaves the map in one round, on both registry
+/// arms: the disabled row reads `disabled` after the sweep, and the sweep runs
+/// while the registry cannot be read.
+#[cfg(unix)]
+#[test]
+fn a_slot_no_supervisor_owns_leaves_the_map_in_one_round() {
+    let _home = HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("dir")).expect("mkdir");
+    let path = crate::proxy::registry_path().expect("registry");
+    let alpha = Service::parse("alpha").expect("alpha");
+    let slots = new_slots();
+    let mut coordinator = Coordinator {
+        threads: BTreeMap::new(),
+        reaping: BTreeMap::new(),
+        last_registry_error: None,
+    };
+    // A dying supervisor's last `absent` publish lands after its row is gone:
+    // the next round's sweep removes it, so the disabled row reads `disabled`,
+    // never the stale `absent`.
+    std::fs::write(&path, "[alpha]\nport = 9101\n").expect("a disabled alpha row");
+    Proxy {
+        service: alpha.clone(),
+    }
+    .publish(&slots, ProxySlot::of(ProxyState::Absent, &alpha));
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert_eq!(
+        published(&slots, &alpha),
+        None,
+        "a slot no supervisor owns leaves the map in one round"
+    );
+    let live = super::slots(&slots);
+    assert_eq!(
+        entries(Some(&live)).first().map(|slot| slot.state),
+        Some(ProxyState::Disabled),
+        "the disabled row reads disabled, never the stale absent"
+    );
+
+    // The sweep runs on the unreadable-registry arm too.
+    std::fs::write(&path, "not = [toml").expect("corrupt the registry");
+    Proxy {
+        service: alpha.clone(),
+    }
+    .publish(&slots, ProxySlot::of(ProxyState::Absent, &alpha));
+    manage_round(&mut coordinator, &slots, crate::usage::now_ms());
+    assert_eq!(
+        published(&slots, &alpha),
+        None,
+        "the sweep runs while the registry is unreadable"
+    );
+}
+
+/// A slot a supervisor owns survives the sweep: its build-time publish lands
+/// before the round's sweep, so a live proxy's slot is never dropped.
+#[cfg(unix)]
+#[test]
+fn a_slot_a_supervisor_owns_survives_the_sweep() {
+    let rig = Rig::new("zcode");
+    let wrapper = rig.dir.join("wrapped").join("clauth-zcode-proxy");
+    std::fs::create_dir_all(wrapper.parent().expect("parent")).expect("dir");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = manifest ] && [ -e '{d}/slow' ]; then sleep 4.8; fi\nexec '{b}' \"$@\"\n",
+            d = rig.dir.display(),
+            b = rig.binary.display(),
+        ),
+    )
+    .expect("wrapper");
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    crate::proxy::enable(
+        "zcode",
+        None,
+        Some(wrapper.parent().expect("parent").as_os_str()),
+    )
+    .expect("re-enable on the wrapper");
+    std::fs::write(rig.dir.join("slow"), "").expect("slow");
+    let mut coordinator = Coordinator {
+        threads: BTreeMap::new(),
+        reaping: BTreeMap::new(),
+        last_registry_error: None,
+    };
+    // The build's publish precedes the sweep, and the supervisor's first
+    // republish is ≥ 4.8 s away (the slow `manifest` read), so the owned slot
+    // must survive the sweep right after the round returns.
+    manage_round(&mut coordinator, &rig.slots, crate::usage::now_ms());
+    assert!(
+        published(&rig.slots, &rig.service).is_some(),
+        "a slot the coordinator owns survives the sweep"
+    );
+    shutdown_threads(coordinator.threads, coordinator.reaping);
+    for call in stub::invocations(&rig.dir) {
+        stub::signal_best_effort(call.pid, "KILL");
+    }
 }

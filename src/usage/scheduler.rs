@@ -762,7 +762,7 @@ fn load_cached_with_status(
 /// instead of serving stale cached usage until the next switch trips
 /// `ensure_installable`. Truth table pinned by the scheduler `*_terminal` tests.
 fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
-    matches!(err, RefreshError::Invalid(_))
+    matches!(err, RefreshError::Invalid { .. })
 }
 
 /// The benign face of a terminal 400: "refresh token not found or invalid" is
@@ -778,10 +778,39 @@ fn refresh_failure_is_terminal(err: &RefreshError) -> bool {
 /// caller's `TokenList` sync instead of quarantining a healthy account.
 /// `None` (unchanged, unreadable, or tokenless) means the 400 was a real
 /// revocation.
+///
+/// A live stage is the chain head, so its pair is the fresh one. Otherwise the
+/// store is fresher only when it is neither spent nor a stage's base: either is
+/// a token the chain already superseded, never an advance. An unreadable spent
+/// record proves nothing fresher.
 fn fresher_disk_pair(name: &ProfileName, spent_refresh: &str) -> Option<RotatedTokens> {
-    let profile = crate::profile::load_profile(name).ok()?;
-    let access = profile.access_token()?.to_string();
-    let refresh = profile.refresh_token()?.to_string();
+    use crate::oauth::{SpentRecord, StageState, StagedPair};
+    let record = SpentRecord::read(name);
+    if matches!(record, SpentRecord::Unreadable) {
+        return None;
+    }
+    let store = crate::oauth::read_raw_store(name).ok()??;
+    let d = store.refresh_token();
+    let stage = StagedPair::read(name);
+    let fresh = match stage
+        .as_ref()
+        .filter(|g| g.state(d, &record) == StageState::Live)
+    {
+        Some(live) => &live.creds,
+        None => {
+            let d = d?;
+            let superseded = record.spent(d) != Some(false)
+                || stage
+                    .as_ref()
+                    .is_some_and(|g| g.base == crate::codex_auth::token_fingerprint(d));
+            if superseded {
+                return None;
+            }
+            &store
+        }
+    };
+    let access = fresh.access_token()?.to_string();
+    let refresh = fresh.refresh_token()?.to_string();
     (refresh != spent_refresh).then_some((access, Some(refresh)))
 }
 
@@ -1067,10 +1096,22 @@ fn fetch_with_rotation(
             true,
             false,
         ));
+    // A live stage's pair is the chain head even while memory and the store lag
+    // it (a persist that could not take the flock), so its expiry is what the
+    // lead window measures; without it a wedged flock re-rotates every tick.
+    let staged_expires_at = crate::oauth::has_stage(name)
+        .then(|| {
+            crate::oauth::live_stage_credentials(
+                name,
+                crate::oauth::read_raw_store(name).ok().flatten().as_ref(),
+            )
+        })
+        .flatten()
+        .and_then(|c| c.access_token_expires_at());
     let proactive = proactive_rotation_due(
         preemptive,
         rolling_token,
-        access_expires_at,
+        access_expires_at.max(staged_expires_at),
         now_ms() as i64,
         interval_ms,
     );
@@ -1188,15 +1229,40 @@ fn fetch_with_rotation(
     if entry.auth_broken {
         return bail_unrotated();
     }
+    let rt = match crate::oauth::send_rule(name, rt, &rotation_guard) {
+        crate::oauth::SendRule::Send(rt) => rt,
+        // The carry's shape: the store's newer login reaches the token list and
+        // the next tick polls with it.
+        crate::oauth::SendRule::Adopt(pair) => {
+            if crate::oauth::adopt_disk_rotation(config, name, &rotation_guard).is_err() {
+                return bail_unrotated();
+            }
+            if let Ok(mut q) = refetch.lock() {
+                q.insert(name.to_string());
+            }
+            return FetchOutcome::cached(name, FetchStatus::Cached, Some(pair), None);
+        }
+        crate::oauth::SendRule::Quarantine => {
+            crate::oauth::mark_auth_broken(config, name, true);
+            return bail_unrotated();
+        }
+        crate::oauth::SendRule::Skip => return bail_unrotated().with_refresh_failed(),
+    };
+    let rt = rt.as_str();
     mark_activity(activity, name, ProfileActivity::Refreshing);
     // `refresh_result` (not `refresh`) so the RefreshError variant survives — the
     // poll needs to tell a dead token (quarantine) from a transient blip (retry).
-    let rotation =
-        crate::oauth::refresh_result(rt, crate::oauth::stored_scopes(config, name).as_deref());
+    let rotation = crate::oauth::settle_refresh_answer(
+        config,
+        name,
+        rt,
+        crate::oauth::refresh_result(rt, crate::oauth::stored_scopes(config, name).as_deref()),
+        &rotation_guard,
+    );
     // This site raised `Refreshing`, so it is the one that may retire it. One
     // hold, so partition never reads the profile idle between the two writes.
     rotation_into_fetch(activity, name);
-    let tok = match rotation {
+    let minted = match rotation {
         Ok(t) => t,
         Err(e) => {
             // A failed refresh on the ACTIVE profile usually means the live
@@ -1246,15 +1312,29 @@ fn fetch_with_rotation(
     };
     // Persist under the AppConfig mutex + state lock — matches every other rotation site
     // so a concurrent `rotate_one_inner` can't interleave, and keeps in-memory AppConfig in sync.
-    let access = tok.access_token.clone();
+    let (access, new_refresh) = minted.pair();
     // The refresh already spent the old single-use token, so this pair is now the
     // only usable one — carry it back even when the persist below fails, or the
-    // caller's live snapshot keeps the dead token and 400s every tick until a
-    // restart adopts the staged sidecar (`auto_start_kick` carries its pair back
-    // for the same reason).
-    let rotated: Option<RotatedTokens> = Some((access.clone(), Some(tok.refresh_token.clone())));
-    if crate::oauth::apply_rotated_tokens_locked(config, name, tok).is_err() {
-        return bail_to_cache(rotated);
+    // caller's live snapshot keeps the dead token and 400s every tick
+    // (`auto_start_kick` carries its pair back for the same reason). A REFUSED
+    // persist carries the store's pair instead, so the token list follows the
+    // store; a store with no login drops the entry.
+    let rotated: Option<RotatedTokens> = Some((access.clone(), new_refresh));
+    match crate::oauth::apply_rotated_tokens_locked(
+        config,
+        name,
+        &minted.sent_fp,
+        &minted.creds,
+        &minted.old_access,
+    ) {
+        Ok(()) => {}
+        Err(crate::oauth::PersistError::Refused { store }) => {
+            return match crate::oauth::PersistError::carried_pair(store.as_deref()) {
+                Some(pair) => bail_to_cache(Some(pair)),
+                None => bail_to_cache(None).with_login_gone(),
+            };
+        }
+        Err(crate::oauth::PersistError::Failed(_)) => return bail_to_cache(rotated),
     }
     // A successful refresh + persist clears any prior auth-broken quarantine
     // (mirrors `ensure_installable`); a no-op when the flag was already clear.
@@ -1308,6 +1388,10 @@ struct FetchOutcome {
     /// into the profile's `refresh_fail` streak by [`apply_outcome`], which is
     /// what ladders the cadence and names the state on the row.
     refresh_failed: bool,
+    /// A rotation's persist refused because the store holds no login any more
+    /// (a logout landed mid-rotation): the drain drops this profile's
+    /// `TokenList` entry rather than poll one more tick on a gone login.
+    login_gone: bool,
     /// A `/profile` reading fetched DESPITE a `/usage` 429 (a canceled account
     /// has been observed to keep 429ing `/usage`). Overlaid onto the cached snapshot by
     /// [`apply_outcome`] so only the tier advances — windows stay cached — and
@@ -1327,6 +1411,7 @@ impl FetchOutcome {
             from_fetch: true,
             retry_after: None,
             refresh_failed: false,
+            login_gone: false,
             plan_override: None,
         }
     }
@@ -1336,6 +1421,13 @@ impl FetchOutcome {
     /// on a live body regardless.
     fn with_refresh_failed(mut self) -> Self {
         self.refresh_failed = true;
+        self
+    }
+
+    /// Mark this outcome as carrying a refused persist whose store holds no
+    /// login: the drain drops the profile's `TokenList` entry.
+    fn with_login_gone(mut self) -> Self {
+        self.login_gone = true;
         self
     }
 
@@ -1356,6 +1448,7 @@ impl FetchOutcome {
             from_fetch: false,
             retry_after,
             refresh_failed: false,
+            login_gone: false,
             plan_override: None,
         }
     }
@@ -1415,6 +1508,12 @@ fn preserve_live_window(
 /// store entry (never fetched this run) returns false on purpose: fetch first,
 /// kick next tick, so a cold cache never kicks blind on a window that may
 /// already be live.
+///
+/// Reads the OAuth store, NOT the picker: the auto-start kick spends the stored
+/// OAuth access token and never routes through `base_url`
+/// ([`crate::oauth::auto_start_kick`]), so the window the kick opens is the
+/// Anthropic 5h window the OAuth leg reads. A hybrid's provider windows are the
+/// walk's input, not this gate's.
 fn window_lapsed(store: &UsageStore, name: &ProfileName, now_secs: i64) -> bool {
     let Ok(s) = store.lock() else {
         return false;
@@ -2071,6 +2170,7 @@ fn run_fetch(
     // fetch below uses the fresh token, never re-spending) and the returned
     // outcome (so the tick syncs it into the live snapshot).
     let mut kick_rotated: Option<RotatedTokens> = None;
+    let mut kick_login_gone = false;
     if entry.auto_start {
         let now_secs = now_epoch_secs();
         // WHICH leg would fire, read before the kick moves the window. The
@@ -2112,6 +2212,7 @@ fn run_fetch(
                 kicked.blocked,
                 now_secs,
             );
+            kick_login_gone = kicked.login_gone;
             if let Some((access, refresh)) = kicked.rotated.clone() {
                 entry.access_token = access;
                 entry.refresh_token = refresh;
@@ -2160,6 +2261,13 @@ fn run_fetch(
             // limit.)
             crate::usage::note_queue_kick_failed(auto_start_queue, &entry.name, now_secs);
         }
+    }
+
+    if kick_login_gone {
+        // The kick's persist found the login cleared: nothing is left to poll
+        // with, so the tick drops the entry instead of fetching.
+        return FetchOutcome::cached(&entry.name, FetchStatus::Cached, None, None)
+            .with_login_gone();
     }
 
     // Prior plan for the TTL'd `/profile` policy, read from the live store and
@@ -2676,37 +2784,6 @@ fn try_seed_cache(
     true
 }
 
-/// Publish a third-party account's derived windows into the OAuth usage store.
-///
-/// [`crate::fallback::next_auto_switch_target`] reads that ONE map, so a
-/// provider window that never lands in it is invisible to the chain however
-/// well it renders — which is why a `fallback_threshold` on an api-key member
-/// used to do nothing at all. Every reader of that map wants the same thing
-/// from a window (a live percentage against a threshold), and the derivation
-/// declines anything it cannot vouch for, so nothing here branches on provider.
-///
-/// `None` REMOVES rather than leaves the previous entry. A provider that
-/// stopped publishing windows — a plan change, a response shape clauth no
-/// longer recognises, a best-effort scan that used to guess one — has no
-/// current reading, and a frozen entry would keep answering the walk with a
-/// figure nothing refreshes: exactly the stale-cache trap the OAuth leg's
-/// liveness checks exist to avoid.
-fn publish_third_party_windows(
-    store: &UsageStore,
-    name: &ProfileName,
-    derived: Option<crate::usage::UsageInfo>,
-) {
-    let Ok(mut s) = store.lock() else { return };
-    match derived {
-        Some(info) => {
-            s.insert(name.to_string(), info);
-        }
-        None => {
-            s.remove(name.as_str());
-        }
-    }
-}
-
 /// Startup third-party seed — the api-key/provider analogue of [`bootstrap_fetch`].
 /// Each profile with a `third_party_cache.json` is seeded straight from disk
 /// (`last_fetched` stamped at the cache mtime — that file's only writer is a
@@ -2716,7 +2793,6 @@ fn publish_third_party_windows(
 /// cache is left unstamped, so the scheduler fetches it fresh.
 pub(crate) fn bootstrap_third_party(
     store: &ThirdPartyUsageStore,
-    usage: &UsageStore,
     status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
     entries: &[ThirdPartyEntry],
@@ -2732,12 +2808,9 @@ pub(crate) fn bootstrap_third_party(
         else {
             continue;
         };
-        // Derived before the move, so the mirror below costs no clone.
-        let derived = stats.to_usage_info();
         if let Ok(mut s) = store.lock() {
             s.insert(entry.name.to_string(), stats);
         }
-        publish_third_party_windows(usage, &entry.name, derived);
         // Ascending rank order: LAST_FETCHED(200) < THIRD_PARTY_STATUS(280).
         if let Ok(mut lf) = last_fetched.lock() {
             lf.insert(
@@ -3019,6 +3092,11 @@ fn drain_oauth_completions(
             entry.access_token = new_access.clone();
             entry.refresh_token = new_refresh.clone();
         }
+        if outcome.login_gone
+            && let Ok(mut t) = state.tokens.lock()
+        {
+            t.retain(|e| e.name != outcome.name);
+        }
         // The active profile's 429 ladder caps low (see `next_slot_deferral`);
         // read the flag at apply time so a switch mid-flight lands the right cadence.
         // `auto_start` rides the same lock: the weekly-reset mark below only
@@ -3116,12 +3194,9 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                 // cache — one landing fetch, one set of readings — and the
                 // fallback legs write none (a cached copy is not a reading).
                 crate::profile::append_wallet_readings(&name, &stats);
-                // Derived before the move, so the mirror below costs no clone.
-                let derived = stats.to_usage_info();
                 if let Ok(mut store) = state.third_party_usage_store.lock() {
                     store.insert(name.to_string(), stats);
                 }
-                publish_third_party_windows(&state.store, &name, derived);
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), FetchStatus::Fresh);
                 }
@@ -3165,21 +3240,10 @@ fn fetch_third_party_due(state: &SchedulerState, due: Vec<ThirdPartyEntry>) {
                     _ if cached.is_some() => (FetchStatus::Cached, None, false),
                     _ => (FetchStatus::Failed, None, false),
                 };
-                let derived = cached
-                    .as_ref()
-                    .and_then(crate::providers::ThirdPartyStats::to_usage_info);
                 if let Some(c) = cached
                     && let Ok(mut store) = state.third_party_usage_store.lock()
                 {
                     store.entry(name.to_string()).or_insert(c);
-                }
-                // Cold-fill, NOT `publish_third_party_windows`: this leg never
-                // overwrites a live reading with disk state, the same rule the
-                // third-party store's own `or_insert` above follows.
-                if let Some(info) = derived
-                    && let Ok(mut s) = state.store.lock()
-                {
-                    s.entry(name.to_string()).or_insert(info);
                 }
                 if let Ok(mut st) = state.third_party_status.lock() {
                     st.insert(name.to_string(), status);
@@ -3483,6 +3547,44 @@ pub(crate) struct SchedulerState {
     fetcher: ThirdPartyFetcher,
 }
 
+/// The plight-latch key for a staged pair the catch-up could not land.
+const STAGE_LAND_PLIGHT: &str = "stage-land";
+
+/// The catch-up leg (lease holder only): every configured claude profile with
+/// a staged pair gets it resolved under its rotation guard — a live stage
+/// lands (`oauth::land_staged_pair`), a landed one runs its hooks, an inert
+/// one goes. `try_acquire`, so a busy guard skips that profile this tick and
+/// the tick thread never parks; a state-flock timeout ends the pass, since
+/// every later profile would wait out the same wedged holder. Inline on the
+/// tick thread for the re-stamp leg's reason: the steady state finds no stage
+/// at all, which costs one `stat` per profile.
+fn catch_up_staged_pairs(config: &crate::profile::ConfigHandle) {
+    let names: Vec<ProfileName> = match config.lock() {
+        Ok(cfg) => cfg.profiles.iter().map(|p| p.name.clone()).collect(),
+        Err(_) => return,
+    };
+    for name in names.iter().filter(|n| crate::oauth::has_stage(n)) {
+        let Ok(Some(guard)) = crate::runtime::RotationGuard::try_acquire(name) else {
+            continue;
+        };
+        match crate::oauth::land_staged_pair(config, name, &guard) {
+            Ok(_) => crate::codex_auth::clear_plight_warn(name.as_str(), STAGE_LAND_PLIGHT),
+            Err(e) => {
+                // A failure that persists (a full disk, an unwritable store)
+                // repeats every tick: logged once until a landing clears it.
+                if crate::codex_auth::plight_warn_once(name.as_str(), STAGE_LAND_PLIGHT) {
+                    logline!("clauth: '{name}': saving the waiting token pair failed: {e:#}");
+                }
+                if e.chain()
+                    .any(|c| c.downcast_ref::<crate::lock::StateLockTimeout>().is_some())
+                {
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// One scheduler tick: drain forced refetches, partition both legs, publish
 /// countdowns, fan out fetches (OAuth + third-party) that republish each
 /// profile's countdown as it lands, propagate rotated tokens, evaluate
@@ -3517,6 +3619,10 @@ fn tick(state: &SchedulerState) {
     // it never races its own appends, and ahead of the fetch legs so a long-run
     // process re-trims before adding to the file rather than after.
     prune_histories_if_due(&state.last_history_prune, &state.config, now_ms());
+
+    // Land any pair a failed persist left staged before anything below reads
+    // the store or spends from memory: ahead of the re-stamp and fetch legs.
+    catch_up_staged_pairs(&state.config);
 
     // CLA-ROLL: rolling-sidecar freshness scan — renew a rolling-token profile's
     // session bearer hours ahead of its clock death instead of relying on
@@ -3714,6 +3820,7 @@ fn tick(state: &SchedulerState) {
     scan_auto_switch(
         &state.config,
         &state.store,
+        &state.third_party_usage_store,
         &state.status,
         &state.third_party_status,
         &state.third_party_streaks,
@@ -3730,6 +3837,7 @@ fn tick(state: &SchedulerState) {
     scan_session_switches(
         &state.config,
         &state.store,
+        &state.third_party_usage_store,
         &state.status,
         &state.third_party_status,
         &state.third_party_streaks,
@@ -3740,6 +3848,7 @@ fn tick(state: &SchedulerState) {
     scan_recovery(
         &state.config,
         &state.store,
+        &state.third_party_usage_store,
         &state.status,
         &state.third_party_status,
         &state.kick_blocks,
@@ -4063,14 +4172,7 @@ fn hydrate_from_daemon_caches(
             interval_ms,
         );
     }
-    bootstrap_third_party(
-        tp_store,
-        store,
-        tp_status,
-        last_fetched,
-        third_party,
-        interval_ms,
-    );
+    bootstrap_third_party(tp_store, tp_status, last_fetched, third_party, interval_ms);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4213,19 +4315,25 @@ fn decision_fresh<R: crate::lockorder::Rank>(
     )
 }
 
-/// [`decision_fresh`] against EITHER store — the OAuth `StatusStore` or the
-/// third-party one. `Profile.fetch_status` (the UI twin's freshness input) is
-/// filled from both in `App::apply_usage`, so the scheduler twin must read both
-/// too or a fresh third-party member looks stale to it alone, inverting the
-/// fresh-preference on a mixed OAuth+third-party chain (2026-07-17). Consulted
+/// [`decision_fresh`] for the side the picker reads: a third-party-classified
+/// member reads its third-party status, every other member reads the OAuth
+/// status (falling back to the third-party one, so a pure third-party member
+/// with no OAuth entry still counts — 2026-07-17). Consulted
 /// by both `scan_auto_switch` (the walk's fresh-preference) and `scan_recovery`
 /// (the relink gate) so both stay in lockstep with the UI twin.
 fn decision_fresh_any(
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
+    third_party: bool,
     name: &ProfileName,
 ) -> bool {
-    decision_fresh(status, name) || decision_fresh(third_party_status, name)
+    if third_party {
+        // The picker reads this member's windows from the provider store, so
+        // the freshness gate guards that leg's status, never the OAuth leg's.
+        decision_fresh(third_party_status, name)
+    } else {
+        decision_fresh(status, name) || decision_fresh(third_party_status, name)
+    }
 }
 
 /// True when `name`'s last reading is a **deep-slot stuck** `RateLimited`: the
@@ -4270,18 +4378,35 @@ pub(crate) fn is_stuck_rate_limited(status: FetchStatus, streak: u32) -> bool {
 /// ONE predicate for the global active ([`scan_auto_switch`]) and for each
 /// chain-following session's own member ([`scan_session_switches`]): the rule is
 /// about what a reading is worth, which does not change with who is reading it.
-/// The reading is OAuth-first: a member with no OAuth status entry (a pure
-/// third-party profile) is judged off its third-party status + streak instead.
+/// The reading follows the picker's side: a third-party-classified member is
+/// judged off its third-party status + streak alone (its OAuth leg still fetches
+/// but its windows no longer come from it); any other member is OAuth-first,
+/// falling back to the third-party reading when it has no OAuth status entry (a
+/// pure third-party profile classified OAuth by a stale config).
 fn reading_is_actionable(
     broken: bool,
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
     streaks: &PollStreaks,
     third_party_streaks: &ThirdPartyStreaks,
+    third_party: bool,
     name: &ProfileName,
 ) -> bool {
     if broken {
         return true;
+    }
+    if third_party {
+        // The picker reads this member's windows from the provider store, so
+        // its actionable reading is the provider leg's status + streak — never
+        // the OAuth leg's, which a hybrid still fetches and which would read
+        // Fresh while the provider leg failed.
+        let tp = third_party_status
+            .lock()
+            .ok()
+            .and_then(|m| m.get(name.as_str()).copied());
+        return tp.is_some_and(|s| {
+            is_stuck_rate_limited(s, third_party_rate_limit_streak(third_party_streaks, name))
+        }) || matches!(tp, Some(FetchStatus::Fresh));
     }
     let reading = status
         .lock()
@@ -4327,36 +4452,47 @@ pub(crate) fn is_stuck_streak(streak: u32) -> bool {
 /// member holding ANY window — lapsed or headroom — never qualifies: that
 /// last Fresh read is a trustworthy verdict the existing rules already judge
 /// (RLS-1), and only the channel's death, not a missing reading, opens the
-/// bypass. The reading is OAuth-first, with the same third-party
-/// status+streak fallback as [`reading_is_actionable`] for a member with no
-/// OAuth status entry.
+/// bypass. The stuck check follows the picker's side, as [`reading_is_actionable`]
+/// does: a third-party-classified member reads its third-party status + streak
+/// alone, every other member is OAuth-first with the third-party fallback for a
+/// member with no OAuth status entry.
 fn reading_dead_names(
     members: &[crate::fallback::ChainMember],
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
     streaks: &PollStreaks,
     third_party_streaks: &ThirdPartyStreaks,
-    store: &UsageStore,
+    third_party_names: &HashSet<ProfileName>,
+    usage: &HashMap<String, UsageInfo>,
 ) -> Vec<ProfileName> {
-    // One store lock window for the windowless checks — the same map the walk
-    // clones a moment later — released before the status/streak reads below,
-    // so no two leaf locks are ever held at once.
-    let windowless: Vec<&crate::fallback::ChainMember> = {
-        let Ok(guard) = store.lock() else {
-            return Vec::new();
-        };
-        members
-            .iter()
-            .filter(|m| {
-                guard
-                    .get(m.name.as_str())
-                    .is_none_or(|i| i.five_hour.is_none())
-            })
-            .collect()
-    };
+    // The windowless check reads the picker snapshot the caller built — the
+    // same map the walk clones a moment later — released before the
+    // status/streak reads below, so no two leaf locks are ever held at once.
+    let windowless: Vec<&crate::fallback::ChainMember> = members
+        .iter()
+        .filter(|m| {
+            usage
+                .get(m.name.as_str())
+                .is_none_or(|i| i.five_hour.is_none())
+        })
+        .collect();
     windowless
         .into_iter()
         .filter(|m| {
+            if third_party_names.contains(&m.name) {
+                // The picker reads this member's windows from the provider
+                // store, so its reading channel is the provider leg.
+                return third_party_status
+                    .lock()
+                    .ok()
+                    .and_then(|s| s.get(m.name.as_str()).copied())
+                    .is_some_and(|s| {
+                        is_stuck_rate_limited(
+                            s,
+                            third_party_rate_limit_streak(third_party_streaks, &m.name),
+                        )
+                    });
+            }
             let reading = status
                 .lock()
                 .ok()
@@ -4386,6 +4522,7 @@ fn reading_dead_names(
 pub(crate) fn scan_auto_switch(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
+    third_party_usage_store: &ThirdPartyUsageStore,
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
     third_party_streaks: &ThirdPartyStreaks,
@@ -4422,7 +4559,7 @@ pub(crate) fn scan_auto_switch(
         .map(|m| m.clone())
         .unwrap_or_default();
     // Snapshot under `config` only — drop guard before taking `usage_store`.
-    let (snapshot, without_snapshot, key_rejected, key_rejected_without_active) = {
+    let (snapshot, without_snapshot, key_rejected, key_rejected_without_active, third_party_names) = {
         let cfg = match config.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -4447,11 +4584,21 @@ pub(crate) fn scan_auto_switch(
             None => key_rejected.clone(),
         };
         let without_snapshot = crate::fallback::snapshot_chain(&cfg, &key_rejected_without_active);
+        // The picker's third-party classification, off the same predicate the
+        // disk readers key on — computed under the same config hold the chain
+        // snapshots are built from, so the set cannot drift from the members.
+        let third_party_names: HashSet<ProfileName> = cfg
+            .profiles
+            .iter()
+            .filter(|p| p.usage_cache_is_third_party())
+            .map(|p| p.name.clone())
+            .collect();
         (
             snapshot,
             without_snapshot,
             key_rejected,
             key_rejected_without_active,
+            third_party_names,
         )
     };
     let Some(mut snapshot) = snapshot else {
@@ -4481,14 +4628,22 @@ pub(crate) fn scan_auto_switch(
     // The dead-reading channel is the same kind of non-config state (issue
     // #83): a deep-stuck `RateLimited` member with no window at all can never
     // produce the live window the walk's exhaustion gate needs, so the scan
-    // hands the walk the bypass flag instead.
+    // hands the walk the bypass flag instead. The picker snapshot is built once
+    // here and shared with the decision below.
+    let usage = crate::fallback::usage_snapshot_for_chain(
+        store,
+        third_party_usage_store,
+        &third_party_names,
+        &snapshot.chain,
+    );
     let reading_dead = reading_dead_names(
         &snapshot.chain,
         status,
         third_party_status,
         streaks,
         third_party_streaks,
-        store,
+        &third_party_names,
+        &usage,
     );
     snapshot.reading_dead = reading_dead.clone();
     without_snapshot.reading_dead = reading_dead;
@@ -4501,7 +4656,14 @@ pub(crate) fn scan_auto_switch(
     let fresh: Vec<ProfileName> = snapshot
         .chain
         .iter()
-        .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
+        .filter(|m| {
+            decision_fresh_any(
+                status,
+                third_party_status,
+                third_party_names.contains(&m.name),
+                &m.name,
+            )
+        })
         .map(|m| m.name.clone())
         .collect();
     snapshot.fresh = fresh.clone();
@@ -4517,12 +4679,18 @@ pub(crate) fn scan_auto_switch(
         third_party_status,
         streaks,
         third_party_streaks,
+        third_party_names.contains(&snapshot.active),
         &snapshot.active.clone(),
     ) {
         return;
     }
 
-    match crate::fallback::next_auto_switch_decision(&snapshot, &without_snapshot, store) {
+    match crate::fallback::next_auto_switch_decision_with_usage(
+        &snapshot,
+        &without_snapshot,
+        &usage,
+        &third_party_names,
+    ) {
         Some(crate::fallback::AutoSwitchDecision {
             action: crate::fallback::SwitchAction::To(name),
             key_rejection_necessary,
@@ -4594,6 +4762,7 @@ struct SessionDecision {
 fn scan_session_switches(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
+    third_party_usage_store: &ThirdPartyUsageStore,
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
     third_party_streaks: &ThirdPartyStreaks,
@@ -4623,12 +4792,23 @@ fn scan_session_switches(
         .unwrap_or_default();
     // Snapshot under `config` only, exactly as `scan_auto_switch` does: holding it
     // while taking `usage_store` is the `App::apply_usage` inversion.
-    let (chain, pending, key_rejected): (Vec<String>, Vec<SessionDecision>, HashSet<ProfileName>) = {
+    let (chain, pending, key_rejected, third_party_names): (
+        Vec<String>,
+        Vec<SessionDecision>,
+        HashSet<ProfileName>,
+        HashSet<ProfileName>,
+    ) = {
         let Ok(cfg) = config.lock() else { return };
         let key_rejected: HashSet<ProfileName> =
             current_key_rejected_names(&broken_snapshot, &cfg.profiles)
                 .into_iter()
                 .collect();
+        let third_party_names: HashSet<ProfileName> = cfg
+            .profiles
+            .iter()
+            .filter(|p| p.usage_cache_is_third_party())
+            .map(|p| p.name.clone())
+            .collect();
         let chain = cfg
             .state
             .fallback_chain
@@ -4657,7 +4837,7 @@ fn scan_session_switches(
                 })
             })
             .collect();
-        (chain, pending, key_rejected)
+        (chain, pending, key_rejected, third_party_names)
     };
 
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
@@ -4670,21 +4850,36 @@ fn scan_session_switches(
     {
         // Neither of these is config state, so `snapshot_session_chain` cannot fill
         // them — same split `scan_auto_switch` works to. `reading_dead` follows the
-        // same split again (issue #83's dead-reading bypass).
+        // same split again (issue #83's dead-reading bypass). The picker snapshot
+        // is built once and shared with the walk below.
         snapshot.kick_rejected = kick_rejected.clone();
         snapshot.broken.extend(key_rejected.iter().cloned());
+        let usage = crate::fallback::usage_snapshot_for_chain(
+            store,
+            third_party_usage_store,
+            &third_party_names,
+            &snapshot.chain,
+        );
         snapshot.reading_dead = reading_dead_names(
             &snapshot.chain,
             status,
             third_party_status,
             streaks,
             third_party_streaks,
-            store,
+            &third_party_names,
+            &usage,
         );
         snapshot.fresh = snapshot
             .chain
             .iter()
-            .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
+            .filter(|m| {
+                decision_fresh_any(
+                    status,
+                    third_party_status,
+                    third_party_names.contains(&m.name),
+                    &m.name,
+                )
+            })
             .map(|m| m.name.clone())
             .collect();
         let member_broken = snapshot.broken.contains(&member);
@@ -4703,6 +4898,7 @@ fn scan_session_switches(
             third_party_status,
             streaks,
             third_party_streaks,
+            third_party_names.contains(&member),
             &member,
         ) {
             continue;
@@ -4711,7 +4907,11 @@ fn scan_session_switches(
         // session cannot be left credential-less mid-flight and there is no member
         // name to write. It, and a stay-put `None`, leave the row as it stands.
         let Some(crate::fallback::SwitchAction::To(target)) =
-            crate::fallback::next_auto_switch_target(&snapshot, store)
+            crate::fallback::next_auto_switch_target_with_usage(
+                &snapshot,
+                &usage,
+                &third_party_names,
+            )
         else {
             continue;
         };
@@ -4767,6 +4967,7 @@ fn scan_session_switches(
 fn scan_recovery(
     config: &crate::profile::ConfigHandle,
     store: &UsageStore,
+    third_party_usage_store: &ThirdPartyUsageStore,
     status: &StatusStore,
     third_party_status: &ThirdPartyStatusStore,
     kick_blocks: &KickBlocks,
@@ -4792,7 +4993,11 @@ fn scan_recovery(
     // touching store (avoids the config↔store inversion that
     // `next_auto_switch_target` avoids via ChainSnapshot). The walk-order
     // mode rides out of the same lock hold.
-    let (members, walk_order): (Vec<crate::fallback::ChainMember>, crate::profile::WalkOrder) = {
+    let (members, walk_order, third_party_names): (
+        Vec<crate::fallback::ChainMember>,
+        crate::profile::WalkOrder,
+        HashSet<ProfileName>,
+    ) = {
         let cfg = match config.lock() {
             Ok(c) => c,
             Err(_) => return,
@@ -4801,6 +5006,12 @@ fn scan_recovery(
             current_key_rejected_names(&broken_snapshot, &cfg.profiles)
                 .into_iter()
                 .collect();
+        let third_party_names: HashSet<ProfileName> = cfg
+            .profiles
+            .iter()
+            .filter(|p| p.usage_cache_is_third_party())
+            .map(|p| p.name.clone())
+            .collect();
         let weekly_pct = cfg.state.weekly_switch_threshold_pct();
         // Only scan for recovery after switch-off-all (no active profile).
         if cfg.state.active_profile.is_some() {
@@ -4846,6 +5057,7 @@ fn scan_recovery(
                 })
                 .collect(),
             walk_order,
+            third_party_names,
         )
     };
 
@@ -4855,14 +5067,27 @@ fn scan_recovery(
     // fallback is recoverable after switch-off-all instead of frozen out.
     let members: Vec<crate::fallback::ChainMember> = members
         .into_iter()
-        .filter(|m| decision_fresh_any(status, third_party_status, &m.name))
+        .filter(|m| {
+            decision_fresh_any(
+                status,
+                third_party_status,
+                third_party_names.contains(&m.name),
+                &m.name,
+            )
+        })
         .collect();
 
     // A switch-grade kick-rejected member is not "recovered" — its idle-looking
     // usage is exactly what the messages-limiter rejection freezes it in.
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
+    let usage = crate::fallback::usage_snapshot_for_chain(
+        store,
+        third_party_usage_store,
+        &third_party_names,
+        &members,
+    );
     if let Some(name) =
-        crate::fallback::find_recovered_member(&members, store, &kick_rejected, walk_order)
+        crate::fallback::find_recovered_member(&members, &usage, &kick_rejected, walk_order)
         && let Ok(mut p) = pending_switch.lock()
     {
         // Recovery has no key-rejected active (it only runs after switch-off), so

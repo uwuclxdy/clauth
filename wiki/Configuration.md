@@ -138,11 +138,13 @@ clauth keeps no file for the queue: it derives the last open from `usage_history
 | `refresh_spent_accounts` | bool | `true` | keep polling accounts at 100% |
 | `auto_start_queue` | bool | `false` | interleave the `auto_start` ping so windows open `5h / N` apart |
 | `preemptive_rotation` | bool | `true` | rotate OAuth ahead of expiry; `false` waits for a rejection |
+| `preserve_non_login_keys` | bool | `true` | keep what Claude Code stores beside each account's login (a `/design-login`) with that account across switches and relinks, and carry MCP-server logins into a setup token's sidecar too ([Security](Security#design-logins-and-other-keys-beside-the-login)); `false` is the behavior before the key existed. An unreadable profiles.toml counts as `true` |
 | `weekly_switch_threshold` | float | `98.0` | chain-wide 7d exhaustion line, 50-100; the codex chain has its own copy of this key in `codex-profiles.toml` ([below](Configuration#codex-profilestoml)) |
 | `burn_aware_switching` | bool | `false` | project usage forward instead of comparing to the threshold |
 | `burn_switch_floor_pct` | float | `98.0` | earliest point burn-aware may switch, 90-100 |
 | `burn_horizon_cap_ms` | int | `60000` | how far ahead burn-aware projects |
-| `walk_order` | string | `chain` | reorder each accept pass by the soonest-resetting 7d window: `chain` or `soonest-weekly-reset` |
+| `walk_order` | string | `chain` | order each accept pass by chain position, the soonest-resetting 7d window or the least-used 7d window: `chain`, `soonest-weekly-reset` or `most-weekly-headroom` |
+| `bell_command` | string | none | the program the daemon runs once each time an account's 5h usage reaches its `bell_threshold` ([below](Configuration#configtoml)), with `%s` standing for the alert's text (`alert: work at 95%`). Split by shell quoting rules and run without a shell: `notify-send 'clauth' %s`, or `sh -c 'logger "$1"' sh %s` when you want a shell (the text stays one argument). A Windows path goes in single quotes (`'C:\tools\notify.exe' %s`). An unbalanced quote, a trailing backslash or an empty value is logged and runs nothing. Hand-edited only; unset means no headless alert |
 | `wrap_off` | bool | `false` | switch off all accounts once the chain is out of quota |
 | `spend_budget_switching` | bool | `false` | master switch for pay-as-you-go fallback |
 | `switch_off_when_budget_spent` | bool | `true` | switch off once the spend ceiling is used up |
@@ -200,7 +202,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
 | `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
-| `bell_threshold` | float | none | 5h % that fires a bell toast |
+| `bell_threshold` | float | none | 5h % at which the TUI shows an alert toast and the daemon runs `bell_command`: once per crossing, again only after usage falls back below. The Setup tab's `alert at` row edits it |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
 | `[env]` | table | `{}` | extra environment variables merged into `settings.json` while active |
 | `[models]` | table | `{}` | `default`, `opus`, `sonnet`, `haiku`, `fable`, `subagent` |
@@ -240,7 +242,10 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   clauthd.pid              # the running daemon's process id
   gateway.toml             # the managed shunt gateway: its adopted config, optional binary and env file, the disabled flag (0600)
   gateway-admin-token      # the gateway's admin write key, alone in its file (0600)
+  gateway-client-tokens.toml # the gateway's client tokens, one per claude profile, minted by clauth and never shown (0600)
   gateway-child.json       # the gateway the daemon spawned (pid, start time, stop deadline), so the next daemon can finish its stop
+  gateway-hold             # the TUI's transient gateway stop: the pid + start time of the daemon whose gateway it holds off (0600)
+  gateway-env.json         # the running daemon's CODEX_HOME, HOME, USERPROFILE, SHUNT_SERVER__BIND and SHUNT_SERVER__AUTH__* keys at its start, plus the client names (never the tokens) its client-tokens variable holds, which the store move, the adopt, the Services card and the client-token checks read (0600)
   gateway.log              # the gateway's own stdout and stderr, size-capped like daemon.log
   shunt/                   # the gateway's credential stores: accounts/{claude,codex,kimi,antigravity}/, xai-auth.json, cursor-auth.json, antigravity-auth.json, codex-auth.json, claude-credentials.json
   proxies.toml             # the proxy registry: one [service] table per registered proxy, in service order (0600)
@@ -264,16 +269,19 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
   rotation-locks/<name>.lock  # one OAuth-rotation lock per account
   keychain-quarantine/     # macOS: raw bytes of a corrupted Keychain item, saved before clauth overwrites or deletes it
   keychain-item-owners.json # which per-session Keychain items clauth seeded; the census deletes nothing else
+  keychain-which-cache/     # macOS: one cached Keychain read per service backing `clauth which`, ~30 s TTL (0600, swept after a day)
   profiles/
     work/
       config.toml          # everything in the table above
-      credentials.json     # OAuth snapshot (.pending while a rotation is mid-write)
+      credentials.json     # OAuth snapshot
+      credentials.json.staged # a refreshed pair waiting to land in credentials.json after a busy or failed save
+      auth.spent.json      # fingerprints of the last 64 refresh tokens clauth traded in, never the tokens
       mcp-logins.json      # MCP-server logins parked while this profile stores no Claude login
       note.txt             # the account's free-form note, edited from the usage tab's n key (0600)
       session-token.json   # long-lived setup-token login, when captured
       session-token.static.json # the mint a rolling token superseded, kept for the restore
-      usage_cache.json     # last-known utilization and plan
-      usage_history.jsonl  # 2 days of samples, feeding burn-aware switching
+      usage_cache.json     # last-known utilization, plan and account email
+      usage_history.jsonl  # 2 days of samples (plan and account email included), feeding burn-aware switching
       wallet_history.jsonl # 2 days of balance readings, feeding the wallet-burn rate
       third_party_cache.json
       third_party_auth.json# set while the usage login is expired; a hash, never the credential
@@ -309,6 +317,6 @@ Two accounts naming the same day is not rejected: the chain returns to whichever
 
 Five static lock files sit alongside and are never deleted on purpose: `.lock`, `clauthd.lock`, `clauthd-standby.lock`, `usage-fetch.lock`, `conversations/.lock`. The tree above lists the stable user-facing stores and the transient paths that are unsafe to remove; other clauth-owned temporary or migration files can appear, so an unlisted path is not by itself proof of leftover state. Everything under `~/.clauth` is `0600`, every directory `0700`, re-tightened on each launch. The plugin tree is not: it carries no credentials and lands at your umask.
 
-Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
+Deleting any `*_cache.json`, `third_party_auth.json`, or `status.json` costs you history and nothing else. Deleting `usage_history.jsonl` costs burn-aware switching its samples and the queue its anchor, so the queue re-spaces from scratch over the next cycle. Deleting `wallet_history.jsonl` costs the wallet-burn rate its series; the rate rebuilds from the next day of fetches. Deleting `credentials.json` or `session-token.json` signs that profile out. Deleting `credentials.json.staged` before clauth lands it can sign that profile out. Deleting a codex profile's `auth.json` signs it out too, and your own codex with it when `~/.codex/auth.json` links there.
 
 The `-<sid>` suffix appears on every isolated session, and on a shared one wherever the OS grants symlinks. Where it does not (a home on exFAT, FAT32 or SMB, or Windows without the symlink privilege) clauth builds a shared runtime tree by copying `~/.claude/`, so every shared session of one profile lands on a single unsuffixed `runtime/` instead of paying for a copy each. An isolated session copies nothing from `~/.claude/`, so it keeps its own suffixed tree there too and its transcripts are rescued on its own exit rather than the last one out. A codex session home follows the same rule with both flavors collapsing: `codex-home-<sid>` and `codex-home-isolated-<sid>` where symlinks work, the bare `codex-home` (the store itself) and `codex-home-isolated` where they do not ([Codex](Codex#windows-and-hosts-without-symlinks)).

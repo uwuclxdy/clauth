@@ -1366,6 +1366,10 @@ fn merge_topup(
     base.topped_up_through = max_date;
 }
 
+pub(crate) fn is_placeholder_model(model: &str) -> bool {
+    model.contains(['<', '>'])
+}
+
 /// Parse one JSONL transcript into per-line contribution records, collapsing
 /// each turn's streaming deltas into its completed line (see
 /// [`collapse_streamed_turns`]) and classifying + correcting the per-model
@@ -1469,6 +1473,11 @@ fn parse_file(path: &Path) -> Vec<LineRec> {
         });
     }
     let mut out = collapse_streamed_turns(out);
+    for rec in &mut out {
+        if rec.has_usage && is_placeholder_model(&rec.model) {
+            rec.has_usage = false;
+        }
+    }
     apply_usage_shapes(&mut out);
     out
 }

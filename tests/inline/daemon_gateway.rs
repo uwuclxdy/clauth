@@ -16,8 +16,15 @@ use std::process::Command;
 use std::time::Duration;
 
 use super::*;
+// The local `struct Supervised` (unix-only) shadows the trait of the same
+// name, so bring the trait's methods (`.intent`) into scope without binding
+// its name. On windows the glob above already imports the trait.
+#[cfg(unix)]
+use super::Supervised as _;
 use crate::gateway::GatewayRecord;
 use crate::testutil::HomeSandbox;
+#[cfg(unix)]
+use crate::testutil::no_shunt_env;
 
 #[cfg(unix)]
 #[path = "../support/gateway_stub.rs"]
@@ -63,9 +70,10 @@ fn shown(path: &std::path::Path) -> Option<String> {
 
 // ── the slot ────────────────────────────────────────────────────────────────
 
-const ALL_STATES: [GatewayState; 14] = [
+const ALL_STATES: [GatewayState; 15] = [
     GatewayState::Absent,
     GatewayState::Disabled,
+    GatewayState::Held,
     GatewayState::NoConfig,
     GatewayState::YamlRefused,
     GatewayState::Misconfigured,
@@ -107,6 +115,15 @@ fn fixture(state: GatewayState) -> (GatewaySlot, &'static str) {
                 ..blank(state)
             },
             r#"{"state":"disabled","config":"/etc/shunt/shunt.toml","binary":"/usr/local/bin/shunt","port":null,"pid":null,"version":null,"answerer":null,"floor":"0.48.0","restarts":2,"last_exit":{"code":null,"signal":15},"reason":null,"since":"2026-09-21T14:13:20+00:00"}"#,
+        ),
+        GatewayState::Held => (
+            GatewaySlot {
+                config,
+                binary,
+                since,
+                ..blank(state)
+            },
+            r#"{"state":"held","config":"/etc/shunt/shunt.toml","binary":"/usr/local/bin/shunt","port":null,"pid":null,"version":null,"answerer":null,"floor":"0.48.0","restarts":0,"last_exit":null,"reason":null,"since":"2026-09-21T14:13:20+00:00"}"#,
         ),
         GatewayState::NoConfig => (
             GatewaySlot {
@@ -385,7 +402,7 @@ fn without_a_supervisor_the_slot_reads_the_record_alone() {
         unsupervised_slot(),
         GatewaySlot {
             reason: Some(format!(
-                "invalid gateway record {}: the adopted shunt config must be an absolute path, got shunt.toml",
+                "invalid gateway record {}: the shunt config must be an absolute path, got shunt.toml",
                 path.display()
             )),
             ..blank(GatewayState::Misconfigured)
@@ -540,6 +557,58 @@ impl Rig {
 
     fn touch(&self, name: &str) {
         fs::write(self.dir.join(name), "").expect("stub switch");
+    }
+
+    /// Rewrite the `shunt` stub to also answer `check`, keeping the run path
+    /// [`stub::write_stub`] wrote and the fifo it made: a `run` behaves
+    /// exactly as before, while a `check` records one line per run in
+    /// `dir/checks` and exits by marker — `check-fail` exits 1 with one
+    /// stderr line, `check-slow` sleeps 60 s (for a timeout), else it exits 0.
+    fn arm_check_stub(&self) {
+        let script = format!(
+            "#!/bin/sh\n\
+             d='{d}'\n\
+             if [ \"$1\" = \"check\" ]; then\n\
+             \x20 echo check >> \"$d/checks\"\n\
+             \x20 if [ -e \"$d/check-slow\" ]; then echo $$ > \"$d/check-slow-pid\"; exec sleep 60; fi\n\
+             \x20 if [ -e \"$d/check-fail\" ]; then echo 'config error: boom' >&2; exit 1; fi\n\
+             \x20 exit 0\n\
+             fi\n\
+             if [ -e \"$d/ignore-term\" ]; then\n\
+             \x20 trap 'echo \"term $$\" >> \"$d/signals\"' TERM\n\
+             else\n\
+             \x20 trap 'echo \"term $$\" >> \"$d/signals\"; trap - TERM; kill -s TERM $$' TERM\n\
+             fi\n\
+             {{\n\
+             \x20 echo \"pid $$\"\n\
+             \x20 echo \"bin $0\"\n\
+             \x20 for a in \"$@\"; do echo \"arg $a\"; done\n\
+             \x20 echo \"cwd $(pwd -P)\"\n\
+             \x20 env | grep -e '^SHUNT_' -e '^CODEX_AUTH_FILE=' -e '^CLAUDE_CREDENTIALS=' | LC_ALL=C sort | sed 's/^/env /'\n\
+             \x20 echo \"secret ${{GATEWAY_TEST_SECRET-}}\"\n\
+             \x20 echo end\n\
+             }} >> \"$d/calls\"\n\
+             echo \"gateway stub stdout $$\"\n\
+             echo \"gateway stub stderr $$\" >&2\n\
+             if [ ! -e \"$d/no-health\" ]; then exec 3>\"$d/fifo\"; fi\n\
+             i=0\n\
+             while [ \"$i\" -lt 120 ]; do\n\
+             \x20 sleep 1 3>&- &\n\
+             \x20 wait $!\n\
+             \x20 i=$((i + 1))\n\
+             done\n",
+            d = self.dir.display(),
+        );
+        fs::write(&self.binary, script).expect("arm the check stub");
+    }
+
+    /// The number of `check` runs the armed stub recorded.
+    fn check_runs(&self) -> usize {
+        fs::read_to_string(self.dir.join("checks"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count()
     }
 }
 
@@ -1040,6 +1109,1968 @@ fn a_changed_binary_stops_the_running_gateway_once_and_spawns_the_new_one_once()
             since: Some(AT_T15.to_string()),
             ..rig.described(GatewayState::Healthy)
         }
+    );
+}
+
+/// The rig's config text with `[server.admin]` added after the bind table, so
+/// the same port and drain keep the spawn preparable while the admin-table
+/// fact flips.
+#[cfg(unix)]
+fn with_admin_table(rig: &Rig) -> String {
+    format!(
+        "[server]\nbind = \"127.0.0.1:{port}\"\nshutdown_timeout_seconds = 2\n[server.admin]\n",
+        port = rig.port
+    )
+}
+
+/// The rig's config text with clauth's own `[server.admin]` entry — the shape
+/// [`crate::gateway::add_admin_table`] writes: a table plus a `write_keys`
+/// entry carrying clauth's id and `${file:}` key reference.
+#[cfg(unix)]
+fn with_clauth_admin_table(rig: &Rig) -> String {
+    let key_ref = format!(
+        "${{file:{}}}",
+        rig.home
+            .home()
+            .join(".clauth")
+            .join("gateway-admin-token")
+            .display()
+    );
+    format!(
+        "[server]\nbind = \"127.0.0.1:{port}\"\nshutdown_timeout_seconds = 2\n[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"{key_ref}\"\n",
+        port = rig.port
+    )
+}
+
+/// A config that gains `[server.admin]` after the child spawned restarts it
+/// with the normal stop: one SIGTERM to the old run, one spawn on the changed
+/// config, no crash counted and `restarts` unchanged. The first stub ignores
+/// SIGTERM, so the `terms` pin counts every signal it got.
+#[cfg(unix)]
+#[test]
+fn a_config_gaining_the_admin_table_restarts_the_gateway_once_without_a_restart_count() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("ignore-term");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let first = rig.only_call();
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a config that gained [server.admin] restarts the child"
+    );
+
+    stub::wait_until("the first stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
+    supervisor.step(t0.after(secs(14)));
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(14)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [first.pid],
+        "the receiver side: exactly one SIGTERM, not two"
+    );
+}
+
+/// The client-token pairs a run saw, as `KEY=VALUE`.
+#[cfg(unix)]
+fn tokens_env(call: &stub::Invocation) -> Vec<String> {
+    call.env
+        .iter()
+        .filter(|pair| pair.starts_with("SHUNT_CLIENT_TOKENS="))
+        .cloned()
+        .collect()
+}
+
+/// A client-token store change after the child spawned restarts it once with
+/// the normal stop: one SIGTERM to the old run, one spawn carrying the new
+/// pairs, no crash counted and `restarts` unchanged. A store op that writes
+/// nothing restarts nothing. The first stub ignores SIGTERM, so the `terms`
+/// pin counts every signal it got.
+#[cfg(unix)]
+#[test]
+fn a_client_token_store_change_restarts_the_gateway_once_without_a_restart_count() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    rig.touch("ignore-term");
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    let add = |profile: &str| {
+        crate::gateway_tokens::add_client_token(&record, profile)
+            .expect("add")
+            .expose()
+            .to_string()
+    };
+    let kerry = add("kerry");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let first = rig.only_call();
+    assert_eq!(
+        tokens_env(&first),
+        [format!("SHUNT_CLIENT_TOKENS=kerry:{kerry}")]
+    );
+
+    assert!(
+        !crate::gateway_tokens::remove_client_token(&record, "nobody").expect("remove"),
+        "a profile holding no token"
+    );
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a store op that writes nothing keeps the child"
+    );
+
+    let alice = add("alice");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a store change restarts the child"
+    );
+    stub::wait_until("the first stub records its SIGTERM", secs(10), || {
+        !stub::terms(&rig.dir).is_empty()
+    });
+    supervisor.step(t0.after(secs(15)));
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(15)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(
+        tokens_env(&calls[1]),
+        [format!("SHUNT_CLIENT_TOKENS=alice:{alice},kerry:{kerry}")]
+    );
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [first.pid],
+        "the receiver side: exactly one SIGTERM, not two"
+    );
+
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(16)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert_eq!(
+        rig.calls().len(),
+        2,
+        "the new run's own store restarts nothing"
+    );
+}
+
+/// A hand edit naming another tokens variable (`[server.auth].tokens_env`)
+/// while a token is stored changes the variable shunt reads them from, which
+/// it reads at spawn alone: the gateway restarts once and the new run carries
+/// the pairs in the new variable. An edit leaving the variable as it was
+/// restarts nothing.
+#[cfg(unix)]
+#[test]
+fn a_changed_tokens_variable_restarts_the_gateway_once() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    rig.arm_check_stub();
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    let kerry = crate::gateway_tokens::add_client_token(&record, "kerry")
+        .expect("add")
+        .expose()
+        .to_string();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let base = format!(
+        "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_CLIENT_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "the same variable spelled out restarts nothing"
+    );
+
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_OTHER_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "another variable restarts the child"
+    );
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(4)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(
+        calls[1]
+            .env
+            .iter()
+            .filter(|pair| pair.contains("_TOKENS="))
+            .cloned()
+            .collect::<Vec<_>>(),
+        [format!("SHUNT_OTHER_TOKENS=kerry:{kerry}")]
+    );
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// A tokens-variable change is a config hand edit, so its restart passes the
+/// same `shunt check` gate the restart-only settings do: a refused check
+/// keeps the serving child and is memoized; the fixed edit restarts it once.
+#[cfg(unix)]
+#[test]
+fn a_tokens_variable_change_shunt_check_refuses_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    crate::gateway_tokens::add_client_token(&record, "kerry").expect("add");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+    let base = format!(
+        "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_OTHER_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a refused check keeps the child"
+    );
+    assert!(stub::alive(pid), "the child serves on");
+    assert_eq!(rig.check_runs(), 1, "one check on the refused bytes");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(rig.check_runs(), 1, "unchanged bytes are not re-checked");
+
+    fs::remove_file(rig.dir.join("check-fail")).expect("clear the refusal");
+    fs::write(
+        &rig.config,
+        format!("{base}[server.auth]\ntokens_env = \"SHUNT_THIRD_TOKENS\"\n"),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(4)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a passing check restarts the child"
+    );
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(5)),
+        GatewayState::Starting,
+    );
+    assert_eq!(rig.calls().len(), 2, "respawned exactly once");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// A store name the env file's own value now holds (the env file edited
+/// after the add) keeps the gateway down, the slot naming the name and never
+/// a value: shunt refuses a duplicate name whole.
+#[cfg(unix)]
+#[test]
+fn a_store_name_the_env_file_now_holds_keeps_the_gateway_down_naming_it() {
+    let rig = Rig::new("0.49.1");
+    let _env = no_shunt_env(&rig.home);
+    let record = GatewayRecord::load().expect("load").expect("a record");
+    crate::gateway_tokens::add_client_token(&record, "kerry").expect("add");
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n[server.auth]\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    fs::write(
+        &rig.env_file,
+        "GATEWAY_TEST_SECRET=from-env-file\nSHUNT_CLIENT_TOKENS=kerry:k0-secret\n",
+    )
+    .expect("env file");
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    let slot = rig.slot();
+    assert_eq!(slot.state, GatewayState::Misconfigured);
+    assert_eq!(
+        slot.reason,
+        Some(format!(
+            "the gateway's env file {} and clauth's client-token store both name a client \"kerry\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file, or remove clauth's token for that profile",
+            rig.env_file.display()
+        ))
+    );
+    assert!(
+        stub::invocations(&rig.dir).is_empty(),
+        "nothing was spawned"
+    );
+}
+
+/// An edit to a hot-reloadable setting keeps the child: only the restart-only
+/// facts force a restart.
+#[cfg(unix)]
+#[test]
+fn an_edit_to_a_hot_reloadable_setting_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\nsse_keepalive_seconds = 60\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a hot-reloadable edit keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a hot-reloadable edit");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A re-read that does not parse is no evidence: the child keeps running (the
+/// "a record that does not load keeps a running gateway" precedent).
+#[cfg(unix)]
+#[test]
+fn a_config_that_becomes_unparseable_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, "[server\nbind = \"127.0.0.1:1\"\n").expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "an unparseable re-read is no evidence and keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for an unparseable config");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A config that had the table at spawn and still has it keeps the child.
+#[cfg(unix)]
+#[test]
+fn a_config_that_had_the_admin_table_at_spawn_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a table held since spawn keeps the child"
+    );
+    assert!(
+        stub::alive(pid),
+        "never stopped for a table it spawned with"
+    );
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// The stop line for an admin-table restart names its cause distinctly from a
+/// record change, so `daemon.log` says why.
+#[cfg(unix)]
+#[test]
+fn the_admin_table_restart_names_its_cause() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Stopping);
+    let stop_line = format!(
+        "clauth daemon: stopping the shunt gateway (pid {pid}): its config changed [server.admin]"
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == stop_line)
+            .count(),
+        1,
+        "the log line names the cause distinctly from a record change"
+    );
+}
+
+/// A gained table whose `shunt check` refuses keeps the child, logs the
+/// refusal once (the daemon's own words, never the check's stderr), and does
+/// not re-run the check while the bytes stay unchanged within the re-check
+/// bound.
+#[cfg(unix)]
+#[test]
+fn a_gained_table_whose_check_is_refused_keeps_the_child_and_logs_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a gained table whose check is refused keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a refused check");
+    assert_eq!(rig.calls().len(), 1, "no respawn on a refused check");
+    assert_eq!(rig.check_runs(), 1, "one check for the gained table");
+
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config changed [server.admin], but `{} check --config {}` refused it (exit 1); keeping the running gateway until the check passes; run that command to see why",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the refusal is logged once, in the daemon's own words"
+    );
+
+    // Unchanged bytes within the re-check bound: the memo keeps the check
+    // from re-running.
+    supervisor.step(t0.after(secs(3)));
+    supervisor.step(t0.after(secs(4)));
+    assert_eq!(rig.check_runs(), 1, "an unchanged config is not re-checked");
+    assert_eq!(rig.calls().len(), 1, "still no respawn");
+    assert!(
+        stub::alive(pid),
+        "the child stays alive across the memoized rounds"
+    );
+}
+
+/// The same refused config, then fixed (bytes change, check passes): the
+/// changed bytes are re-checked and the child restarts exactly once.
+#[cfg(unix)]
+#[test]
+fn a_gained_table_refused_then_fixed_restarts_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert!(stub::alive(pid), "the refused check keeps the child");
+    assert_eq!(rig.check_runs(), 1, "one check on the refused bytes");
+
+    // The user finishes the edit: the bytes change and the check now passes.
+    fs::remove_file(rig.dir.join("check-fail")).expect("clear the refusal");
+    fs::write(&rig.config, with_clauth_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(3)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a fixed config whose check passes restarts the child"
+    );
+    assert_eq!(rig.check_runs(), 2, "the changed bytes are re-checked once");
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(4)),
+        GatewayState::Starting,
+    );
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// A `shunt check` that outruns its bound keeps the child: the restart is
+/// gated on the check passing, and a wedged check is a refusal.
+#[cfg(unix)]
+#[test]
+fn a_check_that_times_out_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-slow");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    let _short = crate::gateway::CheckTimeoutOverride::set(Duration::from_millis(200));
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a timed-out check keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a timed-out check");
+    assert_eq!(rig.calls().len(), 1, "no respawn on a timed-out check");
+    assert_eq!(rig.check_runs(), 1, "one check ran");
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config changed [server.admin], but `{} check --config {}` ran past 200ms and was stopped; keeping the running gateway until the check passes; run that command to see why it does not finish",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the timeout is logged once, in the daemon's own words"
+    );
+}
+
+/// A refusal fixed only through the stub's answer (the config bytes
+/// unchanged) is re-checked once the re-check bound elapses on the harness's
+/// clock, never before, and restarts exactly once.
+#[cfg(unix)]
+#[test]
+fn a_refusal_fixed_through_the_stub_restarts_once_the_bound_elapses() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert!(stub::alive(pid), "the refused check keeps the child");
+    assert_eq!(rig.check_runs(), 1, "one check on the refused bytes");
+
+    // Fix only what the stub answers; the config bytes stay byte-identical.
+    fs::remove_file(rig.dir.join("check-fail")).expect("clear the refusal");
+
+    supervisor.step(t0.after(secs(61)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "no restart before the re-check bound elapses"
+    );
+    assert_eq!(rig.check_runs(), 1, "no re-check before the bound");
+
+    // The bound elapses 60 s after the refusal (at 2 s): the unchanged bytes
+    // are re-checked, the check now passes, and the child restarts once.
+    supervisor.step(t0.after(secs(62)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a fixed check restarts once the bound elapses"
+    );
+    assert_eq!(
+        rig.check_runs(),
+        2,
+        "the unchanged bytes are re-checked after the bound"
+    );
+    rig.server.wait_serving(false);
+    step_until(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(63)),
+        GatewayState::Starting,
+    );
+    assert_eq!(rig.calls().len(), 2, "respawned exactly once");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+}
+
+/// An unchanged refusal re-checked after each bound still logs once: the
+/// refusal line is logged when its text differs from the last one for this
+/// child, never once per re-check.
+#[cfg(unix)]
+#[test]
+fn an_unchanged_refusal_rechecked_twice_logs_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert_eq!(rig.check_runs(), 1, "the first check");
+
+    // Two re-checks, one per elapsed bound, each still refused.
+    supervisor.step(t0.after(secs(62)));
+    assert_eq!(rig.check_runs(), 2, "re-checked once the bound elapses");
+    supervisor.step(t0.after(secs(63)));
+    assert_eq!(
+        rig.check_runs(),
+        2,
+        "the bound restarts at each re-check, never one check per round"
+    );
+    supervisor.step(t0.after(secs(122)));
+    assert_eq!(rig.check_runs(), 3, "re-checked again a bound later");
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    assert!(stub::alive(pid), "never stopped for an unchanged refusal");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config changed [server.admin], but `{} check --config {}` refused it (exit 1); keeping the running gateway until the check passes; run that command to see why",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the refusal is logged once, not once per re-check"
+    );
+}
+
+/// A `shunt check` whose binary is gone keeps the child and logs the missing
+/// binary by path, in the daemon's own words.
+#[cfg(unix)]
+#[test]
+fn a_missing_check_binary_keeps_the_child_and_names_the_binary() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    // The binary the child already runs as is gone by the time the check
+    // would run: the running child is unaffected, the check finds nothing.
+    fs::remove_file(&rig.binary).expect("remove the binary");
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a missing check binary keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a missing binary");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config changed [server.admin], but {} is not there to check it; keeping the running gateway until the check passes",
+        rig.binary.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the missing binary is logged once, by path"
+    );
+}
+
+/// A check cancelled before it starts — the cancel flag already set — yields
+/// the cancellation outcome (never a timeout) and never restarts the child.
+#[cfg(unix)]
+#[test]
+fn a_check_cancelled_before_it_starts_is_cancelled_not_a_timeout_and_never_restarts() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-slow");
+
+    // By value: a cancel already set when the check starts yields the
+    // cancellation outcome, never `CheckTimedOut`.
+    {
+        let mut record = GatewayRecord::new(rig.config.clone()).expect("adoptable");
+        record.binary = Some(rig.binary.clone());
+        record.env_file = Some(rig.env_file.clone());
+        let cancel = AtomicBool::new(true);
+        let _short = crate::gateway::CheckTimeoutOverride::set(Duration::from_millis(200));
+        let err = crate::gateway::check_adopted_config(&record, &cancel)
+            .expect_err("a cancelled check refuses");
+        assert_eq!(
+            err.downcast_ref::<crate::gateway::ConfigEditRefusal>(),
+            None,
+            "the cancellation is not a ConfigEditRefusal, never CheckTimedOut"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("{} was cancelled while it ran", rig.binary.display()),
+            "the cancellation outcome by value"
+        );
+    }
+
+    // Through the gate: a cancel already set keeps the child silently.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut supervisor = Supervised(Supervisor::build_with_cancel(
+        Gateway::for_daemon(),
+        Arc::clone(&rig.handle),
+        Arc::clone(&cancel),
+    ));
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    cancel.store(true, Ordering::SeqCst);
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a check cancelled before it starts never restarts the child"
+    );
+    assert!(stub::alive(pid), "the child stays alive");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+    assert!(
+        !rig.lines
+            .snapshot()
+            .iter()
+            .any(|line| line.contains("keeping")),
+        "a cancelled check is silent, never a refusal line"
+    );
+}
+
+/// A gained table shaped as clauth's own entry (the shape `add_admin_table`
+/// writes) reads as present and restarts: the fact is the key's presence,
+/// never which admin step it needs.
+#[cfg(unix)]
+#[test]
+fn a_gained_table_shaped_as_clauths_own_restarts() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+
+    fs::write(&rig.config, with_clauth_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "a table shaped as clauth's own entry restarts the child"
+    );
+    assert_eq!(rig.check_runs(), 1, "the gain is gated on one check");
+}
+
+/// A child spawned while `[server.admin]` was a non-table value does not
+/// restart when the table later appears: the fact reads the key's presence,
+/// and a non-table `admin` is already present, so the table's appearance is
+/// no change.
+#[cfg(unix)]
+#[test]
+fn a_config_whose_admin_shape_was_not_a_table_at_spawn_does_not_restart_on_a_gained_table() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\nadmin = \"not-a-table\"\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a non-table admin already present at spawn keeps the child"
+    );
+    assert!(
+        stub::alive(pid),
+        "never stopped for a table that was already present as a value"
+    );
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+    assert_eq!(rig.check_runs(), 0, "no check runs when nothing changed");
+}
+
+/// Writes `changed` over the rig's config and drives one restart: the child
+/// stops (one SIGTERM), a fresh spawn happens, no crash is counted, one check
+/// ran, and the stop line names `name` (the changed key paths) by equality.
+#[cfg(unix)]
+fn expect_restart(
+    rig: &Rig,
+    supervisor: &mut Supervised,
+    t0: Tick,
+    first_pid: u32,
+    name: &str,
+    changed: &str,
+) {
+    fs::write(&rig.config, changed).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Stopping,
+        "the restart-only edit restarts the child"
+    );
+    let stop_line = format!(
+        "clauth daemon: stopping the shunt gateway (pid {first_pid}): its config changed {name}"
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == stop_line)
+            .count(),
+        1,
+        "the log names the setting by its key path, never its value"
+    );
+    // The stub dies on its own SIGTERM: wait for the pipe to fall silent,
+    // then step until the reap respawns it (the default-trap restart path,
+    // never a kill at the drain bound).
+    rig.server.wait_serving(false);
+    step_until(rig, supervisor, t0.after(secs(3)), GatewayState::Starting);
+    let calls = rig.calls();
+    assert_eq!(calls.len(), 2, "respawned exactly once: {calls:?}");
+    assert_eq!(rig.slot().restarts, 0, "an asked-for respawn is no crash");
+    assert_eq!(
+        stub::terms(&rig.dir),
+        [first_pid],
+        "the receiver side: exactly one SIGTERM, not two"
+    );
+    assert_eq!(rig.check_runs(), 1, "the restart is gated on one check");
+}
+
+/// The base `[server]` table every restart-only edit starts from.
+#[cfg(unix)]
+fn base_config(port: u16) -> String {
+    format!("[server]\nbind = \"127.0.0.1:{port}\"\nshutdown_timeout_seconds = 2\n")
+}
+
+/// A restart-only case: `(spawn config, changed config)` over a port.
+#[cfg(unix)]
+type RestartCase = dyn Fn(u16) -> (String, String);
+
+/// `bind = "127.0.0.1:3067"` edited to another host keeps the port, so the
+/// same rig port keeps answering `/health` while the bind fact flips.
+#[cfg(unix)]
+#[test]
+fn a_bind_edit_restarts_once_and_names_the_setting() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(&rig, &mut supervisor, t0, pid, "server.bind", &changed);
+}
+
+/// Losing `[server.admin]` restarts too: the fact is the key's presence in
+/// either direction.
+#[cfg(unix)]
+#[test]
+fn removing_the_admin_table_restarts_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    fs::write(&rig.config, with_admin_table(&rig)).expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0,
+        pid,
+        "[server.admin]",
+        &base_config(rig.port),
+    );
+}
+
+/// A model's `display_name` is hot-reloadable: editing it never restarts.
+#[cfg(unix)]
+#[test]
+fn a_model_display_name_edit_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n[[models]]\nid = \"fable\"\ndisplay_name = \"Fable\"\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\n[[models]]\nid = \"fable\"\ndisplay_name = \"Renamed\"\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a display_name edit keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a display_name edit");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A comment added above `bind`, or `bind` moved within `[server]`, compares
+/// as the same value: no restart.
+#[cfg(unix)]
+#[test]
+fn a_comment_or_key_move_above_bind_keeps_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let reordered = format!(
+        "# a comment above bind\n[server]\nshutdown_timeout_seconds = 2\nbind = \"127.0.0.1:{}\"\n",
+        rig.port
+    );
+    fs::write(&rig.config, reordered).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a comment and key move keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a comment or key move");
+    assert_eq!(rig.calls().len(), 1, "no respawn");
+}
+
+/// A refused restart-only edit keeps the child, logs the refusal once, and
+/// does not re-run the check while the bytes stay unchanged.
+#[cfg(unix)]
+#[test]
+fn a_refused_bind_edit_keeps_the_child_and_logs_once() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    rig.touch("check-fail");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    fs::write(&rig.config, changed).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "a refused bind edit keeps the child"
+    );
+    assert!(stub::alive(pid), "never stopped for a refused check");
+    assert_eq!(rig.calls().len(), 1, "no respawn on a refused check");
+    assert_eq!(rig.check_runs(), 1, "one check for the changed bind");
+
+    let keep_line = format!(
+        "clauth daemon: the shunt gateway's config changed server.bind, but `{} check --config {}` refused it (exit 1); keeping the running gateway until the check passes; run that command to see why",
+        rig.binary.display(),
+        rig.config.display()
+    );
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == keep_line)
+            .count(),
+        1,
+        "the refusal is logged once, naming the setting, never its value"
+    );
+
+    supervisor.step(t0.after(secs(3)));
+    supervisor.step(t0.after(secs(4)));
+    assert_eq!(rig.check_runs(), 1, "an unchanged config is not re-checked");
+    assert_eq!(rig.calls().len(), 1, "still no respawn");
+    assert!(
+        stub::alive(pid),
+        "the child stays alive across memoized rounds"
+    );
+}
+
+/// Every member of the restart-only fact set, in every transition its kind
+/// admits. The transitions are generated from the fact table itself: the
+/// profiles below are cross-checked against `FACT_SPECS` (length, label,
+/// walk, kind) before any transition runs, so a member added, removed,
+/// re-pathed, or re-kinded fails this test instead of drifting.
+#[cfg(unix)]
+#[test]
+fn every_restart_only_setting_restarts_once_when_it_changes() {
+    let profiles = member_profiles();
+    assert_eq!(
+        profiles.len(),
+        FACT_SPECS.len(),
+        "the test profiles drifted from the fact set's length"
+    );
+    for (profile, spec) in profiles.iter().zip(FACT_SPECS.iter()) {
+        assert_eq!(
+            profile.path, spec.path,
+            "a test profile's label drifted from the fact set: {}",
+            spec.path
+        );
+        assert_eq!(
+            profile.keys, spec.keys,
+            "a test profile's walk drifted from the fact set: {}",
+            spec.path
+        );
+        assert_eq!(
+            kind_name(profile.kind),
+            kind_name(spec.kind),
+            "a test profile's kind drifted from the fact set: {}",
+            spec.path
+        );
+    }
+    for profile in &profiles {
+        match profile.kind {
+            FactKind::Value => {
+                // absent -> present, present -> a different value, and back to
+                // absent.
+                restart_case(profile, profile.absent, profile.present_a);
+                restart_case(
+                    profile,
+                    profile.present_a,
+                    profile.present_b.expect("a Value fact carries present_b"),
+                );
+                restart_case(profile, profile.present_a, profile.absent);
+            }
+            FactKind::Present => {
+                // absent -> present and back; a content edit inside the present
+                // table is a keep, covered by the non-member test.
+                restart_case(profile, profile.absent, profile.present_a);
+                restart_case(profile, profile.present_a, profile.absent);
+            }
+            FactKind::NonEmpty => {
+                let empty = profile
+                    .empty
+                    .expect("a NonEmpty fact carries its empty config");
+                // absent -> non-empty, [] -> non-empty, and each back.
+                restart_case(profile, profile.absent, profile.present_a);
+                restart_case(profile, empty, profile.present_a);
+                restart_case(profile, profile.present_a, empty);
+                restart_case(profile, profile.present_a, profile.absent);
+            }
+        }
+    }
+}
+
+/// A restart-only fact's test profile: the fact-table entries it must match,
+/// and the config fragments that drive every transition its kind admits.
+#[cfg(unix)]
+struct MemberProfile {
+    /// The log key path, matched against `FactSpec::path`.
+    path: &'static str,
+    /// The document walk, matched against `FactSpec::keys`.
+    keys: &'static [&'static str],
+    /// The fact kind, matched against `FactSpec::kind`.
+    kind: FactKind,
+    /// The config with the member's key absent.
+    absent: fn(u16) -> String,
+    /// The config with the member present (value A).
+    present_a: fn(u16) -> String,
+    /// The config with the member present (value B, different): a `Value` fact
+    /// only — a `Present` or `NonEmpty` member's content edit is a keep, not a
+    /// restart.
+    present_b: Option<fn(u16) -> String>,
+    /// A `NonEmpty` member's config with the key present but `[]`.
+    empty: Option<fn(u16) -> String>,
+    /// Env-file line(s) pinning the probe port while the config's `bind` key
+    /// is absent, so `server.bind`'s absent <-> present transitions stay
+    /// spawnable (the daemon would otherwise probe shunt's default port).
+    env_pin: Option<fn(u16) -> String>,
+}
+
+/// The fact's kind as a name, so the cross-check compares kinds without a
+/// `PartialEq` derive on `FactKind`.
+#[cfg(unix)]
+fn kind_name(kind: FactKind) -> &'static str {
+    match kind {
+        FactKind::Value => "Value",
+        FactKind::Present => "Present",
+        FactKind::NonEmpty => "NonEmpty",
+    }
+}
+
+/// The test profiles, in the fact set's order.
+#[cfg(unix)]
+fn member_profiles() -> Vec<MemberProfile> {
+    vec![
+        MemberProfile {
+            path: "server.bind",
+            keys: &["server", "bind"],
+            kind: FactKind::Value,
+            absent: |_| "[server]\nshutdown_timeout_seconds = 2\n".to_string(),
+            present_a: base_config,
+            present_b: Some(|p| {
+                format!("[server]\nbind = \"0.0.0.0:{p}\"\nshutdown_timeout_seconds = 2\n")
+            }),
+            empty: None,
+            env_pin: Some(|p| format!("SHUNT_SERVER__BIND=127.0.0.1:{p}")),
+        },
+        MemberProfile {
+            path: "server.max_concurrent_requests",
+            keys: &["server", "max_concurrent_requests"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| format!("{}max_concurrent_requests = 2048\n", base_config(p)),
+            present_b: Some(|p| format!("{}max_concurrent_requests = 4096\n", base_config(p))),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.shutdown_timeout_seconds",
+            keys: &["server", "shutdown_timeout_seconds"],
+            kind: FactKind::Value,
+            absent: |p| format!("[server]\nbind = \"127.0.0.1:{p}\"\n"),
+            present_a: base_config,
+            present_b: Some(|p| {
+                format!("[server]\nbind = \"127.0.0.1:{p}\"\nshutdown_timeout_seconds = 3\n")
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.access_control]",
+            keys: &["server", "access_control"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.access_control]\nallow_cidrs = [\"10.0.0.0/8\"]\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.access_control]\nallow_cidrs = [\"10.0.0.0/16\"]\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.limits.max_request_header_bytes",
+            keys: &["server", "limits", "max_request_header_bytes"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.limits]\nmax_request_header_bytes = 512\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.limits]\nmax_request_header_bytes = 1024\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.limits.max_url_length",
+            keys: &["server", "limits", "max_url_length"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| format!("{}[server.limits]\nmax_url_length = 256\n", base_config(p)),
+            present_b: Some(|p| {
+                format!("{}[server.limits]\nmax_url_length = 512\n", base_config(p))
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.rate_limits]",
+            keys: &["server", "rate_limits"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.rate_limits.device_verify]\nmax = 3\nwindow_seconds = 20\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.rate_limits.device_verify]\nmax = 5\nwindow_seconds = 20\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.admin]",
+            keys: &["server", "admin"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.admin]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.gateway]",
+            keys: &["server", "gateway"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.gateway]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.spend]",
+            keys: &["server", "spend"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.spend]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.spend.state_path",
+            keys: &["server", "spend", "state_path"],
+            kind: FactKind::Value,
+            absent: |p| format!("{}[server.spend]\n", base_config(p)),
+            present_a: |p| {
+                format!(
+                    "{}[server.spend]\nstate_path = \"/tmp/spend.json\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.spend]\nstate_path = \"/tmp/spend-2.json\"\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.codex_endpoint]",
+            keys: &["server", "codex_endpoint"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.codex_endpoint]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.usage]",
+            keys: &["server", "usage"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.usage]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.oauth_usage]",
+            keys: &["server", "oauth_usage"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.oauth_usage]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[sentry]",
+            keys: &["sentry"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[sentry]\ndsn = \"\"\nenvironment = \"dev\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[sentry]\ndsn = \"\"\nenvironment = \"prod\"\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[otel]",
+            keys: &["otel"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[otel]\nendpoint = \"http://localhost:4318\"\nsample_ratio = 0.5\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[otel]\nendpoint = \"http://localhost:4318\"\nsample_ratio = 1.0\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.pool.usage_refresh_seconds",
+            keys: &["server", "pool", "usage_refresh_seconds"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.pool]\nusage_refresh_seconds = 120\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.pool]\nusage_refresh_seconds = 300\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.pool.state_path",
+            keys: &["server", "pool", "state_path"],
+            kind: FactKind::Value,
+            absent: base_config,
+            present_a: |p| {
+                format!(
+                    "{}[server.pool]\nstate_path = \"/tmp/pool.json\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: Some(|p| {
+                format!(
+                    "{}[server.pool]\nstate_path = \"/tmp/pool-2.json\"\n",
+                    base_config(p)
+                )
+            }),
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.status]",
+            keys: &["server", "status"],
+            kind: FactKind::Present,
+            absent: base_config,
+            present_a: |p| format!("{}[server.status]\n", base_config(p)),
+            present_b: None,
+            empty: None,
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "[server.status].sources",
+            keys: &["server", "status", "sources"],
+            kind: FactKind::NonEmpty,
+            absent: |p| format!("{}[server.status]\n", base_config(p)),
+            present_a: |p| {
+                format!(
+                    "{}[server.status]\n[[server.status.sources]]\nprovider = \"claude\"\nurl = \"https://status.claude.com/api/v2/summary.json\"\n",
+                    base_config(p)
+                )
+            },
+            present_b: None,
+            empty: Some(|p| format!("{}[server.status]\nsources = []\n", base_config(p))),
+            env_pin: None,
+        },
+        MemberProfile {
+            path: "server.status.refresh_seconds",
+            keys: &["server", "status", "refresh_seconds"],
+            kind: FactKind::Value,
+            absent: |p| format!("{}[server.status]\n", base_config(p)),
+            present_a: |p| format!("{}[server.status]\nrefresh_seconds = 120\n", base_config(p)),
+            present_b: Some(|p| {
+                format!("{}[server.status]\nrefresh_seconds = 300\n", base_config(p))
+            }),
+            empty: None,
+            env_pin: None,
+        },
+    ]
+}
+
+/// One restart-only change, driven end to end in a fresh sandbox: spawn on
+/// `spawn(p)`, edit to `changed(p)`, and assert exactly one restart gated on
+/// one check, the stop line naming the profile's key path by equality.
+#[cfg(unix)]
+fn restart_case(profile: &MemberProfile, spawn: fn(u16) -> String, changed: fn(u16) -> String) {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    if let Some(pin) = profile.env_pin {
+        fs::write(
+            &rig.env_file,
+            format!("GATEWAY_TEST_SECRET=from-env-file\n{}\n", pin(rig.port)),
+        )
+        .expect("env pin");
+    }
+    let spawn_config = spawn(rig.port);
+    fs::write(&rig.config, spawn_config).expect("spawn config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "{}: spawns healthy",
+        profile.path
+    );
+    let first = rig.only_call().pid;
+    let changed_config = changed(rig.port);
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0,
+        first,
+        profile.path,
+        &changed_config,
+    );
+}
+
+/// Representative hot-reloadable non-members: editing them never restarts.
+#[cfg(unix)]
+#[test]
+fn hot_reloadable_settings_never_restart_the_child() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let base = base_config(rig.port);
+    let edits: Vec<(&str, String)> = vec![
+        (
+            "an [[upstreams]] field",
+            format!(
+                "{base}[[upstreams]]\nname = \"u\"\nkind = \"anthropic\"\nbase_url = \"https://api.anthropic.com\"\n"
+            ),
+        ),
+        (
+            "[[models]]",
+            format!("{base}[[models]]\nid = \"fable\"\ndisplay_name = \"Fable\"\n"),
+        ),
+        (
+            "[[routes]]",
+            format!("{base}[[routes]]\nmodel = \"fable\"\n"),
+        ),
+        ("[server.auth]", format!("{base}[server.auth]\n")),
+        (
+            "[server.pool].hard_threshold",
+            format!("{base}[server.pool]\nhard_threshold = 0.9\n"),
+        ),
+    ];
+    for (name, changed) in edits {
+        fs::write(&rig.config, changed).expect("config");
+        supervisor.step(t0.after(secs(2)));
+        assert_eq!(
+            rig.slot().state,
+            GatewayState::Healthy,
+            "{name} keeps the child"
+        );
+        assert!(stub::alive(pid), "{name} never stops the child");
+    }
+    assert_eq!(
+        rig.calls().len(),
+        1,
+        "no respawn for any hot-reloadable edit"
+    );
+}
+
+/// One hot-reloadable edit inside a present restart-only table, driven end to
+/// end in a fresh sandbox: spawn on `spawn_config`, edit to `changed_config`,
+/// and assert no restart and no check.
+#[cfg(unix)]
+fn keep_case(name: &str, case: &RestartCase) {
+    let rig = Rig::new("0.49.1");
+    let (spawn_config, changed_config) = case(rig.port);
+    fs::write(&rig.config, spawn_config).expect("spawn config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "{name}: spawns healthy"
+    );
+    let pid = rig.only_call().pid;
+
+    fs::write(&rig.config, changed_config).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "{name} keeps the child"
+    );
+    assert!(stub::alive(pid), "{name} never stops the child");
+    assert_eq!(rig.calls().len(), 1, "no respawn for {name}");
+}
+
+/// A non-member sibling inside a restart-only table hot-reloads: editing it
+/// never restarts the child, even while the member table is present.
+#[cfg(unix)]
+#[test]
+fn a_non_member_edit_inside_a_member_table_keeps_the_child() {
+    // One keep case per member table: a sibling or content edit that leaves
+    // every fact inside it unchanged. `[server.usage]` and `[server.oauth_usage]`
+    // have no fields of their own, so an arbitrary key stands in for their
+    // content (presence alone is the fact).
+    let cases: Vec<(&str, Box<RestartCase>)> = vec![
+        (
+            "[server] sse_keepalive_seconds beside the bind facts",
+            Box::new(|p| {
+                (
+                    format!("{}sse_keepalive_seconds = 60\n", base_config(p)),
+                    format!("{}sse_keepalive_seconds = 61\n", base_config(p)),
+                )
+            }),
+        ),
+        (
+            "a [[server.admin.write_keys]] edit under a present table",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"first\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.admin]\n[[server.admin.write_keys]]\nid = \"clauth\"\nkey = \"second\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.limits] max_request_bytes",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.limits]\nmax_request_bytes = 1000\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.limits]\nmax_request_bytes = 2000\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.spend] blocked_message",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.spend]\nblocked_message = \"nope\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.spend]\nblocked_message = \"denied\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.pool] hard_threshold beside usage_refresh_seconds",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.pool]\nusage_refresh_seconds = 120\nhard_threshold = 0.9\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.pool]\nusage_refresh_seconds = 120\nhard_threshold = 0.95\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.gateway] trust_forwarded_for",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.gateway]\ntrust_forwarded_for = true\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.gateway]\ntrust_forwarded_for = false\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.codex_endpoint] provider",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.codex_endpoint]\nprovider = \"codex\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.codex_endpoint]\nprovider = \"other\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.usage] a field",
+            Box::new(|p| {
+                (
+                    format!("{}[server.usage]\nnote = \"a\"\n", base_config(p)),
+                    format!("{}[server.usage]\nnote = \"b\"\n", base_config(p)),
+                )
+            }),
+        ),
+        (
+            "[server.oauth_usage] a field",
+            Box::new(|p| {
+                (
+                    format!("{}[server.oauth_usage]\nnote = \"a\"\n", base_config(p)),
+                    format!("{}[server.oauth_usage]\nnote = \"b\"\n", base_config(p)),
+                )
+            }),
+        ),
+        (
+            "a [[server.status.sources]] URL edit with the list non-empty",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.status]\n[[server.status.sources]]\nprovider = \"claude\"\nurl = \"https://status.claude.com/api/v2/summary.json\"\n",
+                        base_config(p)
+                    ),
+                    format!(
+                        "{}[server.status]\n[[server.status.sources]]\nprovider = \"claude\"\nurl = \"https://status.anthropic.com/api/v2/summary.json\"\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.status] sources absent -> sources = [] (shunt starts no poller either way)",
+            Box::new(|p| {
+                (
+                    format!("{}[server.status]\nrefresh_seconds = 300\n", base_config(p)),
+                    format!(
+                        "{}[server.status]\nrefresh_seconds = 300\nsources = []\n",
+                        base_config(p)
+                    ),
+                )
+            }),
+        ),
+        (
+            "[server.status] sources = [] -> absent",
+            Box::new(|p| {
+                (
+                    format!(
+                        "{}[server.status]\nrefresh_seconds = 300\nsources = []\n",
+                        base_config(p)
+                    ),
+                    format!("{}[server.status]\nrefresh_seconds = 300\n", base_config(p)),
+                )
+            }),
+        ),
+    ];
+    for (name, case) in &cases {
+        keep_case(name, case.as_ref());
+    }
+}
+
+/// Changing two restart-only members at once names both key paths in fact-set
+/// order, comma-separated.
+#[cfg(unix)]
+#[test]
+fn a_two_setting_edit_names_both_key_paths_in_order() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n[server.admin]\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0,
+        pid,
+        "server.bind, [server.admin]",
+        &changed,
+    );
+}
+
+/// A child whose spawn-time read failed (a fact path crossed a non-table)
+/// adopts the first readable round's facts as its baseline, logged once, and
+/// then restarts on a later change like any other child.
+#[cfg(unix)]
+#[test]
+fn a_child_whose_spawn_read_failed_adopts_the_first_readable_round_then_restarts_on_a_change() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    fs::write(
+        &rig.config,
+        format!(
+            "[server]\nbind = \"127.0.0.1:{}\"\nshutdown_timeout_seconds = 2\nlimits = \"not-a-table\"\n",
+            rig.port
+        ),
+    )
+    .expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    // The first readable round adopts its facts as the baseline, logged once.
+    fs::write(&rig.config, base_config(rig.port)).expect("config");
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "adopting the baseline never restarts"
+    );
+    assert!(stub::alive(pid), "no stop while adopting the baseline");
+    assert_eq!(
+        rig.calls().len(),
+        1,
+        "no respawn while adopting the baseline"
+    );
+    assert_eq!(
+        rig.check_runs(),
+        0,
+        "no check runs while adopting the baseline"
+    );
+    let adopt_line = "clauth daemon: the shunt gateway's config could not be read at spawn; adopting the current config as its restart baseline";
+    assert_eq!(
+        rig.lines
+            .snapshot()
+            .iter()
+            .filter(|line| **line == adopt_line)
+            .count(),
+        1,
+        "the adoption is logged once"
+    );
+
+    // A later change restarts like any other child.
+    let changed = format!(
+        "[server]\nbind = \"0.0.0.0:{}\"\nshutdown_timeout_seconds = 2\n",
+        rig.port
+    );
+    expect_restart(
+        &rig,
+        &mut supervisor,
+        t0.after(secs(2)),
+        pid,
+        "server.bind",
+        &changed,
+    );
+}
+
+/// A config whose `[sentry]` subtree holds `nan` compares equal to itself
+/// round after round (the mark holds a digest, never the raw value): an
+/// unchanged round never restarts.
+#[cfg(unix)]
+#[test]
+fn a_config_holding_nan_in_a_value_fact_does_not_restart_on_an_unchanged_round() {
+    let rig = Rig::new("0.49.1");
+    rig.arm_check_stub();
+    fs::write(
+        &rig.config,
+        format!(
+            "{}[sentry]\ndsn = \"\"\ntraces_sample_rate = nan\n",
+            base_config(rig.port)
+        ),
+    )
+    .expect("config");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    // The config is untouched: a NaN value fact must not read as changed.
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot().state,
+        GatewayState::Healthy,
+        "an unchanged NaN fact never restarts"
+    );
+    assert!(
+        stub::alive(pid),
+        "the child stays alive across unchanged rounds"
+    );
+    assert_eq!(rig.calls().len(), 1, "no respawn on an unchanged NaN fact");
+    assert_eq!(
+        rig.check_runs(),
+        0,
+        "no check runs on an unchanged NaN fact"
     );
 }
 
@@ -2095,5 +4126,562 @@ fn a_missing_binary_line_names_the_binary_and_the_fix() {
         rig.lines.snapshot().contains(&expected),
         "lines: {:?}",
         rig.lines.snapshot()
+    );
+}
+
+// ── the hold ────────────────────────────────────────────────────────────────
+
+/// This test process's own daemon identity: the pid the supervisor's
+/// `for_daemon` learns, and its start token.
+#[cfg(unix)]
+fn this_daemon() -> crate::gateway::DaemonIdentity {
+    let pid = std::process::id();
+    crate::gateway::DaemonIdentity {
+        pid,
+        start: process_start_time(pid),
+    }
+}
+
+/// Write a hold naming `identity`, the shape `write_hold` writes.
+#[cfg(unix)]
+fn write_hold_naming(identity: &crate::gateway::DaemonIdentity) {
+    let path = crate::gateway::hold_path().expect("hold path");
+    fs::write(&path, serde_json::to_vec(identity).expect("json")).expect("hold");
+}
+
+/// A hold naming this daemon holds the gateway off: the slot reads `held` and
+/// nothing spawns.
+#[cfg(unix)]
+#[test]
+fn a_hold_naming_this_daemon_holds_the_gateway_off() {
+    let rig = Rig::new("0.49.1");
+    write_hold_naming(&this_daemon());
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    assert_eq!(
+        rig.slot(),
+        GatewaySlot {
+            config: shown(&rig.config),
+            binary: shown(&rig.binary),
+            since: Some(AT_T0.to_string()),
+            ..blank(GatewayState::Held)
+        }
+    );
+    assert_eq!(rig.calls().len(), 0, "nothing spawns while held");
+}
+
+/// A hold naming this daemon appearing mid-run stops the running gateway with
+/// the normal stop and lands on `held`.
+#[cfg(unix)]
+#[test]
+fn a_hold_stops_the_running_gateway() {
+    let rig = Rig::new("0.49.1");
+    let mut supervisor = rig.supervisor();
+    let t0 = t0();
+    supervisor.step(t0);
+    rig.server.wait_serving(true);
+    supervisor.step(t0.after(secs(1)));
+    assert_eq!(rig.slot().state, GatewayState::Healthy);
+    let pid = rig.only_call().pid;
+
+    write_hold_naming(&this_daemon());
+    supervisor.step(t0.after(secs(2)));
+    assert_eq!(
+        rig.slot(),
+        GatewaySlot {
+            pid: Some(pid),
+            version: Some("0.49.1".to_string()),
+            since: Some(AT_T2.to_string()),
+            ..rig.described(GatewayState::Stopping)
+        }
+    );
+    step_until(&rig, &mut supervisor, t0.after(secs(2)), GatewayState::Held);
+    assert_eq!(
+        rig.slot(),
+        GatewaySlot {
+            port: None,
+            last_exit: Some(ExitReport {
+                code: None,
+                signal: Some(15),
+            }),
+            since: Some(AT_T2.to_string()),
+            ..rig.described(GatewayState::Held)
+        }
+    );
+    assert_eq!(stub::terms(&rig.dir), [pid], "one SIGTERM, the normal stop");
+}
+
+/// A hold naming another pid, and one naming this pid with another start
+/// token, are each removed with one log line and the gateway runs.
+#[cfg(unix)]
+#[test]
+fn a_hold_naming_another_instance_is_removed_and_ignored() {
+    let me = this_daemon();
+    for (label, other) in [
+        (
+            "another pid",
+            crate::gateway::DaemonIdentity {
+                pid: me.pid.wrapping_add(1),
+                start: me.start.clone(),
+            },
+        ),
+        (
+            "this pid, another start token",
+            crate::gateway::DaemonIdentity {
+                pid: me.pid,
+                start: Some("another-start-token".to_string()),
+            },
+        ),
+    ] {
+        let rig = Rig::new("0.49.1");
+        write_hold_naming(&other);
+        let path = crate::gateway::hold_path().expect("hold path");
+        let mut supervisor = rig.supervisor();
+        supervisor.step(t0());
+        assert!(!path.exists(), "{label}: the hold is removed");
+        assert_eq!(rig.calls().len(), 1, "{label}: the gateway runs");
+        let line = format!(
+            "clauth daemon: ignoring {}: it names another daemon instance or does not parse; removed",
+            path.display()
+        );
+        assert_eq!(
+            rig.lines.snapshot().iter().filter(|l| **l == line).count(),
+            1,
+            "{label}: one log line"
+        );
+    }
+}
+
+/// A hold that does not parse is removed with one log line and the gateway
+/// runs.
+#[cfg(unix)]
+#[test]
+fn an_unparseable_hold_is_removed_and_ignored() {
+    let rig = Rig::new("0.49.1");
+    let path = crate::gateway::hold_path().expect("hold path");
+    fs::write(&path, b"not json").expect("hold");
+    let mut supervisor = rig.supervisor();
+    supervisor.step(t0());
+    assert!(!path.exists(), "an unparseable hold is removed");
+    assert_eq!(rig.calls().len(), 1, "and the gateway runs");
+    let line = format!(
+        "clauth daemon: ignoring {}: it names another daemon instance or does not parse; removed",
+        path.display()
+    );
+    assert_eq!(
+        rig.lines.snapshot().iter().filter(|l| **l == line).count(),
+        1,
+        "one log line"
+    );
+}
+
+/// Writing and releasing a hold never writes the record's `disabled`: the
+/// record's bytes are identical before and after.
+#[cfg(unix)]
+#[test]
+fn writing_and_releasing_a_hold_leaves_the_record_unchanged() {
+    let _rig = Rig::new("0.49.1");
+    let record = crate::gateway::record_path().expect("record path");
+    let before = fs::read(&record).expect("the record");
+    let dir = clauth_dir().expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    crate::gateway::write_hold().expect("write the hold");
+    assert!(
+        crate::gateway::hold_path().expect("hold path").exists(),
+        "the hold is written"
+    );
+    crate::gateway::remove_hold().expect("release the hold");
+    assert!(
+        !crate::gateway::hold_path().expect("hold path").exists(),
+        "the hold is gone"
+    );
+    let after = fs::read(&record).expect("the record");
+    assert_eq!(
+        before, after,
+        "write-hold and release leave the record byte-identical"
+    );
+}
+
+/// `write_hold` errors with no daemon holding the singleton, and the file it
+/// writes is owner-only.
+#[cfg(unix)]
+#[test]
+fn write_hold_errors_without_a_daemon_and_writes_0600() {
+    let _rig = Rig::new("0.49.1");
+    let err = crate::gateway::write_hold().expect_err("no daemon to name");
+    assert_eq!(
+        err.to_string(),
+        "no daemon holds the clauth singleton",
+        "names what was missing"
+    );
+
+    let dir = clauth_dir().expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    crate::gateway::write_hold().expect("write the hold");
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = fs::metadata(crate::gateway::hold_path().expect("hold path"))
+        .expect("hold")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600, "the hold is owner-only");
+}
+
+// ── the hold, cross-platform (no unix rig needed) ──────────────────────────
+
+/// A child that stays alive until its stdin closes: `cat` on unix, `cmd /D`
+/// on windows.
+fn parked_child() -> std::process::Child {
+    #[cfg(not(windows))]
+    let (program, args): (&str, &[&str]) = ("cat", &[]);
+    #[cfg(windows)]
+    let (program, args): (&str, &[&str]) = ("cmd", &["/D"]);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn a parked child")
+}
+
+/// `write_hold` without a daemon names what was missing, pinned by equality,
+/// on every platform (needs no unix rig).
+#[test]
+fn write_hold_errors_without_a_daemon() {
+    let _home = HomeSandbox::new();
+    let err = crate::gateway::write_hold().expect_err("no daemon to name");
+    assert_eq!(err.to_string(), "no daemon holds the clauth singleton");
+}
+
+/// A stale sidecar naming a live pid with no daemon holding the singleton is
+/// the missing-daemon error and writes nothing: the pid is never read past a
+/// true `singleton_held`.
+#[test]
+fn write_hold_refuses_a_stale_sidecar_naming_a_live_pid() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    fs::write(dir.join("clauthd.pid"), format!("{}\n", std::process::id())).expect("sidecar");
+    let err = crate::gateway::write_hold().expect_err("no daemon to name");
+    assert_eq!(err.to_string(), "no daemon holds the clauth singleton");
+    assert!(
+        !crate::gateway::hold_path().expect("hold path").exists(),
+        "no hold file is written"
+    );
+}
+
+/// What `write_hold` writes is what the daemon honours: a hold written by
+/// this process reads back as this daemon's own and stays.
+#[test]
+fn a_written_hold_reads_back_as_this_daemon_and_stays() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    crate::gateway::write_hold().expect("write the hold");
+    let me = Gateway::for_daemon();
+    assert!(
+        matches!(me.hold(), Hold::Mine),
+        "the daemon reads the hold as its own"
+    );
+    assert!(
+        crate::gateway::hold_path().expect("hold path").exists(),
+        "the hold stays"
+    );
+}
+
+/// A daemon holds the singleton but its pid sidecar is torn (the daemon's own
+/// stamp can fail silently): the error names a running daemon, never a missing
+/// one, and no hold is written.
+#[test]
+fn write_hold_names_a_running_daemon_whose_pid_is_unreadable() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    fs::write(dir.join(super::super::PID_FILE), b"").expect("tear the sidecar");
+    let err = crate::gateway::write_hold().expect_err("a torn sidecar names no pid");
+    assert_eq!(
+        err.to_string(),
+        "a clauth daemon is running but its pid is unreadable"
+    );
+    assert!(
+        !crate::gateway::hold_path().expect("hold path").exists(),
+        "no hold is written"
+    );
+}
+
+/// The written hold names the pid the sidecar stamps, not this process's own
+/// pid: overwrite the sidecar with a parked child's pid and read the JSON.
+#[test]
+fn a_written_hold_names_the_pid_the_sidecar_stamps() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    let mut child = parked_child();
+    fs::write(dir.join("clauthd.pid"), format!("{}\n", child.id())).expect("sidecar");
+    crate::gateway::write_hold().expect("write the hold");
+    let bytes = fs::read(crate::gateway::hold_path().expect("hold path")).expect("the hold");
+    let hold: crate::gateway::DaemonIdentity = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(
+        hold.pid,
+        child.id(),
+        "the written hold names the sidecar pid"
+    );
+    assert_eq!(
+        hold.start.as_deref(),
+        process_start_time(child.id()).as_deref(),
+        "the written hold names that pid's start token"
+    );
+    drop(child.stdin.take());
+    child.wait().expect("reap");
+}
+
+/// A daemon whose own start token is unreadable never honours or removes a
+/// hold, and logs that cause once, never blaming another daemon.
+#[test]
+fn a_daemon_whose_own_start_token_is_unreadable_leaves_the_hold() {
+    let _home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let hold_path = crate::gateway::hold_path().expect("hold path");
+    fs::write(
+        &hold_path,
+        serde_json::to_vec(&crate::gateway::DaemonIdentity {
+            pid: std::process::id(),
+            start: Some("any-token".to_string()),
+        })
+        .expect("json"),
+    )
+    .expect("hold");
+    let me = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: None,
+    }));
+    assert!(matches!(me.hold(), Hold::None), "never honours the hold");
+    assert!(matches!(me.hold(), Hold::None), "still never honours it");
+    assert!(hold_path.exists(), "never removes the hold");
+    let expected = format!(
+        "clauth daemon: cannot read this daemon's own start time; leaving the gateway hold {} in place",
+        hold_path.display()
+    );
+    assert_eq!(
+        lines.snapshot().iter().filter(|l| **l == expected).count(),
+        1,
+        "one log line naming the true cause: {:?}",
+        lines.snapshot()
+    );
+    assert!(
+        !lines
+            .snapshot()
+            .iter()
+            .any(|l| l.contains("another daemon instance")),
+        "never blames another daemon"
+    );
+}
+
+/// Releasing a hold that is not there is fine, so a `start shunt` after a
+/// daemon restart (which already removed the hold) still succeeds.
+#[test]
+fn remove_hold_with_no_hold_is_fine() {
+    let _home = HomeSandbox::new();
+    crate::gateway::remove_hold().expect("absent is fine");
+}
+
+/// A hold that cannot be read logs once per change, not once per round.
+#[test]
+fn a_hold_read_error_is_logged_once_per_change() {
+    let _home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let hold_path = crate::gateway::hold_path().expect("hold path");
+    fs::create_dir_all(&hold_path).expect("a directory at the hold path");
+    let me = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("any-token".to_string()),
+    }));
+    assert!(matches!(me.hold(), Hold::None));
+    assert!(matches!(me.hold(), Hold::None));
+    assert_eq!(
+        lines
+            .snapshot()
+            .iter()
+            .filter(|l| l.contains("cannot read") && l.contains(&hold_path.display().to_string()))
+            .count(),
+        1,
+        "one read-error line across two rounds: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// Each round of a daemon's gateway keeps its env record naming it: a record
+/// gone, or one a dead predecessor left (a failed start write leaves it in
+/// place), is written again under this daemon's own identity, with no
+/// singleton read.
+#[test]
+fn a_round_records_this_daemons_env_when_no_record_names_it() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    fs::create_dir_all(clauth_dir().expect("dir")).expect("dir");
+    let older = crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("older-start".to_string()),
+    };
+    let _ = Gateway::for_test(Some(older.clone())).intent();
+    assert_eq!(crate::gateway::recorded_daemon_identity(), Some(older));
+
+    let me = crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("this-start".to_string()),
+    };
+    let _ = Gateway::for_test(Some(me.clone())).intent();
+    assert_eq!(crate::gateway::recorded_daemon_identity(), Some(me));
+}
+
+/// A daemon whose own start time could not be read records nothing in its
+/// rounds: `is_named_by` never matches it, so its record would be rewritten
+/// every round.
+#[test]
+fn a_round_without_its_start_time_records_nothing() {
+    let home = HomeSandbox::new();
+    let _env = crate::testutil::no_shunt_env(&home);
+    fs::create_dir_all(clauth_dir().expect("dir")).expect("dir");
+    let gateway = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: None,
+    }));
+    let _ = gateway.intent();
+    assert_eq!(crate::gateway::recorded_daemon_identity(), None);
+}
+
+/// A record that cannot be written logs once per change, not once per
+/// round: a standing fault logs once, and a fault that clears and recurs
+/// logs again.
+#[test]
+fn an_env_record_write_failure_is_logged_once_per_change() {
+    let _home = HomeSandbox::new();
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let dir = clauth_dir().expect("dir");
+    let record = dir.join("gateway-env.json");
+    let gateway = Gateway::for_test(Some(crate::gateway::DaemonIdentity {
+        pid: std::process::id(),
+        start: Some("this-start".to_string()),
+    }));
+    let faults = || {
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| {
+                line.starts_with("clauth daemon: ")
+                    && line.ends_with("; the reads of this daemon's env refuse until it records it")
+            })
+            .count()
+    };
+    fs::create_dir_all(&record).expect("a directory at the record path");
+    let _ = gateway.intent();
+    let _ = gateway.intent();
+    assert_eq!(
+        faults(),
+        1,
+        "one line across two rounds: {:?}",
+        lines.snapshot()
+    );
+    fs::remove_dir(&record).expect("clear the fault");
+    let _ = gateway.intent();
+    fs::remove_file(&record).expect("drop the written record");
+    fs::create_dir_all(&record).expect("the fault again");
+    let _ = gateway.intent();
+    assert_eq!(
+        faults(),
+        2,
+        "a recurring fault logs again: {:?}",
+        lines.snapshot()
+    );
+}
+
+/// A disabled record still reads `disabled` even with a hold naming this
+/// daemon: the record's flag wins over the hold.
+#[test]
+fn disabled_wins_over_a_hold_naming_this_daemon() {
+    let _home = HomeSandbox::new();
+    let dir = clauth_dir().expect("dir");
+    fs::create_dir_all(&dir).expect("dir");
+    let super::super::probe::Claim::Active(_singleton) =
+        super::super::probe::claim_singleton(&dir, false).expect("claim")
+    else {
+        panic!("the sandbox holds no daemon");
+    };
+    let config = dir.join("shunt.toml");
+    fs::write(&config, "[server]\nbind = \"127.0.0.1:1\"\n").expect("config");
+    let mut record = GatewayRecord::new(config).expect("adoptable");
+    record.disabled = true;
+    GatewayRecord::update(|slot| {
+        *slot = Some(record);
+        Ok(())
+    })
+    .expect("save");
+    crate::gateway::write_hold().expect("write the hold");
+    let Intent::Idle(slot) = Gateway::for_daemon().intent() else {
+        panic!("a disabled record is idle");
+    };
+    assert_eq!(slot.state, GatewayState::Disabled, "{slot:?}");
+}
+
+/// A left-behind gateway serves only while the marker's pid is a live process
+/// started when the marker says and no stop was asked of it: no marker, a
+/// recycled pid (another start time) and a stopping child all read as none.
+#[test]
+fn a_left_behind_gateway_runs_only_while_live_and_unstopped() {
+    let _home = HomeSandbox::new();
+    assert!(!left_behind_gateway_runs(), "no marker");
+
+    let pid = std::process::id();
+    let start = process_start_time(pid).expect("this process has a start time");
+    let marker = |start: String, stop_deadline_ms: Option<u64>| ChildMarker {
+        pid,
+        start: Some(start),
+        stop_bound_secs: 40,
+        stop_deadline_ms,
+    };
+
+    write_marker(&marker(start.clone(), None)).expect("marker");
+    assert!(left_behind_gateway_runs(), "a live, unstopped child serves");
+
+    write_marker(&marker(start.clone(), Some(1))).expect("marker");
+    assert!(
+        !left_behind_gateway_runs(),
+        "a child asked to stop is on its way out"
+    );
+
+    write_marker(&marker(format!("{start}-not"), None)).expect("marker");
+    assert!(
+        !left_behind_gateway_runs(),
+        "a pid with another start time is not the child"
     );
 }

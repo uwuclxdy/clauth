@@ -125,6 +125,8 @@ fn switch_running_spec(job_id: &str, profile: &str, started_at: u64) -> jobs::Ru
         isolated: false,
         cwd: None,
         spawned_by: None,
+        host_session: None,
+        host_pid: 0,
         idle_secs: None,
         kind: jobs::RecordKind::Collectable,
         owner_pid: 0,

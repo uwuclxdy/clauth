@@ -216,7 +216,7 @@ Everything under `~/.clauth` is owner-only, as on the [Security](Security#where-
 
 The Tokens tab and `clauth sessions` / `resume` / `info` read Claude Code's transcript stores; a codex session writes none, so its spend is absent from every figure there rather than folded in. `clauth list` shows codex accounts in their own `CODEX` section under the Claude Code table (plan, 5h, 7d, `(login expired)` on a quarantined chain), and `clauth status --json` and the daemon's `status.json` carry codex entries with `"harness": "codex"` ([Daemon](Daemon#clauth-status---json)). The Claude Code plugin's `profiles`, `switch_profile` and `delegate` refuse a codex name as a codex account they do not manage ([Claude Code plugin](Claude-Code-Plugin)). `disable`, `enable`, `rolling-token` and `static-token` refuse one as `'<name>' is a codex profile; <verb> is claude-only`. The Setup, Usage and Fallback tabs list no codex rows, and there is no TUI form for creating one: the shell verbs above are the whole surface.
 
-On the Overview, codex accounts sit in a read-only section under the Claude Code rows, and <kbd>c</kbd> cycles which harness the tab shows ([Interface and keys](Interface-And-Keys#tab-dependent)).
+On the Overview, codex accounts sit in selectable rows under the Claude Code rows; <kbd>↑</kbd> and <kbd>↓</kbd> reach each one, but <kbd>⏎</kbd> cannot switch a codex account and <kbd>a</kbd> offers tab-wide actions only. <kbd>c</kbd> cycles which harness the tab shows ([Interface and keys](Interface-And-Keys#tab-dependent)).
 
 ## Windows and hosts without symlinks
 

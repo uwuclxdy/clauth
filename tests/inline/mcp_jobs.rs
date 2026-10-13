@@ -31,6 +31,8 @@ fn spec(job_id: &str, profile: &str, started_at: u64) -> RunningSpec {
         isolated: false,
         cwd: None,
         spawned_by: None,
+        host_session: None,
+        host_pid: 0,
         idle_secs: Some(300),
         kind: RecordKind::Collectable,
         // The legacy shape: a record an older server wrote carries no owner, so
@@ -101,45 +103,57 @@ fn the_isolation_flag_rides_the_mint_through_heartbeats_and_the_finish() {
     );
 }
 
-/// The run's cwd and spawning account ride the mint like the isolation flag:
-/// kept by every heartbeat and by the finish. A spec without them writes
-/// neither key, the shape an older server's record has on disk.
+/// The run's cwd, spawning account and host (session id + process) ride the
+/// mint like the isolation flag: kept by every heartbeat and by the finish. A
+/// spec without them writes none of the keys, the shape an older server's
+/// record has on disk.
 #[test]
-fn the_cwd_and_spawner_ride_the_mint_through_heartbeats_and_the_finish() {
+fn the_cwd_spawner_and_host_ride_the_mint_through_heartbeats_and_the_finish() {
     let _home = HomeSandbox::new();
     let id = new_job_id(1000);
     let origin = RunningSpec {
         cwd: Some("/home/u/repos/app".to_string()),
         spawned_by: Some("kerry".to_string()),
+        host_session: Some("host-sess-7".to_string()),
+        host_pid: 4242,
         ..spec(&id, "work", 1000)
     };
     let carried = |id: &str| {
         let r = read(id).unwrap();
-        (r.cwd, r.spawned_by)
+        (r.cwd, r.spawned_by, r.host_session, r.host_pid)
     };
     let want = (
         Some("/home/u/repos/app".to_string()),
         Some("kerry".to_string()),
+        Some("host-sess-7".to_string()),
+        4242,
     );
     write_running(&origin).unwrap();
-    assert_eq!(carried(&id), want, "the mint stamps both");
+    assert_eq!(carried(&id), want, "the mint stamps all four");
     write_heartbeat_with_session(&origin, 41_000, "mid-run", Some("sess-1")).unwrap();
     assert_eq!(
         carried(&id),
         want,
-        "a heartbeat rewrites the record and keeps both"
+        "a heartbeat rewrites the record and keeps all four"
     );
     write_done(&origin, serde_json::json!({"result": "ok"})).unwrap();
-    assert_eq!(carried(&id), want, "the finalized record keeps both");
+    assert_eq!(carried(&id), want, "the finalized record keeps all four");
 
     let bare = new_job_id(2000);
     write_running(&spec(&bare, "work", 2000)).unwrap();
     let bytes = std::fs::read_to_string(jobs_dir().unwrap().join(format!("{bare}.json"))).unwrap();
     assert!(
-        !bytes.contains("\"cwd\"") && !bytes.contains("\"spawned_by\""),
+        !bytes.contains("\"cwd\"")
+            && !bytes.contains("\"spawned_by\"")
+            && !bytes.contains("\"host_session\"")
+            && !bytes.contains("\"host_pid\""),
         "an unknown origin writes no key: {bytes}"
     );
-    assert_eq!(carried(&bare), (None, None), "and reads back as unknown");
+    assert_eq!(
+        carried(&bare),
+        (None, None, None, 0),
+        "and reads back as unknown"
+    );
 }
 
 #[test]

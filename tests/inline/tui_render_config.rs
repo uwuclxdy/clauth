@@ -11,6 +11,30 @@ fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// Wide enough that no row wraps: these pins are about one line's geometry.
+const WIDE: usize = 200;
+
+/// [`detail_row`] in a pane wide enough that the row is one line.
+fn one_row(
+    row: ConfigRow,
+    selected: bool,
+    editing: bool,
+    armed_action: Option<ConfigRow>,
+    snap: &Snap,
+    input: &InputState,
+) -> Line<'static> {
+    let mut lines = detail_row(row, selected, editing, armed_action, snap, input, WIDE);
+    assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+    lines.remove(0)
+}
+
+/// [`model_cycle_lines`] in a pane wide enough that the row is one line.
+fn model_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
+    let mut lines = model_cycle_lines(arrow, current, selected, WIDE);
+    assert_eq!(lines.len(), 1, "a wide pane holds the row on one line");
+    lines.remove(0)
+}
+
 // Blurred: bare labels, no brackets anywhere. Focused: the active preset wraps
 // in `[]` and that bracket pair is the only width change (the old shape padded
 // the blurred active option to ` label `, so blurred==focused in width — this
@@ -18,8 +42,8 @@ fn line_text(line: &Line<'static>) -> String {
 #[test]
 fn model_cycle_brackets_the_active_option_only_on_focus() {
     let arrow = Span::raw("  ");
-    let blurred = line_text(&model_cycle_line(arrow.clone(), "sonnet", false));
-    let focused = line_text(&model_cycle_line(arrow, "sonnet", true));
+    let blurred = line_text(&model_line(arrow.clone(), "sonnet", false));
+    let focused = line_text(&model_line(arrow, "sonnet", true));
 
     assert!(
         blurred.contains("sonnet"),
@@ -37,13 +61,26 @@ fn model_cycle_brackets_the_active_option_only_on_focus() {
     );
 }
 
+#[test]
+fn model_cycle_lists_fable_first_after_default() {
+    let line = line_text(&model_line(Span::raw("  "), "", false));
+    let options = line
+        .trim_start()
+        .strip_prefix("model")
+        .expect("the row opens on its key");
+    assert_eq!(
+        options.split_whitespace().collect::<Vec<_>>(),
+        ["default", "fable", "opus", "sonnet", "haiku", "opusplan"]
+    );
+}
+
 // A custom id (no preset match) appends in ACCENT instead of mis-bracketing the
 // nearest alias — and stays bracket-free when blurred.
 #[test]
 fn model_cycle_appends_a_custom_id_without_brackets() {
     let arrow = Span::raw("  ");
-    let blurred = line_text(&model_cycle_line(arrow.clone(), "claude-fable-5", false));
-    let focused = line_text(&model_cycle_line(arrow, "claude-fable-5", true));
+    let blurred = line_text(&model_line(arrow.clone(), "claude-fable-5", false));
+    let focused = line_text(&model_line(arrow, "claude-fable-5", true));
 
     assert!(
         blurred.contains("claude-fable-5"),
@@ -67,7 +104,7 @@ fn edit_glyph_is_bold_like_the_selection_caret() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let snap = Snap::blank("acct");
     let input = InputState::new("x");
-    let editing = detail_row(ConfigRow::Name, true, true, None, &snap, &input);
+    let editing = one_row(ConfigRow::Name, true, true, None, &snap, &input);
     let glyph = &editing.spans[0];
     assert!(
         glyph.style.add_modifier.contains(Modifier::BOLD),
@@ -87,7 +124,7 @@ fn selection_caret_is_bold_like_every_other_card() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let snap = Snap::blank("acct");
     let input = InputState::new("x");
-    let line = detail_row(ConfigRow::Name, true, false, None, &snap, &input);
+    let line = one_row(ConfigRow::Name, true, false, None, &snap, &input);
     let caret = &line.spans[0];
     assert!(
         caret.style.add_modifier.contains(Modifier::BOLD),
@@ -120,8 +157,8 @@ fn action_rows_bold_on_select_and_keep_their_color() {
         (ConfigRow::Login, theme::accent()),
     ];
     for (row, want) in cases {
-        let blurred = detail_row(row, false, false, None, &snap, &input);
-        let focused = detail_row(row, true, false, None, &snap, &input);
+        let blurred = one_row(row, false, false, None, &snap, &input);
+        let focused = one_row(row, true, false, None, &snap, &input);
         let (b, f) = (&blurred.spans[1], &focused.spans[1]);
         assert_eq!(
             b.content, f.content,
@@ -144,8 +181,8 @@ fn action_rows_bold_on_select_and_keep_their_color() {
 
     // The `✓ logged in` state is the same row in SUCCESS — same promotion rule.
     snap.captured = true;
-    let blurred = detail_row(ConfigRow::Login, false, false, None, &snap, &input);
-    let focused = detail_row(ConfigRow::Login, true, false, None, &snap, &input);
+    let blurred = one_row(ConfigRow::Login, false, false, None, &snap, &input);
+    let focused = one_row(ConfigRow::Login, true, false, None, &snap, &input);
     assert!(line_text(&focused).contains("✓ logged in"));
     assert!(!blurred.spans[1].style.add_modifier.contains(Modifier::BOLD));
     assert!(focused.spans[1].style.add_modifier.contains(Modifier::BOLD));
@@ -253,7 +290,7 @@ fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
 
     for selected in [false, true] {
         let arrow = if selected { "❯ " } else { "  " };
-        let unarmed = detail_row(ConfigRow::Disabled, selected, false, None, &snap, &input);
+        let unarmed = one_row(ConfigRow::Disabled, selected, false, None, &snap, &input);
         assert_eq!(
             line_text(&unarmed),
             format!("{arrow}disable account"),
@@ -269,7 +306,7 @@ fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
             "disable is always bold, unlike the accent bold-on-select class (selected={selected})"
         );
 
-        let armed = detail_row(
+        let armed = one_row(
             ConfigRow::Disabled,
             selected,
             false,
@@ -288,7 +325,7 @@ fn disable_button_is_delete_class_danger_and_arms_on_second_press() {
 
     // `armed_action` naming a DIFFERENT row (e.g. `Delete`) must not bleed
     // into this row's confirm copy — only its own row name arms it.
-    let cross_armed = detail_row(
+    let cross_armed = one_row(
         ConfigRow::Disabled,
         true,
         false,
@@ -310,8 +347,8 @@ fn enable_button_is_accent_class_bold_only_on_select() {
     snap.disabled = true; // currently disabled → the enable direction
     let input = InputState::new("");
 
-    let blurred = detail_row(ConfigRow::Disabled, false, false, None, &snap, &input);
-    let focused = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    let blurred = one_row(ConfigRow::Disabled, false, false, None, &snap, &input);
+    let focused = one_row(ConfigRow::Disabled, true, false, None, &snap, &input);
     assert_eq!(line_text(&blurred), "  enable account");
     assert_eq!(line_text(&focused), "❯ enable account");
     assert_eq!(blurred.spans[1].style.fg, theme::accent().fg);
@@ -328,7 +365,7 @@ fn enable_button_is_accent_class_bold_only_on_select() {
     // An armed_action left over from the disable direction must not surface
     // a "press again" copy once the account is actually disabled — enabling
     // never arms, so it has nothing to confirm.
-    let stale_armed = detail_row(
+    let stale_armed = one_row(
         ConfigRow::Disabled,
         true,
         false,
@@ -353,7 +390,7 @@ fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
     let input = InputState::new("");
 
     snap.is_active = true;
-    let gated_active = detail_row(
+    let gated_active = one_row(
         ConfigRow::Disabled,
         true,
         false,
@@ -375,12 +412,12 @@ fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
 
     snap.is_active = false;
     snap.has_live_session = true;
-    let gated_session = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    let gated_session = one_row(ConfigRow::Disabled, true, false, None, &snap, &input);
     assert_eq!(gated_session.spans[1].style.fg, theme::faint().fg);
 
     // Gated while already disabled reads "enable account", still faint.
     snap.disabled = true;
-    let gated_enable = detail_row(ConfigRow::Disabled, true, false, None, &snap, &input);
+    let gated_enable = one_row(ConfigRow::Disabled, true, false, None, &snap, &input);
     assert_eq!(line_text(&gated_enable), "❯ enable account");
     assert_eq!(gated_enable.spans[1].style.fg, theme::faint().fg);
 
@@ -388,7 +425,7 @@ fn disable_button_dims_while_gated_and_ignores_a_stale_arm() {
     // ungated action row's — proves the dim is a real style branch, not an
     // accident of the two colors overlapping.
     let normal_snap = Snap::blank("a");
-    let normal_action = detail_row(ConfigRow::Login, true, false, None, &normal_snap, &input);
+    let normal_action = one_row(ConfigRow::Login, true, false, None, &normal_snap, &input);
     assert_ne!(
         gated_session.spans[1].style.fg, normal_action.spans[1].style.fg,
         "a gated account-action row must render distinctly from a normal one"
@@ -546,6 +583,251 @@ fn setup_status_row_renders_only_while_disabled() {
     );
 }
 
+/// Render the Setup header for a blank snapshot carrying `email`, `base_url`
+/// and a long-lived `token` state, at `width` cells.
+fn email_header(
+    email: Option<&str>,
+    base_url: &str,
+    token: Option<crate::claude::SessionTokenStatus>,
+    width: u16,
+) -> (Vec<String>, ratatui::buffer::Buffer) {
+    use crate::profile::{AppConfig, AppState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let mut snap = Snap::blank("acct");
+    snap.email = email.map(str::to_string);
+    snap.base_url = base_url.to_string();
+    snap.session_token = token;
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let mut term = Terminal::new(TestBackend::new(width, 20)).unwrap();
+    term.draw(|f| draw_settings_rows(f, f.area(), &app, &[], 0, &snap, false))
+        .unwrap();
+    let buf = term.backend().buffer().clone();
+    (crate::testutil::buffer_rows(&buf), buf)
+}
+
+/// The Setup header's `email` line: the account's address right under `type`, the key in the static-label style and the value in
+/// accent like `type`'s own, exactly once.
+#[test]
+fn setup_email_row_sits_under_type_in_accent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (rows, buf) = email_header(Some("cloudy@example.com"), "", None, 60);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.contains("cloudy@example.com"))
+            .count(),
+        1,
+        "the address renders exactly once:\n{}",
+        rows.join("\n")
+    );
+    let type_idx = rows
+        .iter()
+        .position(|r| r.starts_with("type"))
+        .unwrap_or_else(|| panic!("type row renders:\n{}", rows.join("\n")));
+    assert_eq!(
+        rows[type_idx + 1].trim_end(),
+        "email           cloudy@example.com",
+        "the email line sits right under type:\n{}",
+        rows.join("\n")
+    );
+    let cell = |x: usize| &buf.content[(type_idx + 1) * 60 + x];
+    assert_eq!(
+        cell(0).style().fg,
+        theme::label().fg,
+        "the key takes the static label color"
+    );
+    assert!(
+        cell(0).style().add_modifier.contains(Modifier::BOLD),
+        "the key takes the static label bold"
+    );
+    assert_eq!(
+        cell(16).style().fg,
+        theme::accent().fg,
+        "the address takes the accent value color"
+    );
+}
+
+/// No address, no line: an account `/profile` never reported one for (or an
+/// unfetched one), and an api-typed account, whose draft base url hides the
+/// line with the `oauth` type it belongs to.
+#[test]
+fn setup_email_row_renders_only_for_a_known_oauth_address() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (rows, _) = email_header(None, "", None, 60);
+    assert!(
+        !rows.iter().any(|r| r.starts_with("email")),
+        "no cached address renders no line:\n{}",
+        rows.join("\n")
+    );
+    let (rows, _) = email_header(
+        Some("cloudy@example.com"),
+        "https://api.example.com",
+        None,
+        60,
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("cloudy@example.com")),
+        "an api-typed account renders no address:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// An address wider than the pane keeps both ends around a middle ellipsis,
+/// the shared truncation for identifiers, instead of clipping at the border:
+/// 30 cells less the 16-cell key leave 14, so 7 head + `…` + 6 tail.
+#[test]
+fn a_long_setup_email_keeps_both_ends() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (rows, _) = email_header(Some("averyveryverylongname@example.com"), "", None, 30);
+    assert!(
+        rows.iter().any(|r| r == "email           averyve…le.com"),
+        "the address middle-truncates to the pane:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// On a long-lived-token account the address keeps its place under `type`,
+/// with the `token` row after it, the order the ruling's preview shows.
+#[test]
+fn setup_email_row_sits_between_type_and_token() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (rows, _) = email_header(
+        Some("cloudy@example.com"),
+        "",
+        Some(crate::claude::SessionTokenStatus::LongLived(None)),
+        60,
+    );
+    let type_idx = rows
+        .iter()
+        .position(|r| r.starts_with("type"))
+        .unwrap_or_else(|| panic!("type row renders:\n{}", rows.join("\n")));
+    assert!(
+        rows[type_idx + 1].starts_with("email ") && rows[type_idx + 2].starts_with("token "),
+        "type, then email, then token:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// A stored credentials file holding an OAuth pair.
+fn oauth_login() -> crate::profile::ClaudeCredentials {
+    crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "acc".to_string(),
+            refresh_token: Some("ref".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    }
+}
+
+/// `build_snap`'s `email` for one account whose plan carries an address read
+/// for account `u-1`, holding `credentials`, anchored to `anchor`, its
+/// `/profile` stamped, then marked stale by a copy-back when `copied_back`.
+fn snap_email(
+    credentials: Option<crate::profile::ClaudeCredentials>,
+    anchor: Option<&str>,
+    copied_back: bool,
+) -> Option<String> {
+    use crate::profile::{AccountId, AppConfig, AppState, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = credentials;
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::profile::save_app_state(&AppState {
+        profiles: vec![name.clone()],
+        ..AppState::default()
+    })
+    .expect("save the roster");
+    if let Some(anchor) = anchor {
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+            &AccountId::from(anchor),
+        );
+    }
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+        &1_u64,
+    );
+    if copied_back {
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile dir")
+            .join(".credentials.json");
+        crate::usage::mark_profile_read_stale(&store);
+    }
+    profile.usage = Some(crate::usage::UsageInfo {
+        plan: Some(crate::usage::PlanInfo {
+            email: Some(crate::usage::AccountEmail {
+                address: "cloudy\u{1b}[2J@example.com".to_string(),
+                account: AccountId::from("u-1"),
+            }),
+            ..crate::usage::PlanInfo::default()
+        }),
+        ..crate::usage::UsageInfo::default()
+    });
+    let app = App::new(AppConfig {
+        state: AppState {
+            profiles: vec![name],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    });
+    build_snap(&app, true).email
+}
+
+/// The login's own address reaches the snapshot, its control characters
+/// escaped: it is upstream text bound for the terminal.
+#[test]
+fn snap_email_names_the_logins_own_address_escaped() {
+    assert_eq!(
+        snap_email(Some(oauth_login()), Some("u-1"), false).as_deref(),
+        Some("cloudy\\u{1b}[2J@example.com")
+    );
+}
+
+/// A plan carried over from an earlier login keeps that login's pair, and the
+/// anchor names the login held now: the address names no one.
+#[test]
+fn snap_email_names_no_one_for_another_logins_address() {
+    assert_eq!(snap_email(Some(oauth_login()), Some("u-2"), false), None);
+}
+
+/// No anchor, nothing to tie the address to.
+#[test]
+fn snap_email_names_no_one_without_an_anchor() {
+    assert_eq!(snap_email(Some(oauth_login()), None, false), None);
+}
+
+/// A logged-out account names no one, whatever its cached plan says.
+#[test]
+fn snap_email_names_no_one_on_a_logged_out_account() {
+    assert_eq!(snap_email(None, Some("u-1"), false), None);
+}
+
+/// A copy-back can install another account's login under the same anchor;
+/// its stale mark hides the address until the next `/profile` read.
+#[test]
+fn snap_email_names_no_one_after_a_copy_back() {
+    assert_eq!(snap_email(Some(oauth_login()), Some("u-1"), true), None);
+}
+
+/// A credentials file without an OAuth pair holds no login to name.
+#[test]
+fn snap_email_names_no_one_without_an_oauth_pair() {
+    let empty = crate::profile::ClaudeCredentials {
+        claude_ai_oauth: None,
+    };
+    assert_eq!(snap_email(Some(empty), Some("u-1"), false), None);
+}
+
 // ── CLA-SPLIT: the `token` long-lived-login status row ──────────────────────
 
 // A comfortable horizon is a plain accent value; the last 30 days warn as a
@@ -654,7 +936,7 @@ fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
 
     for selected in [false, true] {
         let arrow = if selected { "❯ " } else { "  " };
-        let unarmed = detail_row(
+        let unarmed = one_row(
             ConfigRow::ClearSessionToken,
             selected,
             false,
@@ -673,7 +955,7 @@ fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
             "always bold, like `delete account` (selected={selected})"
         );
 
-        let armed = detail_row(
+        let armed = one_row(
             ConfigRow::ClearSessionToken,
             selected,
             false,
@@ -691,7 +973,7 @@ fn clear_session_token_button_is_delete_class_and_arms_on_second_press() {
     }
 
     // Another row's arm must not bleed into this row's confirm copy.
-    let cross_armed = detail_row(
+    let cross_armed = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -713,7 +995,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
     let snap = Snap::blank("a"); // has_other_login: false
     let input = InputState::new("");
 
-    let gated = detail_row(
+    let gated = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -735,7 +1017,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
 
     let mut ungated_snap = Snap::blank("a");
     ungated_snap.has_other_login = true;
-    let ungated = detail_row(
+    let ungated = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -754,7 +1036,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
     // lie. `Snap::clear_gated` is the one spelling all three surfaces share.
     let mut flag_only = Snap::blank("a");
     flag_only.rolling_armed = true;
-    let acting = detail_row(
+    let acting = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -767,7 +1049,7 @@ fn clear_session_token_button_dims_without_another_stored_login() {
         theme::danger().fg,
         "a flag-only account renders the acting button, not the dim"
     );
-    let armed = detail_row(
+    let armed = one_row(
         ConfigRow::ClearSessionToken,
         true,
         false,
@@ -1088,7 +1370,7 @@ fn stalled_rolling_fix_line_uses_the_title_that_survives_a_draft() {
 fn login_labels_read_the_same_for_every_flow() {
     let input = InputState::new("");
     let text = |snap: &Snap, row: ConfigRow| {
-        line_text(&detail_row(row, false, false, None, snap, &input))
+        line_text(&one_row(row, false, false, None, snap, &input))
             .trim()
             .to_string()
     };
@@ -1109,4 +1391,169 @@ fn login_labels_read_the_same_for_every_flow() {
     assert_eq!(text(&snap, ConfigRow::Login), "+ login");
     snap.logged_in = true;
     assert_eq!(text(&snap, ConfigRow::Login), "re-login");
+}
+
+/// cloudy-tui "Keys and commands inside prose" on the token row: both fix
+/// lines' commands render ACCENT, never bold.
+#[test]
+fn session_token_fix_lines_style_their_commands() {
+    use crate::claude::SessionTokenStatus as S;
+    use crate::testutil::{assert_prose_part, lines_buffer};
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let now = 1_700_000_000_000_i64;
+    let hour = 3_600_000_i64;
+    let w = 100;
+
+    let dead = session_token_lines(&S::LongLived(Some(now - hour)), false, "acct", now, w);
+    assert_prose_part(
+        &lines_buffer(dead, 100),
+        "re-mint with claude setup-token",
+        "claude setup-token",
+        false,
+    );
+    let stalled = session_token_lines(&S::LongLived(Some(now - hour)), true, "acct", now, w);
+    assert_prose_part(
+        &lines_buffer(stalled, 100),
+        "· clauth rolling-token acct re-arms",
+        "clauth rolling-token acct",
+        false,
+    );
+}
+
+/// The `alert at` row at rest shows the SAVED value (the snapshot), never a
+/// stale draft buffer: the percent in the accent while set, a faint `off`
+/// while not; the editor shows the raw buffer; the hint names each state.
+#[test]
+fn the_alert_row_shows_its_percent_or_off_and_hints_each_state() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let mut snap = Snap::blank("a");
+    let stale_draft = InputState::new("40");
+
+    snap.bell_threshold = "90".into();
+    let set = one_row(
+        ConfigRow::BellThreshold,
+        true,
+        false,
+        None,
+        &snap,
+        &stale_draft,
+    );
+    assert_eq!(set.spans[1].content.trim_end(), "alert at");
+    assert_eq!(set.spans[2].content, "90%");
+    assert_eq!(set.spans[2].style.fg, theme::accent().fg);
+    assert_eq!(
+        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        "alerts once when 5h usage reaches this, again after it drops below"
+    );
+
+    snap.bell_threshold = "97.5".into();
+    let fraction = one_row(
+        ConfigRow::BellThreshold,
+        false,
+        false,
+        None,
+        &snap,
+        &stale_draft,
+    );
+    assert_eq!(fraction.spans[2].content, "97.5%");
+
+    snap.bell_threshold = String::new();
+    let off = one_row(
+        ConfigRow::BellThreshold,
+        false,
+        false,
+        None,
+        &snap,
+        &stale_draft,
+    );
+    assert_eq!(off.spans[2].content, "off");
+    assert_eq!(off.spans[2].style.fg, theme::faint().fg);
+    assert_eq!(
+        row_hint(ConfigRow::BellThreshold, &snap).unwrap(),
+        concat!(
+            "no alert when 5h usage climbs; ",
+            key_lit!("↵"),
+            " or ",
+            key_lit!("+"),
+            " to set one"
+        )
+    );
+
+    let editing = one_row(
+        ConfigRow::BellThreshold,
+        true,
+        true,
+        None,
+        &snap,
+        &InputState::new("8"),
+    );
+    assert_eq!(editing.spans[1].content.trim_end(), "alert at");
+    assert_eq!(
+        editing.spans[2].content, "8",
+        "the editor shows the raw buffer"
+    );
+    assert_eq!(editing.spans[2].style.fg, theme::body().fg);
+    assert_eq!(editing.spans[3].content, " %");
+    assert_eq!(editing.spans[3].style.fg, theme::faint().fg);
+
+    let refused = one_row(
+        ConfigRow::BellThreshold,
+        true,
+        true,
+        None,
+        &snap,
+        &InputState::new("101"),
+    );
+    assert_eq!(refused.spans[2].content, "101");
+    assert_eq!(refused.spans[2].style.fg, theme::danger().fg);
+    assert_eq!(refused.spans[3].style.fg, theme::danger().fg);
+}
+
+/// While typing, the `alert at` field carries its accepted range under it,
+/// faint while the buffer would save and DANGER while it would be refused.
+#[test]
+fn the_alert_editor_names_its_range_and_turns_danger_on_a_refused_buffer() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    for (raw, refused) in [
+        ("90", false),
+        ("", false),
+        ("0", false),
+        ("100", false),
+        ("101", true),
+        ("abc", true),
+        ("-1", true),
+    ] {
+        let lines = alert_range_tooltip(&InputState::new(raw), WIDE);
+        assert_eq!(lines.len(), 1, "{raw:?}");
+        assert_eq!(
+            line_text(&lines[0]),
+            " └ 0-100 % · empty turns it off",
+            "{raw:?}"
+        );
+        let want = if refused {
+            theme::danger().fg
+        } else {
+            theme::faint().fg
+        };
+        assert_eq!(lines[0].spans[1].style.fg, want, "{raw:?}");
+    }
+}
+
+/// A control character in an edited value renders escaped in the Setup editor
+/// body, and the shared caret-column count matches that escaped body, so the
+/// native cursor never drifts right of the caret.
+#[test]
+fn a_control_character_value_renders_escaped_in_the_setup_editor() {
+    let input = InputState::new("x\ty");
+    let spans = value_spans(&input, true, false);
+    let body: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(
+        body, "x\\ty",
+        "the editor body escapes the control character"
+    );
+    assert_eq!(
+        head_cols(&input),
+        body.chars().count(),
+        "the caret column counts the escaped body"
+    );
 }

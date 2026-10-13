@@ -13,11 +13,11 @@ fn login_expired_shares_one_head_across_line_and_toast() {
     let m = login_expired(&crate::profile::ProfileName::from("work"));
     assert_eq!(
         m.line(),
-        "login for 'work' has expired: refresh token revoked or invalid: run clauth login work"
+        "login for 'work' has expired: refresh token revoked or invalid: run `clauth login work`"
     );
     assert_eq!(
         m.toast(),
-        "login for 'work' has expired\nrefresh token revoked or invalid: run clauth login work"
+        "login for 'work' has expired\nrefresh token revoked or invalid: run `clauth login work`"
     );
     // The bold toast head is exactly the line() prefix before the separator.
     assert_eq!(
@@ -264,7 +264,10 @@ fn every_transient_cause_renders_its_own_copy() {
         for (retry, suffix) in [
             (Retry::Wait, ": retry in a moment"),
             (Retry::Connection, ": check your connection and retry"),
-            (Retry::Restart, ": run clauth login again for a fresh code"),
+            (
+                Retry::Restart,
+                ": run `clauth login` again for a fresh code",
+            ),
         ] {
             let retry_name = format!("{retry:?}");
             if names_next_step {
@@ -317,7 +320,7 @@ fn only_the_relogin_causes_read_as_permanent() {
 fn detail_returns_the_next_step_alone_and_falls_back_to_the_head() {
     assert_eq!(
         login_expired(&crate::profile::ProfileName::from("work")).detail(),
-        "refresh token revoked or invalid: run clauth login work"
+        "refresh token revoked or invalid: run `clauth login work`"
     );
     let bare = Message {
         head: "done".to_string(),
@@ -351,6 +354,17 @@ fn format_pct_drops_trailing_zero_on_whole_numbers() {
 #[test]
 fn format_pct_shows_fractional_percent() {
     assert_eq!(format_pct(42.3), "42.3%");
+}
+
+#[test]
+fn format_pct_rounds_to_two_decimals_without_trailing_zeros() {
+    assert_eq!(format_pct(1.0000000000000009), "1%");
+    assert_eq!(format_pct(1.001), "1%");
+    assert_eq!(format_pct(1.234), "1.23%");
+    assert_eq!(format_pct(1.236), "1.24%");
+    assert_eq!(format_pct(0.001), "0%");
+    assert_eq!(format_pct(-0.0), "0%");
+    assert_eq!(format_pct(99.999), "100%");
 }
 
 /// The one threshold spelling, pinned per branch so a drift on one branch
@@ -392,6 +406,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     });
@@ -405,6 +420,7 @@ fn account_tier_reads_the_fetched_tier_only_the_canceled_marker_is_on_the_status
             tier: PlanTier::Free,
             subscription_status: None,
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     });
@@ -444,6 +460,7 @@ fn account_tier_reports_no_tier_for_an_unfetched_plan() {
             tier: PlanTier::Unknown,
             subscription_status: None,
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     });
@@ -474,6 +491,7 @@ fn account_tier_falls_through_an_unclassified_fetched_plan_to_the_token() {
                 tier,
                 subscription_status: None,
                 codex_plan: None,
+                email: None,
             }),
             ..Default::default()
         })
@@ -530,6 +548,7 @@ fn account_tier_still_renders_every_known_tier() {
             tier: PlanTier::Max(Some(20)),
             subscription_status: None,
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     });
@@ -541,6 +560,7 @@ fn account_tier_still_renders_every_known_tier() {
             tier: PlanTier::Free,
             subscription_status: None,
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     });

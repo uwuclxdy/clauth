@@ -553,13 +553,13 @@ fn app_state_reads_burn_aware_switching_true() {
     assert!(state.burn_aware_switching);
 }
 
-// `walk_order` (issue #86) defaults to `chain` and its on-disk spelling is
-// the hyphenated `soonest-weekly-reset` — the serde rename is the load
-// boundary, so a rename typo must red here, not on an operator's first save.
-// Unset is omitted from a stock file (the `reset_display` Option contract),
-// and BOTH values round-trip.
+// `walk_order` (issue #86) defaults to `chain` and its on-disk spellings are
+// the hyphenated `soonest-weekly-reset` and `most-weekly-headroom` — the serde
+// rename is the load boundary, so a rename typo must red here, not on an
+// operator's first save. Unset is omitted from a stock file (the
+// `reset_display` Option contract), and EVERY value round-trips.
 #[test]
-fn app_state_walk_order_defaults_chain_and_both_values_round_trip() {
+fn app_state_walk_order_defaults_chain_and_every_value_round_trips() {
     let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
     assert_eq!(state.walk_order(), WalkOrder::Chain);
     assert!(
@@ -590,6 +590,16 @@ fn app_state_walk_order_defaults_chain_and_both_values_round_trip() {
     );
     let reparsed_chain: AppState = toml::from_str(&rendered_chain).expect("reparse chain state");
     assert_eq!(reparsed_chain.walk_order(), WalkOrder::Chain);
+
+    let headroom: AppState =
+        toml::from_str("profiles = []\nwalk_order = \"most-weekly-headroom\"\n")
+            .expect("parse the hand-written spelling");
+    assert_eq!(headroom.walk_order(), WalkOrder::MostWeeklyHeadroom);
+    let rendered_headroom = toml::to_string_pretty(&headroom).expect("render headroom state");
+    assert!(
+        rendered_headroom.contains("walk_order = \"most-weekly-headroom\""),
+        "must render the hyphenated spelling, got:\n{rendered_headroom}"
+    );
 }
 
 // On must round-trip explicitly; off (the default) is omitted entirely from
@@ -650,6 +660,38 @@ fn preemptive_rotation_defaults_true_and_an_explicit_off_survives_a_round_trip()
     let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render default state");
     assert!(
         !rendered_on.contains("preemptive_rotation"),
+        "on (default) must be omitted, got:\n{rendered_on}"
+    );
+}
+
+// `preserve_non_login_keys` defaults ON with the same serde contract: a state
+// file written before the key existed reads as on, which is what makes the
+// preservation reach every host with no config, and an explicit off renders so
+// the next load does not turn it back on.
+#[test]
+fn preserve_non_login_keys_defaults_true_and_an_explicit_off_survives_a_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(
+        state.preserve_non_login_keys,
+        "a state file predating the key must read as on"
+    );
+    assert!(AppState::default().preserve_non_login_keys);
+
+    let off = AppState {
+        preserve_non_login_keys: false,
+        ..AppState::default()
+    };
+    let rendered_off = toml::to_string_pretty(&off).expect("render off state");
+    assert!(
+        rendered_off.contains("preserve_non_login_keys = false"),
+        "off must render explicitly, got:\n{rendered_off}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered_off).expect("reparse off state");
+    assert!(!reparsed.preserve_non_login_keys);
+
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render default state");
+    assert!(
+        !rendered_on.contains("preserve_non_login_keys"),
         "on (default) must be omitted, got:\n{rendered_on}"
     );
 }
@@ -2850,8 +2892,8 @@ fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
         before
             .config_mtimes
             .iter()
-            .find(|(n, _, _)| n == "newcomer")
-            .map(|(_, m, _)| m.is_some()),
+            .find(|(n, _, _, _)| n == "newcomer")
+            .map(|(_, m, _, _)| m.is_some()),
         Some(false),
         "the dir exists but has no config.toml yet"
     );
@@ -2861,8 +2903,8 @@ fn reload_fingerprint_bumps_when_a_config_toml_is_added() {
         after
             .config_mtimes
             .iter()
-            .find(|(n, _, _)| n == "newcomer")
-            .map(|(_, m, _)| m.is_some()),
+            .find(|(n, _, _, _)| n == "newcomer")
+            .map(|(_, m, _, _)| m.is_some()),
         Some(true),
         "adding a config.toml gives the entry an mtime"
     );
@@ -2883,16 +2925,16 @@ fn reload_fingerprint_advances_when_a_config_toml_is_edited() {
     let before_mtime = before
         .config_mtimes
         .iter()
-        .find(|(n, _, _)| n == "p")
-        .and_then(|(_, m, _)| *m);
+        .find(|(n, _, _, _)| n == "p")
+        .and_then(|(_, m, _, _)| *m);
     let later = std::time::SystemTime::now() + std::time::Duration::from_secs(30);
     crate::testutil::set_mtime(&cfg, later);
     let after = reload_fingerprint();
     let after_mtime = after
         .config_mtimes
         .iter()
-        .find(|(n, _, _)| n == "p")
-        .and_then(|(_, m, _)| *m);
+        .find(|(n, _, _, _)| n == "p")
+        .and_then(|(_, m, _, _)| *m);
     assert!(
         after_mtime > before_mtime,
         "editing a config.toml must advance its recorded mtime"
@@ -2918,7 +2960,7 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
         before
             .config_mtimes
             .iter()
-            .any(|(n, m, _)| n == "p" && m.is_some()),
+            .any(|(n, m, _, _)| n == "p" && m.is_some()),
         "the saved profile has a config.toml"
     );
     std::fs::remove_file(&cfg).expect("remove config");
@@ -2927,7 +2969,7 @@ fn reload_fingerprint_drops_when_a_config_toml_is_removed() {
         after
             .config_mtimes
             .iter()
-            .any(|(n, m, _)| n == "p" && m.is_none()),
+            .any(|(n, m, _, _)| n == "p" && m.is_none()),
         "removing the config.toml drops its recorded mtime to None"
     );
     assert_ne!(before, after);
@@ -4477,5 +4519,145 @@ fn a_default_serve_table_carries_a_stray_key() {
     assert!(
         after[marker..].contains("[serve]"),
         "the carried [serve] table lands after the marker:\n{after}"
+    );
+}
+
+// `bell_command` is a hand-edited key: a rewrite keeps the operator's quoting
+// byte for byte.
+#[test]
+fn app_state_bell_command_round_trips_through_a_save() {
+    let _home = HomeSandbox::new();
+    let template = "notify-send 'clauth alert' %s";
+    save_app_state(&AppState {
+        bell_command: Some(template.to_string()),
+        ..AppState::default()
+    })
+    .expect("save state with a bell command");
+    assert_eq!(
+        load_app_state().expect("reload").bell_command.as_deref(),
+        Some(template)
+    );
+}
+
+// ── the refresh chain's stage, from the loader's side ────────────────────────
+
+use crate::testutil::hold_state_flock;
+
+/// A live `credentials.json.staged` (its base is the store's refresh token, its
+/// pair unrecorded) is what a failed rotation persist leaves: `load_profile`
+/// must hand back the staged pair, without waiting on the state flock and
+/// without consuming the stage, because a loader that writes the pair through
+/// raced installs and refused the rotation's own persist.
+#[test]
+fn a_live_stage_loads_into_memory_without_the_flock_or_a_write() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("stage-live-load");
+    seed_committed(name.as_str(), &pair("at-1", "rt-1"));
+    let dir = profile_dir(&name).expect("dir");
+    // `base` is the hand-computed first 8 bytes of SHA-256("rt-1"), hex.
+    std::fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"a33d8c625833429d","base_access":"at-1",
+            "creds":{"claudeAiOauth":{"accessToken":"at-2","refreshToken":"rt-2"}}}"#,
+    )
+    .expect("write the stage");
+    let _held = hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_secs(3)));
+
+    let started = std::time::Instant::now();
+    let loaded = load_profile(&name);
+    let waited = started.elapsed();
+    crate::lock::set_state_lock_timeout_override(None);
+
+    let loaded = loaded.expect("load the profile");
+    assert_eq!(
+        loaded.refresh_token(),
+        Some("rt-2"),
+        "the live stage's pair is the chain head and must be what loads"
+    );
+    assert!(
+        waited < std::time::Duration::from_millis(1500),
+        "a stage read takes no lock, so a held flock must not delay the load: {waited:?}"
+    );
+    assert!(
+        dir.join("credentials.json.staged").is_file(),
+        "a loader never consumes the stage"
+    );
+    let stored: ClaudeCredentials =
+        read_json_file(&dir.join("credentials.json")).expect("read the store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-1"),
+        "a loader never writes the staged pair through"
+    );
+}
+
+/// A legacy `.pending` newer than the store, read while another process holds
+/// the state flock past its deadline: the write-through cannot take the lock,
+/// so the sidecar must survive for a later load to land, and this load still
+/// hands back the staged pair it judged live.
+#[test]
+fn a_legacy_pending_survives_a_load_that_cannot_take_the_flock() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("pending-flock-held");
+    seed_committed(name.as_str(), &pair("old-access", "old-refresh"));
+    let dir = profile_dir(&name).expect("dir");
+    let pending_path = dir.join("credentials.json.pending");
+    std::fs::write(
+        &pending_path,
+        serde_json::to_vec(&pair("new-access", "new-refresh")).expect("serialize"),
+    )
+    .expect("write the legacy sidecar");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(
+        &dir.join("credentials.json"),
+        now - std::time::Duration::from_secs(60),
+    );
+    crate::testutil::set_mtime(&pending_path, now);
+    let _held = hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(200)));
+
+    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")));
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert_eq!(
+        refresh_token_of(&got),
+        Some("new-refresh"),
+        "the sidecar newer than the store is the live pair"
+    );
+    assert!(
+        pending_path.is_file(),
+        "a sidecar whose write-through never landed must not be deleted"
+    );
+}
+
+/// F8: a legacy sidecar OLDER than the store is discarded lock-free, as before
+/// the flock rule: a busy flock never holds a load of this profile up, and the
+/// stale sidecar still goes.
+#[test]
+fn a_stale_legacy_pending_goes_without_waiting_on_the_flock() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("pending-stale-flock-held");
+    seed_committed(name.as_str(), &pair("old-access", "old-refresh"));
+    let dir = profile_dir(&name).expect("dir");
+    let pending_path = dir.join("credentials.json.pending");
+    std::fs::write(
+        &pending_path,
+        serde_json::to_vec(&pair("new-access", "new-refresh")).expect("serialize"),
+    )
+    .expect("write the legacy sidecar");
+    let now = std::time::SystemTime::now();
+    crate::testutil::set_mtime(&pending_path, now - std::time::Duration::from_secs(60));
+    crate::testutil::set_mtime(&dir.join("credentials.json"), now);
+    let _held = hold_state_flock();
+    crate::lock::set_state_lock_timeout_override(Some(std::time::Duration::from_millis(200)));
+
+    let got = recover_pending_credentials(&name, Some(pair("old-access", "old-refresh")));
+    crate::lock::set_state_lock_timeout_override(None);
+
+    assert_eq!(refresh_token_of(&got), Some("old-refresh"));
+    assert!(
+        !pending_path.exists(),
+        "a stale sidecar goes without the flock"
     );
 }

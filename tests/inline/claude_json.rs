@@ -184,6 +184,101 @@ fn account_scoped_model_caches_stay_per_profile() {
     assert_eq!(bj["additionalModelCostsCache"], json!({}));
 }
 
+/// Two organizations under one account share an `accountUuid`, and
+/// `cachedUsageUtilization` is stamped with that uuid alone, so a shared sync
+/// would show one profile's 5h/7d usage as every other profile's.
+#[test]
+fn usage_and_artifact_caches_stay_per_profile() {
+    let _home = HomeSandbox::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = tmp.path().join("a.json");
+    let b = tmp.path().join("b.json");
+    write_json(
+        &a,
+        &json!({
+            "numStartups": 2,
+            "cachedUsageUtilization": {
+                "accountUuid": "acct",
+                "utilization": {"five_hour": {"utilization": 14}}
+            },
+            "cachedArtifactRoster": {"accountUuid": "acct", "organizationUuid": "org-a"},
+            "artifactRosterDenied": true
+        }),
+    );
+    write_json(
+        &b,
+        &json!({
+            "numStartups": 1,
+            "cachedUsageUtilization": {
+                "accountUuid": "acct",
+                "utilization": {"five_hour": {"utilization": 87}}
+            }
+        }),
+    );
+    set_mtime(&a, t(10));
+    set_mtime(&b, t(5));
+
+    sync_paths(&[a, b.clone()]).expect("sync");
+
+    let bj = read_json(&b);
+    assert_eq!(bj["numStartups"], json!(2), "shared field still propagates");
+    assert_eq!(
+        bj["cachedUsageUtilization"]["utilization"]["five_hour"]["utilization"],
+        json!(87),
+        "the newest file's usage must not overwrite this profile's own"
+    );
+    assert!(
+        bj.get("cachedArtifactRoster").is_none(),
+        "absent per-profile key must not be injected from the winner"
+    );
+    assert!(bj.get("artifactRosterDenied").is_none());
+}
+
+#[test]
+fn org_scoped_config_and_feature_caches_stay_per_profile() {
+    let _home = HomeSandbox::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let a = tmp.path().join("a.json");
+    let b = tmp.path().join("b.json");
+    let keys = [
+        "groveConfigCache",
+        "promoStartupStatusCache",
+        "metricsStatusCacheByPrincipal",
+        "clientDataCacheSlots",
+        "cachedGrowthBookFeatures",
+        "cachedGrowthBookFeaturesAt",
+        "cachedExperimentFeatures",
+        "cachedExperimentData",
+        "additionalModelOptionsAnsweredAt",
+        "lastSeenOrgDefaultUpdatedAt",
+        "clientDataCache",
+        "metricsStatusCache",
+        "githubWebConnectionStatusCache",
+        "autoCompactWindowsCache",
+        "startupPrefetchedAt",
+    ];
+    let mut winner = json!({"numStartups": 2});
+    for key in keys {
+        winner[key] = json!("a");
+    }
+    write_json(&a, &winner);
+    write_json(&b, &json!({"numStartups": 1, "groveConfigCache": "b"}));
+    set_mtime(&a, t(10));
+    set_mtime(&b, t(5));
+
+    sync_paths(&[a, b.clone()]).expect("sync");
+
+    let bj = read_json(&b);
+    assert_eq!(bj["numStartups"], json!(2), "shared field still propagates");
+    assert_eq!(bj["groveConfigCache"], json!("b"));
+    for key in &keys[1..] {
+        assert!(
+            bj.get(*key).is_none(),
+            "{key} must not be injected from the winner"
+        );
+    }
+}
+
 /// `primaryApiKey` is a raw `/login`-managed API key Claude Code stores in
 /// `.claude.json`; `customApiKeyResponses` is its per-key approval ledger. Both
 /// are account-scoped, so a sync must never carry one profile's into another.

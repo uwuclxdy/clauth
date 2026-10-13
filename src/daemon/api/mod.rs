@@ -141,7 +141,7 @@ impl Drop for ConnectionSlot {
 /// not here, and that a second acceptor would break silently.
 fn claim_slot() -> Option<ConnectionSlot> {
     let claimed = LIVE_CONNECTIONS
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |live| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |live| {
             (live < MAX_CONNECTIONS).then_some(live + 1)
         })
         .is_ok();

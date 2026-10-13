@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, Paragraph};
+use ratatui::widgets::{ListItem, Paragraph};
 use std::collections::HashSet;
 
 use super::super::app::{App, CodexRow, MainItemKind};
@@ -16,9 +16,10 @@ use super::format::{
 };
 use super::header::pulse_name_spans;
 use super::panes::{
-    bold_when, draw_scrollbar, empty_state, name_color, section_box, section_box_meta, select_line,
-    wrap_words,
+    bold_when, draw_following_list, empty_state, name_color, section_box, section_box_meta,
+    select_line, wrap_words,
 };
+use super::prose::{self, cmd_lit};
 use super::usage::{eta_left_secs, window_rate_unit};
 use crate::fallback::{
     BlockedReason, SwitchAction, blocked_reason, next_target, soonest_resume, threshold_for,
@@ -39,11 +40,16 @@ const ACCOUNTS_MIN: u16 = 7;
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // The chain panel's inner width is independent of the vertical split (both
     // panels span the full body width), so build its lines first and size the
-    // panel to fit them — no clipped members, no wasted rows.
+    // panel to fit them, capped; members that do not fit collapse into
+    // `truncate_chain`'s `+N more` line.
     let probe = Rect { height: 3, ..area };
     let chain_inner_w = section_box("", false, false).inner(probe).width as usize;
-    let chain_lines = fallback_flow_lines(app, chain_inner_w);
-    let chain_height = chain_panel_height(chain_lines.len(), area.height);
+    let (full_lines, member_count) = fallback_flow_lines(app, chain_inner_w);
+    let chain_height = chain_panel_height(full_lines.len(), area.height);
+    // The panel is capped, so its inner height is the budget the member list
+    // must fit: when members are hidden, the last row names how many.
+    let inner_height = chain_height.saturating_sub(2) as usize;
+    let chain_lines = truncate_chain(full_lines, member_count, inner_height);
 
     let [accounts_area, chain_area] = Layout::vertical([
         Constraint::Min(ACCOUNTS_MIN),
@@ -64,6 +70,58 @@ fn chain_panel_height(content_rows: usize, area_height: u16) -> u16 {
     let desired = (content_rows as u16).saturating_add(2);
     let max_chain = area_height.saturating_sub(ACCOUNTS_MIN);
     desired.min(max_chain).max(3)
+}
+
+/// [`fallback_flow_lines`]'s full output cut to `inner_height` content rows.
+/// Members first: when every member fits, draw them all plus the captions that
+/// still fit, with no `+N more` line. Only when a member is hidden does the
+/// last row become `+N more · → fallback tab` (N = hidden members), captions
+/// keeping their rows while the members shrink.
+fn truncate_chain(
+    full: Vec<Line<'static>>,
+    member_count: usize,
+    inner_height: usize,
+) -> Vec<Line<'static>> {
+    // The empty-chain prose is not a member list — never truncate it.
+    if member_count == 0 || full.len() <= inner_height {
+        return full;
+    }
+    let caption_count = full.len() - member_count;
+    if member_count <= inner_height {
+        let captions_kept = (inner_height - member_count).min(caption_count);
+        let mut out = Vec::with_capacity(member_count + captions_kept);
+        out.extend(full[..member_count].iter().cloned());
+        out.extend(
+            full[member_count..member_count + captions_kept]
+                .iter()
+                .cloned(),
+        );
+        return out;
+    }
+    let room = inner_height.saturating_sub(1);
+    let captions_kept = caption_count.min(room);
+    let members_drawn = (room - captions_kept).min(member_count);
+    let hidden = member_count - members_drawn;
+    let mut out = Vec::with_capacity(members_drawn + captions_kept + 1);
+    out.extend(full[..members_drawn].iter().cloned());
+    out.extend(
+        full[member_count..member_count + captions_kept]
+            .iter()
+            .cloned(),
+    );
+    out.push(more_members_line(hidden));
+    out
+}
+
+/// The `+N more · → fallback tab` line: prose faint, the arrow a running-copy
+/// key (`ACCENT + bold`) through the shared tokenizer, like every caption.
+fn more_members_line(hidden: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(prose::spans(
+        &format!("+{hidden} more · {} fallback tab", prose::key("\u{2192}")),
+        theme::faint(),
+    ));
+    Line::from(spans)
 }
 
 /// The accounts panel's title-right meta: one count per harness — both
@@ -103,6 +161,11 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
         &[]
     };
     if app.config().profiles.is_empty() && codex.is_empty() {
+        app.overview_selector.offset.set(0);
+        app.overview_selector.viewport.set(0);
+        app.overview_selector.starts.replace(Vec::new());
+        app.overview_selector.block_ends.replace(Vec::new());
+        app.overview_selector.total.set(0);
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     }
@@ -114,49 +177,62 @@ fn draw_overview_accounts(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let header = overview_header(&widths, any_deepseek(app));
     frame.render_widget(Paragraph::new(header).style(theme::base()), header_area);
 
-    let items = if app.harness_filter.shows_claude() {
-        app.main_items()
-    } else {
-        Vec::new()
-    };
-    let sel = app.profile_cursor.min(items.len().saturating_sub(1));
+    let items = app.main_items();
+    let sel = app.overview_cursor.min(items.len().saturating_sub(1));
     let width = list_area.width;
-    let mut rows: Vec<ListItem<'_>> = items
+    let claude_count = if app.harness_filter.shows_claude() {
+        app.profile_count()
+    } else {
+        0
+    };
+    let mut rows: Vec<ListItem<'_>> = Vec::with_capacity(items.len() + 2);
+    for (index, item) in items.iter().enumerate() {
+        if index == claude_count && !codex.is_empty() {
+            if claude_count > 0 {
+                rows.push(ListItem::new(Line::from("")));
+            }
+            rows.push(ListItem::new(Line::from(prose::spans(
+                concat!("  codex — switch with ", cmd_lit!("clauth <name>")),
+                theme::dim(),
+            ))));
+        }
+        let selected = index == sel;
+        let line = match item {
+            MainItemKind::Profile(idx) => {
+                render_overview_row(app, *idx, &widths, selected, focused)
+            }
+            MainItemKind::Codex(idx) => render_codex_row(&codex[*idx], &widths, selected),
+        };
+        rows.push(ListItem::new(select_line(line, selected, focused, width)));
+    }
+    // One three-way offset: the blank + header the codex band inserts ahead of
+    // its first row, used for both the selection's rendered row and the
+    // cursor-indexed starts the page step reads.
+    let codex_off = if codex.is_empty() {
+        0
+    } else if claude_count > 0 {
+        2
+    } else {
+        1
+    };
+    let render_sel = sel
+        + if codex.is_empty() || sel < claude_count {
+            0
+        } else {
+            codex_off
+        };
+    draw_following_list(frame, list_area, rows, render_sel, &app.overview_selector);
+    // The list's rows are flat, but the codex band inserts a blank spacer and a
+    // header ahead of the first codex row, so cursor row -> rendered line is
+    // not the identity. Republish the cursor-indexed starts for the page step.
+    let starts: Vec<usize> = items
         .iter()
         .enumerate()
-        .map(|(row, item)| match item {
-            MainItemKind::Profile(idx) => {
-                let selected = row == sel;
-                let line = render_overview_row(app, *idx, &widths, selected, focused);
-                ListItem::new(select_line(line, selected, focused, width))
-            }
-        })
+        .map(|(i, _)| if i < claude_count { i } else { i + codex_off })
         .collect();
-    // The codex section, after the claude rows and never selectable: the cursor
-    // and every action are bound to `config.profiles`, and a codex account has
-    // no record there for them to act on. Rendering it read-only is what keeps
-    // "what the cursor can reach" and "what the screen shows" from diverging.
-    if !codex.is_empty() {
-        if !rows.is_empty() {
-            rows.push(ListItem::new(Line::from("")));
-        }
-        rows.push(ListItem::new(Line::from(vec![Span::styled(
-            "  codex — switch with `clauth <name>`",
-            theme::dim(),
-        )])));
-        for row in codex {
-            rows.push(ListItem::new(render_codex_row(row, &widths)));
-        }
-    }
-
-    let total = rows.len();
-    let list = List::new(rows).style(theme::base());
-    let mut state = ratatui::widgets::ListState::default();
-    state.select(Some(sel));
-    frame.render_stateful_widget(list, list_area, &mut state);
-
-    let viewport = list_area.height as usize;
-    draw_scrollbar(frame, list_area, total, state.offset(), viewport);
+    let block_ends: Vec<usize> = starts.iter().map(|s| s + 1).collect();
+    app.overview_selector.starts.replace(starts);
+    app.overview_selector.block_ends.replace(block_ends);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -410,20 +486,23 @@ fn overview_header(widths: &OverviewWidths, deepseek: bool) -> Line<'static> {
 
 /// One codex account, in the claude columns: name, plan, 5h, 7d, and a
 /// `↺ N` chip while the account holds a banked usage-limit reset (what
-/// `clauth limit-reset` spends). The cursor and timer slots are kept blank and
-/// no live cell is drawn — this section is read-only, and a timer would
-/// promise a countdown the Overview cannot act on.
-fn render_codex_row(row: &CodexRow, widths: &OverviewWidths) -> Line<'static> {
+/// `clauth limit-reset` spends). The timer slot stays blank and no live cell
+/// is drawn: the Overview cannot refresh or switch a Codex account.
+fn render_codex_row(row: &CodexRow, widths: &OverviewWidths, selected: bool) -> Line<'static> {
     let name_style = if row.active {
         theme::accent().bold()
+    } else if selected {
+        theme::base().bold()
     } else {
         theme::base()
     };
-    // The same slots every list row carries — the 2-cell cursor prefix (blank:
-    // a codex row is never selected), the marker cell and its gap — so the
-    // `×` and the name sit in the claude rows' columns under the header.
+    // The two-cell cursor prefix keeps Codex markers under the Claude column.
     let mut spans = vec![
-        Span::raw("  "),
+        if selected {
+            Span::styled("❯ ", theme::accent().bold())
+        } else {
+            Span::raw("  ")
+        },
         if row.broken {
             Span::styled(theme::dead_credential_glyph(), theme::danger())
         } else {
@@ -568,7 +647,7 @@ fn render_overview_row(
     } else if token_danger {
         spans.push(Span::styled("⊘", hue(theme::danger())));
         spans.push(Span::raw(" "));
-    } else if app.bell_fired.contains_key(profile.name.as_str()) {
+    } else if app.bell_fired.is_ringing(profile.name.as_str()) {
         spans.push(Span::styled("!", hue(theme::danger())));
         spans.push(Span::raw(" "));
     } else if active {
@@ -841,7 +920,7 @@ fn draw_fallback_overview(frame: &mut Frame<'_>, area: Rect, lines: Vec<Line<'st
 
 const GAUGE_W: usize = 12;
 
-fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+fn fallback_flow_lines(app: &App, width: usize) -> (Vec<Line<'static>>, usize) {
     // Switch-grade kick blocks feed the blocked-reason markers; read BEFORE the
     // Config lock (rank order: KickBlockState 230 < Config 400).
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
@@ -864,7 +943,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             .into_iter()
             .map(|seg| Line::from(Span::styled(seg, theme::dim()))),
         );
-        return lines;
+        return (lines, 0);
     }
 
     let chain = &cfg.state.fallback_chain;
@@ -1023,7 +1102,7 @@ fn fallback_flow_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             ),
         ]));
     }
-    lines
+    (lines, chain.len())
 }
 
 /// The active profile's projected next switch (action + eta secs), or `None`
@@ -1045,7 +1124,9 @@ fn projected_switch(
     let usage = usage_info.five_hour.as_ref()?;
     let threshold = threshold_for(profile);
     // In-memory rate (`app.history_cache`) — no disk read while `cfg` is held.
-    let active_rate = app.active_burn_rate(active_name, usage_info);
+    // A third-party member has no burn history to pair with its provider window
+    // (maintainer ruling 2026-09-10), so no rate and no projection.
+    let active_rate = app.burn_rate_for(profile, usage_info);
     let eta_secs = burn_rate_eta(active_rate, usage.utilization, threshold)?;
     let reset_secs = super::format::reset_in_secs(usage);
     if reset_secs.is_some_and(|reset| eta_secs >= reset) {

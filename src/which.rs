@@ -8,12 +8,17 @@
 //! each profile's long-lived session-token sidecar (CLA-SPLIT): that is what a
 //! switch installs for such a profile, and both things a sidecar can hold — a
 //! `claude setup-token` mint, or a rolling stamp (CLA-ROLL) — carry no refresh
-//! token by construction, so tier 1 can never see either. (2) Inside
+//! token by construction, so tier 1 can never see either. (2) On macOS, when
+//! the file tiers miss, match the login in the Keychain item Claude Code
+//! actually reads — the bare item for the global login, a config dir's
+//! namespaced twin for a session — read through a ~30 s TTL cache, so the
+//! post-migration steady state (CC moves the login into the item and deletes
+//! the file) still resolves. (3) Inside
 //! a `clauth start` runtime, fall back to the profile named by
 //! `CLAUDE_CONFIG_DIR` (`profiles/<name>/runtime-<sid>`, or a bare
 //! `profiles/<name>/runtime` where the tree is shared): a runtime tree belongs
 //! to exactly one profile, so that profile owns the session even before its
-//! first login is stored. (3) Otherwise, attribute to the credential-less active profile
+//! first login is stored. (4) Otherwise, attribute to the credential-less active profile
 //! (an API-key/endpoint profile, whose creds file is absent after a switch, or
 //! a fresh OAuth login not yet snapshotted).
 //!
@@ -22,6 +27,8 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", test))]
+use anyhow::Context;
 use anyhow::Result;
 
 use crate::out::outln;
@@ -40,6 +47,10 @@ pub(crate) enum Source {
     SessionDir,
     /// Fresh first-login attributed to the credential-less active profile.
     CredentialLessActive,
+    /// Exact `refreshToken` match against the macOS Keychain item — the bare
+    /// global login, or a config dir's namespaced twin — read when the file
+    /// tiers miss.
+    KeychainMatch,
 }
 
 impl Source {
@@ -49,6 +60,7 @@ impl Source {
             Source::SessionTokenMatch => "session_token_match",
             Source::SessionDir => "session_dir",
             Source::CredentialLessActive => "credential_less_active",
+            Source::KeychainMatch => "keychain_match",
         }
     }
 }
@@ -212,6 +224,12 @@ pub(crate) fn session_config_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The config dir the running Claude Code session reads: [`session_config_dir`],
+/// else the global `~/.claude`.
+pub(crate) fn session_config_dir_or_global() -> Option<PathBuf> {
+    session_config_dir().or_else(|| crate::profile::claude_dir().ok())
+}
+
 /// The credentials file [`resolve_active`] reads for this process's session.
 ///
 /// Exposed so a caller can stat the resolution's input instead of redoing the
@@ -241,12 +259,17 @@ fn resolve_at(config: &AppConfig, config_dir: Option<&Path>) -> Option<(String, 
     let creds = credentials_path(config_dir)
         .ok()
         .and_then(|path| read_credentials(&path));
+    #[cfg(target_os = "macos")]
+    let keychain_login = || keychain_evidence(config_dir);
+    #[cfg(not(target_os = "macos"))]
+    let keychain_login = || None;
     resolve_profile(
         config,
         creds.as_ref(),
         config_dir.is_some(),
         session_profile.as_deref(),
         &crate::claude::installed_session_token,
+        &keychain_login,
     )
     .map(|(name, source)| (name.to_string(), source))
 }
@@ -356,6 +379,7 @@ fn resolve_profile<'a>(
     in_session: bool,
     session_profile: Option<&str>,
     installed_session_token: &dyn Fn(&crate::profile::ProfileName) -> Option<String>,
+    keychain_login: &dyn Fn() -> Option<serde_json::Value>,
 ) -> Option<(&'a crate::profile::ProfileName, Source)> {
     let (name, source) = resolve_profile_candidate(
         config,
@@ -363,6 +387,7 @@ fn resolve_profile<'a>(
         in_session,
         session_profile,
         installed_session_token,
+        keychain_login,
     )?;
     if config.find(name).is_some_and(Profile::is_disabled) {
         return None;
@@ -373,19 +398,21 @@ fn resolve_profile<'a>(
 /// Resolve loaded credentials to a stored profile.
 ///
 /// Order: (1) exact refresh-token match; (1b) exact session-token match for a
-/// refresh-token-less login; (2) inside a `clauth start` runtime,
+/// refresh-token-less login; (2) the macOS Keychain item's login (bare or
+/// namespaced), when the file tiers miss; (3) inside a `clauth start` runtime,
 /// the profile named by `CLAUDE_CONFIG_DIR` owns the session even before its
-/// first login is stored; (3) for a non-runtime caller, the credential-less
+/// first login is stored; (4) for a non-runtime caller, the credential-less
 /// active profile (API-key/endpoint, or a fresh login not yet snapshotted).
 ///
-/// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets steps 1/1b only — its
-/// credentials don't belong to the global active profile.
+/// A `CLAUDE_CONFIG_DIR` that isn't a clauth runtime gets steps 1/1b plus the
+/// Keychain item — its credentials don't belong to the global active profile.
 fn resolve_profile_candidate<'a>(
     config: &'a AppConfig,
     creds: Option<&ClaudeCredentials>,
     in_session: bool,
     session_profile: Option<&str>,
     installed_session_token: &dyn Fn(&crate::profile::ProfileName) -> Option<String>,
+    keychain_login: &dyn Fn() -> Option<serde_json::Value>,
 ) -> Option<(&'a crate::profile::ProfileName, Source)> {
     if let Some(name) = creds
         .and_then(ClaudeCredentials::refresh_token)
@@ -405,6 +432,17 @@ fn resolve_profile_candidate<'a>(
         && let Some(name) = match_by_session_token(config, at, installed_session_token)
     {
         return Some((name, Source::SessionTokenMatch));
+    }
+    // Keychain tier (macOS; a no-op closure everywhere else). Fires only when
+    // the file tiers miss — exactly the post-migration steady state, where CC
+    // has moved the login into the item and deleted the file — and reads
+    // through the TTL cache, so the common pre-migration path costs nothing.
+    // A blank or absent login is a logged-out shell: no evidence, fall through.
+    if let Some(name) = keychain_login()
+        .as_ref()
+        .and_then(|blob| match_by_keychain_blob(config, blob))
+    {
+        return Some((name, Source::KeychainMatch));
     }
     if let Some(profile) =
         session_profile.and_then(|n| config.find(&crate::profile::ProfileName::from(n)))
@@ -444,6 +482,23 @@ fn match_by_refresh_token<'a>(
         fallback.get_or_insert(&p.name);
     }
     fallback
+}
+
+/// The pure core of the Keychain tier: attribute an already-read item blob's
+/// login by its refresh token. The `login_blob_is_ours` pattern — a blank or
+/// absent login is a logged-out shell, never a match — over
+/// [`match_by_refresh_token`], so the tier shares tier 1's active-first
+/// tie-break. Pure and pinned cross-platform; only the READ is macOS's.
+fn match_by_keychain_blob<'a>(
+    config: &'a AppConfig,
+    blob: &serde_json::Value,
+) -> Option<&'a crate::profile::ProfileName> {
+    let refresh_token = blob
+        .get("claudeAiOauth")
+        .and_then(|login| login.get("refreshToken"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|rt| !rt.is_empty())?;
+    match_by_refresh_token(config, refresh_token)
 }
 
 /// Active-first tie-break, same as [`match_by_refresh_token`]: two profiles can
@@ -520,6 +575,170 @@ fn json_view(config: &AppConfig, resolved: Option<&(String, Source)>) -> serde_j
         "oauth": profile.map(Profile::is_oauth),
         "active": profile.is_some_and(|p| config.is_active(&p.name)),
     })
+}
+
+// ---- Keychain evidence (macOS): the tier's read, behind a ~30 s TTL cache ----
+//
+// `which` runs once per second wherever the resolution is asked (a statusline,
+// a herdr pane, the TUI's bare-session sweep), so only a DURABLE cache helps:
+// each call pays one small file read, and the `security` subprocess runs on a
+// cache miss or a stale entry. One 0600 file per service under `~/.clauth`
+// (security.md's tree invariant: `atomic_write_600`), so a write takes no
+// state flock — the rename keeps a concurrent reader on old-or-new bytes, the
+// accepted race ("N stale panes re-resolve once") costs one subprocess, and
+// no caller thread (the TUI render thread included) ever waits on a
+// concurrent switch. A locked Keychain stalls the caller once per TTL per
+// service rather than once per call. Each write sweeps entries older than a
+// day, so session churn cannot grow the dir unbounded. Compiled off non-macOS
+// shipped builds: the tier is inert there and Linux stays byte-identical
+// (test builds keep the pure logic pinned).
+
+#[cfg(target_os = "macos")]
+fn keychain_evidence(config_dir: Option<&Path>) -> Option<serde_json::Value> {
+    if !crate::keychain::enabled() {
+        return None;
+    }
+    let service = keychain_evidence_service(config_dir)?;
+    let dir = keychain_cache_dir()?;
+    let now = now_secs();
+    if let Some(entry) =
+        keychain_cache_entry(read_keychain_cache_entry(&dir, &service).as_ref(), now)
+    {
+        return entry.blob.clone();
+    }
+    // Cache miss or stale entry: one `security` subprocess per TTL per
+    // service, bounded by keychain::SECURITY_TIMEOUT.
+    let blob = crate::keychain::read_blob_for_service(&service)
+        .ok()
+        .flatten();
+    let entry = KeychainEvidenceEntry {
+        at: now,
+        blob: blob.clone(),
+    };
+    if write_keychain_cache_entry(&dir, &service, &entry).is_err() {
+        // Best-effort: a read-only home must not fail `which`; the next call
+        // pays one more subprocess.
+    }
+    blob
+}
+
+/// The Keychain service holding the login this resolution asks: the bare
+/// `Claude Code-credentials` item for the global login, a config dir's
+/// namespaced twin for a session. The bare arm is pure; the namespaced arm
+/// needs the canonicalized dir, which is the macOS module's half.
+#[cfg(any(target_os = "macos", test))]
+fn keychain_evidence_service(config_dir: Option<&Path>) -> Option<String> {
+    let Some(dir) = config_dir else {
+        return Some(crate::claude::CLAUDE_KEYCHAIN_SERVICE.to_string());
+    };
+    #[cfg(target_os = "macos")]
+    {
+        crate::keychain::keychain_service_for_config_dir(dir).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+const KEYCHAIN_EVIDENCE_TTL_SECS: u64 = 30;
+
+/// Entries older than this are swept on the next write, so session churn
+/// cannot grow the cache dir unbounded.
+#[cfg(any(target_os = "macos", test))]
+const KEYCHAIN_EVIDENCE_RETENTION_SECS: u64 = 86_400;
+
+/// One service's cached read: the item's login blob, or `None` when the item
+/// was absent or unreadable (both read as "no evidence").
+#[cfg(any(target_os = "macos", test))]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct KeychainEvidenceEntry {
+    at: u64,
+    #[serde(default)]
+    blob: Option<serde_json::Value>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn keychain_cache_dir() -> Option<PathBuf> {
+    crate::profile::clauth_dir()
+        .ok()
+        .map(|dir| dir.join("keychain-which-cache"))
+}
+
+/// The entry file for `service`: the service name IS the file name (the bare
+/// `Claude Code-credentials` and the `-<sha8>` twins carry no separator), so
+/// a write replaces only its own row and can never lose a sibling's.
+#[cfg(any(target_os = "macos", test))]
+fn keychain_cache_entry_path(dir: &Path, service: &str) -> PathBuf {
+    dir.join(service)
+}
+
+/// The cached read for `service`, when one is still fresh. `None` means "run
+/// the subprocess": an absent file, a stale entry, or unparseable bytes.
+#[cfg(any(target_os = "macos", test))]
+fn keychain_cache_entry(
+    entry: Option<&KeychainEvidenceEntry>,
+    now: u64,
+) -> Option<&KeychainEvidenceEntry> {
+    let entry = entry?;
+    (now.saturating_sub(entry.at) <= KEYCHAIN_EVIDENCE_TTL_SECS).then_some(entry)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_keychain_cache_entry(dir: &Path, service: &str) -> Option<KeychainEvidenceEntry> {
+    let bytes = std::fs::read(keychain_cache_entry_path(dir, service)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Write `service`'s entry (atomic 0600, the security.md tree invariant) and
+/// sweep entries older than a day. No state flock: the rename keeps a
+/// concurrent reader on old-or-new bytes, and a racing writer of the SAME
+/// service can only lose its own row, which costs one subprocess later.
+#[cfg(any(target_os = "macos", test))]
+fn write_keychain_cache_entry(
+    dir: &Path,
+    service: &str,
+    entry: &KeychainEvidenceEntry,
+) -> anyhow::Result<()> {
+    let bytes =
+        serde_json::to_vec(entry).context("failed to serialize the keychain evidence cache")?;
+    crate::profile::atomic_write_600(&keychain_cache_entry_path(dir, service), bytes)
+        .context("failed to write the keychain evidence cache")?;
+    sweep_keychain_cache(dir);
+    Ok(())
+}
+
+/// Drop entries older than [`KEYCHAIN_EVIDENCE_RETENTION_SECS`], by file
+/// mtime (the write time, which is the entry's `at`). Best-effort throughout:
+/// a failed sweep leaves a stale file the next write sweeps again.
+#[cfg(any(target_os = "macos", test))]
+fn sweep_keychain_cache(dir: &Path) {
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(
+        KEYCHAIN_EVIDENCE_RETENTION_SECS,
+    )) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if modified < cutoff {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

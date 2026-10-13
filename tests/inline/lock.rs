@@ -361,9 +361,9 @@ fn an_armed_budget_clamps_the_flock_wait() {
 /// The negative twin of the clamp: a scope armed via the plain
 /// [`SharedSubprocessBudget::arm`] keeps the full [`STATE_LOCK_TIMEOUT`] for
 /// its flock wait, never clamping it to its own shorter budget. The macOS GC
-/// sweep and the session-seed carry arm a budget for their own shell-outs
-/// while a legit slow switch can hold the flock ~20 s; their waiter must
-/// survive that hold, not false-time-out at its own budget. A 300 ms lock
+/// sweep arms a budget for its own shell-outs while a legit slow switch can
+/// hold the flock ~20 s; its waiter must survive that hold, not
+/// false-time-out at its own budget. A 300 ms lock
 /// timeout against a 50 ms budget makes the wrong clamp observable in ~50 ms
 /// instead of the real 25 s/20 s.
 #[test]
@@ -396,4 +396,167 @@ fn a_plain_budget_does_not_clamp_the_flock_wait() {
 
     drop(holder);
     set_state_lock_timeout_override(None);
+}
+
+/// Keychain legs reached past a peer's state-flock hold keep their whole
+/// window: [`with_keychain_budget`] arms at its own call, after the caller's
+/// flock wait returned, and runs the closure under that budget, which ends
+/// with it.
+#[test]
+fn keychain_legs_past_a_flock_wait_run_under_their_whole_budget() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("clauth dir"))
+        .expect("mkdir ~/.clauth");
+    let budget = Duration::from_secs(20);
+    let held = Duration::from_millis(1500);
+    let holder = crate::testutil::hold_state_flock();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(held);
+        drop(holder);
+    });
+    let _ = take_keychain_leg_windows();
+
+    let start = Instant::now();
+    with_state_lock(|_held| Ok(())).expect("the flock wait the legs follow");
+    let waited = start.elapsed();
+    let inside = with_keychain_budget(budget, armed_budget_remaining);
+    releaser.join().expect("releaser");
+
+    assert!(waited >= held, "the caller waited out the peer: {waited:?}");
+    let windows = take_keychain_leg_windows();
+    assert_eq!(windows.len(), 1, "one Keychain leg scope");
+    let noted = windows[0].expect("the legs begin under a budget");
+    assert!(
+        noted > budget - Duration::from_millis(500),
+        "the flock wait spent the Keychain budget: {noted:?} left"
+    );
+    let inside = inside.expect("the closure runs under the budget");
+    assert!(
+        inside > budget - Duration::from_millis(500) && inside <= budget,
+        "the closure's window is the whole budget: {inside:?}"
+    );
+    assert_eq!(
+        armed_budget_remaining(),
+        None,
+        "the budget ends with the legs"
+    );
+}
+
+/// A state-flock acquisition that starts inside a Keychain budget scope
+/// refuses in debug builds: its wait would spend the window the scope's
+/// `security` calls share, whichever caller opened the scope.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(
+    expected = "a state-flock acquisition started inside a Keychain budget scope (`lock::with_keychain_budget`): its wait spends the window the scope's `security` calls share, so take the flock before the scope opens"
+)]
+fn a_state_flock_taken_inside_a_keychain_budget_scope_refuses() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("clauth dir"))
+        .expect("mkdir ~/.clauth");
+    with_keychain_budget(Duration::from_secs(20), || with_state_lock(|_held| Ok(())))
+        .expect("the flock inside the scope");
+}
+
+/// Every place under `src/` that arms a Keychain budget, pinned to its file:
+/// the census (`keychain.rs`), [`with_keychain_budget`] itself (`lock.rs`) and
+/// the GC sweep (`runtime.rs`) arm one directly, the daemon tick
+/// (`daemon/tick.rs`) arms the clamped window, and the helper's two callers are
+/// the landing (`oauth.rs`) and `owned_keychain_leg` (`runtime.rs`). The item
+/// legs and their callers are macOS-only code no linux run reaches, and a bare
+/// arm opens no helper scope the flock check could see, so a new arm anywhere
+/// (above a caller's flock wait in another file included) reds here instead.
+/// Each line is cut at its first `//`, as `no_bare_print_macro_under_src`
+/// cuts it, so a comment naming a call never counts; an aliased type
+/// (`use .. SharedSubprocessBudget as B`) is not seen, and an arm moved
+/// within its file keeps the count.
+#[test]
+fn every_keychain_budget_arm_under_src_is_a_known_site() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let files = crate::testutil::rs_files(&src);
+    assert!(
+        files.len() > 10,
+        "the scan found {} files under src/ — it is not reading the crate",
+        files.len()
+    );
+    let mut sites: std::collections::BTreeMap<&str, std::collections::BTreeMap<String, usize>> =
+        std::collections::BTreeMap::new();
+    for file in &files {
+        let text = std::fs::read_to_string(file).expect("read a source file");
+        let rel = file
+            .strip_prefix(&src)
+            .expect("a file under src/")
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        for call in [
+            "SharedSubprocessBudget::arm(",
+            "SharedSubprocessBudget::arm_clamped(",
+            "with_keychain_budget(",
+        ] {
+            let n: usize = text
+                .lines()
+                .map(|line| {
+                    line.split("//")
+                        .next()
+                        .unwrap_or_default()
+                        .matches(call)
+                        .count()
+                })
+                .sum();
+            if n > 0 {
+                *sites
+                    .entry(call)
+                    .or_default()
+                    .entry(rel.clone())
+                    .or_default() += n;
+            }
+        }
+    }
+    let known = |entries: &[(&str, usize)]| -> std::collections::BTreeMap<String, usize> {
+        entries
+            .iter()
+            .map(|(f, n)| ((*f).to_string(), *n))
+            .collect()
+    };
+    assert_eq!(
+        sites,
+        std::collections::BTreeMap::from([
+            (
+                "SharedSubprocessBudget::arm(",
+                known(&[("keychain.rs", 1), ("lock.rs", 1), ("runtime.rs", 1)]),
+            ),
+            (
+                "SharedSubprocessBudget::arm_clamped(",
+                known(&[("daemon/tick.rs", 1)]),
+            ),
+            (
+                "with_keychain_budget(",
+                known(&[("oauth.rs", 1), ("runtime.rs", 1)]),
+            ),
+        ]),
+        "a Keychain budget armed outside its known sites: a per-session item leg arms \
+         only inside `owned_keychain_leg`, a landing only through `with_keychain_budget`; \
+         the census, GC sweep and daemon tick arm above their holds by design, and no \
+         other site arms"
+    );
+}
+
+/// A Keychain budget scope opened inside a state-flock hold refuses in debug
+/// builds: its `security` calls would run under the flock every peer waits on.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(
+    expected = "a Keychain budget scope (`lock::with_keychain_budget`) was opened inside a state-flock hold: its `security` calls would run under the flock every peer waits on; open the scope after the hold returns"
+)]
+fn a_keychain_budget_scope_opened_inside_a_state_flock_hold_refuses() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::profile::mkdir_700(&crate::profile::clauth_dir().expect("clauth dir"))
+        .expect("mkdir ~/.clauth");
+    with_state_lock(|_held| {
+        with_keychain_budget(Duration::from_secs(20), || ());
+        Ok(())
+    })
+    .expect("the scope inside the hold");
 }

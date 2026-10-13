@@ -1,8 +1,8 @@
 //! Application state, keymap, and tick logic.
 //!
 //! Layout invariants:
-//!   - Overview: read-only account list; `profile_cursor` is shared with Usage
-//!     and Config so the highlight follows across tab switches.
+//!   - Overview: selectable Claude and Codex rows; `overview_cursor` maps onto
+//!     the visible filter, while Claude selections sync `profile_cursor` with Usage and Setup.
 //!   - Config: master-detail — account list + `+ new` row + inline editor
 //!     (`config_draft`). No popups for create / edit / rename / delete.
 //!   - Fallback: master-detail — ordered chain + `+ add` on the left; inline
@@ -33,16 +33,16 @@ use crate::actions::{
 };
 use crate::claude::{
     LinkState, adopt_first_login, classify_credentials_link, claude_settings_env_keys,
-    credentials_diverged, detach_credentials_link, force_link_profile_credentials,
-    force_snapshot_active_credentials, is_first_login, link_profile_credentials,
-    live_credentials_are_shell, read_claude_credentials, snapshot_active_credentials,
+    detach_credentials_link, force_link_profile_credentials, force_snapshot_active_credentials,
+    is_first_login, link_profile_credentials, live_credentials_are_shell, read_claude_credentials,
+    snapshot_active_credentials,
 };
 use crate::daemon::gateway::{Answerer, GatewayState};
 use crate::fallback::{
     DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD, SwitchAction, auto_switch_if_needed,
     parse_threshold, threshold_for,
 };
-use crate::format::{format_pct, format_threshold_tokens};
+use crate::format::format_threshold_tokens;
 use crate::harness::Harness;
 use crate::lock::with_state_lock;
 use crate::lockorder::{RankedGuard, RankedMutex};
@@ -52,11 +52,13 @@ use crate::profile::{
     MAX_CONTEXT_NUDGE_TOKENS, MAX_REFRESH_INTERVAL_MS, MAX_WEEKLY_SWITCH_PCT,
     MIN_CONTEXT_NUDGE_TOKENS, MIN_REFRESH_INTERVAL_MS, MIN_WEEKLY_SWITCH_PCT, ModelSettings,
     PopupWidth, Profile, ProfileName, ReloadFingerprint, ResetDisplay, ThemeName, WalkOrder,
-    load_config, reload_fingerprint, save_app_state, save_profile,
+    load_config, reload_fingerprint, save_app_state, save_profile_config,
 };
 use crate::profile_cache::{USAGE_CACHE_FILE, load_profile_cache, profile_cache_mtime_ms};
 use crate::profile_json::{stale_after_ms, usage_cache_file};
 use crate::status::{self, Incident, StatusEvent};
+use crate::tui::render::prose::{self, cmd_lit};
+use crate::tui::render::{ListView, follow_scroll_offset};
 use crate::tui::theme;
 use crate::update::{self, UpdateEvent};
 use crate::usage::{
@@ -436,22 +438,25 @@ pub(crate) enum ConfigRow {
     /// OAuth-only auto-start toggle. `config_rows` renders it in the second
     /// slot (right below `Name`); declared here so the enum tracks that order.
     AutoStart,
+    /// `Profile::bell_threshold`, labelled `alert at`: the 5h % the bell rings
+    /// at. ⏎ types a value (empty turns it off), `+`/`-` step it by 5.
+    BellThreshold,
     BaseUrl,
     ApiKey,
     /// Default model (CC `model` setting). Hybrid: space cycles aliases, ⏎ types a custom value.
     Model,
+    /// `ANTHROPIC_DEFAULT_FABLE_MODEL` — full id, free text.
+    FableModel,
     /// `ANTHROPIC_DEFAULT_OPUS_MODEL` — full id, free text.
     OpusModel,
     /// `ANTHROPIC_DEFAULT_SONNET_MODEL` — full id, free text.
     SonnetModel,
     /// `ANTHROPIC_DEFAULT_HAIKU_MODEL` — full id, free text.
     HaikuModel,
-    /// `ANTHROPIC_DEFAULT_FABLE_MODEL` — full id, free text.
-    FableModel,
     /// `CLAUDE_CODE_SUBAGENT_MODEL` — full id, free text.
     SubagentModel,
     /// The `+ model override` reveal row. Shown only while the unset alias
-    /// overrides are collapsed; ⏎ expands opus/sonnet/haiku/fable/subagent inline.
+    /// overrides are collapsed; ⏎ expands fable/opus/sonnet/haiku/subagent inline.
     ModelOverrideAdd,
     /// A custom `key = value` env entry, indexed into the profile's sorted env
     /// snapshot. ⏎ edits its VALUE. An emptied value REMOVES the key — the
@@ -495,7 +500,8 @@ impl ConfigRow {
     /// Text rows capture keystrokes and commit on ⏎; the rest act on ⏎. The
     /// `Model` row is hybrid (space cycles, ⏎ opens a custom field), and the env
     /// rows seed their buffer before editing, so all three are driven out of band
-    /// and are deliberately not text rows here.
+    /// and are deliberately not text rows here. `BellThreshold` is a text row
+    /// whose `+`/`-` at rest step it without opening the editor.
     pub(crate) fn is_text(self) -> bool {
         matches!(
             self,
@@ -507,13 +513,23 @@ impl ConfigRow {
                 | ConfigRow::HaikuModel
                 | ConfigRow::FableModel
                 | ConfigRow::SubagentModel
+                | ConfigRow::BellThreshold
         )
     }
 }
 
 /// The `model` row alias cycle (space advances it). `None` renders as `default`
 /// (no `model` key); a custom id set via ⏎ is outside this list.
-pub(crate) const MODEL_PRESETS: [&str; 4] = ["opus", "sonnet", "haiku", "opusplan"];
+pub(crate) const MODEL_PRESETS: [&str; 5] = ["fable", "opus", "sonnet", "haiku", "opusplan"];
+
+/// The alias-override rows, in the order Setup lists them.
+const OVERRIDE_ROWS: [ConfigRow; 5] = [
+    ConfigRow::FableModel,
+    ConfigRow::OpusModel,
+    ConfigRow::SonnetModel,
+    ConfigRow::HaikuModel,
+    ConfigRow::SubagentModel,
+];
 
 /// The weekly-line preset ladder: one source for the Config row's segmented
 /// control AND `step_weekly_threshold`'s cycle. 100 reproduces the old
@@ -615,12 +631,20 @@ pub(crate) enum GlobalConfigRow {
     ContextNudge,
     /// Default action when CC overwrites the credentials symlink. ⏎/space cycles.
     DivergenceDefault,
+    /// Keep every key of a credential store other than the login and its
+    /// identity keys with the account whose store it is
+    /// (`AppState.preserve_non_login_keys`) — ON by default. A `/design-login`
+    /// then stays with the account it was made on across switches and relinks.
+    /// Read off disk where it is used, so a flip applies to the next relink.
+    /// ENUMERATED on/off, ⏎ mirrors space.
+    PreserveNonLoginKeys,
     /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
     BurnAware,
     /// Walk-order mode (`AppState.walk_order`, issue #86): `chain` (default —
-    /// today's chain-position walk) / `soonest weekly reset`. Space cycles.
+    /// today's chain-position walk) / `soonest weekly reset` / `most weekly
+    /// headroom`. Space cycles.
     /// Decides WHERE each accept pass lands; `switch mode` decides WHEN the
     /// active is left, so the two stay orthogonal.
     WalkOrder,
@@ -684,6 +708,7 @@ pub(crate) struct ConfigDraft {
     pub(crate) haiku_model: InputState,
     pub(crate) fable_model: InputState,
     pub(crate) subagent_model: InputState,
+    pub(crate) bell_threshold: InputState,
     /// Value buffer for the env entry currently being edited (seeded on entry).
     /// Shared across `EnvEntry` rows since only one is active at a time.
     pub(crate) env_value: InputState,
@@ -708,6 +733,10 @@ pub(crate) struct ConfigDraft {
     /// `+ model override` reveal state. Draft-scoped: a fresh draft starts
     /// collapsed (set overrides still render; unset ones hide behind the chip).
     pub(crate) overrides_expanded: bool,
+    /// The override rows this draft opened with a value. They stay listed for
+    /// the draft's life, so emptying one never pulls the row out from under
+    /// the cursor; a fresh draft tucks an unset one behind the chip again.
+    pub(crate) overrides_shown: Vec<ConfigRow>,
     /// A `+ new`-form login stash, held in memory until `create account`
     /// consumes it (capture-then-commit): the browser mint `+ login` produced,
     /// or the live login `+ capture current login` snapshotted. Carries the
@@ -733,6 +762,7 @@ impl ConfigDraft {
             ConfigRow::HaikuModel => &self.haiku_model,
             ConfigRow::FableModel => &self.fable_model,
             ConfigRow::SubagentModel => &self.subagent_model,
+            ConfigRow::BellThreshold => &self.bell_threshold,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &self.env_new_key,
             ConfigRow::AutoStart
@@ -760,6 +790,7 @@ impl ConfigDraft {
             ConfigRow::HaikuModel => &mut self.haiku_model,
             ConfigRow::FableModel => &mut self.fable_model,
             ConfigRow::SubagentModel => &mut self.subagent_model,
+            ConfigRow::BellThreshold => &mut self.bell_threshold,
             ConfigRow::EnvEntry(_) if self.active == Some(row) => &mut self.env_value,
             ConfigRow::EnvAdd if self.active == Some(ConfigRow::EnvAdd) => &mut self.env_new_key,
             ConfigRow::AutoStart
@@ -793,7 +824,22 @@ pub(crate) struct ConfirmState {
     pub(crate) detail: Option<String>,
     /// Highlighted choice: false = cancel, true = confirm.
     pub(crate) choice: bool,
+    /// Body scroll state for an overflowing confirm body: `↑`/`↓` scroll one
+    /// line, `PageUp`/`PageDown` one page, while the buttons stay pinned. The
+    /// render publishes the bound and the viewport; the key handler clamps.
+    pub(crate) scroll: ConfirmScroll,
     pub(crate) on_confirm: ConfirmAction,
+}
+
+/// The scroll a confirm modal's body carries. `offset` is the key handler's
+/// own state; `max_scroll` and `viewport` are what the last render drew, so a
+/// resize changes the page step on the next press. `Default` keeps the many
+/// one-line confirms at the top of their (fitting) bodies.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConfirmScroll {
+    pub(crate) offset: u16,
+    pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) viewport: std::cell::Cell<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -866,6 +912,63 @@ pub(crate) enum ConfirmAction {
     /// A write into CC's plugin registry (driven via the `claude` CLI), so it
     /// keeps the confirm modal like every other mutating fix.
     InstallPlugin,
+    /// Services tab: adopt a found standalone shunt config (TOML only), running
+    /// the probe and store plan off the UI thread.
+    AdoptConfig(std::path::PathBuf),
+    /// Services tab: move a stopped standalone's account stores in. The plan
+    /// the confirm counted rides here, so the move runs exactly what the card
+    /// showed (never the cache re-read at yes); the move re-plans and refuses
+    /// `PlanChanged` on any drift.
+    MoveStoresIn(crate::gateway::StoreMovePlan),
+    /// Services tab: add clauth's admin write key to the adopted config's
+    /// existing `[server.admin]` table.
+    AddAdminKey,
+    /// Services tab: add a `[server.admin]` table carrying clauth's key (the
+    /// gateway restarts once to register its admin routes).
+    AddAdminTable,
+    /// The shared daemon-start confirm's `start`: spawn `<this binary> daemon`
+    /// detached.
+    StartDaemon,
+    /// `stop shunt?`'s `stop`: the transient hold, if the verb still applies.
+    StopShunt,
+    /// `restart shunt?`'s `restart`: save a bind edit whose restart the confirm
+    /// gates (only while the gateway is supervised and running).
+    RestartBind {
+        key: ShuntFieldKey,
+        edit: Box<crate::gateway_edit::Edit>,
+    },
+    /// `rename upstream|model …?`'s `rename`: save a rename whose cascade the
+    /// confirm counted.
+    RenameField {
+        key: ShuntFieldKey,
+        edit: Box<crate::gateway_edit::Edit>,
+    },
+    /// `remove upstream|model|route …?`'s `remove`: run the entry's remove
+    /// through the save worker. The edit is built when the confirm OPENS (the
+    /// entry as it reads then, a route's `RouteView` included), so confirming
+    /// runs that edit — never a lookup by position at confirm time. A route the
+    /// shift moved under it then refuses through the engine's `EntryChanged`.
+    RemoveEntry {
+        key: ShuntEntryKey,
+        edit: Box<crate::gateway_edit::Edit>,
+    },
+    /// `remove <profile>'s client token?`'s `remove`: revoke the profile's
+    /// client token through the save worker. `record` is the adopted gateway
+    /// read when the confirm opened.
+    RemoveToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+    },
+    /// `point <profile> at the shunt gateway?`'s `overwrite`: mint the profile's
+    /// client token, then point the profile at the gateway (`url`). `replace`
+    /// is the confirm's third body line (`None` = nothing to replace), built
+    /// when the confirm opened.
+    AddToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+        url: String,
+        replace: Option<String>,
+    },
 }
 
 /// One-field name prompt shared by the Setup menu's two naming actions. The
@@ -916,6 +1019,11 @@ pub(crate) struct PresetPickerForm {
     pub(crate) target: String,
     pub(crate) presets: Vec<crate::presets::Preset>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -942,6 +1050,11 @@ pub(crate) struct DivergenceForm {
     /// known account, which the generic three options all get wrong.
     pub(crate) sibling: Option<ProfileName>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 /// The non-blocking divergence signal behind the accounts-pane banner: set by
@@ -966,12 +1079,14 @@ impl DivergenceNotice {
     pub(crate) fn banner_message(&self) -> String {
         match &self.sibling {
             Some(owner) => format!(
-                "live login is '{owner}' · not the active '{}' · press d to resolve",
-                self.active
+                "live login is '{owner}' · not the active '{}' · press {} to resolve",
+                self.active,
+                prose::key("d")
             ),
             None => format!(
-                "live login no longer matches '{}' · press d to resolve",
-                self.active
+                "live login no longer matches '{}' · press {} to resolve",
+                self.active,
+                prose::key("d")
             ),
         }
     }
@@ -1010,6 +1125,28 @@ impl DivergenceForm {
 pub(crate) struct DivergenceTargetForm {
     pub(crate) targets: Vec<String>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
+}
+
+/// The `+ add token` profile picker: one row per claude profile, in roster
+/// order, each carrying its `(name, has_token)` — whether the profile already
+/// holds a token, so the row reads `alice  has a token`. C1 has no synthetic
+/// `+ new profile` row, so the cursor is the profile's own index
+/// (`0..targets.len()`); C2 adds `+ new profile` as row 0 and shifts every
+/// profile down one.
+#[derive(Debug, Clone)]
+pub(crate) struct TokenPickerForm {
+    pub(crate) targets: Vec<(String, bool)>,
+    pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 /// A choice on the env-key collision prompt (3 vertical options).
@@ -1036,6 +1173,12 @@ pub(crate) struct EnvCollisionForm {
     /// Sorted `EnvEntry` index of the colliding own-field, for `keep existing`.
     pub(crate) existing_idx: Option<usize>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    pub(crate) reviewing_overwrite: bool,
+    pub(crate) confirm_overwrite: bool,
+    pub(crate) max_scroll: std::cell::Cell<u16>,
+    pub(crate) viewport: std::cell::Cell<usize>,
+    pub(crate) overwrite_needs_review: std::cell::Cell<bool>,
 }
 
 impl EnvCollisionForm {
@@ -1083,6 +1226,12 @@ pub(crate) enum ActionMenuAction {
     StartDaemon,
     /// `--replace`'s termination with no successor, offered while one runs.
     StopDaemon,
+    /// The `start shunt` verb; the effect re-derives from the gateway slot at
+    /// dispatch (jump to the card, the daemon-start confirm, or a hold release).
+    StartShunt,
+    /// The `stop shunt` verb: a transient hold while a fresh daemon runs the
+    /// gateway.
+    StopShunt,
     // Setup tab — all three act on the focused account and none has a key.
     /// Copy every setting of the focused account onto a new one, credentials
     /// excluded. Prompts for the new name.
@@ -1132,6 +1281,14 @@ pub(crate) struct ActionMenuState {
     /// on a menu of tab-global actions would claim a scope that isn't there.
     pub(crate) context: Option<String>,
     pub(crate) cursor: usize,
+    pub(crate) scroll: std::cell::Cell<usize>,
+    /// Visible menu rows from the last render (the page step).
+    pub(crate) viewport: std::cell::Cell<usize>,
+    /// Chunked row starts/ends per item and the total row count, published by
+    /// the render so the page step accounts for the group-rule line.
+    pub(crate) starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) total: std::cell::Cell<usize>,
 }
 
 impl ActionMenuState {
@@ -1177,6 +1334,11 @@ impl ActionMenuState {
             scoped_len,
             context,
             cursor: 0,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
         }
     }
 }
@@ -1222,6 +1384,8 @@ impl ActionMenuAction {
             Self::OpenProviderConsole => "open provider console",
             Self::StartDaemon => "start daemon",
             Self::StopDaemon => "stop daemon",
+            Self::StartShunt => "start shunt",
+            Self::StopShunt => "stop shunt",
             Self::Duplicate => "duplicate account",
             Self::SaveAsPreset => "save as preset",
             Self::ApplyPreset => "apply preset",
@@ -1255,6 +1419,8 @@ pub(crate) enum Modal {
     PresetPicker(PresetPickerForm),
     /// Divergence "save elsewhere": pick which profile the live login lands in.
     DivergenceTarget(DivergenceTargetForm),
+    /// `+ add token`: pick which claude profile gets a client token.
+    TokenPicker(TokenPickerForm),
     Help,
     /// Context-sensitive action menu opened by `a`.
     ActionMenu(ActionMenuState),
@@ -1264,6 +1430,9 @@ pub(crate) enum Modal {
     /// code field ([`LoginSession::paste_field`]) included. esc/q collapse it
     /// to the footer indicator — the login keeps running.
     Login,
+    /// Read-only scrollable text modal for the shunt card's `check output`:
+    /// the masked stderr of the last failed check.
+    CheckOutput(String),
 }
 
 // ── Toasts ────────────────────────────────────────────────────────────────────
@@ -1308,7 +1477,7 @@ const ROTATE_LIVE_SESSION_TOAST: &str = "macos keeps its login where clauth can'
 const DISABLE_DETAIL: &str =
     "it drops out of auto-switch, usage polling, and status until re-enabled.";
 const TOAST_CAPACITY: usize = 3;
-const TOAST_TTL_NORMAL: Duration = Duration::from_secs(3);
+const TOAST_TTL_NORMAL: Duration = Duration::from_secs(5);
 const TOAST_TTL_DANGER: Duration = Duration::from_secs(6);
 
 // ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -1409,6 +1578,19 @@ impl From<HomeTab> for Tab {
 pub(crate) enum TokenView {
     Dashboard,
     Models,
+}
+
+/// One card of the Tokens dashboard. Focus is stored as this (not an index)
+/// so it keeps meaning across a resize that changes the layout's reading order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CardKind {
+    First,
+    Total,
+    Trend,
+    Models,
+    Comp,
+    Hour,
+    Activity,
 }
 
 /// Display filter over the Tokens tab's grouped model list (top-models card +
@@ -1538,6 +1720,7 @@ pub(crate) struct StatusState {
     /// Selected incident index in `incidents`.
     pub(crate) cursor: usize,
     pub(crate) focus: StatusFocus,
+    pub(crate) selector: ListView,
     /// Scroll offset (lines) into the detail timeline.
     pub(crate) detail_scroll: u16,
     /// Max valid `detail_scroll` from the last detail render (`total - viewport`).
@@ -1545,6 +1728,8 @@ pub(crate) struct StatusState {
     /// `&App` interior mutability) and the key handler clamps against it — that
     /// stops a held ↓ from inflating `detail_scroll` toward `u16::MAX`.
     pub(crate) detail_max_scroll: std::cell::Cell<u16>,
+    /// Visible detail-timeline rows from the last render (the page step).
+    pub(crate) detail_viewport: std::cell::Cell<u16>,
     /// Newest incident id already signalled, so a refresh only toasts genuinely
     /// new incidents (not the initial load).
     pub(crate) seen_latest: Option<String>,
@@ -1560,8 +1745,10 @@ impl Default for StatusState {
             fetching: false,
             cursor: 0,
             focus: StatusFocus::List,
+            selector: ListView::default(),
             detail_scroll: 0,
             detail_max_scroll: std::cell::Cell::new(0),
+            detail_viewport: std::cell::Cell::new(0),
             seen_latest: None,
         }
     }
@@ -1596,8 +1783,9 @@ pub(crate) fn incident_is_active(incident: &Incident) -> bool {
 // ── Services tab ───────────────────────────────────────────────────────────────
 
 /// Which Services pane has focus. `List`: the row selector (↑↓ moves, ⏎
-/// descends, `f` fixes). `Detail`: the selected row's readout (↑↓ scrolls, or
-/// walks the plugin problems / herdr options).
+/// descends, `f` descends onto the row's first fix line). `Detail`: the
+/// selected row's readout (↑↓ scrolls, or walks the plugin problems / herdr
+/// options).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ServicesFocus {
     List,
@@ -1615,9 +1803,9 @@ pub(crate) enum Health {
     Idle,
 }
 
-/// A one-key fix offered on a service row. `WireMcpServers` writes the manual
-/// entry (a [`ConfirmAction`]); the verb `f` renders in the footer and under the
-/// problem it fixes is [`fix_verb`].
+/// A fix offered on a service row. `WireMcpServers` writes the manual
+/// entry (a [`ConfirmAction`]); the verb the footer's `↵` hint and the
+/// `f  <verb>` line under the problem render is [`fix_verb`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ServiceFix {
     WireMcpServers,
@@ -1626,11 +1814,19 @@ pub(crate) enum ServiceFix {
     HealHerdrConfig(std::path::PathBuf),
     /// Install the clauth plugin through agentgear (user scope, embedded tree).
     InstallPlugin,
+    /// Adopt a found standalone shunt config. `PathBuf` = the discovered TOML.
+    AdoptConfig(std::path::PathBuf),
+    /// Move a stopped standalone's account stores into clauth's managed stores.
+    MoveStoresIn,
+    /// Add clauth's admin write key to the adopted config's `[server.admin]`.
+    AddAdminKey,
+    /// Add a `[server.admin]` table carrying clauth's key.
+    AddAdminTable,
 }
 
-/// One focusable fix problem inside a service row's detail. When the detail pane
-/// is descended, ↑↓ walks these problems and `f` applies the focused one; the
-/// footer's `f <verb>` and the dim `f  <verb>` detail line follow the focus.
+/// One focusable line inside a service row's detail. When the detail pane is
+/// descended, ↑↓ and `f` walk these problems and `↵` opens the focused one's
+/// confirm; the footer's `↵ <verb>` follows the focus.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Problem {
     /// The detail-line index of this problem's `f  <verb>` line.
@@ -1638,9 +1834,583 @@ pub(crate) struct Problem {
     pub(crate) fix: ServiceFix,
 }
 
-/// A computed service row. `fix` is the list-focus `f` (the first fixable
-/// problem); `problems` is the detail-pane focus walk (empty on rows whose
-/// detail has no per-problem focus).
+/// One actionable line on the `shunt` card: a fix (`f  <verb>`), the `enabled`
+/// toggle row, the `check output` line, or a config-section stop (an entry row
+/// whose `↵`/`space` toggles it expanded, or a field row whose `↵`/`space` opens
+/// it and `space` cycles a cycle row). Descended, ↑↓ pages the card one line at
+/// a time; an actionable line takes focus as it scrolls into view, read-only
+/// rows never do, and `space`/`↵` act only on the focused one (`↵` on a fix
+/// line opens its confirm; `f` walks between fix lines).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShuntFocus {
+    /// An `f  <verb>` line at this detail index.
+    Fix { line: usize, fix: ServiceFix },
+    /// The `enabled` toggle row at this detail index.
+    Enabled { line: usize },
+    /// The `check output` line at this detail index (a held failed-check
+    /// stderr; ↵/space opens its modal).
+    CheckOutput { line: usize },
+    /// A config-section entry row (an upstream, model or route), whose `↵`/
+    /// `space` toggles it expanded. Not a `Check::detail` line: the render
+    /// draws the config section after the detail lines.
+    Entry { key: ShuntEntryKey },
+    /// A config-section field row (an editable `key value` line, or a cycle
+    /// row), whose `↵` opens it and `space` cycles a cycle row.
+    Field { key: ShuntFieldKey },
+    /// A `+ add <kind>` action row ending its group, whose `↵`/`space` opens
+    /// (or folds) that kind's blank draft in place.
+    Add { kind: ShuntAddKind },
+    /// The `save <kind>` row of an open draft, whose `↵` runs the add.
+    SaveAdd { kind: ShuntAddKind },
+    /// The `remove <kind>` row ending an expanded entry, whose `↵` opens the
+    /// remove confirm.
+    Remove { key: ShuntEntryKey },
+    /// A client-token action-chip row, whose `↵` opens the remove confirm.
+    Token { key: String },
+    /// The `+ add token` row ending the client-token group, whose `↵`/`space`
+    /// opens the profile picker.
+    AddToken,
+}
+
+impl ShuntFocus {
+    /// The detail-line index the focusable sits on; `None` on a config row,
+    /// which has no `Check::detail` line.
+    pub(crate) fn line(&self) -> Option<usize> {
+        match self {
+            ShuntFocus::Fix { line, .. }
+            | ShuntFocus::Enabled { line }
+            | ShuntFocus::CheckOutput { line } => Some(*line),
+            ShuntFocus::Entry { .. }
+            | ShuntFocus::Field { .. }
+            | ShuntFocus::Add { .. }
+            | ShuntFocus::SaveAdd { .. }
+            | ShuntFocus::Remove { .. }
+            | ShuntFocus::Token { .. }
+            | ShuntFocus::AddToken => None,
+        }
+    }
+
+    /// The fix this line applies, `None` on every config-section row.
+    pub(crate) fn fix(&self) -> Option<&ServiceFix> {
+        match self {
+            ShuntFocus::Fix { fix, .. } => Some(fix),
+            ShuntFocus::Enabled { .. }
+            | ShuntFocus::CheckOutput { .. }
+            | ShuntFocus::Entry { .. }
+            | ShuntFocus::Field { .. }
+            | ShuntFocus::Add { .. }
+            | ShuntFocus::SaveAdd { .. }
+            | ShuntFocus::Remove { .. }
+            | ShuntFocus::Token { .. }
+            | ShuntFocus::AddToken => None,
+        }
+    }
+
+    /// The line's kind, the identity focus keeps across a resize or recompute.
+    pub(crate) fn kind(&self) -> ShuntFocusLine {
+        match self {
+            ShuntFocus::Enabled { .. } => ShuntFocusLine::Enabled,
+            ShuntFocus::CheckOutput { .. } => ShuntFocusLine::CheckOutput,
+            ShuntFocus::Entry { key } => ShuntFocusLine::Entry(key.clone()),
+            ShuntFocus::Field { key } => ShuntFocusLine::Field(key.clone()),
+            ShuntFocus::Add { kind } => ShuntFocusLine::Add(*kind),
+            ShuntFocus::SaveAdd { kind } => ShuntFocusLine::SaveAdd(*kind),
+            ShuntFocus::Remove { key } => ShuntFocusLine::Remove(key.clone()),
+            ShuntFocus::Token { key } => ShuntFocusLine::Token(key.clone()),
+            ShuntFocus::AddToken => ShuntFocusLine::AddToken,
+            ShuntFocus::Fix {
+                fix: ServiceFix::AdoptConfig(_),
+                ..
+            } => ShuntFocusLine::Adopt,
+            ShuntFocus::Fix {
+                fix: ServiceFix::MoveStoresIn,
+                ..
+            } => ShuntFocusLine::Move,
+            ShuntFocus::Fix {
+                fix: ServiceFix::AddAdminKey | ServiceFix::AddAdminTable,
+                ..
+            } => ShuntFocusLine::Admin,
+            // No other fix line appears on the shunt card.
+            ShuntFocus::Fix { .. } => unreachable!("no other fix appears on the shunt card"),
+        }
+    }
+}
+
+/// The identity of the shunt card's focused actionable line, by its kind. The
+/// key handler owns it; the render reads it and re-settles it (the descend
+/// rule) when a resize or a card change pushed the held line out of view. A
+/// resize or a card change keeps focus on the same line while that kind still
+/// exists, so the line index ([`ShuntFocus::line`]) is deliberately not part
+/// of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShuntFocusLine {
+    /// The `enabled` toggle row.
+    Enabled,
+    /// The `f  adopt config` line on the absent card.
+    Adopt,
+    /// The `f  add admin key` / `f  add admin table` line.
+    Admin,
+    /// The `f  move stores in` line.
+    Move,
+    /// The `check output` line (a held failed-check stderr).
+    CheckOutput,
+    /// A config-section entry row, by its identity.
+    Entry(ShuntEntryKey),
+    /// A config-section field row, by its `(entry, field)` identity.
+    Field(ShuntFieldKey),
+    /// A `+ add <kind>` row, by its kind.
+    Add(ShuntAddKind),
+    /// The `save <kind>` row of an open draft, by its kind.
+    SaveAdd(ShuntAddKind),
+    /// A `remove <kind>` row, by its entry's identity.
+    Remove(ShuntEntryKey),
+    /// A client-token row, by the profile name.
+    Token(String),
+    /// The `+ add token` row.
+    AddToken,
+}
+
+/// A config-section entry's identity: the group (the variant) plus the
+/// name-or-id and its occurrence index among entries of that kind sharing that
+/// name-or-id (shunt keeps duplicate upstream names and duplicate map-less
+/// model ids valid, so the name alone would trap the walk between two of
+/// them), or the route's 1-based position. This is what focus keeps across a
+/// recompute or resize, and what the expanded set is keyed by — never a line
+/// index, which a reorder would land on another entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntEntryKey {
+    Upstream {
+        name: String,
+        occurrence: usize,
+    },
+    /// `(id, occurrence index)` among models sharing that id.
+    Model {
+        id: String,
+        occurrence: usize,
+    },
+    Route(usize),
+}
+
+/// A config field's identity on the shunt card: the entry it belongs to (a
+/// server field is keyed on its own, the variant alone) plus the field within
+/// it. Field rows are keyed by `(entry key, field)` — never a line index — so
+/// focus follows the edited row across a recompute: a rename follows the new
+/// name and the expanded set's key moves with it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntFieldKey {
+    Bind,
+    DefaultProvider,
+    Upstream {
+        name: String,
+        occurrence: usize,
+        field: UpstreamFieldKind,
+    },
+    Model {
+        id: String,
+        occurrence: usize,
+        field: ModelFieldKind,
+    },
+    Route {
+        position: usize,
+        field: RouteFieldKind,
+    },
+    /// A field of an open add form's draft (keyed by the kind and its field).
+    Draft {
+        kind: ShuntAddKind,
+        field: ShuntDraftField,
+    },
+}
+
+/// A field of an expanded upstream row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UpstreamFieldKind {
+    Name,
+    Provider,
+    Kind,
+    BaseUrl,
+    AuthMode,
+    AuthAccount,
+    Accounts,
+    AuthEnv,
+    AuthHeader,
+    Effort,
+    ServiceTier,
+}
+
+/// A field of an expanded model row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ModelFieldKind {
+    Id,
+    DisplayName,
+    /// One `upstream_model` entry, keyed by its provider.
+    UpstreamModel(String),
+}
+
+/// A field of an expanded route row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum RouteFieldKind {
+    Model,
+    Provider,
+    UpstreamModel,
+    Effort,
+    ServiceTier,
+}
+
+/// The kind of a `+ add` form on the shunt card's config section (and its
+/// `save <kind>` row): one of the three editable groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntAddKind {
+    Upstream,
+    Model,
+    Route,
+}
+
+impl ShuntAddKind {
+    /// The kind word every approved copy spells: `upstream` / `model` / `route`.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            ShuntAddKind::Upstream => "upstream",
+            ShuntAddKind::Model => "model",
+            ShuntAddKind::Route => "route",
+        }
+    }
+
+    /// The `+ add <kind>` row's label.
+    pub(crate) fn add_label(self) -> String {
+        format!("+ add {}", self.word())
+    }
+
+    /// The `save <kind>` row's label.
+    pub(crate) fn save_label(self) -> String {
+        format!("save {}", self.word())
+    }
+
+    /// The `remove <kind>` row's label.
+    pub(crate) fn remove_label(self) -> String {
+        format!("remove {}", self.word())
+    }
+
+    /// The config-section group index of this kind, in the card's order
+    /// (SERVER, UPSTREAMS, MODELS, ROUTES).
+    pub(crate) fn group(self) -> usize {
+        match self {
+            ShuntAddKind::Upstream => 1,
+            ShuntAddKind::Model => 2,
+            ShuntAddKind::Route => 3,
+        }
+    }
+}
+
+/// A field of an open add form's draft, keyed by the kind and the field
+/// within it. It reuses the entry field-kind enums: the upstream draft's
+/// fields are [`UpstreamFieldKind`]'s, the model draft's [`ModelFieldKind`]'s,
+/// the route draft's [`RouteFieldKind`]'s.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntDraftField {
+    Upstream(UpstreamFieldKind),
+    Model(ModelFieldKind),
+    Route(RouteFieldKind),
+}
+
+/// The open add form's committed draft for one upstream: every value is the
+/// typed (or picked) value, `None` = unset (renders `—` and is left out of
+/// the add). A draft commit lands here, in memory, never in the file; only
+/// `save upstream` writes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct UpstreamDraft {
+    pub(crate) name: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) base_url: Option<String>,
+    pub(crate) auth_mode: Option<String>,
+    pub(crate) account: Option<String>,
+    /// The comma-separated account names, exactly as the accounts row parses
+    /// them.
+    pub(crate) accounts: Option<String>,
+    pub(crate) env: Option<String>,
+    pub(crate) header: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) service_tier: Option<String>,
+    /// A refusal rendered on the `└` line under `save upstream` (a required
+    /// field left blank, or the engine's own sentence).
+    pub(crate) refusal: Option<String>,
+}
+
+/// The open add form's committed draft for one model.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ModelDraft {
+    pub(crate) id: Option<String>,
+    pub(crate) display_name: Option<String>,
+    /// Provider name → model slug; `None` = blank (left out of the add). The
+    /// rows derive from the config's current provider list; a committed value
+    /// is looked up by provider name here.
+    pub(crate) upstream_model: Vec<(String, Option<String>)>,
+    /// A refusal rendered on the `└` line under `save model`.
+    pub(crate) refusal: Option<String>,
+}
+
+/// The open add form's committed draft for one route.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RouteDraft {
+    pub(crate) model: Option<String>,
+    pub(crate) provider: Option<String>,
+    pub(crate) upstream_model: Option<String>,
+    pub(crate) effort: Option<String>,
+    pub(crate) service_tier: Option<String>,
+    /// A refusal rendered on the `└` line under `save route`.
+    pub(crate) refusal: Option<String>,
+}
+
+/// The open add forms: at most one draft per kind, each surviving the card's
+/// recompute and any other row's save.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ShuntDrafts {
+    pub(crate) upstream: Option<UpstreamDraft>,
+    pub(crate) model: Option<ModelDraft>,
+    pub(crate) route: Option<RouteDraft>,
+}
+
+impl ShuntDrafts {
+    /// Whether the `+ add <kind>` draft is open.
+    pub(crate) fn is_open(&self, kind: ShuntAddKind) -> bool {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream.is_some(),
+            ShuntAddKind::Model => self.model.is_some(),
+            ShuntAddKind::Route => self.route.is_some(),
+        }
+    }
+
+    /// Open (or reseed) the `+ add <kind>` draft in place, dropping any
+    /// committed values and refusal from a previous open of the same kind. A
+    /// model draft's `upstream_model` rows derive from the config's current
+    /// provider list at render and save time, so opening it seeds nothing.
+    pub(crate) fn open(&mut self, kind: ShuntAddKind) {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream = Some(UpstreamDraft::default()),
+            ShuntAddKind::Model => self.model = Some(ModelDraft::default()),
+            ShuntAddKind::Route => self.route = Some(RouteDraft::default()),
+        }
+    }
+
+    /// Fold (close) the `+ add <kind>` draft, dropping it and its refusal.
+    pub(crate) fn fold(&mut self, kind: ShuntAddKind) {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream = None,
+            ShuntAddKind::Model => self.model = None,
+            ShuntAddKind::Route => self.route = None,
+        }
+    }
+
+    /// The refusal under the `save <kind>` row, if one shows.
+    pub(crate) fn refusal(&self, kind: ShuntAddKind) -> Option<&str> {
+        match kind {
+            ShuntAddKind::Upstream => self.upstream.as_ref().and_then(|d| d.refusal.as_deref()),
+            ShuntAddKind::Model => self.model.as_ref().and_then(|d| d.refusal.as_deref()),
+            ShuntAddKind::Route => self.route.as_ref().and_then(|d| d.refusal.as_deref()),
+        }
+    }
+
+    /// Set the refusal under the `save <kind>` row.
+    pub(crate) fn set_refusal(&mut self, kind: ShuntAddKind, sentence: String) {
+        match kind {
+            ShuntAddKind::Upstream => {
+                if let Some(draft) = &mut self.upstream {
+                    draft.refusal = Some(sentence);
+                }
+            }
+            ShuntAddKind::Model => {
+                if let Some(draft) = &mut self.model {
+                    draft.refusal = Some(sentence);
+                }
+            }
+            ShuntAddKind::Route => {
+                if let Some(draft) = &mut self.route {
+                    draft.refusal = Some(sentence);
+                }
+            }
+        }
+    }
+
+    /// Clear the refusal under the `save <kind>` row of `kind`.
+    pub(crate) fn clear_refusal(&mut self, kind: ShuntAddKind) {
+        match kind {
+            ShuntAddKind::Upstream => {
+                if let Some(draft) = &mut self.upstream {
+                    draft.refusal = None;
+                }
+            }
+            ShuntAddKind::Model => {
+                if let Some(draft) = &mut self.model {
+                    draft.refusal = None;
+                }
+            }
+            ShuntAddKind::Route => {
+                if let Some(draft) = &mut self.route {
+                    draft.refusal = None;
+                }
+            }
+        }
+    }
+}
+
+/// The shunt card's open field editor (or a cycle row's pending pick). `None`
+/// at rest, when a field row shows `❯` + its value.
+#[derive(Debug, Clone)]
+pub(crate) enum ShuntFieldEdit {
+    /// A typed row's open editor — a typed row's `↵`, or a cycle row's `↵` at
+    /// rest, which opens the custom-value editor. `input` holds the typed text;
+    /// `saved` the value the editor opened on (`None` = unset), so `esc`
+    /// restores it exactly.
+    Typed {
+        input: InputState,
+        saved: Option<String>,
+    },
+    /// A cycle row's pending pick after `space` moved it: `picked` is the
+    /// unsaved pick (the row shows `✎`, nothing written), `saved` the file's
+    /// value. `↵` saves the pick, `esc` restores `saved`.
+    Pick {
+        saved: Option<String>,
+        picked: String,
+    },
+}
+
+/// The row a config save is keyed by: a field row, a `save <kind>` row, or a
+/// `remove <kind>` row. The one [`ServicesState::saving`] predicate reads it,
+/// so the spinner, the lock and every footer hint can never disagree about
+/// which row is busy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntSaveKey {
+    Field(ShuntFieldKey),
+    SaveAdd(ShuntAddKind),
+    Remove(ShuntEntryKey),
+    /// A client-token row's remove, keyed by the profile name.
+    Token(String),
+    /// The `+ add token` row's add.
+    AddToken,
+}
+
+/// The row whose caret slot shows the `SUCCESS` `✓` after a successful save:
+/// a field row, or an entry row (an add's new entry).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ShuntOkKey {
+    Field(ShuntFieldKey),
+    Entry(ShuntEntryKey),
+    /// A client-token row, keyed by the profile name (an add's new row).
+    Token(String),
+}
+
+/// One config save in flight: the row's key (so the render spinner/shimmer the
+/// right row) and when it started (the `✓` holds for about a second).
+#[derive(Debug, Clone)]
+pub(crate) struct ShuntSave {
+    pub(crate) key: ShuntSaveKey,
+    pub(crate) started: std::time::Instant,
+    /// The value being saved (`None` = unset), which the saving row renders
+    /// under the shimmer crest (the editor stays open with the typed text, but
+    /// the row shows the value the save checks).
+    pub(crate) value: Option<String>,
+    /// The entry a `save <kind>` lands under, fixed when the save STARTS from
+    /// the `Edit` being saved (the new name/id, or the route's position in the
+    /// pre-save view). The outcome drain reads this, never the draft or the
+    /// live view, so a fold or a recompute mid-check cannot move the `✓`.
+    pub(crate) entry: Option<ShuntEntryKey>,
+}
+
+/// Where an unmanaged client-token value came from, for the card's dim source
+/// word trailing an unmanaged token row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShuntTokenSource {
+    EnvFile,
+    DaemonEnv,
+}
+
+impl ShuntTokenSource {
+    /// The dim source word: `env file` / `daemon env`.
+    pub(crate) fn word(self) -> &'static str {
+        match self {
+            ShuntTokenSource::EnvFile => "env file",
+            ShuntTokenSource::DaemonEnv => "daemon env",
+        }
+    }
+}
+
+/// The client-token section's data, read beside the config view on the
+/// recompute and cached on the card state: the stored tokens in name order,
+/// the unmanaged client names and where they came from, the variable when the
+/// unmanaged value does not parse, the store read failure's sentence (`error`,
+/// the group then renders `tokens  not read` + the sentence), and the unmanaged
+/// (client-auth) read failure's sentence (`unmanaged_error`, the stored rows
+/// stay and the group renders `other clients  not read` + the sentence). Each
+/// keeps `+ add token`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ShuntTokens {
+    pub(crate) stored: Vec<String>,
+    pub(crate) unmanaged: Vec<(String, ShuntTokenSource)>,
+    pub(crate) unparsed: Option<(String, ShuntTokenSource)>,
+    pub(crate) error: Option<String>,
+    pub(crate) unmanaged_error: Option<String>,
+}
+
+/// The shunt card's open field editor: which field, its edit state, and a
+/// refusal's own sentence (rendered on the `└` DANGER line under the field,
+/// the editor kept open with the typed text). `None` at rest.
+#[derive(Debug, Clone)]
+pub(crate) struct ShuntFieldEditState {
+    pub(crate) key: ShuntFieldKey,
+    pub(crate) edit: ShuntFieldEdit,
+    pub(crate) refusal: Option<String>,
+}
+
+/// A remove's `EditRefusal`, rendered on the `└` line under the entry's
+/// `remove <kind>` row while the entry is still expanded. It retires when
+/// focus leaves the row, when the entry collapses, or when a recompute reads a
+/// view that differs from the one it was raised on (a hand-edit).
+#[derive(Debug, Clone)]
+pub(crate) struct ShuntRemoveRefusal {
+    pub(crate) key: ShuntEntryKey,
+    pub(crate) sentence: String,
+    /// The config view the refusal was raised on, so a recompute whose view
+    /// differs retires it.
+    pub(crate) view: Box<crate::gateway_edit::ConfigView>,
+}
+
+/// How long a field's caret slot shows the `SUCCESS` `✓` after its save lands.
+pub(crate) const SHUNT_OK_MS: u64 = 1000;
+
+/// Which edit's refused `shunt check` the card's `check output` line holds:
+/// clauth's admin entry turning up present answers an admin edit's refusal,
+/// never a config save's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CheckOutputSource {
+    AdminEdit,
+    ConfigSave,
+}
+
+/// A refused `shunt check`'s stderr held for the `check output` line, with the
+/// kind of edit it refused.
+#[derive(Debug, Clone)]
+pub(crate) struct HeldCheckOutput {
+    pub(crate) source: CheckOutputSource,
+    pub(crate) stderr: crate::gateway::CheckStderr,
+}
+
+/// The adopted config read through [`crate::gateway_edit::read_view`] on the
+/// recompute. The render draws the card's config section from it.
+#[derive(Debug, Clone)]
+pub(crate) enum ShuntConfigRead {
+    Ok(Box<crate::gateway_edit::ConfigView>),
+    /// The config's own read/parse failed with one of the card's reason words.
+    Unread(UnreadConfig),
+    /// The config reads but the editor's view refuses its shape: the card
+    /// renders `config  not editable` and the refusal's own sentence.
+    Refused(String),
+}
+
+/// A computed service row. `fix` is the row's first fix line's fix (its
+/// presence marks the row in the selector and gates `f`); `problems` is the
+/// detail-pane focus walk (empty on rows whose detail has no per-problem
+/// focus); `shunt_focus` is the `shunt` card's own focus walk (a mix of fix
+/// lines and the `enabled` row).
 #[derive(Debug, Clone)]
 pub(crate) struct Check {
     pub(crate) label: &'static str,
@@ -1651,16 +2421,42 @@ pub(crate) struct Check {
     pub(crate) detail: Vec<String>,
     pub(crate) fix: Option<ServiceFix>,
     pub(crate) problems: Vec<Problem>,
+    /// The `shunt` detail's actionable lines (the fix lines and the `enabled`
+    /// row), in card order. Empty elsewhere.
+    pub(crate) shunt_focus: Vec<ShuntFocus>,
+    /// On the `shunt` card, the detail index where its action section begins
+    /// (the blank line before the `enabled` row, or the first `f  adopt
+    /// config` line on an absent card). Lines at/after it render verbatim with
+    /// per-line focus, instead of the shared `key: value` splitter — the MOVE
+    /// PLAN copy holds a literal `: `. `None` elsewhere.
+    pub(crate) shunt_action_start: Option<usize>,
+}
+
+impl Check {
+    /// How many `f  <verb>` lines the detail shows: the plugin and herdr
+    /// problems plus the shunt card's fix stops, the lines `f` walks.
+    pub(crate) fn fix_line_count(&self) -> usize {
+        self.problems.len()
+            + self
+                .shunt_focus
+                .iter()
+                .filter(|stop| stop.fix().is_some())
+                .count()
+    }
 }
 
 /// The one verb per fix, used identically in the detail's dim `f  <verb>` line
-/// and the footer's `f <verb>` hint. One verb per fix, never the bracketed
+/// and the footer's `↵ <verb>` hint. One verb per fix, never the bracketed
 /// `[f] repair credentials` anti-pattern.
 pub(crate) fn fix_verb(fix: &ServiceFix) -> &'static str {
     match fix {
         ServiceFix::WireMcpServers => "wire mcp server",
         ServiceFix::InstallPlugin => "install plugin",
         ServiceFix::HealHerdrConfig(_) => "heal herdr config",
+        ServiceFix::AdoptConfig(_) => "adopt config",
+        ServiceFix::MoveStoresIn => "move stores in",
+        ServiceFix::AddAdminKey => "add admin key",
+        ServiceFix::AddAdminTable => "add admin table",
     }
 }
 
@@ -1725,7 +2521,9 @@ impl<T: Default + Send + 'static> ProbeWorker<T> {
     }
 
     /// The newest result that landed since the last drain, if any. A landing
-    /// starts the follow-up run a [`Self::restart`] queued.
+    /// with a follow-up queued by [`Self::restart`] starts it and is dropped:
+    /// that run may predate the change the re-probe was asked to see, so only
+    /// the follow-up's result reaches the caller.
     fn drain(&mut self) -> Option<T> {
         let mut landed = None;
         while let Ok(result) = self.rx.try_recv() {
@@ -1734,6 +2532,301 @@ impl<T: Default + Send + 'static> ProbeWorker<T> {
         }
         if landed.is_some() && std::mem::take(&mut self.rerun) {
             self.start();
+            return None;
+        }
+        landed
+    }
+}
+
+/// Which env the store plan, the pool read and the standalone readout resolve
+/// against ([`crate::gateway::inherited_env`]): this process's own with no
+/// daemon, else the env record of the daemon holding the singleton, which
+/// [`crate::gateway::inherited_env`] matches by pid and start time. A
+/// fresh/stale flap keeps the source. A daemon restarted between two reads
+/// moves it, though no read saw it absent, and so does the record a starting
+/// daemon writes after it stamps its pid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlanEnvSource {
+    Own,
+    Daemon {
+        /// The pid sidecar; `None` while unreadable.
+        pid: Option<u32>,
+        /// The identity the env record names; `None` with no record.
+        record: Option<crate::gateway::DaemonIdentity>,
+    },
+}
+
+impl PlanEnvSource {
+    fn of(health: crate::daemon::DaemonHealth) -> Self {
+        match health {
+            crate::daemon::DaemonHealth::Absent => Self::Own,
+            crate::daemon::DaemonHealth::Stale | crate::daemon::DaemonHealth::Fresh => {
+                Self::Daemon {
+                    pid: crate::daemon::holder_pid(),
+                    record: crate::gateway::recorded_daemon_identity(),
+                }
+            }
+        }
+    }
+}
+
+/// The cached standalone-store move plan, computed on a worker (the plan
+/// spawns `ps`/`powershell` on macOS/Windows).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) enum MovePlanOutcome {
+    /// A plan that moves at least one file — the MOVE PLAN section shows.
+    Plan(crate::gateway::StoreMovePlan),
+    /// The plan refused: the refusal's `Display`, ready to render as
+    /// `refused  <…>`.
+    Refused(String),
+    /// A plan that moves nothing and does not refuse — no MOVE PLAN section.
+    Nothing,
+    /// No record, or the record/plan could not be read — no MOVE PLAN section.
+    #[default]
+    Unavailable,
+}
+
+/// The cached codex-pool read, computed on a worker (the pool read blocks up
+/// to ~24 s).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PoolOutcome {
+    /// The providers needing their own pool login, in gateway order.
+    Providers(Vec<String>),
+    /// The read failed: the error's `Display`, the approved `pool  <error>`
+    /// sentence.
+    Error(String),
+}
+
+impl Default for PoolOutcome {
+    /// A panicked pool read shows no note and no error.
+    fn default() -> Self {
+        PoolOutcome::Providers(Vec::new())
+    }
+}
+
+/// A [`ConfigHandle`] carried through the action worker to a token add's
+/// endpoint write. `RankedMutex` has no `Debug`, so the wrapper prints a
+/// placeholder; the job's `Debug` names every other field.
+#[derive(Clone)]
+pub(crate) struct JobConfig(pub(crate) ConfigHandle);
+
+impl std::fmt::Debug for JobConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("JobConfig(<config>)")
+    }
+}
+
+/// One confirmed shunt-card action, handed to the action worker so the slow
+/// call never holds a frame.
+#[derive(Debug, Clone)]
+pub(crate) enum ShuntActionJob {
+    Adopt {
+        found: std::path::PathBuf,
+    },
+    Move {
+        record: crate::gateway::GatewayRecord,
+        confirmed: crate::gateway::StoreMovePlan,
+    },
+    AddAdminKey {
+        record: crate::gateway::GatewayRecord,
+    },
+    AddAdminTable {
+        record: crate::gateway::GatewayRecord,
+    },
+    /// `stop shunt`: write the gateway hold naming the daemon that holds the
+    /// singleton now.
+    Hold,
+    /// `start shunt` on a held gateway: remove the hold.
+    RemoveHold,
+    /// Save one config row (a field, a `save <kind>`, or a `remove <kind>`)
+    /// through the E1 engine (`apply_edit`), off the UI thread. `key` rides
+    /// back in the outcome so the row can spinner/`✓` it; `confirmed` names a
+    /// save that went through the `restart shunt?` confirm.
+    ConfigEdit {
+        record: crate::gateway::GatewayRecord,
+        edit: Box<crate::gateway_edit::Edit>,
+        key: ShuntSaveKey,
+        confirmed: bool,
+    },
+    /// Revoke one profile's client token through the engine, off the UI thread.
+    RemoveToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+    },
+    /// Mint a client token for `profile`, then point it at the gateway (`url`),
+    /// off the UI thread. `config` is the shared handle the endpoint write
+    /// locks.
+    AddToken {
+        record: crate::gateway::GatewayRecord,
+        profile: String,
+        url: String,
+        config: JobConfig,
+    },
+}
+
+/// The result of one shunt-card action, drained on the tick into a toast and a
+/// recompute.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum ShuntActionOutcome {
+    Adopted {
+        path: String,
+    },
+    /// A standalone shunt answered at the adopt probe: nothing written.
+    AdoptRefused {
+        version: String,
+        addr: std::net::SocketAddr,
+    },
+    AdoptFailed {
+        error: String,
+    },
+    Moved {
+        n: usize,
+    },
+    /// The stores moved, but writing the record's `disabled = false` failed:
+    /// the success toast still shows, then the house `save failed` toast.
+    MovedEnableFailed {
+        n: usize,
+        error: String,
+    },
+    MoveFailed {
+        error: String,
+    },
+    AdminAdded,
+    AdminFailed {
+        error: String,
+        /// The failed check's stderr, held for the shunt card's `check output`
+        /// modal. `None` on a refusal that ran no check (or a non-typed error).
+        check_output: Option<crate::gateway::CheckStderr>,
+        /// The adopted config path this edit ran against. The drain holds
+        /// `check_output` only while it equals the current record's config, so
+        /// a re-adopt landing while the check ran never shows another
+        /// gateway's output on the card.
+        config: std::path::PathBuf,
+    },
+    /// `stop shunt` landed: the hold file names the running daemon.
+    Held,
+    HoldFailed {
+        error: String,
+    },
+    /// `start shunt` on a held gateway released the hold.
+    Released,
+    ReleaseFailed {
+        error: String,
+    },
+    /// The worker panicked, or no action was started: no toast, just a
+    /// recompute so the card reads the record's real state.
+    #[default]
+    NoOp,
+    /// A config save landed: the `✓` shows on the row, and (for a confirmed
+    /// written bind) the restart toast. `value` is what was saved (`None` =
+    /// unset, the bind for the restart toast); `restart_only` names a bind
+    /// save; `confirmed` says it went through the restart confirm.
+    ConfigSaved {
+        key: ShuntSaveKey,
+        written: bool,
+        restart_only: bool,
+        value: Option<String>,
+        confirmed: bool,
+    },
+    /// The engine refused the edit on the input or the file's shape: its own
+    /// sentence renders on the `└` DANGER line under the row (the field's, the
+    /// `save <kind>`'s or the `remove <kind>`'s), the draft/editor kept open.
+    ConfigRefused {
+        key: ShuntSaveKey,
+        sentence: String,
+    },
+    /// `shunt check` (or the landing) refused: the compact detail line and the
+    /// held `check output`, as the admin edit surfaces them.
+    ConfigCheckFailed {
+        error: String,
+        check_output: Option<crate::gateway::CheckStderr>,
+        config: std::path::PathBuf,
+    },
+    /// An engine bug or an untyped failure: `save failed` + the error chain.
+    ConfigFailed {
+        error: String,
+    },
+    /// A client-token remove landed (`removed` = true) or was already gone.
+    TokenRemoved {
+        profile: String,
+        removed: bool,
+    },
+    /// The remove refused (the last-token guard or a read failure): the
+    /// refusal's own sentence, on the `└` line while the row is in view, else
+    /// a `remove failed` toast.
+    TokenRemoveRefused {
+        profile: String,
+        sentence: String,
+    },
+    /// A remove failed untyped: `remove failed` + the error chain.
+    TokenRemoveFailed {
+        error: String,
+    },
+    /// A client-token add landed: the profile's row appears, focus on it.
+    TokenAdded {
+        profile: String,
+    },
+    /// The add refused (a bad name, a name the base uses, an unparsed base, or
+    /// an untyped failure): `add failed` + the message.
+    TokenAddRefused {
+        error: String,
+    },
+    /// The mint landed but the profile write failed: the token row stays,
+    /// `add failed` + either `the token is stored but <profile> was not
+    /// changed: <e:#>` (the disk profile still has its old base url) or
+    /// `<profile> points at the gateway, but <e:#>` (the save landed and only
+    /// the active-profile settings write failed).
+    TokenAddedProfileFailed {
+        error: String,
+    },
+}
+
+/// The one-shot worker behind the shunt card's confirmed actions: at most one
+/// action runs at a time, its result landing through the tick's drain. The
+/// same `prober` seam as [`ProbeWorker`] — `None` under test unless a stub is
+/// installed — and `running` is the gate that makes a second press of any
+/// shunt-card action start nothing.
+#[derive(Debug)]
+pub(crate) struct ShuntActionWorker {
+    pub(crate) prober: Option<fn(ShuntActionJob) -> ShuntActionOutcome>,
+    pub(crate) running: bool,
+    pub(crate) tx: std::sync::mpsc::Sender<ShuntActionOutcome>,
+    rx: std::sync::mpsc::Receiver<ShuntActionOutcome>,
+}
+
+impl ShuntActionWorker {
+    fn new(prober: fn(ShuntActionJob) -> ShuntActionOutcome) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self {
+            prober: (!cfg!(test)).then_some(prober),
+            running: false,
+            tx,
+            rx,
+        }
+    }
+
+    /// Start a job unless one is in flight; a prober that panics lands as the
+    /// `NoOp` default, so `running` never sticks.
+    fn start(&mut self, job: ShuntActionJob) {
+        let Some(prober) = self.prober else {
+            return;
+        };
+        if self.running {
+            return;
+        }
+        self.running = true;
+        let tx = self.tx.clone();
+        spawn_worker(move || {
+            let _ = tx.send(catch_unwind(AssertUnwindSafe(|| prober(job))).unwrap_or_default());
+        });
+    }
+
+    /// The newest result that landed since the last drain, if any.
+    fn drain(&mut self) -> Option<ShuntActionOutcome> {
+        let mut landed = None;
+        while let Ok(result) = self.rx.try_recv() {
+            landed = Some(result);
+            self.running = false;
         }
         landed
     }
@@ -1748,7 +2841,12 @@ pub(crate) struct ServicesState {
     pub(crate) focus: ServicesFocus,
     /// Cursor over the service rows (`0..checks.len()`).
     pub(crate) cursor: usize,
+    pub(crate) selector: ListView,
+    pub(crate) form_offset: std::cell::Cell<usize>,
     pub(crate) detail_scroll: u16,
+    pub(crate) diagnostic_focus: bool,
+    pub(crate) displayed_scroll: std::cell::Cell<u16>,
+    pub(crate) detail_viewport: std::cell::Cell<u16>,
     /// Max valid `detail_scroll` from the last render (`&App` interior mutability,
     /// clamped by the key handler — same pattern as `StatusState`).
     pub(crate) detail_max_scroll: std::cell::Cell<u16>,
@@ -1780,10 +2878,97 @@ pub(crate) struct ServicesState {
     /// is adopted: `None` = unprobed. Probed on a worker (config discovery plus
     /// one `/health` round trip) the first time the row reads `absent`; every
     /// `r` starts it or queues one follow-up behind the run in flight; a tab
-    /// switch and the per-tick refresh reuse it.
+    /// switch and the per-tick refresh reuse it, except that a claim that a
+    /// shunt answers is re-probed while the tab shows it
+    /// ([`STANDALONE_RECHECK_INTERVAL`]).
     pub(crate) standalone: Option<StandaloneShunt>,
     /// The worker running [`standalone_probe`].
     pub(crate) standalone_probe: ProbeWorker<StandaloneShunt>,
+    /// When the shown claim was last re-probed.
+    pub(crate) last_standalone_recheck: Instant,
+    /// The gateway record on disk, read once per recompute (a cheap local
+    /// read). `None` = no record, or one that cannot load. Every shunt-card
+    /// action and the `enabled` row read this, never the file per frame.
+    pub(crate) shunt_record: Option<crate::gateway::GatewayRecord>,
+    /// The adopted config's editor view, read through
+    /// [`crate::gateway_edit::read_view`] on the recompute while a record
+    /// exists. `None` = no record (no config section). The render draws the
+    /// card's config groups from it.
+    pub(crate) shunt_config: Option<ShuntConfigRead>,
+    /// Which config entry rows are expanded, keyed by the entry's identity.
+    /// Dropped keys whose entry left the config are pruned on the recompute.
+    pub(crate) shunt_expanded: HashSet<ShuntEntryKey>,
+    /// The shunt card's open field editor; `None` at rest.
+    pub(crate) shunt_field_edit: Option<ShuntFieldEditState>,
+    /// One field save in flight; the row renders the spinner + shimmer +
+    /// `checking` while it runs.
+    pub(crate) shunt_save: Option<ShuntSave>,
+    /// The field whose save just landed and when — its caret slot shows `✓`
+    /// for about a second, then the normal caret.
+    pub(crate) shunt_ok: Option<(ShuntOkKey, Instant)>,
+    /// The open add forms (at most one per kind), each surviving the card's
+    /// recompute and any other row's save.
+    pub(crate) shunt_drafts: ShuntDrafts,
+    /// A remove's `EditRefusal`, rendered on the `└` line under the entry's
+    /// `remove <kind>` row while the entry is still expanded. RefCell so the
+    /// focus setter (which takes `&self`, the render's contract) can retire it
+    /// the moment focus leaves the remove row.
+    pub(crate) shunt_remove_refusal: std::cell::RefCell<Option<ShuntRemoveRefusal>>,
+    /// The client-token section's data, read beside the config view on the
+    /// recompute (the render reads this cache, never the store per frame).
+    pub(crate) shunt_tokens: ShuntTokens,
+    /// A token remove's refusal (the last-token guard), as `(profile,
+    /// sentence)`, rendered on the `└` line under the token row. RefCell so the
+    /// focus setter can retire it the moment focus leaves the row.
+    pub(crate) shunt_token_refusal: std::cell::RefCell<Option<(String, String)>>,
+    /// The cached standalone-store move plan (`None` = not yet planned). The
+    /// plan runs on a worker — it spawns `ps`/`powershell` on macOS/Windows —
+    /// on tab entry, on `r`, and after any shunt-card action lands.
+    pub(crate) move_plan: Option<MovePlanOutcome>,
+    /// The worker running [`move_plan_probe`].
+    pub(crate) move_plan_probe: ProbeWorker<MovePlanOutcome>,
+    /// The adopted config's admin need, read on the recompute (a local read +
+    /// parse, the herdr config re-read's shape). `None` = no record, or an
+    /// unreadable config (no verb offered).
+    pub(crate) admin_need: Option<crate::gateway::AdminNeed>,
+    /// The stderr of the last admin edit or config save THIS TUI ran whose
+    /// `shunt check` refused, held for the shunt card's `check output` modal.
+    /// Cleared when an admin edit succeeds (`AdminAdded`), a later failure of
+    /// either kind edited another config, the gateway record changes, or
+    /// `admin_need` reads `None`; an admin edit's output also when a later
+    /// admin edit fails with no check output or `admin_need` reads `Neither`,
+    /// a config save's when a later save lands.
+    /// The daemon's own restart refusals never land here.
+    pub(crate) check_output: Option<HeldCheckOutput>,
+    /// The cached codex-pool read (`None` = not read, or not due). The read
+    /// runs on a worker while the slot is `healthy` and `admin_need` is
+    /// `Neither`, and can block up to ~24 s.
+    pub(crate) pool: Option<PoolOutcome>,
+    /// The worker running [`pool_probe`].
+    pub(crate) pool_probe: ProbeWorker<PoolOutcome>,
+    /// The worker running one confirmed shunt-card action at a time.
+    pub(crate) shunt_action: ShuntActionWorker,
+    /// The worker running one config field save at a time, apart from
+    /// [`Self::shunt_action`] so a running stop/start/adopt/admin action can
+    /// neither block nor be blocked by a save. Its `running` is the one-save
+    /// guard; a panicked save drains as a failed outcome that clears it.
+    pub(crate) shunt_save_worker: ShuntActionWorker,
+    /// The `shunt` detail's focused actionable line, by its kind. Owned by the
+    /// key handler and the recompute; the render reads it to draw the caret,
+    /// and re-settles it (the descend rule) where it publishes the geometry
+    /// when a resize or a card change pushed the held line out of view.
+    pub(crate) shunt_focus: std::cell::RefCell<Option<ShuntFocusLine>>,
+    /// The rendered line index of each [`Check::shunt_focus`] stop (parallel to
+    /// that list), published by the last render so the key handler can tell
+    /// which stops are in view. A stop's rendered row is what the in-view test
+    /// measures: a wrapped read-only sentence above a stop can shift it down.
+    pub(crate) shunt_stop_rows: std::cell::RefCell<Vec<usize>>,
+    /// The last rendered shunt pane height, published by the render the way
+    /// [`ServicesState::detail_max_scroll`] is — the key handler's viewport.
+    pub(crate) shunt_viewport: std::cell::Cell<u16>,
+    /// The env source the last recompute saw, so a daemon start, stop or
+    /// restart can restart the plan/pool workers and the standalone probe.
+    last_plan_env_source: Option<PlanEnvSource>,
     /// The `clauth mcp` job store as of the last refresh, newest first: what the
     /// delegates detail draws. Re-read on the same cadence as the checks, because
     /// the server writing it is a DIFFERENT process, so there is nothing to
@@ -1804,14 +2989,35 @@ pub(crate) struct ServicesState {
     /// who re-derives it and misses by half. What binds is the order: single-
     /// digit ms in release, roughly ten times that in debug.
     pub(crate) delegates: Vec<crate::mcp::jobs::StoredJob>,
+    /// Cursor over the delegates detail's job list while it is descended.
+    pub(crate) delegates_cursor: usize,
+    /// The selected job's id, tracked across a refresh so a newer job inserting
+    /// above the selection does not move it onto a different job.
+    pub(crate) delegates_selected_id: Option<String>,
+    /// The delegates detail's persisted scroll offset and published geometry,
+    /// parallel to the member card's `fallback_detail_*`: the offset survives
+    /// across frames, and the page keys step against the last render's viewport.
+    pub(crate) delegates_offset: std::cell::Cell<usize>,
+    pub(crate) delegates_viewport: std::cell::Cell<usize>,
+    pub(crate) delegates_total: std::cell::Cell<usize>,
+    pub(crate) delegates_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) delegates_block_ends: std::cell::RefCell<Vec<usize>>,
+    /// True once the delegates detail has been descended at least once: from
+    /// then on the blurred pane keeps the last-selected row's tint and offset.
+    pub(crate) delegates_has_descended: bool,
     /// Cursor over the plugin detail's fixable problems ([`Check::problems`]).
-    /// While the plugin detail is descended, ↑↓ walks these instead of
-    /// scrolling the prose; `f` applies the focused one.
+    /// While the plugin detail is descended, ↑↓ and `f` walk these instead of
+    /// scrolling the prose; `↵` opens the focused one's confirm.
     pub(crate) problem_cursor: usize,
     /// Cursor over the herdr detail's options rows ([`HERDR_OPTIONS`]). The
     /// herdr detail is the one detail pane that takes per-row focus: while it
     /// is descended, ↑↓ walks these rows instead of scrolling the prose.
     pub(crate) herdr_options_cursor: usize,
+    /// Whether the herdr detail's focus sits on its `f  heal herdr config`
+    /// line rather than on [`Self::herdr_options_cursor`]'s option. Read only
+    /// while the check still offers that fix, so a heal that clears it hands
+    /// focus back to the option.
+    pub(crate) herdr_fix_focus: bool,
     /// Typed editor for the `tag refresh` stepper — the Config-tab
     /// refresh-interval editor's shape. `None` = not editing.
     pub(crate) herdr_tag_draft: Option<InputState>,
@@ -1833,7 +3039,12 @@ impl Default for ServicesState {
         Self {
             focus: ServicesFocus::List,
             cursor: 0,
+            selector: ListView::default(),
+            form_offset: std::cell::Cell::new(0),
             detail_scroll: 0,
+            diagnostic_focus: false,
+            displayed_scroll: std::cell::Cell::new(0),
+            detail_viewport: std::cell::Cell::new(0),
             detail_max_scroll: std::cell::Cell::new(0),
             fetching: false,
             error: None,
@@ -1844,9 +3055,41 @@ impl Default for ServicesState {
             herdr_probe: ProbeWorker::new(crate::herdr::probe),
             standalone: None,
             standalone_probe: ProbeWorker::new(standalone_probe),
+            last_standalone_recheck: Instant::now(),
+            shunt_record: None,
+            shunt_config: None,
+            shunt_expanded: HashSet::new(),
+            shunt_field_edit: None,
+            shunt_save: None,
+            shunt_ok: None,
+            shunt_drafts: ShuntDrafts::default(),
+            shunt_remove_refusal: std::cell::RefCell::new(None),
+            shunt_tokens: ShuntTokens::default(),
+            shunt_token_refusal: std::cell::RefCell::new(None),
+            move_plan: None,
+            move_plan_probe: ProbeWorker::new(move_plan_probe),
+            admin_need: None,
+            check_output: None,
+            pool: None,
+            pool_probe: ProbeWorker::new(pool_probe),
+            shunt_action: ShuntActionWorker::new(run_shunt_action),
+            shunt_save_worker: ShuntActionWorker::new(run_shunt_action),
+            shunt_focus: std::cell::RefCell::new(None),
+            shunt_stop_rows: std::cell::RefCell::new(Vec::new()),
+            shunt_viewport: std::cell::Cell::new(0),
+            last_plan_env_source: None,
             delegates: Vec::new(),
+            delegates_cursor: 0,
+            delegates_selected_id: None,
+            delegates_offset: std::cell::Cell::new(0),
+            delegates_viewport: std::cell::Cell::new(0),
+            delegates_total: std::cell::Cell::new(0),
+            delegates_starts: std::cell::RefCell::new(Vec::new()),
+            delegates_block_ends: std::cell::RefCell::new(Vec::new()),
+            delegates_has_descended: false,
             problem_cursor: 0,
             herdr_options_cursor: 0,
+            herdr_fix_focus: false,
             herdr_tag_draft: None,
             herdr_config: None,
             land_on_herdr: false,
@@ -1865,26 +3108,172 @@ impl ServicesState {
         self.checks.get(self.cursor)
     }
 
-    /// The fix offered by the row under the cursor, if any.
-    pub(crate) fn selected_fix(&self) -> Option<&ServiceFix> {
-        self.selected_check().and_then(|check| check.fix.as_ref())
+    /// Whether the row under the cursor shows at least one fix line, the rows
+    /// `f` walks and the selector marks.
+    pub(crate) fn selected_has_fix(&self) -> bool {
+        self.selected_check()
+            .is_some_and(|check| check.fix.is_some())
     }
 
-    /// The fix `f` applies this frame: the list-focus fix, or — on the plugin
-    /// detail, whose problems walk — the focused problem's fix. The footer's
-    /// `f <verb>` and the dim `f  <verb>` detail line follow this.
+    /// The fix whose line holds the detail's focus, the one `↵` opens: the
+    /// plugin's focused problem, the herdr heal line while focus sits on it,
+    /// or the shunt card's focused fix line. `None` with the list focused or
+    /// while a page key hid the plugin/herdr action focus. The footer's
+    /// `↵ <verb>` follows this.
     pub(crate) fn focused_fix(&self) -> Option<&ServiceFix> {
-        match self.focus {
-            ServicesFocus::List => self.selected_fix(),
-            ServicesFocus::Detail => {
-                let check = self.selected_check()?;
-                if check.label == "plugin" {
-                    check.problems.get(self.problem_cursor).map(|p| &p.fix)
-                } else {
-                    self.selected_fix()
-                }
-            }
+        if self.focus == ServicesFocus::List {
+            return None;
         }
+        let check = self.selected_check()?;
+        match check.label {
+            "shunt" => self.focused_shunt_focus().and_then(ShuntFocus::fix),
+            _ if self.diagnostic_focus => None,
+            "herdr" => self
+                .herdr_fix_focus
+                .then(|| check.problems.first().map(|p| &p.fix))
+                .flatten(),
+            _ => check.problems.get(self.problem_cursor).map(|p| &p.fix),
+        }
+    }
+
+    /// Whether `f` would move focus: the row shows a fix line other than the
+    /// one already focused. The footer's `f next fix` reads this.
+    pub(crate) fn f_moves(&self) -> bool {
+        let lines = self.selected_check().map_or(0, Check::fix_line_count);
+        lines > 1 || (lines == 1 && self.focused_fix().is_none())
+    }
+
+    /// The shunt detail's focused actionable line, resolved by the focus
+    /// identity the key handler owns and gated by the one in-view predicate
+    /// every acting key and the footer consult: the resolved stop holds only
+    /// while its rendered row is on screen (the geometry the last render
+    /// published). A resize or a card change that pushes the focused line out
+    /// of view re-settles focus to the first actionable line in view (the
+    /// descend rule) where the render publishes the geometry, so this only
+    /// reads `None` when no actionable line is in view.
+    pub(crate) fn focused_shunt_focus(&self) -> Option<&ShuntFocus> {
+        let kind = self.shunt_focus_kind()?;
+        let stops = &self.selected_check()?.shunt_focus;
+        let i = stops.iter().position(|s| s.kind() == kind)?;
+        let rows = self.shunt_stop_rows.borrow();
+        if rows.len() != stops.len() {
+            // No geometry published for this card yet (a key before the first
+            // frame, or a unit test that skips the render): with nothing to
+            // measure, the by-kind identity is the answer. The in-view gate
+            // only applies over a published geometry.
+            return Some(&stops[i]);
+        }
+        let scroll = self.detail_scroll.min(self.detail_max_scroll.get());
+        shunt_in_view(scroll, self.shunt_viewport.get() as usize, rows[i]).then_some(&stops[i])
+    }
+
+    /// Whether a save for `key` is still checking (its own worker in flight).
+    /// The one predicate every render, key-handler and footer site reads, so a
+    /// hint, a spinner, the editor lock and a re-open guard can never disagree
+    /// about which row is busy.
+    pub(crate) fn saving(&self, key: &ShuntSaveKey) -> bool {
+        self.shunt_save.as_ref().is_some_and(|s| s.key == *key)
+    }
+
+    /// The held focus identity, cloned out of the interior-mutability cell.
+    pub(crate) fn shunt_focus_kind(&self) -> Option<ShuntFocusLine> {
+        self.shunt_focus.borrow().clone()
+    }
+
+    /// Set the held focus identity. The moment focus leaves a remove row, that
+    /// row's refusal retires (its sentence names a comment only meaningful
+    /// while the user still sits on the row that raised it).
+    pub(crate) fn set_shunt_focus(&self, kind: Option<ShuntFocusLine>) {
+        self.shunt_focus.replace(kind.clone());
+        let left_row = self
+            .shunt_remove_refusal
+            .borrow()
+            .as_ref()
+            .is_some_and(|refusal| {
+                kind.as_ref() != Some(&ShuntFocusLine::Remove(refusal.key.clone()))
+            });
+        if left_row {
+            self.shunt_remove_refusal.take();
+        }
+        let left_token = self
+            .shunt_token_refusal
+            .borrow()
+            .as_ref()
+            .is_some_and(|(profile, _)| {
+                kind.as_ref() != Some(&ShuntFocusLine::Token(profile.clone()))
+            });
+        if left_token {
+            self.shunt_token_refusal.take();
+        }
+    }
+
+    /// The descend rule applied where the geometry is published: the render
+    /// calls this over the freshly rendered rows so a resize or a card change
+    /// re-settles focus to the first actionable line in view, else none. A
+    /// held line pushed out of view re-settles regardless of pane focus; a
+    /// focus that is none re-settles only while the detail pane holds focus —
+    /// with the list focused, ascend keeps the identity and a none focus is
+    /// the key handler's own state, never settled here.
+    pub(crate) fn re_settle_shunt_focus(
+        &self,
+        stops: &[ShuntFocus],
+        rows: &[usize],
+        scroll: u16,
+        viewport: usize,
+    ) {
+        if let Some(kind) = self.shunt_focus_kind() {
+            if stops
+                .iter()
+                .position(|s| s.kind() == kind)
+                .and_then(|i| rows.get(i))
+                .is_some_and(|&r| shunt_in_view(scroll, viewport, r))
+            {
+                return;
+            }
+        } else if self.focus != ServicesFocus::Detail {
+            return;
+        }
+        self.set_shunt_focus(shunt_first_in_view(stops, rows, scroll, viewport));
+    }
+
+    /// Re-settle the delegates selection against the current job list: the
+    /// selection follows the job id across a refresh, and clamps to the last
+    /// job when that id left the list. Called after every `delegates` refresh.
+    pub(crate) fn settle_delegates_selection(&mut self) {
+        let len = self.delegates.len();
+        if len == 0 {
+            self.delegates_cursor = 0;
+            self.delegates_selected_id = None;
+            return;
+        }
+        if let Some(id) = self.delegates_selected_id.clone()
+            && let Some(pos) = self.delegates.iter().position(|j| j.record.job_id == id)
+        {
+            self.delegates_cursor = pos;
+            return;
+        }
+        self.delegates_cursor = self.delegates_cursor.min(len - 1);
+        self.delegates_selected_id = self
+            .delegates
+            .get(self.delegates_cursor)
+            .map(|j| j.record.job_id.clone());
+    }
+
+    /// Whether `↵` on the row under the cursor descends into its detail: every
+    /// row except a delegates row, which descends only while it lists a job.
+    /// The one predicate the key handler and the footer both read.
+    pub(crate) fn enter_descends(&self) -> bool {
+        !self
+            .selected_check()
+            .is_some_and(|c| c.label == "delegates")
+            || !self.delegates.is_empty()
+    }
+
+    /// Whether ↑↓/PageUp/PageDown move the delegates selection (≥2 jobs; a
+    /// single job wraps to itself). The footer derives its descended hints
+    /// from this, so a press that cannot move anything advertises nothing.
+    pub(crate) fn delegates_selection_moves(&self) -> bool {
+        self.delegates.len() > 1
     }
 }
 
@@ -1958,18 +3347,13 @@ pub(crate) struct Banner {
 
 // ── Overview list items ───────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MainItemKind {
     Profile(usize),
+    Codex(usize),
 }
 
-/// Which harness the Overview shows. A VIEW filter only: selection and every
-/// action stay bound to the claude list, because a codex account has no
-/// `Profile` record for them to act on and clauth switches it through its own
-/// CLI verb. So the codex section renders READ-ONLY, and while the claude rows
-/// are hidden every key bound to the selection is inert
-/// ([`claude_rows_hidden`]) rather than acting on a row the screen does not
-/// show.
+/// The Overview's visible harness filter; selection maps onto the rows it shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum HarnessFilter {
     #[default]
@@ -2225,10 +3609,48 @@ pub(crate) struct App {
     /// Interior mutability because the render pass takes `&App`; clamping there
     /// stops a held ↓ from inflating `help_scroll` past the end.
     pub(crate) help_max_scroll: std::cell::Cell<u16>,
+    /// First `check output`-modal row on screen (↑↓ scrolls). Reset on open.
+    pub(crate) check_output_scroll: u16,
+    /// Max valid `check_output_scroll` from the last `check output` render.
+    pub(crate) check_output_max_scroll: std::cell::Cell<u16>,
+    /// Visible `check output`-modal rows from the last render — the key
+    /// handler's page step, published like `help_viewport`.
+    pub(crate) check_output_viewport: std::cell::Cell<u16>,
+    /// Visible help-modal rows from the last render — the key handler's page
+    /// step (`PageUp`/`PageDown`), published like `help_max_scroll`.
+    pub(crate) help_viewport: std::cell::Cell<u16>,
 
     /// Selected account index, shared across Overview/Usage/Setup tabs.
     /// On Setup may also rest on the trailing `+ new` row (== profile_count).
     pub(crate) profile_cursor: usize,
+    pub(crate) overview_selector: ListView,
+    pub(crate) overview_cursor: usize,
+    pub(crate) usage_selector: ListView,
+    pub(crate) usage_detail_focus: StatusFocus,
+    pub(crate) usage_detail_scroll: usize,
+    pub(crate) usage_detail_max_scroll: std::cell::Cell<usize>,
+    pub(crate) usage_detail_viewport: std::cell::Cell<usize>,
+    pub(crate) setup_selector: ListView,
+    pub(crate) chain_selector: ListView,
+    pub(crate) models_selector: ListView,
+    pub(crate) setup_detail_offset: std::cell::Cell<usize>,
+    pub(crate) setup_detail_viewport: std::cell::Cell<usize>,
+    pub(crate) setup_detail_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) setup_detail_total: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_offset: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_viewport: std::cell::Cell<usize>,
+    pub(crate) fallback_detail_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) fallback_detail_total: std::cell::Cell<usize>,
+    pub(crate) global_config_offset: std::cell::Cell<usize>,
+    pub(crate) global_config_viewport: std::cell::Cell<usize>,
+    pub(crate) global_config_row_starts: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_block_ends: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_tips: std::cell::RefCell<Vec<usize>>,
+    pub(crate) global_config_total: std::cell::Cell<usize>,
     /// Which harness the Overview lists (`c` cycles). A view filter only — see
     /// [`HarnessFilter`].
     pub(crate) harness_filter: HarnessFilter,
@@ -2310,6 +3732,17 @@ pub(crate) struct App {
     /// instead would render `Absent` — "no daemon runs" — as fact for the whole
     /// first interval, and the first paint happens before any `on_tick`.
     pub(crate) last_daemon_probe: Instant,
+    /// The gateway slot's state under `daemon_health`, re-read beside it and
+    /// whenever a daemon control, a shunt action or a Services recompute
+    /// lands ([`sync_gateway_state`]). UI-thread-only.
+    pub(crate) gateway_state: GatewayState,
+    /// Whether the last [`App::set_gateway_state`] saw a gateway that would
+    /// run with no daemon to run it; its rise raises the no-daemon toast.
+    pub(crate) gateway_unrun: bool,
+    /// The worker asking whether a gateway a daemon left behind still serves
+    /// ([`crate::daemon::gateway::left_behind_gateway_runs`]), which picks the
+    /// no-daemon toast's copy.
+    pub(crate) left_behind_probe: ProbeWorker<bool>,
     /// A `start daemon` / `stop daemon` worker is running; the action menu
     /// offers neither verb until its outcome lands. UI-thread-only.
     pub(crate) daemon_control_busy: bool,
@@ -2343,9 +3776,29 @@ pub(crate) struct App {
     pub(crate) token_view: TokenView,
     /// Cursor into the grouped model list on the Tokens `Models` view.
     pub(crate) token_model_cursor: usize,
+    pub(crate) model_detail_focus: StatusFocus,
+    pub(crate) model_detail_scroll: u16,
+    pub(crate) model_detail_max_scroll: std::cell::Cell<u16>,
+    pub(crate) model_detail_viewport: std::cell::Cell<u16>,
     /// Model filter over the Tokens tab's model surfaces (action-menu driven).
     pub(crate) token_filter: TokenFilter,
     pub(crate) token_period: TokenPeriod,
+    /// Focused card on the Tokens dashboard. Held across period/filter changes
+    /// and across a resize (it names the card, not a layout slot).
+    pub(crate) token_dash_focus: CardKind,
+    /// First fully-visible card (index into the published reading order),
+    /// reconciled each frame by [`follow_dash_focus`] and held in a `Cell` so
+    /// the render pass can publish its correction (precedent: `token_dash_viewport`).
+    pub(crate) token_dash_first: std::cell::Cell<usize>,
+    /// Dashboard card reading order, published by the render pass so the key
+    /// handler can walk `↑`/`↓` in the same order the frame drew.
+    pub(crate) token_dash_order: std::cell::Cell<[CardKind; 7]>,
+    /// Dashboard card `(top, bottom)` rows in reading order, published by the
+    /// render pass for the key handler's whole-card scroll; empty until the
+    /// first dashboard frame draws.
+    pub(crate) token_dash_rows: std::cell::RefCell<Vec<(u16, u16)>>,
+    /// Dashboard viewport height (body rows), published by the render pass.
+    pub(crate) token_dash_viewport: std::cell::Cell<u16>,
     /// Token-stats load results from the background loader; drained in `on_tick`.
     pub(crate) tokens_events: std::sync::mpsc::Receiver<crate::tokens::TokensEvent>,
     /// Manual-refresh signal to the token loader; a `()` triggers a reload.
@@ -2431,9 +3884,8 @@ pub(crate) struct App {
     /// cleared in `switch_tab` when the user visits that tab.
     pub(crate) tab_activity: [Option<ToastKind>; Tab::ALL.len()],
 
-    /// Per-profile flag: has the bell been fired for the current crossing.
-    /// Reset when utilization drops back below threshold.
-    pub(crate) bell_fired: HashMap<String, bool>,
+    /// The 5h bell's latch: which accounts rang for their current crossing.
+    pub(crate) bell_fired: crate::bell::BellLatch,
 
     /// Cached parsed usage history per profile from usage_history.jsonl. The
     /// file itself belongs to the scheduler's fetch path (`apply_outcome`),
@@ -2471,6 +3923,9 @@ pub(crate) struct App {
     /// — the state a fixture writes to force a re-tally, since backdating an
     /// `Instant` panics on a host booted more recently than the interval.
     last_live_sessions_refresh: Option<Instant>,
+    /// The widest the header's `[ N live ]` chip has read `N`, in cells: the
+    /// chip renders at least this wide for the TUI's lifetime.
+    pub(crate) live_count_width: usize,
     /// The codex roster as the Overview lists it and the header counts it.
     /// Cached like `live_sessions`: [`codex_rows`] is a roster read plus a few
     /// small files per account, the header draws on every tab every frame, and
@@ -2718,6 +4173,7 @@ impl App {
         // Seed the token cache and the live tally before `config` moves into the
         // handle below.
         let live_sessions = crate::live_sessions::LiveTally::collect(&config);
+        let daemon_health = crate::daemon::daemon_health();
         let session_tokens = collect_session_tokens(
             &config
                 .profiles
@@ -2763,7 +4219,39 @@ impl App {
             modals: Vec::new(),
             help_scroll: 0,
             help_max_scroll: std::cell::Cell::new(0),
+            check_output_scroll: 0,
+            check_output_max_scroll: std::cell::Cell::new(0),
+            check_output_viewport: std::cell::Cell::new(0),
+            help_viewport: std::cell::Cell::new(0),
             profile_cursor: 0,
+            overview_selector: ListView::default(),
+            overview_cursor: 0,
+            usage_selector: ListView::default(),
+            usage_detail_focus: StatusFocus::List,
+            usage_detail_scroll: 0,
+            usage_detail_max_scroll: std::cell::Cell::new(0),
+            usage_detail_viewport: std::cell::Cell::new(0),
+            setup_selector: ListView::default(),
+            chain_selector: ListView::default(),
+            models_selector: ListView::default(),
+            setup_detail_offset: std::cell::Cell::new(0),
+            setup_detail_viewport: std::cell::Cell::new(0),
+            setup_detail_row_starts: std::cell::RefCell::new(Vec::new()),
+            setup_detail_block_ends: std::cell::RefCell::new(Vec::new()),
+            setup_detail_tips: std::cell::RefCell::new(Vec::new()),
+            setup_detail_total: std::cell::Cell::new(0),
+            fallback_detail_offset: std::cell::Cell::new(0),
+            fallback_detail_viewport: std::cell::Cell::new(0),
+            fallback_detail_row_starts: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_block_ends: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_tips: std::cell::RefCell::new(Vec::new()),
+            fallback_detail_total: std::cell::Cell::new(0),
+            global_config_offset: std::cell::Cell::new(0),
+            global_config_viewport: std::cell::Cell::new(0),
+            global_config_row_starts: std::cell::RefCell::new(Vec::new()),
+            global_config_block_ends: std::cell::RefCell::new(Vec::new()),
+            global_config_tips: std::cell::RefCell::new(Vec::new()),
+            global_config_total: std::cell::Cell::new(0),
             config_focus: ConfigFocus::Profiles,
             config_action_cursor: 0,
             fallback_focus: FallbackFocus::Chain,
@@ -2792,7 +4280,10 @@ impl App {
             status: StatusState::default(),
             status_events,
             status_refresh,
-            daemon_health: crate::daemon::daemon_health(),
+            daemon_health,
+            gateway_state: crate::daemon::gateway_slot(daemon_health).0.state,
+            gateway_unrun: false,
+            left_behind_probe: ProbeWorker::new(crate::daemon::gateway::left_behind_gateway_runs),
             last_daemon_probe: Instant::now(),
             daemon_control_busy: false,
             daemon_control_rx,
@@ -2805,8 +4296,25 @@ impl App {
             tokens_progress: None,
             token_view: TokenView::Dashboard,
             token_model_cursor: 0,
+            model_detail_focus: StatusFocus::List,
+            model_detail_scroll: 0,
+            model_detail_max_scroll: std::cell::Cell::new(0),
+            model_detail_viewport: std::cell::Cell::new(0),
             token_filter: TokenFilter::default(),
             token_period: TokenPeriod::default(),
+            token_dash_focus: CardKind::First,
+            token_dash_first: std::cell::Cell::new(0),
+            token_dash_order: std::cell::Cell::new([
+                CardKind::First,
+                CardKind::Total,
+                CardKind::Trend,
+                CardKind::Models,
+                CardKind::Comp,
+                CardKind::Hour,
+                CardKind::Activity,
+            ]),
+            token_dash_rows: std::cell::RefCell::new(Vec::new()),
+            token_dash_viewport: std::cell::Cell::new(0),
             tokens_events,
             tokens_refresh,
             price_table: None,
@@ -2833,12 +4341,13 @@ impl App {
             bootstrap_active: Arc::new(AtomicBool::new(false)),
             shutting_down: Arc::new(AtomicBool::new(false)),
             tab_activity: [None; Tab::ALL.len()],
-            bell_fired: HashMap::new(),
+            bell_fired: crate::bell::BellLatch::default(),
             history_cache,
             history_fp,
             wallet_cache,
             wallet_fp,
             session_tokens,
+            live_count_width: live_count_text(live_sessions.total()).chars().count(),
             live_sessions,
             last_live_sessions_refresh: Some(Instant::now()),
             codex_rows: codex_rows(),
@@ -2905,7 +4414,7 @@ impl App {
             self.tab = Tab::Services;
             // Land on the herdr row by label once its probe resolves.
             self.services.land_on_herdr = true;
-            recompute_services_checks(&mut self, false);
+            recompute_services_checks(&mut self, false, ShuntRefresh::Keep);
             {
                 let mut cfg = self.config();
                 cfg.state.herdr.first_landing_done = true;
@@ -2920,6 +4429,16 @@ impl App {
             self.tab = home;
         }
         self
+    }
+
+    /// The production write path for the tally after construction: it also widens
+    /// the header chip's held count width, so a count shrinking by a digit
+    /// moves nothing right of the chip.
+    pub(crate) fn set_live_sessions(&mut self, tally: crate::live_sessions::LiveTally) {
+        self.live_count_width = self
+            .live_count_width
+            .max(live_count_text(tally.total()).chars().count());
+        self.live_sessions = tally;
     }
 
     /// Phase clock every ambient animation keys off: milliseconds since the TUI
@@ -2998,7 +4517,6 @@ impl App {
             );
             bootstrap_third_party(
                 &h.third_party_usage_store,
-                &h.usage_store,
                 &h.third_party_status,
                 &h.last_fetched,
                 &third_party,
@@ -3068,6 +4586,28 @@ impl App {
         .flatten()
     }
 
+    /// The in-memory burn rate for `profile`, or `None` when the profile is
+    /// third-party-classified — a hybrid never pairs its OAuth burn history with
+    /// its provider window (maintainer ruling 2026-09-10), so its windows are judged by the
+    /// static threshold, never a cross-pool projection. The one guard the
+    /// Overview ETA and the startup one-shot both read.
+    pub(crate) fn burn_rate_for(&self, profile: &Profile, usage_info: &UsageInfo) -> Option<f64> {
+        if profile.usage_cache_is_third_party() {
+            return None;
+        }
+        self.active_burn_rate(&profile.name, usage_info)
+    }
+
+    /// The startup one-shot's burn rate for `profile`: its `Profile.usage`
+    /// reading, or `None` when there is none. The one-shot reads its rate
+    /// through this step, never `active_burn_rate` directly — a
+    /// third-party-classified profile still refuses the OAuth burn pairing via
+    /// [`Self::burn_rate_for`] (maintainer ruling 2026-09-10).
+    fn startup_rate(&self, profile: &Profile) -> Option<f64> {
+        let usage = profile.usage.as_ref()?;
+        self.burn_rate_for(profile, usage)
+    }
+
     /// The funded wallet's burn rate for `profile`, computed from the
     /// in-memory `wallet_cache` — never touches disk. The wallet twin of
     /// [`Self::active_burn_rate`]: the Usage tab's balance row and the
@@ -3124,10 +4664,7 @@ impl App {
             if active_fresh {
                 // In-memory rate only (`history_cache`) — never a disk read
                 // while the config guard is held; see `active_burn_rate`.
-                let rate = active_profile.and_then(|p| {
-                    let usage = p.usage.as_ref()?;
-                    self.active_burn_rate(&p.name, usage)
-                });
+                let rate = active_profile.and_then(|p| self.startup_rate(p));
                 drop(cfg);
                 auto_switch_if_needed(&self.config, rate).ok().flatten()
             } else {
@@ -3215,11 +4752,40 @@ impl App {
             let interval_ms = cfg.state.refresh_interval_ms;
             let refresh_spent_accounts = cfg.state.refresh_spent_accounts;
             for p in &mut cfg.profiles {
-                if let Some(s) = info_map.as_ref() {
-                    p.usage = s.get(p.name.as_str()).cloned();
+                // The TUI's per-account reading is the picker's whole record,
+                // the same dichotomy the walk's picker and the disk readers
+                // key on (`usage_cache_is_third_party`): a third-party account
+                // (pure or hybrid) takes its provider stats' `to_usage_info()`
+                // — never the OAuth leg's entry, so a stale OAuth reading under
+                // a logged-out hybrid's name cannot survive, and no OAuth plan
+                // or spend reaches a hybrid's `Profile.usage`. Assign only when
+                // the store the classification needs is present — a poisoned
+                // lock keeps the prior reading.
+                let side_ok = if p.usage_cache_is_third_party() {
+                    third_party_map.is_some()
+                } else {
+                    info_map.is_some()
+                };
+                if side_ok {
+                    p.usage = crate::fallback::picked_usage(
+                        p.usage_cache_is_third_party(),
+                        info_map.as_ref().and_then(|s| s.get(p.name.as_str())),
+                        third_party_map
+                            .as_ref()
+                            .and_then(|s| s.get(p.name.as_str())),
+                    );
                 }
-                // OAuth fetch_status takes precedence; third-party only when no OAuth status.
-                if let Some(s) = status_map.as_ref()
+                // Fetch_status follows the picker's side too, so the TUI's
+                // freshness (the startup one-shot gate and the status pill)
+                // agrees with the scheduler's `decision_fresh_any`: a
+                // third-party-classified account reads its third-party status;
+                // every other account is OAuth-first with the third-party
+                // fallback.
+                if p.usage_cache_is_third_party() {
+                    if let Some(s) = third_party_status_map.as_ref() {
+                        p.fetch_status = s.get(p.name.as_str()).copied();
+                    }
+                } else if let Some(s) = status_map.as_ref()
                     && s.contains_key(p.name.as_str())
                 {
                     p.fetch_status = s.get(p.name.as_str()).copied();
@@ -3230,18 +4796,6 @@ impl App {
                     && s.contains_key(p.name.as_str())
                 {
                     p.third_party_usage = s.get(p.name.as_str()).cloned();
-                }
-                // A third-party member's bars are its usage snapshot. The
-                // scheduler writes the snapshot and mirrors its derived window
-                // into the usage store as two separate acquisitions, so an
-                // apply landing between them still owes this account a figure:
-                // derive it off the snapshot. The `is_none` guard keeps that a
-                // fallback — the store's own entry, whichever leg wrote it,
-                // always wins.
-                if p.usage.is_none()
-                    && let Some(stats) = p.third_party_usage.as_ref()
-                {
-                    p.usage = stats.to_usage_info();
                 }
 
                 // #74 degraded cue: cache age past the derived threshold reads
@@ -3282,12 +4836,15 @@ impl App {
                 .profiles
                 .iter()
                 .map(|p| {
+                    // The same reading the daemon's bell judges: a lapsed 5h
+                    // window is no figure, and an aged one is not fresh.
                     let util = p
                         .usage
                         .as_ref()
                         .and_then(|u| u.five_hour.as_ref())
+                        .filter(|w| crate::profile_json::window_row_is_live(w))
                         .map(|u| u.utilization);
-                    let fresh = p.fetch_status == Some(FetchStatus::Fresh);
+                    let fresh = p.fetch_status == Some(FetchStatus::Fresh) && !p.usage_stale;
                     (p.name.to_string(), p.bell_threshold, util, fresh)
                 })
                 .collect::<Vec<_>>();
@@ -3309,27 +4866,9 @@ impl App {
                 .collect::<Vec<_>>();
         }
         for (name, threshold, util, fresh) in bells {
-            // Ring or clear only on a live read — a synthetic/stale window (e.g.
-            // a just-kicked 0%) must not clear a real bell or fire a false one.
-            // Non-fresh profiles keep their prior bell state.
-            if !fresh {
-                continue;
-            }
-            if let Some(t) = threshold
-                && let Some(u) = util
-            {
-                if u >= t {
-                    if !self.bell_fired.contains_key(&name) {
-                        self.toast(
-                            ToastKind::Warning,
-                            format!("bell: {name} at {}", format_pct(u)),
-                        );
-                        self.set_tab_activity(Tab::Overview, ToastKind::Warning);
-                        self.bell_fired.insert(name, true);
-                    }
-                } else {
-                    self.bell_fired.remove(&name);
-                }
+            if let Some(message) = self.bell_fired.observe(&name, threshold, util, fresh) {
+                self.toast(ToastKind::Warning, message);
+                self.set_tab_activity(Tab::Overview, ToastKind::Warning);
             }
         }
 
@@ -3505,13 +5044,28 @@ impl App {
         self.modals.push(modal);
     }
 
+    /// Every write of [`App::gateway_state`] after construction lands here.
+    /// No daemon (never a stale one, whose supervisor still runs) under the
+    /// record-only `unobserved` slot means the gateway would run and nothing
+    /// will start it: entering that state starts the left-behind probe, whose
+    /// landing toasts once ([`drain_left_behind_probe`]).
+    pub(crate) fn set_gateway_state(&mut self, state: GatewayState) {
+        self.gateway_state = state;
+        let unrun = self.daemon_health == crate::daemon::DaemonHealth::Absent
+            && state == GatewayState::Unobserved;
+        if unrun && !self.gateway_unrun {
+            self.left_behind_probe.restart();
+        }
+        self.gateway_unrun = unrun;
+    }
+
     pub(crate) fn toast(&mut self, kind: ToastKind, body: impl Into<String>) {
         if self.toasts.len() >= TOAST_CAPACITY {
             self.toasts.pop_front();
         }
         self.toasts.push_back(Toast {
             kind,
-            body: body.into(),
+            body: prose::mark_commands(&body.into()),
             born: Instant::now(),
         });
     }
@@ -3526,18 +5080,14 @@ impl App {
     }
 
     pub(crate) fn prune_toasts(&mut self) {
-        while let Some(front) = self.toasts.front() {
-            let ttl = if front.kind == ToastKind::Danger {
+        self.toasts.retain(|toast| {
+            let ttl = if toast.kind == ToastKind::Danger {
                 TOAST_TTL_DANGER
             } else {
                 TOAST_TTL_NORMAL
             };
-            if front.born.elapsed() >= ttl {
-                self.toasts.pop_front();
-            } else {
-                break;
-            }
-        }
+            toast.born.elapsed() < ttl
+        });
     }
 
     /// Called each frame with the current terminal height. Tracks compact
@@ -3570,9 +5120,14 @@ impl App {
     // ── Main list ────────────────────────────────────────────────────────────
 
     pub(crate) fn main_items(&self) -> Vec<MainItemKind> {
-        (0..self.config().profiles.len())
-            .map(MainItemKind::Profile)
-            .collect()
+        let mut rows = Vec::new();
+        if self.harness_filter.shows_claude() {
+            rows.extend((0..self.profile_count()).map(MainItemKind::Profile));
+        }
+        if self.harness_filter.shows_codex() {
+            rows.extend((0..self.codex_rows.len()).map(MainItemKind::Codex));
+        }
+        rows
     }
 
     pub(crate) fn profile_count(&self) -> usize {
@@ -3587,6 +5142,7 @@ impl App {
     pub(crate) fn clamp_profile_cursor(&mut self) {
         let max = self.profile_count().saturating_sub(1);
         self.profile_cursor = self.profile_cursor.min(max);
+        self.clamp_overview_cursor();
         // Every reload path lands here (a roster change can move or remove the
         // selected account), so the note tracks the selection for free.
         self.reload_selected_note();
@@ -3600,7 +5156,20 @@ impl App {
     }
 
     pub(crate) fn current_main_item(&self) -> Option<MainItemKind> {
-        self.main_items().get(self.profile_cursor).copied()
+        self.main_items().get(self.overview_cursor).copied()
+    }
+
+    fn clamp_overview_cursor(&mut self) {
+        self.overview_cursor = self
+            .overview_cursor
+            .min(self.main_items().len().saturating_sub(1));
+    }
+
+    fn sync_overview_profile_selection(&mut self) {
+        if let Some(MainItemKind::Profile(idx)) = self.current_main_item() {
+            self.profile_cursor = idx;
+            self.reload_selected_note();
+        }
     }
 }
 
@@ -3608,9 +5177,12 @@ impl App {
 
 // ── Startup reconciliation ────────────────────────────────────────────────────
 
-/// Startup credential reconciliation, non-blocking. Compares the live
-/// `~/.claude/.credentials.json` to the active profile's stored creds inline.
-/// No divergence → snapshot + `ReconcileDone` immediately.
+/// Startup credential reconciliation, non-blocking. Judges the live
+/// `~/.claude/.credentials.json` through the SAME cascade the 1Hz poll uses
+/// ([`reconcile_decision`]): against the install source, never the
+/// clauth-private usage pair — a refreshless live login (a rolling bearer, a
+/// static mint) is no divergence (#104). No divergence → snapshot +
+/// `ReconcileDone` immediately.
 ///
 /// On divergence we never probe the stored chain via OAuth refresh — a refresh
 /// *spends* the single-use refresh token server-side and would rotate the stored
@@ -3624,28 +5196,20 @@ pub(super) fn reconcile_startup(app: &mut App) {
         return;
     };
 
-    // Read live credentials under the state lock to avoid torn snapshots.
-    let live = with_state_lock(|_held| Ok(read_claude_credentials().ok().flatten()))
-        .ok()
-        .flatten();
-    let diverged = {
-        let cfg = app.config();
-        let stored = cfg.find(&active).and_then(|p| p.credentials.as_ref());
-        credentials_diverged(stored, live.as_ref())
-    };
+    let verdict = reconcile_decision(app, &active);
 
-    if !diverged {
+    if matches!(verdict, DivergenceVerdict::Clean) {
         let mut cfg = app.config();
         let _ = snapshot_active_credentials(&mut cfg);
-        let _ = app.startup_sender.send(StartupSignal::ReconcileDone);
-        return;
     }
-
-    // Diverged: hand the verdict to the user. No network, no FS write here.
     let _ = app
         .startup_sender
-        .send(StartupSignal::ReconcileNeedsPrompt {
-            active: active.to_string(),
+        .send(if matches!(verdict, DivergenceVerdict::Clean) {
+            StartupSignal::ReconcileDone
+        } else {
+            StartupSignal::ReconcileNeedsPrompt {
+                active: active.to_string(),
+            }
         });
 }
 
@@ -3658,11 +5222,23 @@ pub(super) fn reconcile_startup(app: &mut App) {
 /// `q back` / `q quit` label; the help-modal esc-row test iterates it too, so
 /// a new sub-focus tab without an `esc` help row fails CI.
 pub(crate) fn has_sub_focus(app: &App) -> bool {
-    (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
+    (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+        || (app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions)
         || (app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail)
         || (app.tab == Tab::Status && app.status.focus == StatusFocus::Detail)
         || (app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail)
         || (app.tab == Tab::Tokens && app.token_view == TokenView::Models)
+}
+
+/// True while focus is descended into the delegates detail: `←` ascends and
+/// `→` is inert there, the master-detail arrow-trap, instead of switching tabs.
+fn services_delegates_descended(app: &App) -> bool {
+    app.tab == Tab::Services
+        && app.services.focus == ServicesFocus::Detail
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "delegates")
 }
 
 /// What owns the keyboard this frame: every key it claims ([`KeyOwner::claims`]),
@@ -3689,6 +5265,9 @@ pub(crate) enum KeyOwner {
     WeeklyThreshold,
     /// The Services tab's herdr tag-refresh field.
     HerdrTag,
+    /// The shunt card's open config field editor (a typed field or a pending
+    /// cycle pick).
+    ShuntField,
     /// The usage tab's note editor (the `n`-opened draft on the selected
     /// account).
     NoteEditor,
@@ -3697,9 +5276,27 @@ pub(crate) enum KeyOwner {
 impl KeyOwner {
     /// Whether this owner takes `code`, or lets it through to the global keys.
     /// The chip picker binds neither `?` nor `x`, so help and toast dismissal
-    /// work mid-pick; a typed field takes both, since they are data there.
-    pub(crate) fn claims(self, code: KeyCode) -> bool {
-        !(self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')))
+    /// work mid-pick; a typed field takes both, since they are data there. A
+    /// shunt editor whose row is saving is locked — only the editing keys are
+    /// inert, so `?` (help) and `x` (dismiss a toast) fall through while `↑↓`
+    /// and `q` (back) stay claimed and act in the editor's own handler (`q`
+    /// closes the editor and ascends, so a locked editor never outlives the
+    /// detail focus).
+    pub(crate) fn claims(self, app: &App, code: KeyCode) -> bool {
+        if self == Self::DayPicker && matches!(code, KeyCode::Char('?' | 'x')) {
+            return false;
+        }
+        if self == Self::ShuntField
+            && app
+                .services
+                .shunt_field_edit
+                .as_ref()
+                .is_some_and(|state| app.services.saving(&ShuntSaveKey::Field(state.key.clone())))
+            && matches!(code, KeyCode::Char('?' | 'x'))
+        {
+            return false;
+        }
+        true
     }
 }
 
@@ -3734,6 +5331,7 @@ pub(crate) fn keyboard_owner(app: &App) -> Option<KeyOwner> {
         Tab::Config if app.context_nudge_draft.is_some() => Some(KeyOwner::ContextNudge),
         Tab::Config if app.weekly_threshold_draft.is_some() => Some(KeyOwner::WeeklyThreshold),
         Tab::Services if app.services.herdr_tag_draft.is_some() => Some(KeyOwner::HerdrTag),
+        Tab::Services if app.services.shunt_field_edit.is_some() => Some(KeyOwner::ShuntField),
         Tab::Usage if app.note_editor.is_some() => Some(KeyOwner::NoteEditor),
         Tab::Overview
         | Tab::Usage
@@ -3759,7 +5357,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     // A modal, then an open editor, owns the keyboard: typed digits and
     // letters can't trip global shortcuts, and ←/→ never switch the tab. A key
     // the owner does not claim falls through to the global senses below.
-    if let Some(owner) = keyboard_owner(app).filter(|owner| owner.claims(key.code)) {
+    if let Some(owner) = keyboard_owner(app).filter(|owner| owner.claims(app, key.code)) {
         match owner {
             KeyOwner::Modal => handle_modal_key(app, key),
             KeyOwner::SetupField | KeyOwner::NewAccountField => handle_config_edit_key(app, key),
@@ -3769,6 +5367,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             KeyOwner::ContextNudge => handle_context_nudge_edit_key(app, key),
             KeyOwner::WeeklyThreshold => handle_weekly_threshold_edit_key(app, key),
             KeyOwner::HerdrTag => handle_herdr_tag_edit_key(app, key),
+            KeyOwner::ShuntField => handle_shunt_field_edit_key(app, key),
             KeyOwner::NoteEditor => handle_note_editor_key(app, key),
         }
         return;
@@ -3787,6 +5386,33 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
     }
 
     match key.code {
+        KeyCode::Left if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail => {
+            app.usage_detail_focus = StatusFocus::List;
+            return;
+        }
+        KeyCode::Left
+            if app.tab == Tab::Tokens
+                && app.token_view == TokenView::Models
+                && app.model_detail_focus == StatusFocus::Detail =>
+        {
+            app.model_detail_focus = StatusFocus::List;
+            return;
+        }
+        KeyCode::Left if services_delegates_descended(app) => {
+            leave_shunt_detail(app);
+            return;
+        }
+        KeyCode::Right
+            if (app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail)
+                || (app.tab == Tab::Tokens
+                    && app.token_view == TokenView::Models
+                    && app.model_detail_focus == StatusFocus::Detail) =>
+        {
+            return;
+        }
+        KeyCode::Right if services_delegates_descended(app) => {
+            return;
+        }
         KeyCode::Right | KeyCode::Tab => {
             app.disarm_quit();
             switch_tab(app, app.tab.next());
@@ -3817,7 +5443,13 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // `c` still reaches the per-tab dispatch (Tokens binds it too).
         KeyCode::Char('c') if app.tab == Tab::Overview => {
             app.disarm_quit();
+            let selected = app.current_main_item();
             app.harness_filter = app.harness_filter.next();
+            app.overview_cursor = selected
+                .and_then(|item| app.main_items().iter().position(|row| *row == item))
+                .unwrap_or(0);
+            app.sync_overview_profile_selection();
+            app.overview_selector.offset.set(0);
             return;
         }
         KeyCode::Char('a') => {
@@ -3836,7 +5468,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
             }
             // Service checks re-run synchronously; `r` also re-probes `claude --version`.
             if app.tab == Tab::Services {
-                recompute_services_checks(app, true);
+                recompute_services_checks(app, true, ShuntRefresh::Keep);
                 app.toast(ToastKind::Info, "re-running service checks");
                 return;
             }
@@ -3864,6 +5496,7 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 message: ROTATE_ALL_MSG.to_string(),
                 detail: Some(ROTATE_ALL_DETAIL.to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::RotateAll,
             }));
             return;
@@ -3883,14 +5516,23 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         // Esc backs out of sub-focus; no-op at the top level.
         KeyCode::Esc => {
             app.disarm_quit();
-            if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
+            if app.tab == Tab::Usage && app.usage_detail_focus == StatusFocus::Detail {
+                app.usage_detail_focus = StatusFocus::List;
+            } else if app.tab == Tab::Tokens
+                && app.token_view == TokenView::Models
+                && app.model_detail_focus == StatusFocus::Detail
+            {
+                app.model_detail_focus = StatusFocus::List;
+            } else if app.tab == Tab::Setup && app.config_focus == ConfigFocus::Actions {
                 leave_config_detail(app);
             } else if app.tab == Tab::Fallback && app.fallback_focus == FallbackFocus::Detail {
                 leave_fallback_detail(app);
             } else if app.tab == Tab::Status && app.status.focus == StatusFocus::Detail {
                 app.status.focus = StatusFocus::List;
             } else if app.tab == Tab::Services && app.services.focus == ServicesFocus::Detail {
-                app.services.focus = ServicesFocus::List;
+                if !shunt_esc_folds_entry(app) {
+                    leave_shunt_detail(app);
+                }
             } else if app.tab == Tab::Tokens && app.token_view == TokenView::Models {
                 app.token_view = TokenView::Dashboard;
             }
@@ -3902,14 +5544,18 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('q') => {
             if has_sub_focus(app) {
                 app.disarm_quit();
-                if app.tab == Tab::Setup {
+                if app.tab == Tab::Usage {
+                    app.usage_detail_focus = StatusFocus::List;
+                } else if app.tab == Tab::Tokens && app.model_detail_focus == StatusFocus::Detail {
+                    app.model_detail_focus = StatusFocus::List;
+                } else if app.tab == Tab::Setup {
                     leave_config_detail(app);
                 } else if app.tab == Tab::Fallback {
                     leave_fallback_detail(app);
                 } else if app.tab == Tab::Tokens {
                     app.token_view = TokenView::Dashboard;
                 } else if app.tab == Tab::Services {
-                    app.services.focus = ServicesFocus::List;
+                    leave_shunt_detail(app);
                 } else {
                     app.status.focus = StatusFocus::List;
                 }
@@ -3918,7 +5564,10 @@ pub(crate) fn handle_key(app: &mut App, key: KeyEvent) {
                 app.shutting_down.store(true, Ordering::SeqCst);
             } else {
                 app.armed_quit = true;
-                app.footer_alert = Some(FooterAlert::Warn("press q again to quit".to_string()));
+                app.footer_alert = Some(FooterAlert::Warn(format!(
+                    "press {} again to quit",
+                    prose::key("q")
+                )));
             }
             return;
         }
@@ -4010,8 +5659,20 @@ pub(crate) fn token_period_models(app: &App) -> Vec<crate::tokens::PeriodModel> 
 
 /// Number of rows in the Tokens `Models` master list under the active
 /// period + filter lenses.
-fn token_model_count(app: &App) -> usize {
+pub(crate) fn token_model_count(app: &App) -> usize {
     token_period_models(app).len()
+}
+
+/// Keep detail focus on a model only while the active list can select one.
+fn clamp_token_model_cursor(app: &mut App) {
+    let len = token_model_count(app);
+    if len == 0 {
+        app.model_detail_focus = StatusFocus::List;
+        app.model_detail_scroll = 0;
+    }
+    if app.token_model_cursor >= len {
+        app.token_model_cursor = len.saturating_sub(1);
+    }
 }
 
 /// Tokens `r` / action-menu reload: re-read the on-disk stats + recent
@@ -4026,40 +5687,215 @@ fn reload_token_stats(app: &mut App) {
     app.toast(ToastKind::Info, "reloading token usage");
 }
 
-/// Tokens tab: `c` toggles cache-counting (persisted) on either view (`t`'s
-/// period cycle is claimed by the global key arm); Dashboard descends to
-/// Models on ⏎; Models moves the model cursor with ↑↓ (ascend handled by the
-/// global esc/q).
+/// Tokens tab: `c` toggles cache-counting on either view; the Dashboard moves
+/// card focus with ↑/↓ (wrapping) and the page keys (stopping at the ends), and
+/// ⏎ descends into Models. From Models, ⏎ descends into the read-only detail.
 fn handle_tokens_key(app: &mut App, key: KeyEvent) {
     if key.code == KeyCode::Char('c') {
         toggle_count_cache(app);
         return;
     }
     match app.token_view {
-        TokenView::Dashboard => {
-            // Dashboard is a fixed grid (no scroll); ⏎ descends into Models.
-            if key.code == KeyCode::Enter && token_model_count(app) > 0 {
+        TokenView::Dashboard => match key.code {
+            KeyCode::Enter if token_model_count(app) > 0 => {
                 app.token_view = TokenView::Models;
+                app.model_detail_focus = StatusFocus::List;
+                app.model_detail_scroll = 0;
                 app.token_model_cursor = 0;
             }
-        }
+            KeyCode::Up => dash_move_focus(app, DashDir::Prev),
+            KeyCode::Down => dash_move_focus(app, DashDir::Next),
+            KeyCode::PageUp => dash_move_focus(app, DashDir::PageUp),
+            KeyCode::PageDown => dash_move_focus(app, DashDir::PageDown),
+            _ => {}
+        },
         TokenView::Models => {
-            let len = token_model_count(app);
-            match key.code {
-                KeyCode::Up if len > 0 => {
-                    app.token_model_cursor = (app.token_model_cursor + len - 1).rem_euclid(len);
+            if app.model_detail_focus == StatusFocus::Detail {
+                let max = app.model_detail_max_scroll.get();
+                let viewport = app.model_detail_viewport.get();
+                match key.code {
+                    KeyCode::Up => {
+                        app.model_detail_scroll = app.model_detail_scroll.min(max).saturating_sub(1)
+                    }
+                    KeyCode::Down => {
+                        app.model_detail_scroll =
+                            app.model_detail_scroll.min(max).saturating_add(1).min(max)
+                    }
+                    KeyCode::PageUp => {
+                        app.model_detail_scroll = page_up_scroll(
+                            app.model_detail_scroll as usize,
+                            max as usize,
+                            viewport as usize,
+                        ) as u16
+                    }
+                    KeyCode::PageDown => {
+                        app.model_detail_scroll = page_down_scroll(
+                            app.model_detail_scroll as usize,
+                            max as usize,
+                            viewport as usize,
+                        ) as u16
+                    }
+                    _ => {}
                 }
-                KeyCode::Down if len > 0 => {
-                    app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+            } else {
+                let len = token_model_count(app);
+                match key.code {
+                    KeyCode::Up if len > 0 => {
+                        app.token_model_cursor = (app.token_model_cursor + len - 1).rem_euclid(len);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::Down if len > 0 => {
+                        app.token_model_cursor = (app.token_model_cursor + 1).rem_euclid(len);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::PageUp if len > 0 => {
+                        app.token_model_cursor =
+                            selector_page_up(app.token_model_cursor, &app.models_selector);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::PageDown if len > 0 => {
+                        app.token_model_cursor =
+                            selector_page_down(app.token_model_cursor, &app.models_selector);
+                        app.model_detail_scroll = 0;
+                    }
+                    KeyCode::Enter if len > 0 => {
+                        app.model_detail_focus = StatusFocus::Detail;
+                        app.model_detail_scroll = 0;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
     }
 }
 
+/// Direction a dashboard key moves card focus.
+enum DashDir {
+    Prev,
+    Next,
+    PageUp,
+    PageDown,
+}
+
+/// Move dashboard card focus one step (or one page) and reconcile the
+/// first-visible card, both through [`follow_dash_focus`].
+fn dash_move_focus(app: &mut App, dir: DashDir) {
+    let (new_focus, new_first) = {
+        let order = app.token_dash_order.get();
+        let rows = app.token_dash_rows.borrow();
+        if rows.len() != 7 {
+            return;
+        }
+        let viewport = app.token_dash_viewport.get();
+        let Some(pos) = order.iter().position(|&k| k == app.token_dash_focus) else {
+            return;
+        };
+        let starts: Vec<usize> = rows.iter().map(|&(top, _)| top as usize).collect();
+        let next = match dir {
+            DashDir::Prev => (pos + 6) % 7,
+            DashDir::Next => (pos + 1) % 7,
+            DashDir::PageUp => page_land_up(pos, &starts, viewport as usize),
+            DashDir::PageDown => page_land_down(pos, &starts, viewport as usize),
+        }
+        .min(6);
+        let focus = order[next];
+        let first = follow_dash_focus(&order, &rows, viewport, focus, app.token_dash_first.get());
+        (focus, first)
+    };
+    app.token_dash_focus = new_focus;
+    app.token_dash_first.set(new_first);
+}
+
+/// Reconcile the persisted first-visible card against the laid-out geometry and
+/// the focused card: it moves only when focus leaves the view. Pure — the key
+/// path and the render pass both call it.
+pub(crate) fn follow_dash_focus(
+    order: &[CardKind; 7],
+    rows: &[(u16, u16)],
+    viewport: u16,
+    focus: CardKind,
+    first: usize,
+) -> usize {
+    if rows.is_empty() || viewport == 0 {
+        return 0;
+    }
+    let last = rows.len() - 1;
+    if rows[last].1 <= rows[0].0 + viewport {
+        return 0; // grid fits: no scroll
+    }
+    let Some(mut focus_idx) = order.iter().position(|&k| k == focus) else {
+        return first.min(last);
+    };
+    focus_idx = focus_idx.min(last);
+    let mut first = dash_row_start(rows, first.min(last));
+    let view_top = rows[first].0;
+    let view_bottom = view_top + viewport;
+    let (f_top, f_bottom) = rows[focus_idx];
+    if f_top < view_top {
+        first = dash_row_start(rows, focus_idx);
+    } else if f_bottom > view_bottom {
+        // Scroll down the minimum that reveals the focused card's bottom.
+        let want = f_bottom.saturating_sub(viewport);
+        let k = (0..=focus_idx)
+            .find(|&k| rows[k].0 >= want)
+            .unwrap_or(focus_idx);
+        first = dash_row_start(rows, k);
+    }
+    first
+}
+
+/// Clamp the first-visible card after a resize: the view never starts past the
+/// last card top that still fills the body (no blank tail while cards above
+/// stay hidden), bounded so the focused card's bottom stays in view. Render-only.
+pub(crate) fn clamp_dash_first(
+    order: &[CardKind; 7],
+    rows: &[(u16, u16)],
+    viewport: u16,
+    focus: CardKind,
+    first: usize,
+) -> usize {
+    if rows.is_empty() || viewport == 0 {
+        return 0;
+    }
+    let last = rows.len() - 1;
+    if rows[last].1 <= rows[0].0 + viewport {
+        return 0; // grid fits
+    }
+    let Some(mut focus_idx) = order.iter().position(|&k| k == focus) else {
+        return first.min(last);
+    };
+    focus_idx = focus_idx.min(last);
+    let first = dash_row_start(rows, first.min(last));
+    if rows[last].1 >= rows[first].0 + viewport {
+        return first; // already fills the body
+    }
+    let max_top = rows[last].1 - viewport;
+    let focus_floor = rows[focus_idx].1.saturating_sub(viewport);
+    let mut k = first;
+    while k > 0 && rows[k].0 > max_top {
+        k -= 1;
+    }
+    if rows[k].0 < focus_floor {
+        while k < last && rows[k].0 < focus_floor {
+            k += 1;
+        }
+    }
+    dash_row_start(rows, k)
+}
+
+/// The first card of `i`'s visual row (side-by-side cards share a top).
+fn dash_row_start(rows: &[(u16, u16)], mut i: usize) -> usize {
+    while i > 0 && rows[i - 1].0 == rows[i].0 {
+        i -= 1;
+    }
+    i
+}
+
 /// Switch the active tab and reset that tab's cursor to a sensible default.
 fn switch_tab(app: &mut App, tab: Tab) {
+    if tab == Tab::Overview && app.tab != Tab::Overview {
+        app.overview_cursor = app.profile_cursor;
+    }
     app.tab = tab;
     app.tab_activity[tab.index()] = None;
     app.config_draft = None;
@@ -4069,10 +5905,16 @@ fn switch_tab(app: &mut App, tab: Tab) {
     // Clamp cursor: a Config `+ new` selection must land on a real account.
     app.clamp_profile_cursor();
     match tab {
-        Tab::Overview | Tab::Usage => {}
+        Tab::Overview => {}
+        Tab::Usage => {
+            app.usage_detail_focus = StatusFocus::List;
+            app.usage_detail_scroll = 0;
+        }
         Tab::Tokens => {
             // Land on the dashboard; keep the model cursor reset for descend.
             app.token_view = TokenView::Dashboard;
+            app.model_detail_focus = StatusFocus::List;
+            app.model_detail_scroll = 0;
             app.token_model_cursor = 0;
         }
         Tab::Setup => {
@@ -4099,15 +5941,17 @@ fn switch_tab(app: &mut App, tab: Tab) {
             app.status.focus = StatusFocus::List;
         }
         Tab::Services => {
-            app.services.focus = ServicesFocus::List;
+            leave_shunt_detail(app);
             app.services.cursor = 0;
             app.services.detail_scroll = 0;
             // Entering the tab clears an open tag editor the same way the
             // Config tab clears its drafts; `switch_tab` matches the
             // destination, so the clear runs on entry, not on exit.
             app.services.herdr_tag_draft = None;
-            // Recompute on focus; the cached `claude --version` is not re-probed.
-            recompute_services_checks(app, false);
+            // Recompute on focus; the cached `claude --version` is not
+            // re-probed, but the shunt plan and pool read re-run so a card
+            // left stale by an action elsewhere reads fresh on re-entry.
+            recompute_services_checks(app, false, ShuntRefresh::Restart);
         }
     }
 }
@@ -4123,37 +5967,247 @@ fn step_profile_cursor(app: &mut App, delta: i32, len: usize) {
     app.reload_selected_note();
 }
 
-/// True, with a toast saying so, while the Overview's `Codex` filter hides the
-/// claude rows the cursor is bound to. Every key that reorders, steps or acts
-/// on the selection asks here first, so nothing acts on a row the screen does
-/// not show.
-fn claude_rows_hidden(app: &mut App) -> bool {
-    if app.harness_filter.shows_claude() {
-        return false;
+/// One page = the current viewport minus one overlap line (minimum 1), so a
+/// page down keeps the old bottom line as the new top line. Every scrollable
+/// surface steps by this; `↑`/`↓` stay one row/line and keep their wrapping.
+pub(crate) fn page_step(viewport: usize) -> usize {
+    viewport.saturating_sub(1).max(1)
+}
+
+/// The page-down landing row: the last row whose start line is within one page
+/// below `cursor`'s start, at least one row forward, stopping at the last row.
+/// Shared by [`page_down_cursor_by_rows`] and the Tokens dashboard page keys.
+pub(crate) fn page_land_down(cursor: usize, starts: &[usize], viewport: usize) -> usize {
+    if starts.is_empty() {
+        return 0;
     }
-    app.toast(ToastKind::Info, "claude rows are hidden, press c");
-    true
+    let last = starts.len() - 1;
+    let cursor = cursor.min(last);
+    if cursor >= last {
+        return last;
+    }
+    let target = starts[cursor] + page_step(viewport);
+    let mut next = cursor + 1;
+    while next < last && starts[next + 1] <= target {
+        next += 1;
+    }
+    next
+}
+
+/// The page-up landing row: the first row whose start line is within one page
+/// above `cursor`'s start, at least one row back, stopping at the first row.
+/// Shared by [`page_up_cursor_by_rows`] and the Tokens dashboard page keys.
+pub(crate) fn page_land_up(cursor: usize, starts: &[usize], viewport: usize) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    if cursor == 0 {
+        return 0;
+    }
+    let target = starts[cursor].saturating_sub(page_step(viewport));
+    let mut prev = cursor - 1;
+    while prev > 0 && starts[prev - 1] >= target {
+        prev -= 1;
+    }
+    prev
+}
+
+/// Page down on a read-only scroll offset, clamped to the last render's bound.
+pub(crate) fn page_down_scroll(scroll: usize, max: usize, viewport: usize) -> usize {
+    scroll.min(max).saturating_add(page_step(viewport)).min(max)
+}
+
+/// Page up on a read-only scroll offset, clamped to the last render's bound.
+pub(crate) fn page_up_scroll(scroll: usize, max: usize, viewport: usize) -> usize {
+    scroll.min(max).saturating_sub(page_step(viewport))
+}
+
+/// Page down on a cursor list over its published row geometry: the cursor
+/// lands on the last row whose start line is within one page (`viewport - 1`
+/// lines) below the current row's start, at least one row forward, stopping at
+/// the last row — walking back if the follow that landing produces would push
+/// the old bottom line off the top (a focused row's tooltip moves with the
+/// cursor). `starts[i]` is the rendered line where row `i` begins; `block_ends`
+/// is the line its block reaches when focused; `offset`/`total` are the last
+/// render's scroll and line count.
+pub(crate) fn page_down_cursor_by_rows(
+    cursor: usize,
+    starts: &[usize],
+    block_ends: &[usize],
+    viewport: usize,
+    offset: usize,
+    total: usize,
+) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    let mut next = page_land_down(cursor, starts, viewport);
+    while next > cursor + 1 {
+        let end = block_ends
+            .get(next)
+            .copied()
+            .unwrap_or(starts[next] + 1)
+            .max(starts[next] + 1);
+        let predicted = follow_scroll_offset(total, viewport, (starts[next], end), offset);
+        if predicted <= offset + page_step(viewport) {
+            break;
+        }
+        next -= 1;
+    }
+    next
+}
+
+/// Page up mirror of [`page_down_cursor_by_rows`]: the cursor lands on the
+/// first row whose start line is within one page above the current row's
+/// start, at least one row back, stopping at the first row — walking forward
+/// if the follow would push the old top line off the bottom. The landing row's
+/// focused tooltip inserts `tips[prev]` lines above the old top line, so the
+/// continuity bound is `offset + tip - page_step`, not `offset - page_step`.
+pub(crate) fn page_up_cursor_by_rows(
+    cursor: usize,
+    starts: &[usize],
+    block_ends: &[usize],
+    tips: &[usize],
+    viewport: usize,
+    offset: usize,
+    total: usize,
+) -> usize {
+    if starts.is_empty() {
+        return 0;
+    }
+    let cursor = cursor.min(starts.len() - 1);
+    if cursor == 0 {
+        return 0;
+    }
+    let mut prev = page_land_up(cursor, starts, viewport);
+    while prev < cursor - 1 {
+        let end = block_ends
+            .get(prev)
+            .copied()
+            .unwrap_or(starts[prev] + 1)
+            .max(starts[prev] + 1);
+        let predicted = follow_scroll_offset(total, viewport, (starts[prev], end), offset);
+        let tip = tips.get(prev).copied().unwrap_or(0);
+        if predicted
+            >= offset
+                .saturating_add(tip)
+                .saturating_sub(page_step(viewport))
+        {
+            break;
+        }
+        prev += 1;
+    }
+    prev
+}
+
+/// Page down on a [`ListView`] cursor (single-line selector rows), reading the
+/// geometry the render published.
+fn selector_page_down(cursor: usize, list: &ListView) -> usize {
+    let starts = list.starts.borrow();
+    let block_ends = list.block_ends.borrow();
+    page_down_cursor_by_rows(
+        cursor,
+        &starts,
+        &block_ends,
+        list.viewport.get(),
+        list.offset.get(),
+        list.total.get(),
+    )
+}
+
+/// Page up on a [`ListView`] cursor, the mirror of [`selector_page_down`].
+fn selector_page_up(cursor: usize, list: &ListView) -> usize {
+    let starts = list.starts.borrow();
+    let block_ends = list.block_ends.borrow();
+    let tips = list.tips.borrow();
+    page_up_cursor_by_rows(
+        cursor,
+        &starts,
+        &block_ends,
+        &tips,
+        list.viewport.get(),
+        list.offset.get(),
+        list.total.get(),
+    )
 }
 
 fn handle_overview_key(app: &mut App, key: KeyEvent) {
-    let count = app.profile_count();
+    let count = app.main_items().len();
     match key.code {
-        KeyCode::Up | KeyCode::Down | KeyCode::Enter if claude_rows_hidden(app) => {}
         KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, -1),
         KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => reorder_main_cursor(app, 1),
-        KeyCode::Up => step_profile_cursor(app, -1, count),
-        KeyCode::Down => step_profile_cursor(app, 1, count),
+        KeyCode::Up if count > 0 => {
+            app.overview_cursor = (app.overview_cursor + count - 1) % count;
+            app.sync_overview_profile_selection();
+        }
+        KeyCode::Down if count > 0 => {
+            app.overview_cursor = (app.overview_cursor + 1) % count;
+            app.sync_overview_profile_selection();
+        }
+        KeyCode::PageUp if count > 0 => {
+            app.overview_cursor = selector_page_up(app.overview_cursor, &app.overview_selector);
+            app.sync_overview_profile_selection();
+        }
+        KeyCode::PageDown if count > 0 => {
+            app.overview_cursor = selector_page_down(app.overview_cursor, &app.overview_selector);
+            app.sync_overview_profile_selection();
+        }
         KeyCode::Enter => activate_main_item(app),
         _ => {}
     }
 }
 
-/// Usage tab: up/down picks the account. Read-only pane.
+/// Usage tab: account selection at rest, read-only detail scrolling on descent.
 fn handle_usage_key(app: &mut App, key: KeyEvent) {
+    if app.usage_detail_focus == StatusFocus::Detail {
+        let max = app.usage_detail_max_scroll.get();
+        let viewport = app.usage_detail_viewport.get();
+        match key.code {
+            KeyCode::Up => {
+                app.usage_detail_scroll = app.usage_detail_scroll.min(max).saturating_sub(1)
+            }
+            KeyCode::Down => {
+                app.usage_detail_scroll =
+                    app.usage_detail_scroll.min(max).saturating_add(1).min(max)
+            }
+            KeyCode::PageUp => {
+                app.usage_detail_scroll = page_up_scroll(app.usage_detail_scroll, max, viewport)
+            }
+            KeyCode::PageDown => {
+                app.usage_detail_scroll = page_down_scroll(app.usage_detail_scroll, max, viewport)
+            }
+            KeyCode::Char('e') => toggle_show_estimates(app),
+            KeyCode::Char('p') => toggle_show_pace(app),
+            _ => {}
+        }
+        return;
+    }
     let count = app.profile_count();
     match key.code {
-        KeyCode::Up => step_profile_cursor(app, -1, count),
-        KeyCode::Down => step_profile_cursor(app, 1, count),
+        KeyCode::Up => {
+            step_profile_cursor(app, -1, count);
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::Down => {
+            step_profile_cursor(app, 1, count);
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::PageUp => {
+            app.profile_cursor = selector_page_up(app.profile_cursor, &app.usage_selector);
+            app.reload_selected_note();
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::PageDown => {
+            app.profile_cursor = selector_page_down(app.profile_cursor, &app.usage_selector);
+            app.reload_selected_note();
+            app.usage_detail_scroll = 0;
+        }
+        KeyCode::Enter if count > 0 => {
+            app.usage_detail_focus = StatusFocus::Detail;
+            app.usage_detail_scroll = 0;
+        }
         KeyCode::Char('e') => toggle_show_estimates(app),
         KeyCode::Char('p') => toggle_show_pace(app),
         _ => {}
@@ -4268,6 +6322,14 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
                     app.status.cursor = (app.status.cursor + 1).rem_euclid(len.max(1));
                     app.status.detail_scroll = 0;
                 }
+                KeyCode::PageUp if len > 0 => {
+                    app.status.cursor = selector_page_up(app.status.cursor, &app.status.selector);
+                    app.status.detail_scroll = 0;
+                }
+                KeyCode::PageDown if len > 0 => {
+                    app.status.cursor = selector_page_down(app.status.cursor, &app.status.selector);
+                    app.status.detail_scroll = 0;
+                }
                 KeyCode::Enter if len > 0 => {
                     app.status.focus = StatusFocus::Detail;
                     app.status.detail_scroll = 0;
@@ -4291,6 +6353,22 @@ fn handle_status_key(app: &mut App, key: KeyEvent) {
                 let max = app.status.detail_max_scroll.get();
                 app.status.detail_scroll = app.status.detail_scroll.saturating_add(1).min(max);
             }
+            KeyCode::PageUp => {
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = page_up_scroll(
+                    app.status.detail_scroll as usize,
+                    max as usize,
+                    app.status.detail_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.status.detail_max_scroll.get();
+                app.status.detail_scroll = page_down_scroll(
+                    app.status.detail_scroll as usize,
+                    max as usize,
+                    app.status.detail_viewport.get() as usize,
+                ) as u16;
+            }
             _ => {}
         },
     }
@@ -4304,11 +6382,12 @@ fn trigger_status_refresh(app: &mut App) {
 }
 
 /// Services tab keymap. List focus: ↑↓ moves the cursor (wrapping), ⏎ descends
-/// to the detail pane (the `delegates` detail binds no key, so ⏎ does not
-/// descend into it), `f` applies the selected row's fix. Detail focus: the
-/// plugin detail walks its fixable problems, the herdr detail walks its
-/// options rows, every other detail scrolls (clamped by the render pass);
-/// `f` still fixes the focused problem.
+/// to the detail pane (the `delegates` detail only while it lists a job), `f`
+/// descends onto the selected row's first fix line. Detail focus: the plugin
+/// detail walks its fixable problems, the herdr detail walks its heal line and
+/// options rows, the delegates detail walks its jobs, every other detail
+/// scrolls (clamped by the render pass); `f` walks to the next fix line and `↵`
+/// on a focused one opens its confirm.
 fn handle_services_key(app: &mut App, key: KeyEvent) {
     match app.services.focus {
         ServicesFocus::List => {
@@ -4317,38 +6396,80 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                 KeyCode::Up if len > 0 => {
                     app.services.cursor = (app.services.cursor + len - 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
                 KeyCode::Down if len > 0 => {
                     app.services.cursor = (app.services.cursor + 1) % len;
                     app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
+                    app.services.land_on_herdr = false;
+                }
+                KeyCode::PageUp if len > 0 => {
+                    app.services.cursor =
+                        selector_page_up(app.services.cursor, &app.services.selector);
+                    app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
+                    app.services.land_on_herdr = false;
+                }
+                KeyCode::PageDown if len > 0 => {
+                    app.services.cursor =
+                        selector_page_down(app.services.cursor, &app.services.selector);
+                    app.services.detail_scroll = 0;
+                    app.services.diagnostic_focus = false;
                     app.services.land_on_herdr = false;
                 }
                 KeyCode::Enter if len > 0 => {
                     // The user has acted: any still-pending herdr landing is
                     // cancelled, whether or not this descends.
                     app.services.land_on_herdr = false;
-                    // The delegates detail binds no key, so it never takes
-                    // pane focus.
-                    if !app
+                    let delegates = app
                         .services
                         .selected_check()
-                        .is_some_and(|c| c.label == "delegates")
-                    {
+                        .is_some_and(|c| c.label == "delegates");
+                    // A delegates detail with no jobs has nothing to select, so
+                    // `↵` does not descend into it (S2/S6 precedent: a pane
+                    // with nothing to select advertises no inert `↵`).
+                    if app.services.enter_descends() {
                         app.services.focus = ServicesFocus::Detail;
                         app.services.detail_scroll = 0;
+                        app.services.diagnostic_focus = false;
+                        app.services.herdr_fix_focus = false;
+                        if delegates {
+                            app.services.settle_delegates_selection();
+                            app.services.delegates_offset.set(0);
+                            app.services.delegates_has_descended = true;
+                        } else {
+                            settle_shunt_focus(app);
+                        }
                     }
                 }
                 KeyCode::Char('f') => {
                     app.services.land_on_herdr = false;
-                    apply_service_fix(app);
+                    walk_to_next_fix(app);
                 }
                 _ => {}
             }
         }
         ServicesFocus::Detail => {
             let label = app.services.selected_check().map(|c| c.label);
-            if label == Some("herdr") {
+            if matches!(label, Some("herdr" | "plugin"))
+                && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown)
+            {
+                let max = app.services.detail_max_scroll.get();
+                let viewport = app.services.detail_viewport.get();
+                let origin = if app.services.diagnostic_focus {
+                    app.services.detail_scroll.min(max)
+                } else {
+                    app.services.displayed_scroll.get().min(max)
+                };
+                app.services.diagnostic_focus = true;
+                app.services.detail_scroll = if key.code == KeyCode::PageDown {
+                    page_down_scroll(origin as usize, max as usize, viewport as usize) as u16
+                } else {
+                    page_up_scroll(origin as usize, max as usize, viewport as usize) as u16
+                };
+            } else if label == Some("herdr") {
                 handle_herdr_options_key(app, key);
             } else if label == Some("plugin")
                 && app
@@ -4357,6 +6478,10 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                     .is_some_and(|c| !c.problems.is_empty())
             {
                 handle_plugin_problems_key(app, key);
+            } else if label == Some("shunt") {
+                handle_shunt_detail_key(app, key);
+            } else if label == Some("delegates") {
+                handle_delegates_detail_key(app, key);
             } else {
                 match key.code {
                     KeyCode::Up => {
@@ -4370,7 +6495,22 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
                         app.services.detail_scroll =
                             app.services.detail_scroll.saturating_add(1).min(max);
                     }
-                    KeyCode::Char('f') => apply_service_fix(app),
+                    KeyCode::PageUp => {
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll = page_up_scroll(
+                            app.services.detail_scroll as usize,
+                            max as usize,
+                            app.services.detail_viewport.get() as usize,
+                        ) as u16;
+                    }
+                    KeyCode::PageDown => {
+                        let max = app.services.detail_max_scroll.get();
+                        app.services.detail_scroll = page_down_scroll(
+                            app.services.detail_scroll as usize,
+                            max as usize,
+                            app.services.detail_viewport.get() as usize,
+                        ) as u16;
+                    }
                     _ => {}
                 }
             }
@@ -4378,9 +6518,101 @@ fn handle_services_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// The plugin detail's problem walk: ↑↓ moves over the fixable problems
-/// (wrapping), `f` applies the focused one. The render keeps the focused line
-/// on screen; there is no manual scroll offset to maintain here.
+/// `f` under the Services fix grammar (cloudy 2026-10-08, scoped to the
+/// selected row 2026-10-12): focus moves to the selected row's next fix line
+/// in detail order, wrapping, and from the list it descends onto the row's
+/// first one. It never opens a fix; `↵` on the focused line does. A row with
+/// no fix line leaves everything as it was.
+fn walk_to_next_fix(app: &mut App) {
+    if !app.services.selected_has_fix() {
+        return;
+    }
+    let Some(check) = app.services.selected_check() else {
+        return;
+    };
+    let label = check.label;
+    let problems: Vec<usize> = check.problems.iter().map(|p| p.line).collect();
+    let from_list = app.services.focus == ServicesFocus::List;
+    if from_list {
+        app.services.focus = ServicesFocus::Detail;
+        app.services.detail_scroll = 0;
+    }
+    match label {
+        "shunt" => shunt_walk_to_next_fix(app, from_list),
+        "herdr" => {
+            app.services.diagnostic_focus = false;
+            app.services.herdr_fix_focus = true;
+        }
+        _ if problems.is_empty() => {}
+        _ => {
+            // A page key hid the walk focus: "next" starts from the top of
+            // what the pane shows.
+            let next = if from_list {
+                0
+            } else if app.services.diagnostic_focus {
+                let top = app.services.displayed_scroll.get() as usize;
+                problems.iter().position(|&line| line >= top).unwrap_or(0)
+            } else {
+                (app.services.problem_cursor + 1) % problems.len()
+            };
+            app.services.diagnostic_focus = false;
+            app.services.problem_cursor = next;
+        }
+    }
+}
+
+/// The shunt card's half of [`walk_to_next_fix`]: the next fix stop after the
+/// focused one in card order (the first one from the list, or the first at or
+/// below the top of the view when nothing holds focus), wrapping, scrolled
+/// just far enough to bring it into view.
+fn shunt_walk_to_next_fix(app: &mut App, from_list: bool) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    let fixes: Vec<usize> = (0..stops.len())
+        .filter(|&i| stops[i].fix().is_some())
+        .collect();
+    let Some(&first) = fixes.first() else {
+        return;
+    };
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    let geometry = rows.len() == stops.len();
+    let viewport = app.services.shunt_viewport.get() as usize;
+    let max = app.services.detail_max_scroll.get();
+    let scroll = app.services.detail_scroll.min(max);
+    let target = if from_list {
+        first
+    } else {
+        match app
+            .services
+            .focused_shunt_focus()
+            .and_then(|f| stops.iter().position(|s| s == f))
+        {
+            Some(cur) => fixes.iter().copied().find(|&i| i > cur).unwrap_or(first),
+            None if geometry => fixes
+                .iter()
+                .copied()
+                .find(|&i| rows[i] >= scroll as usize)
+                .unwrap_or(first),
+            None => first,
+        }
+    };
+    app.services.set_shunt_focus(Some(stops[target].kind()));
+    if geometry && !shunt_in_view(scroll, viewport, rows[target]) {
+        let row = rows[target];
+        let scroll = if row < scroll as usize {
+            row
+        } else {
+            row + 1 - viewport.max(1)
+        };
+        app.services.detail_scroll = scroll.min(max as usize) as u16;
+    }
+}
+
+/// The plugin detail's problem walk: ↑↓ and `f` move over the fixable
+/// problems (wrapping), `↵` opens the focused one's confirm. The render keeps
+/// the focused line on screen; there is no manual scroll offset to maintain
+/// here.
 fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
     let len = app
         .services
@@ -4389,23 +6621,1313 @@ fn handle_plugin_problems_key(app: &mut App, key: KeyEvent) {
         .unwrap_or(0);
     match key.code {
         KeyCode::Up if len > 0 => {
+            app.services.diagnostic_focus = false;
             app.services.problem_cursor = (app.services.problem_cursor + len - 1) % len;
         }
         KeyCode::Down if len > 0 => {
+            app.services.diagnostic_focus = false;
             app.services.problem_cursor = (app.services.problem_cursor + 1) % len;
         }
-        KeyCode::Char('f') => apply_service_fix(app),
+        KeyCode::Char('f') => walk_to_next_fix(app),
+        KeyCode::Enter => apply_service_fix(app),
         _ => {}
     }
 }
 
-/// Apply the focused fix. `WireMcpServers` opens a confirm modal; a diverged
+/// The delegates detail's keymap while descended: ↑↓ walks the job list
+/// (wrapping), PageUp/PageDown page through the S8 page helper, stopping at
+/// the ends. The selection follows the job id, so a refresh that inserts a
+/// newer job above keeps the same job selected. No stop/cancel key exists —
+/// stopping a delegate stays `monitor`'s job, and the pane binds nothing else.
+fn handle_delegates_detail_key(app: &mut App, key: KeyEvent) {
+    let len = app.services.delegates.len();
+    if len == 0 {
+        return;
+    }
+    app.services.delegates_cursor = app.services.delegates_cursor.min(len - 1);
+    match key.code {
+        KeyCode::Up => {
+            app.services.delegates_cursor =
+                (app.services.delegates_cursor + len - 1).rem_euclid(len);
+            track_delegates_selection(app);
+        }
+        KeyCode::Down => {
+            app.services.delegates_cursor = (app.services.delegates_cursor + 1).rem_euclid(len);
+            track_delegates_selection(app);
+        }
+        KeyCode::PageUp => {
+            let next = {
+                let starts = app.services.delegates_starts.borrow();
+                let block_ends = app.services.delegates_block_ends.borrow();
+                page_up_cursor_by_rows(
+                    app.services.delegates_cursor,
+                    &starts,
+                    &block_ends,
+                    &[],
+                    app.services.delegates_viewport.get(),
+                    app.services.delegates_offset.get(),
+                    app.services.delegates_total.get(),
+                )
+            };
+            app.services.delegates_cursor = next;
+            track_delegates_selection(app);
+        }
+        KeyCode::PageDown => {
+            let next = {
+                let starts = app.services.delegates_starts.borrow();
+                let block_ends = app.services.delegates_block_ends.borrow();
+                page_down_cursor_by_rows(
+                    app.services.delegates_cursor,
+                    &starts,
+                    &block_ends,
+                    app.services.delegates_viewport.get(),
+                    app.services.delegates_offset.get(),
+                    app.services.delegates_total.get(),
+                )
+            };
+            app.services.delegates_cursor = next;
+            track_delegates_selection(app);
+        }
+        _ => {}
+    }
+}
+
+/// Mirror the delegates cursor onto the tracked job id (the refresh anchor).
+fn track_delegates_selection(app: &mut App) {
+    app.services.delegates_selected_id = app
+        .services
+        .delegates
+        .get(app.services.delegates_cursor)
+        .map(|j| j.record.job_id.clone());
+}
+
+/// The shunt detail's keymap: ↑↓ walks the actionable lines (landing on each
+/// as it scrolls into view, one line at a time through the read-only text),
+/// `f` walks to the next fix line, `↵` opens the focused fix's confirm, and
+/// `space`/`↵` act on any other focused line (flip the `enabled` toggle, open
+/// the `check output` modal, expand/collapse a config entry, or open/step a
+/// config field editor — `space` cycles a cycle field).
+/// Focus is the key handler's own state (a [`ShuntFocusLine`] identity); the
+/// render reads it and re-settles it (the descend rule) when a resize or a
+/// card change pushed the held line out of view. Only the shunt detail routes
+/// here; the herdr options and plugin problems keep their own walks, every
+/// other detail keeps the scroll-only keymap.
+fn handle_shunt_detail_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Up => shunt_step(app, false),
+        KeyCode::Down => shunt_step(app, true),
+        KeyCode::PageUp => shunt_page(app, false),
+        KeyCode::PageDown => shunt_page(app, true),
+        KeyCode::Char('f') => walk_to_next_fix(app),
+        KeyCode::Enter => match app.services.focused_shunt_focus() {
+            Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
+            Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
+            Some(ShuntFocus::Entry { key }) => {
+                let key = key.clone();
+                toggle_shunt_entry(app, &key);
+            }
+            Some(ShuntFocus::Field { key }) => {
+                let key = key.clone();
+                open_shunt_field_editor(app, &key);
+            }
+            Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
+            Some(ShuntFocus::SaveAdd { kind }) => commit_shunt_add(app, *kind),
+            Some(ShuntFocus::Remove { key }) => {
+                let key = key.clone();
+                confirm_shunt_remove(app, &key);
+            }
+            Some(ShuntFocus::Token { key }) => {
+                let key = key.clone();
+                confirm_shunt_remove_token(app, &key);
+            }
+            Some(ShuntFocus::AddToken) => open_token_picker(app),
+            Some(ShuntFocus::Fix { .. }) => apply_service_fix(app),
+            None => {}
+        },
+        KeyCode::Char(' ') => match app.services.focused_shunt_focus() {
+            Some(ShuntFocus::Enabled { .. }) => toggle_shunt_enabled(app),
+            Some(ShuntFocus::CheckOutput { .. }) => open_check_output_modal(app),
+            Some(ShuntFocus::Entry { key }) => {
+                let key = key.clone();
+                toggle_shunt_entry(app, &key);
+            }
+            Some(ShuntFocus::Field { key }) => {
+                let key = key.clone();
+                // `space` on a cycle row moves the pick; on a typed row it
+                // opens the editor, like `↵`.
+                if is_cycle_field(&key) {
+                    step_shunt_pick(app, &key);
+                } else {
+                    open_shunt_field_editor(app, &key);
+                }
+            }
+            Some(ShuntFocus::Add { kind }) => toggle_shunt_add(app, *kind),
+            Some(ShuntFocus::AddToken) => open_token_picker(app),
+            Some(ShuntFocus::SaveAdd { .. })
+            | Some(ShuntFocus::Remove { .. })
+            | Some(ShuntFocus::Token { .. }) => {}
+            Some(ShuntFocus::Fix { .. }) | None => {}
+        },
+        _ => {}
+    }
+}
+
+/// One `↑`/`↓` on the shunt card, over the geometry the last render published
+/// ([`ServicesState::shunt_stop_rows`] + [`ServicesState::shunt_viewport`] +
+/// [`ServicesState::detail_max_scroll`]): move focus to the next/previous
+/// actionable line in card order, scrolling one rendered line at a time only
+/// while that target is out of view, and never past either end. Read-only rows
+/// never take focus; with no further actionable line a press scrolls (while
+/// there is text to scroll) and focus stays on its line while that line is in
+/// view.
+fn shunt_step(app: &mut App, down: bool) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    if stops.is_empty() {
+        // A card with no actionable line still scrolls one rendered line per
+        // ↑↓ (round 1 S14's behaviour): the read-only detail scrolls, and the
+        // footer's `↑↓ scroll` is true exactly while this does something.
+        let max = app.services.detail_max_scroll.get();
+        app.services.detail_scroll = if down {
+            app.services.detail_scroll.saturating_add(1).min(max)
+        } else {
+            app.services.detail_scroll.min(max).saturating_sub(1)
+        };
+        return;
+    }
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    if rows.len() != stops.len() {
+        // The render has not published this card's geometry yet (nothing drawn
+        // to walk over).
+        return;
+    }
+    let viewport = app.services.shunt_viewport.get() as usize;
+    let max_scroll = app.services.detail_max_scroll.get();
+    let mut scroll = app.services.detail_scroll.min(max_scroll);
+
+    // Reconcile only a held identity that left the view (a resize can move it
+    // out): the descend rule — the first actionable line in view — settles it,
+    // and the step below walks from there. A none focus is NOT reconciled
+    // here: `↓`/`↑` from none start from the target rule itself (the first
+    // stop at/after the top of the view going down, the last before the bottom
+    // going up), so the first visible line is never skipped.
+    let focus = app.services.shunt_focus_kind().and_then(|kind| {
+        stops
+            .iter()
+            .position(|s| s.kind() == kind)
+            .filter(|&i| shunt_in_view(scroll, viewport, rows[i]))
+            .map(|i| stops[i].kind())
+    });
+    let cur = focus
+        .clone()
+        .and_then(|kind| stops.iter().position(|s| s.kind() == kind));
+
+    // The target stop: the one after/before the focused line, or (with no
+    // focus) the first at/after the top of the view going down, the last
+    // before the bottom of the view going up.
+    let target = if down {
+        match cur {
+            Some(cur) => (cur + 1 < stops.len()).then_some(cur + 1),
+            None => (0..stops.len()).find(|&i| rows[i] >= scroll as usize),
+        }
+    } else {
+        match cur {
+            Some(cur) => (cur > 0).then_some(cur - 1),
+            None => (0..stops.len())
+                .rev()
+                .find(|&i| rows[i] < scroll as usize + viewport),
+        }
+    };
+
+    // The current focus kept while its line is still in view after a scroll.
+    let stops_ref = &stops;
+    let rows_ref = &rows;
+    let keep_focus = move |scroll: u16| {
+        focus.filter(|kind| {
+            stops_ref
+                .iter()
+                .position(|s| s.kind() == kind.clone())
+                .is_some_and(|i| shunt_in_view(scroll, viewport, rows_ref[i]))
+        })
+    };
+
+    match target {
+        Some(t) if shunt_in_view(scroll, viewport, rows[t]) => {
+            app.services.set_shunt_focus(Some(stops[t].kind()));
+        }
+        Some(_) => {
+            // The target is out of view: scroll one line toward it, then take
+            // it if that brought it into view, else keep the current focus
+            // while its line is still visible.
+            if down {
+                scroll = scroll.saturating_add(1).min(max_scroll);
+            } else {
+                scroll = scroll.saturating_sub(1);
+            }
+            let target_taken = target
+                .filter(|&t| shunt_in_view(scroll, viewport, rows[t]))
+                .map(|t| stops[t].kind());
+            app.services
+                .set_shunt_focus(target_taken.or_else(|| keep_focus(scroll)));
+        }
+        None => {
+            // No further actionable line: scroll one line while there is text
+            // to scroll in this direction; at either end, nothing.
+            if down {
+                scroll = scroll.saturating_add(1).min(max_scroll);
+            } else {
+                scroll = scroll.saturating_sub(1);
+            }
+            app.services.set_shunt_focus(keep_focus(scroll));
+        }
+    }
+    app.services.detail_scroll = scroll;
+}
+
+/// Whether a rendered row is inside the current viewport.
+fn shunt_in_view(scroll: u16, viewport: usize, r: usize) -> bool {
+    r >= scroll as usize && r < scroll as usize + viewport
+}
+
+/// One `PageUp`/`PageDown` on the shunt card: scroll the read-only detail one
+/// page (`viewport - 1` lines), then re-pick the first actionable line in view
+/// (or none) — the same rule a resize applies.
+fn shunt_page(app: &mut App, down: bool) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    if rows.len() != stops.len() {
+        // Geometry not published yet (a key before the first draw) — as in
+        // `shunt_step`, there is nothing to walk over.
+        return;
+    }
+    let max = app.services.detail_max_scroll.get();
+    let viewport = app.services.shunt_viewport.get() as usize;
+    // Compare the RENDERED offset (the stored scroll clamped to the last
+    // render's bound), not the raw stored value: a taller terminal leaves the
+    // stored scroll above the new bound, and a page over a stale number must
+    // not re-pick focus while the rendered view stays put.
+    let before = app.services.detail_scroll.min(max);
+    let paged = if down {
+        page_down_scroll(before as usize, max as usize, viewport) as u16
+    } else {
+        page_up_scroll(before as usize, max as usize, viewport) as u16
+    };
+    app.services.detail_scroll = paged;
+    if paged == before {
+        // The card fits, or is already at this end: the held focus stays.
+        return;
+    }
+    app.services
+        .set_shunt_focus(shunt_first_in_view(&stops, &rows, paged, viewport));
+}
+
+/// The shunt card's descend rule: the first actionable line in view, else
+/// none.
+fn shunt_first_in_view(
+    stops: &[ShuntFocus],
+    rows: &[usize],
+    scroll: u16,
+    viewport: usize,
+) -> Option<ShuntFocusLine> {
+    stops
+        .iter()
+        .zip(rows)
+        .find(|(_, r)| shunt_in_view(scroll, viewport, **r))
+        .map(|(s, _)| s.kind())
+}
+
+/// The shunt card's descend rule applied on descend: focus keeps its held
+/// identity while that line is in view, else it becomes the first actionable
+/// line in view (else none). Re-descending after an ascend therefore restores
+/// the walk position instead of resetting to the top of the card.
+fn settle_shunt_focus(app: &mut App) {
+    let Some(stops) = app.services.selected_check().map(|c| c.shunt_focus.clone()) else {
+        return;
+    };
+    let rows = app.services.shunt_stop_rows.borrow().clone();
+    let viewport = app.services.shunt_viewport.get() as usize;
+    let scroll = app
+        .services
+        .detail_scroll
+        .min(app.services.detail_max_scroll.get());
+    let held = app.services.shunt_focus_kind().and_then(|kind| {
+        stops
+            .iter()
+            .position(|s| s.kind() == kind)
+            .filter(|&i| i < rows.len() && shunt_in_view(scroll, viewport, rows[i]))
+            .map(|i| stops[i].kind())
+    });
+    app.services
+        .set_shunt_focus(held.or_else(|| shunt_first_in_view(&stops, &rows, scroll, viewport)));
+}
+
+/// Flip the record's `disabled` flag at once, reading and writing the value
+/// ON DISK inside [`crate::gateway::GatewayRecord::update`] (under the state
+/// flock), never the cached record. A failed write toasts the house
+/// `save failed` + the error. The recompute below reloads the record from
+/// disk and re-plans, so the row flips on the same frame.
+fn toggle_shunt_enabled(app: &mut App) {
+    if app.services.shunt_action.running {
+        return;
+    }
+    match crate::gateway::GatewayRecord::update(|slot| {
+        if let Some(held) = slot.as_mut() {
+            held.disabled = !held.disabled;
+        }
+        Ok(())
+    }) {
+        Ok(()) => {}
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+        }
+    }
+    recompute_services_checks(app, false, ShuntRefresh::Restart);
+}
+
+/// Toggle one config entry row expanded/collapsed (the cloudy-tui disclosure
+/// contract: `space` and `↵` both activate, independently per entry). The
+/// recompute prunes an expanded key whose entry left the config, so a key
+/// re-appearing after an edit arrives collapsed.
+fn toggle_shunt_entry(app: &mut App, key: &ShuntEntryKey) {
+    // A locked remove ignores expand/collapse (ruling 2): the entry's rows are
+    // inert while its `remove <kind>` checks.
+    if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
+        return;
+    }
+    if !app.services.shunt_expanded.remove(key) {
+        app.services.shunt_expanded.insert(key.clone());
+    } else {
+        // Collapsing an entry retires a refusal on its remove row.
+        retire_remove_refusal(app, key);
+    }
+    rebuild_shunt_config_stops(app);
+}
+
+/// Retire a remove refusal whose entry is `key` (a collapse), if one shows.
+fn retire_remove_refusal(app: &mut App, key: &ShuntEntryKey) {
+    if app
+        .services
+        .shunt_remove_refusal
+        .borrow()
+        .as_ref()
+        .is_some_and(|refusal| refusal.key == *key)
+    {
+        app.services.shunt_remove_refusal.take();
+    }
+}
+
+/// Re-derive the card's cached config stops in the same call that changed the
+/// expanded set, so the walk and the render agree at once (the render calls the
+/// same [`config_field_stops`] over the same view and expanded set every frame).
+/// The action-section stops (every stop with a detail line) are kept; the
+/// config section is replaced from the one row model.
+fn rebuild_shunt_config_stops(app: &mut App) {
+    let Some(stops) = config_view(app).map(|view| {
+        config_field_stops(
+            view,
+            &app.services.shunt_expanded,
+            &app.services.shunt_drafts,
+            &app.services.shunt_tokens,
+        )
+    }) else {
+        return;
+    };
+    let Some(check) = app.services.checks.iter_mut().find(|c| c.label == "shunt") else {
+        return;
+    };
+    check.shunt_focus.truncate(
+        check
+            .shunt_focus
+            .iter()
+            .take_while(|s| s.line().is_some())
+            .count(),
+    );
+    check.shunt_focus.extend(stops);
+}
+
+// ── add and remove rows ─────────────────────────────────────────────────────
+
+/// `↵`/`space` on `+ add <kind>`: open the blank draft in place, or fold it
+/// when it is already open (the Setup `+ new` form's precedent, which `esc` at
+/// rest on a draft row follows too). Focus stays on the `+ add` row.
+fn toggle_shunt_add(app: &mut App, kind: ShuntAddKind) {
+    // A locked draft ignores fold (ruling 2): `↵`/`space` on `+ add <kind>` are
+    // inert while its `save <kind>` checks.
+    if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+        return;
+    }
+    let was_open = app.services.shunt_drafts.is_open(kind);
+    if was_open {
+        app.services.shunt_drafts.fold(kind);
+    } else {
+        app.services.shunt_drafts.open(kind);
+    }
+    // A folded draft closes its field editor too (a draft field's included).
+    if was_open
+        && let Some(state) = &app.services.shunt_field_edit
+        && let ShuntFieldKey::Draft {
+            kind: state_kind, ..
+        } = state.key
+        && state_kind == kind
+    {
+        app.services.shunt_field_edit = None;
+    }
+    rebuild_shunt_config_stops(app);
+    app.services
+        .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
+}
+
+/// `↵` on `save <kind>`: build the `New*` from the draft (a blank field is
+/// left out) and run it through the save worker. A required field left blank
+/// refuses before any worker runs, on the `└` line under `save <kind>`.
+fn commit_shunt_add(app: &mut App, kind: ShuntAddKind) {
+    if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+        return;
+    }
+    let Some(view) = config_view(app).cloned() else {
+        return;
+    };
+    match build_add_edit(&view, &app.services.shunt_drafts, kind) {
+        AddDraft::Refuse(sentence) => {
+            app.services.shunt_drafts.set_refusal(kind, sentence);
+        }
+        AddDraft::Edit(edit) => {
+            start_shunt_save(app, ShuntSaveKey::SaveAdd(kind), *edit, false);
+        }
+    }
+}
+
+/// The `Edit::Add*` a draft builds, or a required-field refusal sentence.
+enum AddDraft {
+    Edit(Box<crate::gateway_edit::Edit>),
+    Refuse(String),
+}
+
+/// Build the add edit from a draft: a blank field is `None` (left out), the
+/// `accounts` list is comma-separated with spaces around commas trimmed (C2's
+/// accounts row parse). A required field left blank refuses first.
+fn build_add_edit(
+    view: &crate::gateway_edit::ConfigView,
+    drafts: &ShuntDrafts,
+    kind: ShuntAddKind,
+) -> AddDraft {
+    use crate::gateway_edit::{Edit, NewAuth, NewModel, NewRoute, NewUpstream};
+    match kind {
+        ShuntAddKind::Upstream => {
+            let Some(draft) = &drafts.upstream else {
+                return AddDraft::Refuse("cannot add upstream: set its name first".to_string());
+            };
+            let Some(name) = draft.name.as_deref().filter(|name| !name.is_empty()) else {
+                return AddDraft::Refuse("cannot add upstream: set its name first".to_string());
+            };
+            let auth = draft
+                .auth_mode
+                .as_deref()
+                .filter(|mode| !mode.is_empty())
+                .map(|mode| {
+                    // Only the fields whose rows the current mode shows reach
+                    // the add: a value typed under one mode then hidden by a
+                    // switch must not ride into the written config.
+                    let (account, accounts, env, header) = match auth_mode_rows(Some(mode)) {
+                        AuthModeRows::ApiKey => {
+                            (None, Vec::new(), draft.env.clone(), draft.header.clone())
+                        }
+                        AuthModeRows::OAuth => (
+                            None,
+                            split_accounts(draft.accounts.as_deref().unwrap_or("")),
+                            None,
+                            None,
+                        ),
+                        AuthModeRows::None => (None, Vec::new(), None, None),
+                    };
+                    NewAuth {
+                        mode: Some(mode.to_string()),
+                        account,
+                        accounts,
+                        env,
+                        header,
+                    }
+                });
+            AddDraft::Edit(Box::new(Edit::AddUpstream(NewUpstream {
+                name: name.to_string(),
+                provider: draft.provider.clone(),
+                kind: draft.kind.clone(),
+                base_url: draft.base_url.clone(),
+                auth,
+                effort: draft.effort.clone(),
+                service_tier: draft.service_tier.clone(),
+            })))
+        }
+        ShuntAddKind::Model => {
+            let Some(draft) = &drafts.model else {
+                return AddDraft::Refuse("cannot add model: set its id first".to_string());
+            };
+            let Some(id) = draft.id.as_deref().filter(|id| !id.is_empty()) else {
+                return AddDraft::Refuse("cannot add model: set its id first".to_string());
+            };
+            let upstream_model = provider_names(view)
+                .into_iter()
+                .filter_map(|provider| {
+                    draft
+                        .upstream_model
+                        .iter()
+                        .find(|(name, _)| *name == provider)
+                        .and_then(|(_, slug)| slug.clone())
+                        .map(|slug| (provider, slug))
+                })
+                .collect();
+            AddDraft::Edit(Box::new(Edit::AddModel(NewModel {
+                id: id.to_string(),
+                display_name: draft.display_name.clone(),
+                upstream_model,
+            })))
+        }
+        ShuntAddKind::Route => {
+            let Some(draft) = &drafts.route else {
+                return AddDraft::Refuse(
+                    "cannot add a route: set its model and provider first".to_string(),
+                );
+            };
+            let (Some(model), Some(provider)) = (
+                draft.model.clone().filter(|model| !model.is_empty()),
+                draft
+                    .provider
+                    .clone()
+                    .filter(|provider| !provider.is_empty()),
+            ) else {
+                return AddDraft::Refuse(
+                    "cannot add a route: set its model and provider first".to_string(),
+                );
+            };
+            AddDraft::Edit(Box::new(Edit::AddRoute(NewRoute {
+                model,
+                provider,
+                upstream_model: draft.upstream_model.clone(),
+                effort: draft.effort.clone(),
+                service_tier: draft.service_tier.clone(),
+            })))
+        }
+    }
+}
+
+/// `↵` on `remove <kind>`: open the confirm modal (the C2 confirm kind reused,
+/// no new modal kind, no body line), `cancel` default-focused, `remove` the
+/// destructive button.
+fn confirm_shunt_remove(app: &mut App, key: &ShuntEntryKey) {
+    // A locked remove opens no second confirm (ruling 2): the `remove <kind>`
+    // row is inert while its own remove checks.
+    if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
+        return;
+    }
+    let Some(view) = config_view(app).cloned() else {
+        return;
+    };
+    // The edit is built here, from the entry as it reads now (a route's
+    // `RouteView` included): confirming runs THIS edit, never a lookup at
+    // confirm time, so a route the shift moved under it refuses `EntryChanged`
+    // instead of removing the entry that now sits at its position.
+    let Some(edit) = remove_edit(&view, key) else {
+        // The route the key names left the config since its row rendered:
+        // nothing to remove, and no confirm to open.
+        return;
+    };
+    let message = remove_confirm_message(&view, key);
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message,
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemoveEntry {
+            key: key.clone(),
+            edit: Box::new(edit),
+        },
+    }));
+}
+
+/// The remove confirm's message, the approved copy: `remove upstream
+/// "<name>"?` / `remove model "<id>"?` / `remove the route at position <n>
+/// (model "<m>")?`.
+fn remove_confirm_message(view: &crate::gateway_edit::ConfigView, key: &ShuntEntryKey) -> String {
+    match key {
+        ShuntEntryKey::Upstream { name, .. } => {
+            format!("remove upstream \"{}\"?", escape_control(name))
+        }
+        ShuntEntryKey::Model { id, .. } => format!("remove model \"{}\"?", escape_control(id)),
+        ShuntEntryKey::Route(position) => {
+            match entry_for_key(view, key) {
+                Some(ConfigEntryRef::Route(route)) => remove_route_confirm_message(route),
+                // The route the key names left the config since its row
+                // rendered: name it by position alone (there is no model left
+                // to quote).
+                _ => format!("remove the route at position {}?", position),
+            }
+        }
+    }
+}
+
+/// The remove confirm's message for a route, built from the route's own view:
+/// `remove the route at position <n> (model "<m>")?`, or the position alone
+/// when the route has no model (the engine's `RouteView::named` rule,
+/// mirrored). Shared by the confirm at open and by the shift that moves an
+/// open route confirm when an earlier route's remove lands.
+fn remove_route_confirm_message(route: &crate::gateway_edit::RouteView) -> String {
+    match route.model.as_ref().map(written_display) {
+        Some(model) => format!(
+            "remove the route at position {} (model \"{}\")?",
+            route.position,
+            escape_control(&model)
+        ),
+        None => format!("remove the route at position {}?", route.position),
+    }
+}
+
+/// The `Edit::Remove*` one entry key produces; `None` when the route the key
+/// names left the config since the confirm opened (a no-op remove).
+fn remove_edit(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntEntryKey,
+) -> Option<crate::gateway_edit::Edit> {
+    use crate::gateway_edit::Edit;
+    match key {
+        ShuntEntryKey::Upstream { name, .. } => Some(Edit::RemoveUpstream { name: name.clone() }),
+        ShuntEntryKey::Model { id, .. } => Some(Edit::RemoveModel { id: id.clone() }),
+        ShuntEntryKey::Route(_) => match entry_for_key(view, key) {
+            Some(ConfigEntryRef::Route(route)) => Some(Edit::RemoveRoute {
+                route: route.clone(),
+            }),
+            _ => None,
+        },
+    }
+}
+
+// ── the config field editor ─────────────────────────────────────────────────
+
+/// The entry a field row belongs to; `None` on a server or draft field.
+fn field_entry(key: &ShuntFieldKey) -> Option<ShuntEntryKey> {
+    match key {
+        ShuntFieldKey::Bind | ShuntFieldKey::DefaultProvider | ShuntFieldKey::Draft { .. } => None,
+        ShuntFieldKey::Upstream {
+            name, occurrence, ..
+        } => Some(ShuntEntryKey::Upstream {
+            name: name.clone(),
+            occurrence: *occurrence,
+        }),
+        ShuntFieldKey::Model { id, occurrence, .. } => Some(ShuntEntryKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+        }),
+        ShuntFieldKey::Route { position, .. } => Some(ShuntEntryKey::Route(*position)),
+    }
+}
+
+/// Whether a field row's keys (`↵`, `space`, typing, the cycle pick) are inert
+/// while its save — its own, its draft's `save <kind>`, or its entry's
+/// `remove <kind>` — is checking. The one lock the field editor, the pick
+/// stepper and the footer read, so a busy row's hint and lock can never
+/// disagree.
+pub(crate) fn field_locked(app: &App, key: &ShuntFieldKey) -> bool {
+    match key {
+        ShuntFieldKey::Draft { kind, .. } => app.services.saving(&ShuntSaveKey::SaveAdd(*kind)),
+        _ => {
+            app.services.saving(&ShuntSaveKey::Field(key.clone()))
+                || field_entry(key)
+                    .is_some_and(|entry| app.services.saving(&ShuntSaveKey::Remove(entry)))
+        }
+    }
+}
+
+/// Whether `key` is a rename field (upstream `name`, model `id`), whose save
+/// dry-runs the cascade and confirms before writing.
+fn is_rename_field(key: &ShuntFieldKey) -> bool {
+    matches!(
+        key,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::Name,
+            ..
+        } | ShuntFieldKey::Model {
+            field: ModelFieldKind::Id,
+            ..
+        }
+    )
+}
+
+/// Open one field's typed editor, seeded from the saved value (`None` = unset).
+/// Both `↵` and `space` open a typed row; a cycle row's `↵` at rest opens the
+/// same custom-value editor. A row whose save is still checking never reopens a
+/// fresh editor over the file's value: `↵`/`space` are inert there, so a
+/// refusal landing later toasts instead of describing text the editor no
+/// longer shows.
+fn open_shunt_field_editor(app: &mut App, key: &ShuntFieldKey) {
+    if field_locked(app, key) {
+        return;
+    }
+    let saved = config_view(app)
+        .and_then(|view| shunt_field_value(view, &app.services.shunt_drafts, key).flatten());
+    let input = InputState::new(saved.as_deref().unwrap_or(""));
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key: key.clone(),
+        edit: ShuntFieldEdit::Typed { input, saved },
+        refusal: None,
+    });
+}
+
+/// The next cycle pick after the current value, wrapping; a value outside the
+/// set (or none) lands on the first option.
+fn next_pick(options: &[&str], current: Option<&str>) -> String {
+    match current.and_then(|c| options.iter().position(|o| *o == c)) {
+        Some(i) => options[(i + 1) % options.len()].to_string(),
+        None => options[0].to_string(),
+    }
+}
+
+/// `space` on a cycle row: move the pick to the next option (nothing written),
+/// or advance an already-pending pick. A row whose save is still checking never
+/// opens a fresh pick (same inert rule as the typed editor).
+fn step_shunt_pick(app: &mut App, key: &ShuntFieldKey) {
+    if field_locked(app, key) {
+        return;
+    }
+    let Some(value) =
+        config_view(app).and_then(|view| shunt_field_value(view, &app.services.shunt_drafts, key))
+    else {
+        return;
+    };
+    let options = cycle_options(key);
+    let (current, saved) = match &app.services.shunt_field_edit {
+        Some(state) if state.key == *key => match &state.edit {
+            ShuntFieldEdit::Pick { saved, picked } => (Some(picked.clone()), saved.clone()),
+            _ => (value.clone(), value),
+        },
+        _ => (value.clone(), value),
+    };
+    let picked = next_pick(options, current.as_deref());
+    app.services.shunt_field_edit = Some(ShuntFieldEditState {
+        key: key.clone(),
+        edit: ShuntFieldEdit::Pick { saved, picked },
+        refusal: None,
+    });
+}
+
+/// Keystrokes while a config field editor is open: `↵` commits, `esc` restores
+/// the saved value and leaves the editor, `space` steps a pending cycle pick,
+/// every other key edits the typed buffer (a pending pick takes neither).
+fn handle_shunt_field_edit_key(app: &mut App, key: KeyEvent) {
+    let Some(state) = app.services.shunt_field_edit.clone() else {
+        return;
+    };
+    // While this row's save is checking, its editor is locked: no key edits
+    // its text or closes it (the footer drops its edit hints), but focus may
+    // still move away — the outcome then toasts instead of the `└` line. `↑↓`
+    // step off the row (closing the editor) and `q` ascends to the list; both
+    // stay claimed here so neither reaches a global binding that would leave
+    // the editor open on a list-focused screen.
+    if field_locked(app, &state.key) {
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                app.services.shunt_field_edit = None;
+                shunt_step(app, key.code == KeyCode::Down);
+            }
+            KeyCode::Char('q') => leave_shunt_detail(app),
+            _ => {}
+        }
+        return;
+    }
+    match key.code {
+        KeyCode::Esc => {
+            app.services.shunt_field_edit = None;
+        }
+        KeyCode::Enter => commit_shunt_field(app, &state.key),
+        KeyCode::Char(' ') if matches!(state.edit, ShuntFieldEdit::Pick { .. }) => {
+            step_shunt_pick(app, &state.key);
+        }
+        _ => {
+            if let Some(s) = app.services.shunt_field_edit.as_mut()
+                && let ShuntFieldEdit::Typed { input, .. } = &mut s.edit
+            {
+                apply_input_edit(input, key);
+            }
+        }
+    }
+}
+
+/// `↵` in a field editor: build the edit and either save it (through a confirm
+/// for a bind restart or a cascading rename) or show the dry run's refusal.
+fn commit_shunt_field(app: &mut App, key: &ShuntFieldKey) {
+    let Some(state) = app.services.shunt_field_edit.clone() else {
+        return;
+    };
+    let typed = match &state.edit {
+        ShuntFieldEdit::Typed { input, .. } => input.value.clone(),
+        ShuntFieldEdit::Pick { picked, .. } => picked.clone(),
+    };
+    // A draft field's commit lands in the draft, never the file: set the value
+    // (empty unsets), clear the `save <kind>` refusal, close the editor, and
+    // rebuild the stops (a committed auth mode can change the mode-dependent
+    // row set).
+    if let ShuntFieldKey::Draft { kind, field } = key {
+        set_draft_field_value(&mut app.services.shunt_drafts, *kind, field, &typed);
+        app.services.shunt_drafts.clear_refusal(*kind);
+        app.services.shunt_field_edit = None;
+        rebuild_shunt_config_stops(app);
+        return;
+    }
+    let Some(record) = app.services.shunt_record.clone() else {
+        return;
+    };
+    let Some(view) = config_view(app).cloned() else {
+        return;
+    };
+    let Some(edit) = edit_for_field(&view, key, &typed) else {
+        return;
+    };
+
+    // A rename dry-runs the same edit (no write, no check) and counts what
+    // else it touches; any count confirms first.
+    if is_rename_field(key) {
+        match crate::gateway_edit::plan_cascade(&record, &edit) {
+            Ok(Some(cascade)) if cascade_has_refs(&cascade, key) => {
+                let counts = rename_counts_line(&cascade, key);
+                let kind = match key {
+                    ShuntFieldKey::Upstream { .. } => "upstream",
+                    _ => "model",
+                };
+                let from = rename_from(key);
+                app.disarm_quit();
+                app.open_modal(Modal::Confirm(ConfirmState {
+                    message: format!(
+                        "rename {kind} \"{from}\" to \"{}\"?",
+                        escape_control(&typed)
+                    ),
+                    detail: Some(format!("also renames it in {counts}.")),
+                    choice: false,
+                    scroll: ConfirmScroll::default(),
+                    on_confirm: ConfirmAction::RenameField {
+                        key: key.clone(),
+                        edit: Box::new(edit),
+                    },
+                }));
+                return;
+            }
+            Err(e) => {
+                show_field_refusal(app, key, &e);
+                return;
+            }
+            Ok(_) => {}
+        }
+    }
+
+    // A bind save restarts the gateway: confirm while supervised and running
+    // (and the value actually changed — an equal-value save writes nothing;
+    // an emptied bind over an unset one is no change either).
+    if key == &ShuntFieldKey::Bind {
+        let changed = match &state.edit {
+            ShuntFieldEdit::Typed { saved, .. } => saved.as_deref().unwrap_or("") != typed.as_str(),
+            ShuntFieldEdit::Pick { .. } => true,
+        };
+        if changed && bind_save_needs_confirm(app) {
+            let detail = bind_restart_detail(app, &typed);
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: "restart shunt?".to_string(),
+                detail: Some(detail),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::RestartBind {
+                    key: key.clone(),
+                    edit: Box::new(edit),
+                },
+            }));
+            return;
+        }
+    }
+
+    start_shunt_save(app, ShuntSaveKey::Field(key.clone()), edit, false);
+}
+
+/// The rename confirm's `from`: the entry's current name/id, control-escaped
+/// like every config-derived string a modal shows.
+fn rename_from(key: &ShuntFieldKey) -> String {
+    match key {
+        ShuntFieldKey::Upstream { name, .. } => escape_control(name),
+        ShuntFieldKey::Model { id, .. } => escape_control(id),
+        _ => String::new(),
+    }
+}
+
+/// Whether a rename's cascade touches any other reference (a zero-count rename
+/// saves like any field).
+fn cascade_has_refs(cascade: &crate::gateway_edit::Cascade, key: &ShuntFieldKey) -> bool {
+    match key {
+        ShuntFieldKey::Upstream { .. } => {
+            cascade.routes
+                + cascade.models
+                + cascade.default_provider
+                + cascade.route_prefixes
+                + cascade.codex_endpoint
+                + cascade.codex_routes
+                > 0
+        }
+        ShuntFieldKey::Model { .. } => {
+            cascade.route_models + cascade.routers + cascade.subagents > 0
+        }
+        _ => false,
+    }
+}
+
+/// The rename confirm's count line: singular at 1, a kind at 0 left out, joined
+/// by ` · `.
+fn rename_counts_line(cascade: &crate::gateway_edit::Cascade, key: &ShuntFieldKey) -> String {
+    let count = |n: usize, one: &str, many: &str| match n {
+        0 => None,
+        1 => Some(one.to_string()),
+        n => Some(format!("{n} {many}")),
+    };
+    let mut parts = Vec::new();
+    match key {
+        ShuntFieldKey::Upstream { .. } => {
+            parts.extend(count(cascade.routes, "1 route", "routes"));
+            parts.extend(count(
+                cascade.default_provider,
+                "default_provider",
+                "default_provider",
+            ));
+            parts.extend(count(cascade.models, "1 model mapping", "model mappings"));
+            parts.extend(count(
+                cascade.route_prefixes,
+                "1 route prefix",
+                "route prefixes",
+            ));
+            parts.extend(count(
+                cascade.codex_endpoint,
+                "codex_endpoint",
+                "codex_endpoint",
+            ));
+            parts.extend(count(cascade.codex_routes, "1 codex route", "codex routes"));
+        }
+        ShuntFieldKey::Model { .. } => {
+            parts.extend(count(cascade.route_models, "1 route", "routes"));
+            parts.extend(count(cascade.routers, "1 router target", "router targets"));
+            parts.extend(count(
+                cascade.subagents,
+                "1 subagent target",
+                "subagent targets",
+            ));
+        }
+        _ => {}
+    }
+    parts.join(" · ")
+}
+
+/// Whether a bind save needs the restart confirm: the gateway is supervised and
+/// running (`starting`, `healthy` or `unhealthy`).
+fn bind_save_needs_confirm(app: &App) -> bool {
+    use crate::daemon::gateway::GatewayState;
+    let (slot, supervised) = crate::daemon::gateway_slot(app.daemon_health);
+    supervised
+        && matches!(
+            slot.state,
+            GatewayState::Starting | GatewayState::Healthy | GatewayState::Unhealthy
+        )
+}
+
+/// The live-session count clause both the `stop shunt?` and the `restart
+/// shunt?` confirms lead with: `1 live session uses it; ` at one, `N live
+/// sessions use it; ` above one, absent at 0 and when clauth cannot count.
+fn live_sessions_clause(app: &App) -> String {
+    match gateway_session_count(app) {
+        Some(1) => "1 live session uses it; ".to_string(),
+        Some(n) if n > 1 => format!("{n} live sessions use it; "),
+        Some(_) | None => String::new(),
+    }
+}
+
+/// The `restart shunt?` detail, its live-session count the `stop shunt?` way
+/// (the count clause absent at 0 and when clauth cannot count). An emptied bind
+/// reads the target as shunt's default, never a bare trailing "on .".
+fn bind_restart_detail(app: &App, bind: &str) -> String {
+    let target = if bind.is_empty() {
+        format!("shunt's default, {}", crate::gateway::SHUNT_DEFAULT_BIND)
+    } else {
+        escape_control(bind)
+    };
+    format!(
+        "bind is read at start; {}in-flight requests drain, then it starts on {target}.",
+        live_sessions_clause(app)
+    )
+}
+
+/// Show a save's failure: an [`EditRefusal`] renders its own sentence on the
+/// field's `└` line (the editor kept open with the typed text); any other
+/// failure — an engine bug or an untyped read error — toasts `save failed` +
+/// the chain, never the `└` line.
+fn show_field_refusal(app: &mut App, key: &ShuntFieldKey, err: &anyhow::Error) {
+    if let Some(refusal) = err.downcast_ref::<crate::gateway_edit::EditRefusal>() {
+        if let Some(state) = app.services.shunt_field_edit.as_mut()
+            && state.key == *key
+        {
+            state.refusal = Some(refusal.to_string());
+        }
+    } else {
+        app.toast(
+            ToastKind::Danger,
+            format!("save failed\n{}", escape_control(&error_toast_detail(err))),
+        );
+    }
+}
+
+/// Start `job` on the one save worker under the one-save guard (the same slot
+/// every config save, token add and token remove shares; a second toasts the
+/// guard). `value`/`entry` are the [`ShuntSave`] fields the config-save path
+/// carries for its row; token jobs pass none. A field's editor stays open with
+/// the typed text until the outcome lands.
+fn start_on_save_worker(
+    app: &mut App,
+    key: ShuntSaveKey,
+    value: Option<String>,
+    entry: Option<ShuntEntryKey>,
+    job: ShuntActionJob,
+) {
+    if app.services.shunt_save_worker.running {
+        app.toast(
+            ToastKind::Info,
+            "a save is still checking\nwait for it, then save again",
+        );
+        return;
+    }
+    app.services.shunt_save = Some(ShuntSave {
+        key,
+        started: Instant::now(),
+        value,
+        entry,
+    });
+    app.services.shunt_save_worker.start(job);
+}
+
+/// Start the save worker for one config row (the outcome drains on the tick).
+fn start_shunt_save(
+    app: &mut App,
+    key: ShuntSaveKey,
+    edit: crate::gateway_edit::Edit,
+    confirmed: bool,
+) {
+    let Some(record) = app.services.shunt_record.clone() else {
+        return;
+    };
+    let entry = add_edit_entry_key(&edit, config_view(app));
+    start_on_save_worker(
+        app,
+        key.clone(),
+        edit_save_value(&edit),
+        entry,
+        ShuntActionJob::ConfigEdit {
+            record,
+            edit: Box::new(edit),
+            key,
+            confirmed,
+        },
+    );
+}
+
+/// Start a token remove on the one save worker (the same one-save slot every
+/// config save, add, remove and token op shares; a second toasts the guard).
+fn start_shunt_token_save(
+    app: &mut App,
+    key: ShuntSaveKey,
+    record: crate::gateway::GatewayRecord,
+    profile: String,
+) {
+    start_on_save_worker(
+        app,
+        key,
+        None,
+        None,
+        ShuntActionJob::RemoveToken { record, profile },
+    );
+}
+
+/// Start a token add on the one save worker: the `+ add token` row holds the
+/// save slot while the mint and the profile write run.
+fn start_shunt_token_add(
+    app: &mut App,
+    record: crate::gateway::GatewayRecord,
+    profile: String,
+    url: String,
+) {
+    let config = JobConfig(Arc::clone(&app.config));
+    start_on_save_worker(
+        app,
+        ShuntSaveKey::AddToken,
+        None,
+        None,
+        ShuntActionJob::AddToken {
+            record,
+            profile,
+            url,
+            config,
+        },
+    );
+}
+
+/// Ascend off the shunt detail: close any open field editor, retire a remove
+/// refusal (its row is no longer the user's), and move focus to the list.
+/// Every site that moves `services.focus` off the shunt detail (the
+/// global `esc` and `q` ascend arms, the tab jump's Services reset, and the
+/// locked editor's own `q`) goes through here, so the state "list focused,
+/// editor open" cannot exist — an editor left open would keep owning the
+/// keyboard on a pane that does not hold focus.
+fn leave_shunt_detail(app: &mut App) {
+    app.services.shunt_field_edit = None;
+    app.services.shunt_remove_refusal.take();
+    app.services.shunt_token_refusal.take();
+    app.services.focus = ServicesFocus::List;
+}
+
+/// `esc` on a config row that is not editing: fold its entry (back to the
+/// entry row), or fold its open draft (back to the `+ add` row) — the Setup
+/// `+ new` form's precedent, whose `esc` at rest drops the draft. Returns
+/// `true` when it folded; a server field row (or no config focus) leaves it to
+/// ascend as today.
+fn shunt_esc_folds_entry(app: &mut App) -> bool {
+    let Some(focus) = app.services.focused_shunt_focus().cloned() else {
+        return false;
+    };
+    let fold_draft = |app: &mut App, kind: ShuntAddKind| {
+        app.services.shunt_drafts.fold(kind);
+        rebuild_shunt_config_stops(app);
+        app.services
+            .set_shunt_focus(Some(ShuntFocusLine::Add(kind)));
+    };
+    match focus {
+        ShuntFocus::Field { key } => {
+            // A locked row's `esc` ascends to the list (no fold) — ruling 2.
+            if field_locked(app, &key) {
+                return false;
+            }
+            if let ShuntFieldKey::Draft { kind, .. } = &key {
+                fold_draft(app, *kind);
+                return true;
+            }
+            let Some(entry) = field_entry(&key) else {
+                return false;
+            };
+            app.services.shunt_expanded.remove(&entry);
+            retire_remove_refusal(app, &entry);
+            rebuild_shunt_config_stops(app);
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
+            true
+        }
+        ShuntFocus::SaveAdd { kind } => {
+            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+                return false;
+            }
+            fold_draft(app, kind);
+            true
+        }
+        ShuntFocus::Add { kind } if app.services.shunt_drafts.is_open(kind) => {
+            if app.services.saving(&ShuntSaveKey::SaveAdd(kind)) {
+                return false;
+            }
+            fold_draft(app, kind);
+            true
+        }
+        ShuntFocus::Remove { key } => {
+            // `esc` on the `remove <kind>` row folds its entry like C2's field
+            // rows, unless the remove is locked (ruling 2): then it ascends.
+            if app.services.saving(&ShuntSaveKey::Remove(key.clone())) {
+                return false;
+            }
+            app.services.shunt_expanded.remove(&key);
+            retire_remove_refusal(app, &key);
+            rebuild_shunt_config_stops(app);
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Entry(key)));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Open the read-only `check output` modal over the held failed-check stderr,
+/// which `crate::gateway::run_check` already masked. The body is split into its
+/// real lines, ANSI CSI sequences stripped (shunt's tracing may emit SGR), and
+/// each line control-escaped here; nothing is re-read or re-masked.
+fn open_check_output_modal(app: &mut App) {
+    let Some(held) = app.services.check_output.as_ref() else {
+        return;
+    };
+    let body = stderr_display_lines(held.stderr.text()).join("\n");
+    app.check_output_scroll = 0;
+    app.open_modal(Modal::CheckOutput(body));
+}
+
+/// The held stderr as display lines: ANSI CSI sequences (`ESC [ … final`) that
+/// shunt's tracing layer may emit are stripped, then each line is
+/// control-escaped so no `\n` or escape byte reaches a cell. The modal's own
+/// `.lines()` split is what turns the joined newlines back into rows.
+fn stderr_display_lines(text: &str) -> Vec<String> {
+    strip_ansi_csi(text).lines().map(escape_control).collect()
+}
+
+/// Strip ANSI CSI sequences (`ESC [ params/intermediates final`, params in
+/// `0x20..=0x3F`, final in `0x40..=0x7E`) from `text`, so the modal shows
+/// text, not terminal escape bytes. Any byte outside those ranges before the
+/// final byte ends the sequence without eating text: the `ESC` is kept and
+/// scanning resumes after it, so a malformed CSI never swallows a line.
+fn strip_ansi_csi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(esc) = rest.find('\x1b') {
+        out.push_str(&rest[..esc]);
+        let after = &rest[esc + 1..];
+        if let Some(body) = after.strip_prefix('[') {
+            match body
+                .char_indices()
+                .find(|(_, c)| ('@'..='~').contains(c) || !('\u{20}'..='\u{3f}').contains(c))
+            {
+                Some((at, c)) if ('@'..='~').contains(&c) => rest = &body[at + c.len_utf8()..],
+                _ => {
+                    // No final byte, or a non-parameter byte: not a CSI.
+                    out.push('\x1b');
+                    rest = after;
+                }
+            }
+        } else {
+            out.push('\x1b');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Apply the focused fix. Every mutating fix opens a confirm modal; a diverged
 /// active profile's repair lives on the divergence resolver's own `d` prompt,
-/// never on this tab.
+/// never on this tab. Only the four shunt fixes are gated by an in-flight shunt
+/// action — a second shunt press starts nothing, while the plugin and herdr
+/// fixes keep working.
 fn apply_service_fix(app: &mut App) {
     let Some(fix) = app.services.focused_fix().cloned() else {
         return;
     };
+    if app.services.shunt_action.running
+        && matches!(
+            fix,
+            ServiceFix::AdoptConfig(_)
+                | ServiceFix::MoveStoresIn
+                | ServiceFix::AddAdminKey
+                | ServiceFix::AddAdminTable
+        )
+    {
+        return;
+    }
     match fix {
         ServiceFix::WireMcpServers => {
             app.disarm_quit();
@@ -4416,6 +7938,7 @@ fn apply_service_fix(app: &mut App) {
                         .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::WireMcpServers,
             }));
         }
@@ -4424,9 +7947,15 @@ fn apply_service_fix(app: &mut App) {
             app.open_modal(Modal::Confirm(ConfirmState {
                 message: "add the keybinding and sidebar row to herdr's config?".to_string(),
                 detail: Some(
-                    "writes them into herdr's config.toml and validates the result with `herdr config check`.".to_string(),
+                    concat!(
+                        "writes them into herdr's config.toml and validates the result with ",
+                        cmd_lit!("herdr config check"),
+                        "."
+                    )
+                    .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::HealHerdrConfig(path),
             }));
         }
@@ -4435,30 +7964,135 @@ fn apply_service_fix(app: &mut App) {
             app.open_modal(Modal::Confirm(ConfirmState {
                 message: "install the clauth plugin into claude code?".to_string(),
                 detail: Some(
-                    "runs claude's own plugin installer at user scope; your other plugins and settings are untouched."
+                    "runs claude's own plugin installer at user scope and turns the plugin on; your other plugins and settings are untouched."
                         .to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::InstallPlugin,
+            }));
+        }
+        ServiceFix::AdoptConfig(path) => {
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: format!("adopt {}?", escape_control(&path.to_string_lossy())),
+                detail: Some("clauth runs shunt on this config and edits it in place.".to_string()),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::AdoptConfig(path),
+            }));
+        }
+        ServiceFix::MoveStoresIn => open_move_confirm(app),
+        ServiceFix::AddAdminKey => {
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: "add clauth's admin key to this config?".to_string(),
+                detail: Some(
+                    "clauth needs it to manage pool accounts and read their usage.".to_string(),
+                ),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::AddAdminKey,
+            }));
+        }
+        ServiceFix::AddAdminTable => {
+            app.disarm_quit();
+            app.open_modal(Modal::Confirm(ConfirmState {
+                message: "add a [server.admin] table with clauth's key?".to_string(),
+                detail: Some("the gateway restarts once to load it.".to_string()),
+                choice: false,
+                scroll: ConfirmScroll::default(),
+                on_confirm: ConfirmAction::AddAdminTable,
             }));
         }
     }
 }
 
-/// The herdr detail's options keymap: ↑↓ walks the six rows (wrapping), space
-/// and ⏎ activate the focused row, `+`/`-` step the tag-refresh stepper, `f`
-/// still applies the check's fix. Only the herdr detail routes here — every
-/// other detail keeps the scroll-only keymap.
+/// The move confirm: the two counts off the plan the card showed, carried in
+/// the confirm action so the move runs exactly that plan. The `<K> stay
+/// behind` line is absent at K = 0, and both lines take the singular at 1.
+fn open_move_confirm(app: &mut App) {
+    let plan = match &app.services.move_plan {
+        Some(MovePlanOutcome::Plan(plan)) => plan.clone(),
+        _ => return,
+    };
+    let n = plan.moved.len();
+    let k = plan.kept.len();
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("move {n} {} into clauth?", account_files_word(n)),
+        detail: (k > 0).then(|| format!("{k} {} behind, listed on the card.", stays_word(k))),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::MoveStoresIn(plan),
+    }));
+}
+
+/// The `account files`/`account file` noun, singular at 1 (the owner's copy).
+fn account_files_word(n: usize) -> &'static str {
+    if n == 1 {
+        "account file"
+    } else {
+        "account files"
+    }
+}
+
+/// The `stay`/`stays` verb, singular at 1 (the owner's copy).
+fn stays_word(k: usize) -> &'static str {
+    if k == 1 { "stays" } else { "stay" }
+}
+
+/// The herdr detail's keymap: ↑↓ walks the `f  heal herdr config` line (while
+/// the check offers it, the stop above the first option) and the six option
+/// rows, wrapping; `f` walks to the fix line; `↵` on it opens the heal
+/// confirm; space and ⏎ activate a focused option, `+`/`-` step the
+/// tag-refresh stepper. Only the herdr detail routes here — every other
+/// detail keeps the scroll-only keymap.
 fn handle_herdr_options_key(app: &mut App, key: KeyEvent) {
+    let has_fix = app
+        .services
+        .selected_check()
+        .is_some_and(|c| !c.problems.is_empty());
+    if !has_fix {
+        app.services.herdr_fix_focus = false;
+    }
+    let on_fix = app.services.herdr_fix_focus;
     let cursor = app.services.herdr_options_cursor;
     let rows = HERDR_OPTIONS.len();
     match key.code {
-        KeyCode::Up => app.services.herdr_options_cursor = (cursor + rows - 1) % rows,
-        KeyCode::Down => app.services.herdr_options_cursor = (cursor + 1) % rows,
-        KeyCode::Char('f') => apply_service_fix(app),
-        KeyCode::Enter | KeyCode::Char(' ') => activate_herdr_option(app, HERDR_OPTIONS[cursor]),
-        KeyCode::Char('+') => step_herdr_tag_refresh(app, 1),
-        KeyCode::Char('-') => step_herdr_tag_refresh(app, -1),
+        KeyCode::Up => {
+            app.services.diagnostic_focus = false;
+            if on_fix {
+                app.services.herdr_fix_focus = false;
+                app.services.herdr_options_cursor = rows - 1;
+            } else if has_fix && cursor == 0 {
+                app.services.herdr_fix_focus = true;
+            } else {
+                app.services.herdr_options_cursor = (cursor + rows - 1) % rows;
+            }
+        }
+        KeyCode::Down => {
+            app.services.diagnostic_focus = false;
+            if on_fix {
+                app.services.herdr_fix_focus = false;
+                app.services.herdr_options_cursor = 0;
+            } else if has_fix && cursor == rows - 1 {
+                app.services.herdr_fix_focus = true;
+            } else {
+                app.services.herdr_options_cursor = (cursor + 1) % rows;
+            }
+        }
+        KeyCode::Char('f') => walk_to_next_fix(app),
+        KeyCode::Enter if on_fix => apply_service_fix(app),
+        KeyCode::Enter | KeyCode::Char(' ') if !app.services.diagnostic_focus && !on_fix => {
+            activate_herdr_option(app, HERDR_OPTIONS[cursor]);
+        }
+        KeyCode::Char('+') if !app.services.diagnostic_focus && !on_fix => {
+            step_herdr_tag_refresh(app, 1);
+        }
+        KeyCode::Char('-') if !app.services.diagnostic_focus && !on_fix => {
+            step_herdr_tag_refresh(app, -1);
+        }
         _ => {}
     }
 }
@@ -4683,13 +8317,22 @@ fn open_herdr_row_text_confirm(app: &mut App) {
             "drop the delegate token from herdr's sidebar row?".to_string()
         },
         detail: Some(if turning_on {
-            "writes $clauth_delegate into the row clauth added in herdr's config.toml, validated by `herdr config check`; a hand-owned row is left alone with a note."
-                .to_string()
+            concat!(
+                "writes $clauth_delegate into the row clauth added in herdr's config.toml, validated by ",
+                cmd_lit!("herdr config check"),
+                "; a hand-owned row is left alone with a note."
+            )
+            .to_string()
         } else {
-            "rewrites the row clauth added in herdr's config.toml without $clauth_delegate, validated by `herdr config check`; a hand-owned row is left alone with a note."
-                .to_string()
+            concat!(
+                "rewrites the row clauth added in herdr's config.toml without $clauth_delegate, validated by ",
+                cmd_lit!("herdr config check"),
+                "; a hand-owned row is left alone with a note."
+            )
+            .to_string()
         }),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::HerdrDelegateRowText(path),
     }));
 }
@@ -4739,7 +8382,10 @@ pub(crate) fn herdr_check(
     let mut problems: Vec<Problem> = Vec::new();
 
     // Indented, because herdr's own prose carries colons ("manifest unavailable: No such file or directory") and `detail_line` splits the first `": "` into a key column: left flush, a warning renders as a field named after its first clause and widens that column for every real field above it.
-    let error_line = probe.error.as_ref().map(|error| format!("  {error}"));
+    let error_line = probe
+        .error
+        .as_ref()
+        .map(|error| format!("  {}", prose::mark_commands(error)));
     if error_line.is_some() {
         danger = true;
     }
@@ -4824,7 +8470,7 @@ pub(crate) fn herdr_check(
         detail.push("plugin: not installed".to_string());
         detail.push(herdr_line);
         detail.push(String::new());
-        detail.push("  clauth herdr install".to_string());
+        detail.push(format!("  {}", prose::cmd("clauth herdr install")));
     }
 
     let health = if danger {
@@ -4841,7 +8487,19 @@ pub(crate) fn herdr_check(
         detail,
         fix: fixed,
         problems,
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
+}
+
+/// Whether a recompute re-runs the shunt card's plan and pool workers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShuntRefresh {
+    /// Cheap recompute: start a worker only when its cache is empty.
+    Keep,
+    /// Drop the plan/pool caches and restart their workers (respecting their
+    /// gates), so "until it lands the card shows nothing for the plan" holds.
+    Restart,
 }
 
 /// Recompute the Services tab's rows: `shunt` (the managed gateway's readout),
@@ -4849,11 +8507,30 @@ pub(crate) fn herdr_check(
 /// readouts in one detail), `herdr`. Every read is a local FS/`PATH` check;
 /// `claude --version` and the `clauth mcp` boot probe run only when
 /// `refresh_version` is set. Synchronous, except the herdr probe, which it
-/// starts on a worker when none is cached or on `r`.
-fn recompute_services_checks(app: &mut App, refresh_version: bool) {
+/// starts on a worker when none is cached or on `r`, and the shunt plan/pool
+/// workers, which [`ShuntRefresh::Restart`] re-runs on tab entry and after a
+/// shunt action lands.
+pub(crate) fn recompute_services_checks(app: &mut App, refresh_version: bool, shunt: ShuntRefresh) {
     use crate::plugin_probe as probe;
 
     app.services.error = None;
+
+    // A daemon start, stop or restart moves the plan's env source (the running
+    // daemon's record vs this process's own env), so the cached plan is invalid
+    // the moment the source moves: restart the plan/pool workers exactly as
+    // `Restart` does. The first recompute just records the source.
+    let source = PlanEnvSource::of(app.daemon_health);
+    let daemon_flipped = app
+        .services
+        .last_plan_env_source
+        .as_ref()
+        .is_some_and(|last| *last != source);
+    app.services.last_plan_env_source = Some(source);
+    let shunt = if daemon_flipped {
+        ShuntRefresh::Restart
+    } else {
+        shunt
+    };
 
     // CC version is cached; only `r` probes. Construction and a tab switch
     // leave it unprobed rather than spawning `claude --version` synchronously
@@ -4898,27 +8575,148 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
 
     let mut checks: Vec<Check> = Vec::with_capacity(4);
 
-    // shunt row — read-only gateway status: the daemon's feed when one is
-    // fresh, else the record-only verdict. The "the daemon runs the gateway"
-    // note names the daemon only for a record the gateway WOULD run on with no
-    // daemon to run it (the `unobserved` verdict) — never for absent/disabled/
-    // no_config, where no gateway would run at all. With no gateway adopted,
-    // the standalone probe says what shunt would load and what answers.
+    // shunt row — the gateway's control surface: the daemon's feed when one is
+    // fresh, else the record-only verdict. With no gateway adopted, the
+    // standalone probe says what shunt would load and what answers. The record
+    // and the admin need are cheap local reads on the recompute; the store
+    // move plan and the codex pool read run on workers.
     let (gateway_slot, gateway_supervised) = crate::daemon::gateway_slot(app.daemon_health);
+    app.set_gateway_state(gateway_slot.state);
     if gateway_slot.state == GatewayState::Absent {
-        if refresh_version {
+        // The readout's bind comes from the env the adopt reads, which moves
+        // with the env source.
+        if refresh_version || daemon_flipped {
             app.services.standalone_probe.restart();
         } else if app.services.standalone.is_none() {
             app.services.standalone_probe.start();
         }
     }
-    let mut shunt = shunt_check(
+    let record = crate::gateway::GatewayRecord::load().ok().flatten();
+    if record != app.services.shunt_record {
+        // The last refusal belonged to the record it edited against; a record
+        // change (a re-adopt, a binary/env move) retires it.
+        app.services.check_output = None;
+    }
+    app.services.shunt_record = record;
+    // The adopted config's editor view: a cheap local read on the recompute,
+    // like the record and the admin need. `None` while no record exists (the
+    // absent card shows no config section); a config read/parse failure keeps
+    // the groups off and renders one `config  not read (<reason>)` line, a
+    // shape refusal `config  not editable` with its sentence. An env file the
+    // view cannot read still reads the config (the view carries it). The
+    // expanded set drops keys whose entry left the config, only over a read
+    // view — a failed read says nothing about the entries.
+    app.services.shunt_config = app.services.shunt_record.as_ref().map(|record| {
+        match crate::gateway_edit::read_view(record) {
+            Ok(view) => ShuntConfigRead::Ok(Box::new(view)),
+            Err(e) => classify_shunt_config_read(&e),
+        }
+    });
+    // The client-token section's data, read beside the config view (the same
+    // per-tick cadence, the same "never spawn a process" UI-thread reads) and
+    // cached so the render draws from it, never the store per frame.
+    app.services.shunt_tokens = app
+        .services
+        .shunt_record
+        .as_ref()
+        .map(read_shunt_tokens)
+        .unwrap_or_default();
+    if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
+        prune_shunt_expanded(view, &mut app.services.shunt_expanded);
+    }
+    // A remove refusal names a comment in the file it was raised on; a
+    // recompute whose view differs (a hand-edit) retires it, so a stale DANGER
+    // sentence never outlives the file it described.
+    if app
+        .services
+        .shunt_remove_refusal
+        .borrow()
+        .as_ref()
+        .is_some_and(|refusal| {
+            matches!(&app.services.shunt_config, Some(ShuntConfigRead::Ok(view)) if view.as_ref() != refusal.view.as_ref())
+        })
+    {
+        app.services.shunt_remove_refusal.take();
+    }
+    app.services.admin_need = app
+        .services
+        .shunt_record
+        .as_ref()
+        .and_then(|record| crate::gateway::admin_need(record.config()).ok());
+    match app.services.admin_need {
+        // The admin entry is present (this edit landed, another writer added
+        // it, or a fresh adopt already had it): no admin refusal is left to
+        // show. A config save's refusal is not answered by it and stays.
+        Some(crate::gateway::AdminNeed::Neither) => {
+            if app
+                .services
+                .check_output
+                .as_ref()
+                .is_some_and(|held| held.source == CheckOutputSource::AdminEdit)
+            {
+                app.services.check_output = None;
+            }
+        }
+        // No record, or the config is unreadable: the line has no card to sit
+        // under.
+        None => app.services.check_output = None,
+        Some(crate::gateway::AdminNeed::WriteKey | crate::gateway::AdminNeed::AdminTable) => {}
+    }
+
+    // The store move plan: on a worker, on tab entry, on `r`, and after any
+    // action lands (the outcome drain passes [`ShuntRefresh::Restart`], which
+    // drops the cache so the card shows nothing until the fresh plan lands).
+    if shunt == ShuntRefresh::Restart {
+        app.services.move_plan = None;
+        app.services.pool = None;
+    }
+    if app.services.shunt_record.is_some() {
+        if refresh_version || shunt == ShuntRefresh::Restart {
+            app.services.move_plan_probe.restart();
+        } else if app.services.move_plan.is_none() {
+            app.services.move_plan_probe.start();
+        }
+    } else {
+        app.services.move_plan = None;
+    }
+
+    // The codex pool note: on a worker, gated on the slot being `healthy` with
+    // no admin step owed. Re-probed on tab entry, `r`, and whenever the slot
+    // turns healthy (the recompute re-reads the slot each tick).
+    let pool_due = gateway_slot.state == GatewayState::Healthy
+        && app.services.admin_need == Some(crate::gateway::AdminNeed::Neither);
+    if pool_due {
+        if refresh_version || shunt == ShuntRefresh::Restart {
+            app.services.pool_probe.restart();
+        } else if app.services.pool.is_none() {
+            app.services.pool_probe.start();
+        }
+    } else {
+        app.services.pool = None;
+    }
+
+    let mut shunt = shunt_card(
         &gateway_slot,
         gateway_supervised,
+        app.daemon_health == crate::daemon::DaemonHealth::Absent,
         app.services.standalone.as_ref(),
+        app.services.shunt_record.as_ref(),
+        app.services.admin_need,
+        app.services.move_plan.as_ref(),
+        app.services.pool.as_ref(),
+        app.services.check_output.is_some(),
     );
-    if !gateway_supervised && gateway_slot.state == GatewayState::Unobserved {
-        shunt.detail.push("the daemon runs the gateway".to_string());
+    // The config rows join the focus walk after the action section, in card
+    // order (server fields, then each entry and its expanded fields); the
+    // render draws them in the same order, so the published geometry stays
+    // parallel to this list.
+    if let Some(ShuntConfigRead::Ok(view)) = &app.services.shunt_config {
+        shunt.shunt_focus.extend(config_field_stops(
+            view,
+            &app.services.shunt_expanded,
+            &app.services.shunt_drafts,
+            &app.services.shunt_tokens,
+        ));
     }
     checks.push(shunt);
 
@@ -4943,6 +8741,7 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
     // delegates row — the job store is also its detail, so read it first and
     // derive the dot from what it holds now, not the previous tick's.
     app.services.delegates = crate::mcp::jobs::list_banded(crate::usage::now_ms());
+    app.services.settle_delegates_selection();
     checks.push(delegates_check(&app.services.delegates, &rate_limited));
 
     // plugin row — the folded readout, over the cached probes + the PATH read.
@@ -4993,6 +8792,19 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
         app.services.problem_cursor = problems;
     }
 
+    // A delegates detail that emptied while descended has nothing left to
+    // select: ascend to the selector so the footer and the pane focus cannot
+    // stay stuck on a dead pane.
+    if app.services.focus == ServicesFocus::Detail
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "delegates")
+        && app.services.delegates.is_empty()
+    {
+        leave_shunt_detail(app);
+    }
+
     // A pending herdr landing (the first herdr launch; its probe lands on a
     // worker) selects the herdr row the moment it appears — by label, not by a
     // stale index — and descends into its detail. The intent clears on
@@ -5008,6 +8820,19 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
             app.services.cursor = app.services.row_count().saturating_sub(1);
         }
     }
+
+    // A card change keeps the shunt focus by identity while the kind still
+    // exists (a landed action can drop the line that held it); the render
+    // re-settles it (the descend rule) on the next frame when a change pushed
+    // the line out of view, over the freshly rendered geometry.
+    if let Some(kind) = app.services.shunt_focus_kind()
+        && !app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.shunt_focus.iter().any(|s| s.kind() == kind))
+    {
+        app.services.set_shunt_focus(None);
+    }
 }
 
 /// Adopt every finished Services probe and recompute once, so a row appears
@@ -5017,7 +8842,17 @@ fn recompute_services_checks(app: &mut App, refresh_version: bool) {
 fn drain_service_probes(app: &mut App) {
     let herdr = app.services.herdr_probe.drain();
     let standalone = app.services.standalone_probe.drain();
-    if herdr.is_none() && standalone.is_none() {
+    let move_plan = app.services.move_plan_probe.drain();
+    let pool = app.services.pool_probe.drain();
+    let action = app.services.shunt_action.drain();
+    let save = app.services.shunt_save_worker.drain();
+    if herdr.is_none()
+        && standalone.is_none()
+        && move_plan.is_none()
+        && pool.is_none()
+        && action.is_none()
+        && save.is_none()
+    {
         return;
     }
     let herdr_landed = herdr.is_some();
@@ -5027,9 +8862,864 @@ fn drain_service_probes(app: &mut App) {
     if let Some(readout) = standalone {
         app.services.standalone = Some(readout);
     }
-    recompute_services_checks(app, false);
+    if let Some(plan) = move_plan {
+        app.services.move_plan = Some(plan);
+    }
+    if let Some(readout) = pool {
+        app.services.pool = Some(readout);
+    }
+    let action_landed = action.is_some() || save.is_some();
+    if let Some(outcome) = action {
+        handle_shunt_action_outcome(app, outcome);
+    }
+    if let Some(outcome) = save {
+        // The save worker runs `ConfigEdit`, `RemoveToken` and `AddToken`,
+        // none of which yields `NoOp`, so a `NoOp` here is a panicked save: it
+        // drains as a failed outcome that clears the guard. A config edit's
+        // panic can land only before the staged rename (the rename is the
+        // write's last step and everything after it is pure), so nothing was
+        // written holds there; a token job's panic can land after the store
+        // write (a minted add), so its copy never claims nothing was written.
+        let outcome = match outcome {
+            ShuntActionOutcome::NoOp => {
+                let token_job = app.services.shunt_save.as_ref().is_some_and(|s| {
+                    matches!(s.key, ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken)
+                });
+                if token_job {
+                    ShuntActionOutcome::ConfigFailed {
+                        error: "the save stopped unexpectedly; check the card".to_string(),
+                    }
+                } else {
+                    ShuntActionOutcome::ConfigFailed {
+                        error: "the save stopped unexpectedly; nothing was written".to_string(),
+                    }
+                }
+            }
+            other => other,
+        };
+        handle_shunt_action_outcome(app, outcome);
+    }
+    // After a shunt action lands (success OR failure) the plan and pool caches
+    // are dropped and their workers restarted, so the next confirm counts a
+    // fresh plan — never the stale one a failed move left behind.
+    recompute_services_checks(
+        app,
+        false,
+        if action_landed {
+            ShuntRefresh::Restart
+        } else {
+            ShuntRefresh::Keep
+        },
+    );
     if herdr_landed {
         app.services.land_on_herdr = false;
+    }
+}
+
+/// Whether a shunt refusal can show on its own `└` line: the Services tab is
+/// shown, the detail pane holds focus, the `shunt` row is the selected
+/// service, and the focus still rests on the row that started the save. Any
+/// conjunct false (an `esc` ascend, a tab jump, another service picked, or a
+/// focus move off the row) leaves the row off-screen — the refusal toasts
+/// `save failed` + the sentence instead.
+fn refusal_row_visible(app: &App, on_row: bool) -> bool {
+    app.tab == Tab::Services
+        && app.services.focus == ServicesFocus::Detail
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|c| c.label == "shunt")
+        && on_row
+}
+
+/// One shunt-card action's result: the toast, every error `Display` escaped
+/// (it can interpolate an untrusted path), the moved count singular at 1. The
+/// plan/pool caches are dropped by the drain's recompute (which restarts their
+/// workers after any action).
+fn handle_shunt_action_outcome(app: &mut App, outcome: ShuntActionOutcome) {
+    match outcome {
+        ShuntActionOutcome::Adopted { path } => {
+            app.toast(ToastKind::Success, format!("adopted {path}"));
+        }
+        ShuntActionOutcome::AdoptRefused { version, addr } => {
+            app.toast(
+                ToastKind::Warning,
+                format!("shunt {version} answers on {addr}\nstop it, then adopt again"),
+            );
+        }
+        ShuntActionOutcome::AdoptFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("adopt failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::Moved { n } => {
+            app.toast(
+                ToastKind::Success,
+                format!("moved {n} {} into clauth", account_files_word(n)),
+            );
+        }
+        ShuntActionOutcome::MovedEnableFailed { n, error } => {
+            // The stores moved, so the success toast still shows; the record
+            // write failed, so the house `save failed` toast follows it.
+            app.toast(
+                ToastKind::Success,
+                format!("moved {n} {} into clauth", account_files_word(n)),
+            );
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::MoveFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("move failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::AdminAdded => {
+            // The one toast for both admin steps (the orchestrator's reading,
+            // flagged in the report).
+            app.services.check_output = None;
+            app.toast(ToastKind::Success, "added clauth's admin key");
+        }
+        ShuntActionOutcome::AdminFailed {
+            error,
+            check_output,
+            config,
+        } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("admin key failed\n{}", escape_control(&error)),
+            );
+            hold_check_output(app, &config, CheckOutputSource::AdminEdit, check_output);
+        }
+        ShuntActionOutcome::Held => {
+            app.toast(
+                ToastKind::Success,
+                "shunt stopped\nit stays off until the daemon restarts",
+            );
+        }
+        ShuntActionOutcome::HoldFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("shunt stop failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::Released => {
+            app.toast(ToastKind::Success, "shunt starting");
+        }
+        ShuntActionOutcome::ReleaseFailed { error } => {
+            app.toast(
+                ToastKind::Danger,
+                format!("shunt start failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::NoOp => {}
+        ShuntActionOutcome::ConfigSaved {
+            key,
+            written,
+            restart_only,
+            value,
+            confirmed,
+        } => {
+            // The entry a `save <kind>` lands under was fixed when the save
+            // started and rides in the in-flight save; capture it before the
+            // slot clears.
+            let save_entry = app
+                .services
+                .shunt_save
+                .as_ref()
+                .and_then(|save| save.entry.clone());
+            app.services.shunt_save = None;
+            // A save landed (or matched the file and wrote nothing): the user
+            // moved past the refused edit, so its output no longer explains
+            // the card.
+            if app
+                .services
+                .check_output
+                .as_ref()
+                .is_some_and(|held| held.source == CheckOutputSource::ConfigSave)
+            {
+                app.services.check_output = None;
+            }
+            match key {
+                ShuntSaveKey::Field(field_key) => {
+                    // The `✓` shows for about a second on the row that saved; a
+                    // rename moves focus to the renamed field (the expanded
+                    // set's key moves with it).
+                    let new_key = config_view(app)
+                        .and_then(|view| {
+                            renamed_field_key(view, &field_key, value.as_deref().unwrap_or(""))
+                        })
+                        .unwrap_or(field_key.clone());
+                    // A rename moves the expanded set's key with the renamed
+                    // entry, so the new name's fields stay expanded and the
+                    // focus follows.
+                    if is_rename_field(&field_key) {
+                        if let Some(old_entry) = field_entry(&field_key) {
+                            app.services.shunt_expanded.remove(&old_entry);
+                        }
+                        if let Some(new_entry) = field_entry(&new_key) {
+                            app.services.shunt_expanded.insert(new_entry);
+                        }
+                    }
+                    app.services.shunt_ok =
+                        Some((ShuntOkKey::Field(new_key.clone()), Instant::now()));
+                    // A landing save touches only its own row: it closes the
+                    // editor and moves focus only when they still name the
+                    // saved row (a rename's new name included), never another
+                    // editor the user opened or a row the user moved to while
+                    // the save ran.
+                    if app
+                        .services
+                        .shunt_field_edit
+                        .as_ref()
+                        .is_some_and(|state| state.key == field_key)
+                    {
+                        app.services.shunt_field_edit = None;
+                    }
+                    if app.services.focused_shunt_focus().is_some_and(|focus| {
+                        focus
+                            == &ShuntFocus::Field {
+                                key: field_key.clone(),
+                            }
+                    }) {
+                        app.services
+                            .set_shunt_focus(Some(ShuntFocusLine::Field(new_key)));
+                    }
+                    if written && restart_only && confirmed {
+                        // An emptied bind writes the key's removal, so shunt
+                        // starts on its own default; a set bind restarts on the
+                        // new address.
+                        if let Some(bind) = value {
+                            app.toast(
+                                ToastKind::Success,
+                                format!(
+                                    "shunt restarting\nbind saved · it starts on {}",
+                                    escape_control(&bind)
+                                ),
+                            );
+                        } else {
+                            app.toast(
+                                ToastKind::Success,
+                                format!(
+                                    "shunt restarting\nbind removed · it starts on {}",
+                                    crate::gateway::SHUNT_DEFAULT_BIND
+                                ),
+                            );
+                        }
+                    }
+                }
+                ShuntSaveKey::SaveAdd(kind) => {
+                    // The draft closes, the new entry appears where the engine
+                    // put it (collapsed), and that row's caret slot shows the
+                    // `✓` for `SHUNT_OK_MS`. Focus moves to the new entry only
+                    // while it still rests on this kind's own rows (the
+                    // `+ add`, a draft field, or `save <kind>`) — never an
+                    // editor the user opened or a row they moved to meanwhile.
+                    let new_entry = save_entry.clone();
+                    app.services.shunt_drafts.fold(kind);
+                    if let Some(entry) = new_entry {
+                        app.services.shunt_expanded.remove(&entry);
+                        app.services.shunt_ok =
+                            Some((ShuntOkKey::Entry(entry.clone()), Instant::now()));
+                        if focus_on_add_kind(app, kind) {
+                            app.services
+                                .set_shunt_focus(Some(ShuntFocusLine::Entry(entry)));
+                        }
+                    }
+                }
+                ShuntSaveKey::Remove(entry_key) => {
+                    // The entry leaves the card and the expanded set. Focus
+                    // lands on the next entry row of that group, else the
+                    // previous one, else its `+ add <kind>` row — but only
+                    // while it still rests on the removed entry's own rows.
+                    let focus_was_here = focus_on_removed_entry(app, &entry_key);
+                    // Close a field editor open on the removed entry BEFORE
+                    // re-keying: its key names the removed entry, and after a
+                    // route shift a later route's new position could coincide.
+                    if app
+                        .services
+                        .shunt_field_edit
+                        .as_ref()
+                        .is_some_and(|state| field_entry(&state.key).as_ref() == Some(&entry_key))
+                    {
+                        app.services.shunt_field_edit = None;
+                    }
+                    if let ShuntEntryKey::Route(position) = entry_key {
+                        // A route remove shifts every later route down by one:
+                        // re-key the route-positioned state so each still names
+                        // the SAME route after the recompute. This also drops
+                        // the removed route's own keys.
+                        rekey_routes_after_remove(app, position);
+                    } else {
+                        app.services.shunt_expanded.remove(&entry_key);
+                    }
+                    app.services.shunt_remove_refusal.take();
+                    if focus_was_here {
+                        let focus = remove_focus_target(app, &entry_key);
+                        app.services.set_shunt_focus(focus);
+                    }
+                }
+                ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken => {
+                    unreachable!("a token save never yields ConfigSaved")
+                }
+            }
+        }
+        ShuntActionOutcome::ConfigRefused { key, sentence } => {
+            app.services.shunt_save = None;
+            match key {
+                ShuntSaveKey::Field(field_key) => {
+                    // The engine refused the input or the file's shape: the
+                    // editor stays open with the typed text, the refusal on the
+                    // `└` line. Once the user moved focus away (or opened
+                    // another field), there is no editor for that row to write
+                    // — the refusal toasts instead of reaching no surface.
+                    if let Some(state) = app.services.shunt_field_edit.as_mut()
+                        && state.key == field_key
+                    {
+                        state.refusal = Some(sentence);
+                    } else {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("save failed\n{}", escape_control(&sentence)),
+                        );
+                    }
+                }
+                ShuntSaveKey::SaveAdd(kind) => {
+                    // The draft is kept; the refusal sits on the `└` line under
+                    // the `save <kind>` row only while that row is on the
+                    // focused card — the Services tab, the detail pane, the
+                    // `shunt` row, and the kind's own rows (`+ add`, a draft
+                    // field, `save`). Anything else has no surface to hold the
+                    // sentence, so it toasts like the field arm.
+                    if refusal_row_visible(app, focus_on_add_kind(app, kind)) {
+                        app.services.shunt_drafts.set_refusal(kind, sentence);
+                    } else {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("save failed\n{}", escape_control(&sentence)),
+                        );
+                    }
+                }
+                ShuntSaveKey::Remove(entry_key) => {
+                    // The refusal sits on the `└` line under the entry's
+                    // `remove <kind>` row only while that row is on the focused
+                    // card — the Services tab, the detail pane, the `shunt`
+                    // row, and the focus still on the `remove` row. Landing
+                    // anywhere else, it has no row to show under — it toasts
+                    // like the field and add arms instead.
+                    let on_row = app.services.shunt_focus_kind()
+                        == Some(ShuntFocusLine::Remove(entry_key.clone()));
+                    if refusal_row_visible(app, on_row) {
+                        let view = config_view(app).cloned().map(Box::new);
+                        if let Some(view) = view {
+                            app.services
+                                .shunt_remove_refusal
+                                .replace(Some(ShuntRemoveRefusal {
+                                    key: entry_key,
+                                    sentence,
+                                    view,
+                                }));
+                        }
+                    } else {
+                        app.toast(
+                            ToastKind::Danger,
+                            format!("save failed\n{}", escape_control(&sentence)),
+                        );
+                    }
+                }
+                ShuntSaveKey::Token(_) | ShuntSaveKey::AddToken => {
+                    unreachable!("a token save never yields ConfigRefused")
+                }
+            }
+        }
+        ShuntActionOutcome::ConfigCheckFailed {
+            error,
+            check_output,
+            config,
+        } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error)),
+            );
+            hold_check_output(app, &config, CheckOutputSource::ConfigSave, check_output);
+        }
+        ShuntActionOutcome::ConfigFailed { error } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("save failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::TokenRemoved { profile, removed } => {
+            app.services.shunt_save = None;
+            if removed {
+                app.toast(
+                    ToastKind::Success,
+                    format!(
+                        "removed {}'s client token\nthe gateway restarts once",
+                        escape_control(&profile)
+                    ),
+                );
+            }
+            // The row leaves and focus lands on the next token row, else the
+            // previous one, else `+ add token` — only while focus still rests
+            // on the removed row.
+            if focus_on_removed_token(app, &profile) {
+                let focus = token_remove_focus_target(app, &profile);
+                app.services.set_shunt_focus(focus);
+            }
+        }
+        ShuntActionOutcome::TokenRemoveRefused { profile, sentence } => {
+            app.services.shunt_save = None;
+            // The refusal sits on the `└` line under the token row only while
+            // that row is on the focused card — the Services tab, the detail
+            // pane, the `shunt` row, and the focus still on the token row.
+            // Landing anywhere else, it has no row to show under — it toasts
+            // like the field and remove arms instead.
+            let on_row = focus_on_removed_token(app, &profile);
+            if refusal_row_visible(app, on_row) {
+                app.services
+                    .shunt_token_refusal
+                    .replace(Some((profile, sentence)));
+            } else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("remove failed\n{}", escape_control(&sentence)),
+                );
+            }
+        }
+        ShuntActionOutcome::TokenRemoveFailed { error } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("remove failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::TokenAdded { profile } => {
+            app.services.shunt_save = None;
+            // A repointed credential retires the old provider's verdict pill
+            // and throttle streak — the shared clear every credential-replacing
+            // path runs (the `commit_endpoint` precedent), and the token
+            // collection re-reads so the fetch leg schedules the re-keyed
+            // profile's first fetch same-frame.
+            app.refresh_tokens();
+            clear_profile_status_chrome(app, &ProfileName::from(profile.as_str()));
+            // The new token row appears in store order; focus lands on it with
+            // the `✓` for `SHUNT_OK_MS`.
+            app.services.shunt_ok = Some((ShuntOkKey::Token(profile.clone()), Instant::now()));
+            app.services
+                .set_shunt_focus(Some(ShuntFocusLine::Token(profile.clone())));
+            app.toast(
+                ToastKind::Success,
+                format!(
+                    "{} uses the gateway\nthe gateway restarts once to read its token",
+                    escape_control(&profile)
+                ),
+            );
+        }
+        ShuntActionOutcome::TokenAddRefused { error } => {
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error)),
+            );
+        }
+        ShuntActionOutcome::TokenAddedProfileFailed { error } => {
+            // The token is stored, so the row stays; the copy already names
+            // which of the two failure shapes it was (the disk profile read in
+            // `run_add_client_token` decides), so the arm just toasts it.
+            app.services.shunt_save = None;
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error)),
+            );
+        }
+    }
+}
+
+/// Hold a failed `shunt check`'s stderr on the card, but only for the config
+/// the edit ran against: a re-adopt that landed while the check ran must never
+/// show another gateway's output on this card. A check-output-free refusal (or
+/// a non-typed error) retires a held output of its own kind only.
+fn hold_check_output(
+    app: &mut App,
+    config: &std::path::Path,
+    source: CheckOutputSource,
+    check_output: Option<crate::gateway::CheckStderr>,
+) {
+    let current = app
+        .services
+        .shunt_record
+        .as_ref()
+        .map(|record| record.config().to_path_buf());
+    if Some(config) != current.as_deref() {
+        app.services.check_output = None;
+        return;
+    }
+    match check_output {
+        Some(stderr) => app.services.check_output = Some(HeldCheckOutput { source, stderr }),
+        // A refusal with no output answers only its own kind's held output.
+        None => {
+            if app
+                .services
+                .check_output
+                .as_ref()
+                .is_some_and(|held| held.source == source)
+            {
+                app.services.check_output = None;
+            }
+        }
+    }
+}
+
+/// The entry key a `save <kind>` edit lands under, fixed at save START: for an
+/// upstream/model, the (unique) name/id with occurrence 0 (the engine refused
+/// a duplicate); for a route, the position after the pre-save view's routes.
+/// `None` on any non-add edit. The outcome drain reads the key this captured,
+/// never the draft or the live view.
+fn add_edit_entry_key(
+    edit: &crate::gateway_edit::Edit,
+    view: Option<&crate::gateway_edit::ConfigView>,
+) -> Option<ShuntEntryKey> {
+    use crate::gateway_edit::Edit;
+    match edit {
+        Edit::AddUpstream(new) => Some(ShuntEntryKey::Upstream {
+            name: new.name.clone(),
+            occurrence: 0,
+        }),
+        Edit::AddModel(new) => Some(ShuntEntryKey::Model {
+            id: new.id.clone(),
+            occurrence: 0,
+        }),
+        Edit::AddRoute(_) => view.map(|view| ShuntEntryKey::Route(view.routes.len() + 1)),
+        _ => None,
+    }
+}
+
+/// The focus target after a successful remove: the next entry row of the same
+/// group, else the previous one, else the group's `+ add <kind>` row. A route
+/// remove shifts every later route down by one, so its "next" is the route now
+/// at position p (the old p+1), computed against the pre-remove view.
+fn remove_focus_target(app: &App, removed: &ShuntEntryKey) -> Option<ShuntFocusLine> {
+    let view = config_view(app)?;
+    match removed {
+        ShuntEntryKey::Route(position) => {
+            let has_next = view
+                .routes
+                .iter()
+                .any(|route| route.position == *position + 1);
+            if has_next {
+                return Some(ShuntFocusLine::Entry(ShuntEntryKey::Route(*position)));
+            }
+            if *position > 1 {
+                return Some(ShuntFocusLine::Entry(ShuntEntryKey::Route(position - 1)));
+            }
+            add_row_offered(view, ShuntAddKind::Route)
+                .then_some(ShuntFocusLine::Add(ShuntAddKind::Route))
+        }
+        _ => {
+            let kind = entry_kind(removed);
+            let keys = config_entry_keys(view);
+            let idx = keys.iter().position(|key| key == removed)?;
+            let same_kind = |key: &ShuntEntryKey| entry_kind(key) == kind;
+            if let Some(next) = keys.iter().skip(idx + 1).find(|key| same_kind(key)) {
+                return Some(ShuntFocusLine::Entry(next.clone()));
+            }
+            if let Some(prev) = keys.iter().take(idx).rev().find(|key| same_kind(key)) {
+                return Some(ShuntFocusLine::Entry(prev.clone()));
+            }
+            add_row_offered(view, kind).then_some(ShuntFocusLine::Add(kind))
+        }
+    }
+}
+
+/// Whether focus still rests on a `+ add <kind>` save's own rows: the `+ add`
+/// row, one of its draft field rows, or its `save <kind>` row.
+fn focus_on_add_kind(app: &App, kind: ShuntAddKind) -> bool {
+    app.services
+        .focused_shunt_focus()
+        .is_some_and(|focus| match focus {
+            ShuntFocus::Add { kind: k } | ShuntFocus::SaveAdd { kind: k } => *k == kind,
+            ShuntFocus::Field {
+                key: ShuntFieldKey::Draft { kind: k, .. },
+            } => *k == kind,
+            _ => false,
+        })
+}
+
+/// Whether focus still rests on a removed entry's own rows: the entry row, one
+/// of its field rows, or its `remove <kind>` row.
+fn focus_on_removed_entry(app: &App, removed: &ShuntEntryKey) -> bool {
+    app.services
+        .focused_shunt_focus()
+        .is_some_and(|focus| match focus {
+            ShuntFocus::Entry { key } | ShuntFocus::Remove { key } => key == removed,
+            ShuntFocus::Field { key } => field_entry(key).as_ref() == Some(removed),
+            _ => false,
+        })
+}
+
+/// Whether focus still rests on the token row whose remove landed.
+fn focus_on_removed_token(app: &App, removed: &str) -> bool {
+    app.services.shunt_focus_kind() == Some(ShuntFocusLine::Token(removed.to_string()))
+}
+
+/// The focus target after a successful token remove: the next stored token row,
+/// else the previous one, else `+ add token` — read off the PRE-remove cached
+/// list, so the removed row's neighbours are its neighbours as it left.
+fn token_remove_focus_target(app: &App, removed: &str) -> Option<ShuntFocusLine> {
+    let stored = &app.services.shunt_tokens.stored;
+    let idx = stored.iter().position(|name| name == removed)?;
+    if let Some(next) = stored.get(idx + 1) {
+        return Some(ShuntFocusLine::Token(next.clone()));
+    }
+    if idx > 0 {
+        return Some(ShuntFocusLine::Token(stored[idx - 1].clone()));
+    }
+    Some(ShuntFocusLine::AddToken)
+}
+
+/// `↵` on a token row: open the token-remove confirm. A locked row opens no
+/// second confirm (ruling 2): the row is inert while its own remove checks.
+fn confirm_shunt_remove_token(app: &mut App, profile: &str) {
+    if app
+        .services
+        .saving(&ShuntSaveKey::Token(profile.to_string()))
+    {
+        return;
+    }
+    let Some(record) = app.services.shunt_record.clone() else {
+        return;
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("remove {}'s client token?", escape_control(profile)),
+        detail: Some(format!(
+            "{} keeps its api key, which stops working once the gateway restarts.",
+            escape_control(profile)
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::RemoveToken {
+            record,
+            profile: profile.to_string(),
+        },
+    }));
+}
+
+/// `↵`/`space` on `+ add token`: open the profile picker, one row per claude
+/// profile in roster order (the Overview's roster; codex profiles live in their
+/// own store, never here). An empty roster opens nothing: the `n` hint names
+/// the way to make one.
+fn open_token_picker(app: &mut App) {
+    if app.services.saving(&ShuntSaveKey::AddToken) {
+        return;
+    }
+    let stored = &app.services.shunt_tokens.stored;
+    let targets: Vec<(String, bool)> = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .map(|p| {
+                let name = p.name.to_string();
+                let has = stored.iter().any(|held| held == &name);
+                (name, has)
+            })
+            .collect()
+    };
+    if targets.is_empty() {
+        app.toast(
+            ToastKind::Info,
+            "no claude profile to give a token\npress n to create one",
+        );
+        return;
+    }
+    app.disarm_quit();
+    app.open_modal(Modal::TokenPicker(TokenPickerForm {
+        targets,
+        cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
+    }));
+}
+
+/// A picker pick: open the overwrite confirm naming what it replaces. The
+/// gateway base url is read here (a bind read failure toasts `add failed`, no
+/// confirm); the `replace` line follows the profile's current base url — an
+/// api-key endpoint reads `it replaces <base> and its current api key.` (or
+/// `it replaces <base>.` with no key), and a profile with no base url (an OAuth
+/// subscription login) reads the OAuth copy. A profile that vanished from the
+/// roster refuses with `add failed` / `<profile> no longer exists`, no confirm.
+fn open_token_overwrite_confirm(app: &mut App, profile: String) {
+    let Some(record) = app.services.shunt_record.clone() else {
+        app.toast(
+            ToastKind::Danger,
+            format!("add failed\n{NO_ADOPTED_CONFIG}"),
+        );
+        return;
+    };
+    let url = match crate::gateway::gateway_base_url(&record) {
+        Ok(url) => url,
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{}", escape_control(&error_toast_detail(&e))),
+            );
+            return;
+        }
+    };
+    let found = {
+        let cfg = app.config();
+        cfg.profiles
+            .iter()
+            .find(|p| p.name.as_str() == profile)
+            .map(|p| (p.base_url.clone(), p.api_key.is_some()))
+    };
+    let (base_url, has_key) = match found {
+        Some(pair) => pair,
+        None => {
+            // A profile that vanished from the roster (the picker opened over
+            // an older roster) refuses before any confirm, never minting.
+            app.toast(
+                ToastKind::Danger,
+                format!("add failed\n{} no longer exists", escape_control(&profile)),
+            );
+            return;
+        }
+    };
+    let replace = match (base_url.as_deref(), has_key) {
+        (Some(base), true) => Some(format!(
+            "it replaces {} and its current api key.",
+            escape_control(base)
+        )),
+        (Some(base), false) => Some(format!("it replaces {}.", escape_control(base))),
+        // An OAuth profile (no base url): the overwrite turns its subscription
+        // login into a gateway consumer, so the third line names that and the
+        // way back (the owner ruling 2026-10-12).
+        (None, _) => Some(
+            "it stops using its subscription login, which stays stored; clear its base url in Setup to go back."
+                .to_string(),
+        ),
+    };
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: format!("point {} at the shunt gateway?", escape_control(&profile)),
+        detail: Some(format!(
+            "its base url becomes {} and its api key a new client token.",
+            escape_control(&url)
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::AddToken {
+            record,
+            profile,
+            url,
+            replace,
+        },
+    }));
+}
+
+/// Re-key every route-positioned piece of state after removing the route at
+/// `position`: each `Route(n > position)` key moves down by one (the same
+/// route's new position), and `Route(position)` drops (its entry left the
+/// config). Upstreams and models are keyed by name/id and never shift.
+fn rekey_routes_after_remove(app: &mut App, position: usize) {
+    app.services.shunt_expanded = app
+        .services
+        .shunt_expanded
+        .iter()
+        .filter_map(|key| shift_entry_key(key, position))
+        .collect();
+    if let Some(state) = app.services.shunt_field_edit.clone() {
+        app.services.shunt_field_edit =
+            shift_field_key(&state.key, position).map(|key| ShuntFieldEditState {
+                key,
+                edit: state.edit,
+                refusal: state.refusal,
+            });
+    }
+    app.services.shunt_ok = app
+        .services
+        .shunt_ok
+        .take()
+        .and_then(|(key, at)| shift_ok_key(&key, position).map(|key| (key, at)));
+    let focus = app
+        .services
+        .shunt_focus_kind()
+        .and_then(|line| shift_focus_line(&line, position));
+    app.services.set_shunt_focus(focus);
+    // An open remove confirm's route key shifts with the other route-keyed
+    // state (ruling 5's list gains the open confirm). A shifted route confirm
+    // still names and removes its own route: the stored `RemoveRoute` edit
+    // moves down with the key, and the message is rebuilt from the shifted
+    // route so the copy names the route's new position. A confirm must never
+    // be left able only to refuse.
+    if let Some(Modal::Confirm(state)) = app.modals.last_mut()
+        && let ConfirmAction::RemoveEntry { key, edit } = &mut state.on_confirm
+        && let Some(shifted) = shift_entry_key(key, position)
+    {
+        *key = shifted;
+        if let crate::gateway_edit::Edit::RemoveRoute { route } = edit.as_mut()
+            && route.position > position
+        {
+            route.position -= 1;
+            state.message = remove_route_confirm_message(route);
+        }
+    }
+}
+
+/// Shift one entry key past a removed route; `None` when it names the removed
+/// route itself.
+fn shift_entry_key(key: &ShuntEntryKey, position: usize) -> Option<ShuntEntryKey> {
+    match key {
+        ShuntEntryKey::Route(p) if *p > position => Some(ShuntEntryKey::Route(p - 1)),
+        ShuntEntryKey::Route(p) if *p == position => None,
+        other => Some(other.clone()),
+    }
+}
+
+/// Shift one field key past a removed route; `None` when it names the removed
+/// route itself.
+fn shift_field_key(key: &ShuntFieldKey, position: usize) -> Option<ShuntFieldKey> {
+    match key {
+        ShuntFieldKey::Route { position: p, field } if *p > position => {
+            Some(ShuntFieldKey::Route {
+                position: p - 1,
+                field: *field,
+            })
+        }
+        ShuntFieldKey::Route { position: p, .. } if *p == position => None,
+        other => Some(other.clone()),
+    }
+}
+
+/// Shift one `✓` key past a removed route; `None` when it names the removed
+/// route itself.
+fn shift_ok_key(key: &ShuntOkKey, position: usize) -> Option<ShuntOkKey> {
+    match key {
+        ShuntOkKey::Entry(entry) => shift_entry_key(entry, position).map(ShuntOkKey::Entry),
+        ShuntOkKey::Field(field) => shift_field_key(field, position).map(ShuntOkKey::Field),
+        ShuntOkKey::Token(_) => Some(key.clone()),
+    }
+}
+
+/// Shift one held focus identity past a removed route; `None` when it names the
+/// removed route itself.
+fn shift_focus_line(line: &ShuntFocusLine, position: usize) -> Option<ShuntFocusLine> {
+    match line {
+        ShuntFocusLine::Entry(entry) => shift_entry_key(entry, position).map(ShuntFocusLine::Entry),
+        ShuntFocusLine::Field(field) => shift_field_key(field, position).map(ShuntFocusLine::Field),
+        ShuntFocusLine::Remove(entry) => {
+            shift_entry_key(entry, position).map(ShuntFocusLine::Remove)
+        }
+        other => Some(other.clone()),
     }
 }
 
@@ -5059,6 +9749,8 @@ pub(crate) fn delegates_check(
         detail,
         fix: None,
         problems: Vec::new(),
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
 }
 
@@ -5072,6 +9764,13 @@ pub(crate) struct StandaloneShunt {
     /// Why clauth could not read the bind shunt would listen on; `None` when
     /// it read one, or when no config and no env override set one.
     pub(crate) unread_bind: Option<UnreadBind>,
+    /// Why the found config itself could not be read, whatever set the bind:
+    /// an env bind hides this from `unread_bind`, and the adopt offer still
+    /// needs it.
+    pub(crate) unread_config: Option<UnreadConfig>,
+    /// The running daemon holds the singleton but recorded no env, so the
+    /// bind its adopt would read is unknown and the card offers no adopt.
+    pub(crate) unread_env: bool,
     /// The version a shunt-shaped `/health` answer reported, and the address
     /// that answered; `None` when nothing shunt-shaped answered.
     pub(crate) answer: Option<(String, std::net::SocketAddr)>,
@@ -5104,6 +9803,38 @@ impl UnreadBind {
     }
 }
 
+/// Why clauth could not read a found config at all. An adopt of it can only
+/// fail, so the card offers none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnreadConfig {
+    /// The config is YAML, which clauth does not parse.
+    Yaml,
+    /// The config file could not be read.
+    Unreadable,
+    /// The config is not valid TOML.
+    Unparsed,
+}
+
+impl UnreadConfig {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            UnreadConfig::Yaml => "yaml",
+            UnreadConfig::Unreadable => "unreadable",
+            UnreadConfig::Unparsed => "does not parse",
+        }
+    }
+}
+
+impl From<UnreadConfig> for UnreadBind {
+    fn from(unread: UnreadConfig) -> Self {
+        match unread {
+            UnreadConfig::Yaml => UnreadBind::Yaml,
+            UnreadConfig::Unreadable => UnreadBind::Unreadable,
+            UnreadConfig::Unparsed => UnreadBind::Unparsed,
+        }
+    }
+}
+
 /// The standalone readout from a discovery result, the `SHUNT_SERVER__BIND`
 /// value and one `/health` probe: of the bind clauth reads off the found TOML
 /// config and the env, else of shunt's default. A bind clauth cannot read
@@ -5116,22 +9847,43 @@ pub(crate) fn standalone_readout_from(
 ) -> StandaloneShunt {
     let (found, config_text, unread_config) = match discovered {
         Ok(Some(path)) => match std::fs::read_to_string(&path) {
-            Ok(text) => (Some(path), text, None),
-            Err(_) => (Some(path), String::new(), Some(UnreadBind::Unreadable)),
+            // The adopt's own check: a TOML name linked onto a YAML file, or a
+            // config that does not parse (an env bind skips the bind's parse),
+            // reads here but refuses there.
+            Ok(text) => match crate::gateway::adoptable_record(path.clone()) {
+                Ok(_) => (Some(path), text, None),
+                Err(e) if e.is::<crate::gateway::NotToml>() => {
+                    (Some(path), String::new(), Some(UnreadConfig::Yaml))
+                }
+                Err(e) if e.is::<crate::gateway::ConfigUnparsed>() => {
+                    (Some(path), String::new(), Some(UnreadConfig::Unparsed))
+                }
+                Err(_) => (Some(path), String::new(), Some(UnreadConfig::Unreadable)),
+            },
+            Err(_) => (Some(path), String::new(), Some(UnreadConfig::Unreadable)),
         },
         Ok(None) => (None, String::new(), None),
         Err(e) => match e.downcast_ref::<crate::gateway::YamlConfig>() {
             Some(yaml) => (
                 Some(yaml.path.clone()),
                 String::new(),
-                Some(UnreadBind::Yaml),
+                Some(UnreadConfig::Yaml),
             ),
             None => (None, String::new(), None),
         },
     };
-    let (addr, unread_bind) = match crate::gateway::resolve_bind(&config_text, env_bind) {
+    let resolved = match env_bind.map(crate::gateway::read_bind_env).transpose() {
+        Ok(env) => crate::gateway::resolve_bind(&config_text, env.as_deref()),
+        Err(refusal) => Err(refusal.into()),
+    };
+    let (addr, unread_bind) = match resolved {
         // An env override is the bind shunt uses whatever the config says.
-        Ok(bind) => (bind.probe, unread_config.filter(|_| env_bind.is_none())),
+        Ok(bind) => (
+            bind.probe,
+            unread_config
+                .filter(|_| env_bind.is_none())
+                .map(UnreadBind::from),
+        ),
         Err(e) => {
             let reason = match env_bind {
                 Some(value) => UnreadBind::Value(format!("{}={value}", crate::gateway::BIND_ENV)),
@@ -5151,27 +9903,49 @@ pub(crate) fn standalone_readout_from(
     StandaloneShunt {
         found,
         unread_bind,
+        unread_config,
+        unread_env: false,
         answer,
     }
 }
 
-/// [`standalone_readout_from`] over this process's cwd and env: the Services
-/// worker's prober.
+/// [`standalone_readout_from`] over the bind env the adopt reads
+/// ([`crate::gateway::inherited_bind_env`]): a refused one leaves the bind
+/// unknown, so the readout probes the config's own bind and marks
+/// `unread_env`. Every refusal that reader returns is `DaemonEnvUnrecorded`.
+pub(crate) fn standalone_readout_with(
+    discovered: anyhow::Result<Option<std::path::PathBuf>>,
+    env_bind: anyhow::Result<Option<String>>,
+    probe: impl Fn(std::net::SocketAddr) -> anyhow::Result<crate::gateway::Health>,
+) -> StandaloneShunt {
+    let mut readout = standalone_readout_from(
+        discovered,
+        env_bind.as_ref().ok().and_then(Option::as_deref),
+        probe,
+    );
+    readout.unread_env = env_bind.is_err();
+    readout
+}
+
+/// The readout over this process's cwd and the adopt's bind env: the
+/// Services worker's prober.
 fn standalone_probe() -> StandaloneShunt {
-    standalone_readout_from(
+    standalone_readout_with(
         crate::gateway::discover_config(),
-        std::env::var(crate::gateway::BIND_ENV).ok().as_deref(),
+        crate::gateway::inherited_bind_env(),
         crate::gateway::probe_health,
     )
 }
 
 /// The `shunt` row: the managed gateway's status dot + readout, from the slot
 /// `gateway_slot` resolves (the daemon's feed, or the record-only verdict).
-/// Read-only — no actions — so no fix and no problems. Pure over the slot plus
-/// the `supervised` flag (whether the slot came from a fresh daemon's feed) so
-/// the verdict logic unit-tests without touching `status.json`. With no
-/// gateway adopted (`absent`) the state reads `not adopted` and the
-/// `standalone` readout, once probed, names what runs without clauth.
+/// The FIELD lines only — the action section (the `enabled` row, the admin
+/// fix, the codex pool note and the MOVE PLAN) is appended by [`shunt_card`],
+/// which also fills the focus walk. Pure over the slot plus the `supervised`
+/// flag (whether the slot came from a fresh daemon's feed) so the verdict
+/// logic unit-tests without touching `status.json`. With no gateway adopted
+/// (`absent`) the state reads `not adopted` and the `standalone` readout, once
+/// probed, names what runs without clauth.
 pub(crate) fn shunt_check(
     slot: &crate::daemon::gateway::GatewaySlot,
     supervised: bool,
@@ -5196,11 +9970,23 @@ pub(crate) fn shunt_check(
                 escape_control(&path.to_string_lossy())
             ));
         }
-        if let Some(unread) = standalone.and_then(|s| s.unread_bind.as_ref()) {
+        if standalone.is_some_and(|s| s.unread_env) {
+            detail.push("the running daemon recorded no environment; restart it".to_string());
+        }
+        let unread_bind = standalone.and_then(|s| s.unread_bind.as_ref());
+        if let Some(unread) = unread_bind {
             detail.push(format!(
                 "bind: not read ({})",
                 escape_control(&unread.label())
             ));
+        }
+        // An env bind, read or refused, hides the config's own reason from
+        // the bind line; this line names it, since the card offers no adopt.
+        if let Some(unread) = standalone
+            .and_then(|s| s.unread_config)
+            .filter(|unread| unread_bind != Some(&UnreadBind::from(*unread)))
+        {
+            detail.push(format!("config: not read ({})", unread.label()));
         }
         if let Some((version, addr)) = standalone.and_then(|s| s.answer.as_ref()) {
             // A `:` in the version, followed by a space of its own or the one
@@ -5211,6 +9997,10 @@ pub(crate) fn shunt_check(
                 escape_control(version).replace(':', "\\u{3a}")
             ));
         }
+    } else if slot.state == GatewayState::Held {
+        // `held` is the feed's word; the card states what it means: the
+        // daemon holds the gateway off until its next start.
+        detail.push("state: stopped until the daemon restarts".to_string());
     } else {
         detail.push(format!("state: {}", gateway_state_word(slot.state)));
     }
@@ -5258,14 +10048,18 @@ pub(crate) fn shunt_check(
         detail,
         fix: None,
         problems: Vec::new(),
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
 }
 
-/// The gateway state's word — the same spelling `status.json` publishes.
+/// The gateway state's word — the same spelling `status.json` publishes,
+/// except `held`, which the card renders as its meaning (see [`shunt_check`]).
 fn gateway_state_word(state: GatewayState) -> &'static str {
     match state {
         GatewayState::Absent => "absent",
         GatewayState::Disabled => "disabled",
+        GatewayState::Held => "held",
         GatewayState::NoConfig => "no_config",
         GatewayState::YamlRefused => "yaml_refused",
         GatewayState::Misconfigured => "misconfigured",
@@ -5283,7 +10077,7 @@ fn gateway_state_word(state: GatewayState) -> &'static str {
 
 /// The gateway state's dot bucket: green healthy; amber starting/unhealthy/
 /// restarting/stopping; red the refusal states; dim absent/disabled/unobserved.
-fn gateway_health(state: GatewayState) -> Health {
+pub(crate) fn gateway_health(state: GatewayState) -> Health {
     match state {
         GatewayState::Healthy => Health::Ok,
         GatewayState::Starting
@@ -5296,7 +10090,1768 @@ fn gateway_health(state: GatewayState) -> Health {
         | GatewayState::YamlRefused
         | GatewayState::BelowFloor
         | GatewayState::NoConfig => Health::Danger,
-        GatewayState::Absent | GatewayState::Disabled | GatewayState::Unobserved => Health::Idle,
+        GatewayState::Absent
+        | GatewayState::Disabled
+        | GatewayState::Held
+        | GatewayState::Unobserved => Health::Idle,
+    }
+}
+
+/// The full `shunt` card: [`shunt_check`]'s field lines, then the action
+/// section — the blank line, the `enabled` toggle row, the admin fix (its
+/// explanation line above it), the `check output` line while a failed check's
+/// stderr is held, the codex pool note (or `pool` error), and the MOVE PLAN
+/// section. Fills the card's [`Check::shunt_focus`] (the fix lines, the
+/// `enabled` row and the `check output` row — the only actionable lines) and
+/// its first fix line's [`Check::fix`].
+///
+/// `daemon_absent` is the header chip's no-daemon liveness (the same
+/// [`crate::daemon::DaemonHealth::Absent`] the `[ daemon ]` chip reads):
+/// alongside `record.disabled` and the slot states whose supervisor holds no
+/// child, it is what "off" is derived from, never the feed's freshness.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn shunt_card(
+    slot: &crate::daemon::gateway::GatewaySlot,
+    supervised: bool,
+    daemon_absent: bool,
+    standalone: Option<&StandaloneShunt>,
+    record: Option<&crate::gateway::GatewayRecord>,
+    admin_need: Option<crate::gateway::AdminNeed>,
+    move_plan: Option<&MovePlanOutcome>,
+    pool: Option<&PoolOutcome>,
+    check_output: bool,
+) -> Check {
+    let mut check = shunt_check(slot, supervised, standalone);
+
+    // The "the daemon runs the gateway" note names the daemon only for a
+    // record the gateway WOULD run on with no daemon to run it (the
+    // `unobserved` verdict) — never for absent/disabled/no_config, where no
+    // gateway would run at all. It rides the field lines, before the action
+    // section, so the focus indices below stay true.
+    if !supervised && slot.state == GatewayState::Unobserved {
+        check.detail.push("the daemon runs the gateway".to_string());
+    }
+
+    if slot.state == GatewayState::Absent {
+        // `f  adopt config` sits directly under the absent card's lines, and
+        // only a readable TOML find whose bind clauth READ gets it: a YAML,
+        // unreadable or unparsed find, an unreadable bind, or a daemon env clauth cannot
+        // read offers nothing, since the adopt would only ever fail.
+        let toml = standalone.and_then(|s| {
+            if s.unread_bind.is_none() && s.unread_config.is_none() && !s.unread_env {
+                s.found.as_ref()
+            } else {
+                None
+            }
+        });
+        if let Some(path) = toml {
+            check.shunt_action_start = Some(check.detail.len());
+            let line = check.detail.len();
+            check
+                .detail
+                .push(fix_line(&ServiceFix::AdoptConfig(path.clone())));
+            check.shunt_focus.push(ShuntFocus::Fix {
+                line,
+                fix: ServiceFix::AdoptConfig(path.clone()),
+            });
+            check.fix = Some(ServiceFix::AdoptConfig(path.clone()));
+        }
+        return check;
+    }
+
+    let Some(record) = record else {
+        return check;
+    };
+
+    // `off` = the managed gateway cannot be answering on its bind: the record
+    // is `disabled`, no daemon holds the singleton, or the published slot is
+    // one in which the supervisor holds no child. That set, derived from
+    // `src/daemon/gateway.rs` at source: `idle_stops_child` names `absent`/
+    // `disabled`/`no_config`/`held`; the Idle intents `yaml_refused` and
+    // `misconfigured` publish only from the no-child path (a running child
+    // keeps its live slot, never `misconfigured`), and `binary_missing`,
+    // `below_floor` and `restarting` publish only after the child is gone
+    // (a spawn miss, a refused-and-held stop, the exit backoff). A `foreign`
+    // slot is never off (someone answers); a stale feed reads as unknown (a
+    // wedged daemon's gateway may still answer), so no MOVE PLAN.
+    let off = record.disabled
+        || daemon_absent
+        || matches!(
+            slot.state,
+            GatewayState::Disabled
+                | GatewayState::Held
+                | GatewayState::NoConfig
+                | GatewayState::YamlRefused
+                | GatewayState::Misconfigured
+                | GatewayState::BinaryMissing
+                | GatewayState::BelowFloor
+                | GatewayState::Restarting
+        );
+
+    check.shunt_action_start = Some(check.detail.len());
+    check.detail.push(String::new());
+
+    // `enabled` toggle row.
+    let line = check.detail.len();
+    check.detail.push("enabled".to_string());
+    check.shunt_focus.push(ShuntFocus::Enabled { line });
+
+    // The admin fix, its explanation line directly above the `f` line.
+    match admin_need {
+        Some(crate::gateway::AdminNeed::WriteKey) => {
+            check
+                .detail
+                .push("admin  clauth's key is not in [server.admin]".to_string());
+            let line = check.detail.len();
+            check.detail.push(fix_line(&ServiceFix::AddAdminKey));
+            check.shunt_focus.push(ShuntFocus::Fix {
+                line,
+                fix: ServiceFix::AddAdminKey,
+            });
+        }
+        Some(crate::gateway::AdminNeed::AdminTable) => {
+            check
+                .detail
+                .push("admin  no [server.admin] table".to_string());
+            let line = check.detail.len();
+            check.detail.push(fix_line(&ServiceFix::AddAdminTable));
+            check.shunt_focus.push(ShuntFocus::Fix {
+                line,
+                fix: ServiceFix::AddAdminTable,
+            });
+        }
+        Some(crate::gateway::AdminNeed::Neither) | None => {}
+    }
+
+    // The failed check's output, after the admin fix lines (an admin edit's
+    // sits right under the fix it came from; a config save's follows whatever
+    // fix line the card shows): an actionable line whose ↵/space opens the
+    // read-only masked-stderr modal.
+    if check_output {
+        let line = check.detail.len();
+        check.detail.push("check output".to_string());
+        check.shunt_focus.push(ShuntFocus::CheckOutput { line });
+    }
+
+    // The codex pool note, or the `pool` error in its place. Every provider
+    // name escapes control/bidi characters. These lines are short (and the
+    // `pool` error wraps), so they are not walk stops.
+    match pool {
+        Some(PoolOutcome::Providers(providers)) => {
+            for provider in providers {
+                check.detail.push(format!(
+                    "codex  provider {} needs its own pool login",
+                    escape_control(provider)
+                ));
+            }
+        }
+        Some(PoolOutcome::Error(error)) => {
+            check
+                .detail
+                .push(format!("pool  {}", escape_control(error)));
+        }
+        None => {}
+    }
+
+    // The MOVE PLAN section, only while a move is due (off, and the plan moves
+    // ≥1 file or refuses). A blank line precedes it (the herdr OPTIONS /
+    // Config-band spacing rule).
+    if off {
+        match move_plan {
+            Some(MovePlanOutcome::Plan(plan)) => {
+                check.detail.push(String::new());
+                check.detail.push("MOVE PLAN".to_string());
+                for file in &plan.moved {
+                    check
+                        .detail
+                        .push(format!("moves  {}", prose_path(&file.from)));
+                }
+                for kept in &plan.kept {
+                    check.detail.push(kept_line(kept));
+                }
+                let line = check.detail.len();
+                check.detail.push(fix_line(&ServiceFix::MoveStoresIn));
+                check.shunt_focus.push(ShuntFocus::Fix {
+                    line,
+                    fix: ServiceFix::MoveStoresIn,
+                });
+            }
+            Some(MovePlanOutcome::Refused(reason)) => {
+                check.detail.push(String::new());
+                check.detail.push("MOVE PLAN".to_string());
+                check
+                    .detail
+                    .push(format!("refused  {}", escape_control(reason)));
+            }
+            _ => {}
+        }
+    }
+
+    // The row's first fix line, never the `enabled` row.
+    check.fix = check.shunt_focus.iter().find_map(ShuntFocus::fix).cloned();
+    check
+}
+
+/// A `read_view` failure as the card's reason words: the config's own read
+/// failure reads `unreadable`, a TOML parse failure `does not parse`; an
+/// `EditRefusal` (a shape the editor does not read) carries the refusal's
+/// sentence, rendered as `config  not editable` under it. The `yaml` word never
+/// arises here: a loaded record's config was checked not to be YAML at adopt.
+/// An env file failure never reaches this: the view carries it typed.
+pub(crate) fn classify_shunt_config_read(e: &anyhow::Error) -> ShuntConfigRead {
+    if e.is::<std::io::Error>() {
+        return ShuntConfigRead::Unread(UnreadConfig::Unreadable);
+    }
+    if let Some(refusal) = e.downcast_ref::<crate::gateway_edit::EditRefusal>() {
+        return ShuntConfigRead::Refused(refusal.to_string());
+    }
+    ShuntConfigRead::Unread(UnreadConfig::Unparsed)
+}
+
+/// The config section's entry rows in render order — the one row model both the
+/// render and the focus walk derive from, so they cannot disagree for any view:
+/// under `ProviderForm::Legacy` there are no upstream entries, to either. An
+/// upstream and a model are each keyed by their name-or-id plus the occurrence
+/// index among entries of that kind sharing it (shunt keeps duplicate upstream
+/// names and duplicate map-less ids valid), so two same-name upstreams or
+/// same-id models are distinct rows.
+pub(crate) fn config_entry_keys(view: &crate::gateway_edit::ConfigView) -> Vec<ShuntEntryKey> {
+    let mut keys = Vec::new();
+    if let crate::gateway_edit::ProviderForm::Upstreams = view.form {
+        for (i, u) in view.upstreams.iter().enumerate() {
+            let name = entry_name(u.name.as_ref());
+            let occurrence = view
+                .upstreams
+                .iter()
+                .take(i)
+                .filter(|earlier| entry_name(earlier.name.as_ref()) == name)
+                .count();
+            keys.push(ShuntEntryKey::Upstream { name, occurrence });
+        }
+    }
+    for (i, m) in view.models.iter().enumerate() {
+        let id = entry_name(m.id.as_ref());
+        let occurrence = view
+            .models
+            .iter()
+            .take(i)
+            .filter(|earlier| entry_name(earlier.id.as_ref()) == id)
+            .count();
+        keys.push(ShuntEntryKey::Model { id, occurrence });
+    }
+    keys.extend(view.routes.iter().map(|r| ShuntEntryKey::Route(r.position)));
+    keys
+}
+
+/// The read `ConfigView` the shunt card's config section renders from.
+pub(crate) fn config_view(app: &App) -> Option<&crate::gateway_edit::ConfigView> {
+    match &app.services.shunt_config {
+        Some(ShuntConfigRead::Ok(view)) => Some(view.as_ref()),
+        _ => None,
+    }
+}
+
+/// The `BaseSource` an unmanaged client-token value came from, for the card's
+/// dim source word.
+fn token_source(source: crate::gateway_tokens::BaseSource) -> ShuntTokenSource {
+    match source {
+        crate::gateway_tokens::BaseSource::EnvFile(_) => ShuntTokenSource::EnvFile,
+        crate::gateway_tokens::BaseSource::Inherited => ShuntTokenSource::DaemonEnv,
+    }
+}
+
+/// A token read failure's sentence, for the `└` line under the group's
+/// `tokens  not read` / `other clients  not read` line: a typed refusal's own
+/// sentence, any other error its chain.
+fn token_read_reason(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<crate::gateway_tokens::ClientTokenRefusal>() {
+        Some(refusal) => refusal.to_string(),
+        None => error_toast_detail(e),
+    }
+}
+
+/// The client-token section's data, read beside the config view: the store's
+/// names and the unmanaged client names (with their source) from
+/// [`crate::gateway::client_auth`]. A store read failure records its sentence
+/// in `error` (no stored rows); a client-auth read failure records its
+/// sentence in `unmanaged_error` (the stored rows stay, the unmanaged rows read
+/// `other clients  not read`). Each keeps the `+ add token` row.
+fn read_shunt_tokens(record: &crate::gateway::GatewayRecord) -> ShuntTokens {
+    let stored: Vec<String> = match crate::gateway_tokens::ClientTokens::load() {
+        Ok(tokens) => tokens.names().map(str::to_string).collect(),
+        Err(e) => {
+            return ShuntTokens {
+                error: Some(token_read_reason(&e)),
+                ..ShuntTokens::default()
+            };
+        }
+    };
+    match crate::gateway::client_auth(record) {
+        Ok(auth) => match auth.unmanaged {
+            Some((crate::gateway_tokens::TokensState::Names(names), source)) => ShuntTokens {
+                stored,
+                unmanaged: names
+                    .into_iter()
+                    .map(|name| (name, token_source(source.clone())))
+                    .collect(),
+                ..ShuntTokens::default()
+            },
+            Some((crate::gateway_tokens::TokensState::Unparsed, source)) => ShuntTokens {
+                stored,
+                unparsed: Some((auth.variable, token_source(source))),
+                ..ShuntTokens::default()
+            },
+            Some((crate::gateway_tokens::TokensState::Unset, _)) | None => ShuntTokens {
+                stored,
+                ..ShuntTokens::default()
+            },
+        },
+        Err(e) => ShuntTokens {
+            stored,
+            unmanaged_error: Some(token_read_reason(&e)),
+            ..ShuntTokens::default()
+        },
+    }
+}
+
+/// The config entry rows as focus stops, in card order (the render tests'
+/// entry-only walk).
+#[cfg(test)]
+pub(crate) fn config_entry_stops(view: &crate::gateway_edit::ConfigView) -> Vec<ShuntFocus> {
+    config_entry_keys(view)
+        .into_iter()
+        .map(|key| ShuntFocus::Entry { key })
+        .collect()
+}
+
+/// The entry a [`ShuntEntryKey`] names, resolved by the key's own rule
+/// (name-or-id plus its occurrence index, route position) — the one lookup the
+/// render and the field model both go through, so a key and the row it names
+/// can never disagree.
+pub(crate) enum ConfigEntryRef<'a> {
+    Upstream(&'a crate::gateway_edit::UpstreamView),
+    Model(&'a crate::gateway_edit::ModelView),
+    Route(&'a crate::gateway_edit::RouteView),
+}
+
+pub(crate) fn entry_for_key<'a>(
+    view: &'a crate::gateway_edit::ConfigView,
+    key: &ShuntEntryKey,
+) -> Option<ConfigEntryRef<'a>> {
+    match key {
+        ShuntEntryKey::Upstream { name, occurrence } => view
+            .upstreams
+            .iter()
+            .filter(|u| entry_name(u.name.as_ref()) == *name)
+            .nth(*occurrence)
+            .map(ConfigEntryRef::Upstream),
+        ShuntEntryKey::Model { id, occurrence } => view
+            .models
+            .iter()
+            .filter(|m| entry_name(m.id.as_ref()) == *id)
+            .nth(*occurrence)
+            .map(ConfigEntryRef::Model),
+        ShuntEntryKey::Route(position) => view
+            .routes
+            .iter()
+            .find(|r| r.position == *position)
+            .map(ConfigEntryRef::Route),
+    }
+}
+
+/// The field rows one expanded entry renders, in render order — the single row
+/// model the render and the focus walk both derive from, so they cannot
+/// disagree for any view. The auth sub-rows follow the MODE (never the auth's
+/// spelling): `api_key` takes `auth env` + `auth header`, the four pool OAuth
+/// modes (`claude_oauth`, `chatgpt_oauth`, `kimi_oauth`, `antigravity_oauth`)
+/// take `account` (only when set) + `accounts`, every other mode or none takes
+/// neither. A model's `upstream_model` rows are keyed by their provider.
+pub(crate) fn entry_field_keys(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntEntryKey,
+) -> Vec<ShuntFieldKey> {
+    match entry_for_key(view, key) {
+        Some(ConfigEntryRef::Upstream(u)) => upstream_field_keys(key, u),
+        Some(ConfigEntryRef::Model(m)) => model_field_keys(key, m),
+        Some(ConfigEntryRef::Route(r)) => route_field_keys(r),
+        None => Vec::new(),
+    }
+}
+
+/// The auth sub-rows one auth mode shows — the single row model shared by
+/// C2's existing-entry rows, the draft's rows, and the add the draft builds,
+/// so the form never writes a key whose row the current mode does not show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthModeRows {
+    /// `api_key`: `auth env` + `auth header`.
+    ApiKey,
+    /// A pool OAuth mode: `account` (only when set, for an existing entry) +
+    /// `accounts`.
+    OAuth,
+    /// Any other mode, or none: no sub-rows.
+    None,
+}
+
+/// The sub-rows a mode name shows, per [`AuthModeRows`].
+fn auth_mode_rows(mode: Option<&str>) -> AuthModeRows {
+    match mode {
+        Some("api_key") => AuthModeRows::ApiKey,
+        Some("claude_oauth" | "chatgpt_oauth" | "kimi_oauth" | "antigravity_oauth") => {
+            AuthModeRows::OAuth
+        }
+        _ => AuthModeRows::None,
+    }
+}
+
+fn upstream_field_keys(
+    key: &ShuntEntryKey,
+    u: &crate::gateway_edit::UpstreamView,
+) -> Vec<ShuntFieldKey> {
+    let ShuntEntryKey::Upstream { name, occurrence } = key else {
+        unreachable!("an upstream field key names an upstream entry");
+    };
+    let at = |field| ShuntFieldKey::Upstream {
+        name: name.clone(),
+        occurrence: *occurrence,
+        field,
+    };
+    let mut keys = vec![
+        at(UpstreamFieldKind::Name),
+        at(UpstreamFieldKind::Provider),
+        at(UpstreamFieldKind::Kind),
+        at(UpstreamFieldKind::BaseUrl),
+        at(UpstreamFieldKind::AuthMode),
+    ];
+    if let Some(auth) = &u.auth {
+        match auth_mode_rows(auth.mode.as_ref().map(written_display).as_deref()) {
+            AuthModeRows::ApiKey => {
+                keys.push(at(UpstreamFieldKind::AuthEnv));
+                keys.push(at(UpstreamFieldKind::AuthHeader));
+            }
+            AuthModeRows::OAuth => {
+                if auth.account.is_some() {
+                    keys.push(at(UpstreamFieldKind::AuthAccount));
+                }
+                keys.push(at(UpstreamFieldKind::Accounts));
+            }
+            AuthModeRows::None => {}
+        }
+    }
+    keys.push(at(UpstreamFieldKind::Effort));
+    keys.push(at(UpstreamFieldKind::ServiceTier));
+    keys
+}
+
+fn model_field_keys(key: &ShuntEntryKey, m: &crate::gateway_edit::ModelView) -> Vec<ShuntFieldKey> {
+    let ShuntEntryKey::Model { id, occurrence } = key else {
+        unreachable!("a model field key names a model entry");
+    };
+    let mut keys = vec![
+        ShuntFieldKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+            field: ModelFieldKind::Id,
+        },
+        ShuntFieldKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+            field: ModelFieldKind::DisplayName,
+        },
+    ];
+    if let Some(map) = &m.upstream_model {
+        keys.extend(map.iter().map(|(provider, _)| ShuntFieldKey::Model {
+            id: id.clone(),
+            occurrence: *occurrence,
+            field: ModelFieldKind::UpstreamModel(provider.clone()),
+        }));
+    }
+    keys
+}
+
+fn route_field_keys(r: &crate::gateway_edit::RouteView) -> Vec<ShuntFieldKey> {
+    [
+        RouteFieldKind::Model,
+        RouteFieldKind::Provider,
+        RouteFieldKind::UpstreamModel,
+        RouteFieldKind::Effort,
+        RouteFieldKind::ServiceTier,
+    ]
+    .into_iter()
+    .map(|field| ShuntFieldKey::Route {
+        position: r.position,
+        field,
+    })
+    .collect()
+}
+
+/// The config section's focus stops in render order — the one row model both
+/// the render and the focus walk derive from: the `bind` row (only while not
+/// overridden and the env file read), `default_provider`, then each entry row
+/// and, when expanded, its field rows, then the `CLIENT TOKENS` group's stored
+/// token rows and its `+ add token` row. The legacy `providers` row and its
+/// note, the eyebrows and the unmanaged token rows are read-only and never take
+/// focus.
+pub(crate) fn config_field_stops(
+    view: &crate::gateway_edit::ConfigView,
+    expanded: &HashSet<ShuntEntryKey>,
+    drafts: &ShuntDrafts,
+    tokens: &ShuntTokens,
+) -> Vec<ShuntFocus> {
+    let mut stops = Vec::new();
+    if matches!(
+        view.server.bind_override,
+        crate::gateway_edit::BindOverride::None
+    ) {
+        stops.push(ShuntFocus::Field {
+            key: ShuntFieldKey::Bind,
+        });
+    }
+    stops.push(ShuntFocus::Field {
+        key: ShuntFieldKey::DefaultProvider,
+    });
+
+    let keys = config_entry_keys(view);
+    for kind in [
+        ShuntAddKind::Upstream,
+        ShuntAddKind::Model,
+        ShuntAddKind::Route,
+    ] {
+        for key in keys.iter().filter(|key| entry_kind(key) == kind) {
+            stops.push(ShuntFocus::Entry { key: key.clone() });
+            if expanded.contains(key) {
+                stops.extend(
+                    entry_field_keys(view, key)
+                        .into_iter()
+                        .map(|field| ShuntFocus::Field { key: field }),
+                );
+                if removable(view, key) {
+                    stops.push(ShuntFocus::Remove { key: key.clone() });
+                }
+            }
+        }
+        if add_row_offered(view, kind) {
+            stops.push(ShuntFocus::Add { kind });
+            if drafts.is_open(kind) {
+                stops.extend(
+                    draft_field_keys(view, kind, drafts)
+                        .into_iter()
+                        .map(|field| ShuntFocus::Field { key: field }),
+                );
+                stops.push(ShuntFocus::SaveAdd { kind });
+            }
+        }
+    }
+    // The stored token rows in name order, then `+ add token`. The unmanaged
+    // rows never join: they are faint and skipped by the walk.
+    stops.extend(
+        tokens
+            .stored
+            .iter()
+            .cloned()
+            .map(|name| ShuntFocus::Token { key: name }),
+    );
+    stops.push(ShuntFocus::AddToken);
+    stops
+}
+
+/// The group kind an entry key belongs to.
+pub(crate) fn entry_kind(key: &ShuntEntryKey) -> ShuntAddKind {
+    match key {
+        ShuntEntryKey::Upstream { .. } => ShuntAddKind::Upstream,
+        ShuntEntryKey::Model { .. } => ShuntAddKind::Model,
+        ShuntEntryKey::Route(_) => ShuntAddKind::Route,
+    }
+}
+
+/// Whether the `+ add <kind>` row is offered: upstreams only while the config
+/// declares `[[upstreams]]` (a legacy `[providers.*]` config's providers are
+/// read-only), models and routes always (the groups stay editable on legacy).
+pub(crate) fn add_row_offered(view: &crate::gateway_edit::ConfigView, kind: ShuntAddKind) -> bool {
+    match kind {
+        ShuntAddKind::Upstream => {
+            matches!(view.form, crate::gateway_edit::ProviderForm::Upstreams)
+        }
+        ShuntAddKind::Model | ShuntAddKind::Route => true,
+    }
+}
+
+/// Whether an expanded entry offers a `remove <kind>` row. The engine's
+/// `RemoveUpstream`/`RemoveModel` take the name/id alone and refuse a
+/// duplicated name/id (`Ctx::find` → `Ambiguous`), so a duplicated name or id
+/// has no remove row (`under-scoped`); routes are keyed by position and
+/// always removable.
+pub(crate) fn removable(view: &crate::gateway_edit::ConfigView, key: &ShuntEntryKey) -> bool {
+    match key {
+        ShuntEntryKey::Upstream { name, .. } => {
+            view.upstreams
+                .iter()
+                .filter(|u| entry_name(u.name.as_ref()) == *name)
+                .count()
+                == 1
+        }
+        ShuntEntryKey::Model { id, .. } => {
+            view.models
+                .iter()
+                .filter(|m| entry_name(m.id.as_ref()) == *id)
+                .count()
+                == 1
+        }
+        ShuntEntryKey::Route(_) => true,
+    }
+}
+
+/// The field rows one open draft renders, in render order — the same row model
+/// the focus walk derives from. The upstream draft's mode-dependent rows
+/// follow the draft's own `auth mode` (never the file's), mirroring C2's
+/// existing-entry row set; the model draft's `upstream_model` rows follow the
+/// config's current provider list.
+pub(crate) fn draft_field_keys(
+    view: &crate::gateway_edit::ConfigView,
+    kind: ShuntAddKind,
+    drafts: &ShuntDrafts,
+) -> Vec<ShuntFieldKey> {
+    let at = |field: ShuntDraftField| ShuntFieldKey::Draft { kind, field };
+    let mut keys = Vec::new();
+    match kind {
+        ShuntAddKind::Upstream => {
+            let Some(draft) = &drafts.upstream else {
+                return Vec::new();
+            };
+            let mut fields = vec![
+                ShuntDraftField::Upstream(UpstreamFieldKind::Name),
+                ShuntDraftField::Upstream(UpstreamFieldKind::Provider),
+                ShuntDraftField::Upstream(UpstreamFieldKind::Kind),
+                ShuntDraftField::Upstream(UpstreamFieldKind::BaseUrl),
+                ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode),
+            ];
+            match auth_mode_rows(draft.auth_mode.as_deref()) {
+                AuthModeRows::ApiKey => {
+                    fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::AuthEnv));
+                    fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::AuthHeader));
+                }
+                AuthModeRows::OAuth => {
+                    // A fresh draft offers `accounts` only: `account` appears
+                    // only when set, and a draft never sets it (no `account`
+                    // row), so a one-name list serves a single account.
+                    fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::Accounts));
+                }
+                AuthModeRows::None => {}
+            }
+            fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::Effort));
+            fields.push(ShuntDraftField::Upstream(UpstreamFieldKind::ServiceTier));
+            keys.extend(fields.into_iter().map(at));
+        }
+        ShuntAddKind::Model => {
+            if drafts.model.is_none() {
+                return Vec::new();
+            }
+            keys.push(at(ShuntDraftField::Model(ModelFieldKind::Id)));
+            keys.push(at(ShuntDraftField::Model(ModelFieldKind::DisplayName)));
+            keys.extend(provider_names(view).into_iter().map(|provider| {
+                at(ShuntDraftField::Model(ModelFieldKind::UpstreamModel(
+                    provider,
+                )))
+            }));
+        }
+        ShuntAddKind::Route => {
+            if drafts.route.is_none() {
+                return Vec::new();
+            }
+            keys.extend(
+                [
+                    RouteFieldKind::Model,
+                    RouteFieldKind::Provider,
+                    RouteFieldKind::UpstreamModel,
+                    RouteFieldKind::Effort,
+                    RouteFieldKind::ServiceTier,
+                ]
+                .into_iter()
+                .map(|field| at(ShuntDraftField::Route(field))),
+            );
+        }
+    }
+    keys
+}
+
+/// The provider names a model draft's `upstream_model` rows follow, in config
+/// order and one row per DISTINCT name (first occurrence's order): the
+/// `[[upstreams]]` names, or a legacy `[providers.*]` config's provider keys.
+/// Duplicate upstream names are valid for shunt, but a model maps provider →
+/// slug by name, so two rows would collide on one `ShuntFieldKey` and build a
+/// non-parse TOML map.
+fn provider_names(view: &crate::gateway_edit::ConfigView) -> Vec<String> {
+    let names: Vec<String> = match &view.form {
+        crate::gateway_edit::ProviderForm::Upstreams => view
+            .upstreams
+            .iter()
+            .map(|u| entry_name(u.name.as_ref()))
+            .collect(),
+        crate::gateway_edit::ProviderForm::Legacy { providers } => providers.clone(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .filter(|name| seen.insert(name.clone()))
+        .collect()
+}
+
+/// A draft field's committed value, `None` = unset (or the draft of that kind
+/// is closed, which a rendered draft field never is).
+fn draft_field_value(
+    drafts: &ShuntDrafts,
+    kind: ShuntAddKind,
+    field: &ShuntDraftField,
+) -> Option<String> {
+    match (kind, field) {
+        (ShuntAddKind::Upstream, ShuntDraftField::Upstream(field)) => {
+            let draft = drafts.upstream.as_ref()?;
+            match field {
+                UpstreamFieldKind::Name => draft.name.clone(),
+                UpstreamFieldKind::Provider => draft.provider.clone(),
+                UpstreamFieldKind::Kind => draft.kind.clone(),
+                UpstreamFieldKind::BaseUrl => draft.base_url.clone(),
+                UpstreamFieldKind::AuthMode => draft.auth_mode.clone(),
+                UpstreamFieldKind::AuthAccount => draft.account.clone(),
+                UpstreamFieldKind::Accounts => draft.accounts.clone(),
+                UpstreamFieldKind::AuthEnv => draft.env.clone(),
+                UpstreamFieldKind::AuthHeader => draft.header.clone(),
+                UpstreamFieldKind::Effort => draft.effort.clone(),
+                UpstreamFieldKind::ServiceTier => draft.service_tier.clone(),
+            }
+        }
+        (ShuntAddKind::Model, ShuntDraftField::Model(field)) => {
+            let draft = drafts.model.as_ref()?;
+            match field {
+                ModelFieldKind::Id => draft.id.clone(),
+                ModelFieldKind::DisplayName => draft.display_name.clone(),
+                ModelFieldKind::UpstreamModel(provider) => draft
+                    .upstream_model
+                    .iter()
+                    .find(|(name, _)| name == provider)
+                    .and_then(|(_, slug)| slug.clone()),
+            }
+        }
+        (ShuntAddKind::Route, ShuntDraftField::Route(field)) => {
+            let draft = drafts.route.as_ref()?;
+            match field {
+                RouteFieldKind::Model => draft.model.clone(),
+                RouteFieldKind::Provider => draft.provider.clone(),
+                RouteFieldKind::UpstreamModel => draft.upstream_model.clone(),
+                RouteFieldKind::Effort => draft.effort.clone(),
+                RouteFieldKind::ServiceTier => draft.service_tier.clone(),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Commit `value` into a draft field, in memory: empty text unsets it. The
+/// caller rebuilds the config stops afterwards, since a committed auth mode
+/// changes the mode-dependent row set.
+fn set_draft_field_value(
+    drafts: &mut ShuntDrafts,
+    kind: ShuntAddKind,
+    field: &ShuntDraftField,
+    value: &str,
+) {
+    let value = (!value.is_empty()).then(|| value.to_string());
+    match (kind, field) {
+        (ShuntAddKind::Upstream, ShuntDraftField::Upstream(field)) => {
+            let draft = drafts.upstream.get_or_insert_with(UpstreamDraft::default);
+            match field {
+                UpstreamFieldKind::Name => draft.name = value,
+                UpstreamFieldKind::Provider => draft.provider = value,
+                UpstreamFieldKind::Kind => draft.kind = value,
+                UpstreamFieldKind::BaseUrl => draft.base_url = value,
+                UpstreamFieldKind::AuthMode => draft.auth_mode = value,
+                UpstreamFieldKind::AuthAccount => draft.account = value,
+                UpstreamFieldKind::Accounts => draft.accounts = value,
+                UpstreamFieldKind::AuthEnv => draft.env = value,
+                UpstreamFieldKind::AuthHeader => draft.header = value,
+                UpstreamFieldKind::Effort => draft.effort = value,
+                UpstreamFieldKind::ServiceTier => draft.service_tier = value,
+            }
+        }
+        (ShuntAddKind::Model, ShuntDraftField::Model(field)) => {
+            let draft = drafts.model.get_or_insert_with(ModelDraft::default);
+            match field {
+                ModelFieldKind::Id => draft.id = value,
+                ModelFieldKind::DisplayName => draft.display_name = value,
+                ModelFieldKind::UpstreamModel(provider) => {
+                    if let Some((_, slug)) = draft
+                        .upstream_model
+                        .iter_mut()
+                        .find(|(name, _)| name == provider)
+                    {
+                        *slug = value;
+                    } else {
+                        draft.upstream_model.push((provider.clone(), value));
+                    }
+                }
+            }
+        }
+        (ShuntAddKind::Route, ShuntDraftField::Route(field)) => {
+            let draft = drafts.route.get_or_insert_with(RouteDraft::default);
+            match field {
+                RouteFieldKind::Model => draft.model = value,
+                RouteFieldKind::Provider => draft.provider = value,
+                RouteFieldKind::UpstreamModel => draft.upstream_model = value,
+                RouteFieldKind::Effort => draft.effort = value,
+                RouteFieldKind::ServiceTier => draft.service_tier = value,
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The value a field row renders and its editor opens on: the decoded string,
+/// else the file's own TOML text; the inner `None` = unset (renders `—`). The
+/// outer `None` = the key names no editable field. A draft field's value reads
+/// the open draft (the inner `None` = the draft's field is unset).
+pub(crate) fn shunt_field_value(
+    view: &crate::gateway_edit::ConfigView,
+    drafts: &ShuntDrafts,
+    key: &ShuntFieldKey,
+) -> Option<Option<String>> {
+    match key {
+        ShuntFieldKey::Bind => Some(written_value(view.server.bind.as_ref())),
+        ShuntFieldKey::DefaultProvider => {
+            Some(written_value(view.server.default_provider.as_ref()))
+        }
+        ShuntFieldKey::Draft { kind, field } => Some(draft_field_value(drafts, *kind, field)),
+        ShuntFieldKey::Upstream {
+            name,
+            occurrence,
+            field,
+        } => {
+            let key = ShuntEntryKey::Upstream {
+                name: name.clone(),
+                occurrence: *occurrence,
+            };
+            let ConfigEntryRef::Upstream(u) = entry_for_key(view, &key)? else {
+                unreachable!("an upstream field key resolves to an upstream");
+            };
+            Some(match field {
+                UpstreamFieldKind::Name => written_value(u.name.as_ref()),
+                UpstreamFieldKind::Provider => written_value(u.provider.as_ref()),
+                UpstreamFieldKind::Kind => written_value(u.kind.as_ref()),
+                UpstreamFieldKind::BaseUrl => written_value(u.base_url.as_ref()),
+                UpstreamFieldKind::AuthMode => {
+                    written_value(u.auth.as_ref().and_then(|a| a.mode.as_ref()))
+                }
+                UpstreamFieldKind::AuthAccount => {
+                    written_value(u.auth.as_ref().and_then(|a| a.account.as_ref()))
+                }
+                UpstreamFieldKind::Accounts => u
+                    .auth
+                    .as_ref()
+                    .and_then(|a| a.accounts.as_ref())
+                    .map(|accounts| accounts_joined(accounts))
+                    .filter(|names| !names.is_empty()),
+                UpstreamFieldKind::AuthEnv => {
+                    written_value(u.auth.as_ref().and_then(|a| a.env.as_ref()))
+                }
+                UpstreamFieldKind::AuthHeader => {
+                    written_value(u.auth.as_ref().and_then(|a| a.header.as_ref()))
+                }
+                UpstreamFieldKind::Effort => written_value(u.effort.as_ref()),
+                UpstreamFieldKind::ServiceTier => written_value(u.service_tier.as_ref()),
+            })
+        }
+        ShuntFieldKey::Model {
+            id,
+            occurrence,
+            field,
+        } => {
+            let key = ShuntEntryKey::Model {
+                id: id.clone(),
+                occurrence: *occurrence,
+            };
+            let ConfigEntryRef::Model(m) = entry_for_key(view, &key)? else {
+                unreachable!("a model field key resolves to a model");
+            };
+            Some(match field {
+                ModelFieldKind::Id => written_value(m.id.as_ref()),
+                ModelFieldKind::DisplayName => written_value(m.display_name.as_ref()),
+                ModelFieldKind::UpstreamModel(provider) => m
+                    .upstream_model
+                    .as_ref()
+                    .and_then(|map| map.iter().find(|(k, _)| k == provider))
+                    .map(|(_, slug)| written_value(Some(slug)))
+                    .unwrap_or(None),
+            })
+        }
+        ShuntFieldKey::Route { position, field } => {
+            let ConfigEntryRef::Route(r) = entry_for_key(view, &ShuntEntryKey::Route(*position))?
+            else {
+                unreachable!("a route field key resolves to a route");
+            };
+            Some(match field {
+                RouteFieldKind::Model => written_value(r.model.as_ref()),
+                RouteFieldKind::Provider => written_value(r.provider.as_ref()),
+                RouteFieldKind::UpstreamModel => written_value(r.upstream_model.as_ref()),
+                RouteFieldKind::Effort => written_value(r.effort.as_ref()),
+                RouteFieldKind::ServiceTier => written_value(r.service_tier.as_ref()),
+            })
+        }
+    }
+}
+
+/// A `Written` as its render value: the decoded string, else the raw TOML text.
+fn written_value(w: Option<&crate::gateway_edit::Written>) -> Option<String> {
+    w.map(written_display)
+}
+
+/// The `Edit` one field key's save produces, from the typed text (the picked
+/// value for a cycle row's pending pick). A typed field's empty text unsets the
+/// key; a rename's empty text renames to the empty string (the check refuses);
+/// an emptied accounts list removes the key.
+pub(crate) fn edit_for_field(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntFieldKey,
+    typed: &str,
+) -> Option<crate::gateway_edit::Edit> {
+    use crate::gateway_edit::{Edit, ModelField, RouteField, ServerField, UpstreamField};
+    let unset = |text: &str| (!text.is_empty()).then(|| text.to_string());
+    match key {
+        ShuntFieldKey::Bind => Some(Edit::Server {
+            field: ServerField::Bind,
+            value: unset(typed),
+        }),
+        ShuntFieldKey::DefaultProvider => Some(Edit::Server {
+            field: ServerField::DefaultProvider,
+            value: unset(typed),
+        }),
+        ShuntFieldKey::Upstream { name, field, .. } => match field {
+            UpstreamFieldKind::Name => Some(Edit::RenameUpstream {
+                name: name.clone(),
+                to: typed.to_string(),
+            }),
+            UpstreamFieldKind::Accounts => Some(Edit::SetAccounts {
+                name: name.clone(),
+                accounts: split_accounts(typed),
+            }),
+            UpstreamFieldKind::Provider => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::Provider,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::Kind => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::Kind,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::BaseUrl => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::BaseUrl,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthMode => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthMode,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthAccount => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthAccount,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthEnv => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthEnv,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::AuthHeader => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::AuthHeader,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::Effort => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::Effort,
+                value: unset(typed),
+            }),
+            UpstreamFieldKind::ServiceTier => Some(Edit::Upstream {
+                name: name.clone(),
+                field: UpstreamField::ServiceTier,
+                value: unset(typed),
+            }),
+        },
+        ShuntFieldKey::Model { id, field, .. } => match field {
+            ModelFieldKind::Id => Some(Edit::RenameModel {
+                id: id.clone(),
+                to: typed.to_string(),
+            }),
+            ModelFieldKind::DisplayName => Some(Edit::Model {
+                id: id.clone(),
+                field: ModelField::DisplayName,
+                value: unset(typed),
+            }),
+            ModelFieldKind::UpstreamModel(provider) => Some(Edit::Model {
+                id: id.clone(),
+                field: ModelField::UpstreamModel(provider.clone()),
+                value: unset(typed),
+            }),
+        },
+        ShuntFieldKey::Route { position, field } => {
+            let route = match entry_for_key(view, &ShuntEntryKey::Route(*position))? {
+                ConfigEntryRef::Route(r) => r.clone(),
+                _ => unreachable!("a route field key resolves to a route"),
+            };
+            let field = match field {
+                RouteFieldKind::Model => RouteField::Model,
+                RouteFieldKind::Provider => RouteField::Provider,
+                RouteFieldKind::UpstreamModel => RouteField::UpstreamModel,
+                RouteFieldKind::Effort => RouteField::Effort,
+                RouteFieldKind::ServiceTier => RouteField::ServiceTier,
+            };
+            Some(Edit::Route {
+                route,
+                field,
+                value: unset(typed),
+            })
+        }
+        // A draft field never produces a file edit: its commit lands in the
+        // draft (handled before `edit_for_field` is reached).
+        ShuntFieldKey::Draft { .. } => None,
+    }
+}
+
+/// Split a typed accounts list: comma-separated, each name trimmed, empties
+/// dropped, order kept.
+fn split_accounts(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The account names a `accounts` field renders, comma-joined.
+fn accounts_joined(accounts: &[crate::gateway_edit::AccountView]) -> String {
+    accounts
+        .iter()
+        .filter_map(account_display)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One account's name as it renders; `None` for a selection with no name.
+fn account_display(a: &crate::gateway_edit::AccountView) -> Option<String> {
+    match a {
+        crate::gateway_edit::AccountView::Name(w) => Some(escape_control(&written_display(w))),
+        crate::gateway_edit::AccountView::Selection { name: Some(w), .. } => {
+            Some(escape_control(&written_display(w)))
+        }
+        crate::gateway_edit::AccountView::Selection { name: None, .. } => None,
+    }
+}
+
+/// The cycle options of a cycle field, in shunt's own order (off shunt
+/// 532f5c7's config types): the upstream `provider` presets, `kind` minus the
+/// deprecated `antigravity_cli`, the `auth mode` enum, the `auth header` enum,
+/// and `service_tier`'s three normalized values. Empty = not a cycle row.
+pub(crate) fn cycle_options(key: &ShuntFieldKey) -> &'static [&'static str] {
+    match key {
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::Provider,
+            ..
+        } => &UPSTREAM_PROVIDERS,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::Kind,
+            ..
+        } => &KINDS,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::AuthMode,
+            ..
+        } => &AUTH_MODES,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::AuthHeader,
+            ..
+        } => &AUTH_HEADERS,
+        ShuntFieldKey::Upstream {
+            field: UpstreamFieldKind::ServiceTier,
+            ..
+        }
+        | ShuntFieldKey::Route {
+            field: RouteFieldKind::ServiceTier,
+            ..
+        } => &SERVICE_TIERS,
+        ShuntFieldKey::Draft { field, .. } => match field {
+            ShuntDraftField::Upstream(UpstreamFieldKind::Provider) => &UPSTREAM_PROVIDERS,
+            ShuntDraftField::Upstream(UpstreamFieldKind::Kind) => &KINDS,
+            ShuntDraftField::Upstream(UpstreamFieldKind::AuthMode) => &AUTH_MODES,
+            ShuntDraftField::Upstream(UpstreamFieldKind::AuthHeader) => &AUTH_HEADERS,
+            ShuntDraftField::Upstream(UpstreamFieldKind::ServiceTier)
+            | ShuntDraftField::Route(RouteFieldKind::ServiceTier) => &SERVICE_TIERS,
+            _ => &[],
+        },
+        _ => &[],
+    }
+}
+
+/// The upstream `provider` presets, in the order shunt's own preset table
+/// declares them.
+pub(crate) const UPSTREAM_PROVIDERS: [&str; 11] = [
+    "anthropic",
+    "codex",
+    "openai",
+    "xai",
+    "grok",
+    "kimi",
+    "cursor",
+    "kimi-code",
+    "zhipu",
+    "minimax-cn",
+    "opencode",
+];
+
+/// The `kind` values, `antigravity_cli` omitted (deprecated).
+pub(crate) const KINDS: [&str; 5] = ["anthropic", "responses", "cursor", "gemini", "antigravity"];
+
+/// The `auth` mode names, in the order shunt's `AuthMode` enum declares them.
+pub(crate) const AUTH_MODES: [&str; 10] = [
+    "passthrough",
+    "api_key",
+    "chatgpt_oauth",
+    "claude_oauth",
+    "xai_oauth",
+    "cursor_oauth",
+    "kimi_oauth",
+    "google_oauth",
+    "antigravity_oauth",
+    "none",
+];
+
+/// The `auth.header` names, in the order shunt's `ApiKeyHeader` enum declares
+/// them.
+pub(crate) const AUTH_HEADERS: [&str; 2] = ["bearer", "x_api_key"];
+
+/// The `service_tier` values, in the order `normalize_service_tier_value`
+/// reads them (the `fast` alias normalizes to `priority` and is not a pick).
+pub(crate) const SERVICE_TIERS: [&str; 3] = ["priority", "flex", "default"];
+
+/// Whether `key` is a cycle row (`space` moves the pick; `↵` at rest opens the
+/// typed custom-value editor).
+pub(crate) fn is_cycle_field(key: &ShuntFieldKey) -> bool {
+    !cycle_options(key).is_empty()
+}
+
+/// The field key a successful rename moves focus to: the renamed entry's
+/// name/id field under the new name, with the occurrence the rename gives it
+/// (rename never reorders, so the new occurrence is the count of same-named
+/// entries before it). Non-rename keys map to themselves.
+pub(crate) fn renamed_field_key(
+    view: &crate::gateway_edit::ConfigView,
+    key: &ShuntFieldKey,
+    to: &str,
+) -> Option<ShuntFieldKey> {
+    match key {
+        ShuntFieldKey::Upstream {
+            name,
+            occurrence,
+            field: UpstreamFieldKind::Name,
+        } => {
+            let idx = view
+                .upstreams
+                .iter()
+                .enumerate()
+                .filter(|(_, u)| entry_name(u.name.as_ref()) == *name)
+                .nth(*occurrence)
+                .map(|(i, _)| i)?;
+            let new_occurrence = view
+                .upstreams
+                .iter()
+                .take(idx)
+                .filter(|u| entry_name(u.name.as_ref()) == *to)
+                .count();
+            Some(ShuntFieldKey::Upstream {
+                name: to.to_string(),
+                occurrence: new_occurrence,
+                field: UpstreamFieldKind::Name,
+            })
+        }
+        ShuntFieldKey::Model {
+            id,
+            occurrence,
+            field: ModelFieldKind::Id,
+        } => {
+            let idx = view
+                .models
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| entry_name(m.id.as_ref()) == *id)
+                .nth(*occurrence)
+                .map(|(i, _)| i)?;
+            let new_occurrence = view
+                .models
+                .iter()
+                .take(idx)
+                .filter(|m| entry_name(m.id.as_ref()) == *to)
+                .count();
+            Some(ShuntFieldKey::Model {
+                id: to.to_string(),
+                occurrence: new_occurrence,
+                field: ModelFieldKind::Id,
+            })
+        }
+        _ => Some(key.clone()),
+    }
+}
+
+/// Drop every expanded key whose entry is not in `view` (an entry that left the
+/// config). Only a read view prunes — a failed read keeps the set.
+pub(crate) fn prune_shunt_expanded(
+    view: &crate::gateway_edit::ConfigView,
+    expanded: &mut HashSet<ShuntEntryKey>,
+) {
+    let live: HashSet<ShuntEntryKey> = config_entry_keys(view).into_iter().collect();
+    expanded.retain(|key| live.contains(key));
+}
+
+/// The name/id an entry is keyed by: the value as it renders, the raw TOML
+/// text when it is not a plain string, empty when the key is absent (a shape
+/// shunt itself would refuse).
+pub(crate) fn entry_name(w: Option<&crate::gateway_edit::Written>) -> String {
+    written_text(w).unwrap_or_default()
+}
+
+/// A `Written` as it renders: the decoded string when it is one, else the
+/// file's own text (a `${…}` reference stays unresolved, a number keeps its
+/// spelling).
+pub(crate) fn written_display(w: &crate::gateway_edit::Written) -> String {
+    w.value.clone().unwrap_or_else(|| w.raw.clone())
+}
+
+/// A `Written` as it renders: the decoded string when it is one, else the
+/// file's own text (a `${…}` reference stays unresolved, a number keeps its
+/// spelling).
+fn written_text(w: Option<&crate::gateway_edit::Written>) -> Option<String> {
+    w.map(written_display)
+}
+
+/// A path rendered inside a verbatim card line (a MOVE PLAN row): control and
+/// bidi characters spelled as their visible escape, everything else verbatim —
+/// the verbatim renderer never splits on `: `, so a Windows `C:` or a `: ` in
+/// the path passes through untouched.
+fn prose_path(path: &std::path::Path) -> String {
+    escape_control(&path.to_string_lossy())
+}
+
+/// One MOVE PLAN `stays`/`NoHome` row, in its rendered two-space form.
+fn kept_line(kept: &crate::gateway::KeptFile) -> String {
+    match kept {
+        crate::gateway::KeptFile::At { path, reason } => {
+            format!("stays  {}  {}", prose_path(path), kept_reason_word(*reason))
+        }
+        crate::gateway::KeptFile::NoHome { store } => {
+            format!("stays  {store}  no home to find it: set HOME in the env file")
+        }
+    }
+}
+
+/// The approved reason word for each [`crate::gateway::KeptReason`].
+fn kept_reason_word(reason: crate::gateway::KeptReason) -> &'static str {
+    match reason {
+        crate::gateway::KeptReason::LeftBehind => "not an account file",
+        crate::gateway::KeptReason::CodexLogin => "the codex CLI's own login",
+        crate::gateway::KeptReason::ClauthOwned => "already clauth's",
+        crate::gateway::KeptReason::HardLink => "linked under another name",
+        crate::gateway::KeptReason::LinkCountUnreadable => "link count unreadable",
+        crate::gateway::KeptReason::DuplicateSource => "named twice",
+    }
+}
+
+/// The move-plan worker's prober: reload the record and plan its store move.
+fn move_plan_probe() -> MovePlanOutcome {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return MovePlanOutcome::Unavailable;
+    };
+    match crate::gateway::plan_standalone_stores(&record) {
+        Ok(plan) if !plan.moved.is_empty() => MovePlanOutcome::Plan(plan),
+        Ok(_) => MovePlanOutcome::Nothing,
+        Err(e) => MovePlanOutcome::Refused(format!("{e:#}")),
+    }
+}
+
+/// The pool worker's prober: reload the record and ask the gateway which
+/// `chatgpt_oauth` providers have no pool login.
+fn pool_probe() -> PoolOutcome {
+    let Some(record) = crate::gateway::GatewayRecord::load().ok().flatten() else {
+        return PoolOutcome::Providers(Vec::new());
+    };
+    match crate::gateway::chatgpt_oauth_providers_needing_login(&record) {
+        Ok(providers) => PoolOutcome::Providers(providers),
+        Err(e) => PoolOutcome::Error(format!("{e:#}")),
+    }
+}
+
+/// The production action prober: run one confirmed shunt-card action to
+/// completion. The slow calls — the `/health` probe, the store plan, `shunt
+/// check` — never hold a frame here. Every error keeps its cause chain as
+/// [`error_toast_detail`] (root cause first): a failed write names its path in
+/// the context and why it failed only in the io error under it.
+fn run_shunt_action(job: ShuntActionJob) -> ShuntActionOutcome {
+    match job {
+        ShuntActionJob::Adopt { found } => run_adopt(&found),
+        ShuntActionJob::Move { record, confirmed } => run_move(&record, &confirmed),
+        ShuntActionJob::AddAdminKey { record } => {
+            run_admin_edit(&record, crate::gateway::AdminNeed::WriteKey)
+        }
+        ShuntActionJob::AddAdminTable { record } => {
+            run_admin_edit(&record, crate::gateway::AdminNeed::AdminTable)
+        }
+        ShuntActionJob::Hold => match crate::gateway::write_hold() {
+            Ok(()) => ShuntActionOutcome::Held,
+            Err(e) => ShuntActionOutcome::HoldFailed {
+                error: error_toast_detail(&e),
+            },
+        },
+        ShuntActionJob::RemoveHold => match crate::gateway::remove_hold() {
+            Ok(()) => ShuntActionOutcome::Released,
+            Err(e) => ShuntActionOutcome::ReleaseFailed {
+                error: error_toast_detail(&e),
+            },
+        },
+        ShuntActionJob::ConfigEdit {
+            record,
+            edit,
+            key,
+            confirmed,
+        } => run_config_edit(&record, &edit, key, confirmed),
+        ShuntActionJob::RemoveToken { record, profile } => {
+            run_remove_client_token(&record, &profile)
+        }
+        ShuntActionJob::AddToken {
+            record,
+            profile,
+            url,
+            config,
+        } => run_add_client_token(&record, &profile, &url, &config),
+    }
+}
+
+/// A token op's error as its message: a [`ClientTokenRefusal`]'s own sentence,
+/// any other error its chain (`{e:#}`).
+fn token_error_message(e: &anyhow::Error) -> String {
+    match e.downcast_ref::<crate::gateway_tokens::ClientTokenRefusal>() {
+        Some(refusal) => refusal.to_string(),
+        None => format!("{e:#}"),
+    }
+}
+
+/// Revoke one profile's client token through the engine, classifying the
+/// failure the card's rules name: a refusal (the last-token guard or a read
+/// failure) keeps its own sentence for the `└` line; anything else is an
+/// untyped failure.
+fn run_remove_client_token(
+    record: &crate::gateway::GatewayRecord,
+    profile: &str,
+) -> ShuntActionOutcome {
+    match crate::gateway_tokens::remove_client_token(record, profile) {
+        Ok(removed) => ShuntActionOutcome::TokenRemoved {
+            profile: profile.to_string(),
+            removed,
+        },
+        Err(e) => {
+            if let Some(refusal) = e.downcast_ref::<crate::gateway_tokens::ClientTokenRefusal>() {
+                ShuntActionOutcome::TokenRemoveRefused {
+                    profile: profile.to_string(),
+                    sentence: refusal.to_string(),
+                }
+            } else {
+                ShuntActionOutcome::TokenRemoveFailed {
+                    error: format!("{e:#}"),
+                }
+            }
+        }
+    }
+}
+
+/// Mint a client token for `profile`, then point it at the gateway through the
+/// one endpoint write path ([`crate::actions::edit_profile_endpoint`], its own
+/// locking). The token never reaches an outcome, a log line or a `Debug`.
+fn run_add_client_token(
+    record: &crate::gateway::GatewayRecord,
+    profile: &str,
+    url: &str,
+    config: &JobConfig,
+) -> ShuntActionOutcome {
+    let profile_name = ProfileName::from(profile);
+    // A profile that vanished between the picker and the job refuses before
+    // any mint: the config lock is taken and dropped ahead of the state flock
+    // `add_client_token` takes (config → flock is the ranked order), so nothing
+    // is minted and the gateway never restarts for a deleted profile.
+    {
+        let cfg = App::lock_config(&config.0);
+        if cfg.find(&profile_name).is_none() {
+            return ShuntActionOutcome::TokenAddRefused {
+                error: format!("{profile} no longer exists"),
+            };
+        }
+    }
+    let token = match crate::gateway_tokens::add_client_token(record, profile) {
+        Ok(token) => token,
+        Err(e) => {
+            return ShuntActionOutcome::TokenAddRefused {
+                error: token_error_message(&e),
+            };
+        }
+    };
+    let mut cfg = App::lock_config(&config.0);
+    match crate::actions::edit_profile_endpoint(
+        &mut cfg,
+        &profile_name,
+        Some(url.to_string()),
+        Some(token.expose().to_string()),
+    ) {
+        Ok(()) => ShuntActionOutcome::TokenAdded {
+            profile: profile.to_string(),
+        },
+        Err(e) => {
+            // Decide the copy from the profile as saved on disk after the
+            // error (the reload's source), never the in-memory copy the write
+            // may already have mutated: the save landed and only the
+            // active-profile settings write failed -> the profile points at
+            // the gateway; the save itself failed -> it was not changed. Both
+            // legs must match: a re-mint of a profile already on the gateway
+            // whose save then failed keeps its OLD key on disk, so it was not
+            // changed even though its base url still matches the gateway. The
+            // token only takes part in this comparison, never a message.
+            let points_at_gateway = crate::profile::load_profile(&profile_name)
+                .ok()
+                .is_some_and(|saved| {
+                    saved.base_url.as_deref() == Some(url)
+                        && saved.api_key.as_deref() == Some(token.expose())
+                });
+            ShuntActionOutcome::TokenAddedProfileFailed {
+                error: if points_at_gateway {
+                    format!("{profile} points at the gateway, but {e:#}")
+                } else {
+                    format!("the token is stored but {profile} was not changed: {e:#}")
+                },
+            }
+        }
+    }
+}
+
+/// Save one config field through the E1 engine, classifying the failure the
+/// card's rules name: an [`EditRefusal`] keeps its own sentence, a
+/// [`ConfigEditRefusal::CheckFailed`] its compact line + held stderr, anything
+/// else the error chain (root cause first).
+fn run_config_edit(
+    record: &crate::gateway::GatewayRecord,
+    edit: &crate::gateway_edit::Edit,
+    key: ShuntSaveKey,
+    confirmed: bool,
+) -> ShuntActionOutcome {
+    use crate::gateway::ConfigEditRefusal;
+    match crate::gateway_edit::apply_edit(record, edit) {
+        Ok(applied) => ShuntActionOutcome::ConfigSaved {
+            key,
+            written: applied.written,
+            restart_only: applied.restart_only,
+            value: edit_save_value(edit),
+            confirmed,
+        },
+        Err(e) => {
+            if let Some(refusal) = e.downcast_ref::<crate::gateway_edit::EditRefusal>() {
+                return ShuntActionOutcome::ConfigRefused {
+                    key,
+                    sentence: refusal.to_string(),
+                };
+            }
+            if let Some(ConfigEditRefusal::CheckFailed {
+                binary,
+                config,
+                code,
+                stderr,
+            }) = e.downcast_ref::<ConfigEditRefusal>()
+            {
+                return ShuntActionOutcome::ConfigCheckFailed {
+                    error: check_refused_line(binary, config, code, "save"),
+                    check_output: Some(stderr.clone()),
+                    config: record.config().to_path_buf(),
+                };
+            }
+            ShuntActionOutcome::ConfigFailed {
+                error: error_toast_detail(&e),
+            }
+        }
+    }
+}
+
+/// The value a field save writes, for the saving row's shimmer and the bind
+/// restart toast: the new value, the rename target, the accounts list, or
+/// `None` for an unset.
+fn edit_save_value(edit: &crate::gateway_edit::Edit) -> Option<String> {
+    use crate::gateway_edit::Edit;
+    match edit {
+        Edit::Server { value, .. }
+        | Edit::Upstream { value, .. }
+        | Edit::Model { value, .. }
+        | Edit::Route { value, .. } => value.clone(),
+        Edit::RenameUpstream { to, .. } | Edit::RenameModel { to, .. } => Some(to.clone()),
+        Edit::SetAccounts { accounts, .. } => Some(accounts.join(", ")),
+        Edit::AddUpstream(_)
+        | Edit::AddModel(_)
+        | Edit::AddRoute(_)
+        | Edit::RemoveUpstream { .. }
+        | Edit::RemoveModel { .. }
+        | Edit::RemoveRoute { .. }
+        | Edit::RequireClientTokens => None,
+    }
+}
+
+/// Adopt `found`: probe the candidate, plan its stores, and write the record
+/// (`disabled` while a move is due, enabled when nothing moves).
+fn run_adopt(found: &std::path::Path) -> ShuntActionOutcome {
+    use crate::gateway::Health;
+    let candidate = match crate::gateway::adoptable_record(found.to_path_buf()) {
+        Ok(candidate) => candidate,
+        Err(e) => {
+            return ShuntActionOutcome::AdoptFailed {
+                error: error_toast_detail(&e),
+            };
+        }
+    };
+    let addr = match crate::gateway::gateway_probe(&candidate) {
+        Ok(addr) => addr,
+        Err(e) => {
+            return ShuntActionOutcome::AdoptFailed {
+                error: error_toast_detail(&e),
+            };
+        }
+    };
+    match crate::gateway::probe_health(addr) {
+        // A standalone shunt answers: refuse the adopt, write nothing.
+        Ok(Health::Shunt { version }) => {
+            return ShuntActionOutcome::AdoptRefused {
+                version: escape_control(&version),
+                addr,
+            };
+        }
+        Ok(Health::Silent(_) | Health::NotShunt { .. }) | Err(_) => {}
+    }
+    // The record stays `disabled` until the move lands: a plan with a file to
+    // move (or a refusal) leaves the gateway off so the daemon never starts it
+    // on empty stores; a plan with nothing to move adopts enabled.
+    let disabled = match crate::gateway::plan_standalone_stores(&candidate) {
+        Ok(plan) => !plan.moved.is_empty(),
+        Err(_) => true,
+    };
+    let mut record = candidate;
+    record.disabled = disabled;
+    let result = crate::gateway::GatewayRecord::update(|slot| {
+        if slot.is_some() {
+            // Another surface adopted a config meanwhile.
+            anyhow::bail!("a gateway is already adopted");
+        }
+        *slot = Some(record.clone());
+        Ok(())
+    });
+    match result {
+        Ok(()) => ShuntActionOutcome::Adopted {
+            path: escape_control(&found.to_string_lossy()),
+        },
+        Err(e) => ShuntActionOutcome::AdoptFailed {
+            error: error_toast_detail(&e),
+        },
+    }
+}
+
+/// Move a stopped standalone's stores in behind a fresh silent proof, then the
+/// record lands `disabled = false` so the daemon starts the gateway.
+fn run_move(
+    record: &crate::gateway::GatewayRecord,
+    confirmed: &crate::gateway::StoreMovePlan,
+) -> ShuntActionOutcome {
+    use crate::gateway::Health;
+    let addr = match crate::gateway::gateway_probe(record) {
+        Ok(addr) => addr,
+        Err(e) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: error_toast_detail(&e),
+            };
+        }
+    };
+    let proof = match crate::gateway::probe_health(addr) {
+        Ok(Health::Silent(proof)) => proof,
+        // A shunt answering is the orchestrator's composition of the adopt
+        // warning copy under the `move failed` head (flagged in the report).
+        Ok(Health::Shunt { version }) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: format!("shunt {} answers on {addr}", escape_control(&version)),
+            };
+        }
+        Ok(Health::NotShunt { status }) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: format!("something other than shunt answers on {addr} (status {status})"),
+            };
+        }
+        Err(e) => {
+            return ShuntActionOutcome::MoveFailed {
+                error: error_toast_detail(&e),
+            };
+        }
+    };
+    match crate::gateway::move_standalone_stores(record, proof, confirmed) {
+        Ok(moved) => {
+            let disabled_off = crate::gateway::GatewayRecord::update(|slot| {
+                if let Some(held) = slot.as_mut() {
+                    held.disabled = false;
+                }
+                Ok(())
+            });
+            match disabled_off {
+                Ok(()) => ShuntActionOutcome::Moved {
+                    n: moved.moved.len(),
+                },
+                // The stores moved, so `moved <N> …` still shows; the record
+                // write failed, so the `save failed` toast follows it.
+                Err(e) => ShuntActionOutcome::MovedEnableFailed {
+                    n: moved.moved.len(),
+                    error: error_toast_detail(&e),
+                },
+            }
+        }
+        Err(e) => ShuntActionOutcome::MoveFailed {
+            error: error_toast_detail(&e),
+        },
+    }
+}
+
+/// One compact toast line for a typed admin refusal: outcome first, files by
+/// basename. The `CheckFailed` arm appends the `↵ check output` pointer, whose
+/// tail may clip on a 38-cell terminal while the outcome stays in view.
+fn admin_refusal_line(refusal: &crate::gateway::ConfigEditRefusal) -> String {
+    use crate::gateway::{AdminNeed, ConfigEditRefusal as R};
+    match refusal {
+        R::Needs(AdminNeed::AdminTable) => {
+            "the config has no [server.admin] table; adding one enables shunt's admin API and is its own step".to_string()
+        }
+        R::Needs(AdminNeed::WriteKey) => {
+            "the config already has a [server.admin] table; clauth's write key goes into it instead".to_string()
+        }
+        R::Needs(AdminNeed::Neither) => "the config already carries clauth's write key".to_string(),
+        R::ForeignClauthKey => format!(
+            "[server.admin] already has a write key with id {:?} holding another key; clauth adds none beside it; remove that entry, then run the edit again",
+            crate::gateway::WRITE_KEY_ID
+        ),
+        R::UnexpectedShape { what } => {
+            format!("{what}; clauth edits only a [server.admin] table and its write_keys array")
+        }
+        R::TokenPathUnusable { path } => {
+            let why = if path.to_str().is_some() {
+                "holds a `}`"
+            } else {
+                "is not UTF-8"
+            };
+            format!(
+                "the clauth dir path {why} · the admin key cannot be a ${{file:}} reference"
+            )
+        }
+        R::Symlink { path } => {
+            format!("{} is a symlink · clauth would replace the link by renaming over it", file_basename(path))
+        }
+        R::ShuntMissing { binary } => {
+            format!("cannot run {}: no such file · install shunt or point the gateway at its binary", file_basename(binary))
+        }
+        R::CheckFailed {
+            binary,
+            config,
+            code,
+            ..
+        } => check_refused_line(binary, config, code, "edit"),
+        R::ChangedDuringEdit { path } => {
+            format!("{} changed during the check · nothing was written · run the edit again", file_basename(path))
+        }
+        R::CheckTimedOut {
+            binary,
+            config,
+            after,
+        } => format!(
+            "`{} check` ran past {after:?} and was stopped · {} unchanged · run `{} check --config {}` to see why it does not finish, then try again",
+            file_basename(binary),
+            file_basename(config),
+            file_basename(binary),
+            config.display(),
+        ),
+    }
+}
+
+/// A path's basename for a compact toast line, the path itself when it has no
+/// file name.
+fn file_basename(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// The compact `shunt check` refusal line shared by the admin edit and a field
+/// save: outcome first, files by basename, the `↵ check output` pointer. `op`
+/// names the refused operation (`edit` / `save`).
+fn check_refused_line(
+    binary: &std::path::Path,
+    config: &std::path::Path,
+    code: &Option<i32>,
+    op: &str,
+) -> String {
+    let status = match code {
+        Some(code) => format!("exit {code}"),
+        None => "killed by a signal".to_string(),
+    };
+    format!(
+        "`{} check` refused the {op} ({status}) · {} unchanged · {} check output on the shunt card",
+        file_basename(binary),
+        file_basename(config),
+        prose::key("↵"),
+    )
+}
+
+/// Add clauth's admin write key (or a whole `[server.admin]` table) behind the
+/// engine's own `shunt check` gate.
+fn run_admin_edit(
+    record: &crate::gateway::GatewayRecord,
+    step: crate::gateway::AdminNeed,
+) -> ShuntActionOutcome {
+    let result = match step {
+        crate::gateway::AdminNeed::WriteKey => crate::gateway::add_admin_write_key(record),
+        crate::gateway::AdminNeed::AdminTable => crate::gateway::add_admin_table(record),
+        // Only offered when the config needs this exact step.
+        crate::gateway::AdminNeed::Neither => Ok(crate::gateway::AdminEdit::AlreadyPresent),
+    };
+    match result {
+        // Another writer added the key between the recompute and this worker:
+        // nothing was added, so no success toast (the recompute re-reads it).
+        Ok(crate::gateway::AdminEdit::AlreadyPresent) => ShuntActionOutcome::NoOp,
+        Ok(_) => ShuntActionOutcome::AdminAdded,
+        Err(e) => match e.downcast_ref::<crate::gateway::ConfigEditRefusal>() {
+            Some(refusal) => {
+                use crate::gateway::ConfigEditRefusal as R;
+                let check_output = match refusal {
+                    R::CheckFailed { stderr, .. } => Some(stderr.clone()),
+                    R::Needs(_)
+                    | R::ForeignClauthKey
+                    | R::UnexpectedShape { .. }
+                    | R::TokenPathUnusable { .. }
+                    | R::Symlink { .. }
+                    | R::ShuntMissing { .. }
+                    | R::ChangedDuringEdit { .. }
+                    | R::CheckTimedOut { .. } => None,
+                };
+                ShuntActionOutcome::AdminFailed {
+                    error: admin_refusal_line(refusal),
+                    check_output,
+                    config: record.config().to_path_buf(),
+                }
+            }
+            None => ShuntActionOutcome::AdminFailed {
+                error: error_toast_detail(&e),
+                check_output: None,
+                config: record.config().to_path_buf(),
+            },
+        },
     }
 }
 
@@ -5316,12 +11871,33 @@ pub(crate) fn escape_control(s: &str) -> String {
         .collect()
 }
 
+/// A compact toast detail from an `anyhow::Error`: the root cause first (it
+/// must stay on screen), then the rest of the chain outermost-first, joined by
+/// ` · `. Paths stay in full there — they may clip, the cause may not. Logs
+/// and the CLI keep the full `{e:#}` Display.
+fn error_toast_detail(err: &anyhow::Error) -> String {
+    let chain: Vec<String> = err.chain().map(ToString::to_string).collect();
+    match chain.as_slice() {
+        [] => String::new(),
+        [only] => only.clone(),
+        [.., root] => {
+            let mut parts = vec![root.clone()];
+            parts.extend(chain[..chain.len() - 1].iter().cloned());
+            parts.join(" · ")
+        }
+    }
+}
+
+/// The clause an outdated plugin install's version line carries; the services
+/// renderer tones that line by it, so the copy and its color share one spelling.
+pub(crate) const OUTDATED_PLUGIN_MARK: &str = "this clauth is";
+
 /// The `plugin` row: one detail holding the plugin install, the mcpServers
 /// entry (+ the `r`-gated start probe), then the Claude Code version, clauth
 /// on PATH and the data dir, a blank line between the three groups. The
 /// install leads because installing is the fix a fresh box needs, and it also
 /// registers the server. Health is the worst of the four; the fixable problems
-/// walk in detail order, so list-level `f` installs first. `clauth_path` is
+/// walk in detail order, so list-level `f` lands on install first. `clauth_path` is
 /// passed in (the recompute also gates the start probe on it) so the verdict
 /// logic unit-tests without a live `PATH`.
 fn plugin_check(
@@ -5342,8 +11918,8 @@ fn plugin_check(
     let plugin_global = records.iter().any(|r| r.scope.as_deref() == Some("user"));
 
     // plugin install record — installed-only verdict (CC exposes no clean
-    // per-scope "enabled" boolean, so the row reports presence + scope, not
-    // enabled/disabled).
+    // per-scope "enabled" boolean, so the row reports presence, scope and
+    // version, not enabled/disabled).
     let marketplace = probe::marketplace_known();
     // The operative record is the `user`-scope install when one exists; a stale
     // project/local row that sorts first must not name the install beside a
@@ -5354,9 +11930,23 @@ fn plugin_check(
         .or_else(|| records.first());
     if let Some(record) = record_for_check {
         let scope = record.scope.as_deref();
+        // Claude Code caches the plugin by its manifest version, so a user
+        // install older than this binary keeps serving the old tree until it
+        // is reinstalled, and the install fix updates it. A newer install is a
+        // newer clauth's, which the install never downgrades.
+        let this_version = crate::update::CURRENT_VERSION;
+        let outdated = plugin_global
+            && record
+                .version
+                .as_deref()
+                .is_some_and(|installed| crate::update::is_newer(this_version, installed));
         detail.push(format!("installed: yes ({})", scope.unwrap_or("?")));
         if let Some(version) = &record.version {
-            detail.push(format!("version: {version}"));
+            detail.push(if outdated {
+                format!("version: {version} ({OUTDATED_PLUGIN_MARK} {this_version})")
+            } else {
+                format!("version: {version}")
+            });
         }
         if let Some(sha) = &record.git_commit_sha {
             detail.push(format!(
@@ -5376,7 +11966,15 @@ fn plugin_check(
         if let Some(repo) = marketplace.as_ref().and_then(|m| m.repo.as_ref()) {
             detail.push(format!("marketplace: {repo}"));
         }
-        if plugin_global {
+        if outdated {
+            let line = detail.len();
+            detail.push(fix_line(&ServiceFix::InstallPlugin));
+            problems.push(Problem {
+                line,
+                fix: ServiceFix::InstallPlugin,
+            });
+            health = worst(health, Health::Warn);
+        } else if plugin_global {
             health = worst(health, Health::Ok);
         } else {
             detail.push("installed for this project only, not global".to_string());
@@ -5493,7 +12091,7 @@ fn plugin_check(
         // Unprobed is not missing: the probe is `r`-gated, so before the first
         // `r` the row names the key that fills the line in instead of claiming
         // a binary is absent.
-        None => detail.push("claude: press r to probe".to_string()),
+        None => detail.push(format!("claude: press {} to probe", prose::key("r"))),
     }
     match &clauth_path {
         Some(path) => detail.push(format!("path: {}", path.display())),
@@ -5513,8 +12111,8 @@ fn plugin_check(
             .unwrap_or_else(|_| "\u{2014}".to_string())
     ));
 
-    // List-focus `f` fixes the first fixable problem shown, in the same order
-    // the detail walk presents them (install, then wire).
+    // The first fix line shown, in the order the detail walk presents them
+    // (install, then wire).
     let fix = problems.first().map(|p| p.fix.clone());
 
     Check {
@@ -5523,6 +12121,8 @@ fn plugin_check(
         detail,
         fix,
         problems,
+        shunt_focus: Vec::new(),
+        shunt_action_start: None,
     }
 }
 
@@ -5573,6 +12173,7 @@ fn request_switch_to(app: &mut App, idx: usize) {
         message: format!("switch to '{name}'?"),
         detail: None,
         choice: true,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::Switch(name.to_string()),
     }));
 }
@@ -5583,6 +12184,7 @@ fn activate_main_item(app: &mut App) {
     };
     match item {
         MainItemKind::Profile(idx) => request_switch_to(app, idx),
+        MainItemKind::Codex(_) => {}
     }
 }
 
@@ -5603,11 +12205,8 @@ fn reorder_main_cursor(app: &mut App, delta: i32) {
         app.toast(ToastKind::Danger, format!("reorder failed\n{e}"));
         return;
     }
-    if delta < 0 && app.profile_cursor > 0 {
-        app.profile_cursor -= 1;
-    } else if delta > 0 {
-        app.profile_cursor += 1;
-    }
+    app.profile_cursor = new_idx;
+    app.overview_cursor = new_idx;
 }
 
 /// One off-thread AUTH-1 switch-gate answer, posted by `spawn_switch_gate`'s
@@ -5688,6 +12287,11 @@ fn open_divergence_modal(app: &mut App, active: &str) {
         active: active.to_string(),
         sibling,
         cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
     }));
 }
 
@@ -5787,6 +12391,7 @@ fn begin_capture(app: &mut App, from_divergence: bool) {
             message: format!("these credentials already belong to '{existing}'."),
             detail: Some("capture anyway?".to_string()),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::CaptureConflict(Box::new(snapshot), from_divergence),
         }));
         return;
@@ -5871,12 +12476,13 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 9] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 19] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 20] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::HomeTab,
     GlobalConfigRow::DivergenceDefault,
+    GlobalConfigRow::PreserveNonLoginKeys,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
     GlobalConfigRow::ContextNudge,
@@ -5905,6 +12511,7 @@ impl GlobalConfigRow {
             | GlobalConfigRow::ClockNotation
             | GlobalConfigRow::HomeTab => "appearance",
             GlobalConfigRow::DivergenceDefault
+            | GlobalConfigRow::PreserveNonLoginKeys
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
             | GlobalConfigRow::ContextNudge
@@ -5947,6 +12554,32 @@ fn handle_global_config_key(app: &mut App, key: KeyEvent) {
             } else {
                 app.global_config_cursor + 1
             };
+        }
+        KeyCode::PageUp => {
+            let starts = app.global_config_row_starts.borrow();
+            let block_ends = app.global_config_block_ends.borrow();
+            let tips = app.global_config_tips.borrow();
+            app.global_config_cursor = page_up_cursor_by_rows(
+                app.global_config_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.global_config_viewport.get(),
+                app.global_config_offset.get(),
+                app.global_config_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            let starts = app.global_config_row_starts.borrow();
+            let block_ends = app.global_config_block_ends.borrow();
+            app.global_config_cursor = page_down_cursor_by_rows(
+                app.global_config_cursor,
+                &starts,
+                &block_ends,
+                app.global_config_viewport.get(),
+                app.global_config_offset.get(),
+                app.global_config_total.get(),
+            );
         }
         KeyCode::Char(' ') => {
             run_global_config_row(app, GLOBAL_CONFIG_ROWS[app.global_config_cursor]);
@@ -6011,6 +12644,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         }
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
+        GlobalConfigRow::PreserveNonLoginKeys => toggle_preserve_non_login_keys(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
         // Inert while no account has `auto_start` on (rendered dimmed): a
         // queue with no possible member spaces nothing, so it stays a true
@@ -6231,6 +12865,14 @@ fn handle_fallback_chain_key(app: &mut App, key: KeyEvent) {
             };
             sync_profile_from_chain(app);
         }
+        KeyCode::PageUp => {
+            app.chain_cursor = selector_page_up(app.chain_cursor, &app.chain_selector);
+            sync_profile_from_chain(app);
+        }
+        KeyCode::PageDown => {
+            app.chain_cursor = selector_page_down(app.chain_cursor, &app.chain_selector);
+            sync_profile_from_chain(app);
+        }
         KeyCode::Enter => enter_fallback_detail(app),
         _ => {}
     }
@@ -6324,7 +12966,8 @@ fn toggle_burn_aware_switching(app: &mut App) {
     app.last_reload_fp = reload_fingerprint();
 }
 
-/// Cycle the walk-order mode (issue #86): `chain` ↔ `soonest weekly reset`.
+/// Cycle the walk-order mode (issue #86): `chain` → `soonest weekly reset` →
+/// `most weekly headroom` → `chain`.
 /// `cycle_reset_display`'s persistence shape exactly: mutate the shared
 /// `AppConfig`, `save_app_state`, bump `last_reload_fp` — no separate
 /// propagation to the scheduler, since every walk reads the mode off the same
@@ -6333,7 +12976,8 @@ fn toggle_burn_aware_switching(app: &mut App) {
 fn cycle_walk_order(app: &mut App) {
     let next = match app.config().state.walk_order() {
         WalkOrder::Chain => WalkOrder::SoonestWeeklyReset,
-        WalkOrder::SoonestWeeklyReset => WalkOrder::Chain,
+        WalkOrder::SoonestWeeklyReset => WalkOrder::MostWeeklyHeadroom,
+        WalkOrder::MostWeeklyHeadroom => WalkOrder::Chain,
     };
     {
         let mut cfg = app.config();
@@ -6430,6 +13074,20 @@ fn toggle_auto_update(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.update.auto_update = !cfg.state.update.auto_update;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.last_reload_fp = reload_fingerprint();
+}
+
+/// Flip whether non-login keys stay with their account
+/// (`preserve_non_login_keys`, default on). Same persistence shape as
+/// `toggle_preemptive_rotation`; every reader loads the flag off disk at the
+/// moment it relinks or rewrites a store (`claude::preserve_non_login_keys`),
+/// so the next relink in any process acts on the flip.
+fn toggle_preserve_non_login_keys(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
         let _ = save_app_state(&cfg.state);
     }
     app.last_reload_fp = reload_fingerprint();
@@ -6743,6 +13401,34 @@ fn handle_fallback_detail_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            app.fallback_edit = None;
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
+            app.fallback_detail_cursor = page_up_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            app.fallback_edit = None;
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            app.fallback_detail_cursor = page_down_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
         // Continuous fields only — `max spend` (a dollar ceiling) has no
         // natural step unit and stays typed-only.
         KeyCode::Char('+' | '=') if row == FallbackRow::Threshold => adjust_threshold(app, 5.0),
@@ -6785,6 +13471,32 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                 app.fallback_detail_cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            let tips = app.fallback_detail_tips.borrow();
+            app.fallback_detail_cursor = page_up_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                &tips,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
+        KeyCode::PageDown => {
+            let starts = app.fallback_detail_row_starts.borrow();
+            let block_ends = app.fallback_detail_block_ends.borrow();
+            app.fallback_detail_cursor = page_down_cursor_by_rows(
+                app.fallback_detail_cursor,
+                &starts,
+                &block_ends,
+                app.fallback_detail_viewport.get(),
+                app.fallback_detail_offset.get(),
+                app.fallback_detail_total.get(),
+            );
+        }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
             let would_mix = {
@@ -6798,6 +13510,7 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
                 }));
             } else {
@@ -7045,7 +13758,7 @@ fn write_weekly_override(app: &mut App, name: &ProfileName, value: Option<f64>) 
         match cfg.find_mut(name) {
             Some(profile) => {
                 profile.weekly_threshold = value;
-                save_profile(profile).err()
+                save_profile_config(profile).err()
             }
             None => None,
         }
@@ -7082,7 +13795,7 @@ fn write_max_spend(app: &mut App, name: &ProfileName, value: f64) {
         match cfg.find_mut(name) {
             Some(profile) => {
                 profile.max_auto_spend = Some(value);
-                save_profile(profile).err()
+                save_profile_config(profile).err()
             }
             None => None,
         }
@@ -7398,7 +14111,7 @@ fn toggle_member_flag(app: &mut App, flag: MemberFlag) {
             }
         }
         *field(profile, flag) = !*field(profile, flag);
-        match save_profile(profile) {
+        match save_profile_config(profile) {
             Ok(()) => None,
             Err(e) => {
                 *field(profile, flag) = !*field(profile, flag);
@@ -7439,7 +14152,7 @@ fn toggle_last_resort(app: &mut App) {
                 if now_on {
                     profile.preferred = false;
                 }
-                match save_profile(profile) {
+                match save_profile_config(profile) {
                     Ok(()) => {
                         let mut moved_from = None;
                         if now_on {
@@ -7449,7 +14162,7 @@ fn toggle_last_resort(app: &mut App) {
                                 .filter(|p| p.last_resort && p.name != name)
                             {
                                 p.last_resort = false;
-                                match save_profile(p) {
+                                match save_profile_config(p) {
                                     Ok(()) => {
                                         moved_from.get_or_insert_with(|| p.name.to_string());
                                     }
@@ -7514,7 +14227,7 @@ fn toggle_preferred(app: &mut App) {
                 if now_on {
                     profile.last_resort = false;
                 }
-                match save_profile(profile) {
+                match save_profile_config(profile) {
                     Ok(()) => {
                         let mut moved_from = None;
                         if now_on {
@@ -7524,7 +14237,7 @@ fn toggle_preferred(app: &mut App) {
                                 .filter(|p| p.preferred && p.name != name)
                             {
                                 p.preferred = false;
-                                match save_profile(p) {
+                                match save_profile_config(p) {
                                     Ok(()) => {
                                         moved_from.get_or_insert_with(|| p.name.to_string());
                                     }
@@ -7566,7 +14279,7 @@ fn add_chain_candidate(app: &mut App, name: &ProfileName) {
         && profile.fallback_threshold.is_none()
     {
         profile.fallback_threshold = Some(DEFAULT_THRESHOLD);
-        let _ = save_profile(profile);
+        let _ = save_profile_config(profile);
     }
     cfg.state.fallback_chain.push(name.clone());
     let _ = save_app_state(&cfg.state);
@@ -7613,17 +14326,66 @@ fn handle_modal_key(app: &mut App, key: KeyEvent) {
                 let max = app.help_max_scroll.get();
                 app.help_scroll = app.help_scroll.saturating_add(1).min(max);
             }
+            KeyCode::PageUp => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = page_up_scroll(
+                    app.help_scroll as usize,
+                    max as usize,
+                    app.help_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.help_max_scroll.get();
+                app.help_scroll = page_down_scroll(
+                    app.help_scroll as usize,
+                    max as usize,
+                    app.help_viewport.get() as usize,
+                ) as u16;
+            }
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?' | 'q') => {
                 app.modals.pop();
             }
             _ => {}
         },
         Modal::Confirm(_) => handle_confirm_key(app, key),
+        // The read-only `check output` modal scrolls, pages and closes like the
+        // help modal, bar `?`: the body may hold one, so it is no close key here.
+        Modal::CheckOutput(_) => match key.code {
+            KeyCode::Up => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = app.check_output_scroll.min(max).saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = app.check_output_scroll.saturating_add(1).min(max);
+            }
+            KeyCode::PageUp => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = page_up_scroll(
+                    app.check_output_scroll as usize,
+                    max as usize,
+                    app.check_output_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::PageDown => {
+                let max = app.check_output_max_scroll.get();
+                app.check_output_scroll = page_down_scroll(
+                    app.check_output_scroll as usize,
+                    max as usize,
+                    app.check_output_viewport.get() as usize,
+                ) as u16;
+            }
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                app.modals.pop();
+            }
+            _ => {}
+        },
         Modal::Divergence(_) => handle_divergence_key(app, key),
         Modal::CaptureName(_) => handle_capture_name_key(app, key),
         Modal::NamePrompt(_) => handle_name_prompt_key(app, key),
         Modal::PresetPicker(_) => handle_preset_picker_key(app, key),
         Modal::DivergenceTarget(_) => handle_divergence_target_key(app, key),
+        Modal::TokenPicker(_) => handle_token_picker_key(app, key),
         Modal::ActionMenu(_) => handle_action_menu_key(app, key),
         Modal::EnvCollision(_) => handle_env_collision_key(app, key),
         Modal::Login => handle_login_modal_key(app, key),
@@ -7757,9 +14519,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
 
     match app.tab {
         Tab::Overview => {
-            // The codex filter hides the claude rows the cursor is bound to,
-            // so nothing may act on the row under it.
-            if app.harness_filter.shows_claude() {
+            if matches!(app.current_main_item(), Some(MainItemKind::Profile(_))) {
                 context = push_account_scope(app, &mut scoped);
             }
             actions.push(RefreshAll);
@@ -7834,7 +14594,7 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
                 actions.push(OpenIncidentLink);
             }
         }
-        // Services: `r` re-runs checks, `f` fixes, ⏎/esc navigate.
+        // Services: `r` re-runs checks, `f` walks the fix lines, ⏎/esc navigate.
         Tab::Services => {}
     }
     // Every tab: the daemon verb that applies, none while one is in flight.
@@ -7844,9 +14604,119 @@ pub(crate) fn build_action_menu(app: &App) -> ActionMenuState {
             crate::daemon::DaemonHealth::Stale | crate::daemon::DaemonHealth::Fresh => StopDaemon,
         });
     }
+    // Directly after it, the shunt verb that applies — never while a shunt
+    // action is in flight, and the daemon-start row also yields none while a
+    // daemon control runs (the daemon verb's own rule).
+    if let Some(verb) = shunt_verb(app) {
+        actions.push(verb.action());
+    }
 
     ActionMenuState::new(scoped, actions, context)
 }
+
+/// What the action menu's shunt verb does, decided once by [`shunt_verb`] for
+/// both the label the menu shows and the effect a pick runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShuntVerb {
+    /// `stop shunt`: the `stop shunt?` confirm, then the transient hold.
+    Stop,
+    /// `start shunt` with nothing adopted: the card's `f  adopt config` line.
+    JumpAdopt,
+    /// `start shunt` on a `disabled` gateway: the card's `enabled` row.
+    JumpEnabled,
+    /// `start shunt` with no daemon: the shared daemon-start confirm.
+    StartDaemon,
+    /// `start shunt` on a held gateway: the hold's release.
+    Release,
+}
+
+impl ShuntVerb {
+    pub(crate) fn action(self) -> ActionMenuAction {
+        match self {
+            Self::Stop => ActionMenuAction::StopShunt,
+            Self::JumpAdopt | Self::JumpEnabled | Self::StartDaemon | Self::Release => {
+                ActionMenuAction::StartShunt
+            }
+        }
+    }
+}
+
+/// The one shunt verb that applies: an absent or `disabled` gateway jumps to
+/// its card whatever the daemon; a running gateway under a fresh daemon stops;
+/// a held one releases while a daemon runs; any other state with no daemon
+/// starts the daemon. None while a shunt action is in flight, and the no-daemon
+/// start none while a daemon control runs (the daemon verb's own rule). Reads
+/// the cached [`App::gateway_state`], so the per-frame footer never touches the
+/// disk.
+pub(crate) fn shunt_verb(app: &App) -> Option<ShuntVerb> {
+    use crate::daemon::DaemonHealth;
+    use GatewayState as S;
+    if app.services.shunt_action.running {
+        return None;
+    }
+    let health = app.daemon_health;
+    match app.gateway_state {
+        S::Absent => Some(ShuntVerb::JumpAdopt),
+        S::Disabled => Some(ShuntVerb::JumpEnabled),
+        S::Starting | S::Healthy | S::Unhealthy | S::Restarting
+            if health == DaemonHealth::Fresh =>
+        {
+            Some(ShuntVerb::Stop)
+        }
+        S::Held if health != DaemonHealth::Absent => Some(ShuntVerb::Release),
+        S::Held
+        | S::Starting
+        | S::Healthy
+        | S::Unhealthy
+        | S::Restarting
+        | S::NoConfig
+        | S::YamlRefused
+        | S::Misconfigured
+        | S::BinaryMissing
+        | S::Foreign
+        | S::BelowFloor
+        | S::Stopping
+        | S::Unobserved => (health == DaemonHealth::Absent && !app.daemon_control_busy)
+            .then_some(ShuntVerb::StartDaemon),
+    }
+}
+
+/// Re-read the gateway slot for [`App::gateway_state`] under the daemon health
+/// the app holds now.
+pub(crate) fn sync_gateway_state(app: &mut App) {
+    app.set_gateway_state(crate::daemon::gateway_slot(app.daemon_health).0.state);
+}
+
+/// The left-behind probe's landing: the no-daemon toast, its copy by the
+/// probe's answer, raised only while the app is still in the state that
+/// started it.
+fn drain_left_behind_probe(app: &mut App) {
+    let Some(left_running) = app.left_behind_probe.drain() else {
+        return;
+    };
+    if app.gateway_unrun {
+        let body = if left_running {
+            GATEWAY_LEFT_RUNNING
+        } else {
+            GATEWAY_UNRUN
+        };
+        app.toast(ToastKind::Warning, body);
+    }
+}
+
+/// The toast for a gateway that would run with no daemon to run it.
+const GATEWAY_UNRUN: &str = concat!(
+    "the shunt gateway will not run\nno daemon runs · ",
+    prose::key_lit!("a"),
+    " → start daemon"
+);
+
+/// The no-daemon toast's copy while a gateway the last daemon left still serves.
+const GATEWAY_LEFT_RUNNING: &str = concat!(
+    "a shunt gateway the last daemon left still runs\nno daemon supervises it · ",
+    prose::key_lit!("a"),
+    " → start daemon"
+);
 
 /// Push what the account under the cursor can be told to do, returning the name
 /// the menu titles that group with. Nothing to push when the cursor sits past
@@ -7938,6 +14808,49 @@ fn handle_action_menu_key(app: &mut App, key: KeyEvent) {
                 state.cursor = (state.cursor + 1) % len;
             }
         }
+        KeyCode::PageUp => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                let next = {
+                    let starts = state.starts.borrow();
+                    let block_ends = state.block_ends.borrow();
+                    page_up_cursor_by_rows(
+                        state.cursor,
+                        &starts,
+                        &block_ends,
+                        &[],
+                        state.viewport.get(),
+                        state.scroll.get(),
+                        state.total.get(),
+                    )
+                };
+                state.cursor = next;
+            }
+        }
+        KeyCode::PageDown => {
+            let Some(Modal::ActionMenu(state)) = app.modals.last_mut() else {
+                return;
+            };
+            let len = state.items.len();
+            if len > 0 {
+                let next = {
+                    let starts = state.starts.borrow();
+                    let block_ends = state.block_ends.borrow();
+                    page_down_cursor_by_rows(
+                        state.cursor,
+                        &starts,
+                        &block_ends,
+                        state.viewport.get(),
+                        state.scroll.get(),
+                        state.total.get(),
+                    )
+                };
+                state.cursor = next;
+            }
+        }
         KeyCode::Enter => {
             let Some(Modal::ActionMenu(state)) = app.modals.last() else {
                 return;
@@ -8012,6 +14925,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("'{name}' {ROTATE_LIVE_SESSION_MSG}"),
                     detail: Some(ROTATE_LIVE_SESSION_DETAIL.to_string()),
                     choice: true,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::Acknowledge,
                 }));
             }
@@ -8020,6 +14934,7 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
                     message: format!("rotate access token for '{name}'?"),
                     detail: None,
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::RotateOne(name.to_string()),
                 }));
             }
@@ -8036,8 +14951,11 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
             toggle_focused_account_disabled(app);
         }
         ActionMenuAction::OpenProviderConsole => open_provider_console(app),
-        ActionMenuAction::StartDaemon => start_daemon(app),
+        ActionMenuAction::StartDaemon => open_daemon_start_confirm(app),
         ActionMenuAction::StopDaemon => stop_daemon(app),
+        ActionMenuAction::StartShunt | ActionMenuAction::StopShunt => {
+            dispatch_shunt_verb(app, action);
+        }
         ActionMenuAction::Duplicate => prompt_duplicate_profile(app),
         ActionMenuAction::SaveAsPreset => prompt_save_preset(app),
         ActionMenuAction::ApplyPreset => open_preset_picker(app),
@@ -8057,18 +14975,150 @@ fn dispatch_action_menu_action(app: &mut App, action: ActionMenuAction) {
     }
 }
 
+/// The toast for a shunt pick whose verb no longer applies.
+const SHUNT_CHANGED: &str = "the shunt gateway changed; open the menu again";
+
+/// The shunt verb a pick of `picked` runs now: [`shunt_verb`] over a slot
+/// re-read at pick time, or the [`SHUNT_CHANGED`] toast and `None` when the
+/// state moved under the open menu to a verb with another label, or to none.
+fn shunt_verb_at_pick(app: &mut App, picked: ActionMenuAction) -> Option<ShuntVerb> {
+    sync_gateway_state(app);
+    let verb = shunt_verb(app).filter(|verb| verb.action() == picked);
+    if verb.is_none() {
+        app.toast(ToastKind::Info, SHUNT_CHANGED);
+    }
+    verb
+}
+
+/// A picked `start shunt` / `stop shunt`, acting on the verb that applies at
+/// pick time.
+fn dispatch_shunt_verb(app: &mut App, picked: ActionMenuAction) {
+    let Some(verb) = shunt_verb_at_pick(app, picked) else {
+        return;
+    };
+    match verb {
+        ShuntVerb::Stop => open_shunt_stop_confirm(app),
+        ShuntVerb::JumpAdopt => jump_to_shunt_card(app, ShuntFocusLine::Adopt),
+        ShuntVerb::JumpEnabled => jump_to_shunt_card(app, ShuntFocusLine::Enabled),
+        ShuntVerb::StartDaemon => open_daemon_start_confirm(app),
+        ShuntVerb::Release => app.services.shunt_action.start(ShuntActionJob::RemoveHold),
+    }
+}
+
+/// `stop shunt?`, its detail leading with how many live sessions run on the
+/// gateway when that is at least one and clauth could count them.
+fn open_shunt_stop_confirm(app: &mut App) {
+    const DRAIN: &str =
+        "in-flight requests drain, then the gateway stays off until the daemon restarts.";
+    let detail = format!("{}{DRAIN}", live_sessions_clause(app));
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "stop shunt?".to_string(),
+        detail: Some(detail),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::StopShunt,
+    }));
+}
+
+/// Live sessions whose current account's `base_url` names the gateway's
+/// address, off the tally the header already polls. The port is the running
+/// gateway's, off the daemon's slot (a bind edited since its spawn moves
+/// nothing until a restart); the host is the one
+/// [`crate::gateway::displayed_gateway_bind`] resolves. `None` when the tally,
+/// the gateway record or its bind could not be read.
+fn gateway_session_count(app: &App) -> Option<usize> {
+    app.live_sessions.total()?;
+    let record = crate::gateway::GatewayRecord::load().ok().flatten()?;
+    let mut bind = crate::gateway::displayed_gateway_bind(&record).ok()?;
+    if let Some(port) = crate::daemon::gateway_slot(app.daemon_health).0.port {
+        bind.configured.set_port(port);
+        bind.probe.set_port(port);
+    }
+    Some(
+        app.config()
+            .profiles
+            .iter()
+            .filter(|profile| {
+                profile
+                    .base_url
+                    .as_deref()
+                    .is_some_and(|url| crate::gateway::url_names_bind(url, &bind))
+            })
+            .map(|profile| app.live_sessions.member(&profile.name).sessions)
+            .sum(),
+    )
+}
+
+/// Switch to the Services tab, select the `shunt` row, descend, and focus the
+/// named actionable line when the card offers it; a kind the card does not
+/// offer leaves the focus to the descend rule (the first line in view, else
+/// none).
+fn jump_to_shunt_card(app: &mut App, focus: ShuntFocusLine) {
+    switch_tab(app, Tab::Services);
+    if let Some(idx) = app.services.checks.iter().position(|c| c.label == "shunt") {
+        app.services.cursor = idx;
+    }
+    app.services.focus = ServicesFocus::Detail;
+    app.services.detail_scroll = 0;
+    app.services.set_shunt_focus(
+        app.services
+            .selected_check()
+            .is_some_and(|c| c.shunt_focus.iter().any(|s| s.kind() == focus))
+            .then_some(focus),
+    );
+}
+
 /// Where the daemon's start and stop toasts send the user when either fails.
 const DAEMON_LOG_HINT: &str = "see ~/.clauth/daemon.log";
 
-/// The action menu's `start daemon`: spawn `<this binary> daemon` detached,
+/// The shared daemon-start confirm, opened by the action menu's `start daemon`
+/// and by a no-daemon `start shunt`; its two detail lines are drawn off
+/// [`ConfirmAction::StartDaemon`]. `cancel`/`esc` spawn nothing; `start` runs
+/// [`start_daemon`].
+fn open_daemon_start_confirm(app: &mut App) {
+    app.disarm_quit();
+    app.open_modal(Modal::Confirm(ConfirmState {
+        message: "start daemon?".to_string(),
+        detail: None,
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::StartDaemon,
+    }));
+}
+
+/// The daemon-start confirm's `start`: spawn `<this binary> daemon` detached,
 /// then report, off the UI thread, whether a daemon came up. The worker stays
 /// to reap the child, so a daemon this TUI started and stops never lingers as
-/// a zombie while the TUI runs.
+/// a zombie while the TUI runs. The singleton is re-read here, not at the
+/// confirm's opening: a daemon started elsewhere while it sat open would make
+/// the spawn exit at start.
 fn start_daemon(app: &mut App) {
+    match crate::daemon::singleton_held() {
+        Ok(false) => {}
+        Ok(true) => {
+            app.toast(ToastKind::Info, "daemon already running");
+            reprobe_daemon(app);
+            return;
+        }
+        Err(e) => {
+            app.toast(
+                ToastKind::Danger,
+                format!(
+                    "daemon start failed\n{}",
+                    escape_control(&error_toast_detail(&e))
+                ),
+            );
+            return;
+        }
+    }
     let exe = match daemon_exe() {
         Ok(exe) => exe,
         Err(e) => {
-            app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+            app.toast(
+                ToastKind::Danger,
+                format!("daemon start failed\n{}", escape_control(&e.to_string())),
+            );
             return;
         }
     };
@@ -8086,7 +15136,7 @@ fn start_daemon(app: &mut App) {
             let _ = child.wait();
         }
         Err(e) => {
-            let _ = tx.send(DaemonControlResult::Start(Err(format!("{e:#}"))));
+            let _ = tx.send(DaemonControlResult::Start(Err(error_toast_detail(&e))));
         }
     });
 }
@@ -8108,7 +15158,7 @@ fn stop_daemon(app: &mut App) {
     app.daemon_control_busy = true;
     app.toast(ToastKind::Info, "stopping daemon");
     spawn_worker(move || {
-        let outcome = crate::daemon::stop_running().map_err(|e| format!("{e:#}"));
+        let outcome = crate::daemon::stop_running().map_err(|e| error_toast_detail(&e));
         let _ = tx.send(DaemonControlResult::Stop(outcome));
     });
 }
@@ -8116,8 +15166,8 @@ fn stop_daemon(app: &mut App) {
 /// How often the start worker re-checks its child.
 const DAEMON_CONTROL_POLL: Duration = Duration::from_millis(50);
 
-/// Toast each daemon start/stop outcome, re-arm the menu's verb, and re-probe
-/// the header chip at once rather than at the next throttled probe.
+/// Toast each daemon start/stop outcome, re-arm the menu's verb, and
+/// [`reprobe_daemon`].
 fn drain_daemon_control(app: &mut App) {
     use crate::daemon::{DaemonStop, StartOutcome};
     while let Ok(result) = app.daemon_control_rx.try_recv() {
@@ -8138,7 +15188,10 @@ fn drain_daemon_control(app: &mut App) {
                 ),
             ),
             DaemonControlResult::Start(Err(e)) => {
-                app.toast(ToastKind::Danger, format!("daemon start failed\n{e}"));
+                app.toast(
+                    ToastKind::Danger,
+                    format!("daemon start failed\n{}", escape_control(&e)),
+                );
             }
             DaemonControlResult::Stop(Ok(DaemonStop::Stopped)) => {
                 app.toast(ToastKind::Success, "daemon stopped");
@@ -8153,32 +15206,38 @@ fn drain_daemon_control(app: &mut App) {
                 );
             }
             DaemonControlResult::Stop(Err(e)) => {
-                app.toast(ToastKind::Danger, format!("daemon stop failed\n{e}"));
+                app.toast(
+                    ToastKind::Danger,
+                    format!("daemon stop failed\n{}", escape_control(&e)),
+                );
             }
         }
-        app.daemon_health = crate::daemon::daemon_health();
-        app.last_daemon_probe = Instant::now();
+        reprobe_daemon(app);
     }
+}
+
+/// Re-probe the header chip and the menu's verb at once rather than at the
+/// next throttled probe.
+fn reprobe_daemon(app: &mut App) {
+    app.daemon_health = crate::daemon::daemon_health();
+    sync_gateway_state(app);
+    app.last_daemon_probe = Instant::now();
 }
 
 /// Swap the Tokens model filter and re-clamp the Models cursor — the filtered
 /// list can be shorter than where the cursor sat.
 fn set_token_filter(app: &mut App, filter: TokenFilter) {
     app.token_filter = filter;
-    let len = token_model_count(app);
-    if app.token_model_cursor >= len {
-        app.token_model_cursor = len.saturating_sub(1);
-    }
+    app.model_detail_scroll = 0;
+    clamp_token_model_cursor(app);
 }
 
 /// Swap the Tokens period lens and re-clamp the Models cursor — the scoped
 /// list can be shorter than where the cursor sat.
 fn set_token_period(app: &mut App, period: TokenPeriod) {
     app.token_period = period;
-    let len = token_model_count(app);
-    if app.token_model_cursor >= len {
-        app.token_model_cursor = len.saturating_sub(1);
-    }
+    app.model_detail_scroll = 0;
+    clamp_token_model_cursor(app);
 }
 
 /// Setup tab keymap. Left: ↑↓ + ⏎ enters detail. Right: ↑↓ walks rows, ⏎
@@ -8191,6 +15250,14 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
         ConfigFocus::Profiles => match key.code {
             KeyCode::Up => step_profile_cursor(app, -1, sel_len),
             KeyCode::Down => step_profile_cursor(app, 1, sel_len),
+            KeyCode::PageUp => {
+                app.profile_cursor = selector_page_up(app.profile_cursor, &app.setup_selector);
+                app.reload_selected_note();
+            }
+            KeyCode::PageDown => {
+                app.profile_cursor = selector_page_down(app.profile_cursor, &app.setup_selector);
+                app.reload_selected_note();
+            }
             KeyCode::Enter => enter_config_detail(app),
             _ => {}
         },
@@ -8220,7 +15287,45 @@ fn handle_config_key(app: &mut App, key: KeyEvent) {
                         app.config_action_cursor + 1
                     };
                 }
+                KeyCode::PageUp => {
+                    disarm_armed_action(app);
+                    let starts = app.setup_detail_row_starts.borrow();
+                    let block_ends = app.setup_detail_block_ends.borrow();
+                    let tips = app.setup_detail_tips.borrow();
+                    app.config_action_cursor = page_up_cursor_by_rows(
+                        app.config_action_cursor,
+                        &starts,
+                        &block_ends,
+                        &tips,
+                        app.setup_detail_viewport.get(),
+                        app.setup_detail_offset.get(),
+                        app.setup_detail_total.get(),
+                    );
+                }
+                KeyCode::PageDown => {
+                    disarm_armed_action(app);
+                    let starts = app.setup_detail_row_starts.borrow();
+                    let block_ends = app.setup_detail_block_ends.borrow();
+                    app.config_action_cursor = page_down_cursor_by_rows(
+                        app.config_action_cursor,
+                        &starts,
+                        &block_ends,
+                        app.setup_detail_viewport.get(),
+                        app.setup_detail_offset.get(),
+                        app.setup_detail_total.get(),
+                    );
+                }
                 KeyCode::Enter => run_config_row(app, rows[app.config_action_cursor]),
+                KeyCode::Char('+' | '=')
+                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
+                {
+                    step_bell_threshold(app, 5.0);
+                }
+                KeyCode::Char('-' | '_')
+                    if rows[app.config_action_cursor] == ConfigRow::BellThreshold =>
+                {
+                    step_bell_threshold(app, -5.0);
+                }
                 KeyCode::Char(' ') => {
                     let row = rows[app.config_action_cursor];
                     // Space cycles the `model` alias in place; ⏎ opens its custom
@@ -8277,17 +15382,18 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
     if !is_api {
         rows.push(ConfigRow::AutoStart);
     }
+    rows.push(ConfigRow::BellThreshold);
     rows.push(ConfigRow::BaseUrl);
     if is_api {
         rows.push(ConfigRow::ApiKey);
     }
     rows.push(ConfigRow::Model);
 
-    // Alias overrides collapse: render the ones already set, tuck the rest behind
-    // a single `+ model override` reveal until ⏎ expands them (draft-scoped).
+    // Alias overrides collapse: render the ones set when the draft opened, tuck
+    // the rest behind a single `+ model override` reveal until ⏎ expands them.
     let expanded = draft.is_some_and(|d| d.overrides_expanded);
     let override_set = |row: ConfigRow| match draft {
-        Some(d) => d.field(row).is_some_and(|i| !i.value.trim().is_empty()),
+        Some(d) => d.overrides_shown.contains(&row),
         None => {
             let v = match row {
                 ConfigRow::OpusModel => profile.and_then(|p| p.models.opus.as_deref()),
@@ -8301,13 +15407,7 @@ pub(crate) fn config_rows(app: &App) -> Vec<ConfigRow> {
         }
     };
     let mut any_collapsed = false;
-    for row in [
-        ConfigRow::OpusModel,
-        ConfigRow::SonnetModel,
-        ConfigRow::HaikuModel,
-        ConfigRow::FableModel,
-        ConfigRow::SubagentModel,
-    ] {
+    for row in OVERRIDE_ROWS {
         if expanded || override_set(row) {
             rows.push(row);
         } else {
@@ -8397,6 +15497,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         haiku_model: InputState::new(""),
         fable_model: InputState::new(""),
         subagent_model: InputState::new(""),
+        bell_threshold: InputState::new(""),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
@@ -8404,6 +15505,7 @@ pub(crate) fn build_draft_new() -> ConfigDraft {
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
+        overrides_shown: Vec::new(),
         captured_login: None,
     }
 }
@@ -8412,7 +15514,7 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
     let cfg = app.config();
     let profile = cfg.find(name);
     let m = profile.map(|p| p.models.clone()).unwrap_or_default();
-    ConfigDraft {
+    let mut draft = ConfigDraft {
         editing_name: Some(name.to_string()),
         name: InputState::new(name),
         base_url: InputState::new(profile.and_then(|p| p.base_url.as_deref()).unwrap_or("")),
@@ -8423,6 +15525,11 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         haiku_model: InputState::new(m.haiku.as_deref().unwrap_or("")),
         fable_model: InputState::new(m.fable.as_deref().unwrap_or("")),
         subagent_model: InputState::new(m.subagent.as_deref().unwrap_or("")),
+        bell_threshold: InputState::new(&row_committed_value(
+            profile,
+            name,
+            ConfigRow::BellThreshold,
+        )),
         env_value: InputState::new(""),
         env_new_key: InputState::new(""),
         env_just_added: None,
@@ -8430,8 +15537,14 @@ fn build_draft_existing(app: &App, name: &ProfileName) -> ConfigDraft {
         armed_action: None,
         relogin_chain: false,
         overrides_expanded: false,
+        overrides_shown: Vec::new(),
         captured_login: None,
-    }
+    };
+    draft.overrides_shown = OVERRIDE_ROWS
+        .into_iter()
+        .filter(|&row| draft.field(row).is_some_and(|i| !i.value.trim().is_empty()))
+        .collect();
+    draft
 }
 
 /// Back out of the Setup detail pane, dropping the draft. A `+ new` draft
@@ -8482,6 +15595,22 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
     }
     // Text rows plus the `model` row's custom field open an inline editor.
     if row.is_text() || row == ConfigRow::Model {
+        // The alert buffer reseeds from the profile as it opens: a reload may
+        // have moved the value since the draft was built.
+        if row == ConfigRow::BellThreshold {
+            let saved = app
+                .config_draft
+                .as_ref()
+                .and_then(|d| d.editing_name.clone())
+                .map(ProfileName::from)
+                .map(|name| {
+                    let cfg = app.config();
+                    row_committed_value(cfg.find(&name), &name, row)
+                });
+            if let (Some(saved), Some(d)) = (saved, app.config_draft.as_mut()) {
+                d.bell_threshold = InputState::new(&saved);
+            }
+        }
         if let Some(d) = app.config_draft.as_mut() {
             d.active = Some(row);
             if let Some(input) = d.field_mut(row) {
@@ -8583,7 +15712,8 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                 app.toast(
                     ToastKind::Danger,
                     format!(
-                        "these credentials already belong to '{owner}'\nswitch to it with:  clauth {owner}"
+                        "these credentials already belong to '{owner}'\nswitch to it with:  {}",
+                        prose::cmd(&format!("clauth {owner}"))
                     ),
                 );
                 app.refresh_unsaved_live_login();
@@ -8601,6 +15731,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                         "the browser login you already captured will be dropped".to_string(),
                     ),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::CaptureOverMintStash(Box::new(snapshot)),
                 }));
                 return;
@@ -8629,6 +15760,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
                     message: format!("log out of '{name}'?"),
                     detail: Some(detail.to_string()),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::BlankCredentials(name.to_string()),
                 }));
             }
@@ -8709,7 +15841,7 @@ fn run_config_row(app: &mut App, row: ConfigRow) {
 /// reload and rebuild `session_tokens` (the Overview `⊘` marker's cache). The
 /// local `remove` below only spares that marker one tick of staleness.
 fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
-    let _guard = match crate::runtime::RotationGuard::try_acquire(name) {
+    let guard = match crate::runtime::RotationGuard::try_acquire(name) {
         Ok(Some(guard)) => guard,
         Ok(None) => {
             // Rendered from the shared cause, not spelled here: one condition
@@ -8730,6 +15862,15 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
             return;
         }
     };
+    // The relink below puts the store in front of Claude Code: a staged pair
+    // lands first.
+    if let Err(refused) = crate::oauth::land_stage_for_install(name, &guard) {
+        app.toast(
+            ToastKind::Danger,
+            format!("clear failed\n{}", refused.text()),
+        );
+        return;
+    }
     // Everything the ACTIONS key off is re-read under the guard — the CLI's
     // own rule, and stricter here: the TUI's config is a tick-stale snapshot,
     // and `reload_fingerprint` does not stat `credentials.json` at all, so an
@@ -8755,16 +15896,16 @@ fn perform_clear_session_token(app: &mut App, name: &ProfileName) {
     let rolling_armed = on_disk.rolling_token;
     if rolling_armed {
         // The PERSIST is written from the same under-guard disk read, never
-        // the in-memory snapshot — an external daemon's rotation may have
-        // landed since the last reload, and `save_profile` writes the whole
-        // profile back. The renderer's in-memory flag flips only AFTER that
+        // the in-memory snapshot — another process's config edit may have
+        // landed since the last reload, and `save_profile_config` writes the
+        // whole config back. The renderer's in-memory flag flips only AFTER that
         // write lands: flipped first, a failed save leaves the config lying
         // (`reload_fingerprint` never corrects it — config mtime did not move)
         // until an unrelated save makes the lie durable, and the end state is
         // a live rolling sidecar nothing re-stamps.
         let mut disarmed = on_disk.clone();
         disarmed.rolling_token = false;
-        if let Err(e) = save_profile(&disarmed) {
+        if let Err(e) = save_profile_config(&disarmed) {
             app.toast(ToastKind::Danger, format!("clear failed\n{e}"));
             return;
         }
@@ -8886,6 +16027,9 @@ fn start_api_relogin(app: &mut App) {
         d.base_url.end();
         d.relogin_chain = true;
         d.active = Some(ConfigRow::BaseUrl);
+    }
+    if let Some(pos) = config_row_index(app, ConfigRow::BaseUrl) {
+        app.config_action_cursor = pos;
     }
 }
 
@@ -9033,6 +16177,7 @@ fn begin_oauth_login(app: &mut App, name: String, is_new: bool) {
             message: "replace the captured login?".to_string(),
             detail: Some("the login you already captured will be dropped".to_string()),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::RestartLogin(name, is_new),
         }));
     } else {
@@ -9110,11 +16255,12 @@ fn start_console_login(app: &mut App, name: String, site: ConsoleSite, region: &
         let _ = result_tx.send((
             generation,
             res.map(|o| LoginResult::Console(Box::new(o)))
-                // `{e:#}` keeps the whole `anyhow` chain: the outermost context
-                // here is a bare "loopback accept failed" whose io cause is the
-                // only part that says what to do about it. No constructor in
-                // `alibaba_login` embeds the token or an upstream body.
-                .map_err(|e| format!("{e:#}")),
+                // The toast leads with the root cause, then the rest of the
+                // chain outermost-first: the outermost context here is a bare
+                // "loopback accept failed" whose io cause is the only part that
+                // says what to do about it. No constructor in `alibaba_login`
+                // embeds the token or an upstream body.
+                .map_err(|e| error_toast_detail(&e)),
         ));
     });
     open_login_modal(app);
@@ -9155,6 +16301,16 @@ fn handle_config_edit_key(app: &mut App, key: KeyEvent) {
                 apply_input_edit(input, key);
             }
         }
+    }
+    // A keystroke, commit or revert can add or drop rows above the field (a
+    // typed base url flips the account's rows), and the cursor is an index.
+    let edited = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.active)
+        .unwrap_or(active);
+    if let Some(pos) = config_row_index(app, edited) {
+        app.config_action_cursor = pos;
     }
 }
 
@@ -9284,6 +16440,10 @@ fn row_committed_value(profile: Option<&Profile>, name: &ProfileName, row: Confi
         ConfigRow::SubagentModel => profile
             .and_then(|p| p.models.subagent.clone())
             .unwrap_or_default(),
+        ConfigRow::BellThreshold => profile
+            .and_then(|p| p.bell_threshold)
+            .map(format_weekly_pct)
+            .unwrap_or_default(),
         // The saved value of the i-th sorted env entry; reverts a value edit on ⎋.
         ConfigRow::EnvEntry(i) => profile
             .and_then(|p| p.env.values().nth(i).cloned())
@@ -9325,6 +16485,7 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
         | ConfigRow::SubagentModel => commit_model_field(app, field),
         ConfigRow::EnvEntry(i) => commit_env_value(app, i),
         ConfigRow::EnvAdd => commit_env_new_key(app),
+        ConfigRow::BellThreshold => commit_bell_threshold(app),
         _ => {
             if let Some(d) = app.config_draft.as_mut() {
                 d.active = None;
@@ -9378,6 +16539,110 @@ fn commit_model_field(app: &mut App, field: ConfigRow) {
     }
 }
 
+/// ⏎ on the `alert at` field: a value in `0..=100` sets the bell, an empty one
+/// turns it off; anything else keeps the editor open, as the Fallback card's
+/// threshold editor does.
+fn commit_bell_threshold(app: &mut App) {
+    let raw = app
+        .config_draft
+        .as_ref()
+        .map(|d| d.bell_threshold.trimmed().to_string())
+        .unwrap_or_default();
+    let Some(value) = parse_bell_threshold(&raw) else {
+        return;
+    };
+    write_bell_threshold(app, value);
+}
+
+/// A typed `alert at` value: a number in `0..=100`, or EMPTY, which turns the
+/// bell off. `Some(None)` = off, `Some(Some(v))` = set, `None` = refused.
+pub(crate) fn parse_bell_threshold(raw: &str) -> Option<Option<f64>> {
+    if raw.is_empty() {
+        return Some(None);
+    }
+    crate::fallback::parse_threshold(raw).map(Some)
+}
+
+/// `+`/`-` on the `alert at` row: step by `delta` inside the typed range,
+/// starting from 95% when the alert is off.
+fn step_bell_threshold(app: &mut App, delta: f64) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return;
+    };
+    let current = app.config().find(&name).and_then(|p| p.bell_threshold);
+    let next = match current {
+        // Rounded to hundredths, so a step off `5.01` lands on `0.01`, not on
+        // a float tail.
+        Some(v) => (((v + delta) * 100.0).round() / 100.0).clamp(
+            crate::fallback::MIN_THRESHOLD,
+            crate::fallback::MAX_THRESHOLD,
+        ),
+        None => DEFAULT_BELL_THRESHOLD,
+    };
+    write_bell_threshold(app, Some(next));
+}
+
+/// Where `+`/`-` start on an account with no alert: the commented-out default
+/// in a fresh `config.toml`.
+const DEFAULT_BELL_THRESHOLD: f64 = 95.0;
+
+/// Persist the drafted account's alert threshold, rolling memory back on a
+/// failed save, then reseed the row's buffer from what was saved.
+fn write_bell_threshold(app: &mut App, value: Option<f64>) {
+    let Some(name) = app
+        .config_draft
+        .as_ref()
+        .and_then(|d| d.editing_name.clone())
+        .map(ProfileName::from)
+    else {
+        return;
+    };
+    // `-0` saves as `0`, the value a reload reads back.
+    let value = value.map(|v| v + 0.0);
+    let result = {
+        let mut cfg = app.config();
+        match cfg.find_mut(&name) {
+            None => None,
+            Some(profile) => {
+                let before = profile.bell_threshold;
+                profile.bell_threshold = value;
+                let saved = save_profile_config(profile);
+                if saved.is_err()
+                    && let Some(p) = cfg.find_mut(&name)
+                {
+                    p.bell_threshold = before;
+                }
+                Some(saved)
+            }
+        }
+    };
+    match result {
+        // The account left under the open editor (an outside delete or
+        // rename): end the edit rather than leave a dead ⏎.
+        None => {
+            if let Some(d) = app.config_draft.as_mut() {
+                d.active = None;
+            }
+        }
+        Some(Ok(())) => {
+            let shown = {
+                let cfg = app.config();
+                row_committed_value(cfg.find(&name), &name, ConfigRow::BellThreshold)
+            };
+            if let Some(d) = app.config_draft.as_mut() {
+                d.bell_threshold = InputState::new(&shown);
+                d.active = None;
+            }
+        }
+        Some(Err(e)) => app.toast(ToastKind::Danger, format!("alert update failed\n{e}")),
+    }
+}
+
 /// Fold a trimmed buffer into the matching [`ModelSettings`] field. Empty input
 /// clears it (scalar → `None`).
 fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
@@ -9394,6 +16659,7 @@ fn apply_model_field(models: &mut ModelSettings, field: ConfigRow, raw: &str) {
         // `ConfigRow` variant fails the build instead of a silent no-op.
         ConfigRow::Name
         | ConfigRow::AutoStart
+        | ConfigRow::BellThreshold
         | ConfigRow::BaseUrl
         | ConfigRow::ApiKey
         | ConfigRow::ModelOverrideAdd
@@ -9454,8 +16720,9 @@ fn cycle_model(app: &mut App) {
     }
 }
 
-/// Advance the `model` alias cycle: default → opus → sonnet → haiku → opusplan →
-/// default. A value outside [`MODEL_PRESETS`] (a custom id) collapses to default.
+/// Advance the `model` alias cycle: default → fable → opus → sonnet → haiku →
+/// opusplan → default. A value outside [`MODEL_PRESETS`] (a custom id)
+/// collapses to default.
 fn next_model_preset(current: Option<&str>) -> Option<String> {
     match current {
         None => Some(MODEL_PRESETS[0].to_string()),
@@ -9664,17 +16931,15 @@ fn env_add_commit(app: &mut App, name: &ProfileName, key: &str) {
     let Some(idx) = idx else {
         return;
     };
-    if let Some(row_pos) = env_entry_row_index(app, idx) {
+    if let Some(row_pos) = config_row_index(app, ConfigRow::EnvEntry(idx)) {
         app.config_action_cursor = row_pos;
     }
     enter_env_value_edit(app, idx);
 }
 
-/// Position of `EnvEntry(sorted_idx)` in the current detail-row list, if present.
-fn env_entry_row_index(app: &App, sorted_idx: usize) -> Option<usize> {
-    config_rows(app)
-        .iter()
-        .position(|r| *r == ConfigRow::EnvEntry(sorted_idx))
+/// Position of `row` in the current detail-row list, if present.
+fn config_row_index(app: &App, row: ConfigRow) -> Option<usize> {
+    config_rows(app).iter().position(|r| *r == row)
 }
 
 /// Build the collision prompt for a candidate key against its colliding source.
@@ -9700,6 +16965,12 @@ fn env_collision_form(
         existing_idx,
         // Default to the safe choice (cancel), per the modal cancel-default rule.
         cursor: EnvCollisionForm::options().len() - 1,
+        scroll: std::cell::Cell::new(0),
+        reviewing_overwrite: false,
+        confirm_overwrite: false,
+        max_scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        overwrite_needs_review: std::cell::Cell::new(false),
     }
 }
 
@@ -9707,6 +16978,69 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
     let Some(Modal::EnvCollision(state)) = app.modals.last_mut() else {
         return;
     };
+    if state.reviewing_overwrite {
+        match key.code {
+            KeyCode::Up => {
+                state.scroll.set(
+                    state
+                        .scroll
+                        .get()
+                        .min(state.max_scroll.get() as usize)
+                        .saturating_sub(1),
+                );
+            }
+            KeyCode::Down => {
+                state.scroll.set(
+                    state
+                        .scroll
+                        .get()
+                        .saturating_add(1)
+                        .min(state.max_scroll.get() as usize),
+                );
+            }
+            KeyCode::PageUp => {
+                state.scroll.set(page_up_scroll(
+                    state.scroll.get(),
+                    state.max_scroll.get() as usize,
+                    state.viewport.get(),
+                ));
+            }
+            KeyCode::PageDown => {
+                state.scroll.set(page_down_scroll(
+                    state.scroll.get(),
+                    state.max_scroll.get() as usize,
+                    state.viewport.get(),
+                ));
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Tab => {
+                state.confirm_overwrite = !state.confirm_overwrite;
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                state.reviewing_overwrite = false;
+                state.confirm_overwrite = false;
+                state.scroll.set(0);
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if state.confirm_overwrite {
+                    let name = ProfileName::from(state.profile.clone());
+                    let pending = state.key.clone();
+                    app.modals.pop();
+                    run_env_collision_choice(
+                        app,
+                        &name,
+                        &pending,
+                        None,
+                        EnvCollisionChoice::Overwrite,
+                    );
+                } else {
+                    state.reviewing_overwrite = false;
+                    state.scroll.set(0);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
     let last = EnvCollisionForm::options().len() - 1;
     match key.code {
         KeyCode::Up => {
@@ -9728,6 +17062,12 @@ fn handle_env_collision_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let choice = EnvCollisionForm::options()[state.cursor.min(last)];
+            if choice == EnvCollisionChoice::Overwrite && state.overwrite_needs_review.get() {
+                state.reviewing_overwrite = true;
+                state.confirm_overwrite = false;
+                state.scroll.set(0);
+                return;
+            }
             let name = ProfileName::from(state.profile.clone());
             let pending = state.key.clone();
             let existing_idx = state.existing_idx;
@@ -9750,7 +17090,7 @@ fn run_env_collision_choice(
         EnvCollisionChoice::KeepExisting => {
             // For an own-field clash, jump to the existing entry; else just dismiss.
             if let Some(idx) = existing_idx
-                && let Some(row_pos) = env_entry_row_index(app, idx)
+                && let Some(row_pos) = config_row_index(app, ConfigRow::EnvEntry(idx))
             {
                 app.config_action_cursor = row_pos;
             }
@@ -9995,6 +17335,7 @@ fn perform_delete(app: &mut App, name: &ProfileName) {
                     .to_string(),
             ),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::DeleteLiveSession(name.to_string()),
         }));
         return;
@@ -10055,6 +17396,7 @@ fn toggle_focused_account_disabled(app: &mut App) {
         message: format!("disable '{name}'?"),
         detail: Some(DISABLE_DETAIL.to_string()),
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::DisableOne(name.to_string()),
     }));
 }
@@ -10106,6 +17448,11 @@ fn open_preset_picker(app: &mut App) {
         target,
         presets: crate::presets::list_presets(),
         cursor: 0,
+        scroll: std::cell::Cell::new(0),
+        viewport: std::cell::Cell::new(0),
+        starts: std::cell::RefCell::new(Vec::new()),
+        block_ends: std::cell::RefCell::new(Vec::new()),
+        total: std::cell::Cell::new(0),
     }));
 }
 
@@ -10163,6 +17510,7 @@ fn handle_name_prompt_key(app: &mut App, key: KeyEvent) {
                                     .to_string(),
                             ),
                             choice: false,
+                            scroll: ConfirmScroll::default(),
                             on_confirm: ConfirmAction::OverwritePreset(name, source),
                         }));
                         return;
@@ -10198,6 +17546,37 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 state.cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
         // Drop a custom preset. Built-ins have no file to drop, so the pick says
         // so rather than no-opping: a list carries no dimmed row here. The toast
         // fires with the picker still mounted so the user can pick another.
@@ -10217,6 +17596,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 message: format!("delete preset '{}'?", preset.name),
                 detail: Some("accounts already stamped from it are untouched.".to_string()),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::DeletePreset(preset.name),
             }));
         }
@@ -10243,6 +17623,7 @@ fn handle_preset_picker_key(app: &mut App, key: KeyEvent) {
                 message: format!("apply '{}' over '{target}'?", preset.name),
                 detail: Some(format!("replaces {}.", clobbered.join(", "))),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::ApplyPresetOver(target, preset.name),
             }));
         }
@@ -10263,10 +17644,10 @@ fn preset_clobbers(profile: &Profile) -> Vec<&'static str> {
     let m = &profile.models;
     for (label, set) in [
         ("model", m.default.is_some()),
+        ("fable", m.fable.is_some()),
         ("opus", m.opus.is_some()),
         ("sonnet", m.sonnet.is_some()),
         ("haiku", m.haiku.is_some()),
-        ("fable", m.fable.is_some()),
         ("subagent", m.subagent.is_some()),
     ] {
         if set {
@@ -10317,7 +17698,11 @@ fn apply_preset_to(app: &mut App, target: &str, preset: &str) {
             clear_profile_status_chrome(app, &target);
             app.last_reload_fp = reload_fingerprint();
             if app.config_draft.is_some() {
+                let selected = config_rows(app).get(app.config_action_cursor).copied();
                 app.config_draft = Some(build_draft_existing(app, &target));
+                if let Some(pos) = selected.and_then(|row| config_row_index(app, row)) {
+                    app.config_action_cursor = pos;
+                }
             }
             app.toast(
                 ToastKind::Success,
@@ -10465,7 +17850,7 @@ fn toggle_auto_start(app: &mut App, name: &ProfileName) {
             Some(profile) => {
                 profile.auto_start = !profile.auto_start;
                 let now_on = profile.auto_start;
-                match save_profile(profile) {
+                match save_profile_config(profile) {
                     Ok(()) => Outcome::Saved(now_on),
                     Err(e) => {
                         if let Some(p) = cfg.find_mut(name) {
@@ -10508,6 +17893,30 @@ fn handle_confirm_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('y') => state.choice = true,
         KeyCode::Char('n') => state.choice = false,
+        KeyCode::Up => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = state.scroll.offset.min(max).saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = state.scroll.offset.saturating_add(1).min(max);
+        }
+        KeyCode::PageUp => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = page_up_scroll(
+                state.scroll.offset as usize,
+                max as usize,
+                state.scroll.viewport.get() as usize,
+            ) as u16;
+        }
+        KeyCode::PageDown => {
+            let max = state.scroll.max_scroll.get();
+            state.scroll.offset = page_down_scroll(
+                state.scroll.offset as usize,
+                max as usize,
+                state.scroll.viewport.get() as usize,
+            ) as u16;
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
         }
@@ -10548,7 +17957,7 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                     if delegate_row_text { "on" } else { "off" }
                 ),
             );
-            recompute_services_checks(app, false);
+            recompute_services_checks(app, false, ShuntRefresh::Keep);
         }
         Ok(notes) => {
             // Non-empty notes = pieces clauth refused to touch (a table it
@@ -10558,11 +17967,15 @@ fn run_herdr_heal(app: &mut App, path: &std::path::Path) {
                 ToastKind::Warning,
                 format!("herdr's config needs attention\n{}", notes.join("\n")),
             );
-            recompute_services_checks(app, false);
+            recompute_services_checks(app, false, ShuntRefresh::Keep);
         }
         Err(e) => app.toast(ToastKind::Danger, format!("herdr config fix failed\n{e}")),
     }
 }
+
+/// The detail line of a shunt-card confirm whose adopted record vanished
+/// before the yes.
+const NO_ADOPTED_CONFIG: &str = "no shunt config is adopted any more";
 
 fn run_confirm_action(app: &mut App, action: ConfirmAction) {
     match action {
@@ -10726,7 +18139,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                 Ok(()) => {
                     app.toast(ToastKind::Success, "wired clauth into ~/.claude.json");
                     // Reflect the new wiring in the rows without a fresh version probe.
-                    recompute_services_checks(app, false);
+                    recompute_services_checks(app, false, ShuntRefresh::Keep);
                 }
                 Err(e) => app.toast(ToastKind::Danger, format!("wire failed\n{e}")),
             }
@@ -10755,7 +18168,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
                     ToastKind::Warning,
                     "plugin install made no changes\ninstall claude code first, then try again",
                 );
-                recompute_services_checks(app, false);
+                recompute_services_checks(app, false, ShuntRefresh::Keep);
             }
             // Installed / Repaired / Adopted / Updated, or anything agentgear
             // adds later: a real change happened, so the success toast is
@@ -10764,7 +18177,7 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Ok(outcome) => {
                 app.toast(ToastKind::Success, format!("clauth plugin {outcome}"));
                 // Reflect the fresh install in the rows without a version probe.
-                recompute_services_checks(app, false);
+                recompute_services_checks(app, false, ShuntRefresh::Keep);
             }
             Err(e) => app.toast(ToastKind::Danger, format!("install failed\n{e}")),
         },
@@ -10814,6 +18227,76 @@ fn run_confirm_action(app: &mut App, action: ConfirmAction) {
             Ok(()) => app.toast(ToastKind::Success, format!("deleted preset '{preset}'")),
             Err(e) => app.toast(ToastKind::Danger, format!("delete preset failed\n{e}")),
         },
+        ConfirmAction::AdoptConfig(path) => {
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::Adopt { found: path });
+        }
+        ConfirmAction::MoveStoresIn(confirmed) => {
+            let Some(record) = app.services.shunt_record.clone() else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("move failed\n{NO_ADOPTED_CONFIG}"),
+                );
+                return;
+            };
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::Move { record, confirmed });
+        }
+        ConfirmAction::AddAdminKey => {
+            let Some(record) = app.services.shunt_record.clone() else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("admin key failed\n{NO_ADOPTED_CONFIG}"),
+                );
+                return;
+            };
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::AddAdminKey { record });
+        }
+        ConfirmAction::AddAdminTable => {
+            let Some(record) = app.services.shunt_record.clone() else {
+                app.toast(
+                    ToastKind::Danger,
+                    format!("admin key failed\n{NO_ADOPTED_CONFIG}"),
+                );
+                return;
+            };
+            app.services
+                .shunt_action
+                .start(ShuntActionJob::AddAdminTable { record });
+        }
+        ConfirmAction::StartDaemon => start_daemon(app),
+        ConfirmAction::StopShunt => {
+            if shunt_verb_at_pick(app, ActionMenuAction::StopShunt).is_some() {
+                app.services.shunt_action.start(ShuntActionJob::Hold);
+            }
+        }
+        ConfirmAction::RestartBind { key, edit } => {
+            start_shunt_save(app, ShuntSaveKey::Field(key), *edit, true);
+        }
+        ConfirmAction::RenameField { key, edit } => {
+            start_shunt_save(app, ShuntSaveKey::Field(key), *edit, false);
+        }
+        ConfirmAction::RemoveEntry { key, edit } => {
+            // Re-arming a remove clears the stale refusal line under the row.
+            app.services.shunt_remove_refusal.take();
+            start_shunt_save(app, ShuntSaveKey::Remove(key), *edit, false);
+        }
+        ConfirmAction::RemoveToken { record, profile } => {
+            app.services.shunt_token_refusal.take();
+            start_shunt_token_save(app, ShuntSaveKey::Token(profile.clone()), record, profile);
+        }
+        ConfirmAction::AddToken {
+            record,
+            profile,
+            url,
+            replace: _,
+        } => {
+            start_shunt_token_add(app, record, profile, url);
+        }
         ConfirmAction::Acknowledge => {}
     }
 }
@@ -10839,6 +18322,37 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                 state.cursor + 1
             };
         }
+        KeyCode::PageUp => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = state.starts.borrow();
+            let block_ends = state.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                state.cursor,
+                &starts,
+                &block_ends,
+                state.viewport.get(),
+                state.scroll.get(),
+                state.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            state.cursor = next;
+        }
         KeyCode::Esc | KeyCode::Char('q') => {
             // Just close — the prompt is on-demand now; the non-blocking
             // banner keeps carrying the signal until the divergence resolves.
@@ -10863,6 +18377,7 @@ fn handle_divergence_key(app: &mut App, key: KeyEvent) {
                              account. the running claude is untouched."
                         )),
                         choice: false,
+                        scroll: ConfirmScroll::default(),
                         on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), owner),
                     }));
                 }
@@ -10884,6 +18399,10 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                 app.toast(ToastKind::Danger, format!("overwrite failed\n{e}"));
                 return;
             }
+            // The overwrite captured a live login that may be a DIFFERENT
+            // account: expire the clock so the next `/profile` read re-seeds the
+            // anchor, the way `overwrite_captured_profile` does.
+            crate::usage::expire_profile_ttl(&ProfileName::from(active));
             if let Err(e) = force_link_profile_credentials(&ProfileName::from(active)) {
                 app.toast(ToastKind::Danger, format!("relink failed\n{e}"));
                 return;
@@ -10910,6 +18429,7 @@ fn run_divergence_choice(app: &mut App, active: &str, choice: DivergenceChoice) 
                     "claude code's freshly written credentials will be overwritten with the account's stored tokens.".to_string(),
                 ),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::DiscardDivergence(active.to_string()),
             }));
         }
@@ -10955,6 +18475,11 @@ fn open_divergence_target_picker(app: &mut App) {
         .push(Modal::DivergenceTarget(DivergenceTargetForm {
             targets,
             cursor: preselect,
+            scroll: std::cell::Cell::new(0),
+            viewport: std::cell::Cell::new(0),
+            starts: std::cell::RefCell::new(Vec::new()),
+            block_ends: std::cell::RefCell::new(Vec::new()),
+            total: std::cell::Cell::new(0),
         }));
 }
 
@@ -10981,6 +18506,37 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
             } else {
                 form.cursor + 1
             };
+        }
+        KeyCode::PageUp => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
         }
         KeyCode::Esc | KeyCode::Char('q') => {
             app.modals.pop();
@@ -11014,8 +18570,81 @@ fn handle_divergence_target_key(app: &mut App, key: KeyEvent) {
                     "'{target}' becomes the active account; its old credentials are replaced. usage history, env, and model settings are kept."
                 )),
                 choice: false,
+                scroll: ConfirmScroll::default(),
                 on_confirm: ConfirmAction::AdoptDivergence(Box::new(snapshot), target),
             }));
+        }
+        _ => {}
+    }
+}
+
+/// Keys on the `+ add token` profile picker: Up/Down wrap, PageUp/PageDown
+/// page, `esc`/`q` close, `↵`/`space` pick (a pick opens the overwrite
+/// confirm). No synthetic `+ new profile` row in C1, so the cursor is the
+/// profile's own index.
+fn handle_token_picker_key(app: &mut App, key: KeyEvent) {
+    let Some(Modal::TokenPicker(form)) = app.modals.last_mut() else {
+        return;
+    };
+    let last = form.targets.len() - 1;
+    match key.code {
+        KeyCode::Up => {
+            form.cursor = if form.cursor == 0 {
+                last
+            } else {
+                form.cursor - 1
+            };
+        }
+        KeyCode::Down => {
+            form.cursor = if form.cursor >= last {
+                0
+            } else {
+                form.cursor + 1
+            };
+        }
+        KeyCode::PageUp => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_up_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                &[],
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+        }
+        KeyCode::PageDown => {
+            let starts = form.starts.borrow();
+            let block_ends = form.block_ends.borrow();
+            let next = page_down_cursor_by_rows(
+                form.cursor,
+                &starts,
+                &block_ends,
+                form.viewport.get(),
+                form.scroll.get(),
+                form.total.get(),
+            );
+            drop(starts);
+            drop(block_ends);
+            form.cursor = next;
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.modals.pop();
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            let cursor = form.cursor;
+            let Some(Modal::TokenPicker(form)) = app.modals.pop() else {
+                return;
+            };
+            let Some((profile, _)) = form.targets.get(cursor).cloned() else {
+                return;
+            };
+            open_token_overwrite_confirm(app, profile);
         }
         _ => {}
     }
@@ -11067,6 +18696,7 @@ fn handle_capture_name_key(app: &mut App, key: KeyEvent) {
                         "overwrite its credentials with the captured login? usage history, env, and model settings are kept.".to_string(),
                     ),
                     choice: false,
+                    scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::CaptureOverwrite(
                         snapshot,
                         existing,
@@ -11246,11 +18876,8 @@ fn drain_tokens_events(app: &mut App) {
                 app.tokens_topping_up = false;
                 app.tokens_progress = None;
                 app.token_stats = Some(*stats);
-                // Re-clamp the model cursor in case the grouped list shrank.
-                let len = token_model_count(app);
-                if len > 0 && app.token_model_cursor >= len {
-                    app.token_model_cursor = len - 1;
-                }
+                // Re-clamp after the loader replaces the grouped list.
+                clamp_token_model_cursor(app);
             }
             // Surface failure only when there is nothing to show — a transient
             // read error mid-session keeps the last good snapshot.
@@ -11372,7 +18999,10 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
         credentials: Some(outcome.credentials),
         base_url: None,
         api_key: None,
-        account_uuid: outcome.account_uuid,
+        anchor: outcome
+            .account_uuid
+            .map(crate::actions::AnchorAction::Proven)
+            .unwrap_or(crate::actions::AnchorAction::Unproven),
     };
     // No stored creds → nothing diverges; adopt silently (mirrors the
     // first-login adopt in `poll_credentials_divergence`).
@@ -11401,6 +19031,7 @@ fn apply_login(app: &mut App, session: LoginSession, outcome: crate::oauth_login
                 .to_string(),
             ),
             choice: false,
+            scroll: ConfirmScroll::default(),
             on_confirm: ConfirmAction::CaptureOverwrite(Box::new(snapshot), session.name, false),
         }));
         return;
@@ -11509,7 +19140,10 @@ pub(crate) fn on_tick(app: &mut App) {
             UpdateEvent::Available(v) => {
                 app.toast(
                     ToastKind::Info,
-                    format!("update available: v{v}\nreinstall with cargo install clauth"),
+                    format!(
+                        "update available: v{v}\nreinstall with {}",
+                        prose::cmd("cargo install clauth")
+                    ),
                 );
             }
         }
@@ -11518,11 +19152,21 @@ pub(crate) fn on_tick(app: &mut App) {
     drain_op_results(app);
     drain_status_events(app);
     drain_tokens_events(app);
+    if app.tab == Tab::Tokens
+        && app.token_view == TokenView::Models
+        && app.token_period.bucket().is_some()
+    {
+        clamp_token_model_cursor(app);
+    }
     drain_pricing_events(app);
     drain_login_events(app);
 
     if app.reload_if_state_changed() {
         app.clamp_profile_cursor();
+        if app.profile_count() == 0 {
+            app.usage_detail_focus = StatusFocus::List;
+            app.usage_detail_scroll = 0;
+        }
     }
     app.apply_usage();
 
@@ -11584,6 +19228,7 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_services_refresh(app);
     drain_daemon_control(app);
     poll_daemon_health(app);
+    drain_left_behind_probe(app);
 
     warn_day_claim_notices(app);
     update_banner(app);
@@ -11633,12 +19278,18 @@ fn poll_codex_rows(app: &mut App) {
         return;
     }
     app.last_codex_rows_refresh = Some(Instant::now());
+    let selected = app.current_main_item();
     app.codex_rows = codex_rows();
+    app.clamp_overview_cursor();
+    if app.tab == Tab::Overview && selected != app.current_main_item() {
+        app.sync_overview_profile_selection();
+    }
 }
 
 /// Re-probe the daemon presence + `status.json` health for the `[ daemon ]`
-/// header chip, at most once a second (a flock try-lock + `status.json` read is
-/// cheap but not free, and the chip changes on a human timescale).
+/// header chip, and the gateway slot the action menu's shunt verb reads, at
+/// most once a second (a flock try-lock + `status.json` read is cheap but not
+/// free, and both change on a human timescale).
 fn poll_daemon_health(app: &mut App) {
     const DAEMON_PROBE_INTERVAL: Duration = Duration::from_secs(1);
     if app.last_daemon_probe.elapsed() < DAEMON_PROBE_INTERVAL {
@@ -11646,6 +19297,7 @@ fn poll_daemon_health(app: &mut App) {
     }
     app.last_daemon_probe = Instant::now();
     app.daemon_health = crate::daemon::daemon_health();
+    sync_gateway_state(app);
 }
 
 /// Re-tally the live-session registry for the Overview `live` column, the
@@ -11664,7 +19316,13 @@ fn poll_live_sessions(app: &mut App) {
     }
     app.last_live_sessions_refresh = Some(Instant::now());
     let tally = crate::live_sessions::LiveTally::collect(&app.config());
-    app.live_sessions = tally;
+    app.set_live_sessions(tally);
+}
+
+/// The header chip's number: the fleet total, or `—` for a tally that could
+/// not read the registry or the bare-session markers.
+pub(crate) fn live_count_text(total: Option<usize>) -> String {
+    total.map_or_else(|| "—".to_owned(), |n| n.to_string())
 }
 
 /// Re-sync the durable key-rejection verdicts into the live `ThirdPartyBroken`
@@ -11749,11 +19407,16 @@ fn sync_broken_verdicts(app: &mut App) {
     }
 }
 
+/// How often a shown standalone-shunt claim is re-probed, so a shunt that
+/// stopped answering loses its claim with no `r`.
+const STANDALONE_RECHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Services tab live refresh: re-run the cheap local reads (job store, wiring,
 /// herdr config) at most once per interval while the tab is focused and no
 /// modal is open, so a delegate started elsewhere shows up without a manual
-/// `r`. Never re-probes `claude --version` or `clauth mcp` — both stay
-/// `r`-gated.
+/// `r`, and re-probe a shown standalone-shunt claim every
+/// [`STANDALONE_RECHECK_INTERVAL`]. Never re-probes `claude --version` or
+/// `clauth mcp` — both stay `r`-gated.
 fn poll_services_refresh(app: &mut App) {
     const SERVICES_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -11764,7 +19427,24 @@ fn poll_services_refresh(app: &mut App) {
         return;
     }
     app.last_services_refresh = Instant::now();
-    recompute_services_checks(app, false);
+    recompute_services_checks(app, false, ShuntRefresh::Keep);
+    // The claim renders only in the `shunt` card, the readout only while no
+    // gateway is adopted.
+    let claim_shown = app.gateway_state == GatewayState::Absent
+        && app
+            .services
+            .selected_check()
+            .is_some_and(|check| check.label == "shunt")
+        && app
+            .services
+            .standalone
+            .as_ref()
+            .is_some_and(|readout| readout.answer.is_some());
+    if claim_shown && app.services.last_standalone_recheck.elapsed() >= STANDALONE_RECHECK_INTERVAL
+    {
+        app.services.last_standalone_recheck = Instant::now();
+        app.services.standalone_probe.start();
+    }
 }
 
 /// Recompute the sticky banner from current app state. Called every tick.
@@ -11923,8 +19603,8 @@ fn maybe_spawn_bootstrap(app: &mut App) {
 }
 
 /// 1Hz check: keep [`App::divergence_pending`] (the non-blocking banner) in
-/// sync with whether `.credentials.json` matches the active profile's stored
-/// creds. Never pushes the modal — a divergence must not lock the whole TUI out
+/// sync with whether the live login matches what a switch to the active
+/// profile installs (the install source). Never pushes the modal — a divergence must not lock the whole TUI out
 /// of browsing usage; <kbd>d</kbd> opens the resolver on demand, and
 /// switch-shaped actions raise it themselves when resolution is actually
 /// required. First-login adoption resolves automatically here, as does a
@@ -11957,23 +19637,56 @@ fn poll_credentials_divergence(app: &mut App) {
         return;
     };
     if !matches!(
-        classify_credentials_link(&active).ok(),
+        reconcile_decision(app, &active),
+        DivergenceVerdict::NeedsPrompt
+    ) {
+        return;
+    }
+    resolve_or_note_divergence(app, active.as_ref());
+}
+
+/// What the shared divergence cascade ([`reconcile_decision`]) makes of the
+/// live slot.
+enum DivergenceVerdict {
+    /// Linked, adopted, or already stored — no divergence to resolve.
+    Clean,
+    /// A logged-out shell. The poll exempts it outright (no nag, no banner);
+    /// the startup reconcile treats it as a divergence so a configured
+    /// `default_divergence` Overwrite still performs the boot heal (relink
+    /// the stored login over the shell) — the shipped pin's behavior.
+    Shell,
+    /// A genuine divergence — the user's verdict is needed.
+    NeedsPrompt,
+}
+
+/// The ONE divergence decision, shared by the startup reconcile and the 1Hz
+/// poll (#104): the live login is judged against what a switch INSTALLS
+/// (the install source — the sidecar for split profiles), never the
+/// clauth-private usage pair, so a refreshless live login (a rolling bearer,
+/// a static mint) is no divergence. Side effects: a first-login adoption runs
+/// here; exempt states clear the banner. A logged-out shell is reported as
+/// its own verdict so the two callers can disagree on it (see
+/// [`DivergenceVerdict::Shell`]).
+fn reconcile_decision(app: &mut App, active: &ProfileName) -> DivergenceVerdict {
+    if !matches!(
+        classify_credentials_link(active).ok(),
         Some(LinkState::Diverged)
     ) {
         app.divergence_pending = None; // resolved; a later divergence re-flags
-        return;
+        return DivergenceVerdict::Clean;
     }
-    // A logged-out shell is nothing to resolve: don't nag, and never let a
-    // `default_divergence` Overwrite capture its blank tokens over the stored chain.
+    // A logged-out shell is nothing the poll must resolve: don't nag, and
+    // never let a `default_divergence` Overwrite capture its blank tokens
+    // over the stored chain.
     if live_credentials_are_shell() {
         app.divergence_pending = None;
-        return;
+        return DivergenceVerdict::Shell;
     }
     // First login on a credential-less profile: adopt silently, don't prompt.
-    if is_first_login(&active).unwrap_or(false) {
+    if is_first_login(active).unwrap_or(false) {
         let result = {
             let mut cfg = app.config();
-            adopt_first_login(&mut cfg, &active)
+            adopt_first_login(&mut cfg, active)
         };
         match result {
             Ok(()) => {
@@ -11981,14 +19694,14 @@ fn poll_credentials_divergence(app: &mut App) {
                 // AUTH-1: an adopted first login is a fresh login — lift a
                 // standing auth_broken quarantine like the sibling fresh-login
                 // paths do.
-                oauth::mark_auth_broken(&app.config, &active, false);
+                oauth::mark_auth_broken(&app.config, active, false);
                 app.last_reload_fp = reload_fingerprint();
                 app.refresh_unsaved_live_login();
                 app.toast(ToastKind::Success, format!("saved login into '{active}'"));
             }
             Err(e) => app.toast(ToastKind::Danger, format!("adopt failed\n{e}")),
         }
-        return;
+        return DivergenceVerdict::Clean;
     }
     // A login already saved in the active profile's store holds nothing unsaved —
     // the next switch re-installs it, losing no login — so it must not raise the
@@ -11996,11 +19709,11 @@ fn poll_credentials_divergence(app: &mut App) {
     // writes over it. The switch/defer gates apply the same exemption through
     // `live_diverged_and_unsaved`; the poll must adopt a first login before this
     // point, so it checks the predicate directly here instead.
-    if crate::claude::live_login_is_stored(&active) {
+    if crate::claude::live_login_is_stored(active) {
         app.divergence_pending = None;
-        return;
+        return DivergenceVerdict::Clean;
     }
-    resolve_or_note_divergence(app, active.as_ref());
+    DivergenceVerdict::NeedsPrompt
 }
 
 /// Apply the configured `default_divergence`, or flag the non-blocking banner

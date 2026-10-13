@@ -264,11 +264,11 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     let rejected = LoginError::Exchange(TokenFailure::Status(400));
     assert_eq!(
         rejected.cli_message(),
-        "anthropic rejected the request (HTTP 400): run clauth login again for a fresh code"
+        "anthropic rejected the request (HTTP 400): run `clauth login` again for a fresh code"
     );
     assert_eq!(
         rejected.user_message(),
-        "anthropic rejected the request: run clauth login again for a fresh code"
+        "anthropic rejected the request: run `clauth login` again for a fresh code"
     );
     assert!(
         !rejected.user_message().contains("400"),
@@ -285,7 +285,7 @@ fn login_names_the_status_on_stderr_but_not_in_the_toast() {
     for status in [400, 429, 503] {
         let m = LoginError::Exchange(TokenFailure::Status(status)).user_message();
         assert!(
-            m.ends_with(": run clauth login again for a fresh code"),
+            m.ends_with(": run `clauth login` again for a fresh code"),
             "a spent authorization code is only fixed by a new login, got: {m}"
         );
         assert!(

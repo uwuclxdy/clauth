@@ -9,15 +9,21 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 
+use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache};
+
 use super::super::app::{
     App, ConfigDraft, ConfigFocus, ConfigRow, DraftLogin, InputState, MODEL_PRESETS, config_rows,
+    escape_control,
 };
 use super::super::theme;
+use super::format::middle_truncate;
 use super::panes::{
-    DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, bold_when, cycle_option, draw_scrolled_lines,
-    draw_selector_list, head_cols, help_tooltip_lines, highlight_row, key_cell, label_style,
-    master_detail, name_color, picker_row, pill, section_box, section_box_verbatim,
+    DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_DISABLED, bold_when, cycle_row_lines,
+    draw_scrolled_lines, draw_selector_list, head_cols, help_tooltip_lines, highlight_row,
+    invalid_tooltip_lines, key_cell, label_style, master_detail, name_color, picker_row, pill,
+    section_box, section_box_verbatim, value_caret,
 };
+use super::prose::{cmd, cmd_lit, key_lit};
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // +1 for the trailing `+ new` picker row.
@@ -33,30 +39,38 @@ fn draw_selector(frame: &mut Frame<'_>, area: Rect, app: &App, focused: bool) {
     let cfg = app.config();
     let count = cfg.profiles.len();
     let sel = app.profile_cursor.min(count);
-    draw_selector_list(frame, area, "accounts", focused, sel, |w| {
-        let mut rows: Vec<_> = cfg
-            .profiles
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                // A disabled account can never be active, so dim wins outright.
-                let ns = if p.is_disabled() {
-                    theme::dim()
-                } else {
-                    name_color(cfg.is_active(&p.name))
-                };
-                picker_row(i == sel, focused, p.name.to_string(), ns, w)
-            })
-            .collect();
-        rows.push(picker_row(
-            count == sel,
-            focused,
-            "+ new".to_string(),
-            theme::accent(),
-            w,
-        ));
-        rows
-    });
+    draw_selector_list(
+        frame,
+        area,
+        "accounts",
+        focused,
+        sel,
+        &app.setup_selector,
+        |w| {
+            let mut rows: Vec<_> = cfg
+                .profiles
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    // A disabled account can never be active, so dim wins outright.
+                    let ns = if p.is_disabled() {
+                        theme::dim()
+                    } else {
+                        name_color(cfg.is_active(&p.name))
+                    };
+                    picker_row(i == sel, focused, p.name.to_string(), ns, w)
+                })
+                .collect();
+            rows.push(picker_row(
+                count == sel,
+                focused,
+                "+ new".to_string(),
+                theme::accent(),
+                w,
+            ));
+            rows
+        },
+    );
 }
 
 /// Snapshot taken under one short `config` guard, decoupled from render so
@@ -76,6 +90,8 @@ struct Snap {
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
+    /// `Profile::bell_threshold` as the `alert at` buffer spells it; empty = off.
+    bell_threshold: String,
     /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
     disabled: bool,
     /// The global active profile — one of the two gates (mirroring
@@ -141,6 +157,10 @@ struct Snap {
     /// Whether a preserved mint backup sits beside the sidecar — the clear
     /// row's disclosure that a second, restorable credential goes with it.
     has_static_backup: bool,
+    /// The account's email off its cached `/profile` plan, control characters
+    /// escaped; `None` until `/profile` has reported one for the login the
+    /// account holds now (`login_email`).
+    email: Option<String>,
 }
 
 impl Snap {
@@ -175,6 +195,7 @@ impl Snap {
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
+            bell_threshold: String::new(),
             disabled: false,
             is_active: false,
             has_live_session: false,
@@ -190,6 +211,7 @@ impl Snap {
             rolling_token: false,
             rolling_armed: false,
             has_static_backup: false,
+            email: None,
         }
     }
 }
@@ -243,6 +265,10 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 auto_start: p.auto_start,
+                bell_threshold: p
+                    .bell_threshold
+                    .map(crate::tui::app::format_weekly_pct)
+                    .unwrap_or_default(),
                 disabled: p.is_disabled(),
                 is_active: cfg.is_active(&p.name),
                 // Read per frame for the selected profile only, same as
@@ -285,10 +311,27 @@ fn build_snap(app: &App, with_text: bool) -> Snap {
                 rolling_token: matches!(&sidecar, Some((crate::claude::SidecarKind::Rolling, _))),
                 rolling_armed: p.rolling_token,
                 has_static_backup: crate::claude::has_static_backup(&p.name),
+                email: login_email(p),
             }
         }
         None => Snap::blank("settings"),
     }
+}
+
+/// The cached `/profile` address, only while it still belongs to the account's
+/// login: the account holds an OAuth login, the address was read for the
+/// account its identity anchor names (a login install rewrites or removes the
+/// anchor), and no copy-back has replaced the login since the last `/profile`
+/// attempt (a copy-back keeps the anchor and removes the durable stamp until
+/// the next read re-anchors). A plan carried over from an earlier login, here
+/// or in another process, names no one. Read per frame for the selected
+/// profile only (two small files).
+fn login_email(p: &crate::profile::Profile) -> Option<String> {
+    p.credentials.as_ref()?.claude_ai_oauth.as_ref()?;
+    let email = p.usage.as_ref()?.plan.as_ref()?.email.as_ref()?;
+    load_profile_cache::<u64>(&p.name, PROFILE_FETCHED_CACHE_FILE)?;
+    let anchor = load_profile_cache::<crate::profile::AccountId>(&p.name, ACCOUNT_ID_CACHE_FILE)?;
+    (email.account == anchor).then(|| escape_control(&email.address))
 }
 
 fn draw_settings(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -356,11 +399,15 @@ fn session_token_lines(
                     charged(
                         "rolling token stalled".to_string(),
                         &format!(
-                            "nothing re-stamped it before expiry · clauth rolling-token {name} re-arms"
+                            "nothing re-stamped it before expiry · {} re-arms",
+                            cmd(&format!("clauth rolling-token {name}"))
                         ),
                     )
                 } else {
-                    charged("expired".to_string(), "re-mint with claude setup-token")
+                    charged(
+                        "expired".to_string(),
+                        concat!("re-mint with ", cmd_lit!("claude setup-token")),
+                    )
                 }
             } else if rolling {
                 // Hours-scale countdown, accent not warning: the daemon
@@ -451,6 +498,17 @@ fn draw_settings_rows(
         Span::styled(type_value, type_style),
     ]));
 
+    // The address belongs to the OAuth login, so it goes with the `oauth` type
+    // the moment a draft base url turns the account api-typed.
+    if !is_api && let Some(email) = &snap.email {
+        let key = key_cell("email", DETAIL_KEY_W, DETAIL_KEY_GUTTER);
+        let value_w = (inner.width as usize).saturating_sub(key.chars().count());
+        lines.push(Line::from(vec![
+            Span::styled(key, theme::label()),
+            Span::styled(middle_truncate(email, value_w), theme::accent()),
+        ]));
+    }
+
     // Provider row — only for recognised third-party providers. Hidden while a
     // draft empties the base-url buffer (`is_api` tracks the draft live).
     let provider_label = if is_api { snap.provider } else { None };
@@ -477,7 +535,8 @@ fn draw_settings_rows(
     lines.push(Line::from(""));
     // Tracks the absolute line index + buffer + row of the active edit row for
     // cursor placement after rendering. The header block above is variable
-    // (optional status + type + optional provider + optional session + blank),
+    // (optional status + type + optional email + optional provider + optional
+    // session + blank),
     // so the row loop's base index is simply what has been pushed so far.
     let mut edit_caret: Option<(u16, InputState, ConfigRow)> = None;
     let mut line_idx: u16 = lines.len() as u16;
@@ -485,39 +544,72 @@ fn draw_settings_rows(
     // Start + end of the focused row's block (row plus its tooltip lines), so a
     // wrapped hint can't scroll off the bottom while its row stays visible.
     let mut focus = (0usize, 1usize);
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut block_ends: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut tips: Vec<usize> = Vec::with_capacity(rows.len());
     for (i, row) in rows.iter().enumerate() {
         let selected = actions_focused && i == cursor;
         let is_editing = editing == Some(*row);
         let input = row_input(draft, snap, *row);
-        let line = detail_row(*row, selected, is_editing, armed_action, snap, &input);
+        let row_lines = detail_row(
+            *row,
+            selected,
+            is_editing,
+            armed_action,
+            snap,
+            &input,
+            inner.width as usize,
+        );
+        // The tooltip this row carries when focused: its range tooltip while
+        // editing the bell threshold, else its behaviour hint.
+        let tip_lines: Vec<Line<'static>> = if is_editing && *row == ConfigRow::BellThreshold {
+            alert_range_tooltip(&input, inner.width as usize)
+        } else if !is_editing {
+            row_hint(*row, snap)
+                .map(|text| help_tooltip_lines(&text, inner.width as usize))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let tip_len = tip_lines.len() as u16;
         if is_editing {
             edit_caret = Some((line_idx, input, *row));
         }
+        starts.push(line_idx as usize);
         if selected || is_editing {
             focus.0 = line_idx as usize;
         }
-        lines.push(if selected {
-            highlight_row(line, inner.width as usize)
-        } else {
-            line
-        });
-        line_idx += 1;
-        if selected
-            && !is_editing
-            && let Some(text) = row_hint(*row, snap)
-        {
-            let hint = help_tooltip_lines(&text, inner.width as usize);
-            line_idx += hint.len() as u16;
-            lines.extend(hint);
+        for line in row_lines {
+            lines.push(if selected {
+                highlight_row(line, inner.width as usize)
+            } else {
+                line
+            });
+            line_idx += 1;
+        }
+        if selected || is_editing {
+            line_idx += tip_len;
+            lines.extend(tip_lines);
         }
         if selected || is_editing {
             focus.1 = line_idx as usize;
         }
+        block_ends.push(if selected || is_editing {
+            line_idx as usize
+        } else {
+            (line_idx + tip_len) as usize
+        });
+        tips.push(tip_len as usize);
     }
 
     // The row list outgrows a short terminal (env entries + model overrides are
     // unbounded), so it scrolls to the focused row rather than clipping its tail.
-    let offset = draw_scrolled_lines(frame, inner, lines, focus);
+    app.setup_detail_viewport.set(inner.height as usize);
+    app.setup_detail_total.set(lines.len());
+    app.setup_detail_row_starts.replace(starts);
+    app.setup_detail_block_ends.replace(block_ends);
+    app.setup_detail_tips.replace(tips);
+    let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.setup_detail_offset));
 
     // Position the native terminal cursor at the caret when a text/model field is active.
     if let Some((ly, input, row)) = edit_caret
@@ -567,6 +659,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::HaikuModel => &snap.haiku,
         ConfigRow::FableModel => &snap.fable,
         ConfigRow::SubagentModel => &snap.subagent,
+        ConfigRow::BellThreshold => &snap.bell_threshold,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
         | ConfigRow::ModelOverrideAdd
@@ -584,8 +677,8 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
 /// Inline help for rows whose labels don't self-describe, phrased for the row's
 /// current value so it re-explains itself as the value changes. `login_is_oauth`
 /// (not the base-url buffer) picks the login/log-out wording — the copy has to
-/// name what ⏎ really does — while `auto_start` / `base_url` flip on their own
-/// value.
+/// name what ⏎ really does — while `auto_start`, `base_url` and `alert at` flip
+/// on their own value.
 fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
     let api_login = !snap.login_is_oauth;
     let hint = match row {
@@ -614,6 +707,16 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "sends a 1-token request to Haiku at every 5h usage reset"
         }
         ConfigRow::AutoStart => "5h usage window stays closed after reset",
+        ConfigRow::BellThreshold if snap.bell_threshold.is_empty() => concat!(
+            "no alert when 5h usage climbs; ",
+            key_lit!("↵"),
+            " or ",
+            key_lit!("+"),
+            " to set one"
+        ),
+        ConfigRow::BellThreshold => {
+            "alerts once when 5h usage reaches this, again after it drops below"
+        }
         ConfigRow::ModelOverrideAdd => "set custom model names on this account",
         ConfigRow::Login if snap.console_login => {
             "log into alibaba console to see this account's usage"
@@ -687,6 +790,17 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
     Some(hint.to_string())
 }
 
+/// Sub-line under the `alert at` field while typing: the accepted input,
+/// DANGER while the buffer would be refused (the Fallback `rotate at` twin).
+fn alert_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> {
+    let range = "0-100 % · empty turns it off";
+    if crate::tui::app::parse_bell_threshold(input.trimmed()).is_none() {
+        invalid_tooltip_lines(range, width)
+    } else {
+        help_tooltip_lines(range, width)
+    }
+}
+
 fn detail_row(
     row: ConfigRow,
     selected: bool,
@@ -694,7 +808,8 @@ fn detail_row(
     armed_action: Option<ConfigRow>,
     snap: &Snap,
     input: &InputState,
-) -> Line<'static> {
+    width: usize,
+) -> Vec<Line<'static>> {
     let arrow = if editing {
         Span::styled(format!("{} ", theme::edit_glyph()), theme::accent().bold())
     } else if selected {
@@ -702,12 +817,14 @@ fn detail_row(
     } else {
         Span::raw("  ")
     };
-    match row {
+    let line = match row {
         ConfigRow::Name => kv_field(arrow, "name", input, editing, selected, false),
         ConfigRow::BaseUrl => kv_field(arrow, "base url", input, editing, selected, false),
         ConfigRow::ApiKey => kv_field(arrow, "api key", input, editing, selected, true),
         // Hybrid: the alias cycle at rest, a plain text field while typing a custom id.
-        ConfigRow::Model if !editing => model_cycle_line(arrow, &input.value, selected),
+        ConfigRow::Model if !editing => {
+            return model_cycle_lines(arrow, &input.value, selected, width);
+        }
         ConfigRow::Model => kv_field(arrow, "model", input, editing, selected, false),
         ConfigRow::OpusModel => kv_field(arrow, "opus", input, editing, selected, false),
         ConfigRow::SonnetModel => kv_field(arrow, "sonnet", input, editing, selected, false),
@@ -766,6 +883,35 @@ fn detail_row(
                 ("disable account".to_string(), theme::danger().bold())
             };
             Line::from(vec![row_arrow, Span::styled(label, style)])
+        }
+        // A refused buffer renders DANGER beside its range line, and the ` %`
+        // unit trails the native caret: the `rotate at` editor's shape.
+        ConfigRow::BellThreshold if editing => {
+            let invalid = crate::tui::app::parse_bell_threshold(input.trimmed()).is_none();
+            let mut spans = vec![
+                arrow,
+                Span::styled(
+                    key_cell("alert at", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
+                    label_style(selected),
+                ),
+            ];
+            spans.extend(value_caret(input, invalid));
+            spans.push(Span::styled(
+                " %",
+                if invalid {
+                    theme::danger()
+                } else {
+                    theme::faint()
+                },
+            ));
+            Line::from(spans)
+        }
+        ConfigRow::BellThreshold => {
+            let (value, style) = match snap.bell_threshold.as_str() {
+                "" => ("off".to_string(), theme::faint()),
+                pct => (format!("{pct}%"), theme::accent()),
+            };
+            kv_static(arrow, "alert at", value, style, selected)
         }
         ConfigRow::AutoStart => {
             let (value, style) = if snap.auto_start {
@@ -853,7 +999,8 @@ fn detail_row(
             };
             Line::from(vec![row_arrow, Span::styled(label, style)])
         }
-    }
+    };
+    vec![line]
 }
 
 fn kv_field(
@@ -913,21 +1060,27 @@ fn value_spans(input: &InputState, editing: bool, mask_value: bool) -> Vec<Span<
         return vec![Span::styled(display, theme::accent())];
     }
     // In edit mode the terminal cursor (set via frame.set_cursor_position) owns
-    // the caret glyph — no simulated block highlight needed.
+    // the caret glyph — no simulated block highlight needed. Control-escaped
+    // like [`value_caret`], so the shared `head_cols` escaped column count
+    // stays aligned with the body it feeds.
     let body = Style::default()
         .fg(theme::text_color())
         .bg(theme::bg_sunken());
-    vec![Span::styled(input.value.clone(), body)]
+    vec![Span::styled(
+        crate::tui::app::escape_control(&input.value),
+        body,
+    )]
 }
 
-/// The `model` row at rest: a segmented alias control (`default` + presets).
-/// The active option is `ACCENT` and wraps in `[]` only while the row is the
-/// cursor (the row widens by 2 on focus — the Config-tab focus cue); the rest
-/// stay bare `TEXT_FAINT`. A custom id (set via ⏎) matches no preset, so the
-/// real value is appended in `ACCENT` rather than mis-bracketing the nearest
-/// alias.
-fn model_cycle_line(arrow: Span<'static>, current: &str, selected: bool) -> Line<'static> {
-    let mut spans = vec![
+/// The `model` row at rest. A custom id (set via ⏎) matches no preset, so it
+/// trails the run rather than mis-bracketing the nearest alias.
+fn model_cycle_lines(
+    arrow: Span<'static>,
+    current: &str,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let lead = vec![
         arrow,
         Span::styled(
             key_cell("model", DETAIL_KEY_W, DETAIL_KEY_GUTTER),
@@ -936,16 +1089,9 @@ fn model_cycle_line(arrow: Span<'static>, current: &str, selected: bool) -> Line
     ];
     let mut options: Vec<(&str, bool)> = vec![("default", current.is_empty())];
     options.extend(MODEL_PRESETS.iter().map(|p| (*p, *p == current)));
-    for (i, (label, active)) in options.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(cycle_option(label, *active, selected));
-    }
-    if !current.is_empty() && !MODEL_PRESETS.contains(&current) {
-        spans.push(Span::styled(format!("   {current}"), theme::accent()));
-    }
-    Line::from(spans)
+    let custom =
+        (!current.is_empty() && !MODEL_PRESETS.contains(&current)).then_some((current, true));
+    cycle_row_lines(lead, &options, custom, None, selected, width)
 }
 
 #[cfg(test)]

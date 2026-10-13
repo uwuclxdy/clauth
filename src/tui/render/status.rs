@@ -17,13 +17,18 @@ use ratatui::widgets::{Block, Paragraph};
 use super::super::app::{App, StatusFocus};
 use super::super::theme;
 use super::format::{NO_DATA, middle_truncate, relative_age, spinner_frame};
-use super::panes::{draw_scrollbar, empty_state, key_cell, master_detail, section_box, wrap_words};
+use super::panes::{
+    draw_scrollbar, empty_state, follow_scroll_offset, key_cell, master_detail, section_box,
+    wrap_words,
+};
 use crate::status::{Impact, Incident, IncidentUpdate, UpdatePhase, shorten_component_status};
 
 /// Detail-pane key column width, the usage tab's `TP_KEY_W` (11).
 const KEY_W: usize = 11;
 /// Fixed gap between the padded key and the value column (house standard).
 const KEY_GUTTER: usize = 2;
+/// Rows per rendered incident (a title row + a phase-pill row).
+const STATUS_ROW_LINES: usize = 2;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Each incident renders two rows (title + phase pill) in the list.
@@ -42,6 +47,11 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(block, area);
 
     if app.status.incidents.is_empty() {
+        app.status.selector.offset.set(0);
+        app.status.selector.viewport.set(0);
+        app.status.selector.starts.replace(Vec::new());
+        app.status.selector.block_ends.replace(Vec::new());
+        app.status.selector.total.set(0);
         // The widget already renders the `r to retry` action line, so the hint
         // line only states the condition.
         let widget = if app.status.error.is_some() {
@@ -53,58 +63,56 @@ fn draw_incident_list(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // 2 lines per incident; window so the selected item stays visible.
-    const ITEM_H: usize = 2;
-    let viewport_lines = inner.height as usize;
-    // Items that fill the viewport (ceil — the last may be partially clipped).
-    let viewport_items = viewport_lines
-        .div_ceil(ITEM_H)
-        .max(1)
-        .min(app.status.incidents.len());
-    let first_item = first_visible_item(
-        app.status.cursor,
-        viewport_items,
-        app.status.incidents.len(),
-    );
-
-    let shown = (app.status.incidents.len() - first_item).min(viewport_items);
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(shown * ITEM_H);
     let content_w = inner.width as usize;
-    for (i, incident) in app
+    let viewport = if inner.height > 1 {
+        inner.height as usize / STATUS_ROW_LINES * STATUS_ROW_LINES
+    } else {
+        inner.height as usize
+    };
+    let whole_inner = Rect {
+        height: viewport as u16,
+        ..inner
+    };
+    let total = app.status.incidents.len() * STATUS_ROW_LINES;
+    let cursor = app.status.cursor.min(app.status.incidents.len() - 1);
+    let focus = (
+        cursor * STATUS_ROW_LINES,
+        cursor * STATUS_ROW_LINES + STATUS_ROW_LINES,
+    );
+    app.status.selector.viewport.set(viewport);
+    app.status.selector.total.set(total);
+    app.status.selector.starts.replace(
+        (0..app.status.incidents.len())
+            .map(|i| i * STATUS_ROW_LINES)
+            .collect(),
+    );
+    app.status.selector.block_ends.replace(
+        (0..app.status.incidents.len())
+            .map(|i| i * STATUS_ROW_LINES + STATUS_ROW_LINES)
+            .collect(),
+    );
+    let max_offset = total
+        .saturating_sub(viewport)
+        .min(total.saturating_sub(STATUS_ROW_LINES))
+        & !(STATUS_ROW_LINES - 1);
+    let offset = follow_scroll_offset(total, viewport, focus, app.status.selector.offset.get())
+        .next_multiple_of(STATUS_ROW_LINES)
+        .min(max_offset);
+    app.status.selector.offset.set(offset);
+    let lines: Vec<Line<'static>> = app
         .status
         .incidents
         .iter()
         .enumerate()
-        .skip(first_item)
-        .take(shown)
-    {
-        let selected = i == app.status.cursor;
-        lines.extend(incident_rows(incident, selected, focused, content_w));
-    }
-
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
-
-    draw_scrollbar(
-        frame,
-        inner,
-        app.status.incidents.len() * ITEM_H,
-        first_item * ITEM_H,
-        viewport_lines,
+        .flat_map(|(i, incident)| incident_rows(incident, i == cursor, focused, content_w))
+        .collect();
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        whole_inner,
     );
-}
-
-/// First item index to render so `cursor` is near the center of the viewport,
-/// shifting the window on both ↑ and ↓ (not only when the cursor hits the bottom).
-fn first_visible_item(cursor: usize, viewport_items: usize, total: usize) -> usize {
-    if total <= viewport_items {
-        return 0;
-    }
-    let half = viewport_items / 2;
-    if cursor < half {
-        0
-    } else {
-        cursor.saturating_sub(half).min(total - viewport_items)
-    }
+    draw_scrollbar(frame, inner, total, offset, viewport);
 }
 
 /// Two rendered lines for one incident: title row + phase-pill / age row. The
@@ -292,6 +300,7 @@ fn draw_incident_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // too (otherwise a held ↓ inflates `detail_scroll` past the end).
     let max_scroll = total.saturating_sub(viewport).min(u16::MAX as usize) as u16;
     app.status.detail_max_scroll.set(max_scroll);
+    app.status.detail_viewport.set(viewport as u16);
     let scroll = app.status.detail_scroll.min(max_scroll);
 
     frame.render_widget(

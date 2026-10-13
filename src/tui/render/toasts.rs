@@ -8,35 +8,52 @@ use ratatui::widgets::{Clear, Paragraph};
 
 use super::super::app::{App, Toast, ToastKind};
 use super::super::theme;
-use super::panes::wrap_words;
+use super::prose;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if app.toasts.is_empty() {
         return;
     }
-    let toasts: Vec<&Toast> = app.toasts.iter().collect();
-
     // Full toast width (bar + padding + content + padding) caps at min(60, w − 4)
     // (the −4 is the 2-cell inset each side). col_width adds the
     // 3-cell chrome (`┃ ` + 1 right pad), so content = full − 3.
     let content_cap = 60_u16.min(area.width.saturating_sub(4)).saturating_sub(3);
 
-    // Widest natural line across all toasts, clamped to cap — drives column width and wrap budget.
-    let max_content_width = toasts
+    // Widest natural line across all toasts, in cells, clamped to cap: the wrap
+    // budget.
+    let budget = app
+        .toasts
         .iter()
-        .flat_map(|t| t.body.lines().map(|l| l.chars().count() as u16))
+        .flat_map(|t| t.body.lines().map(|l| Span::raw(prose::plain(l)).width()))
         .max()
         .unwrap_or(0)
-        .min(content_cap);
+        .min(usize::from(content_cap));
 
+    let stack: Vec<(&Toast, Vec<Vec<Span<'static>>>)> = app
+        .toasts
+        .iter()
+        .map(|toast| (toast, toast_rows(toast, budget)))
+        .collect();
+
+    // The column fits the widest row shown, so a line the height cap cut
+    // reserves no width.
+    let content_width = stack
+        .iter()
+        .flat_map(|(_, rows)| {
+            rows.iter()
+                .map(|spans| spans.iter().map(Span::width).sum::<usize>())
+        })
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(content_cap));
     // +3: `┃ ` (bar cell + space) on the left, 1 trailing pad cell on the right.
     // The pad cell carries no text, so the Paragraph's `bg_sunken` base fills it.
-    let col_width = max_content_width + 3;
+    let col_width = u16::try_from(content_width).unwrap_or(content_cap) + 3;
 
     let x = area.x + area.width.saturating_sub(col_width + 2);
     let mut row = area.y + 2;
 
-    for toast in &toasts {
+    for (toast, rows) in stack {
         let color = match toast.kind {
             ToastKind::Info => theme::info_color(),
             ToastKind::Success => theme::success_color(),
@@ -44,32 +61,15 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             ToastKind::Danger => theme::danger_color(),
         };
         let bar_style = Style::default().fg(color).bg(theme::bg_sunken());
-        let title_style = Style::default()
-            .fg(theme::text_color())
-            .bg(theme::bg_sunken())
-            .bold();
-        let detail_style = Style::default()
-            .fg(theme::text_dim_color())
-            .bg(theme::bg_sunken());
 
-        let mut lines_iter = toast.body.lines();
-        let first = lines_iter.next().unwrap_or("");
-
-        let mut render_lines: Vec<Line<'_>> = Vec::new();
-        for wrapped in wrap_words(first, max_content_width as usize) {
-            render_lines.push(Line::from(vec![
-                Span::styled("┃ ", bar_style),
-                Span::styled(wrapped, title_style),
-            ]));
-        }
-        for detail in lines_iter {
-            for wrapped in wrap_words(detail, max_content_width as usize) {
-                render_lines.push(Line::from(vec![
-                    Span::styled("┃ ", bar_style),
-                    Span::styled(wrapped, detail_style),
-                ]));
-            }
-        }
+        let mut render_lines: Vec<Line<'_>> = rows
+            .into_iter()
+            .map(|wrapped| {
+                let mut spans = vec![Span::styled("┃ ", bar_style)];
+                spans.extend(wrapped);
+                Line::from(spans)
+            })
+            .collect();
         if render_lines.is_empty() {
             render_lines.push(Line::from(vec![Span::styled("┃ ", bar_style)]));
         }
@@ -122,6 +122,60 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
         row += height;
     }
+}
+
+/// The cloudy-tui contract's toast height.
+const MAX_ROWS: usize = 3;
+
+/// One toast's rows wrapped to `budget` cells: the head bold, the detail dim;
+/// past [`MAX_ROWS`] the first rows stay and the last kept one ends in `…`.
+fn toast_rows(toast: &Toast, budget: usize) -> Vec<Vec<Span<'static>>> {
+    let title_style = Style::default()
+        .fg(theme::text_color())
+        .bg(theme::bg_sunken())
+        .bold();
+    let detail_style = Style::default()
+        .fg(theme::text_dim_color())
+        .bg(theme::bg_sunken());
+
+    let mut lines = toast.body.lines();
+    let first = lines.next().unwrap_or("");
+    let mut rows: Vec<(Vec<Span<'static>>, Style)> = prose::wrap(first, budget, title_style)
+        .into_iter()
+        .map(|row| (row, title_style))
+        .collect();
+    for detail in lines {
+        rows.extend(
+            prose::wrap(detail, budget, detail_style)
+                .into_iter()
+                .map(|row| (row, detail_style)),
+        );
+    }
+    if rows.len() > MAX_ROWS {
+        rows.truncate(MAX_ROWS);
+        if let Some((spans, base)) = rows.last_mut() {
+            end_in_ellipsis(spans, *base, budget);
+        }
+    }
+    rows.into_iter().map(|(spans, _)| spans).collect()
+}
+
+/// Marks the last kept row of a cut toast: `…` after its text, or in place of
+/// as many trailing graphemes as free a cell when the row fills `width`.
+fn end_in_ellipsis(spans: &mut Vec<Span<'static>>, base: Style, width: usize) {
+    while spans.iter().map(Span::width).sum::<usize>() >= width
+        && let Some(last) = spans.pop()
+    {
+        let mut graphemes: Vec<&str> = last
+            .styled_graphemes(Style::default())
+            .map(|grapheme| grapheme.symbol)
+            .collect();
+        graphemes.pop();
+        if !graphemes.is_empty() {
+            spans.push(Span::styled(graphemes.concat(), last.style));
+        }
+    }
+    spans.push(Span::styled("…", base));
 }
 
 fn fits_in(outer: Rect, inner: Rect) -> bool {

@@ -254,6 +254,8 @@ fn a_job_left_running_fails_the_finalized_assertion() {
         isolated: false,
         cwd: None,
         spawned_by: None,
+        host_session: None,
+        host_pid: 0,
         idle_secs: None,
         kind: jobs::RecordKind::Collectable,
         owner_pid: 0,

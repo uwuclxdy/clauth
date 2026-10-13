@@ -1,4 +1,4 @@
-//! `clauth jobs` — the operator's enumeration of the delegate job store.
+//! `clauth jobs` — the user's enumeration of the delegate job store.
 //!
 //! Reads `~/.clauth/jobs/` through `mcp::jobs::list`, the same parser the MCP
 //! surface and the TUI's delegates detail read it through, and classifies each row
@@ -9,7 +9,7 @@
 //! Read-only, and deliberately so past sharing a parser: `jobs::list` destroys
 //! nothing, and this command adds no sweep of its own. Stopping a delegate is
 //! `monitor({job_ids, cancel: true})`'s job — one stop path, which is also why
-//! the TUI pane binds no key.
+//! the TUI pane binds no stop key.
 //!
 //! Why a separate command rather than a column on `clauth list`: a job is a
 //! transient run, not an account, and its rows come and go inside one 5h window.

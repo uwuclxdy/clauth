@@ -9,8 +9,8 @@
 //! cargo test showcase -- --ignored --nocapture
 //! ```
 //!
-//! All tests redirect `~/.clauth` and `~/.claude` into a tempdir via
-//! [`crate::profile::set_home_override`] so real files are never touched.
+//! All tests redirect `~/.clauth` and `~/.claude` into a tempdir through a
+//! [`crate::testutil::HomeSandbox`] so real files are never touched.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,7 +19,6 @@ use anyhow::Result;
 use ratatui::crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
-use tempfile::TempDir;
 
 use super::{TICK, app, render};
 use crate::profile::{AppConfig, AppState, Profile, ProfileName};
@@ -36,52 +35,46 @@ fn showcase() {
     run(demo_config()).expect("showcase loop");
 }
 
-/// Redirect home into a tempdir so all disk ops land on scratch space.
-struct ShowcaseHome {
-    _home_lock: crate::lockorder::RankedGuard<'static, ()>,
-    _tmp: TempDir,
+/// A [`HomeSandbox`](crate::testutil::HomeSandbox) holding the synthetic usage
+/// history on disk, so on_tick → apply_usage doesn't overwrite the in-memory
+/// seed with an empty/partial reload.
+fn showcase_home() -> crate::testutil::HomeSandbox {
+    let home = crate::testutil::HomeSandbox::new();
+    for (name, entries) in &build_synthetic_history() {
+        let history_path =
+            crate::profile::profile_history_path(&crate::profile::ProfileName::from(name.clone()))
+                .expect("history path");
+        std::fs::create_dir_all(history_path.parent().unwrap()).expect("history dir");
+        let content: String = entries
+            .iter()
+            .map(|(ts, usage)| {
+                let usage_json = serde_json::to_string(usage).unwrap_or_default();
+                let name_json =
+                    serde_json::to_string(name).unwrap_or_else(|_| format!(r#""{}""#, name));
+                format!(
+                    r#"{{"ts":{},"name":{},"usage":{}}}"#,
+                    ts, name_json, usage_json
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&history_path, content).expect("write seeded history");
+    }
+    home
 }
 
-impl ShowcaseHome {
-    fn new() -> Self {
-        let _home_lock = crate::profile::HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let tmp = TempDir::new().expect("tempdir for showcase");
-        let path = tmp.path().to_path_buf();
-        std::fs::create_dir_all(&path).expect("create temp home");
-        crate::profile::set_home_override(path);
-
-        // Pre-seed usage history files on disk so on_tick → apply_usage doesn't
-        // overwrite the in-memory seed with an empty/partial reload.
-        for (name, entries) in &build_synthetic_history() {
-            let history_path = crate::profile::profile_history_path(
-                &crate::profile::ProfileName::from(name.clone()),
-            )
-            .expect("history path");
-            std::fs::create_dir_all(history_path.parent().unwrap()).expect("history dir");
-            let content: String = entries
-                .iter()
-                .map(|(ts, usage)| {
-                    let usage_json = serde_json::to_string(usage).unwrap_or_default();
-                    let name_json =
-                        serde_json::to_string(name).unwrap_or_else(|_| format!(r#""{}""#, name));
-                    format!(
-                        r#"{{"ts":{},"name":{},"usage":{}}}"#,
-                        ts, name_json, usage_json
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n";
-            std::fs::write(&history_path, content).expect("write seeded history");
-        }
-
-        Self {
-            _home_lock,
-            _tmp: tmp,
-        }
-    }
+/// The showcase home drops its home redirect with it, so a later test that
+/// forgot its own sandbox panics instead of resolving a deleted tempdir.
+/// Every holder of `HOME_TEST_LOCK` clears the redirect before releasing it,
+/// so under the lock it reads clear.
+#[test]
+fn the_showcase_home_clears_the_home_redirect_on_drop() {
+    drop(showcase_home());
+    let _lock = crate::profile::HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(!crate::profile::home_override_active());
 }
 
 /// Build the same synthetic history used by [`seed_history`], returned as a map
@@ -186,7 +179,7 @@ fn build_synthetic_history() -> std::collections::HashMap<String, Vec<(u64, Usag
 
 /// Same as [`super::run`] but with home redirected into a tempdir.
 fn run(config: AppConfig) -> Result<()> {
-    let _home = ShowcaseHome::new();
+    let _home = showcase_home();
     let mut terminal = ratatui::try_init()?;
     let outcome = showcase_loop(&mut terminal, config);
     ratatui::restore();
@@ -310,6 +303,7 @@ fn oauth_profile(
                 tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
                 subscription_status: None,
                 codex_plan: None,
+                email: None,
             }),
             five_hour,
             seven_day: None,
@@ -538,7 +532,7 @@ fn seed_timers(application: &app::App) {
 /// windows, and ~12 entries over the last ~5d for 7d windows, with plausible
 /// utilization ramps so the burn-rate math yields non-zero results.
 ///
-/// The same data is pre-seeded as disk files by [`ShowcaseHome::new`] so
+/// The same data is pre-seeded as disk files by [`showcase_home`] so
 /// `apply_usage`'s history reload preserves the full timeline.
 fn seed_history(application: &app::App) {
     let cache = build_synthetic_history();
@@ -588,7 +582,7 @@ fn future_iso_parses() {
 /// Synthetic history entries must be parseable by the burn-rate engine.
 #[test]
 fn seed_history_yields_burn_rates() {
-    let _home = ShowcaseHome::new();
+    let _home = showcase_home();
     let app = app::App::new(demo_config());
     seed_usage(&app);
     seed_history(&app);
@@ -617,7 +611,7 @@ fn headless_showcase_renders() {
     // fn so on_tick writes land on scratch. Acquired BEFORE App::new so no
     // RankedMutex is ever held while taking HOME_TEST_LOCK, now the outermost
     // rank — the lock-order check enforces that ordering.
-    let _home = ShowcaseHome::new();
+    let _home = showcase_home();
     let mut app = app::App::new(demo_config());
     seed_usage(&app);
     seed_timers(&app);
@@ -776,7 +770,7 @@ fn threshold_of(app: &app::App, name: &str) -> Option<f64> {
 
 #[test]
 fn demo_data_drives_all_actions() {
-    let _home = ShowcaseHome::new();
+    let _home = showcase_home();
     let config = demo_config();
     crate::profile::save_app_state(&config.state).expect("persist state");
     let mut app = app::App::new(config);
@@ -885,7 +879,8 @@ fn demo_data_drives_all_actions() {
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     assert!(app.config_draft.is_some());
     press(&mut app, KeyCode::Down); // Name → AutoStart (OAuth row)
-    press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
+    press(&mut app, KeyCode::Down); // AutoStart → BellThreshold
+    press(&mut app, KeyCode::Down); // BellThreshold → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing the field
     assert_eq!(
         app.config_draft.as_ref().and_then(|d| d.active),
@@ -1160,7 +1155,7 @@ fn demo_data_drives_all_actions() {
 #[test]
 fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
     use app::Tab;
-    let _home = ShowcaseHome::new();
+    let _home = showcase_home();
     let mut app = app::App::new(demo_config());
 
     assert_eq!(app.tab, Tab::Overview);
@@ -1193,7 +1188,7 @@ fn tab_backtab_cycle_screens_like_arrow_keys_at_top_level() {
 #[test]
 fn tab_key_does_not_leak_past_modal_or_field_capture() {
     use app::Tab;
-    let _home = ShowcaseHome::new();
+    let _home = showcase_home();
     let mut app = app::App::new(demo_config());
 
     // ── Setup field capture: Tab/BackTab must stay inert, not switch tabs ──
@@ -1204,7 +1199,8 @@ fn tab_key_does_not_leak_past_modal_or_field_capture() {
     press(&mut app, KeyCode::Enter); // focus detail pane for "personal" (cursor 0)
     assert_eq!(app.config_focus, app::ConfigFocus::Actions);
     press(&mut app, KeyCode::Down); // Name → AutoStart
-    press(&mut app, KeyCode::Down); // AutoStart → BaseUrl
+    press(&mut app, KeyCode::Down); // AutoStart → BellThreshold
+    press(&mut app, KeyCode::Down); // BellThreshold → BaseUrl
     press(&mut app, KeyCode::Enter); // start capturing BaseUrl
     assert_eq!(
         app.config_draft.as_ref().and_then(|d| d.active),
@@ -1278,7 +1274,7 @@ fn tab_key_does_not_leak_past_modal_or_field_capture() {
 fn config_reset_rows_cycle_and_persist_with_the_clock_row_gated() {
     use crate::profile::{ClockFormat, ResetDisplay};
     use app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
-    let _home = ShowcaseHome::new();
+    let _home = showcase_home();
     let mut app = app::App::new(demo_config());
     app.tab = Tab::Config;
 

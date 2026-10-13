@@ -439,7 +439,7 @@ fn all_exhausted_wrap_mode_shows_resumes_hint() {
     let b = profile("b", 95.0, 100.0, 1800);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     let hint =
         resumes_line(&lines).expect("resumes hint must render when the whole chain is exhausted");
     assert!(
@@ -458,7 +458,7 @@ fn all_exhausted_wrap_off_active_cleared_shows_resumes_hint() {
     let mut config = config_with(vec![a, b], None, vec!["a", "b"]);
     config.state.switch_off_when_spent = true;
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     let hint = resumes_line(&lines)
         .expect("resumes hint must render even with no active profile (wrap-off cleared it)");
     assert!(hint.contains("resumes: a in ~"), "{hint}");
@@ -473,7 +473,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     assert!(
         resumes_line(&lines).is_none(),
         "must not show when the chain isn't fully exhausted"
@@ -505,7 +505,7 @@ fn a_wallet_bearing_active_shows_its_drains_line() {
             })
             .collect(),
     );
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     let drains = lines
         .iter()
         .map(line_text)
@@ -525,7 +525,7 @@ fn a_wallet_bearing_active_without_a_series_shows_no_drains_line() {
     let ds = deepseek_profile("ds", &["63.34 CNY"]);
     let config = config_with(vec![ds], Some("ds"), vec!["ds"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     assert!(
         !lines.iter().map(line_text).any(|t| t.contains("drains in")),
         "no series, no runway: {:?}",
@@ -541,7 +541,7 @@ fn healthy_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 5.0, 3600);
     let config = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
-    let lines = fallback_flow_lines(&app, 60);
+    let lines = fallback_flow_lines(&app, 60).0;
     assert!(resumes_line(&lines).is_none());
 }
 
@@ -557,7 +557,7 @@ fn broken_login_marker_outranks_bell_and_active() {
     let mut config = config_with(vec![a], Some("a"), vec![]);
     config.state.auth_broken.push("a".into());
     let mut app = App::new(config);
-    app.bell_fired.insert("a".into(), true);
+    app.bell_fired.observe("a", Some(50.0), Some(60.0), true);
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     let text = line_text(&line);
@@ -574,7 +574,7 @@ fn bell_marker_shows_when_login_is_fine() {
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], None, vec![]);
     let mut app = App::new(config);
-    app.bell_fired.insert("a".into(), true);
+    app.bell_fired.observe("a", Some(50.0), Some(60.0), true);
     let widths = OverviewWidths::new(80, &app);
     let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
     assert!(text.contains('!'), "{text}");
@@ -590,7 +590,7 @@ fn token_danger_marker_outranks_bell_and_active() {
     let a = profile("a", 95.0, 10.0, 3600);
     let config = config_with(vec![a], Some("a"), vec![]); // active
     let mut app = App::new(config);
-    app.bell_fired.insert("a".into(), true); // bell also fired
+    app.bell_fired.observe("a", Some(50.0), Some(60.0), true); // bell also fired
     app.session_tokens
         .insert("a".into(), crate::claude::SessionTokenStatus::NotLongLived);
     let widths = OverviewWidths::new(80, &app);
@@ -619,11 +619,12 @@ fn canceled_marker_is_dead_first() {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
+        email: None,
     });
     let mut config = config_with(vec![a], Some("a"), vec![]); // also active
     config.state.auth_broken.push("a".into()); // also auth-broken
     let mut app = App::new(config);
-    app.bell_fired.insert("a".into(), true); // bell also fired
+    app.bell_fired.observe("a", Some(50.0), Some(60.0), true); // bell also fired
     let widths = OverviewWidths::new(80, &app);
     let line = render_overview_row(&app, 0, &widths, false, true);
     let text = line_text(&line);
@@ -933,6 +934,7 @@ fn disabled_row_dims_its_name_and_keeps_the_real_type_value() {
             tier: crate::usage::PlanTier::Pro,
             subscription_status: None,
             codex_plan: None,
+            email: None,
         });
     }
     let config = config_with(vec![a, b], None, vec![]);
@@ -1542,7 +1544,7 @@ fn fallback_panel_parks_trailers_next_to_the_content() {
     let app = App::new(config);
 
     let wide = 120;
-    let lines = fallback_flow_lines(&app, wide);
+    let lines = fallback_flow_lines(&app, wide).0;
     let marked = lines
         .iter()
         .find(|l| line_text(l).contains('×'))
@@ -1578,6 +1580,7 @@ fn chain_rows_align_the_threshold_percent_column() {
     let config = config_with(vec![ninety_five, hundred], Some("a"), vec!["a", "b"]);
     let app = App::new(config);
     let texts: Vec<String> = fallback_flow_lines(&app, 60)
+        .0
         .iter()
         .map(line_text)
         .collect();
@@ -1679,6 +1682,7 @@ fn fallback_panel_marks_a_blocked_member() {
     config.state.auth_broken.push("a".into());
     let app = App::new(config);
     let joined = fallback_flow_lines(&app, 60)
+        .0
         .iter()
         .map(line_text)
         .collect::<Vec<_>>()
@@ -2891,7 +2895,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
 
     let wide = OverviewWidths::new(80, &app);
     assert!(wide.seven_day > 0, "80 columns keep the 7d column");
-    let line = render_codex_row(&row, &wide);
+    let line = render_codex_row(&row, &wide, false);
     assert_eq!(
         five_hour_cell_text(&wide, false, &line),
         fixed("42%", wide.five_hour),
@@ -2905,7 +2909,7 @@ fn a_codex_rows_usage_cells_sit_under_their_headers() {
 
     let narrow = OverviewWidths::new(56, &app);
     assert_eq!(narrow.seven_day, 0, "56 columns drop the 7d column");
-    let line = render_codex_row(&row, &narrow);
+    let line = render_codex_row(&row, &narrow, false);
     assert_eq!(
         five_hour_cell_text(&narrow, false, &line),
         fixed("42%", narrow.five_hour)
@@ -2938,11 +2942,11 @@ fn a_codex_row_shows_the_reset_chip_only_while_one_is_available() {
 
     let wide = OverviewWidths::new(80, &app);
     assert!(
-        text(render_codex_row(&row(Some(2)), &wide)).contains("↺ 2"),
+        text(render_codex_row(&row(Some(2)), &wide, false)).contains("↺ 2"),
         "two banked resets render the chip"
     );
     assert!(
-        !text(render_codex_row(&row(None), &wide)).contains("↺"),
+        !text(render_codex_row(&row(None), &wide, false)).contains("↺"),
         "no available reset (the constructor floors zero to None): no chip"
     );
 }
@@ -2978,8 +2982,8 @@ fn a_quarantined_codex_row_renders_the_broken_marker() {
 
     let app = App::new(config_with(vec![], None, vec![]));
     let widths = OverviewWidths::new(80, &app);
-    let broken = render_codex_row(&rows[0], &widths);
-    let live = render_codex_row(&rows[1], &widths);
+    let broken = render_codex_row(&rows[0], &widths, false);
+    let live = render_codex_row(&rows[1], &widths, false);
 
     // The codex row carries the list rows' slots (blank 2-cell cursor prefix,
     // marker cell, gap, name), so the glyph and the name sit in the claude
@@ -3245,7 +3249,7 @@ fn bell_outranks_the_peak_marker() {
     let config = config_with(vec![peak_profile("a")], Some("a"), vec![]);
     let mut app = App::new(config);
     app.price_table = Some(windowed_table("00:00", "24:00"));
-    app.bell_fired.insert("a".into(), true);
+    app.bell_fired.observe("a", Some(50.0), Some(60.0), true);
     let widths = OverviewWidths::new(80, &app);
     let text = line_text(&render_overview_row(&app, 0, &widths, false, true));
     assert!(text.contains('!'), "{text}");
@@ -3323,5 +3327,346 @@ fn the_accounts_scrollbar_counts_the_codex_rows() {
         accounts_scrollbar_column(&with_codex, 80, 8),
         "┃┃┃┊┊",
         "seven rows overflow a 5-row list: thumb 5*5/7 = 3 rows at offset 0, then track"
+    );
+}
+
+#[test]
+fn selecting_the_active_codex_row_keeps_its_active_name_color() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let mut app = App::new(config_with(vec![], None, vec![]));
+    app.codex_rows[0].active = true;
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+        .expect("draw");
+    let buf = term.backend().buffer();
+    let rows = crate::testutil::buffer_rows(buf);
+    let x = rows[3].find("cx1").expect("active Codex row is selected") as u16;
+    assert!(rows[3].contains("❯"), "selection is visible: {rows:?}");
+    assert_eq!(
+        buf.cell((x, 3)).expect("name cell").fg,
+        theme::accent().fg.expect("accent color")
+    );
+}
+
+#[test]
+fn the_last_codex_row_and_thumb_follow_a_short_viewport() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3"]);
+    let mut app = App::new(config_with(
+        vec![
+            profile("cl1", 80.0, 10.0, 3_600),
+            profile("cl2", 80.0, 20.0, 3_600),
+        ],
+        None,
+        vec![],
+    ));
+    assert_eq!(app.codex_rows.len(), 3);
+    app.overview_cursor = 4;
+    assert_eq!(
+        app.current_main_item().map(|item| format!("{item:?}")),
+        Some("Codex(2)".to_string())
+    );
+    let mut term =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 8)).expect("terminal");
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+        .expect("draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows[6].contains("❯") && rows[6].contains("cx3"),
+        "last row: {rows:?}"
+    );
+    assert_eq!(accounts_scrollbar_column(&app, 80, 8), "┊┊┃┃┃");
+    app.harness_filter = crate::tui::app::HarnessFilter::Codex;
+    app.overview_cursor = 2;
+    term.draw(|f| draw_overview_accounts(f, f.area(), &app))
+        .expect("codex-only draw");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        rows[5].contains("❯") && rows[5].contains("cx3"),
+        "codex-only: {rows:?}"
+    );
+    assert_eq!(accounts_scrollbar_column(&app, 80, 8), "     ");
+}
+
+/// cloudy-tui "Keys and commands inside prose": the codex section's heading
+/// names its switch command in ACCENT, never bold, the rest of the line dim.
+#[test]
+fn the_codex_heading_styles_its_switch_command() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    crate::testutil::write_codex_roster(&["cx1"]);
+    let app = App::new(config_with(
+        vec![profile("cl1", 80.0, 10.0, 3_600)],
+        None,
+        vec![],
+    ));
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    crate::testutil::assert_prose_part(
+        term.backend().buffer(),
+        "codex — switch with clauth <name>",
+        "clauth <name>",
+        false,
+    );
+}
+
+// ── bounded Overview chain summary (tui-fix S3) ─────────────────────────────
+
+/// A chain of live, unexhausted members — the only caption is the always-on
+/// all-spent line, so the truncation arithmetic is pinned exactly.
+fn chain_app(names: &[String]) -> App {
+    let profiles: Vec<Profile> = names.iter().map(|n| profile(n, 95.0, 20.0, 3600)).collect();
+    let chain: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    App::new(config_with(profiles, None, chain))
+}
+
+#[test]
+fn truncate_chain_keeps_captions_and_names_hidden_members() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..28).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let (full, member_count) = fallback_flow_lines(&app, 76);
+    assert_eq!(member_count, 28, "the builder returns its member count");
+    assert_eq!(full.len(), 29, "28 members + the all-spent caption");
+    // 11 inner rows: 9 members + the caption + the more-line.
+    let cut = truncate_chain(full, member_count, 11);
+    assert_eq!(cut.len(), 11);
+    assert_eq!(
+        line_text(cut.last().unwrap()),
+        "  +19 more · → fallback tab",
+        "the last row names the 19 hidden members"
+    );
+    assert!(
+        line_text(&cut[8]).contains("a8"),
+        "the ninth member still draws"
+    );
+    assert!(
+        line_text(&cut[9]).contains("when all spent"),
+        "the all-spent caption survives the cut"
+    );
+}
+
+#[test]
+fn truncate_chain_draws_every_member_that_fits_without_the_more_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    // 11 members = the panel's inner height at 80×24; the base drew all 11 and
+    // the round-1 code hid two behind a `+2 more` line.
+    let names: Vec<String> = (0..11).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let (full, member_count) = fallback_flow_lines(&app, 76);
+    assert_eq!(full.len(), 12, "11 members + the all-spent caption");
+    let cut = truncate_chain(full, member_count, 11);
+    assert_eq!(cut.len(), 11, "every member fits, the caption drops");
+    assert!(
+        cut.iter().all(|l| !line_text(l).contains("more · ")),
+        "no hidden-members line when every member fits"
+    );
+    assert!(
+        line_text(&cut[10]).contains("a10"),
+        "the eleventh member draws"
+    );
+}
+
+#[test]
+fn overview_chain_panel_names_hidden_members_on_a_short_terminal() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..28).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let more = rows
+        .iter()
+        .find(|r| r.contains("more · "))
+        .unwrap_or_else(|| panic!("the hidden-members line renders: {rows:#?}"));
+    let content = more
+        .strip_prefix("│ ")
+        .unwrap_or(more)
+        .trim_end_matches([' ', '│']);
+    assert_eq!(
+        content, "  +19 more · → fallback tab",
+        "the whole last content row names the hidden members, got {content:?}"
+    );
+}
+
+#[test]
+fn overview_chain_panel_omits_the_more_line_when_everyone_fits() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let names: Vec<String> = (0..3).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let out = crate::testutil::buffer_rows(term.backend().buffer()).concat();
+    assert!(
+        !out.contains("more · "),
+        "no hidden-members line when the chain fits"
+    );
+}
+
+#[test]
+fn overview_more_line_styles_the_arrow_as_a_key() {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let names: Vec<String> = (0..28).map(|i| format!("a{i}")).collect();
+    let app = chain_app(&names);
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let buf = term.backend().buffer();
+    crate::testutil::assert_prose_part(buf, "+19 more · → fallback tab", "→", true);
+    // The words beside the arrow are the caption style, faint — pinned by
+    // equality, not just "not accent".
+    let faint = crate::tui::theme::text_faint_color();
+    for word in ["+19 more", "fallback tab"] {
+        let cells =
+            crate::testutil::needle_cells(buf, word).unwrap_or_else(|| panic!("`{word}` missing"));
+        for cell in cells {
+            if cell.symbol() == " " {
+                continue;
+            }
+            assert_eq!(cell.fg, faint, "`{word}` renders faint");
+            assert!(
+                !cell.modifier.contains(ratatui::style::Modifier::BOLD),
+                "`{word}` is not bold"
+            );
+        }
+    }
+}
+
+/// A hybrid's Overview bar text equals the
+/// provider-derived percentage — `apply_usage` fills `Profile.usage` from the
+/// picker, so the Overview shows 10% (the provider bar), never the OAuth 100%.
+#[test]
+fn a_hybrids_overview_bar_shows_the_provider_percentage() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = ProfileName::from("h");
+    let mut hybrid = crate::testutil::blank_profile(&name);
+    hybrid.base_url = Some("https://example.com".to_string());
+    hybrid.api_key = Some("key".to_string());
+    hybrid.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert!(
+        hybrid.usage_cache_is_third_party(),
+        "fixture classifies third-party"
+    );
+    let config = config_with(vec![hybrid], Some("h"), vec!["h"]);
+    let mut app = App::new(config);
+    app.usage_store
+        .lock()
+        .unwrap()
+        .insert("h".into(), oauth_usage(100.0));
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("h".into(), tp_bar(10.0));
+    app.apply_usage();
+    let widths = OverviewWidths::new(80, &app);
+    let line = render_overview_row(&app, 0, &widths, false, true);
+    let text = line_text(&line);
+    assert_eq!(
+        text, "  ● h             API                [█░░░░░░░░░]  10%      —              ",
+        "the hybrid's Overview row renders the provider percentage"
+    );
+}
+
+fn oauth_usage(pct: f64) -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: pct,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+        }),
+        ..crate::usage::UsageInfo::default()
+    }
+}
+
+fn tp_bar(pct: f64) -> crate::providers::ThirdPartyStats {
+    crate::providers::ThirdPartyStats {
+        is_available: true,
+        rows: Vec::new(),
+        bars: vec![crate::providers::UsageBar {
+            label: "5h".to_string(),
+            pct,
+            resets_at: Some(crate::usage::epoch_secs_to_iso(
+                crate::usage::now_epoch_secs() + 3600,
+            )),
+            used: None,
+            total: None,
+        }],
+        plan: None,
+        endpoint: None,
+        best_effort: false,
+    }
+}
+
+/// A hybrid active has no projected-switch ETA: its provider window has no OAuth
+/// burn history to pair with, so `projected_switch` renders nothing even when a
+/// burn series exists under the name (maintainer ruling 2026-09-10).
+#[test]
+fn a_hybrid_has_no_projected_switch_eta() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let name = ProfileName::from("h");
+    let mut hybrid = crate::testutil::blank_profile(&name);
+    hybrid.base_url = Some("https://example.com".to_string());
+    hybrid.api_key = Some("key".to_string());
+    hybrid.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    assert!(
+        hybrid.usage_cache_is_third_party(),
+        "fixture classifies third-party"
+    );
+    let spare = profile("spare", 95.0, 10.0, 3600);
+    let config = config_with(vec![hybrid, spare], Some("h"), vec!["h", "spare"]);
+    let mut app = App::new(config);
+    // The provider's live 5h bar at 92% — below the static threshold, but a
+    // burn series would project it past.
+    app.third_party_usage_store
+        .lock()
+        .unwrap()
+        .insert("h".into(), tp_bar(92.0));
+    app.apply_usage();
+    let now = crate::usage::now_ms();
+    app.history_cache.insert(
+        "h".into(),
+        vec![
+            (now - 360_000, oauth_usage(32.0)),
+            (now - 240_000, oauth_usage(52.0)),
+            (now - 120_000, oauth_usage(72.0)),
+        ],
+    );
+    let cfg = app.config();
+    assert_eq!(
+        projected_switch(&app, &cfg, &HashSet::new()),
+        None,
+        "a hybrid active has no projected-switch ETA"
     );
 }

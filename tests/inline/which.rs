@@ -125,6 +125,40 @@ fn no_sidecars(_name: &crate::profile::ProfileName) -> Option<String> {
     None
 }
 
+/// A tree with no Keychain evidence — the shape every pre-keychain-tier test
+/// resolves under.
+fn no_keychain() -> Option<serde_json::Value> {
+    None
+}
+
+/// The login block a Keychain item carries, beside the sibling keys the same
+/// object holds (a real item stores the login as one key among many). Built
+/// from the typed credentials serializer, so the blob's wire shape cannot
+/// drift from the real one; a blank login is a logged-out shell with its
+/// tokens blanked in place, as CC writes it.
+fn keychain_blob(refresh: Option<&str>) -> serde_json::Value {
+    let creds = ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: refresh.map(|rt| format!("at-{rt}")).unwrap_or_default(),
+            refresh_token: Some(refresh.unwrap_or_default().to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut blob = serde_json::to_value(&creds).expect("serialize");
+    blob["organizationUuid"] = serde_json::json!("org-1");
+    blob["mcpOAuth"] = serde_json::json!({});
+    blob
+}
+
+/// The keychain read the resolution tier asks, standing in for the macOS
+/// `security` subprocess (test builds gate the real one off).
+fn keychain_holding(refresh: Option<&'static str>) -> impl Fn() -> Option<serde_json::Value> {
+    move || Some(keychain_blob(refresh))
+}
+
 /// A stub CLA-SPLIT lookup over `(profile, installed access token)` pairs,
 /// standing in for `claude::installed_session_token`'s disk read. The real one
 /// already filters mis-filled sidecars out, so anything listed here is a token a
@@ -226,7 +260,14 @@ fn attributes_unmatched_login_to_credential_less_active() {
     );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &no_keychain
+        ),
         Some((
             &crate::profile::ProfileName::from("new"),
             Source::CredentialLessActive
@@ -245,7 +286,14 @@ fn token_match_wins_over_credential_less_active() {
     );
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &no_keychain
+        ),
         Some((
             &crate::profile::ProfileName::from("personal"),
             Source::RefreshMatch
@@ -258,7 +306,14 @@ fn no_attribution_when_active_profile_has_creds() {
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &no_keychain
+        ),
         None
     );
 }
@@ -271,7 +326,14 @@ fn no_attribution_when_no_active_profile() {
     );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &no_keychain
+        ),
         None
     );
 }
@@ -286,7 +348,14 @@ fn attributes_credential_less_active_without_loaded_refresh_token() {
     );
     let live = live_oauth(None);
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &no_keychain
+        ),
         Some((
             &crate::profile::ProfileName::from("new"),
             Source::CredentialLessActive
@@ -300,7 +369,7 @@ fn attributes_api_key_active_when_credentials_file_absent() {
     // the loaded creds are `None`. the active profile still owns the session.
     let config = config_with(vec![endpoint_profile("api")], Some("api"));
     assert_eq!(
-        resolve_profile(&config, None, false, None, &no_sidecars),
+        resolve_profile(&config, None, false, None, &no_sidecars, &no_keychain),
         Some((
             &crate::profile::ProfileName::from("api"),
             Source::CredentialLessActive
@@ -321,7 +390,7 @@ fn no_credential_less_attribution_inside_session() {
     );
     let live = live_oauth(Some("rt-from-runtime"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, None, &no_sidecars),
+        resolve_profile(&config, Some(&live), true, None, &no_sidecars, &no_keychain),
         None
     );
 }
@@ -338,7 +407,7 @@ fn token_match_still_works_inside_session() {
     );
     let live = live_oauth(Some("rt-work"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, None, &no_sidecars),
+        resolve_profile(&config, Some(&live), true, None, &no_sidecars, &no_keychain),
         Some((
             &crate::profile::ProfileName::from("work"),
             Source::RefreshMatch
@@ -358,7 +427,14 @@ fn resolves_started_profile_in_runtime_session() {
     );
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, Some("new"), &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            true,
+            Some("new"),
+            &no_sidecars,
+            &no_keychain
+        ),
         Some((
             &crate::profile::ProfileName::from("new"),
             Source::SessionDir
@@ -374,7 +450,7 @@ fn started_profile_resolves_with_no_loaded_creds() {
         Some("work"),
     );
     assert_eq!(
-        resolve_profile(&config, None, true, Some("new"), &no_sidecars),
+        resolve_profile(&config, None, true, Some("new"), &no_sidecars, &no_keychain),
         Some((
             &crate::profile::ProfileName::from("new"),
             Source::SessionDir
@@ -394,7 +470,14 @@ fn token_match_wins_over_started_profile() {
     );
     let live = live_oauth(Some("rt-personal"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, Some("new"), &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            true,
+            Some("new"),
+            &no_sidecars,
+            &no_keychain
+        ),
         Some((
             &crate::profile::ProfileName::from("personal"),
             Source::RefreshMatch
@@ -408,7 +491,14 @@ fn unknown_started_profile_is_not_resolved() {
     let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
     let live = live_oauth(Some("rt-fresh"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), true, Some("ghost"), &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            true,
+            Some("ghost"),
+            &no_sidecars,
+            &no_keychain
+        ),
         None
     );
 }
@@ -424,7 +514,14 @@ fn disabled_profile_is_never_resolved_even_on_a_stale_token_match() {
     let config = config_with(vec![disabled], None);
     let live = live_oauth(Some("rt-acme"));
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &no_keychain
+        ),
         None
     );
 }
@@ -439,7 +536,14 @@ fn disabled_profile_is_never_resolved_as_credential_less_active() {
     let config = config_with(vec![disabled], Some("acme"));
     let live = live_oauth(None);
     assert_eq!(
-        resolve_profile(&config, Some(&live), false, None, &no_sidecars),
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &no_keychain
+        ),
         None
     );
 }
@@ -458,7 +562,8 @@ fn session_token_install_is_attributed_to_its_profile() {
             Some(&live),
             false,
             None,
-            &sidecars(&[("work", "oat-work")])
+            &sidecars(&[("work", "oat-work")]),
+            &no_keychain
         ),
         Some((
             &crate::profile::ProfileName::from("work"),
@@ -490,7 +595,8 @@ fn a_rotating_login_is_never_attributed_to_a_sidecar() {
             Some(&live),
             false,
             None,
-            &sidecars(&[("work", "oat-work")])
+            &sidecars(&[("work", "oat-work")]),
+            &no_keychain
         ),
         None
     );
@@ -514,7 +620,8 @@ fn session_token_match_wins_over_credential_less_active() {
             Some(&live),
             false,
             None,
-            &sidecars(&[("work", "oat-work")])
+            &sidecars(&[("work", "oat-work")]),
+            &no_keychain
         ),
         Some((
             &crate::profile::ProfileName::from("work"),
@@ -541,7 +648,8 @@ fn session_token_ties_break_on_the_active_profile() {
             Some(&live),
             false,
             None,
-            &sidecars(&[("work", "oat-shared"), ("copy", "oat-shared")])
+            &sidecars(&[("work", "oat-shared"), ("copy", "oat-shared")]),
+            &no_keychain
         ),
         Some((
             &crate::profile::ProfileName::from("copy"),
@@ -562,7 +670,8 @@ fn session_token_match_still_works_inside_a_session() {
             Some(&live),
             true,
             None,
-            &sidecars(&[("work", "oat-work")])
+            &sidecars(&[("work", "oat-work")]),
+            &no_keychain
         ),
         Some((
             &crate::profile::ProfileName::from("work"),
@@ -585,7 +694,8 @@ fn disabled_profile_is_never_resolved_on_a_session_token_match() {
             Some(&live),
             false,
             None,
-            &sidecars(&[("acme", "oat-acme")])
+            &sidecars(&[("acme", "oat-acme")]),
+            &no_keychain
         ),
         None
     );
@@ -603,10 +713,312 @@ fn a_blank_access_token_never_matches_a_sidecar() {
             Some(&live),
             false,
             None,
-            &sidecars(&[("work", "")])
+            &sidecars(&[("work", "")]),
+            &no_keychain
         ),
         None
     );
+}
+
+#[test]
+fn keychain_login_is_attributed_when_the_file_tier_misses() {
+    // The #105 shape: after CC migrates its login into the Keychain, the live
+    // file is gone or stale, so tiers 1/1b miss — the item's login is the only
+    // evidence left.
+    let config = config_with(
+        vec![
+            oauth_profile("work", "rt-work"),
+            blank_profile(&crate::profile::ProfileName::from("new")),
+        ],
+        Some("new"),
+    );
+    let live = live_oauth(Some("rt-stale"));
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &keychain_holding(Some("rt-work"))
+        ),
+        Some((
+            &crate::profile::ProfileName::from("work"),
+            Source::KeychainMatch
+        ))
+    );
+}
+
+#[test]
+fn keychain_match_outranks_the_session_dir_claim() {
+    // A credential match is more precise than the path claim, exactly like
+    // tiers 1/1b: the namespaced item holds the login CC actually runs on,
+    // which outranks the runtime dir's name.
+    let config = config_with(
+        vec![
+            oauth_profile("personal", "rt-personal"),
+            blank_profile(&crate::profile::ProfileName::from("new")),
+        ],
+        Some("new"),
+    );
+    let live = live_oauth(Some("rt-stale"));
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            true,
+            Some("new"),
+            &no_sidecars,
+            &keychain_holding(Some("rt-personal"))
+        ),
+        Some((
+            &crate::profile::ProfileName::from("personal"),
+            Source::KeychainMatch
+        ))
+    );
+}
+
+#[test]
+fn file_refresh_match_outranks_the_keychain_item() {
+    // Tier 1 keeps its precedence: the file still answering means the
+    // migration has not happened, and the file's login is the live one.
+    let config = config_with(
+        vec![
+            oauth_profile("work", "rt-work"),
+            oauth_profile("personal", "rt-personal"),
+        ],
+        Some("work"),
+    );
+    let live = live_oauth(Some("rt-personal"));
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &keychain_holding(Some("rt-work"))
+        ),
+        Some((
+            &crate::profile::ProfileName::from("personal"),
+            Source::RefreshMatch
+        ))
+    );
+}
+
+#[test]
+fn keychain_login_attributes_inside_a_custom_config_dir() {
+    // A custom `CLAUDE_CONFIG_DIR` (not a clauth runtime) gets no SessionDir
+    // tier — but its namespaced item is evidence, so the scope-both pick
+    // resolves it too.
+    let config = config_with(vec![oauth_profile("work", "rt-work")], Some("work"));
+    let live = live_oauth(Some("rt-stale"));
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            true,
+            None,
+            &no_sidecars,
+            &keychain_holding(Some("rt-work"))
+        ),
+        Some((
+            &crate::profile::ProfileName::from("work"),
+            Source::KeychainMatch
+        ))
+    );
+}
+
+#[test]
+fn a_blank_keychain_login_is_no_evidence() {
+    // A logged-out shell blanks its login in place: the tier must fall
+    // through, never attribute the empty pair.
+    let config = config_with(
+        vec![blank_profile(&crate::profile::ProfileName::from("new"))],
+        Some("new"),
+    );
+    let live = live_oauth(Some("rt-stale"));
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &keychain_holding(None)
+        ),
+        Some((
+            &crate::profile::ProfileName::from("new"),
+            Source::CredentialLessActive
+        ))
+    );
+}
+
+#[test]
+fn disabled_profile_is_never_resolved_on_a_keychain_match() {
+    let mut disabled = oauth_profile("acme", "rt-acme");
+    disabled.disabled = true;
+    let config = config_with(vec![disabled], None);
+    let live = live_oauth(Some("rt-stale"));
+    assert_eq!(
+        resolve_profile(
+            &config,
+            Some(&live),
+            false,
+            None,
+            &no_sidecars,
+            &keychain_holding(Some("rt-acme"))
+        ),
+        None
+    );
+}
+
+#[test]
+fn the_global_keychain_evidence_service_is_the_bare_item() {
+    // The bare arm is what the issue's repro needs; the namespaced arm needs
+    // the canonicalized dir and is covered by the macOS real-item leg.
+    assert_eq!(
+        keychain_evidence_service(None).as_deref(),
+        Some(crate::claude::CLAUDE_KEYCHAIN_SERVICE)
+    );
+}
+
+#[test]
+fn keychain_cache_entry_serves_fresh_and_rejects_stale() {
+    let entry = KeychainEvidenceEntry {
+        at: 1000,
+        blob: Some(keychain_blob(Some("rt-work"))),
+    };
+    let entry = Some(&entry);
+    assert!(
+        keychain_cache_entry(entry, 1029).is_some(),
+        "a 29 s old entry is fresh"
+    );
+    assert!(
+        keychain_cache_entry(entry, 1030).is_some(),
+        "a 30 s old entry is still fresh (TTL inclusive)"
+    );
+    assert!(
+        keychain_cache_entry(entry, 1031).is_none(),
+        "a 31 s old entry is stale"
+    );
+    assert!(
+        keychain_cache_entry(None, 1000).is_none(),
+        "an absent entry is a miss"
+    );
+}
+
+#[test]
+fn keychain_cache_write_reads_back_owner_only_and_preserves_other_services() {
+    let _home = HomeSandbox::new();
+    let dir = keychain_cache_dir().expect("the sandbox home resolves");
+    write_keychain_cache_entry(
+        &dir,
+        "svc-a",
+        &KeychainEvidenceEntry {
+            at: 1000,
+            blob: Some(keychain_blob(Some("rt-a"))),
+        },
+    )
+    .expect("write a");
+    write_keychain_cache_entry(
+        &dir,
+        "svc-b",
+        &KeychainEvidenceEntry {
+            at: 2000,
+            blob: None,
+        },
+    )
+    .expect("write b");
+    let a = read_keychain_cache_entry(&dir, "svc-a").expect("read a");
+    assert_eq!(a.at, 1000);
+    assert_eq!(
+        a.blob.as_ref().expect("a holds a blob")["claudeAiOauth"]["refreshToken"],
+        "rt-a"
+    );
+    let b = read_keychain_cache_entry(&dir, "svc-b").expect("read b");
+    assert_eq!(b.at, 2000);
+    assert_eq!(b.blob, None, "an absent item caches as no evidence");
+    #[cfg(unix)]
+    {
+        assert_eq!(
+            mode(&keychain_cache_entry_path(&dir, "svc-a")),
+            0o600,
+            "the cache is owner-only"
+        );
+        assert_eq!(mode(&dir), 0o700, "the cache dir is owner-only");
+    }
+}
+
+#[test]
+fn an_unparseable_keychain_cache_is_a_miss() {
+    let _home = HomeSandbox::new();
+    let dir = keychain_cache_dir().expect("the sandbox home resolves");
+    write_keychain_cache_entry(
+        &dir,
+        "svc",
+        &KeychainEvidenceEntry {
+            at: 1000,
+            blob: None,
+        },
+    )
+    .expect("seed the file (and its dir)");
+    std::fs::write(keychain_cache_entry_path(&dir, "svc"), b"not json").expect("corrupt");
+    assert!(
+        read_keychain_cache_entry(&dir, "svc").is_none(),
+        "a corrupt cache reads as absent"
+    );
+}
+
+#[test]
+fn a_stale_keychain_cache_entry_is_swept_on_the_next_write() {
+    let _home = HomeSandbox::new();
+    let dir = keychain_cache_dir().expect("the sandbox home resolves");
+    write_keychain_cache_entry(
+        &dir,
+        "svc-old",
+        &KeychainEvidenceEntry {
+            at: 1000,
+            blob: None,
+        },
+    )
+    .expect("write old");
+    let old_path = keychain_cache_entry_path(&dir, "svc-old");
+    crate::testutil::set_mtime(
+        &old_path,
+        std::time::SystemTime::now()
+            - std::time::Duration::from_secs(KEYCHAIN_EVIDENCE_RETENTION_SECS * 2),
+    );
+    write_keychain_cache_entry(
+        &dir,
+        "svc-new",
+        &KeychainEvidenceEntry {
+            at: 2000,
+            blob: Some(keychain_blob(Some("rt-new"))),
+        },
+    )
+    .expect("write new");
+    assert!(!old_path.exists(), "the stale entry is swept");
+    assert!(
+        keychain_cache_entry_path(&dir, "svc-new").exists(),
+        "the fresh entry stays"
+    );
+    assert_eq!(
+        read_keychain_cache_entry(&dir, "svc-new")
+            .expect("read new")
+            .at,
+        2000
+    );
+}
+
+#[cfg(unix)]
+fn mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 /// An OAuth profile whose login token claims `sub`, the tier this field reported
@@ -634,6 +1046,7 @@ fn cache_plan(name: &str, tier: PlanTier, status: Option<&str>) {
             tier,
             subscription_status: status.map(str::to_string),
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     };
@@ -865,6 +1278,7 @@ fn source_maps_to_wire_strings() {
         Source::CredentialLessActive.as_str(),
         "credential_less_active"
     );
+    assert_eq!(Source::KeychainMatch.as_str(), "keychain_match");
 }
 
 /// Tier 2 keys on the config dir's NAME, so per-session runtime dirs have to

@@ -453,12 +453,15 @@ pub(crate) fn bounded_output(bin: &str, args: &[&str], envs: &[(&str, &OsStr)]) 
     run_bounded(child, PROBE_TIMEOUT)
 }
 
-/// The `HERDR_*` vars a daemon-side herdr spawn strips (owner ruling
+/// The `HERDR_*` session vars stripped from a spawn that must not act as the
+/// pane it was started in. A daemon-side herdr spawn (owner ruling
 /// 2026-09-15; threat-model HB-4): a daemon started
 /// inside a herdr pane must still target herdr's default session, or it serves
 /// — and for the terminal bridge, types into — whichever session its ancestor
-/// happened to be. `HERDR_BIN_PATH` is not on the list: it is the operator and
-/// test seam that names the binary, never a session selector.
+/// happened to be. A delegate's `claude`: it is not the pane's agent, so its
+/// hooks must not report into the pane. `HERDR_BIN_PATH` is not on the list: it
+/// is the operator and test seam that names the binary, never a session
+/// selector.
 pub(crate) fn strip_session_env(cmd: &mut Command) {
     for var in [
         "HERDR_ENV",

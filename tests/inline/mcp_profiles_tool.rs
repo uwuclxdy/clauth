@@ -277,6 +277,7 @@ fn seed_flag_states() {
                 tier: PlanTier::Free,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
+                email: None,
             }),
             ..Default::default()
         },
@@ -363,6 +364,7 @@ fn seed_canceled_account() {
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     };

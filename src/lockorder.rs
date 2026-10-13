@@ -83,7 +83,7 @@ pub(crate) mod rank {
     ranks! {
         // Test-only scaffolding locks, ranked OUTERMOST (below every production
         // rank): the RAII sandboxes that hold them (`testutil::HomeSandbox` /
-        // `TierSandbox`, `showcase::ShowcaseHome`, runtime's `with_fake_home`)
+        // `TierSandbox`, runtime's `with_fake_home`)
         // wrap the whole test, so the code under test still legally acquires any
         // production lock inside them. Two ranks, not one, so a future test that
         // needs both cannot invert them into a deadlock: acquire `HomeTest`

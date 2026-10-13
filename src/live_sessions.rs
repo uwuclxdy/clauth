@@ -190,6 +190,10 @@ pub(crate) struct LiveTally {
     /// live, but on no account clauth attributes them to, so they reach
     /// [`LiveTally::total`] only.
     unattributed: usize,
+    /// The registry or the bare-marker dir could not be listed (it exists but
+    /// refuses, or `~/.clauth` itself does not resolve), so [`LiveTally::total`]
+    /// has no reading to give.
+    unread: bool,
 }
 
 /// One account's slice of a [`LiveTally`]. All-zero for an account hosting none.
@@ -210,12 +214,15 @@ impl LiveTally {
     /// the same predicate the decision leg does, so a row cannot be live for one
     /// and dead for the other.
     pub(crate) fn collect(config: &AppConfig) -> Self {
-        let mut tally = Self::from_live_rows(list().into_iter().filter(|row| {
+        let rows = read_registry();
+        let unread = rows.is_none();
+        let mut tally = Self::from_live_rows(rows.unwrap_or_default().into_iter().filter(|row| {
             let probe = crate::profile::ProfileName::from(
                 row.current_member.as_deref().unwrap_or(&row.start_profile),
             );
             crate::runtime::session_row_is_live(&probe, row.isolated, &row.session_id)
         }));
+        tally.unread = unread;
         tally.add_bare_sessions(config);
         tally
     }
@@ -237,14 +244,18 @@ impl LiveTally {
     /// They count as `following` as well, because the chain genuinely moves them:
     /// a global auto-switch repoints the link and Claude Code re-reads it.
     ///
-    /// An unreadable marker dir counts as ZERO — the OPPOSITE direction to
+    /// An unreadable marker dir adds no session to any account and leaves the
+    /// fleet total unread — the OPPOSITE direction to
     /// [`crate::runtime::has_live_session`], which gates delete, disable,
     /// rename and rotation and so must read an unknown as live. This tally
-    /// only renders, so
-    /// folding an unknown in as live would put a session on screen that nothing
-    /// produced.
+    /// only renders, so folding an unknown in as live would put a session on
+    /// screen that nothing produced, and folding it in as zero would show a
+    /// total nothing read.
     fn add_bare_sessions(&mut self, config: &AppConfig) {
-        let bare = crate::runtime::live_bare_sessions().unwrap_or(0);
+        let Some(bare) = crate::runtime::live_bare_sessions() else {
+            self.unread = true;
+            return;
+        };
         if bare == 0 {
             return;
         }
@@ -274,6 +285,7 @@ impl LiveTally {
         Self {
             members: per_member,
             unattributed: 0,
+            unread: false,
         }
     }
 
@@ -290,10 +302,33 @@ impl LiveTally {
         self.members.get(name.as_str()).copied().unwrap_or_default()
     }
 
+    /// A tally that read `rows` but not every dir it counts from (the bare
+    /// markers refused), for tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn partly_read(rows: impl IntoIterator<Item = LiveSession>) -> Self {
+        Self {
+            unread: true,
+            ..Self::from_live_rows(rows)
+        }
+    }
+
+    /// A tally whose reads failed, for render tests in other modules.
+    #[cfg(test)]
+    pub(crate) fn unread() -> Self {
+        Self {
+            unread: true,
+            ..Self::default()
+        }
+    }
+
     /// Every live session across the fleet: those on a deleted account and bare
-    /// ones on a link no profile matches included.
-    pub(crate) fn total(&self) -> usize {
-        self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed
+    /// ones on a link no profile matches included. `None` when a dir it counts
+    /// from could not be listed.
+    pub(crate) fn total(&self) -> Option<usize> {
+        if self.unread {
+            return None;
+        }
+        Some(self.members.values().map(|m| m.sessions).sum::<usize>() + self.unattributed)
     }
 }
 
@@ -343,18 +378,27 @@ pub(crate) fn unregister(session_id: &str) -> Result<()> {
 
 /// Snapshot of every registered row. Read-only: the returned rows are owned
 /// copies, so nothing a caller does to one reaches disk. An unreadable or
-/// unparseable file is skipped rather than failing the sweep.
+/// unparseable file is skipped rather than failing the sweep, and so is an
+/// unlistable registry.
 pub(crate) fn list() -> Vec<LiveSession> {
-    let Ok(dir) = registry_dir() else {
-        return Vec::new();
+    read_registry().unwrap_or_default()
+}
+
+/// [`list`], telling an absent registry (nothing ever registered: empty) from
+/// one that cannot be listed or located (`None`).
+fn read_registry() -> Option<Vec<LiveSession>> {
+    let dir = registry_dir().ok()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+        Err(_) => return None,
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| read_row(&entry.path()))
-        .collect()
+    Some(
+        entries
+            .flatten()
+            .filter_map(|entry| read_row(&entry.path()))
+            .collect(),
+    )
 }
 
 fn read_row(path: &Path) -> Option<LiveSession> {
