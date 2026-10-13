@@ -2568,7 +2568,7 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 /// ([`merge_nested_carried_keys`]) — the class a future `[update]` knob joins
 /// the moment the model gains the table.
 ///
-/// Two exclusions, each closing the other's hole. "Modelled" is decided by
+/// Three exclusions; the first two close each other's hole. "Modelled" is decided by
 /// ROUND-TRIPPING the on-disk file through this binary's own `AppState`, so a
 /// modelled key the new state just moved to a default (absent from the render,
 /// its `skip_serializing_if` omitted it) cannot come back from disk with its
@@ -2576,8 +2576,12 @@ pub(crate) fn save_app_state(state: &AppState) -> Result<()> {
 /// ON-DISK value is itself the skipped default (`show_pace = false` written
 /// by hand), so the second exclusion drops any key the RENDER already names —
 /// without it, a save that moves such a key off default emits it twice, and a
-/// duplicate top-level key is a hard parse error bricking the file. A carried
-/// key is one the model's round-trip never saw AND the render does not write.
+/// duplicate top-level key is a hard parse error bricking the file. The third,
+/// [`carry_is_inert`] (per nested entry, [`nested_carry_if_inert`]), catches what
+/// the round-trip cannot see: a serde alias of a modelled key reads as
+/// unmodelled, and carried beside its field it duplicates that field. A carried
+/// key is one the model's round-trip never saw, the render does not write, and
+/// whose presence leaves what the file parses to unchanged.
 fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return rendered; // nothing on disk to preserve (first save)
@@ -2596,14 +2600,16 @@ fn preserve_unmodelled_state_keys(rendered: String, path: &Path) -> String {
     let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
         return rendered; // a render that does not parse: nothing safe to merge
     };
+    let baseline = parsed_as::<AppState>(&rendered);
     let rendered = nested_carry_if_inert::<AppState>(
         rendered,
+        baseline.as_deref(),
         &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
     );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
         .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
-        .filter(|(k, v)| carry_is_inert::<AppState>(&rendered_table, k, v))
+        .filter(|(k, v)| carry_is_inert::<AppState>(baseline.as_deref(), &rendered_table, k, v))
         .collect();
     if carried.is_empty() {
         return rendered; // the common case: nothing unmodelled on disk
@@ -2688,45 +2694,71 @@ fn nested_unmodelled(
     out
 }
 
-/// Whether carrying `key = value` beside `rendered` leaves what the file parses
-/// to exactly as the render alone has it: the last word on every top-level
-/// carry. The round-trip that decides "modelled" cannot see a serde alias
-/// (`kick_timer` for `auto_start`): the alias parses into its field and
-/// re-emits under the field's own name, so the alias reads as unmodelled. And
-/// serde counts an alias and its field as ONE field, so carried beside the
-/// render's copy it is a duplicate field and the next load fails outright.
-/// Any carry that breaks the parse or changes a parsed value is dropped; a
-/// genuinely unmodelled key parses the same with or without it and stays.
-fn carry_is_inert<T>(rendered: &toml::Table, key: &str, value: &toml::Value) -> bool
+/// What `text` parses to as a `T`, re-rendered: the value the inert rule
+/// compares. Callers parse the render once per save and hand it down.
+fn parsed_as<T>(text: &str) -> Option<String>
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
-    let parse = |table: &toml::Table| -> Option<String> {
-        let parsed = toml::from_str::<T>(&toml::to_string(table).ok()?).ok()?;
-        toml::to_string(&parsed).ok()
-    };
-    let mut with = rendered.clone();
-    with.insert(key.to_string(), value.clone());
-    matches!((parse(rendered), parse(&with)), (Some(a), Some(b)) if a == b)
+    toml::to_string(&toml::from_str::<T>(text).ok()?).ok()
 }
 
-/// The nested carry, merged only when it leaves what the file parses to
-/// exactly as the render has it: [`carry_is_inert`]'s rule one level down,
-/// checked over the whole merge at once.
-fn nested_carry_if_inert<T>(rendered: String, nested: &[(String, String, toml::Value)]) -> String
+/// Whether carrying `key = value` beside `rendered` leaves what the file parses
+/// to exactly as the render alone has it (`baseline`, the render's
+/// [`parsed_as`]): the last word on every top-level carry. The round-trip that
+/// decides "modelled" cannot see a serde alias (`kick_timer` for
+/// `auto_start`): the alias parses into its field and re-emits under the
+/// field's own name, so the alias reads as unmodelled. Serde counts an alias
+/// and its field as ONE field, so carried beside the render's copy it is a
+/// duplicate field and the next load fails outright; carried where the render
+/// leaves the field at its skipped default, it turns the field back on. Any
+/// carry that breaks the parse or changes a parsed value is dropped; a
+/// genuinely unmodelled key parses the same with or without it and stays. A
+/// render that does not parse (`baseline` `None`) carries nothing.
+fn carry_is_inert<T>(
+    baseline: Option<&str>,
+    rendered: &toml::Table,
+    key: &str,
+    value: &toml::Value,
+) -> bool
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
 {
-    if nested.is_empty() {
+    let mut with = rendered.clone();
+    with.insert(key.to_string(), value.clone());
+    let parsed = toml::to_string(&with)
+        .ok()
+        .and_then(|text| parsed_as::<T>(&text));
+    matches!((baseline, parsed), (Some(a), Some(b)) if a == b)
+}
+
+/// The nested carry with [`carry_is_inert`]'s rule one level down, entry by
+/// entry: each `[table] key = value` is merged only when it alone leaves what
+/// the file parses to as the render has it (`baseline`), so one bad nested
+/// key never costs the genuine ones beside it.
+fn nested_carry_if_inert<T>(
+    rendered: String,
+    baseline: Option<&str>,
+    nested: &[(String, String, toml::Value)],
+) -> String
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let Some(baseline) = baseline else {
+        return rendered;
+    };
+    let inert: Vec<(String, String, toml::Value)> = nested
+        .iter()
+        .filter(|entry| {
+            let one = merge_nested_carried_keys(rendered.clone(), std::slice::from_ref(*entry));
+            parsed_as::<T>(&one).is_some_and(|parsed| parsed == baseline)
+        })
+        .cloned()
+        .collect();
+    if inert.is_empty() {
         return rendered;
     }
-    let merged = merge_nested_carried_keys(rendered.clone(), nested);
-    let parse =
-        |text: &str| -> Option<String> { toml::to_string(&toml::from_str::<T>(text).ok()?).ok() };
-    match (parse(&rendered), parse(&merged)) {
-        (Some(a), Some(b)) if a == b => merged,
-        _ => rendered,
-    }
+    merge_nested_carried_keys(rendered, &inert)
 }
 
 /// Marker comment written above keys `AppState` does not model, so a hand-editor
@@ -3789,7 +3821,9 @@ pub(crate) fn write_profile_credentials(
 /// `ProfileConfig` — same shape as `preserve_unmodelled_state_keys`, the
 /// recursive sub-key carry ([`merge_nested_carried_keys`]) included, and for
 /// the same reason: a modelled key the profile just moved to a default is
-/// absent from the render, and must not come back from disk. `load_profile`'s
+/// absent from the render, and must not come back from disk. The same three
+/// exclusions apply, so a pre-rename alias (`kick_timer` for `auto_start`) is
+/// never carried beside its field ([`carry_is_inert`]). `load_profile`'s
 /// typed-vs-typed drift comparison never sees unmodelled keys, so carrying
 /// them does not add write thrash.
 pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> String {
@@ -3810,14 +3844,18 @@ pub(crate) fn preserving_config_render(rendered: &str, config_path: &Path) -> St
     let Ok(rendered_table) = rendered.parse::<toml::Table>() else {
         return rendered.to_string(); // a render that does not parse: merge nothing
     };
+    let baseline = parsed_as::<ProfileConfig>(rendered);
     let merged = nested_carry_if_inert::<ProfileConfig>(
         rendered.to_string(),
+        baseline.as_deref(),
         &nested_unmodelled(&disk, &modelled_nested, &rendered_table),
     );
     let carried: Vec<(String, toml::Value)> = disk
         .into_iter()
         .filter(|(k, _)| !modelled.contains(k.as_str()) && !rendered_table.contains_key(k.as_str()))
-        .filter(|(k, v)| carry_is_inert::<ProfileConfig>(&rendered_table, k, v))
+        .filter(|(k, v)| {
+            carry_is_inert::<ProfileConfig>(baseline.as_deref(), &rendered_table, k, v)
+        })
         .collect();
     if carried.is_empty() {
         return merged; // the common case

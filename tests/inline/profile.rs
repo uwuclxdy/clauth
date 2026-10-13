@@ -4554,6 +4554,87 @@ fn an_aliased_key_on_disk_is_never_carried_beside_its_field() {
     );
 }
 
+/// Turning auto-start OFF on a file that spells it `kick_timer = true`: the
+/// render leaves `auto_start` at its skipped default, so the alias is not a
+/// duplicate there, but carried back it would turn auto-start on again at the
+/// next load. The inert rule drops it because it changes a parsed value.
+#[test]
+fn turning_auto_start_off_never_carries_the_alias_back() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["alias"]);
+    let name = ProfileName::from("alias");
+    let profile = crate::testutil::blank_profile(&name);
+    save_profile(&profile).expect("first save");
+    let path = profile_config_path(&name).expect("config path");
+    let rendered = std::fs::read_to_string(&path).expect("read");
+    std::fs::write(&path, rendered + "kick_timer = true\n").expect("plant the pre-rename spelling");
+
+    let mut on = load_profile(&name).expect("the alias loads");
+    assert!(on.auto_start, "kick_timer = true reads as auto-start on");
+    on.auto_start = false;
+    save_profile(&on).expect("save auto-start off");
+
+    let after = std::fs::read_to_string(&path).expect("read after");
+    let back = load_profile(&name).unwrap_or_else(|e| panic!("reload failed: {e:#}\n{after}"));
+    assert!(!back.auto_start, "auto-start stays off:\n{after}");
+    let table: toml::Table = after.parse().expect("parses");
+    assert!(!table.contains_key("kick_timer"), "{after}");
+}
+
+/// A small model with a serde alias at the top level and inside a table, so
+/// the inert rule is pinned on its own: neither real model has a nested alias.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AliasModel {
+    #[serde(alias = "old")]
+    new: bool,
+    #[serde(default)]
+    inner: AliasInner,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct AliasInner {
+    #[serde(alias = "old_in")]
+    new_in: bool,
+}
+
+#[test]
+fn an_alias_carry_is_never_inert_and_an_unmodelled_one_is() {
+    let render = "new = true\n\n[inner]\nnew_in = true\n";
+    let table: toml::Table = render.parse().unwrap();
+    let baseline = parsed_as::<AliasModel>(render);
+    assert!(baseline.is_some());
+    let yes = toml::Value::Boolean(true);
+
+    // Top level: the alias beside its field is a duplicate field.
+    assert!(!carry_is_inert::<AliasModel>(
+        baseline.as_deref(),
+        &table,
+        "old",
+        &yes
+    ));
+    assert!(carry_is_inert::<AliasModel>(
+        baseline.as_deref(),
+        &table,
+        "future",
+        &yes
+    ));
+    // A render that does not parse as the model carries nothing.
+    assert!(!carry_is_inert::<AliasModel>(None, &table, "future", &yes));
+
+    // Nested, entry by entry: the aliased key goes, its genuine sibling stays.
+    let nested = vec![
+        ("inner".to_string(), "old_in".to_string(), yes.clone()),
+        ("inner".to_string(), "future_in".to_string(), yes.clone()),
+    ];
+    let merged =
+        nested_carry_if_inert::<AliasModel>(render.to_string(), baseline.as_deref(), &nested);
+    let back: toml::Table = merged.parse().expect("merged parses");
+    let inner = back["inner"].as_table().expect("inner table");
+    assert!(inner.contains_key("future_in"), "{merged}");
+    assert!(!inner.contains_key("old_in"), "{merged}");
+    assert!(toml::from_str::<AliasModel>(&merged).is_ok(), "{merged}");
+}
+
 // `bell_command` is a hand-edited key: a rewrite keeps the operator's quoting
 // byte for byte.
 #[test]
