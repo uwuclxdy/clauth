@@ -801,9 +801,9 @@ fn model_detail_total_floors_mixed_priced_days() {
             f.area(),
             Some(&row),
             20_000,
-            Some(&table),
-            false,
+            (Some(&table), false),
             TokenPeriod::Weekly,
+            None,
         );
     })
     .unwrap();
@@ -811,6 +811,124 @@ fn model_detail_total_floors_mixed_priced_days() {
     assert!(
         out.contains("$0.010+"),
         "the total renders as a floor over the priced day, got: {out}"
+    );
+}
+
+#[test]
+fn priced_split_model_detail_scroll_reaches_cache_hit_at_eighty_by_fourteen() {
+    use crate::tui::app::{TokenView, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    app.token_stats.as_mut().unwrap().models = vec![ModelTokens {
+        model: "claude-opus-4-8".into(),
+        input: 10,
+        output: 20,
+        cache_read: 30,
+        cache_create: 40,
+        ..Default::default()
+    }];
+    app.price_table = Some(table_of(vec![flat_model(
+        "claude-opus-4-8",
+        0.001,
+        0.002,
+        0.003,
+        0.004,
+    )]));
+    app.token_view = TokenView::Models;
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let before = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        !before.concat().contains("CACHE HIT"),
+        "cache-hit tail starts clipped"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    for _ in 0..30 {
+        handle_key(&mut app, crate::testutil::key(KeyCode::Down));
+    }
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let after = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        after.concat().contains("CACHE HIT"),
+        "the priced model's last section must be reachable"
+    );
+    assert_eq!(
+        app.token_model_cursor, 0,
+        "detail scrolling retains the model"
+    );
+    assert_eq!(
+        after[11].chars().skip(24).take(11).collect::<String>(),
+        "│ CACHE HIT",
+        "the final section is visible at the bottom"
+    );
+    assert_eq!(
+        after[12].chars().last(),
+        Some('│'),
+        "the pane keeps its right border"
+    );
+    let (_, detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 80, 14), 1);
+    assert_eq!(
+        term.backend()
+            .buffer()
+            .cell((detail.x + detail.width - 2, 12))
+            .unwrap()
+            .symbol(),
+        "┃",
+        "the scrollbar reaches the detail bottom"
+    );
+    assert_eq!(
+        term.backend().buffer().cell((detail.x, 0)).unwrap().fg,
+        crate::tui::theme::line_strong_color(),
+        "the detail border receives focus"
+    );
+    assert_eq!(
+        term.backend().buffer().cell((0, 0)).unwrap().fg,
+        crate::tui::theme::line_color(),
+        "the selector border is blurred"
+    );
+    term.backend_mut().resize(45, 24);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let resized = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        resized.concat().contains("CACHE HIT"),
+        "the narrow stacked detail still shows the last section"
+    );
+    let (_, narrow_detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 45, 24), 1);
+    assert_eq!(
+        term.backend()
+            .buffer()
+            .cell((
+                narrow_detail.x + narrow_detail.width - 2,
+                narrow_detail.y + narrow_detail.height - 2
+            ))
+            .unwrap()
+            .symbol(),
+        "┃",
+        "the resized thumb stays at the bottom"
+    );
+}
+
+#[test]
+fn short_model_detail_has_no_scrollbar() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = app_with_stats(TokenPeriod::Lifetime);
+    app.token_view = crate::tui::app::TokenView::Models;
+    let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), &app)).unwrap();
+    let (_, detail) = super::master_detail(ratatui::layout::Rect::new(0, 0, 80, 40), 1);
+    let col = detail.x + detail.width - 2;
+    assert_eq!(
+        app.model_detail_max_scroll.get(),
+        0,
+        "fitting model has no scroll bound"
+    );
+    assert_eq!(
+        term.backend().buffer().cell((col, 10)).unwrap().symbol(),
+        " ",
+        "no scrollbar track when content fits"
     );
 }
 
@@ -836,9 +954,9 @@ fn cost_lens_reads_rates_loading_before_any_pricing_result() {
             f.area(),
             Some(&row),
             10_000,
-            None,
-            false,
+            (None, false),
             TokenPeriod::Weekly,
+            None,
         );
     })
     .unwrap();
@@ -1315,9 +1433,9 @@ fn model_detail_marks_cache_write_not_reported() {
             f.area(),
             Some(&a1_row),
             2_000,
-            None,
-            false,
+            (None, false),
             TokenPeriod::Daily,
+            None,
         );
     })
     .unwrap();
@@ -1348,9 +1466,9 @@ fn model_detail_marks_cache_write_not_reported() {
             f.area(),
             Some(&a2_row),
             40_600,
-            None,
-            false,
+            (None, false),
             TokenPeriod::Daily,
+            None,
         );
     })
     .unwrap();
@@ -1381,9 +1499,9 @@ fn model_detail_marks_cache_write_not_reported() {
             f.area(),
             Some(&healthy_row),
             45_600,
-            None,
-            false,
+            (None, false),
             TokenPeriod::Daily,
+            None,
         );
     })
     .unwrap();
@@ -1413,9 +1531,9 @@ fn model_detail_marks_nothing_on_incomplete_split() {
             f.area(),
             Some(&row),
             2_000,
-            None,
-            false,
+            (None, false),
             TokenPeriod::Daily,
+            None,
         );
     })
     .unwrap();

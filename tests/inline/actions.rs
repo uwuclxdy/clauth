@@ -6,6 +6,7 @@ use super::*;
 use crate::profile::AppState;
 use crate::testutil::HomeSandbox;
 use crate::testutil::hold_rotation_lock;
+use crate::testutil::no_shunt_env;
 use crate::testutil::through_handle;
 use crate::testutil::write_codex_state;
 
@@ -850,6 +851,7 @@ fn auto_switch_if_needed_does_not_hop_a_scoped_blocked_active_onto_a_canceled_me
             tier: PlanTier::Free,
             subscription_status: Some("canceled".to_string()),
             codex_plan: None,
+            email: None,
         }),
         ..Default::default()
     });
@@ -1837,7 +1839,7 @@ fn overwrite_captured_profile_keeps_config_and_history_swaps_credentials() {
         }),
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
 
     overwrite_captured_profile(
@@ -1984,7 +1986,7 @@ fn browser_reauth_on_a_third_party_profile_keeps_its_endpoint_and_key() {
             credentials: Some(pair(access)),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         };
         overwrite_captured_profile(
             &mut config,
@@ -2178,7 +2180,7 @@ fn browser_reauth_keeps_a_generic_endpoint_and_key() {
                 credentials: Some(oauth_pair("new-access")),
                 base_url: None,
                 api_key: None,
-                account_uuid: None,
+                anchor: crate::actions::AnchorAction::Unproven,
             },
         )
         .expect("reauth");
@@ -2271,7 +2273,7 @@ fn an_env_token_profiles_endpoint_survives_reauth_and_the_next_load() {
                 }),
                 base_url: None,
                 api_key: None,
-                account_uuid: None,
+                anchor: crate::actions::AnchorAction::Unproven,
             },
         )
         .expect("reauth");
@@ -2384,7 +2386,7 @@ fn the_auto_activate_arm_writes_a_preserved_endpoint_into_the_live_settings() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth");
@@ -2603,7 +2605,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("endpoint-only capture");
@@ -2627,7 +2629,7 @@ fn a_half_filled_snapshot_never_pairs_a_stored_key_with_a_new_endpoint() {
             credentials: None,
             base_url: None,
             api_key: Some("sk-foreign".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("key-only capture");
@@ -2689,7 +2691,7 @@ fn browser_reauth_does_not_keep_an_endpoint_with_no_key_behind_it() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth");
@@ -2760,7 +2762,7 @@ fn browser_reauth_on_an_active_third_party_profile_keeps_the_live_endpoint() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth the active profile");
@@ -2833,7 +2835,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
             }),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("reauth");
@@ -2853,7 +2855,7 @@ fn overwrite_still_replaces_the_endpoint_set_outside_the_preserve_arm() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("api-mode reauth");
@@ -2921,7 +2923,7 @@ fn a_credentials_less_recapture_still_drops_the_stored_chain() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("recapture");
@@ -3062,7 +3064,10 @@ fn login_snapshot(refresh: &str, account_uuid: Option<&str>) -> CaptureSnapshot 
         }),
         base_url: None,
         api_key: None,
-        account_uuid: account_uuid.map(crate::profile::AccountId::from),
+        anchor: account_uuid
+            .map(crate::profile::AccountId::from)
+            .map(AnchorAction::Proven)
+            .unwrap_or(AnchorAction::Unproven),
     }
 }
 
@@ -3441,7 +3446,7 @@ fn capture_current_login_refuses_a_login_an_existing_profile_owns() {
 }
 
 #[test]
-fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
+fn a_snapshot_with_no_proven_identity_removes_the_anchor() {
     let _home = HomeSandbox::new();
     // The seed below is a cache write, gated on the on-disk record.
     crate::testutil::register_names(&["unproven"]);
@@ -3456,8 +3461,9 @@ fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     );
 
     // `capture_snapshot()` reads live creds off disk and proves no identity; a
-    // failed login probe reports none either. Neither may mint OR clear an anchor
-    // — a `None` stays the silent no-op it has always been.
+    // failed login probe reports none either. The old anchor names the account
+    // the credentials USED to prove, so it must go — the next `/profile` read
+    // backfills it from the new login's own body.
     overwrite_captured_profile(
         &mut config,
         &crate::profile::ProfileName::from("unproven"),
@@ -3466,9 +3472,164 @@ fn a_snapshot_with_no_proven_identity_leaves_the_anchor_alone() {
     .expect("overwrite in place");
 
     assert_eq!(
-        anchor_of("unproven").as_deref(),
+        anchor_of("unproven"),
+        None,
+        "an unproven swap removes the stale anchor rather than leaving it vouching for a login it never proved"
+    );
+}
+
+/// A capture onto an orphan dir (a dir holding a stale anchor with no roster
+/// row) removes that anchor inside the committing hold, and a capture onto a
+/// brand-new name logs no removal line.
+#[test]
+fn a_capture_onto_an_orphan_dir_removes_its_stale_anchor() {
+    let _home = HomeSandbox::new();
+    let dir =
+        crate::profile::profile_dir(&crate::profile::ProfileName::from("orphan")).expect("dir");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join(crate::profile_cache::ACCOUNT_ID_CACHE_FILE),
+        br#""uuid-stale""#,
+    )
+    .expect("seed");
+    assert_eq!(
+        anchor_of("orphan").as_deref(),
+        Some("uuid-stale"),
+        "precondition"
+    );
+    let mut config = AppConfig {
+        state: AppState {
+            active_profile: Some("someone-else".into()),
+            ..AppState::default()
+        },
+        profiles: vec![],
+    };
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    capture_into_profile(
+        &mut config,
+        "orphan".to_string(),
+        None,
+        login_snapshot("minted", None),
+    )
+    .expect("capture");
+    capture_into_profile(
+        &mut config,
+        "brandnew".to_string(),
+        None,
+        login_snapshot("minted2", None),
+    )
+    .expect("capture brand new");
+    let lines = sink.snapshot();
+    assert_eq!(
+        anchor_of("orphan"),
+        None,
+        "the orphan dir's stale anchor is removed"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("could not remove")),
+        "a brand-new name logs no removal line"
+    );
+}
+
+/// The commit-side `AnchorAction::Unchanged` arm (the api re-key) leaves a
+/// present anchor byte-for-byte: it is a not-a-login-write, never an install.
+#[test]
+fn an_unchanged_commit_keeps_the_anchor() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["unchanged"]);
+    let target = Profile::new("unchanged".to_string(), None, None);
+    save_profile(&target).expect("save target");
+    let mut config = inactive_config(target);
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("unchanged"),
+        Some(&crate::profile::AccountId::from(
+            "uuid-existing".to_string(),
+        )),
+    );
+
+    overwrite_captured_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("unchanged"),
+        CaptureSnapshot {
+            credentials: None,
+            base_url: Some("https://api.example.com".to_string()),
+            api_key: Some("sk-new".to_string()),
+            anchor: AnchorAction::Unchanged,
+        },
+    )
+    .expect("overwrite in place");
+
+    assert_eq!(
+        anchor_of("unchanged").as_deref(),
         Some("uuid-existing"),
-        "an unproven swap must not clear a live anchor"
+        "an Unchanged commit leaves the anchor byte-for-byte"
+    );
+}
+
+/// A settings write failing AFTER `overwrite_captured_profile`'s store commit
+/// must still leave the old anchor gone: the removal happens inside the hold,
+/// before `save_profile`, so the failure never strands the new login under the
+/// old account's anchor.
+#[cfg(unix)]
+#[test]
+fn a_failed_overwrite_after_the_commit_leaves_no_stale_anchor() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p5");
+    let tok = |a: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: a.to_string(),
+            refresh_token: Some(format!("{a}-rt")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(tok("at-a"));
+    save_profile(&profile).expect("save");
+    crate::testutil::register_names(&["p5"]);
+    crate::usage::seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.active_profile = Some("p5".into());
+    crate::profile::save_app_state(&state).expect("save state");
+    let mut config = AppConfig {
+        state,
+        profiles: vec![profile],
+    };
+    let claude_dir = crate::profile::claude_dir().expect("claude dir");
+    std::fs::create_dir_all(&claude_dir).expect("mkdir .claude");
+    // A settings.json whose `env` is not an object: the active-profile settings
+    // write after the credential commit fails.
+    std::fs::write(claude_dir.join("settings.json"), br#"{"env": 5}"#).expect("settings");
+    let r = overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(tok("at-b")),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    );
+    assert!(
+        r.is_err(),
+        "precondition: the settings write after the commit fails"
+    );
+    let stored = crate::profile::load_profile(&name).expect("load");
+    assert_eq!(
+        stored.access_token(),
+        Some("at-b"),
+        "precondition: the store took the new login"
+    );
+    assert_eq!(
+        anchor_of("p5"),
+        None,
+        "the store holds a login the anchor never proved, so the old anchor must not survive the failed overwrite"
     );
 }
 
@@ -3485,7 +3646,7 @@ fn overwrite_captured_profile_expires_the_profile_ttl_clock() {
             credentials: None,
             base_url: Some("https://api.example.com".to_string()),
             api_key: Some("new-api-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("overwrite in place");
@@ -3621,7 +3782,7 @@ fn overwrite_captured_profile_clears_auth_broken_quarantine() {
         }),
         base_url: None,
         api_key: None,
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -3681,7 +3842,7 @@ fn overwrite_captured_profile_reapplies_live_state_when_active() {
         credentials: None,
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -3778,7 +3939,7 @@ fn overwriting_the_active_profile_replaces_a_regular_live_file() {
         }),
         base_url: None,
         api_key: None,
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -3849,7 +4010,7 @@ fn overwriting_the_active_profile_with_no_credentials_clears_a_regular_live_file
         credentials: None,
         base_url: Some("https://api.example.com".to_string()),
         api_key: Some("new-api-key".to_string()),
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     };
     overwrite_captured_profile(
         &mut config,
@@ -5206,7 +5367,7 @@ fn reauth_overwrite_clears_broken_flag() {
             credentials: Some(oauth_creds("fresh-access")),
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("re-auth overwrite");
@@ -5769,7 +5930,7 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
             credentials: None,
             base_url: Some("https://api.z.ai/api/anthropic".to_string()),
             api_key: Some("zai-key".to_string()),
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         },
     )
     .expect("overwrite_captured_profile");
@@ -5779,6 +5940,101 @@ fn moving_the_endpoint_off_alibaba_clears_the_console_session() {
             .console
             .is_none(),
         "a reauth that moves the endpoint off Alibaba clears the session with it",
+    );
+}
+
+/// A failed endpoint save restores the in-memory profile to exactly its
+/// pre-call value: the save mutates the profile first, so without the restore
+/// the TUI's roster would hold the new endpoint/key while disk kept the old,
+/// and the next write would persist the change the error said did not happen.
+#[cfg(unix)]
+#[test]
+fn a_failed_endpoint_save_restores_the_in_memory_profile() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = HomeSandbox::new();
+    let mut p = Profile::new(
+        "alice".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    p.console = Some(crate::profile::ConsoleCredential {
+        token: "3f2b1c4d-5e6f-4708-9a1b-2c3d4e5f6071".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    p.third_party_usage = Some(crate::testutil::stats_with_bars(vec![
+        crate::testutil::bar("5h", 80.0),
+    ]));
+    crate::profile::save_profile(&p).expect("save the profile");
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("alice"))
+        .expect("profile dir");
+    let mut config = inactive_config(p);
+    let before = config
+        .find(&crate::profile::ProfileName::from("alice"))
+        .expect("alice in the roster")
+        .clone();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500))
+        .expect("chmod the profile dir read-only");
+    let err = edit_profile_endpoint(
+        &mut config,
+        &crate::profile::ProfileName::from("alice"),
+        Some("http://127.0.0.1:3001".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect_err("the save must fail");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore the profile dir");
+    let after = config
+        .find(&crate::profile::ProfileName::from("alice"))
+        .expect("alice still in the roster")
+        .clone();
+    assert_eq!(
+        format!("{after:?}"),
+        format!("{before:?}"),
+        "the failed save restores the in-memory profile to exactly its pre-call value: {err:#}"
+    );
+}
+
+/// A failed endpoint save leaves the third-party DISK cache as it was: the
+/// removal runs only after `save_profile_config` landed. `config.toml` is made a
+/// directory so the save fails while the profile dir stays writable — a
+/// read-only dir would also block the removal, hiding the ordering.
+#[test]
+fn a_failed_endpoint_save_keeps_the_third_party_cache() {
+    let _home = HomeSandbox::new();
+    let p = Profile::new(
+        "alice".to_string(),
+        Some("https://api.deepseek.com".to_string()),
+        Some("old-key".to_string()),
+    );
+    crate::profile::save_profile(&p).expect("save the profile");
+    crate::testutil::register_names(&["alice"]);
+    let name = crate::profile::ProfileName::from("alice");
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &crate::testutil::stats_with_bars(vec![crate::testutil::bar("5h", 80.0)]),
+    );
+    let cache = crate::profile_cache::profile_cache_path(
+        &name,
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+    )
+    .expect("cache path");
+    assert!(cache.exists(), "the fixture wrote the cache file");
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    std::fs::remove_file(&config_toml).expect("remove config.toml");
+    std::fs::create_dir_all(&config_toml).expect("replace config.toml with a directory");
+    let mut config = inactive_config(p);
+    let err = edit_profile_endpoint(
+        &mut config,
+        &name,
+        Some("http://127.0.0.1:3001".to_string()),
+        Some("new-key".to_string()),
+    )
+    .expect_err("the save must fail");
+    assert!(
+        cache.exists(),
+        "a failed save keeps the third-party cache file: {err:#}"
     );
 }
 
@@ -6599,5 +6855,679 @@ fn a_link_that_cannot_follow_fails_the_switch_whole() {
             .map(|n| n.as_str()),
         Some("cx1"),
         "marker unmoved — the switch failed whole, not half"
+    );
+}
+
+// ── the gateway's client tokens follow their profile ────────────────────────
+
+/// An adopted gateway over `config` whose env file holds `env_text`, saved as
+/// the record the token store's guards read.
+fn adopt_gateway(
+    home: &HomeSandbox,
+    config: &str,
+    env_text: &str,
+) -> crate::gateway::GatewayRecord {
+    let etc = home.home().join("etc");
+    std::fs::create_dir_all(&etc).expect("etc");
+    let path = etc.join("shunt.toml");
+    std::fs::write(&path, config).expect("config");
+    let env_file = home.home().join("tokens.env");
+    std::fs::write(&env_file, env_text).expect("env file");
+    let mut record = crate::gateway::GatewayRecord::new(path).expect("adoptable");
+    record.env_file = Some(env_file);
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .expect("save the record");
+    record
+}
+
+fn blank_profiles(names: &[&str]) -> AppConfig {
+    let mut config = AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    };
+    for name in names {
+        create_blank_profile(&mut config, (*name).to_string(), None, None, None)
+            .expect("create profile");
+    }
+    config
+}
+
+fn stored_tokens() -> String {
+    std::fs::read_to_string(
+        crate::profile::clauth_dir()
+            .expect("dir")
+            .join("gateway-client-tokens.toml"),
+    )
+    .unwrap_or_default()
+}
+
+/// Deleting a profile revokes its client token: the store loses the entry,
+/// so the gateway restarts once without it.
+#[test]
+fn deleting_a_profile_revokes_its_gateway_client_token() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    let mut config = blank_profiles(&["keep", "gone"]);
+    let keep = crate::gateway_tokens::add_client_token(&record, "keep")
+        .expect("add")
+        .expose()
+        .to_string();
+    crate::gateway_tokens::add_client_token(&record, "gone").expect("add");
+
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("gone"),
+        false,
+        &rotation_guard("gone"),
+    )
+    .expect("delete");
+    assert_eq!(stored_tokens(), format!("[tokens]\nkeep = \"{keep}\"\n"));
+}
+
+/// A delete that would remove the last token while the gateway requires one
+/// refuses before anything is removed, a clean no-op like the live-session
+/// refusal; with no `[server.auth]` the same delete revokes it.
+#[test]
+fn deleting_the_profile_holding_the_last_token_refuses_while_the_gateway_requires_one() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    let mut config = blank_profiles(&["only"]);
+    let only = crate::gateway_tokens::add_client_token(&record, "only")
+        .expect("add")
+        .expose()
+        .to_string();
+    let dir = home.home().join(".clauth").join("profiles").join("only");
+    assert!(dir.exists(), "the profile has a directory");
+
+    let refused = delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("only"),
+        false,
+        &rotation_guard("only"),
+    );
+    assert_eq!(
+        refused.map_err(|e| format!("{e:#}")),
+        Err("cannot remove the last client token while the gateway requires tokens; add another token or remove [server.auth] from the config first".to_string())
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("only"))
+            .is_some(),
+        "the record stays"
+    );
+    assert!(dir.exists(), "the directory stays");
+    assert_eq!(stored_tokens(), format!("[tokens]\nonly = \"{only}\"\n"));
+
+    adopt_gateway(&home, "[server]\n", "");
+    delete_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("only"),
+        false,
+        &rotation_guard("only"),
+    )
+    .expect("an open gateway lets the last token go");
+    assert_eq!(stored_tokens(), "[tokens]\n");
+}
+
+/// Renaming a profile moves its token to the new name, the same key, so the
+/// profile's api key keeps working after the restart; a new name the env
+/// file's value already uses refuses before anything moves.
+#[test]
+fn renaming_a_profile_moves_its_token_to_the_new_name() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "SHUNT_CLIENT_TOKENS=taken:t1\n");
+    let mut config = blank_profiles(&["old"]);
+    let token = crate::gateway_tokens::add_client_token(&record, "old")
+        .expect("add")
+        .expose()
+        .to_string();
+
+    let refused = rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("old"),
+        &crate::profile::ProfileName::from("taken"),
+        &rotation_guard("old"),
+    );
+    assert_eq!(
+        refused.map_err(|e| format!("{e:#}")),
+        Err(format!(
+            "cannot rename profile \"old\" to \"taken\": the gateway's env file {} already names a client \"taken\" in SHUNT_CLIENT_TOKENS, and shunt refuses a duplicate name; remove that entry from the env file first",
+            home.home().join("tokens.env").display()
+        ))
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("old"))
+            .is_some(),
+        "the refused rename moved nothing"
+    );
+
+    rename_profile(
+        &mut config,
+        &crate::profile::ProfileName::from("old"),
+        &crate::profile::ProfileName::from("new"),
+        &rotation_guard("old"),
+    )
+    .expect("rename");
+    assert_eq!(stored_tokens(), format!("[tokens]\nnew = \"{token}\"\n"));
+}
+
+/// A profile that gains a client token between the delete's plan (which read
+/// none) and its hold refuses, asking for a rerun, so no token outlives its
+/// profile; the rerun plans the token and revokes it.
+#[test]
+fn a_delete_whose_profile_gained_a_token_after_its_plan_refuses() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["keep", "late"]);
+    let keep = crate::gateway_tokens::add_client_token(&record, "keep")
+        .expect("add")
+        .expose()
+        .to_string();
+    let other = record.clone();
+    let late = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let minted = std::sync::Arc::clone(&late);
+    crate::gateway_tokens::set_pre_hold_hook(
+        "late",
+        std::sync::Arc::new(move || {
+            let token = crate::gateway_tokens::add_client_token(&other, "late")
+                .expect("another process adds a token");
+            *minted.lock().expect("lock") = token.expose().to_string();
+        }),
+    );
+    assert_eq!(
+        delete(&mut config, "late"),
+        Err("cannot delete profile \"late\": the profile gained a client token while the delete was being prepared; run the delete again".to_string())
+    );
+    let late = late.lock().expect("lock").clone();
+    assert_eq!(
+        stored_tokens(),
+        format!("[tokens]\nkeep = \"{keep}\"\nlate = \"{late}\"\n")
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("late"))
+            .is_some(),
+        "the refused delete removed nothing"
+    );
+    assert_eq!(delete(&mut config, "late"), Ok(()));
+    assert_eq!(stored_tokens(), format!("[tokens]\nkeep = \"{keep}\"\n"));
+}
+
+/// A profile that gains a client token between the rename's plan (which read
+/// none, so never checked the new name against the gateway's clients) and its
+/// hold refuses, asking for a rerun; nothing moves.
+#[test]
+fn a_rename_whose_profile_gained_a_token_after_its_plan_refuses() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["old"]);
+    let other = record.clone();
+    let late = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+    let minted = std::sync::Arc::clone(&late);
+    crate::gateway_tokens::set_pre_hold_hook(
+        "old",
+        std::sync::Arc::new(move || {
+            let token = crate::gateway_tokens::add_client_token(&other, "old")
+                .expect("another process adds a token");
+            *minted.lock().expect("lock") = token.expose().to_string();
+        }),
+    );
+    assert_eq!(
+        rename(&mut config, "old", "new"),
+        Err("cannot rename profile \"old\" to \"new\": the profile gained a client token while the rename was being prepared; run the rename again".to_string())
+    );
+    let late = late.lock().expect("lock").clone();
+    assert_eq!(stored_tokens(), format!("[tokens]\nold = \"{late}\"\n"));
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("old"))
+            .is_some(),
+        "the refused rename moved nothing"
+    );
+}
+
+fn delete(config: &mut AppConfig, name: &str) -> std::result::Result<(), String> {
+    delete_profile(
+        config,
+        &crate::profile::ProfileName::from(name),
+        false,
+        &rotation_guard(name),
+    )
+    .map_err(|e| format!("{e:#}"))
+}
+
+fn rename(config: &mut AppConfig, old: &str, new: &str) -> std::result::Result<(), String> {
+    rename_profile(
+        config,
+        &crate::profile::ProfileName::from(old),
+        &crate::profile::ProfileName::from(new),
+        &rotation_guard(old),
+    )
+    .map_err(|e| format!("{e:#}"))
+}
+
+/// A delete reads the gateway only when its token is the store's last:
+/// with another token left, a gateway read that would refuse if made (its
+/// env file gone) blocks nothing, and the token is revoked.
+#[test]
+fn a_delete_with_other_tokens_left_reads_nothing_of_the_gateway() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    let mut config = blank_profiles(&["a", "b"]);
+    crate::gateway_tokens::add_client_token(&record, "a").expect("add");
+    let b = crate::gateway_tokens::add_client_token(&record, "b")
+        .expect("add")
+        .expose()
+        .to_string();
+    std::fs::remove_file(home.home().join("tokens.env")).expect("remove the env file");
+    assert_eq!(delete(&mut config, "a"), Ok(()));
+    assert_eq!(stored_tokens(), format!("[tokens]\nb = \"{b}\"\n"));
+}
+
+/// Deleting the profile holding the last token: an absent config has
+/// nothing to protect, so the delete proceeds, before the env file or a
+/// daemon record is read; a read that hides whether the gateway would be
+/// left with no token refuses, opening on the op and naming the fix, before
+/// anything is removed. That includes a config that does not parse and a
+/// record naming YAML, both of which a running gateway keeps serving on, and
+/// an unreadable env file or a daemon that recorded no env.
+#[test]
+fn deleting_the_last_token_reads_the_gateway_and_refuses_only_what_it_cannot_tell() {
+    let missing_env = |home: &HomeSandbox| {
+        // Error 2 is a missing file on unix and Windows alike; each words it
+        // its own way.
+        format!(
+            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token (failed to read env file {}: {}); fix that, or add another client token first",
+            home.home().join("tokens.env").display(),
+            std::io::Error::from_raw_os_error(2)
+        )
+    };
+    let unread = |cause: &str| {
+        format!(
+            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token ({cause}); fix that, or add another client token first"
+        )
+    };
+    let unrecorded = unread(
+        "the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; try again in a moment, and restart the daemon if it persists",
+    );
+    let mut got = Vec::new();
+    let mut want = Vec::new();
+    for case in [
+        "config missing",
+        "config missing, daemon unrecorded",
+        "config and env file missing",
+        "config not TOML",
+        "record names YAML",
+        "env file missing",
+        "daemon unrecorded",
+    ] {
+        let home = HomeSandbox::new();
+        let _env = no_shunt_env(&home);
+        let record = adopt_gateway(&home, "[server.auth]\n", "");
+        let mut config = blank_profiles(&["only"]);
+        crate::gateway_tokens::add_client_token(&record, "only").expect("add");
+        let mut held = None;
+        let expected = match case {
+            "config missing" => {
+                std::fs::remove_file(record.config()).expect("remove the config");
+                Ok(())
+            }
+            "config missing, daemon unrecorded" => {
+                std::fs::remove_file(record.config()).expect("remove the config");
+                held = Some(crate::daemon::hold_daemon_lock());
+                std::fs::write(
+                    home.home().join(".clauth").join("clauthd.pid"),
+                    format!("{}\n", std::process::id()),
+                )
+                .expect("pid file");
+                Ok(())
+            }
+            "config and env file missing" => {
+                std::fs::remove_file(record.config()).expect("remove the config");
+                std::fs::remove_file(home.home().join("tokens.env")).expect("remove");
+                Ok(())
+            }
+            "config not TOML" => {
+                std::fs::write(record.config(), "[server.auth]\nheader = \"x").expect("config");
+                Err(unread("the shunt config does not parse as TOML (line 2)"))
+            }
+            "record names YAML" => {
+                let yaml = home.home().join("etc").join("shunt.yaml");
+                let record_file = home.home().join(".clauth").join("gateway.toml");
+                std::fs::write(
+                    &record_file,
+                    format!("config = {:?}\n", yaml.display().to_string()),
+                )
+                .expect("hand-edit the record");
+                Err(unread(&format!(
+                    "invalid gateway record {}: the shunt config must be TOML, and {} is YAML",
+                    record_file.display(),
+                    yaml.display()
+                )))
+            }
+            "env file missing" => {
+                std::fs::remove_file(home.home().join("tokens.env")).expect("remove");
+                Err(missing_env(&home))
+            }
+            _ => {
+                held = Some(crate::daemon::hold_daemon_lock());
+                std::fs::write(
+                    home.home().join(".clauth").join("clauthd.pid"),
+                    format!("{}\n", std::process::id()),
+                )
+                .expect("pid file");
+                Err(unrecorded.clone())
+            }
+        };
+        let outcome = delete(&mut config, "only");
+        let kept = config
+            .find(&crate::profile::ProfileName::from("only"))
+            .is_some();
+        got.push((
+            case,
+            outcome,
+            kept,
+            stored_tokens().starts_with("[tokens]\nonly"),
+        ));
+        let refused = expected.is_err();
+        want.push((case, expected, refused, refused));
+        drop(held);
+    }
+    assert_eq!(got, want);
+}
+
+/// A store clauth cannot parse refuses a delete and a rename of a profile,
+/// opening on the op and naming the file and the fix, never a parser
+/// message (it would quote a token).
+#[test]
+fn an_unparseable_store_refuses_delete_and_rename_naming_the_file() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["a"]);
+    let store = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("gateway-client-tokens.toml");
+    std::fs::write(&store, "[tokens]\na = \"tok-secret\n").expect("store");
+    let unreadable = format!(
+        "clauth's client-token store {} does not parse; delete it and add the tokens again",
+        store.display()
+    );
+    assert_eq!(
+        (delete(&mut config, "a"), rename(&mut config, "a", "b")),
+        (
+            Err(format!("cannot delete profile \"a\": {unreadable}")),
+            Err(format!(
+                "cannot rename profile \"a\" to \"b\": {unreadable}"
+            ))
+        )
+    );
+}
+
+/// A rename whose new name the store already holds a token under (a hand
+/// edit; a consistent store never does) refuses before anything moves,
+/// never overwriting that token; a gateway read the rename cannot make
+/// refuses opening on the op.
+#[test]
+fn a_rename_refuses_a_held_name_and_a_gateway_it_cannot_read() {
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    let mut config = blank_profiles(&["old", "plain"]);
+    let old = crate::gateway_tokens::add_client_token(&record, "old")
+        .expect("add")
+        .expose()
+        .to_string();
+    let stale = crate::gateway_tokens::add_client_token(&record, "new")
+        .expect("add")
+        .expose()
+        .to_string();
+    assert_eq!(
+        rename(&mut config, "old", "new"),
+        Err("cannot rename profile \"old\" to \"new\": clauth's client-token store already holds a token for \"new\"; remove that token first".to_string())
+    );
+    assert_eq!(
+        stored_tokens(),
+        format!("[tokens]\nnew = \"{stale}\"\nold = \"{old}\"\n")
+    );
+
+    let held = crate::daemon::hold_daemon_lock();
+    std::fs::write(
+        home.home().join(".clauth").join("clauthd.pid"),
+        format!("{}\n", std::process::id()),
+    )
+    .expect("pid file");
+    assert_eq!(
+        rename(&mut config, "old", "fresh"),
+        Err("cannot rename profile \"old\" to \"fresh\": clauth cannot tell whether the new name clashes with a client the gateway already names (the running daemon recorded no environment, so clauth cannot read the client tokens the gateway inherits; try again in a moment, and restart the daemon if it persists); fix that, then try again".to_string())
+    );
+    assert!(
+        config
+            .find(&crate::profile::ProfileName::from("old"))
+            .is_some(),
+        "the refused rename moved nothing"
+    );
+    assert_eq!(
+        rename(&mut config, "plain", "plain2"),
+        Ok(()),
+        "a profile holding no token renames without reading the gateway"
+    );
+    drop(held);
+}
+
+/// A store that cannot be read refuses a delete and a rename of a profile,
+/// opening on the op, typed, naming the file and the fix.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_store_refuses_delete_and_rename_naming_the_file() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server]\n", "");
+    if std::fs::metadata(record.config()).expect("stat").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can read any file");
+        return;
+    }
+    let mut config = blank_profiles(&["a"]);
+    crate::gateway_tokens::add_client_token(&record, "a").expect("add");
+    let store = crate::profile::clauth_dir()
+        .expect("dir")
+        .join("gateway-client-tokens.toml");
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let unread = format!(
+        "clauth's client-token store {} cannot be read (Permission denied (os error 13)); repair its permissions or remove it",
+        store.display()
+    );
+    let outcome = (delete(&mut config, "a"), rename(&mut config, "a", "b"));
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).expect("chmod back");
+    assert_eq!(
+        outcome,
+        (
+            Err(format!("cannot delete profile \"a\": {unread}")),
+            Err(format!("cannot rename profile \"a\" to \"b\": {unread}"))
+        )
+    );
+}
+
+/// Deleting the profile holding the last token over a config that exists but
+/// cannot be read refuses: a running gateway keeps serving on it, so its
+/// absence is no answer. Unix only, and skipped under root, which reads any
+/// file.
+#[cfg(unix)]
+#[test]
+fn deleting_the_last_token_refuses_over_an_unreadable_config() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let home = HomeSandbox::new();
+    let _env = no_shunt_env(&home);
+    let record = adopt_gateway(&home, "[server.auth]\n", "");
+    if std::fs::metadata(record.config()).expect("stat").uid() == 0 {
+        eprintln!("SKIPPING: running as root, which can read any file");
+        return;
+    }
+    let mut config = blank_profiles(&["only"]);
+    crate::gateway_tokens::add_client_token(&record, "only").expect("add");
+    std::fs::set_permissions(record.config(), std::fs::Permissions::from_mode(0o000))
+        .expect("chmod");
+    let outcome = delete(&mut config, "only");
+    std::fs::set_permissions(record.config(), std::fs::Permissions::from_mode(0o600))
+        .expect("chmod back");
+    assert_eq!(
+        outcome,
+        Err(format!(
+            "cannot delete profile \"only\": clauth cannot tell whether the gateway would be left with no client token (failed to read {}: Permission denied (os error 13)); fix that, or add another client token first",
+            record.config().display()
+        ))
+    );
+    assert!(
+        stored_tokens().starts_with("[tokens]\nonly"),
+        "the refused delete revoked nothing"
+    );
+}
+
+// ── settings edits save config.toml only ─────────────────────────────────────
+
+/// Another process (the daemon's rotation) landed a new pair while this
+/// process's in-memory profile still holds the old one. A model edit from that
+/// stale memory must not write the old pair back over the store.
+#[test]
+fn a_model_edit_never_rewinds_a_pair_another_process_landed() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("settings-stale-pair");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("save state");
+    let store = crate::profile::profile_dir(&name)
+        .expect("dir")
+        .join("credentials.json");
+    std::fs::write(
+        &store,
+        r#"{"claudeAiOauth":{"accessToken":"at-2","refreshToken":"rt-2"}}"#,
+    )
+    .expect("another process lands its pair");
+
+    let models = ModelSettings {
+        default: Some("opus".to_string()),
+        ..ModelSettings::default()
+    };
+    edit_profile_model(&mut config, &name, models).expect("edit the model");
+
+    let stored: ClaudeCredentials = crate::profile::read_json_file(&store).expect("read store");
+    assert_eq!(
+        stored.refresh_token(),
+        Some("rt-2"),
+        "a settings edit saves config.toml only"
+    );
+}
+
+/// A profile holding a login and an UNPARSEABLE spent record beside it.
+fn profile_with_a_corrupt_spent_record(name: &ProfileName) -> AppConfig {
+    let mut profile = crate::testutil::blank_profile(name);
+    profile.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-1".to_string(),
+            refresh_token: Some("rt-1".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save the profile");
+    let config = AppConfig {
+        state: AppState {
+            profiles: vec![name.clone()],
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    crate::profile::save_app_state(&config.state).expect("save state");
+    std::fs::write(
+        crate::profile::profile_dir(name)
+            .expect("dir")
+            .join("auth.spent.json"),
+        "not json",
+    )
+    .expect("corrupt the record");
+    config
+}
+
+/// F6: a login install retires the spent record, so an unparseable one never
+/// outlives the next login (it would hold every spend of the new login off).
+#[test]
+fn a_login_install_retires_the_spent_record() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("record-relogin");
+    let mut config = profile_with_a_corrupt_spent_record(&name);
+
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(ClaudeCredentials {
+                claude_ai_oauth: Some(crate::profile::OAuthToken {
+                    access_token: "at-relogin".to_string(),
+                    refresh_token: Some("rt-relogin".to_string()),
+                    expires_at: None,
+                    scopes: None,
+                    subscription_type: None,
+                    ..crate::profile::OAuthToken::default_extra()
+                }),
+            }),
+            base_url: None,
+            api_key: None,
+            anchor: AnchorAction::Unproven,
+        },
+    )
+    .expect("install the re-login");
+
+    assert!(
+        !crate::profile::profile_dir(&name)
+            .expect("dir")
+            .join("auth.spent.json")
+            .exists()
+    );
+}
+
+/// F6: a clear retires it too.
+#[test]
+fn a_login_clear_retires_the_spent_record() {
+    let _home = HomeSandbox::new();
+    let name = ProfileName::from("record-clear");
+    let mut config = profile_with_a_corrupt_spent_record(&name);
+
+    clear_profile_credentials(&mut config, &name).expect("clear");
+
+    assert!(
+        !crate::profile::profile_dir(&name)
+            .expect("dir")
+            .join("auth.spent.json")
+            .exists()
     );
 }

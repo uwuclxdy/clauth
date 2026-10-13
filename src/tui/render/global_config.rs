@@ -2,9 +2,10 @@
 //! the per-account Setup tab. Rows back real persisted state in `AppState` and
 //! run in the concern bands `GlobalConfigRow::band` names, each opened by an
 //! eyebrow header: appearance (`theme`, `reset display`, the `clock`
-//! notation it gates, and `home tab`), scheduler (`on mismatch`, `refresh`
-//! cadence, `refresh spent` toggle, `context nudge`, `auto-start queue`,
-//! `rotation`, `auto-update`), auto-switch (`weekly limit`,
+//! notation it gates, and `home tab`), scheduler (`on mismatch`,
+//! `non-login keys`, `refresh` cadence, `refresh spent` toggle, `context
+//! nudge`, `auto-start queue`, `rotation`, `auto-update`), auto-switch
+//! (`weekly limit`,
 //! `switch mode` = burn-aware, `walk order` (issue #86), the burn-aware
 //! `burn floor`/`burn horizon`
 //! tunables it gates (issue #8 follow-up b), then the `quota spent` halt), then
@@ -34,8 +35,8 @@ use super::super::app::{
 };
 use super::super::theme::{self, Tier};
 use super::panes::{
-    cycle_option, cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines,
-    highlight_row, invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
+    cycle_row_lines, draw_scrolled_lines, head_cols, help_tooltip_lines, highlight_row,
+    invalid_tooltip_lines, key_cell, label_style, section_box, value_caret,
 };
 
 /// Width of the key column: the longest keys (`allow extra usage` /
@@ -61,6 +62,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             spend_budget: state.spend_budget_switching,
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
+            preserve_non_login_keys: state.preserve_non_login_keys,
             auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
@@ -97,6 +99,9 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Start + end of the focused row's block (row plus its tooltip lines), so a
     // wrapped hint can't scroll off the bottom while its row stays visible.
     let mut focus = (0usize, 1usize);
+    let mut starts: Vec<usize> = Vec::with_capacity(GLOBAL_CONFIG_ROWS.len());
+    let mut block_ends: Vec<usize> = Vec::with_capacity(GLOBAL_CONFIG_ROWS.len());
+    let mut tips: Vec<usize> = Vec::with_capacity(GLOBAL_CONFIG_ROWS.len());
     let mut band: Option<&str> = None;
     for (i, row) in GLOBAL_CONFIG_ROWS.iter().enumerate() {
         let selected = i == cursor;
@@ -109,6 +114,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             band = Some(row.band());
             lines.push(band_header(row.band(), row.band() == focused_band));
         }
+        starts.push(lines.len());
         if selected {
             focus.0 = lines.len();
         }
@@ -118,7 +124,32 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
             GlobalConfigRow::ContextNudge => context_nudge_editing,
             _ => None,
         };
-        let line = detail_row(*row, selected, rows, tunables, row_editing);
+        let row_lines = detail_row(
+            *row,
+            selected,
+            rows,
+            tunables,
+            row_editing,
+            inner.width as usize,
+        );
+        // The tooltip this row carries when focused: its range tooltip while
+        // editing, else its behaviour hint. Computed for every row so the page
+        // step can predict the follow the focused tooltip produces.
+        let tip_lines: Vec<Line<'static>> = match row_editing {
+            Some(input) => match *row {
+                GlobalConfigRow::WeeklyThreshold => {
+                    weekly_range_tooltip(input, inner.width as usize)
+                }
+                GlobalConfigRow::ContextNudge => {
+                    context_nudge_range_tooltip(input, inner.width as usize)
+                }
+                _ => refresh_range_tooltip(input, inner.width as usize),
+            },
+            None => row_hint(*row, rows, tunables)
+                .map(|tip| help_tooltip_lines(&tip, inner.width as usize))
+                .unwrap_or_default(),
+        };
+        let tip_len = tip_lines.len();
         match row_editing {
             Some(input) => {
                 // The native terminal cursor owns the caret; the row renders plain
@@ -128,42 +159,10 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .x
                     .saturating_add((2 + KEY_W + KEY_GUTTER + head_cols(input)) as u16);
                 caret = Some((cx, lines.len()));
-                lines.push(line);
-                let tooltip = match *row {
-                    GlobalConfigRow::WeeklyThreshold => {
-                        weekly_range_tooltip(input, inner.width as usize)
-                    }
-                    GlobalConfigRow::ContextNudge => {
-                        context_nudge_range_tooltip(input, inner.width as usize)
-                    }
-                    _ => refresh_range_tooltip(input, inner.width as usize),
-                };
-                lines.extend(tooltip);
+                lines.extend(row_lines);
+                lines.extend(tip_lines);
             }
             None => {
-                // `home tab` is the Config tab's widest run (eight chips, 87
-                // cells focused), so it is the one row here that wraps.
-                let row_lines = if *row == GlobalConfigRow::HomeTab {
-                    let arrow = if selected {
-                        Span::styled("❯ ", theme::accent().bold())
-                    } else {
-                        Span::raw("  ")
-                    };
-                    let lead = vec![
-                        arrow,
-                        Span::styled(
-                            key_cell("home tab", KEY_W, KEY_GUTTER),
-                            label_style(selected),
-                        ),
-                    ];
-                    let options: Vec<(&str, bool)> = HomeTab::ALL
-                        .iter()
-                        .map(|t| (t.as_str(), rows.home_tab == *t))
-                        .collect();
-                    cycle_row_lines(lead, &options, None, selected, inner.width as usize)
-                } else {
-                    vec![detail_row(*row, selected, rows, tunables, row_editing)]
-                };
                 for line in row_lines {
                     lines.push(if selected {
                         highlight_row(line, inner.width as usize)
@@ -171,17 +170,28 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         line
                     });
                 }
-                if selected && let Some(tip) = row_hint(*row, rows, tunables) {
-                    lines.extend(help_tooltip_lines(&tip, inner.width as usize));
+                if selected {
+                    lines.extend(tip_lines);
                 }
             }
         }
         if selected {
             focus.1 = lines.len();
         }
+        block_ends.push(if selected {
+            lines.len()
+        } else {
+            lines.len() + tip_len
+        });
+        tips.push(tip_len);
     }
 
-    let offset = draw_scrolled_lines(frame, inner, lines, focus);
+    app.global_config_viewport.set(inner.height as usize);
+    app.global_config_total.set(lines.len());
+    app.global_config_row_starts.replace(starts);
+    app.global_config_block_ends.replace(block_ends);
+    app.global_config_tips.replace(tips);
+    let offset = draw_scrolled_lines(frame, inner, lines, focus, Some(&app.global_config_offset));
     // A caret scrolled off the top has no cell to sit in; leaving the cursor
     // unset is better than parking it on an unrelated row.
     if let Some((cx, row)) = caret
@@ -215,6 +225,7 @@ struct RowState {
     spend_budget: bool,
     switch_off_when_budget_spent: bool,
     preemptive: bool,
+    preserve_non_login_keys: bool,
     auto_update: bool,
     refresh_spent: bool,
     auto_start_queue: bool,
@@ -279,6 +290,13 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
                 "restore the previous credentials and drop the new login"
             }
         }),
+        // On names the one login everybody meets; off names what the loss
+        // costs, since off is the pre-toggle behavior an operator opts back to.
+        GlobalConfigRow::PreserveNonLoginKeys => String::from(if rows.preserve_non_login_keys {
+            "keep a /design-login with the account it was made on"
+        } else {
+            "a /design-login is dropped at the next switch, and outside macOS at any relink"
+        }),
         GlobalConfigRow::RefreshInterval => {
             format!(
                 "check every account's usage every {}s",
@@ -310,6 +328,9 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             WalkOrder::Chain => "pick the next member with headroom by chain position",
             WalkOrder::SoonestWeeklyReset => {
                 "spend the accepted member whose 7d window resets soonest, so less quota expires unspent"
+            }
+            WalkOrder::MostWeeklyHeadroom => {
+                "spend the accepted member whose 7d window is least used, so the week spreads across the chain"
             }
         }),
         GlobalConfigRow::BurnFloor => format!(
@@ -365,7 +386,8 @@ fn detail_row(
     rows: RowState,
     tunables: RowTunables,
     editing: Option<&InputState>,
-) -> Line<'static> {
+    width: usize,
+) -> Vec<Line<'static>> {
     let RowTunables {
         refresh_interval_ms,
         weekly_pct,
@@ -391,6 +413,7 @@ fn detail_row(
                 ("compatible", tier == Tier::Compatible),
             ],
             selected,
+            width,
         ),
         GlobalConfigRow::ResetShape => cycle_row(
             arrow,
@@ -401,6 +424,7 @@ fn detail_row(
                 ("both", rows.reset_display == ResetDisplay::Both),
             ],
             selected,
+            width,
         ),
         // Inert until a reset renders a clock — the notation decides nothing
         // under `relative`. Dimmed AND the key no-ops, like `extra usage spent`.
@@ -410,9 +434,9 @@ fn detail_row(
                 ("12h", rows.clock_format == ClockFormat::H12),
             ];
             if rows.reset_display.shows_clock() {
-                cycle_row(arrow, "clock", &options, selected)
+                cycle_row(arrow, "clock", &options, selected, width)
             } else {
-                dimmed_cycle_row("clock", &options, selected)
+                vec![dimmed_cycle_row("clock", &options, selected)]
             }
         }
         GlobalConfigRow::HomeTab => {
@@ -420,19 +444,19 @@ fn detail_row(
                 .iter()
                 .map(|t| (t.as_str(), rows.home_tab == *t))
                 .collect();
-            cycle_row(arrow, "home tab", &options, selected)
+            cycle_row(arrow, "home tab", &options, selected, width)
         }
         GlobalConfigRow::RefreshInterval => match editing {
-            Some(input) => refresh_edit_line(arrow, input),
-            None => refresh_cycle_line(arrow, refresh_interval_ms, selected),
+            Some(input) => vec![refresh_edit_line(arrow, input)],
+            None => refresh_cycle_lines(arrow, refresh_interval_ms, selected, width),
         },
         GlobalConfigRow::ContextNudge => match editing {
-            Some(input) => context_nudge_edit_line(arrow, input),
-            None => context_nudge_cycle_line(arrow, context_nudge_tokens, selected),
+            Some(input) => vec![context_nudge_edit_line(arrow, input)],
+            None => context_nudge_cycle_lines(arrow, context_nudge_tokens, selected, width),
         },
         GlobalConfigRow::WeeklyThreshold => match editing {
-            Some(input) => weekly_edit_line(arrow, input),
-            None => weekly_cycle_line(arrow, weekly_pct, selected),
+            Some(input) => vec![weekly_edit_line(arrow, input)],
+            None => weekly_cycle_lines(arrow, weekly_pct, selected, width),
         },
         GlobalConfigRow::DivergenceDefault => cycle_row(
             arrow,
@@ -453,6 +477,7 @@ fn detail_row(
                 ),
             ],
             selected,
+            width,
         ),
         GlobalConfigRow::SwitchOffWhenSpent => cycle_row(
             arrow,
@@ -462,6 +487,7 @@ fn detail_row(
                 ("switch off all", rows.switch_off_when_spent),
             ],
             selected,
+            width,
         ),
         GlobalConfigRow::BurnAware => cycle_row(
             arrow,
@@ -471,6 +497,7 @@ fn detail_row(
                 ("burn-aware", rows.burn_aware),
             ],
             selected,
+            width,
         ),
         GlobalConfigRow::WalkOrder => cycle_row(
             arrow,
@@ -481,14 +508,19 @@ fn detail_row(
                     "soonest weekly reset",
                     rows.walk_order == WalkOrder::SoonestWeeklyReset,
                 ),
+                (
+                    "most weekly headroom",
+                    rows.walk_order == WalkOrder::MostWeeklyHeadroom,
+                ),
             ],
             selected,
+            width,
         ),
         GlobalConfigRow::BurnFloor => {
-            burn_floor_line(arrow, burn_floor_pct, selected, rows.burn_aware)
+            burn_floor_lines(arrow, burn_floor_pct, selected, rows.burn_aware, width)
         }
         GlobalConfigRow::BurnHorizon => {
-            burn_horizon_line(arrow, burn_horizon_ms, selected, rows.burn_aware)
+            burn_horizon_lines(arrow, burn_horizon_ms, selected, rows.burn_aware, width)
         }
         GlobalConfigRow::SpendBudget => cycle_row(
             arrow,
@@ -498,6 +530,7 @@ fn detail_row(
                 ("pay-as-you-go", rows.spend_budget),
             ],
             selected,
+            width,
         ),
         // Same two values as `quota spent` on purpose: the pairing is the point.
         // Only the default differs — staying is free there and costs money here.
@@ -510,33 +543,44 @@ fn detail_row(
                 ("switch off all", rows.switch_off_when_budget_spent),
             ];
             if rows.spend_budget {
-                cycle_row(arrow, "extra usage spent", &options, selected)
+                cycle_row(arrow, "extra usage spent", &options, selected, width)
             } else {
-                dimmed_cycle_row("extra usage spent", &options, selected)
+                vec![dimmed_cycle_row("extra usage spent", &options, selected)]
             }
         }
         GlobalConfigRow::PreemptiveRotation => {
             let options = [("lazy", !rows.preemptive), ("preemptive", rows.preemptive)];
-            cycle_row(arrow, "rotation", &options, selected)
+            cycle_row(arrow, "rotation", &options, selected, width)
         }
         // Never dimmed, never gated: the row edits the persisted value even
         // while `CLAUTH_NO_UPDATE=1` overrides it (the env var stays
         // authoritative until it goes, and the row renders what is saved).
-        GlobalConfigRow::AutoUpdate => toggle_row(arrow, "auto-update", rows.auto_update, selected),
+        GlobalConfigRow::AutoUpdate => {
+            vec![toggle_row(arrow, "auto-update", rows.auto_update, selected)]
+        }
+        GlobalConfigRow::PreserveNonLoginKeys => vec![toggle_row(
+            arrow,
+            "non-login keys",
+            rows.preserve_non_login_keys,
+            selected,
+        )],
         GlobalConfigRow::RefreshSpentAccounts => {
-            toggle_row(arrow, "refresh spent", rows.refresh_spent, selected)
+            vec![toggle_row(
+                arrow,
+                "refresh spent",
+                rows.refresh_spent,
+                selected,
+            )]
         }
         // Inert until some account opts into `auto_start` (rendered dimmed):
         // a queue with no possible member spaces nothing, so it stays a true
         // disabled row — the key is a no-op, and `faint` never decouples from
         // "not editable" (the `extra usage spent` contract above).
-        GlobalConfigRow::AutoStartQueue => {
-            if rows.any_auto_start {
-                toggle_row(arrow, "auto-start queue", rows.auto_start_queue, selected)
-            } else {
-                dimmed_toggle_row("auto-start queue", rows.auto_start_queue, selected)
-            }
-        }
+        GlobalConfigRow::AutoStartQueue => vec![if rows.any_auto_start {
+            toggle_row(arrow, "auto-start queue", rows.auto_start_queue, selected)
+        } else {
+            dimmed_toggle_row("auto-start queue", rows.auto_start_queue, selected)
+        }],
     }
 }
 
@@ -545,7 +589,12 @@ fn detail_row(
 /// moment they've moved away from it, and never as noise otherwise (the chain
 /// `rotate at` idiom).
 pub(super) fn default_reminder(value: String) -> Span<'static> {
-    Span::styled(format!("   default: {value}"), theme::faint())
+    Span::styled(format!("   {}", reminder_text(value)), theme::faint())
+}
+
+/// The reminder's words alone, for a cycle row, which lays out its own gap.
+fn reminder_text(value: impl std::fmt::Display) -> String {
+    format!("default: {value}")
 }
 
 /// The presets the refresh row steps through, paired with their `ms` value.
@@ -563,34 +612,30 @@ const REFRESH_PRESETS: [(&str, u64); 6] = [
 /// chip is bracketed only when the interval **exactly** equals that preset; a
 /// custom value (set via ⏎) matches none, so the real `<n>s` is appended in
 /// `ACCENT` instead of mis-highlighting the nearest preset.
-fn refresh_cycle_line(
+fn refresh_cycle_lines(
     arrow: Span<'static>,
     refresh_interval_ms: u64,
     selected: bool,
-) -> Line<'static> {
+    width: usize,
+) -> Vec<Line<'static>> {
     let options: Vec<(&str, bool)> = REFRESH_PRESETS
         .iter()
         .map(|(label, ms)| (*label, *ms == refresh_interval_ms))
         .collect();
-    let mut line = cycle_row(arrow, "refresh", &options, selected);
-    if !REFRESH_PRESETS
+    let custom = (!REFRESH_PRESETS
         .iter()
-        .any(|(_, ms)| *ms == refresh_interval_ms)
-    {
-        // The append's 2 leading spaces match the gap the options keep
-        // between themselves.
-        line.push_span(Span::styled(
-            format!("  {}s", refresh_interval_ms / 1000),
-            theme::accent(),
-        ));
-    }
-    if refresh_interval_ms != DEFAULT_REFRESH_INTERVAL_MS {
-        line.push_span(default_reminder(format!(
-            "{}s",
-            DEFAULT_REFRESH_INTERVAL_MS / 1000
-        )));
-    }
-    line
+        .any(|(_, ms)| *ms == refresh_interval_ms))
+    .then(|| format!("{}s", refresh_interval_ms / 1000));
+    let reminder = (refresh_interval_ms != DEFAULT_REFRESH_INTERVAL_MS)
+        .then(|| reminder_text(format!("{}s", DEFAULT_REFRESH_INTERVAL_MS / 1000)));
+    cycle_row_lines(
+        cycle_lead(arrow, "refresh", selected),
+        &options,
+        custom.as_deref().map(|v| (v, true)),
+        reminder.as_deref(),
+        selected,
+        width,
+    )
 }
 
 /// The `refresh` row mid-edit: edit gutter + `refresh` key block + the typed
@@ -643,11 +688,12 @@ const CONTEXT_NUDGE_PRESETS: [(&str, u64); 4] = [
 /// value (set via ⏎) matches none, so the real threshold is appended in
 /// `ACCENT` in its shared display form (`600k`, `1M`, plain) instead of
 /// mis-highlighting the nearest preset.
-fn context_nudge_cycle_line(
+fn context_nudge_cycle_lines(
     arrow: Span<'static>,
     tokens: Option<u64>,
     selected: bool,
-) -> Line<'static> {
+    width: usize,
+) -> Vec<Line<'static>> {
     let options: Vec<(&str, bool)> = std::iter::once(("off", tokens.is_none()))
         .chain(
             CONTEXT_NUDGE_PRESETS
@@ -655,21 +701,18 @@ fn context_nudge_cycle_line(
                 .map(|(label, v)| (*label, tokens == Some(*v))),
         )
         .collect();
-    let mut line = cycle_row(arrow, "context nudge", &options, selected);
-    if let Some(v) = tokens
-        && !CONTEXT_NUDGE_PRESETS.iter().any(|(_, p)| *p == v)
-    {
-        // The append's 2 leading spaces match the gap the options keep
-        // between themselves.
-        line.push_span(Span::styled(
-            format!("  {}", format_threshold_tokens(v)),
-            theme::accent(),
-        ));
-    }
-    if tokens.is_some() {
-        line.push_span(default_reminder(String::from("off")));
-    }
-    line
+    let custom = tokens
+        .filter(|v| !CONTEXT_NUDGE_PRESETS.iter().any(|(_, p)| p == v))
+        .map(format_threshold_tokens);
+    let reminder = tokens.map(|_| reminder_text("off"));
+    cycle_row_lines(
+        cycle_lead(arrow, "context nudge", selected),
+        &options,
+        custom.as_deref().map(|v| (v, true)),
+        reminder.as_deref(),
+        selected,
+        width,
+    )
 }
 
 /// The `context nudge` row mid-edit: edit gutter + `context nudge` key block +
@@ -708,7 +751,12 @@ fn context_nudge_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'st
 /// The `weekly limit` row at rest: a segmented control over
 /// [`WEEKLY_PRESETS`], with a custom value (set via ⏎) appended in `ACCENT`
 /// when it matches no preset — same grammar as the refresh row.
-fn weekly_cycle_line(arrow: Span<'static>, weekly_pct: f64, selected: bool) -> Line<'static> {
+fn weekly_cycle_lines(
+    arrow: Span<'static>,
+    weekly_pct: f64,
+    selected: bool,
+    width: usize,
+) -> Vec<Line<'static>> {
     let labels: Vec<String> = WEEKLY_PRESETS
         .iter()
         .map(|p| format!("{}%", format_weekly_pct(*p)))
@@ -718,20 +766,18 @@ fn weekly_cycle_line(arrow: Span<'static>, weekly_pct: f64, selected: bool) -> L
         .zip(WEEKLY_PRESETS.iter())
         .map(|(label, p)| (label.as_str(), *p == weekly_pct))
         .collect();
-    let mut line = cycle_row(arrow, "weekly limit", &options, selected);
-    if !WEEKLY_PRESETS.contains(&weekly_pct) {
-        line.push_span(Span::styled(
-            format!("  {}%", format_weekly_pct(weekly_pct)),
-            theme::accent(),
-        ));
-    }
-    if (weekly_pct - DEFAULT_WEEKLY_SWITCH_PCT).abs() > f64::EPSILON {
-        line.push_span(default_reminder(format!(
-            "{}%",
-            format_weekly_pct(DEFAULT_WEEKLY_SWITCH_PCT)
-        )));
-    }
-    line
+    let custom = (!WEEKLY_PRESETS.contains(&weekly_pct))
+        .then(|| format!("{}%", format_weekly_pct(weekly_pct)));
+    let reminder = ((weekly_pct - DEFAULT_WEEKLY_SWITCH_PCT).abs() > f64::EPSILON)
+        .then(|| reminder_text(format!("{}%", format_weekly_pct(DEFAULT_WEEKLY_SWITCH_PCT))));
+    cycle_row_lines(
+        cycle_lead(arrow, "weekly limit", selected),
+        &options,
+        custom.as_deref().map(|v| (v, true)),
+        reminder.as_deref(),
+        selected,
+        width,
+    )
 }
 
 /// The `weekly limit` row mid-edit: edit gutter + key block + typed buffer
@@ -771,12 +817,13 @@ fn weekly_range_tooltip(input: &InputState, width: usize) -> Vec<Line<'static>> 
 /// projection it gates never runs), mirroring the `extra usage spent` row. A
 /// hand-edited in-band value matching no preset is appended in `ACCENT`, same
 /// grammar as the weekly row.
-fn burn_floor_line(
+fn burn_floor_lines(
     arrow: Span<'static>,
     floor_pct: f64,
     selected: bool,
     burn_aware: bool,
-) -> Line<'static> {
+    width: usize,
+) -> Vec<Line<'static>> {
     let labels: Vec<String> = BURN_FLOOR_PRESETS
         .iter()
         .map(|p| format!("{}%", format_weekly_pct(*p)))
@@ -787,33 +834,32 @@ fn burn_floor_line(
         .map(|(label, p)| (label.as_str(), *p == floor_pct))
         .collect();
     if !burn_aware {
-        return dimmed_cycle_row("burn floor", &options, selected);
+        return vec![dimmed_cycle_row("burn floor", &options, selected)];
     }
-    let mut line = cycle_row(arrow, "burn floor", &options, selected);
-    if !BURN_FLOOR_PRESETS.contains(&floor_pct) {
-        line.push_span(Span::styled(
-            format!("  {}%", format_weekly_pct(floor_pct)),
-            theme::accent(),
-        ));
-    }
-    if (floor_pct - DEFAULT_BURN_FLOOR_PCT).abs() > f64::EPSILON {
-        line.push_span(default_reminder(format!(
-            "{}%",
-            format_weekly_pct(DEFAULT_BURN_FLOOR_PCT)
-        )));
-    }
-    line
+    let custom = (!BURN_FLOOR_PRESETS.contains(&floor_pct))
+        .then(|| format!("{}%", format_weekly_pct(floor_pct)));
+    let reminder = ((floor_pct - DEFAULT_BURN_FLOOR_PCT).abs() > f64::EPSILON)
+        .then(|| reminder_text(format!("{}%", format_weekly_pct(DEFAULT_BURN_FLOOR_PCT))));
+    cycle_row_lines(
+        cycle_lead(arrow, "burn floor", selected),
+        &options,
+        custom.as_deref().map(|v| (v, true)),
+        reminder.as_deref(),
+        selected,
+        width,
+    )
 }
 
 /// The `burn horizon` row: burn-aware projection look-ahead cap as a segmented
 /// control over [`BURN_HORIZON_PRESETS`] (labelled in seconds). Dimmed + inert
 /// when burn-aware is off. Custom in-band value appended in `ACCENT`.
-fn burn_horizon_line(
+fn burn_horizon_lines(
     arrow: Span<'static>,
     horizon_ms: u64,
     selected: bool,
     burn_aware: bool,
-) -> Line<'static> {
+    width: usize,
+) -> Vec<Line<'static>> {
     let labels: Vec<String> = BURN_HORIZON_PRESETS
         .iter()
         .map(|ms| format!("{}s", ms / 1000))
@@ -824,46 +870,50 @@ fn burn_horizon_line(
         .map(|(label, ms)| (label.as_str(), *ms == horizon_ms))
         .collect();
     if !burn_aware {
-        return dimmed_cycle_row("burn horizon", &options, selected);
+        return vec![dimmed_cycle_row("burn horizon", &options, selected)];
     }
-    let mut line = cycle_row(arrow, "burn horizon", &options, selected);
-    if !BURN_HORIZON_PRESETS.contains(&horizon_ms) {
-        line.push_span(Span::styled(
-            format!("  {}s", horizon_ms / 1000),
-            theme::accent(),
-        ));
-    }
-    if horizon_ms != DEFAULT_BURN_HORIZON_MS {
-        line.push_span(default_reminder(format!(
-            "{}s",
-            DEFAULT_BURN_HORIZON_MS / 1000
-        )));
-    }
-    line
+    let custom =
+        (!BURN_HORIZON_PRESETS.contains(&horizon_ms)).then(|| format!("{}s", horizon_ms / 1000));
+    let reminder = (horizon_ms != DEFAULT_BURN_HORIZON_MS)
+        .then(|| reminder_text(format!("{}s", DEFAULT_BURN_HORIZON_MS / 1000)));
+    cycle_row_lines(
+        cycle_lead(arrow, "burn horizon", selected),
+        &options,
+        custom.as_deref().map(|v| (v, true)),
+        reminder.as_deref(),
+        selected,
+        width,
+    )
 }
 
 /// A cycle row: `key  label  [active]  other`. Options are bare
 /// labels separated by 2-space gaps; the active option is `ACCENT` and wraps in
 /// `[]` only while the row holds the cursor, the rest stay `TEXT_FAINT`. `space`
 /// cycles the value in place. Reads as the segmented control it is, instead of
-/// a single value that silently swaps text on cycle.
+/// a single value that silently swaps text on cycle. A run wider than `width`
+/// wraps between options ([`cycle_row_lines`]).
 fn cycle_row(
     arrow: Span<'static>,
     key: &str,
     options: &[(&str, bool)],
     row_selected: bool,
-) -> Line<'static> {
-    let mut spans = vec![
+    width: usize,
+) -> Vec<Line<'static>> {
+    cycle_row_lines(
+        cycle_lead(arrow, key, row_selected),
+        options,
+        None,
+        None,
+        row_selected,
+        width,
+    )
+}
+
+fn cycle_lead(arrow: Span<'static>, key: &str, row_selected: bool) -> Vec<Span<'static>> {
+    vec![
         arrow,
         Span::styled(key_cell(key, KEY_W, KEY_GUTTER), label_style(row_selected)),
-    ];
-    for (i, (label, active)) in options.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        spans.push(cycle_option(label, *active, row_selected));
-    }
-    Line::from(spans)
+    ]
 }
 
 /// A disabled row for a cycle setting another toggle makes inert: the

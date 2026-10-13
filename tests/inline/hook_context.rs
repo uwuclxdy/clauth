@@ -59,8 +59,10 @@ fn write_transcript(home: &Path, name: &str, lines: &[String]) -> std::path::Pat
 }
 
 /// Write a job-store record into the sandboxed `~/.clauth/jobs`: a fresh
-/// `running` one reads live, a `done` one does not.
-fn write_job(id: &str, live: bool) {
+/// `running` one reads live, a `done` one does not. `host` and `host_pid` are
+/// the session id and the process whose server minted it (`None`/`0` =
+/// unstamped, an older server's record).
+fn write_job(id: &str, live: bool, host: Option<&str>, host_pid: u32) {
     let dir = crate::profile::clauth_dir()
         .expect("clauth dir")
         .join("jobs");
@@ -81,6 +83,8 @@ fn write_job(id: &str, live: bool) {
         isolated: false,
         cwd: None,
         spawned_by: None,
+        host_session: host.map(str::to_string),
+        host_pid,
         session_id: None,
         timeout_secs: 0,
         idle_secs: None,
@@ -422,8 +426,9 @@ fn the_running_clause_lists_only_what_is_running() {
             &format!("{},{}", task_block("tA"), task_block("tB")),
         )],
     );
-    write_job("d-run", true);
-    write_job("d-done", false);
+    write_job("d-run", true, Some("sess-2a1d"), 0);
+    write_job("d-done", false, Some("sess-2a1d"), 0);
+    write_job("d-run-1d", true, Some("sess-1d"), 0);
     let mut f = payload("PostToolUse", "sess-2a1d");
     f.transcript = Some(two);
     assert_eq!(
@@ -433,8 +438,8 @@ fn the_running_clause_lists_only_what_is_running() {
         )
     );
 
-    // One delegate alone: a transcript with no open tasks; the done job is not
-    // counted.
+    // One delegate alone: a transcript with no open tasks; the other
+    // session's done job is not counted.
     let none = write_transcript(
         home.home(),
         "clause-none",
@@ -449,14 +454,75 @@ fn the_running_clause_lists_only_what_is_running() {
         )
     );
 
-    // Nothing running: no clause at all.
-    write_job("d-run", false);
+    // Nothing running here: this session's delegate finished, and a peer's
+    // live one adds no clause.
+    write_job("d-0", false, Some("sess-0"), 0);
     let mut f = payload("PostToolUse", "sess-0");
     f.transcript = Some(none);
     assert_eq!(
         fire(&f).as_deref(),
         Some(
             "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over."
+        )
+    );
+}
+
+/// The clause speaks for THIS conversation: a peer session's live delegate is
+/// not its to wait on, while a record no server stamped (an older server still
+/// running across a self-update) counts, since missing it orphans a paid run.
+#[test]
+fn the_running_clause_counts_only_this_sessions_delegates() {
+    let home = HomeSandbox::new();
+    set_threshold(Some(100_000));
+    write_settings(home.home(), r#"{"autoCompactEnabled":false}"#);
+    let path = write_transcript(
+        home.home(),
+        "own-delegates",
+        &[assistant_line(120_000, 0, 0, "")],
+    );
+    write_job("d-mine", true, Some("sess-me"), 0);
+    write_job("d-peer", true, Some("sess-peer"), 0);
+    write_job("d-legacy", true, None, 0);
+    let mut f = payload("PostToolUse", "sess-me");
+    f.transcript = Some(path);
+    assert_eq!(
+        fire(&f).as_deref(),
+        Some(
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 2 delegates running. wait for them to return before closing the session."
+        )
+    );
+}
+
+/// `/clear` hands the conversation a new session id while the same `claude`
+/// process and its `clauth mcp` server live on, so the server keeps stamping
+/// the id it started under. The hook knows its own process (`CLAUDE_PID`) and
+/// matches on it; a peer process stays out even when its server started under
+/// the same id. A record with no host pid (an older server, a host whose pid
+/// was unknown) still falls back to the session id, and an unstamped one counts.
+#[test]
+fn the_running_clause_keeps_counting_its_own_delegates_after_a_clear() {
+    let home = HomeSandbox::new();
+    set_threshold(Some(100_000));
+    write_settings(home.home(), r#"{"autoCompactEnabled":false}"#);
+    let _pid =
+        crate::testutil::EnvPin::new(&home, &[("CLAUDE_PID", Some(std::ffi::OsStr::new("4242")))]);
+    let path = write_transcript(
+        home.home(),
+        "after-clear",
+        &[assistant_line(120_000, 0, 0, "")],
+    );
+    write_job("d-before-clear", true, Some("sess-before-clear"), 4242);
+    write_job("d-after-clear", true, Some("sess-before-clear"), 4242);
+    write_job("d-peer", true, Some("sess-before-clear"), 5151);
+    write_job("d-pidless", true, Some("sess-after-clear"), 0);
+    write_job("d-pidless-peer", true, Some("sess-peer"), 0);
+    write_job("d-legacy", true, None, 0);
+    let mut f = payload("PostToolUse", "sess-after-clear");
+    f.transcript = Some(path);
+    assert_eq!(
+        fire(&f).as_deref(),
+        Some(
+            "clauth: context window usage has exceeded 100k tokens. consider writing or updating a handoff prompt so a fresh session can take over. there are still 4 delegates running. wait for them to return before closing the session."
         )
     );
 }

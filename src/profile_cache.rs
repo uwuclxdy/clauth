@@ -250,26 +250,43 @@ pub(crate) fn load_profile_cache<T: DeserializeOwned + 'static>(
 /// every codex usage reading, so the cache the published feed and the Overview
 /// resolve BY NAME stayed empty forever while the fetch itself succeeded.
 pub(crate) fn write_profile_cache<T: Serialize>(name: &ProfileName, file: &str, value: &T) {
+    let _ = write_profile_cache_reported(name, file, value);
+}
+
+/// [`write_profile_cache`] that reports whether the file write actually landed,
+/// so a caller whose cache is load-bearing (the identity anchor) can log a
+/// failure instead of taking the default silent swallow. `false` covers every
+/// skip (off-roster, unresolvable path, serialization) and a failed write alike.
+pub(crate) fn write_profile_cache_reported<T: Serialize>(
+    name: &ProfileName,
+    file: &str,
+    value: &T,
+) -> bool {
     let configured = crate::profile::is_configured(name).unwrap_or(false)
         || crate::codex_profiles::CodexState::load().is_ok_and(|s| s.holds(name.as_str()));
     if !configured {
-        return;
+        return false;
     }
+    let Some(path) = profile_cache_path(name, file) else {
+        return false;
+    };
+    let Ok(json) = serde_json::to_string(value) else {
+        return false;
+    };
+    crate::profile::atomic_write_600(&path, json.as_bytes()).is_ok()
+}
+
+/// Delete `<profile_dir>/<file>`. Best-effort: an already-absent file is the
+/// intended post-state, and every other removal error is logged (never surfaced
+/// as a failure) — a stale cache is worse than the log line that names it.
+pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
     let Some(path) = profile_cache_path(name, file) else {
         return;
     };
-    let Ok(json) = serde_json::to_string(value) else {
-        return;
-    };
-    let _ = crate::profile::atomic_write_600(&path, json.as_bytes());
-}
-
-/// Delete `<profile_dir>/<file>`. Best-effort, same contract as the writer: an
-/// already-absent file and any removal error alike leave the caller with "no
-/// cache", which is the intended post-state either way.
-pub(crate) fn remove_profile_cache(name: &ProfileName, file: &str) {
-    if let Some(path) = profile_cache_path(name, file) {
-        let _ = std::fs::remove_file(path);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logline::logline!("clauth: {name}: could not remove its {file} cache: {e}");
     }
 }
 

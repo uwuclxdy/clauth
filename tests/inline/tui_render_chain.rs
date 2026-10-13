@@ -65,10 +65,6 @@ fn line_text(line: &Line<'static>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-fn resumes_line(lines: &[Line<'static>]) -> Option<String> {
-    lines.iter().map(line_text).find(|t| t.contains("resumes:"))
-}
-
 /// `QueueView` is the one resolver every chip goes through: membership from
 /// the shared rule, the slot from the anchor. Pinned here because a view that
 /// answered `None` for everyone would silently remove every chip on every
@@ -142,8 +138,8 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
         },
         &HashSet::new(),
     )
-    .0;
-    let hint_a = resumes_line(&on_a).expect("resumes hint renders while viewing member a");
+    .2;
+    let hint_a = on_a.expect("resumes hint renders while viewing member a");
     assert!(hint_a.contains("resumes: b in ~"), "{hint_a}");
 
     let on_b = member_detail(
@@ -155,8 +151,8 @@ fn all_exhausted_shows_resumes_hint_under_any_selected_member() {
         },
         &HashSet::new(),
     )
-    .0;
-    let hint_b = resumes_line(&on_b).expect("resumes hint renders while viewing member b");
+    .2;
+    let hint_b = on_b.expect("resumes hint renders while viewing member b");
     assert!(hint_b.contains("resumes: b in ~"), "{hint_b}");
 }
 
@@ -167,7 +163,7 @@ fn partially_exhausted_chain_hides_resumes_hint() {
     let b = profile("b", 95.0, 20.0, 3600);
     let cfg = config_with(vec![a, b], Some("a"), vec!["a", "b"]);
 
-    let lines = member_detail(
+    let footnote = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
         MemberCard {
@@ -176,10 +172,236 @@ fn partially_exhausted_chain_hides_resumes_hint() {
         },
         &HashSet::new(),
     )
-    .0;
+    .2;
     assert!(
-        resumes_line(&lines).is_none(),
+        footnote.is_none(),
         "must not show when the chain isn't fully exhausted"
+    );
+}
+
+/// The detail pane's content of a rendered row (after the `││` seam, trimmed
+/// of the pane border and its 1-cell padding), empty on a blank interior row.
+fn detail_of(row: &str) -> &str {
+    row.split("││")
+        .nth(1)
+        .unwrap_or("")
+        .trim_matches('│')
+        .trim()
+}
+
+/// Render the Fallback body (not the full app frame) at `(w, h)`.
+fn render_chain(app: &App, w: u16, h: u16) -> Vec<String> {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, f.area(), app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+/// A two-member fully-exhausted chain: both at 100%, `a` resets later than `b`.
+fn exhausted_cfg() -> AppConfig {
+    config_with(
+        vec![
+            profile("a", 95.0, 100.0, 3600),
+            profile("b", 95.0, 100.0, 1800),
+        ],
+        Some("a"),
+        vec!["a", "b"],
+    )
+}
+
+// #A1: with the chain exhausted, `resumes:` pins on the detail pane's last
+// interior row with a blank margin row above it, for EVERY member selected in
+// turn (walking the selection frame-to-frame in one app, so the persisted
+// scroll offset carries across the walk), at the 14-row short pane and the
+// 24-row size the chain tests already use. The old code pushed the caption
+// into the scroll content, where the focused scroll capped at the cursored row
+// and never brought it into view.
+#[test]
+fn the_pinned_resumes_footnote_renders_at_every_height_for_every_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    for (w, h) in [(100u16, 14u16), (100u16, 24u16)] {
+        let mut app = App::new(exhausted_cfg());
+        app.fallback_focus = FallbackFocus::Detail;
+        for cursor in 0..2 {
+            app.chain_cursor = cursor;
+            let rows = render_chain(&app, w, h);
+            let screen = rows.join("\n");
+            let resumes = rows
+                .iter()
+                .position(|r| detail_of(r).starts_with("resumes:"))
+                .unwrap_or_else(|| {
+                    panic!("[{w}x{h} member {cursor}] resumes: never renders:\n{screen}")
+                });
+            assert_eq!(
+                resumes,
+                h as usize - 2,
+                "[{w}x{h} member {cursor}] resumes: pins on the last interior row:\n{screen}"
+            );
+            // The margin row is blank by whole-row equality; the footnote row
+            // carries the deterministic prefix (its `~` eta is clock-derived).
+            assert_eq!(
+                detail_of(&rows[resumes - 1]),
+                "",
+                "[{w}x{h} member {cursor}] a blank margin row sits above the footnote:\n{screen}"
+            );
+            assert!(
+                detail_of(&rows[resumes]).starts_with("resumes: b in ~"),
+                "[{w}x{h} member {cursor}] the footnote names the soonest-resuming member:\n{screen}"
+            );
+        }
+    }
+}
+
+// #A2: the overflow scrollbar's track/thumb column never extends onto the
+// margin row or the footnote row — the scrollbar spans the scroll area only.
+#[test]
+fn the_pinned_footnote_scrollbar_spans_only_the_scroll_area() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let (w, h) = (100u16, 14u16);
+    let mut app = App::new(exhausted_cfg());
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    let rows = render_chain(&app, w, h);
+    let screen = rows.join("\n");
+
+    let resumes = rows
+        .iter()
+        .position(|r| detail_of(r).starts_with("resumes:"))
+        .unwrap_or_else(|| panic!("resumes: never renders:\n{screen}"));
+    // The scrollbar lives in the detail pane's right-padding column, the cell
+    // just inside its right border.
+    let track_col = w as usize - 2;
+    let cell = |row_idx: usize| rows[row_idx].chars().nth(track_col).unwrap_or(' ');
+    for off in 0..2 {
+        let idx = resumes - 1 + off; // the margin row, then the footnote row
+        assert!(
+            !matches!(cell(idx), '┊' | '┃'),
+            "row {idx} (margin/footnote) carries a scrollbar cell: {}",
+            cell(idx)
+        );
+    }
+    // The scroll content overflows at this height, so the scroll area itself
+    // must still draw the track — the absence above is a span, not a missing bar.
+    assert!(
+        (0..resumes - 1).any(|idx| matches!(cell(idx), '┊' | '┃')),
+        "no scrollbar cell on any scroll-area row:\n{screen}"
+    );
+}
+
+// #A3: with headroom left, no footnote and no margin render — the scroll area
+// takes the full height (absence assert).
+#[test]
+fn the_member_card_reserves_no_footnote_without_a_resume() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let cfg = config_with(
+        vec![
+            profile("a", 95.0, 100.0, 3600),
+            profile("b", 95.0, 20.0, 3600),
+        ],
+        Some("a"),
+        vec!["a", "b"],
+    );
+    for (w, h) in [(100u16, 14u16), (100u16, 24u16)] {
+        let mut app = App::new(cfg.clone());
+        app.fallback_focus = FallbackFocus::Detail;
+        app.chain_cursor = 0;
+        let rows = render_chain(&app, w, h);
+        assert!(
+            !rows.iter().any(|r| r.contains("resumes:")),
+            "[{w}x{h}] a partially exhausted chain shows no footnote:\n{}",
+            rows.join("\n")
+        );
+        // The scroll area takes the full height: at 14 rows the card overflows,
+        // so the last interior row carries content (no reserved footnote/margin
+        // rows sit empty at the bottom).
+        if h == 14 {
+            assert!(
+                !detail_of(&rows[h as usize - 2]).is_empty(),
+                "[{w}x{h}] the last interior row carries content (full-height scroll area):\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+}
+
+// #A4: the pinned-footnote split rule, pinned pure: margin while the scroll
+// area keeps 3 rows, margin dropped next, inlined past that.
+#[test]
+fn footnote_layout_pins_the_margin_drop_and_inline_rules() {
+    use super::super::panes::{FootnoteLayout, footnote_layout};
+    assert_eq!(
+        footnote_layout(12, 1),
+        FootnoteLayout::Pinned {
+            scroll: 10,
+            margin: 1
+        },
+        "roomy pane pins with the margin row"
+    );
+    assert_eq!(
+        footnote_layout(5, 1),
+        FootnoteLayout::Pinned {
+            scroll: 3,
+            margin: 1
+        },
+        "exactly 3 scroll rows keeps the margin"
+    );
+    assert_eq!(
+        footnote_layout(4, 1),
+        FootnoteLayout::Pinned {
+            scroll: 3,
+            margin: 0
+        },
+        "a scroll area under 3 with the margin drops the margin first"
+    );
+    assert_eq!(
+        footnote_layout(3, 1),
+        FootnoteLayout::Inline,
+        "smaller still inlines the footnote into the scroll content"
+    );
+    assert_eq!(
+        footnote_layout(12, 0),
+        FootnoteLayout::Absent,
+        "no footnote, full height"
+    );
+}
+
+// #A4 render: at a pane whose scroll area is exactly 3 rows the margin row
+// drops (the footnote pins directly below the scroll content), and at a pane
+// too short to pin, walking to the last block scrolls the inline footnote into
+// view instead of stranding it.
+#[test]
+fn the_short_pane_footnote_drops_the_margin_then_inlines_reachably() {
+    let _home = crate::testutil::HomeSandbox::new();
+
+    // body 6 → detail interior 4 → Pinned { scroll: 3, margin: 0 }: the
+    // footnote pins on the last interior row with NO blank row above it.
+    let mut app = App::new(exhausted_cfg());
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    let rows = render_chain(&app, 100, 6);
+    let screen = rows.join("\n");
+    let resumes = rows
+        .iter()
+        .position(|r| detail_of(r).starts_with("resumes:"))
+        .unwrap_or_else(|| panic!("resumes: never renders:\n{screen}"));
+    assert_eq!(
+        resumes, 4,
+        "the footnote pins on the last interior row:\n{screen}"
+    );
+    assert!(
+        !detail_of(&rows[resumes - 1]).is_empty(),
+        "no margin row above it — the row above is scroll content:\n{screen}"
+    );
+
+    // body 5 → detail interior 3 → Inline: walking to the last row reaches it.
+    let mut app = App::new(exhausted_cfg());
+    app.fallback_focus = FallbackFocus::Detail;
+    app.chain_cursor = 0;
+    app.fallback_detail_cursor = FALLBACK_ROWS.len() - 1; // the last row
+    let rows = render_chain(&app, 100, 5);
+    assert!(
+        rows.iter().any(|r| detail_of(r).starts_with("resumes:")),
+        "walking to the last block scrolls the inline footnote into view:\n{}",
+        rows.join("\n")
     );
 }
 
@@ -970,7 +1192,7 @@ fn headroom_member_shows_no_reason_pill() {
 #[test]
 fn member_detail_rows_start_indexes_the_first_fallback_row_at_every_header_height() {
     let at_width = |cfg: &AppConfig, width: usize| -> (usize, usize) {
-        let (lines, spans) = member_detail(
+        let (lines, spans, _) = member_detail(
             cfg,
             &crate::profile::ProfileName::from("a"),
             MemberCard {
@@ -1234,7 +1456,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     // Both pills on one `├│└` rail, each with its own fix line. The first row
     // carries the `status` key so the rail has a column to anchor against; the
     // second bridges with `│` at col 0 while the rail is still open.
-    let (lines, _) = member_detail(
+    let (lines, _, _) = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
         MemberCard {
@@ -1260,7 +1482,7 @@ fn member_detail_stacks_the_health_pill_under_disabled() {
     e.disabled = false;
     let mut enabled = config_with(vec![e], Some("other"), vec!["a"]);
     enabled.state.auth_broken.push("a".into());
-    let (lines, _) = member_detail(
+    let (lines, _, _) = member_detail(
         &enabled,
         &crate::profile::ProfileName::from("a"),
         MemberCard {
@@ -1880,7 +2102,7 @@ fn the_member_card_places_the_session_block_above_the_five_hour_gauge() {
     let sessions = crate::live_sessions::LiveTally::of([live_row("4242-0", "a", true, None)])
         .member(&crate::profile::ProfileName::from("a"));
 
-    let (lines, spans) = member_detail(
+    let (lines, spans, _) = member_detail(
         &cfg,
         &crate::profile::ProfileName::from("a"),
         MemberCard {
@@ -2043,7 +2265,7 @@ fn member_detail_rows_start_clears_the_session_block_at_every_height() {
     let cfg = config_with(vec![profile("a", 95.0, 10.0, 7200)], None, vec!["a"]);
     let start_and_first_row =
         |sessions: crate::live_sessions::MemberSessions, width: usize| -> (usize, usize, usize) {
-            let (lines, spans) = member_detail(
+            let (lines, spans, _) = member_detail(
                 &cfg,
                 &crate::profile::ProfileName::from("a"),
                 MemberCard {
@@ -2377,7 +2599,7 @@ fn the_add_picker_names_a_carried_day_list_before_the_add() {
     // At 80 the blurb holds one line, so the candidates open on the fifth.
     let picker = |app: &App| -> Vec<String> {
         add_detail(app, true, 80, &HashSet::new())
-            .0
+            .lines
             .iter()
             .skip(4)
             .map(line_text)
@@ -2431,7 +2653,7 @@ fn the_add_picker_names_the_blocker_before_a_carried_list() {
     let mut app = App::new(cfg);
     app.fallback_detail_cursor = 0;
     let picker: Vec<String> = add_detail(&app, true, 80, &HashSet::new())
-        .0
+        .lines
         .iter()
         .skip(4)
         .map(line_text)
@@ -2444,4 +2666,65 @@ fn the_add_picker_names_the_blocker_before_a_carried_list() {
             " └ its day list (weekends) would claim nothing: its login is auth-broken",
         ]
     );
+}
+
+/// cloudy-tui "Keys and commands inside prose" on the Fallback card: the
+/// auth-broken fix's command and every key the preferred-days tooltip names.
+#[test]
+fn chain_prose_styles_the_relogin_command_and_the_day_picker_keys() {
+    use crate::testutil::{assert_prose_part, lines_buffer};
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+
+    let fix = reason_fix(&BlockedReason::AuthBroken, &ProfileName::from("a"));
+    assert_prose_part(
+        &lines_buffer(rail_hint_lines(&fix, 60, false), 60),
+        "re-login with clauth login a",
+        "clauth login a",
+        false,
+    );
+
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::PreferredDays)
+        .expect("the row exists");
+    let card_of = |cfg: &AppConfig, day_picker: Option<usize>| {
+        let lines = member_detail(
+            cfg,
+            &ProfileName::from("a"),
+            MemberCard {
+                focused: true,
+                row_cursor: row,
+                day_picker,
+                width: 100,
+                ..Default::default()
+            },
+            &HashSet::new(),
+        )
+        .0;
+        lines_buffer(lines, 100)
+    };
+    let plain = config_with(vec![profile("a", 95.0, 20.0, 3600)], Some("a"), vec!["a"]);
+    let card = |day_picker: Option<usize>| card_of(&plain, day_picker);
+    assert_prose_part(&card(None), "· ↵ picks days one by one", "↵", true);
+
+    let mut dead = profile("a", 95.0, 20.0, 3600);
+    dead.disabled = true;
+    let dead = config_with(vec![dead], Some("other"), vec!["a"]);
+    assert_prose_part(&card_of(&dead, None), "disabled · ↵ picks days", "↵", true);
+
+    let mut shared = profile("a", 95.0, 20.0, 3600);
+    shared.preferred_days = vec![chrono::Weekday::Sat];
+    let mut b = profile("b", 95.0, 20.0, 3600);
+    b.preferred_days = vec![chrono::Weekday::Sat];
+    let shared = config_with(vec![shared, b], Some("a"), vec!["a", "b"]);
+    assert_prose_part(&card_of(&shared, None), "first · ↵ picks days", "↵", true);
+    let picking = card(Some(0));
+    for (phrase, part) in [
+        ("← → walk", "← →"),
+        ("· space toggles", "space"),
+        ("· ↵ esc done", "↵ esc"),
+        ("· ↑ ↓ leave", "↑ ↓"),
+    ] {
+        assert_prose_part(&picking, phrase, part, true);
+    }
 }

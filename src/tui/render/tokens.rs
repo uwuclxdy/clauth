@@ -23,12 +23,15 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, TokenFilter, TokenPeriod, TokenView, token_period_models};
+use super::super::app::{
+    App, CardKind, StatusFocus, TokenFilter, TokenPeriod, TokenView, follow_dash_focus,
+    token_period_models,
+};
 use super::super::theme;
 use super::format::{fixed, spinner_frame};
 use super::panes::{
-    draw_selector_list, master_detail, meta_line, picker_row, section_box, section_box_loading,
-    section_box_verbatim,
+    draw_scrollbar, draw_selector_list, master_detail, meta_line, picker_row, section_box,
+    section_box_loading, section_box_verbatim,
 };
 use crate::pricing::{HourTokens, PriceTable};
 use crate::tokens::{
@@ -638,6 +641,7 @@ fn clamp_width(area: Rect, max_w: u16) -> Rect {
 }
 
 /// Card rectangles for the dashboard grid, resolved per layout mode.
+#[derive(Clone, Copy)]
 struct DashRects {
     first: Rect,
     total: Rect,
@@ -665,19 +669,16 @@ const CARD_COL_W: u16 = 56;
 fn dash_rects(area: Rect) -> DashRects {
     // Phone width: every card pair stacks — a 45-col terminal has no room for
     // side-by-side cards (the TODAY card alone needs ~20 content cells). Rows
-    // are the abundant resource there; a short terminal clips the trailing
-    // charts (hour/activity) rather than crushing every card.
+    // are the abundant resource there; a terminal too short for the stack
+    // scrolls it by whole cards (`dash_rects_natural`) rather than crushing
+    // every card.
     if super::panes::narrow(area.width) {
-        let rows = Layout::vertical([
-            Constraint::Length(6), // today / this week / this month
-            Constraint::Length(6), // total
-            Constraint::Length(4), // trend (compact)
-            Constraint::Length(7), // top models
-            Constraint::Length(6), // composition
-            Constraint::Length(9), // hour of day (24 buckets fit 45 cols)
-            Constraint::Min(0),    // activity takes whatever is left
-        ])
-        .split(area);
+        let mut constraints: Vec<Constraint> = NARROW_ROWS[..6]
+            .iter()
+            .map(|&h| Constraint::Length(h))
+            .collect();
+        constraints.push(Constraint::Min(0)); // activity takes whatever is left
+        let rows = Layout::vertical(constraints).split(area);
         return DashRects {
             first: rows[0],
             total: rows[1],
@@ -718,12 +719,16 @@ fn dash_rects(area: Rect) -> DashRects {
     // Grow the trend card toward a ~10-row cap so its chart breathes, leaving the
     // bottom row (hour + activity) its 4-row floor plus the rest of the height.
     // Falls back to the old 4-row trend on short terminals.
-    let trend_h = area.height.saturating_sub(6 + 7 + 4).clamp(4, 10);
+    let trend_floor = SINGLE_COL_ROWS[1];
+    let trend_h = area
+        .height
+        .saturating_sub(SINGLE_COL_ROWS[0] + SINGLE_COL_ROWS[2] + SINGLE_COL_ROWS[3])
+        .clamp(trend_floor, 10);
     let rows: [Rect; 4] = Layout::vertical([
-        Constraint::Length(6), // today/this week/this month · total (incl. cost row)
-        Constraint::Length(trend_h), // daily/weekly/monthly trend (growable)
-        Constraint::Length(7), // top models · composition
-        Constraint::Min(4),    // hour · activity (takes the rest)
+        Constraint::Length(SINGLE_COL_ROWS[0]), // today/this week/this month · total
+        Constraint::Length(trend_h),            // daily/weekly/monthly trend (growable)
+        Constraint::Length(SINGLE_COL_ROWS[2]), // top models · composition
+        Constraint::Min(SINGLE_COL_ROWS[3]),    // hour · activity (takes the rest)
     ])
     .areas(area);
     let top = halves(rows[0], 42);
@@ -742,6 +747,130 @@ fn dash_rects(area: Rect) -> DashRects {
         hour: bot[0],
         activity: bot[1],
     }
+}
+
+impl DashRects {
+    fn get(&self, kind: CardKind) -> Rect {
+        match kind {
+            CardKind::First => self.first,
+            CardKind::Total => self.total,
+            CardKind::Trend => self.trend,
+            CardKind::Models => self.models,
+            CardKind::Comp => self.comp,
+            CardKind::Hour => self.hour,
+            CardKind::Activity => self.activity,
+        }
+    }
+}
+
+/// Natural card row heights for the narrow (phone-width) stacked layout, in
+/// reading order: today, total, trend, top models, composition, hour, activity.
+const NARROW_ROWS: [u16; 7] = [6, 6, 4, 7, 6, 9, 7];
+/// Natural row heights for the single-column band layout: first|total, trend
+/// (its short-terminal floor), models|comp, hour|activity at its 4-row minimum.
+const SINGLE_COL_ROWS: [u16; 4] = [6, 4, 7, 4];
+
+/// Whether the dashboard reflows to two columns at this size.
+fn two_col(area: Rect) -> bool {
+    !super::panes::narrow(area.width) && area.width >= TWO_COL_MIN_W && area.height >= TWO_COL_MIN_H
+}
+
+/// Focus/scroll walk order. The two-column layout reads its left column
+/// top-down, then the right column; every other layout is a single column.
+fn reading_order(area: Rect) -> [CardKind; 7] {
+    if two_col(area) {
+        [
+            CardKind::First,
+            CardKind::Total,
+            CardKind::Models,
+            CardKind::Comp,
+            CardKind::Hour,
+            CardKind::Trend,
+            CardKind::Activity,
+        ]
+    } else {
+        [
+            CardKind::First,
+            CardKind::Total,
+            CardKind::Trend,
+            CardKind::Models,
+            CardKind::Comp,
+            CardKind::Hour,
+            CardKind::Activity,
+        ]
+    }
+}
+
+/// Total natural height of a scrollable grid (narrow or single-column), summed
+/// from the same arrays the natural rect builder lays out.
+fn dash_total_rows(area: Rect) -> u16 {
+    if super::panes::narrow(area.width) {
+        NARROW_ROWS.iter().sum()
+    } else {
+        SINGLE_COL_ROWS.iter().sum()
+    }
+}
+
+/// Whether the grid is taller than the body at its natural heights. The
+/// two-column layout never overflows (its height gate equals its content), so
+/// only the narrow and single-column grids scroll.
+fn dash_overflows(area: Rect) -> bool {
+    if two_col(area) {
+        false
+    } else {
+        area.height < dash_total_rows(area)
+    }
+}
+
+/// Natural card rects for the whole-card scroll: fixed heights laid out in
+/// virtual space (they may extend past `area`'s bottom), so the view can
+/// window them without clipping a bottom border.
+fn dash_rects_natural(area: Rect) -> DashRects {
+    if super::panes::narrow(area.width) {
+        let rows = stack_vertical(area, &NARROW_ROWS);
+        return DashRects {
+            first: rows[0],
+            total: rows[1],
+            trend: rows[2],
+            models: rows[3],
+            comp: rows[4],
+            hour: rows[5],
+            activity: rows[6],
+        };
+    }
+    let rows = stack_vertical(area, &SINGLE_COL_ROWS);
+    let top = halves(rows[0], 42);
+    let mid = halves(rows[2], 55);
+    let bot: [Rect; 2] =
+        Layout::horizontal([Constraint::Length(HOUR_BOX_W), Constraint::Fill(1)]).areas(rows[3]);
+    DashRects {
+        first: top[0],
+        total: top[1],
+        trend: rows[1],
+        models: mid[0],
+        comp: mid[1],
+        hour: bot[0],
+        activity: bot[1],
+    }
+}
+
+/// Stack `heights` full-width rows top-down from `area`'s top, extending past
+/// `area`'s bottom when the sum exceeds it.
+fn stack_vertical(area: Rect, heights: &[u16]) -> Vec<Rect> {
+    let mut y = area.y;
+    heights
+        .iter()
+        .map(|&h| {
+            let rect = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: h,
+            };
+            y += h;
+            rect
+        })
+        .collect()
 }
 
 fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -776,52 +905,129 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // braille spinner (one clock — the app's tick frame).
     let card_spin = app.tokens_topping_up.then(|| spinner_frame(app.tick_count));
 
-    let r = dash_rects(area);
-    if let Some(bucket) = period.bucket() {
-        // Scoped first card: the current calendar bucket, meta = its start day.
-        let (from, to) = current_bucket_bounds(&today_date(), bucket);
-        // `→` = "from this day"; a `+` here would collide with the cost floor's
-        // `$X+` suffix inches below it.
-        let meta = format!("{} →", short_date(&from));
-        card(
-            frame,
-            r.first,
-            period.badge().unwrap_or("period"),
-            Some(&meta),
-            true,
-            card_spin,
-            period_lines(stats, inner_w(r.first), count_cache, prices, &from, &to),
-        );
+    // Whole-card scroll: lay the grid out at its natural heights when it
+    // overflows the body, reserve the rightmost column for the scrollbar, and
+    // hide a card that would clip its bottom border below the fold.
+    let reading = reading_order(area);
+    let overflow = dash_overflows(area);
+    // The overflowing single-column grid clamps to the centered `DASH_MAX_W`
+    // band (like the fitting layout); narrow stays full-width and two-column
+    // never overflows. The scrollbar reserves the band's rightmost column.
+    let content_area = if overflow {
+        let band = if super::panes::narrow(area.width) || two_col(area) {
+            area
+        } else {
+            clamp_width(area, DASH_MAX_W)
+        };
+        Rect {
+            width: band.width.saturating_sub(1),
+            ..band
+        }
     } else {
-        // Today's date → the today card's title-right meta badge.
-        let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
-        card(
-            frame,
-            r.first,
-            "today",
-            today_meta.as_deref(),
-            true,
-            card_spin,
-            today_lines(stats, inner_w(r.first), count_cache, prices),
-        );
+        area
+    };
+    let r = if overflow {
+        dash_rects_natural(content_area)
+    } else {
+        dash_rects(area)
+    };
+    let tops: Vec<u16> = reading.iter().map(|&k| r.get(k).y).collect();
+    let geometry: Vec<(u16, u16)> = tops
+        .iter()
+        .copied()
+        .zip(reading.iter().map(|&k| r.get(k).bottom()))
+        .collect();
+    app.token_dash_order.set(reading);
+    let prev_rows = app.token_dash_rows.replace(geometry.clone());
+    let prev_viewport = app.token_dash_viewport.replace(area.height);
+    // Reconcile the persisted first-visible card against the focus every frame
+    // (a resize can leave focus off-screen), publishing the correction back so
+    // the key path and this frame agree. Any change of the laid-out geometry —
+    // a width-only resize that swaps layouts included — re-clamps the view to
+    // fill the body; an unchanged geometry (a period change) does not, so a key
+    // never yanks the view.
+    let focus = app.token_dash_focus;
+    let mut first = follow_dash_focus(
+        &reading,
+        &geometry,
+        area.height,
+        focus,
+        app.token_dash_first.get(),
+    );
+    if prev_viewport != 0 && (prev_viewport != area.height || prev_rows != geometry) {
+        first = super::super::app::clamp_dash_first(&reading, &geometry, area.height, focus, first);
+    }
+    app.token_dash_first.set(first);
+    let scroll_top = if overflow { tops[first] } else { area.y };
+    let dy = scroll_top - area.y;
+
+    // Offset every card up by the scroll offset. Visibility is decided from the
+    // unshifted rect against the scroll top (so a card scrolled above the view
+    // is never drawn even at `area.y == 0`); the shifted rect is what draws.
+    let mut d = r;
+    d.first.y = d.first.y.saturating_sub(dy);
+    d.total.y = d.total.y.saturating_sub(dy);
+    d.trend.y = d.trend.y.saturating_sub(dy);
+    d.models.y = d.models.y.saturating_sub(dy);
+    d.comp.y = d.comp.y.saturating_sub(dy);
+    d.hour.y = d.hour.y.saturating_sub(dy);
+    d.activity.y = d.activity.y.saturating_sub(dy);
+    let view_bottom = scroll_top.saturating_add(area.height);
+    let on_screen = |rect: Rect| rect.y >= scroll_top && rect.bottom() <= view_bottom;
+    let focused = |kind: CardKind| focus == kind;
+
+    if on_screen(r.first) {
+        if let Some(bucket) = period.bucket() {
+            // Scoped first card: the current calendar bucket, meta = its start day.
+            let (from, to) = current_bucket_bounds(&today_date(), bucket);
+            // `→` = "from this day"; a `+` here would collide with the cost floor's
+            // `$X+` suffix inches below it.
+            let meta = format!("{} →", short_date(&from));
+            card(
+                frame,
+                d.first,
+                period.badge().unwrap_or("period"),
+                Some(&meta),
+                true,
+                focused(CardKind::First),
+                card_spin,
+                period_lines(stats, inner_w(d.first), count_cache, prices, &from, &to),
+            );
+        } else {
+            // Today's date → the today card's title-right meta badge.
+            let today_meta = stats.today.as_ref().map(|t| short_date(&t.date));
+            card(
+                frame,
+                d.first,
+                "today",
+                today_meta.as_deref(),
+                true,
+                focused(CardKind::First),
+                card_spin,
+                today_lines(stats, inner_w(d.first), count_cache, prices),
+            );
+        }
     }
     // Total stays the lifetime anchor in every period — the scoped window
     // already owns the first card.
-    let (total_body, total_meta) = total_lines(stats, inner_w(r.total), count_cache, prices);
-    card(
-        frame,
-        r.total,
-        "total",
-        total_meta.as_deref(),
-        false,
-        None,
-        total_body,
-    );
+    if on_screen(r.total) {
+        let (total_body, total_meta) = total_lines(stats, inner_w(d.total), count_cache, prices);
+        card(
+            frame,
+            d.total,
+            "total",
+            total_meta.as_deref(),
+            false,
+            focused(CardKind::Total),
+            None,
+            total_body,
+        );
+    }
 
     // Freshness badge → the trend card's title-right meta slot. Before the first
     // top-up lands there is no `live thru` date, so a topping-up spinner stands in.
-    let trend_meta = if let Some(d) = stats.topped_up_through.as_deref() {
-        Some(format!("live thru {}", short_date(d)))
+    let trend_meta = if let Some(dd) = stats.topped_up_through.as_deref() {
+        Some(format!("live thru {}", short_date(dd)))
     } else if app.tokens_topping_up {
         // Sweep counts (when the loader has reported any) ride the spinner.
         let count = app
@@ -845,7 +1051,7 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Some((d, t)) => format!("scanning session logs {d}/{t}"),
             None => "scanning session logs".to_string(),
         };
-        let track = inner_w(r.trend)
+        let track = inner_w(d.trend)
             .saturating_sub(2 + 2 + label.chars().count())
             .clamp(INDET_BLOCK, 40);
         vec![match app.tokens_progress {
@@ -853,47 +1059,64 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             None => indeterminate_bar(app.tick_count, track, &label),
         }]
     } else {
-        trend_lines(stats, inner_w(r.trend), inner_h(r.trend), period)
+        trend_lines(stats, inner_w(d.trend), inner_h(d.trend), period)
     };
-    card(
-        frame,
-        r.trend,
-        trend_title,
-        trend_meta.as_deref(),
-        false,
-        None,
-        trend_body,
-    );
+    if on_screen(r.trend) {
+        card(
+            frame,
+            d.trend,
+            trend_title,
+            trend_meta.as_deref(),
+            false,
+            focused(CardKind::Trend),
+            None,
+            trend_body,
+        );
+    }
 
     // Filter + period lenses both show as the card's title-right meta badge.
     let model_rows = token_period_models(app);
     let models_meta = join_badges(app.token_filter.badge(), Some(period.lens_badge()));
-    card(
-        frame,
-        r.models,
-        "top models",
-        models_meta.as_deref(),
-        false,
-        None,
-        model_lines(
-            &model_rows,
-            inner_w(r.models),
-            5,
-            effective_cache_basis(&model_rows, count_cache),
-            prices,
-            empty_models_msg(app.token_filter),
-        ),
-    );
+    if on_screen(r.models) {
+        card(
+            frame,
+            d.models,
+            "top models",
+            models_meta.as_deref(),
+            false,
+            focused(CardKind::Models),
+            None,
+            model_lines(
+                &model_rows,
+                inner_w(d.models),
+                5,
+                effective_cache_basis(&model_rows, count_cache),
+                prices,
+                empty_models_msg(app.token_filter),
+            ),
+        );
+    }
     // Composition can scope honestly only to today (transcript-derived split);
     // weekly/monthly fall back to lifetime, badged as such.
     let (comp_meta, comp) = match period {
-        TokenPeriod::Daily => (Some("today"), today_comp_lines(stats, inner_w(r.comp))),
+        TokenPeriod::Daily => (Some("today"), today_comp_lines(stats, inner_w(d.comp))),
         TokenPeriod::Weekly | TokenPeriod::Monthly => {
-            (Some("lifetime"), comp_lines(stats, inner_w(r.comp)))
+            (Some("lifetime"), comp_lines(stats, inner_w(d.comp)))
         }
-        TokenPeriod::Lifetime => (Some("lifetime"), comp_lines(stats, inner_w(r.comp))),
+        TokenPeriod::Lifetime => (Some("lifetime"), comp_lines(stats, inner_w(d.comp))),
     };
-    card(frame, r.comp, "composition", comp_meta, false, None, comp);
+    if on_screen(r.comp) {
+        card(
+            frame,
+            d.comp,
+            "composition",
+            comp_meta,
+            false,
+            focused(CardKind::Comp),
+            None,
+            comp,
+        );
+    }
 
     // Same fallback shape as composition: per-day hours exist only for today.
     let (hour_meta, hours) = match period {
@@ -905,29 +1128,49 @@ fn draw_dashboard(frame: &mut Frame<'_>, area: Rect, app: &App) {
             (Some("lifetime"), stats.hour_counts)
         }
     };
-    card(
-        frame,
-        r.hour,
-        "hour of day",
-        hour_meta,
-        false,
-        None,
-        hour_lines(&hours, inner_w(r.hour), inner_h(r.hour)),
-    );
+    if on_screen(r.hour) {
+        card(
+            frame,
+            d.hour,
+            "hour of day",
+            hour_meta,
+            false,
+            focused(CardKind::Hour),
+            None,
+            hour_lines(&hours, inner_w(d.hour), inner_h(d.hour)),
+        );
+    }
     let act_meta = match period {
         TokenPeriod::Weekly => Some("by week"),
         TokenPeriod::Monthly => Some("by month"),
         TokenPeriod::Lifetime | TokenPeriod::Daily => Some("by day"),
     };
-    card(
-        frame,
-        r.activity,
-        "activity",
-        act_meta,
-        false,
-        None,
-        activity_lines(stats, inner_w(r.activity), inner_h(r.activity), period),
-    );
+    if on_screen(r.activity) {
+        card(
+            frame,
+            d.activity,
+            "activity",
+            act_meta,
+            false,
+            focused(CardKind::Activity),
+            None,
+            activity_lines(stats, inner_w(d.activity), inner_h(d.activity), period),
+        );
+    }
+
+    // The scrollbar reuses the panel's right padding column (reserved above),
+    // so it shows only while the grid overflows and never covers a content cell.
+    if overflow {
+        draw_scrollbar(
+            frame,
+            content_area,
+            // Whole-card scroll can land past the natural total (the last card
+            // sits at the body bottom), so the thumb's extent grows to match.
+            (dash_total_rows(area).max(dy + area.height)) as usize,
+            dy as usize,
+            area.height as usize,
+        );
+    }
 }
 
 /// Compose the filter + period meta badges into one title-right string.
@@ -962,18 +1205,23 @@ fn halves(area: Rect, left_pct: u16) -> [Rect; 2] {
 /// Draw one bordered card with its lines. `meta` (if any) renders as a
 /// right-aligned title badge (the title-right meta slot); `spinner`
 /// (if any) appends a braille loading frame into the title's left inset.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one call per card carries its whole chrome: title, meta, focus, spinner"
+)]
 fn card(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     meta: Option<&str>,
     first: bool,
+    focused: bool,
     spinner: Option<&str>,
     lines: Vec<Line<'static>>,
 ) {
     let mut block = match spinner {
-        Some(f) => section_box_loading(title, false, first, f),
-        None => section_box(title, false, first),
+        Some(f) => section_box_loading(title, focused, first, f),
+        None => section_box(title, focused, first),
     };
     if let Some(m) = meta {
         // The badge closes with a border cell of its own (`… badge ─╮`), the
@@ -1454,6 +1702,13 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // `draw_selector_list`'s shared empty state talks about accounts, so
     // render the lens-specific message instead.
     if grouped.is_empty() {
+        app.models_selector.offset.set(0);
+        app.models_selector.viewport.set(0);
+        app.models_selector.starts.replace(Vec::new());
+        app.models_selector.block_ends.replace(Vec::new());
+        app.models_selector.total.set(0);
+        app.model_detail_max_scroll.set(0);
+        app.model_detail_viewport.set(0);
         let block = section_box(&title, true, true);
         let inner = block.inner(cols[0]);
         frame.render_widget(block, cols[0]);
@@ -1470,35 +1725,49 @@ fn draw_models(frame: &mut Frame<'_>, area: Rect, app: &App) {
             cols[1],
             None,
             0,
-            app.price_table.as_ref(),
-            app.price_failed,
+            (app.price_table.as_ref(), app.price_failed),
             app.token_period,
+            Some(app),
         );
         return;
     }
-    draw_selector_list(frame, cols[0], &title, true, sel, |w| {
-        grouped
-            .iter()
-            .enumerate()
-            .map(|(i, m)| {
-                let style = if is_anthropic(&m.model) {
-                    Style::default().fg(theme::text_color())
-                } else {
-                    theme::dim()
-                };
-                picker_row(i == sel, true, model_display_name(&m.model), style, w)
-            })
-            .collect()
-    });
+    draw_selector_list(
+        frame,
+        cols[0],
+        &title,
+        app.model_detail_focus == StatusFocus::List,
+        sel,
+        &app.models_selector,
+        |w| {
+            grouped
+                .iter()
+                .enumerate()
+                .map(|(i, m)| {
+                    let style = if is_anthropic(&m.model) {
+                        Style::default().fg(theme::text_color())
+                    } else {
+                        theme::dim()
+                    };
+                    picker_row(
+                        i == sel,
+                        app.model_detail_focus == StatusFocus::List,
+                        model_display_name(&m.model),
+                        style,
+                        w,
+                    )
+                })
+                .collect()
+        },
+    );
 
     draw_model_detail(
         frame,
         cols[1],
         grouped.get(sel),
         period_grand(app),
-        app.price_table.as_ref(),
-        app.price_failed,
+        (app.price_table.as_ref(), app.price_failed),
         app.token_period,
+        Some(app),
     );
 }
 
@@ -1529,18 +1798,26 @@ fn draw_model_detail(
     area: Rect,
     model: Option<&PeriodModel>,
     grand: u64,
-    prices: Option<&PriceTable>,
-    rates_failed: bool,
+    (prices, rates_failed): (Option<&PriceTable>, bool),
     period: TokenPeriod,
+    app: Option<&App>,
 ) {
     let title = model
         .map(|m| model_display_name(&m.model))
         .unwrap_or_else(|| "model".to_string());
-    let block = section_box_verbatim(&title, false, false);
+    let block = section_box_verbatim(
+        &title,
+        app.is_some_and(|app| app.model_detail_focus == StatusFocus::Detail),
+        false,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let Some(m) = model else {
+        if let Some(app) = app {
+            app.model_detail_max_scroll.set(0);
+            app.model_detail_viewport.set(0);
+        }
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled("no model data", theme::faint())))
                 .style(theme::base()),
@@ -1704,7 +1981,25 @@ fn draw_model_detail(
         lines.push(Line::from(hit_line));
     }
 
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), inner);
+    let total = lines.len();
+    let viewport = inner.height as usize;
+    let max_scroll = if viewport == 0 {
+        0
+    } else {
+        total.saturating_sub(viewport).min(u16::MAX as usize) as u16
+    };
+    let scroll = app.map_or(0, |app| {
+        app.model_detail_max_scroll.set(max_scroll);
+        app.model_detail_viewport.set(inner.height);
+        app.model_detail_scroll.min(max_scroll)
+    });
+    frame.render_widget(
+        Paragraph::new(lines)
+            .style(theme::base())
+            .scroll((scroll, 0)),
+        inner,
+    );
+    draw_scrollbar(frame, inner, total, scroll as usize, viewport);
 }
 
 #[cfg(test)]

@@ -147,10 +147,14 @@ impl Ledger {
     /// Load the ledger, or an empty one when absent/unreadable/corrupt — the
     /// ledger is a durability + speed layer, never required for a correct base.
     pub(crate) fn load(clauth_dir: &Path) -> Self {
-        std::fs::read(Self::path(clauth_dir))
+        let mut ledger: Self = std::fs::read(Self::path(clauth_dir))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        for models in ledger.days.values_mut() {
+            models.retain(|model, _| !crate::tokens::is_placeholder_model(model));
+        }
+        ledger
     }
 
     /// Persist atomically. Best-effort: a write failure only forfeits the

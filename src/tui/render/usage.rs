@@ -10,7 +10,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::super::app::{App, NoteBuffer};
+use super::super::app::{App, NoteBuffer, StatusFocus};
 use super::super::theme;
 use super::format::{
     ResetFmt, activity_verb, is_past_reset, reset_in_secs_at, reset_phrase, spinner_frame,
@@ -21,6 +21,7 @@ use super::panes::{
     draw_profile_selector, draw_scrollbar, edit_slot_block, empty_state, key_cell, master_detail,
     pill, rail_hint_lines, scroll_offset, section_box, section_box_verbatim, wrap_words,
 };
+use super::prose::{self, cmd, cmd_lit, key_lit};
 use crate::format::{account_tier, format_pct};
 use crate::profile::Profile;
 use crate::providers::{Provider, StatRowKind};
@@ -97,7 +98,13 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let items = app.config().profiles.len();
     let (selector, detail) = master_detail(area, items);
 
-    draw_profile_selector(frame, selector, app, app.profile_cursor, true);
+    draw_profile_selector(
+        frame,
+        selector,
+        app,
+        app.profile_cursor,
+        app.usage_detail_focus == StatusFocus::List,
+    );
     draw_usage_detail(frame, detail, app);
 }
 
@@ -178,17 +185,18 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .get(app.profile_cursor.min(cfg.profiles.len().saturating_sub(1)));
 
     let title = profile.map(|p| p.name.as_str()).unwrap_or("usage");
-    // Detail pane: read-only, focus never descends into it; second panel on screen.
-    // Profile names preserve original case; the "usage" fallback stays uppercased.
+    let focused = app.usage_detail_focus == StatusFocus::Detail;
     let block = if profile.is_some() {
-        section_box_verbatim(title, false, false)
+        section_box_verbatim(title, focused, false)
     } else {
-        section_box(title, false, false)
+        section_box(title, focused, false)
     };
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     let Some(profile) = profile else {
+        app.usage_detail_max_scroll.set(0);
+        app.usage_detail_viewport.set(0);
         frame.render_widget(empty_state("no accounts yet", "n", "to create one"), inner);
         return;
     };
@@ -283,7 +291,30 @@ fn draw_usage_detail(frame: &mut Frame<'_>, area: Rect, app: &App) {
         show_pace,
         reset_fmt,
     );
-    frame.render_widget(Paragraph::new(lines).style(theme::base()), content_area);
+    let total = lines.len();
+    let viewport = content_area.height as usize;
+    let max_scroll = if viewport == 0 {
+        0
+    } else {
+        total.saturating_sub(viewport)
+    };
+    app.usage_detail_max_scroll.set(max_scroll);
+    app.usage_detail_viewport.set(viewport);
+    let scroll = app.usage_detail_scroll.min(max_scroll);
+    // Paragraph::scroll accepts u16; large saved notes can exceed that row limit.
+    let paragraph = if scroll > usize::from(u16::MAX) {
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(scroll)
+                .take(viewport)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        Paragraph::new(lines).scroll((scroll as u16, 0))
+    };
+    frame.render_widget(paragraph.style(theme::base()), content_area);
+    draw_scrollbar(frame, content_area, total, scroll, viewport);
     if let Some(editor) = slot {
         draw_note_slot(frame, slot_area.unwrap_or(inner), &editor.buf);
     }
@@ -1431,7 +1462,12 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         }
         UsageDiag::KickBurst => "claude code hit a burst limit".to_string(),
         UsageDiag::Stuck429 { throttler } => format!("{throttler} is throttling usage reads"),
-        UsageDiag::AuthBroken => format!("re-login with clauth login {profile_name}"),
+        UsageDiag::AuthBroken => {
+            format!(
+                "re-login with {}",
+                cmd(&format!("clauth login {profile_name}"))
+            )
+        }
         UsageDiag::WeeklyHard => "weekly limit is spent".to_string(),
         UsageDiag::BudgetSpent => "raise max spend on the fallback tab".to_string(),
         UsageDiag::SpendUncapped => crate::fallback::uncapped_spend_fix().to_string(),
@@ -1536,12 +1572,14 @@ fn build_tp_rows(
                 // (Alibaba), or a dead api key (any other provider, whose
                 // verdict only a 401 can produce).
                 Some(FetchStatus::AuthExpired) if profile.console.is_some() => {
-                    "console login expired, run clauth login"
+                    concat!("console login expired, run ", cmd_lit!("clauth login"))
                 }
                 Some(FetchStatus::AuthExpired) if profile.provider != Some(Provider::Alibaba) => {
                     "api key rejected, re-enter it on the setup tab"
                 }
-                Some(FetchStatus::AuthExpired) => "console login needed, run clauth login",
+                Some(FetchStatus::AuthExpired) => {
+                    concat!("console login needed, run ", cmd_lit!("clauth login"))
+                }
                 // A profile no leg will ever fetch must not claim to be
                 // loading — the same rule `oauth_empty_msg` applies. An Alibaba
                 // profile is never in here: its quota runs on the console
@@ -1554,9 +1592,9 @@ fn build_tp_rows(
         // every terminal message routes through the shared greedy wrapper
         // (`panes::wrap_words`) instead of clipping its tail at the pane edge.
         lines.extend(
-            wrap_words(msg, usize::from(inner_w))
+            prose::wrap(msg, usize::from(inner_w), theme::faint())
                 .into_iter()
-                .map(|seg| Line::from(Span::styled(seg, theme::faint()))),
+                .map(Line::from),
         );
         return lines;
     };
@@ -1739,10 +1777,17 @@ fn notes_lines(note: Option<&str>, inner_w: u16) -> Vec<Line<'static>> {
     let value_w = (inner_w as usize).saturating_sub(NOTES_VALUE_LEAD).max(8);
     let pad = " ".repeat(NOTES_VALUE_LEAD);
     match note.filter(|t| !t.is_empty()) {
-        None => vec![Line::from(vec![
-            Span::styled(key_cell("notes:", KEY_W, KEY_GUTTER), theme::accent()),
-            Span::styled("press n to add notes", theme::faint()),
-        ])],
+        None => {
+            let mut spans = vec![Span::styled(
+                key_cell("notes:", KEY_W, KEY_GUTTER),
+                theme::accent(),
+            )];
+            spans.extend(prose::spans(
+                concat!("press ", key_lit!("n"), " to add notes"),
+                theme::faint(),
+            ));
+            vec![Line::from(spans)]
+        }
         Some(text) => {
             let mut lines = Vec::new();
             for (i, note_line) in text.split('\n').enumerate() {

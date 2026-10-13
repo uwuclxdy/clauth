@@ -33,7 +33,7 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "mcp__plugin_clauth_clauth__delegate$",
+        "matcher": "^mcp__(plugin_clauth_)?clauth__delegate$",
         "hooks": [
           {
             "type": "command",

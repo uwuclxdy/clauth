@@ -497,7 +497,7 @@ fn mirror_credentials_newer_runtime_wins() {
     set_mtime(&canonical, past);
     set_mtime(&runtime, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V2);
 }
 
@@ -513,7 +513,7 @@ fn mirror_credentials_newer_canonical_wins() {
     set_mtime(&runtime, past);
     set_mtime(&canonical, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&runtime).expect("read"), CREDS_V2);
 }
 
@@ -529,7 +529,7 @@ fn mirror_credentials_skips_invalid_json() {
     set_mtime(&canonical, past);
     set_mtime(&runtime, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1); // canonical untouched; partial JSON ignored
 }
 
@@ -546,7 +546,7 @@ fn mirror_credentials_skips_empty_credentials() {
     set_mtime(&canonical, past);
     set_mtime(&runtime, now);
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
@@ -557,7 +557,7 @@ fn mirror_credentials_seeds_missing_side() {
     let runtime = tmp.path().join(".credentials.json");
     fs::write(&runtime, CREDS_V1).expect("write runtime");
 
-    mirror_credentials(&runtime, &canonical).expect("mirror");
+    let _ = mirror_credentials(&runtime, &canonical).expect("mirror");
     assert_eq!(fs::read(&canonical).expect("read"), CREDS_V1);
 }
 
@@ -5850,6 +5850,48 @@ fn lone_session(
     (swap, markers)
 }
 
+/// [`lone_session`] under [`LinkMode::Fake`] (a regular-file credential copy
+/// instead of a symlink), so a test can drive the fake-mode watchdog tick arms.
+fn fake_session(
+    launch: &Profile,
+    isolation: Isolation,
+) -> (std::sync::Arc<SessionSwap>, SwappedMarkers) {
+    let name = launch.name.as_str();
+    let session = SessionId::mint();
+    let store = crate::claude::install_source_path(&crate::profile::ProfileName::from(name))
+        .expect("install source");
+    let paths = SessionPaths::resolve(
+        &crate::profile::ProfileName::from(name),
+        isolation,
+        &session,
+        LinkMode::Fake,
+    )
+    .expect("session paths");
+    crate::profile::mkdir_700(&paths.runtime).expect("mkdir runtime");
+    fs::copy(&store, paths.runtime.join(".credentials.json")).expect("copy creds");
+    let markers = stamp_swapped_markers(&paths)
+        .expect("stamp the launch marker")
+        .expect("the launch member's marker must be free in a fresh sandbox");
+    let row = crate::live_sessions::LiveSession::starting(
+        &session,
+        name,
+        crate::harness::Harness::Claude,
+        isolation == Isolation::Isolated,
+        false,
+        Some(store.to_path_buf()),
+    );
+    crate::live_sessions::register(&row).expect("register row");
+    let swap = std::sync::Arc::new(SessionSwap::new(
+        session,
+        isolation,
+        LinkMode::Fake,
+        launch,
+        store,
+        &paths,
+    ));
+    (swap, markers)
+}
+
 /// The decision leg gates on `follows_chain` and nothing sets it true yet, so an
 /// acquire-shaped registration must leave a session opted OUT — otherwise landing
 /// the leg would move EVERY live session off the account it launched on.
@@ -6537,6 +6579,351 @@ fn a_swap_drains_a_pending_relogin_into_the_launch_store() {
             "the intended member's own chain must be untouched by the drain"
         );
     });
+}
+
+fn armed_durable_stamp(name: &str) -> crate::profile::ProfileName {
+    let pname = crate::profile::ProfileName::from(name);
+    crate::usage::seed_login_anchor(
+        &pname,
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    assert!(
+        crate::usage::take_profile_fetch(&pname, false, 1_000_000_000_000u64),
+        "precondition: the durable /profile stamp is armed"
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<u64>(
+            &pname,
+            crate::profile_cache::PROFILE_FETCHED_CACHE_FILE
+        )
+        .is_some(),
+        "precondition: the durable stamp exists"
+    );
+    pname
+}
+
+fn durable_stamp(name: &crate::profile::ProfileName) -> Option<u64> {
+    crate::profile_cache::load_profile_cache::<u64>(
+        name,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+    )
+}
+
+/// A watchdog tick drain that copied a session-side `/login` into the store
+/// marks that account's `/profile` reading stale (removes the durable stamp) —
+/// no network call.
+#[test]
+fn a_tick_drain_marks_the_profile_reading_stale() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("tick-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("tick-stale");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    tick(&claude_home, &swap).expect("tick");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the tick drained the session's login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "a tick drain that wrote the store marks the profile's /profile reading stale"
+    );
+}
+
+/// The swap executor's drain (swap_to) marks the OUTGOING member's `/profile`
+/// reading stale after it wrote the drained login.
+#[test]
+fn a_swap_drain_marks_the_outgoing_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("sw-stale-a");
+    let intended = member("sw-stale-b");
+    let launch_store = member_store(&launch);
+    let _intended_store = member_store(&intended);
+    let pname = armed_durable_stamp("sw-stale-a");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    set_mtime(&launch_store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    assert_eq!(
+        swap.swap_to("sw-stale-b").expect("swap"),
+        SwapOutcome::Swapped
+    );
+
+    assert_eq!(
+        fs::read(&launch_store).expect("read launch store"),
+        CREDS_V2,
+        "precondition: the swap drained into the outgoing member"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the swap's drain marks the outgoing profile's /profile reading stale"
+    );
+}
+
+/// A converge (the poll onto an armed rolling sidecar, same member) that drained
+/// a session-side login marks the member's `/profile` reading stale.
+#[test]
+fn a_converge_drain_marks_the_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("conv-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("conv-stale");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+    // Arm the sidecar so the converge transition holds (current refreshable,
+    // selected refreshless).
+    let sidecar = crate::profile::profile_dir(&pname)
+        .expect("profile_dir")
+        .join("session-token.json");
+    write_creds(&sidecar, None);
+
+    swap.poll();
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the converge drained the session's login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the converge's drain marks the profile's /profile reading stale"
+    );
+}
+
+/// The build-time drain (`reconcile_credentials`) marks the profile's `/profile`
+/// reading stale after a session→store copy, and leaves it untouched when the
+/// copy wrote nothing.
+#[test]
+fn a_build_drain_marks_the_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("build-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("build-stale");
+    let runtime = crate::profile::profile_subpath(&pname, "runtime").expect("runtime path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    let runtime_creds = runtime.join(".credentials.json");
+    fs::write(&runtime_creds, CREDS_V2).expect("session relogin");
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    set_mtime(&runtime_creds, SystemTime::now());
+
+    reconcile_credentials(&runtime_creds, &store, LinkMode::Fake).expect("reconcile");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the build drained the newer runtime copy"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the build drain marks the profile's /profile reading stale"
+    );
+
+    // A second reconcile over equal bytes writes nothing and must not re-mark.
+    crate::usage::take_profile_fetch(&pname, false, 2_000_000_000_000u64);
+    assert!(
+        durable_stamp(&pname).is_some(),
+        "precondition: the stamp is re-armed"
+    );
+    reconcile_credentials(&runtime_creds, &store, LinkMode::Fake).expect("reconcile");
+    assert!(
+        durable_stamp(&pname).is_some(),
+        "a drain that wrote nothing leaves the durable stamp untouched"
+    );
+}
+
+/// A copy-back whose bytes differ only in a non-login key (Claude Code rewriting
+/// the file for an MCP-server token refresh) must NOT mark the `/profile`
+/// reading stale — the mark fires only when the copied login changed.
+#[test]
+fn a_non_login_rewrite_does_not_mark_the_reading_stale() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("mcpprobe");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("mcpprobe");
+    let (swap, _markers) = lone_session(&launch, Isolation::Shared);
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("store json");
+    v["mcpOAuth"] = serde_json::json!({});
+    v["mcpOAuth"]["srv|https://mcp.example"]["accessToken"] = "mcp-2".into();
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(
+        &swap.runtime,
+        &serde_json::to_vec(&v).expect("ser"),
+        SystemTime::now(),
+    );
+    tick(&claude_home, &swap).expect("tick");
+    let after: ClaudeCredentials =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("parse store");
+    assert_eq!(
+        after.claude_ai_oauth.map(|o| o.access_token).as_deref(),
+        Some("at-mcpprobe"),
+        "precondition: the copy-back kept the same login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        Some(1_000_000_000_000),
+        "a copy-back that refreshed no token must not spend a /profile read"
+    );
+}
+
+/// The fake-transport login-change gate (`copy_if_valid_creds`): P4's shape
+/// through a fake-mode session (Windows' default), so an MCP-only rewrite marks
+/// nothing.
+#[test]
+fn a_fake_mode_non_login_rewrite_marks_nothing() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("mcpprobef");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("mcpprobef");
+    let (swap, _markers) = fake_session(&launch, Isolation::Shared);
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("store json");
+    v["mcpOAuth"] = serde_json::json!({});
+    v["mcpOAuth"]["srv|https://mcp.example"]["accessToken"] = "mcp-2".into();
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(
+        &swap.runtime,
+        &serde_json::to_vec(&v).expect("ser"),
+        SystemTime::now(),
+    );
+    tick(&claude_home, &swap).expect("tick");
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(&store).expect("read store")).expect("parse store");
+    assert_eq!(
+        after["mcpOAuth"]["srv|https://mcp.example"]["accessToken"], "mcp-2",
+        "precondition: the fake copy-back landed the MCP refresh"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        Some(1_000_000_000_000),
+        "a fake-mode copy-back that moved no login must not mark"
+    );
+}
+
+/// The fake-mode (shared) watchdog tick arm marks the `/profile` reading stale
+/// after a session→store copy of a different login, and keeps it after a
+/// store→session copy.
+#[test]
+fn a_fake_mode_tick_marks_the_reading_stale_only_on_a_store_copy() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("fake-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("fake-stale");
+    let (swap, _markers) = fake_session(&launch, Isolation::Shared);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    tick(&claude_home, &swap).expect("tick");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the session login was copied into the store"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "a session→store copy marks the reading stale"
+    );
+
+    // A store→session copy (clauth rotated the store to a different pair; the
+    // session's fake-mode copy is older) writes no store, so it must not mark.
+    crate::usage::take_profile_fetch(&pname, false, 2_000_000_000_000u64);
+    assert!(durable_stamp(&pname).is_some(), "precondition: re-armed");
+    let runtime_creds = swap.runtime.join(".credentials.json");
+    set_mtime(&runtime_creds, SystemTime::now() - Duration::from_secs(60));
+    let mut rotated = serde_json::json!({"claudeAiOauth": {"expiresAt": 9_999_999_999_999u64}});
+    rotated["claudeAiOauth"]["accessToken"] = "at-rotated".into();
+    rotated["claudeAiOauth"]["refreshToken"] = "rt-rotated".into();
+    fs::write(&store, serde_json::to_vec(&rotated).expect("rotated json"))
+        .expect("rotate the store");
+    set_mtime(&store, SystemTime::now());
+    tick(&claude_home, &swap).expect("tick");
+    let runtime_now: ClaudeCredentials =
+        serde_json::from_slice(&fs::read(&runtime_creds).expect("read runtime"))
+            .expect("parse runtime");
+    assert_eq!(
+        runtime_now
+            .claude_ai_oauth
+            .map(|o| o.access_token)
+            .as_deref(),
+        Some("at-rotated"),
+        "precondition: the store→session copy landed a different login in the session"
+    );
+    assert!(
+        durable_stamp(&pname).is_some(),
+        "a store→session copy writes no store and leaves the stamp untouched"
+    );
+}
+
+/// The fake-mode ISOLATED watchdog tick arm marks the reading stale after a
+/// session→store copy, the same wiring as the shared arm.
+#[test]
+fn a_fake_mode_isolated_tick_marks_the_reading_stale() {
+    let home = HomeSandbox::new();
+    let claude_home = fake_claude_home(home.home());
+    let launch = member("fake-iso-stale");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("fake-iso-stale");
+    let (swap, _markers) = fake_session(&launch, Isolation::Isolated);
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    cc_relogin(&swap.runtime, CREDS_V2, SystemTime::now());
+
+    tick(&claude_home, &swap).expect("tick");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the isolated tick drained the session's login"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the isolated tick marks the reading stale after a store copy"
+    );
+}
+
+/// The Real-mode build drain (`reconcile_credentials`'s Real arm) marks the
+/// profile's `/profile` reading stale after a session→store copy.
+#[test]
+fn a_real_mode_build_drain_marks_the_profile_reading_stale() {
+    let _home = HomeSandbox::new();
+    let launch = member("build-real");
+    let store = member_store(&launch);
+    let pname = armed_durable_stamp("build-real");
+    let runtime = crate::profile::profile_subpath(&pname, "runtime").expect("runtime path");
+    fs::create_dir_all(&runtime).expect("mkdir runtime");
+    let runtime_creds = runtime.join(".credentials.json");
+    fs::write(&runtime_creds, CREDS_V2).expect("session relogin");
+    set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+    set_mtime(&runtime_creds, SystemTime::now());
+
+    reconcile_credentials(&runtime_creds, &store, LinkMode::Real).expect("reconcile");
+
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        CREDS_V2,
+        "precondition: the Real build drained the newer runtime copy"
+    );
+    assert_eq!(
+        durable_stamp(&pname),
+        None,
+        "the Real-mode build drain marks the profile's /profile reading stale"
+    );
 }
 
 /// B5. The watchdog thread and `Drop`'s final tick both used to read a MOVED
@@ -7495,6 +7882,48 @@ fn a_pre_arming_session_converges_onto_the_armed_sidecar_on_one_poll() {
         let creds = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&sidecar)
             .expect("read sidecar");
         assert_eq!(converge_item_arm(Some(&creds)), SwapItemArm::SignOut);
+    });
+}
+
+/// The convergence's twin of the swap's unjudged-drain refusal: Claude Code's
+/// own refresh in the runtime file, the record beside the store unreadable,
+/// and the convergence stops before it repoints the link onto the sidecar.
+#[test]
+fn a_convergence_refuses_while_the_drain_cannot_judge_the_session_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("conv-unjudged");
+        let store = member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+        let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-unjudged"))
+            .expect("profile_dir");
+        write_creds(&dir.join("session-token.json"), None);
+        set_mtime(&store, SystemTime::now() - Duration::from_secs(60));
+        cc_relogin(&swap.runtime, CHAIN_P1, SystemTime::now());
+        fs::create_dir(dir.join("auth.spent.json")).expect("block the record");
+        let link = swap.runtime.join(".credentials.json");
+
+        let outcome = swap.swap_to("conv-unjudged").expect("converge");
+
+        assert!(
+            !link
+                .symlink_metadata()
+                .expect("runtime file")
+                .file_type()
+                .is_symlink(),
+            "the session's own file is not relinked away"
+        );
+        assert_eq!(fs::read(&link).expect("runtime file"), CHAIN_P1);
+        assert_eq!(swap.canonical(), store, "the cell still names the store");
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member, None, "the row still names no swap");
+        assert_eq!(
+            outcome,
+            SwapOutcome::Refused(SwapRefused::OutgoingRecordUnreadable(
+                "conv-unjudged".to_string()
+            ))
+        );
     });
 }
 
@@ -9887,6 +10316,235 @@ fn failed_owner_persist_prevents_the_namespaced_item_write_decision() {
     );
 }
 
+/// A per-session item leg whose ownership row waits out a peer's state-flock
+/// hold still hands its Keychain call the whole budget: the budget is armed
+/// only once the row persisted, so the wait spends none of it.
+#[test]
+fn an_item_legs_ownership_wait_leaves_its_keychain_budget_whole() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/budgeted/runtime-702-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("budgeted");
+    let session = SessionId::for_test("702-1");
+    let budget = Duration::from_secs(20);
+    let held = Duration::from_millis(1500);
+    let holder = crate::testutil::hold_state_flock();
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(held);
+        drop(holder);
+    });
+    let _ = crate::lock::take_keychain_leg_windows();
+
+    let start = std::time::Instant::now();
+    let inside = owned_keychain_leg(
+        budget,
+        || namespaced_keychain_ledger::authorize_write(&runtime, &profile, &session),
+        |owned| {
+            Ok((
+                owned.service().to_string(),
+                crate::lock::armed_budget_remaining(),
+            ))
+        },
+    );
+    let waited = start.elapsed();
+    releaser.join().expect("releaser");
+
+    let (service, inside) = inside.expect("the leg runs once the row persisted");
+    assert!(
+        waited >= held,
+        "the ownership row waited out the peer: {waited:?}"
+    );
+    assert_eq!(
+        namespaced_keychain_ledger::owned_services().expect("owned services"),
+        BTreeSet::from([service]),
+        "the leg ran under the witness the persisted row minted"
+    );
+    let windows = crate::lock::take_keychain_leg_windows();
+    assert_eq!(windows.len(), 1, "one item leg, one Keychain leg scope");
+    let noted = windows[0].expect("the leg begins under a budget");
+    assert!(
+        noted > budget - Duration::from_millis(500),
+        "the ownership row's flock wait spent the Keychain budget: {noted:?} left"
+    );
+    let inside = inside.expect("the leg runs under the budget");
+    assert!(
+        inside > budget - Duration::from_millis(500) && inside <= budget,
+        "the leg's window is the whole budget: {inside:?}"
+    );
+    assert_eq!(
+        crate::lock::armed_budget_remaining(),
+        None,
+        "the budget ends with the leg"
+    );
+}
+
+/// An item leg reached under a budget armed above it refuses in debug builds:
+/// the leg would adopt that window, which the flock waits between the outer
+/// arm and the leg (the carry's store write, the ownership row) spend.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(
+    expected = "a per-session Keychain item leg was entered under an armed budget (a budget armed above it, or a state-flock hold, which arms one): the waits in between may have spent its window; arm nothing and hold no state flock above `owned_keychain_leg`"
+)]
+fn an_item_leg_under_an_outer_budget_refuses() {
+    let _outer = crate::lock::SharedSubprocessBudget::arm(Duration::from_secs(20));
+    let _ = owned_keychain_leg(
+        Duration::from_secs(20),
+        || anyhow::bail!("the entry check refuses before the ownership row"),
+        |_| Ok(()),
+    );
+}
+
+/// `src` with every comment, string literal and char literal blanked to
+/// spaces (newlines kept), so a scan over it sees code tokens only. Raw
+/// strings read as plain strings.
+fn code_tokens_only(src: &str) -> String {
+    let chars: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let blank = |c: char| if c == '\n' { '\n' } else { ' ' };
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        if c == '/' && next == Some('/') {
+            while i < chars.len() && chars[i] != '\n' {
+                out.push(' ');
+                i += 1;
+            }
+        } else if c == '/' && next == Some('*') {
+            out.push_str("  ");
+            i += 2;
+            while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                out.push(blank(chars[i]));
+                i += 1;
+            }
+            out.push_str("  ");
+            i += 2;
+        } else if c == '"' {
+            out.push(' ');
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                if chars[i] == '\\' {
+                    out.push(' ');
+                    i += 1;
+                }
+                if let Some(&e) = chars.get(i) {
+                    out.push(blank(e));
+                }
+                i += 1;
+            }
+            out.push(' ');
+            i += 1;
+        } else if c == '\'' && next == Some('\\') {
+            out.push_str("  ");
+            i += 2;
+            while i < chars.len() && chars[i] != '\'' {
+                out.push(' ');
+                i += 1;
+            }
+            out.push(' ');
+            i += 1;
+        } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+            out.push_str("   ");
+            i += 3;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// No per-session item leg's call names the carry, a state-flock hold or the
+/// row retouch that takes one: they run before or after the call, so the leg's
+/// budget spends none of their waits (`authorize` takes its own hold through
+/// `authorize_write` before the budget arms). A source scan, because the
+/// callers are macOS-only and no linux test runs them. It reads code tokens
+/// only (comments and literals blanked), takes each call (`owned_keychain_leg(`
+/// or its turbofish form) up to its balancing `)`, which a `;`, `?`, `.`, `,`
+/// or `}` must follow, and sees those names only when written in the call
+/// itself, not reached through another helper; the call count proves it found
+/// every site.
+#[test]
+fn no_item_leg_folds_in_a_carry_or_a_flock() {
+    let code = code_tokens_only(include_str!("../../src/runtime.rs"));
+    let mut calls = 0usize;
+    let mut offenders = Vec::new();
+    for (at, _) in code.match_indices("owned_keychain_leg") {
+        if code[..at].trim_end().ends_with("fn") {
+            continue;
+        }
+        let rest = code[at + "owned_keychain_leg".len()..].trim_start();
+        assert!(
+            rest.starts_with('(') || rest.starts_with("::<"),
+            "`owned_keychain_leg` named outside a call: {:?}",
+            rest.chars().take(40).collect::<String>()
+        );
+        let args = if let Some(generics) = rest.strip_prefix("::<") {
+            let mut angle = 1usize;
+            let close = generics
+                .char_indices()
+                .find(|&(_, c)| {
+                    match c {
+                        '<' => angle += 1,
+                        '>' => angle -= 1,
+                        _ => {}
+                    }
+                    angle == 0
+                })
+                .map_or(generics.len(), |(k, _)| k + 1);
+            generics[close..].trim_start()
+        } else {
+            rest
+        };
+        let start = code.len() - args.len();
+        let line = code[..start].lines().count();
+        assert!(
+            args.starts_with('('),
+            "the item leg call near line {line} takes no argument list"
+        );
+        let mut depth = 0usize;
+        let mut end = None;
+        for (j, c) in code[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' if depth > 0 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + j);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end.unwrap_or_else(|| panic!("the item leg call near line {line} never closes"));
+        let next = code[end + 1..].trim_start().chars().next();
+        assert!(
+            matches!(next, Some(';' | '?' | '.' | ',' | '}')),
+            "the item leg call near line {line} ends where no call ends: followed by {next:?}"
+        );
+        calls += 1;
+        for banned in [
+            "carry_session_item_into(",
+            "with_state_lock(",
+            "retouch_after_item_leg(",
+        ] {
+            if code[start..end].contains(banned) {
+                offenders.push((line, banned));
+            }
+        }
+    }
+    assert_eq!(
+        calls, 6,
+        "the swap's item write and sign-out, the convergence's sign-out, the seed's write and sign-out and the seed's retry each call `owned_keychain_leg` once"
+    );
+    assert!(
+        offenders.is_empty(),
+        "an item leg's call names the carry, a state-flock hold or the row retouch, which must run outside it: {offenders:?}"
+    );
+}
+
 /// The ownership-first wiring, structurally: every namespaced producer routes
 /// through `authorize_write`, whose [`OwnedKeychainWrite`] witness is the only
 /// argument the macOS Keychain sinks accept, so a `/usr/bin/security` write
@@ -10845,4 +11503,378 @@ fn seed_degrade_disposition_retries_only_the_classified_transient() {
         seed_degrade_disposition(SecurityExitClass::Unclassified),
         SeedDegradeDisposition::LogAndDegrade
     );
+}
+
+/// The watchdog keeps a static token over a differing runtime file, and what
+/// the session's Claude Code saved beside that same token (a `/design-login`)
+/// went with the file. It is synced into the sidecar first. A runtime file
+/// holding another login (a session-side re-login) syncs nothing.
+#[test]
+fn the_watchdog_keeps_what_a_session_saved_beside_a_static_token() {
+    let _home = HomeSandbox::new();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let canonical = tmp.path().join("session-token.json");
+    let link_path = tmp.path().join(".credentials.json");
+    let token =
+        br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-static","expiresAt":4102444800000}}"#;
+    fs::write(&canonical, token).expect("write sidecar");
+    fs::write(
+        &link_path,
+        br#"{"claudeAiOauth":{"accessToken":"sk-ant-oat01-static","expiresAt":4102444800000},"designOauth":{"accessToken":"design-1"}}"#,
+    )
+    .expect("write runtime file");
+
+    assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
+
+    let sidecar: serde_json::Value =
+        serde_json::from_slice(&fs::read(&canonical).expect("read")).expect("parse");
+    assert_eq!(
+        sidecar["claudeAiOauth"]["accessToken"],
+        "sk-ant-oat01-static"
+    );
+    assert_eq!(sidecar["designOauth"]["accessToken"], "design-1");
+
+    fs::write(&canonical, token).expect("reset sidecar");
+    // The watchdog relinked the slot onto the sidecar; a write through that link
+    // would land in the sidecar itself, so the re-login replaces the link.
+    fs::remove_file(&link_path).expect("drop the relinked slot");
+    fs::write(
+        &link_path,
+        br#"{"claudeAiOauth":{"accessToken":"relogin","refreshToken":"r"},"designOauth":{"accessToken":"design-2"}}"#,
+    )
+    .expect("write re-login");
+    assert!(!sync_credentials_unlocked(&link_path, &canonical).expect("sync"));
+    assert_eq!(
+        fs::read(&canonical).expect("read"),
+        token.to_vec(),
+        "a re-login syncs nothing"
+    );
+}
+
+// ── the refresh chain: the copy-back never rewinds onto a spent token ────────
+
+const CHAIN_P1: &[u8] =
+    br#"{"claudeAiOauth":{"accessToken":"at-old","refreshToken":"rt-old","expiresAt":1000}}"#;
+const CHAIN_P2: &[u8] =
+    br#"{"claudeAiOauth":{"accessToken":"at-new","refreshToken":"rt-new","expiresAt":2000}}"#;
+
+/// A store dir holding P2 as canonical, a runtime copy holding P1 written
+/// later, and a spent record beside the store naming P1 (fp("rt-old"),
+/// hand-computed: the first 8 bytes of its SHA-256, hex).
+fn chain_rewind_fixture(tmp: &Path) -> (PathBuf, PathBuf) {
+    let canonical = tmp.join("credentials.json");
+    let runtime = tmp.join(".credentials.json");
+    fs::write(&canonical, CHAIN_P2).expect("write canonical");
+    fs::write(&runtime, CHAIN_P1).expect("write runtime");
+    fs::write(tmp.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    set_mtime(&canonical, SystemTime::now() - Duration::from_secs(60));
+    set_mtime(&runtime, SystemTime::now());
+    (canonical, runtime)
+}
+
+/// C8: P2 persisted; a fake-mode runtime copy still holding the spent P1 is
+/// newer. The mirror leaves canonical on P2 and hands the session P2 back.
+#[test]
+fn the_fake_mode_mirror_never_copies_a_spent_runtime_login_over_canonical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (canonical, runtime) = chain_rewind_fixture(tmp.path());
+
+    let wrote = mirror_credentials(&runtime, &canonical).expect("mirror");
+
+    assert!(!wrote, "nothing was copied into the store");
+    assert_eq!(fs::read(&canonical).expect("read"), CHAIN_P2);
+    assert_eq!(fs::read(&runtime).expect("read"), CHAIN_P2);
+}
+
+/// §G's real-mode twin: the watchdog drain keeps canonical over a newer runtime
+/// file whose refresh token is spent, and relinks the session onto it.
+#[test]
+fn the_real_mode_drain_never_copies_a_spent_runtime_login_over_canonical() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (canonical, runtime) = chain_rewind_fixture(tmp.path());
+
+    let wrote = sync_credentials_unlocked(&runtime, &canonical).expect("drain");
+
+    assert!(!wrote);
+    assert_eq!(fs::read(&canonical).expect("read"), CHAIN_P2);
+    assert!(
+        runtime
+            .symlink_metadata()
+            .expect("link")
+            .file_type()
+            .is_symlink(),
+        "the session reads canonical again"
+    );
+}
+
+/// The chain-rewind fixture with an UNREADABLE record (a directory at its path):
+/// whether the runtime login is spent is unknown.
+fn chain_unknown_fixture(tmp: &Path) -> (PathBuf, PathBuf) {
+    let paths = chain_rewind_fixture(tmp);
+    fs::remove_file(tmp.join("auth.spent.json")).expect("drop the record");
+    fs::create_dir(tmp.join("auth.spent.json")).expect("block the record");
+    paths
+}
+
+/// An unreadable record beside the store can neither vouch for the runtime
+/// login nor condemn it, so the drain writes neither side: canonical stays, and
+/// the session keeps its own file rather than being relinked away from what may
+/// be the chain head.
+#[test]
+fn the_real_mode_drain_keeps_both_sides_when_the_record_is_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (canonical, runtime) = chain_unknown_fixture(tmp.path());
+
+    let wrote = sync_credentials_unlocked(&runtime, &canonical).expect("drain");
+
+    assert!(!wrote);
+    assert_eq!(fs::read(&canonical).expect("read"), CHAIN_P2);
+    assert!(
+        !runtime
+            .symlink_metadata()
+            .expect("runtime file")
+            .file_type()
+            .is_symlink(),
+        "the session's own file is not relinked away"
+    );
+    assert_eq!(fs::read(&runtime).expect("read"), CHAIN_P1);
+}
+
+/// The fake-mode twin: neither side is copied over the other.
+#[test]
+fn the_fake_mode_mirror_keeps_both_sides_when_the_record_is_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (canonical, runtime) = chain_unknown_fixture(tmp.path());
+
+    let wrote = mirror_credentials(&runtime, &canonical).expect("mirror");
+
+    assert!(!wrote);
+    assert_eq!(fs::read(&canonical).expect("read"), CHAIN_P2);
+    assert_eq!(fs::read(&runtime).expect("read"), CHAIN_P1);
+}
+
+/// The macOS Keychain carry's spent gate, on every platform: an unspent item
+/// login is written, a spent one keeps the store, and an unreadable record
+/// refuses the carry so the swap stays inert rather than overwriting the item.
+#[test]
+fn the_session_item_carry_refuses_while_the_record_is_unreadable() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (canonical, _) = chain_rewind_fixture(tmp.path());
+    let item: ClaudeCredentials = serde_json::from_slice(CHAIN_P1).expect("parse P1");
+    let record = tmp.path().join("auth.spent.json");
+
+    assert!(!crate::claude::session_item_carry_gate(&canonical, &item).expect("spent"));
+    fs::write(&record, "[]").expect("an empty record");
+    assert!(crate::claude::session_item_carry_gate(&canonical, &item).expect("unspent"));
+    fs::remove_file(&record).expect("drop the record");
+    fs::create_dir(&record).expect("block the record");
+    let err = crate::claude::session_item_carry_gate(&canonical, &item)
+        .expect_err("an unknown record refuses the carry");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "cannot read the spent-token record beside {}, so whether the per-session Keychain \
+             item's refresh token was already consumed is unknown: the item is left as it is; \
+             check permissions on ~/.clauth",
+            canonical.display()
+        )
+    );
+}
+
+/// A profile whose store holds the spent `rt-old`, a live stage over it holding
+/// `rt-mid`, and the record naming `rt-old`.
+fn staged_profile(name: &str) -> crate::profile::Profile {
+    let mut profile = make_profile(name);
+    profile.credentials = Some(serde_json::from_slice(CHAIN_P1).expect("parse the fixture login"));
+    register_profile(&profile);
+    let dir = crate::profile::profile_dir(&profile.name).expect("dir");
+    fs::write(
+        dir.join("credentials.json.staged"),
+        r#"{"base":"068bfce5d78d07ac","base_access":"at-old",
+            "creds":{"claudeAiOauth":{"accessToken":"at-mid","refreshToken":"rt-mid"}}}"#,
+    )
+    .expect("write the stage");
+    fs::write(dir.join("auth.spent.json"), r#"["068bfce5d78d07ac"]"#).expect("record P1");
+    profile
+}
+
+fn stored_refresh_of(name: &str) -> Option<String> {
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir");
+    let creds: crate::profile::ClaudeCredentials =
+        crate::profile::read_json_file(&dir.join("credentials.json")).expect("store");
+    creds.refresh_token().map(str::to_string)
+}
+
+/// C22: a session start lands a live stage before it builds its tree, so the
+/// session's first store read is the chain head.
+#[test]
+fn a_session_start_lands_a_live_stage_before_its_tree_reads_the_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a linked session store") {
+            return;
+        }
+        fake_claude_home(tmp.path());
+        let profile = staged_profile("chain-start");
+
+        let rt = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+
+        assert_eq!(stored_refresh_of("chain-start").as_deref(), Some("rt-mid"));
+        let seen: crate::profile::ClaudeCredentials =
+            crate::profile::read_json_file(&rt.config_dir().join(".credentials.json"))
+                .expect("the session's credentials");
+        assert_eq!(seen.refresh_token(), Some("rt-mid"));
+        let dir = crate::profile::profile_dir(&profile.name).expect("dir");
+        assert!(!dir.join("credentials.json.staged").exists());
+    });
+}
+
+/// C27 (start): a live stage whose landing cannot complete refuses the start as
+/// Transient before any tree is built from the lagging store. The flock is
+/// FREE here, so the start's own state-flock hold would succeed: only the
+/// refusal stands between the start and a tree seeded from `rt-old`. The land
+/// fails because the record beside a store still bound to the stage cannot be
+/// read (`Unjudgeable`).
+#[test]
+fn a_session_start_refuses_while_a_live_stage_cannot_land() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        fake_claude_home(tmp.path());
+        let profile = staged_profile("chain-start-wedge");
+        let profile_dir = crate::profile::profile_dir(&profile.name).expect("dir");
+        fs::remove_file(profile_dir.join("auth.spent.json")).expect("drop the record");
+        fs::create_dir(profile_dir.join("auth.spent.json")).expect("block the record");
+
+        let err = ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false)
+            .map(|_| ())
+            .expect_err("a failed land refuses the start");
+
+        assert_eq!(
+            err.to_string(),
+            "could not lock 'chain-start-wedge' for a token refresh; check permissions on ~/.clauth"
+        );
+        assert_eq!(
+            stored_refresh_of("chain-start-wedge").as_deref(),
+            Some("rt-old")
+        );
+        assert!(profile_dir.join("credentials.json.staged").exists());
+        assert!(
+            !profile_dir
+                .read_dir()
+                .expect("profile dir")
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with("runtime")),
+            "nothing was seeded from the lagging store"
+        );
+    });
+}
+
+/// A swap onto a member holding a live stage lands it before the repoint, so
+/// the session is handed the chain head, and the stage is gone.
+#[test]
+fn a_swap_lands_the_incoming_members_live_stage_before_it_repoints() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("chain-swap-a");
+        member_store(&launch);
+        let intended = staged_profile("chain-swap-b");
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        assert_eq!(
+            swap.swap_to("chain-swap-b").expect("swap"),
+            SwapOutcome::Swapped
+        );
+
+        assert_eq!(stored_refresh_of("chain-swap-b").as_deref(), Some("rt-mid"));
+        let dir = crate::profile::profile_dir(&intended.name).expect("dir");
+        assert!(!dir.join("credentials.json.staged").exists());
+    });
+}
+
+/// The outgoing member's spent record cannot be read while Claude Code's own
+/// refresh sits in the session's runtime file: the drain cannot judge that
+/// login, so the swap refuses before any link, marker or row moves, and the
+/// file that may hold the member's only live refresh token stays the session's.
+#[test]
+fn a_swap_refuses_while_the_drain_cannot_judge_the_session_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("unjudged-a");
+        let launch_store = member_store(&launch);
+        member_store(&member("unjudged-b"));
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+        let link = swap.runtime.join(".credentials.json");
+        fs::remove_file(&link).expect("drop the link");
+        fs::write(&link, CHAIN_P1).expect("Claude Code's refreshed login");
+        set_mtime(&launch_store, SystemTime::now() - Duration::from_secs(60));
+        let store_before = fs::read(&launch_store).expect("store");
+        fs::create_dir(
+            launch_store
+                .parent()
+                .expect("store dir")
+                .join("auth.spent.json"),
+        )
+        .expect("block the record");
+
+        let outcome = swap.swap_to("unjudged-b").expect("swap");
+
+        assert!(
+            !link
+                .symlink_metadata()
+                .expect("runtime file")
+                .file_type()
+                .is_symlink(),
+            "the session's own file is not relinked away"
+        );
+        assert_eq!(fs::read(&link).expect("runtime file"), CHAIN_P1);
+        assert_eq!(fs::read(&launch_store).expect("store"), store_before);
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member, None, "the row still names no swap");
+        assert!(swap.cell().held.is_empty(), "no marker was claimed");
+        assert_eq!(swap.member(), "unjudged-a");
+        assert_eq!(
+            outcome,
+            SwapOutcome::Refused(SwapRefused::OutgoingRecordUnreadable(
+                "unjudged-a".to_string()
+            ))
+        );
+    });
+}
+
+/// The announced refusal line, read off the log: an unreadable outgoing
+/// record names the session's own member, every other refusal the intended
+/// one.
+#[test]
+fn an_unreadable_outgoing_record_is_announced_against_the_session_member() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("announce-work");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+        let lines = crate::logline::LogLines::new();
+        let capture = lines.capture_here();
+
+        swap.announce_refusal(
+            "announce-home",
+            SwapRefused::OutgoingRecordUnreadable("announce-work".to_string()),
+        );
+        swap.announce_refusal("announce-home", SwapRefused::Disabled);
+        drop(capture);
+
+        assert_eq!(
+            lines.snapshot(),
+            [
+                format!(
+                    "clauth: session {sid} stays on announce-work: cannot read announce-work's \
+                     spent-token record, so the session keeps its own credential copy"
+                ),
+                format!(
+                    "clauth: session {sid} stays on announce-work: announce-home is not \
+                     swappable (it is disabled)"
+                ),
+            ]
+        );
+    });
 }

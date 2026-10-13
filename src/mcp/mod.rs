@@ -561,7 +561,7 @@ fn fold_active_live_usage(
 /// [`delegate_call_endpoint`] layers the caller's own `env` override on top;
 /// a caller wanting one answer for the whole call starts there. Name-keyed
 /// rather than threaded from a resolved `Profile`, because `load_profile`
-/// recovers a staged rotation under the cross-process state flock
+/// recovers a legacy `.pending` rotation sidecar under the cross-process state flock
 /// (`rank::State`, 500), a serialization point no fold path should sit
 /// inside.
 fn target_endpoint(name: &ProfileName) -> Option<String> {
@@ -3531,8 +3531,9 @@ fn delegate_session_id(resume: Option<&str>) -> std::result::Result<String, Stri
 
 /// Compose a delegate's environment on `command`: drop inherited provider
 /// routing + the outgoing activation's custom env keys
-/// ([`crate::runtime::scrub_profile_env`]), layer the caller's `env`, then
-/// clauth's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
+/// ([`crate::runtime::scrub_profile_env`]), clauth's harness homes and the
+/// pane's herdr session ([`crate::herdr::strip_session_env`]), layer the
+/// caller's `env`, then clauth's own keys which always win. `CLAUDE_CONFIG_DIR`, the depth guard
 /// and the delegate session id can't be overridden, and
 /// `CLAUDE_CODE_MAX_OUTPUT_TOKENS` only defaults when the caller didn't set
 /// it.
@@ -3548,6 +3549,7 @@ fn apply_delegate_env(
     // aligned with `start`'s (same scrub, same home pin).
     let engine: &dyn crate::harness::HarnessEngine = &crate::harness::ClaudeEngine;
     engine.scrub_env(command, stale_env_keys);
+    crate::herdr::strip_session_env(command);
     command.envs(caller_env);
     if !caller_env.contains_key("CLAUDE_CODE_MAX_OUTPUT_TOKENS") {
         command.env("CLAUDE_CODE_MAX_OUTPUT_TOKENS", DEFAULT_MAX_OUTPUT_TOKENS);
@@ -4447,13 +4449,15 @@ struct MintSpec {
     origin: DelegateOrigin,
 }
 
-/// Where a delegate runs and whose session asked for it: the two facts a job
+/// Where a delegate runs and whose session asked for it: the facts a job
 /// record carries so the Services tab can say where each delegate works and
-/// who spawned it.
+/// who spawned it, and the context note can count its own conversation's.
 #[derive(Debug, Clone, Default)]
 struct DelegateOrigin {
     cwd: Option<String>,
     spawned_by: Option<String>,
+    host_session: Option<String>,
+    host_pid: u32,
 }
 
 impl DelegateOrigin {
@@ -4463,7 +4467,8 @@ impl DelegateOrigin {
     /// a resume whose workspace does not resolve falls through to the caller's
     /// `cwd`, since `run_delegate` refuses that run anyway. The account is whichever profile
     /// owns this server's session credentials (`which::resolve_active`, the
-    /// `which` tool's own answer).
+    /// `which` tool's own answer). The host is the process that spawned this
+    /// server and the conversation it is in at this call ([`host_session`]).
     fn resolve(config: &AppConfig, resume: Option<&str>, cwd: Option<&str>) -> Self {
         let workspace = resume.and_then(|id| resolve_resume_workspace(id).ok());
         Self {
@@ -4471,8 +4476,97 @@ impl DelegateOrigin {
                 .and_then(|dir| std::path::absolute(dir).ok())
                 .map(|dir| dir.to_string_lossy().into_owned()),
             spawned_by: crate::which::resolve_active(config).map(|(name, _)| name),
+            host_session: host_session(host_pid()),
+            host_pid: host_pid(),
         }
     }
+}
+
+/// The conversation the host process `pid` is in now: its Claude Code session
+/// record's `sessionId`, which a `/clear` moves while this server's
+/// `CLAUDE_CODE_SESSION_ID` keeps the startup id. The env id is the fallback
+/// where no record answers for `pid`, and its absence (a server launched
+/// outside Claude Code) stamps nothing, so a stale record a reused pid left
+/// behind is never read for a server Claude Code did not start.
+fn host_session(pid: u32) -> Option<String> {
+    let started_under = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|id| !id.is_empty())?;
+    let sessions = crate::which::session_config_dir_or_global().map(|dir| dir.join("sessions"));
+    Some(
+        sessions
+            .and_then(|dir| session_record_id(&dir, pid))
+            .unwrap_or(started_under),
+    )
+}
+
+/// The `sessionId` the Claude Code session record `<pid>.json` in `dir`
+/// carries, when that record names `pid` itself and a non-empty id.
+fn session_record_id(dir: &std::path::Path, pid: u32) -> Option<String> {
+    let path = dir.join(format!("{pid}.json"));
+    // Claude Code rewrites the record in place, so one read can land mid-write
+    // and the stamp is never re-taken: a second read decides.
+    let record = (0..2)
+        .find_map(|_| serde_json::from_slice::<SessionRecord>(&std::fs::read(&path).ok()?).ok())?;
+    (record.pid == pid && !record.session_id.is_empty()).then_some(record.session_id)
+}
+
+/// The fields of a Claude Code session record (`<config dir>/sessions/<pid>.json`)
+/// clauth reads.
+#[derive(serde::Deserialize)]
+struct SessionRecord {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    pid: u32,
+}
+
+/// The `claude` process hosting this server, resolved once ([`serve`] primes
+/// it at startup). On unix it is the server's parent: Claude Code spawns
+/// `clauth mcp` as its own direct child. Elsewhere it is [`session_host_pid`],
+/// which matches only until a `/clear` moves the record's id, hence the
+/// startup resolve.
+static HOST_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+fn host_pid() -> u32 {
+    *HOST_PID.get_or_init(resolve_host_pid)
+}
+
+#[cfg(unix)]
+fn resolve_host_pid() -> u32 {
+    std::os::unix::process::parent_id()
+}
+
+#[cfg(not(unix))]
+fn resolve_host_pid() -> u32 {
+    session_host_pid().unwrap_or(0)
+}
+
+/// The pid of the session record naming this server's
+/// `CLAUDE_CODE_SESSION_ID` in the session's config dir.
+#[cfg(any(not(unix), test))]
+fn session_host_pid() -> Option<u32> {
+    let session_id = std::env::var("CLAUDE_CODE_SESSION_ID")
+        .ok()
+        .filter(|id| !id.is_empty())?;
+    let sessions = crate::which::session_config_dir_or_global()?.join("sessions");
+    session_record_pid(&sessions, &session_id)
+}
+
+/// The pid of the Claude Code session record in `dir` (`<pid>.json`, one per
+/// process) whose `sessionId` is `session_id`, when exactly one names it: a
+/// dead record left behind, or two processes resumed on one id, makes the
+/// answer ambiguous, and a wrong pid would hide this process's delegates.
+#[cfg(any(not(unix), test))]
+fn session_record_pid(dir: &std::path::Path, session_id: &str) -> Option<u32> {
+    let mut matching = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+        .filter_map(|e| std::fs::read(e.path()).ok())
+        .filter_map(|bytes| serde_json::from_slice::<SessionRecord>(&bytes).ok())
+        .filter(|r| r.session_id == session_id);
+    let pid = matching.next()?.pid;
+    matching.next().is_none().then_some(pid)
 }
 
 /// The directory a delegate's `claude` runs in: a resume's recorded workspace,
@@ -4539,6 +4633,8 @@ fn mint_spec(mint: &MintSpec, kind: jobs::RecordKind) -> jobs::RunningSpec {
         isolated: mint.isolation == Isolation::Isolated,
         cwd: mint.origin.cwd.clone(),
         spawned_by: mint.origin.spawned_by.clone(),
+        host_session: mint.origin.host_session.clone(),
+        host_pid: mint.origin.host_pid,
         kind,
         // The owning server's liveness marker, so a later server reads the
         // record dead the moment this one dies — see `jobs::hold_server_marker`.
@@ -5611,6 +5707,7 @@ pub(crate) fn serve() -> Result<()> {
             None
         }
     };
+    let _ = host_pid();
     // The delegate-dot knob, read once at startup from the on-demand config.
     // A missing or unreadable profiles.toml answers the default (dot on), so
     // the knob can never fail the server.

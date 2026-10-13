@@ -1,4 +1,5 @@
 use super::*;
+use crate::profile_cache::write_profile_cache;
 
 // 2026-05-17T14:20:00 UTC == 1779027600 epoch seconds.
 const BASE_UTC: i64 = 1_779_027_600;
@@ -120,14 +121,403 @@ fn spent_resume_in_secs_takes_the_latest_maxed_reset() {
     assert_eq!(spent_resume_in_secs(&below, now), None);
 }
 
+/// The `/profile` read asks about the STORED login: after an install replaced
+/// the login, the fetcher's in-memory token is stale, so the read is sent with
+/// the stored token (spend-free) and re-anchors to the new account.
 #[test]
-fn identity_anchor_backfills_only_when_missing() {
+fn a_profile_read_asks_about_the_stored_login() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("p2");
+    crate::testutil::register_names(&["p2"]);
+    let tok = |a: &str| crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: a.to_string(),
+            refresh_token: Some(format!("{a}-rt")),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    };
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(tok("at-a"));
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("u-a".to_string())),
+    );
+    let mut state = crate::profile::load_app_state().expect("state");
+    state.active_profile = Some("someone-else".into());
+    let mut config = crate::profile::AppConfig {
+        state,
+        profiles: vec![profile],
+    };
+    crate::actions::overwrite_captured_profile(
+        &mut config,
+        &name,
+        crate::actions::CaptureSnapshot {
+            credentials: Some(tok("at-b")),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+        },
+    )
+    .expect("install b with no proven uuid");
+    assert_eq!(
+        load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
+        None,
+        "precondition: the unproven install removed the anchor"
+    );
+
+    // The fetcher still holds at-a; the read must send the STORED at-b and
+    // re-anchor to u-b (the account at-b authenticates as).
+    let (base, handle) = serve_endpoints_raw(1, |_path, _i| {
+        (200, r#"{"account":{"uuid":"u-b"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    let seen = handle.join().expect("join stub");
+    let bearer = seen
+        .iter()
+        .find_map(|r| crate::testutil::request_header(r, "authorization"));
+    assert_eq!(
+        bearer.as_deref(),
+        Some("Bearer at-b"),
+        "the /profile read is sent with the stored token, not the fetcher's stale one"
+    );
+    assert_eq!(
+        load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE).as_deref(),
+        Some("u-b"),
+        "the read re-anchors to the new account"
+    );
+}
+
+/// A replacement that changes the uuid is logged with both values (`{:?}` each).
+#[test]
+fn a_differing_account_replacement_logs_both_values() {
+    use crate::profile_cache::load_profile_cache;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("acme"));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-acme".to_string(),
+            refresh_token: Some("rt-acme".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        Some(&crate::profile::AccountId::from("uuid-live".to_string())),
+    );
+
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    reconcile_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        "at-acme",
+        &raw_profile(Some("uuid-later")),
+    );
+    assert_eq!(
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            crate::profile_cache::ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
+        Some("uuid-later"),
+        "precondition: the replacement landed"
+    );
+    assert_eq!(
+        sink.snapshot(),
+        vec![
+            "clauth: acme: identity anchor AccountId(\"uuid-live\") -> AccountId(\"uuid-later\")"
+                .to_string()
+        ],
+        "a differing-account replacement logs both values"
+    );
+}
+
+/// A first fill (no prior anchor) logs nothing — the replacement line names two
+/// values and must not fire when there was no old value.
+#[test]
+fn a_first_fill_logs_no_replacement_line() {
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("acme"));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-acme".to_string(),
+            refresh_token: Some("rt-acme".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    reconcile_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        "at-acme",
+        &raw_profile(Some("uuid-live")),
+    );
+    assert!(
+        sink.snapshot().is_empty(),
+        "a first fill logs no replacement line"
+    );
+}
+
+/// A failed anchor write logs its failure line alone, never a replacement line
+/// for a transition that did not land.
+/// A store that moves MID-read is refused by the production ride-along's
+/// stored-token guard: a concurrent install rewrites `credentials.json` and drops
+/// the anchor while the `/profile` round trip is in flight, so the body (for the
+/// displaced token) must write no anchor and stamp no tier.
+#[test]
+fn a_store_moved_mid_read_writes_no_anchor() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("midread");
+    crate::testutil::register_names(&["midread"]);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-a".to_string(),
+            refresh_token: Some("rt-a".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    let (base, handle) = serve_endpoints_raw(1, move |_path, _i| {
+        let mut b = serde_json::json!({"claudeAiOauth": {}});
+        b["claudeAiOauth"]["accessToken"] = "at-b".into();
+        b["claudeAiOauth"]["refreshToken"] = "rt-b".into();
+        std::fs::write(
+            dir.join("credentials.json"),
+            serde_json::to_vec(&b).expect("creds json"),
+        )
+        .expect("install b mid-read");
+        let _ = std::fs::remove_file(dir.join(ACCOUNT_ID_CACHE_FILE));
+        (200, r#"{"account":{"uuid":"uuid-a"}}"#.to_string())
+    });
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    handle.join().expect("join stub");
+    assert_eq!(
+        load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
+        None,
+        "a body for a token the store no longer holds writes nothing"
+    );
+}
+
+/// A failed anchor write (the off-roster skip, the same `!landed` branch an
+/// ENOSPC takes) leaves the profile UNANCHORED, never on the displaced account:
+/// the removal runs before the write, so a removable old anchor is gone even when
+/// the new write fails, and the log is exactly the failure line.
+#[test]
+fn a_failed_reconcile_write_leaves_no_displaced_anchor() {
+    use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("offroster");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-off".to_string(),
+            refresh_token: Some("rt-off".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save");
+    let dir = crate::profile::profile_dir(&name).expect("dir");
+    std::fs::write(dir.join(ACCOUNT_ID_CACHE_FILE), br#""uuid-displaced""#).expect("seed anchor");
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    reconcile_identity_anchor(&name, "at-off", &raw_profile(Some("uuid-new")));
+    assert_eq!(
+        load_profile_cache::<String>(&name, ACCOUNT_ID_CACHE_FILE),
+        None,
+        "a failed write leaves the profile unanchored, never on the displaced account"
+    );
+    assert_eq!(
+        sink.snapshot(),
+        vec!["clauth: offroster: could not write the identity anchor".to_string()],
+        "the failed write logs its failure line alone"
+    );
+}
+
+/// A failed anchor write (both the removal and the write fail on a read-only
+/// dir) logs the failure line, never a replacement line for a transition that
+/// did not land.
+#[cfg(unix)]
+#[test]
+fn a_failed_reconcile_write_logs_only_the_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("acme"));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-acme".to_string(),
+            refresh_token: Some("rt-acme".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        Some(&crate::profile::AccountId::from("uuid-live".to_string())),
+    );
+    let dir = crate::profile::profile_dir(&crate::profile::ProfileName::from("acme"))
+        .expect("profile dir");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("ro");
+
+    let sink = crate::logline::LogLines::new();
+    let _capture = sink.capture_here();
+    reconcile_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        "at-acme",
+        &raw_profile(Some("uuid-later")),
+    );
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("rw");
+    assert_eq!(
+        sink.snapshot(),
+        vec![
+            "clauth: acme: could not remove its account_id.json cache: Permission denied \
+             (os error 13)"
+                .to_string(),
+            "clauth: acme: could not write the identity anchor".to_string(),
+        ],
+        "a failed write logs its failure line, never a replacement line"
+    );
+}
+
+/// A body for the SAME account writes nothing: the anchor file is not rewritten
+/// (inode kept), so a same-account read never churns the anchor.
+#[cfg(unix)]
+#[test]
+fn a_same_account_read_leaves_the_anchor_file_untouched() {
+    use std::os::unix::fs::MetadataExt;
+    let _home = crate::testutil::HomeSandbox::new();
+    crate::testutil::register_names(&["acme"]);
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("acme"));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-acme".to_string(),
+            refresh_token: Some("rt-acme".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::usage::seed_login_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+    let anchor_path = crate::profile::profile_subpath(
+        &crate::profile::ProfileName::from("acme"),
+        crate::profile_cache::ACCOUNT_ID_CACHE_FILE,
+    )
+    .expect("anchor path");
+    let ino_before = std::fs::metadata(&anchor_path).expect("anchor meta").ino();
+
+    reconcile_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        "at-acme",
+        &raw_profile(Some("uuid-a")),
+    );
+
+    assert_eq!(
+        std::fs::metadata(&anchor_path).expect("anchor meta").ino(),
+        ino_before,
+        "a same-account read writes nothing"
+    );
+}
+
+/// A failed `/profile` read (the HTTP leg) changes nothing: the reconcile never
+/// runs, so the anchor is kept and retried at the next refresh.
+#[test]
+fn a_failed_profile_read_keeps_the_anchor() {
+    use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("failed-read");
+    crate::testutil::register_names(&["failed-read"]);
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-a".to_string(),
+            refresh_token: Some("rt-a".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
+    crate::usage::seed_login_anchor(
+        &name,
+        Some(&crate::profile::AccountId::from("uuid-a".to_string())),
+    );
+
+    let (base, handle) = serve_endpoints_raw(1, |_p, _i| (500, String::new()));
+    let _sandbox = EndpointSandbox::new(&_home, &base);
+    let _ = fetch_profile_plan(&name, "at-a", true, None);
+    handle.join().expect("join stub");
+
+    assert_eq!(
+        load_profile_cache::<String>(&name, crate::profile_cache::ACCOUNT_ID_CACHE_FILE).as_deref(),
+        Some("uuid-a"),
+        "a failed /profile read keeps the anchor"
+    );
+}
+
+#[test]
+fn identity_anchor_reconciles_the_stored_logins_account() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["acme"]);
+    // The reconcile only writes while the token the body answered for is still
+    // the stored one, so the test stores that token first.
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("acme"));
+    profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at-acme".to_string(),
+            refresh_token: Some("rt-acme".to_string()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    crate::profile::save_profile(&profile).expect("save profile");
 
-    seed_identity_anchor(
+    reconcile_identity_anchor(
         &crate::profile::ProfileName::from("acme"),
+        "at-acme",
         &raw_profile(Some("uuid-live")),
     );
     assert_eq!(
@@ -137,13 +527,14 @@ fn identity_anchor_backfills_only_when_missing() {
         )
         .as_deref(),
         Some("uuid-live"),
-        "missing anchor is seeded from the parsed /profile response"
+        "a missing anchor is written from the parsed /profile response"
     );
 
-    // An existing anchor is authoritative (login re-seeds it; the ride-along
-    // must never churn it).
-    seed_identity_anchor(
+    // A body whose account DIFFERS from the anchor replaces it — the read is
+    // the authority and repairs a wrong anchor.
+    reconcile_identity_anchor(
         &crate::profile::ProfileName::from("acme"),
+        "at-acme",
         &raw_profile(Some("uuid-later")),
     );
     assert_eq!(
@@ -152,8 +543,24 @@ fn identity_anchor_backfills_only_when_missing() {
             ACCOUNT_ID_CACHE_FILE
         )
         .as_deref(),
-        Some("uuid-live"),
-        "a present anchor is never overwritten by the ride-along"
+        Some("uuid-later"),
+        "a differing account replaces the anchor"
+    );
+
+    // A body for the SAME account writes nothing.
+    reconcile_identity_anchor(
+        &crate::profile::ProfileName::from("acme"),
+        "at-acme",
+        &raw_profile(Some("uuid-later")),
+    );
+    assert_eq!(
+        load_profile_cache::<String>(
+            &crate::profile::ProfileName::from("acme"),
+            ACCOUNT_ID_CACHE_FILE
+        )
+        .as_deref(),
+        Some("uuid-later"),
+        "a same-account read writes nothing"
     );
 }
 
@@ -238,12 +645,12 @@ fn the_poll_backfills_the_tier_through_the_profile_leg() {
     }
 }
 
-/// A failed backfill never fails the fetch: a corrupt store (a hand-edit, a
-/// foreign writer) makes the stamp read fail, the leg logs and still hands
-/// back the plan — the store bytes are left as they were for the operator's
-/// own recovery.
+/// A corrupt store (a hand-edit, a foreign writer) makes the ride-along's
+/// stored-token guard refuse, so no backfill write is attempted — the leg still
+/// hands back the plan, and the store bytes are left as they were for the
+/// operator's own recovery.
 #[test]
-fn a_failed_backfill_never_fails_the_profile_leg() {
+fn a_corrupt_store_refuses_the_ride_along_without_failing_the_fetch() {
     use crate::testutil::{EndpointSandbox, serve_endpoints_raw};
     let _home = crate::testutil::HomeSandbox::new();
     let name = "feed-corrupt";
@@ -280,7 +687,7 @@ fn a_failed_backfill_never_fails_the_profile_leg() {
     let plan = fetch_profile_plan(&name, "at-poll", true, None).expect("the /profile leg parses");
     assert!(
         matches!(plan.tier, PlanTier::Team),
-        "a failed stamp never fails the fetch"
+        "a corrupt store never fails the fetch"
     );
     assert_eq!(
         std::fs::read(&cred_path).expect("read store"),
@@ -295,12 +702,14 @@ fn identity_anchor_refuses_blank_or_absent_uuid() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
 
-    seed_identity_anchor(
+    reconcile_identity_anchor(
         &crate::profile::ProfileName::from("acme"),
+        "unused",
         &raw_profile(None),
     );
-    seed_identity_anchor(
+    reconcile_identity_anchor(
         &crate::profile::ProfileName::from("acme"),
+        "unused",
         &raw_profile(Some("  ")),
     );
     assert_eq!(
@@ -479,7 +888,7 @@ fn a_login_anchor_overwrites_the_previous_account() {
 }
 
 #[test]
-fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
+fn a_login_with_no_proven_uuid_removes_the_anchor() {
     use crate::profile_cache::{ACCOUNT_ID_CACHE_FILE, load_profile_cache};
     let _home = crate::testutil::HomeSandbox::new();
     crate::testutil::register_names(&["acme"]);
@@ -499,7 +908,9 @@ fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
         "no anchor may be minted from an absent or blank uuid"
     );
 
-    // …and must never wipe a good one either.
+    // …and it removes a good one too: an install with no proven uuid must not
+    // leave the old account's anchor vouching for the new login. The next
+    // `/profile` read backfills it from the new login's own body.
     seed_login_anchor(
         &crate::profile::ProfileName::from("acme"),
         Some(&crate::profile::AccountId::from("uuid-good".to_string())),
@@ -509,10 +920,9 @@ fn a_login_anchor_write_ignores_an_absent_or_blank_uuid() {
         load_profile_cache::<String>(
             &crate::profile::ProfileName::from("acme"),
             ACCOUNT_ID_CACHE_FILE
-        )
-        .as_deref(),
-        Some("uuid-good"),
-        "a probe failure leaves the existing anchor intact"
+        ),
+        None,
+        "a login with no proven uuid removes the existing anchor"
     );
 }
 
@@ -573,6 +983,82 @@ fn plan_from_profile_reads_tier_and_canceled_status() {
     );
 }
 
+/// `/profile`'s `account.email` (the field Claude Code's own profile fetch maps
+/// to its `emailAddress`) caches inside the plan, trimmed and paired with the
+/// same body's `account.uuid`; a blank, null or absent value on either side is
+/// shape drift, never an address, and caches as none.
+#[test]
+fn plan_from_profile_caches_the_account_email_blank_filtered() {
+    let pair = |address: &str, account: &str| {
+        Some(AccountEmail {
+            address: address.to_string(),
+            account: crate::profile::AccountId::from(account),
+        })
+    };
+    let cases = [
+        (
+            r#"{"account":{"uuid":"u-1","email":"cloudy@example.com"}}"#,
+            pair("cloudy@example.com", "u-1"),
+            "a plain address",
+        ),
+        (
+            r#"{"account":{"uuid":" u-1 ","email":"  cloudy@example.com \n"}}"#,
+            pair("cloudy@example.com", "u-1"),
+            "padded values trim",
+        ),
+        (
+            r#"{"account":{"uuid":"u-1","email":"   "}}"#,
+            None,
+            "a blank address",
+        ),
+        (
+            r#"{"account":{"uuid":"u-1","email":""}}"#,
+            None,
+            "an empty address",
+        ),
+        (
+            r#"{"account":{"uuid":"u-1","email":null}}"#,
+            None,
+            "a null address",
+        ),
+        (r#"{"account":{"uuid":"u-1"}}"#, None, "no email field"),
+        (
+            r#"{"account":{"email":"cloudy@example.com"}}"#,
+            None,
+            "no uuid to pair it with",
+        ),
+        (
+            r#"{"account":{"uuid":"  ","email":"cloudy@example.com"}}"#,
+            None,
+            "a blank uuid",
+        ),
+        ("{}", None, "no account object"),
+    ];
+    for (body, expected, case) in cases {
+        let profile: RawProfile = serde_json::from_str(body).expect("fixture parses");
+        assert_eq!(plan_from_profile(&profile).email, expected, "{case}");
+    }
+}
+
+/// A plan with no email writes no `email` key, so the usage cache and history
+/// lines of an account `/profile` reports no address for keep the shape they
+/// had before the field existed; a cache written before it parses as none.
+#[test]
+fn a_plan_without_an_email_keeps_its_cache_shape() {
+    let plan = PlanInfo {
+        tier: PlanTier::Pro,
+        ..PlanInfo::default()
+    };
+    assert_eq!(
+        serde_json::to_string(&plan).expect("plan serializes"),
+        r#"{"tier":"Pro"}"#,
+        "no email key on a plan without one"
+    );
+    let old: PlanInfo = serde_json::from_str(r#"{"tier":"Pro","subscription_status":"active"}"#)
+        .expect("a pre-email cache parses");
+    assert_eq!(old.email, None, "a pre-email cache carries no address");
+}
+
 /// The load-bearing decouple: when `/usage` 429s, `assemble_usage` STILL runs the
 /// `/profile` leg and the error carries the FRESHLY observed plan — never the
 /// stale prior one. Without this a canceled account (whose `/usage` 429s forever)
@@ -584,11 +1070,13 @@ fn a_usage_429_still_surfaces_a_freshly_fetched_plan() {
         tier: PlanTier::Pro,
         subscription_status: None,
         codex_plan: None,
+        email: None,
     };
     let canceled = PlanInfo {
         tier: PlanTier::Free,
         subscription_status: Some("canceled".to_string()),
         codex_plan: None,
+        email: None,
     };
 
     // /profile observed canceled this tick → the 429 carries canceled, not Pro.
@@ -1291,7 +1779,7 @@ fn a_durable_stamp_past_the_ttl_still_re_pulls() {
 fn an_unanchored_profile_ignores_the_durable_stamp() {
     let _home = crate::testutil::HomeSandbox::new();
     let t0 = 1_000_000_000_000u64;
-    // No `anchor()` — `seed_identity_anchor`'s backfill rides the /profile body,
+    // No `anchor()` — `reconcile_identity_anchor`'s write rides the /profile body,
     // and deferring it by an hour is exactly what wedges an unanchored profile in
     // `auth_broken` once its stored pair dies.
     assert!(take_profile_fetch(
@@ -1314,7 +1802,7 @@ fn an_unanchored_profile_ignores_the_durable_stamp() {
 fn a_blank_anchor_counts_as_absent_for_the_durable_stamp() {
     let _home = crate::testutil::HomeSandbox::new();
     let t0 = 1_000_000_000_000u64;
-    // Shape drift, not an identity — same contract as `seed_identity_anchor`.
+    // Shape drift, not an identity — same contract as `reconcile_identity_anchor`.
     write_profile_cache(
         &crate::profile::ProfileName::from("ttl-blank-anchor"),
         ACCOUNT_ID_CACHE_FILE,
@@ -1485,8 +1973,30 @@ fn a_stamp_in_the_future_is_not_freshness() {
     );
 }
 
+/// Ruling 3 outcome (b): a durable stamp ANOTHER process wrote (an attempt) never
+/// forces this process to fetch again within the TTL — the memo-hit re-checks the
+/// stamp's presence, not its value.
 #[test]
-fn the_durable_stamp_is_read_at_most_once_per_process() {
+fn a_foreign_durable_stamp_does_not_force_a_refetch() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let t0 = 1_000_000_000_000u64;
+    let name = crate::profile::ProfileName::from("cb");
+    anchor("cb");
+    assert!(take_profile_fetch(&name, false, t0));
+    // Another process attempted /profile and wrote a different stamp value.
+    write_profile_cache(
+        &name,
+        crate::profile_cache::PROFILE_FETCHED_CACHE_FILE,
+        &(t0 + 30_000u64),
+    );
+    assert!(
+        !take_profile_fetch(&name, false, t0 + 60_000),
+        "a foreign durable stamp value never forces this process to fetch again within the TTL"
+    );
+}
+
+#[test]
+fn a_cross_process_stamp_removal_reads_as_lapsed() {
     let _home = crate::testutil::HomeSandbox::new();
     let t0 = 1_000_000_000_000u64;
     anchor("ttl-memo");
@@ -1506,8 +2016,9 @@ fn the_durable_stamp_is_read_at_most_once_per_process() {
         "the cold map falls back to the durable stamp"
     );
 
-    // Both inputs deleted: a per-tick disk read would now see an unanchored
-    // profile with no stamp and fire.
+    // Both inputs deleted: the memo's durable write landed, so the stamp now
+    // absent (a cross-process install removed it) reads as lapsed and forces ONE
+    // `/profile` pull — the durable stamp alone must not wait the removal out.
     remove_profile_cache(
         &crate::profile::ProfileName::from("ttl-memo"),
         PROFILE_FETCHED_CACHE_FILE,
@@ -1517,12 +2028,23 @@ fn the_durable_stamp_is_read_at_most_once_per_process() {
         ACCOUNT_ID_CACHE_FILE,
     );
     assert!(
-        !take_profile_fetch(
+        take_profile_fetch(
             &crate::profile::ProfileName::from("ttl-memo"),
             false,
             t0 + 120_000
         ),
-        "the memoized stamp answers every later tick — one disk read per profile per process"
+        "a landed durable stamp now absent reads as lapsed"
+    );
+    // That pull re-stamped: the next tick inside the TTL answers from the memo,
+    // so a `/profile` that keeps failing still costs at most one attempt per TTL
+    // per process.
+    assert!(
+        !take_profile_fetch(
+            &crate::profile::ProfileName::from("ttl-memo"),
+            false,
+            t0 + 180_000
+        ),
+        "one forced pull, then the normal TTL applies again"
     );
 }
 

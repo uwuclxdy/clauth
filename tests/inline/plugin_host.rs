@@ -1,6 +1,7 @@
 //! Inline tests for `plugin_host`. No environment needed: these pin the
 //! compile-time wiring (derive metadata, the embedded tree), the committed
-//! SessionStart hook that points at `clauth self-heal`, and the `clauth start`
+//! SessionStart hook that points at `clauth self-heal`, the PostToolUse
+//! await-job hook's matcher and wake summary, and the `clauth start`
 //! pre-flight gate's registry shapes. The lifecycle itself (the real `claude`
 //! CLI as transaction boundary) is pinned hermetically by the fake-claude
 //! install test in `tui_app.rs` and exercised for real in the scratch-profile
@@ -52,19 +53,7 @@ fn the_delegate_hook_names_its_wake_summary_instead_of_the_host_placeholder() {
     let hooks: serde_json::Value =
         serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
             .expect("plugins/hooks/hooks.json parses");
-    let entry = hooks["hooks"]["PostToolUse"]
-        .as_array()
-        .expect("PostToolUse is an array")
-        .iter()
-        .find_map(|group| {
-            group["matcher"]
-                .as_str()
-                .is_some_and(|m| m == "mcp__plugin_clauth_clauth__delegate$")
-                .then(|| group["hooks"].as_array())
-                .flatten()
-        })
-        .and_then(|hooks| hooks.first())
-        .expect("the delegate matcher carries one hook entry");
+    let (_, entry) = await_job_hook(&hooks);
     assert_eq!(
         entry["rewakeSummary"], "clauth delegate results",
         "the manifest names the wake notification instead of the host's placeholder"
@@ -73,6 +62,73 @@ fn the_delegate_hook_names_its_wake_summary_instead_of_the_host_placeholder() {
         entry["rewakeSummary"], "Stop hook feedback",
         "the host's internal placeholder must never be the shipped summary"
     );
+}
+
+/// The `PostToolUse` group and hook entry running `clauth mcp-await-job`,
+/// found by its command so a matcher edit cannot hide them from the tests
+/// pinning them. Counted over every `PostToolUse` entry: a second copy there
+/// would spawn the hook on calls no test covers.
+fn await_job_hook(hooks: &serde_json::Value) -> (&serde_json::Value, &serde_json::Value) {
+    let found: Vec<(&serde_json::Value, &serde_json::Value)> = hooks["hooks"]["PostToolUse"]
+        .as_array()
+        .expect("PostToolUse is an array")
+        .iter()
+        .flat_map(|group| {
+            group["hooks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(move |entry| (group, entry))
+        })
+        .filter(|(_, entry)| entry["command"] == "clauth mcp-await-job")
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one PostToolUse hook runs `clauth mcp-await-job`"
+    );
+    found[0]
+}
+
+/// A session reaches `delegate` under the plugin's server name, or under the
+/// bare `clauth` server name when a user-scope `clauth` MCP server suppresses
+/// the plugin's; a backgrounded result reaches a stopped session unprompted
+/// only through this hook, so the matcher must take both names and nothing
+/// else. The host tests this matcher as an unanchored JS regex, and the
+/// literal is pinned by equality because the `regex` crate stands in for that
+/// engine below: a respelling must first re-establish that both read it alike.
+#[test]
+fn the_await_job_hook_matches_delegate_under_both_server_names() {
+    let hooks: serde_json::Value =
+        serde_json::from_str(include_str!("../../plugins/hooks/hooks.json"))
+            .expect("plugins/hooks/hooks.json parses");
+    let matcher = await_job_hook(&hooks).0["matcher"]
+        .as_str()
+        .expect("the await-job group carries a matcher");
+    assert_eq!(
+        matcher, "^mcp__(plugin_clauth_)?clauth__delegate$",
+        "respelling the await-job matcher: re-check that JS RegExp and the regex crate read it \
+         alike, then update this literal"
+    );
+    let matcher = regex::Regex::new(matcher).expect("the matcher compiles as a regex");
+    for tool in [
+        "mcp__plugin_clauth_clauth__delegate",
+        "mcp__clauth__delegate",
+    ] {
+        assert!(matcher.is_match(tool), "{tool:?} must wake on its result");
+    }
+    for tool in [
+        "mcp__clauth__monitor",
+        "mcp__plugin_clauth_clauth__monitor",
+        "mcp__clauth__profiles",
+        "mcp__clauth__switch_profile",
+        "mcp__clauth__delegates",
+        "mcp__notclauth__delegate",
+        "mcp__plugin_other_clauth__delegate",
+        "mcp__foo_mcp__clauth__delegate",
+    ] {
+        assert!(!matcher.is_match(tool), "{tool:?} must not run the hook");
+    }
 }
 
 /// The SessionStart wiring the self-heal rides on: the committed hooks.json

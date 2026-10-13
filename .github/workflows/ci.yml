@@ -1,17 +1,23 @@
 name: ci
 
+# Docs skip CI, but README.md is a test fixture (`feature_coverage`
+# include_str!s it), so it is re-included; later patterns win.
 on:
   push:
-    branches: [mommy]
-    paths-ignore:
-      - "**/*.md"
-      - wiki/**
-      - docs/**
+    branches: [mommy, dev]
+    paths:
+      - "**"
+      - "!**/*.md"
+      - "README.md"
+      - "!wiki/**"
+      - "!docs/**"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
-      - wiki/**
-      - docs/**
+    paths:
+      - "**"
+      - "!**/*.md"
+      - "README.md"
+      - "!wiki/**"
+      - "!docs/**"
 
 # Least-privilege default: read-only token. A job that needs more (e.g. a docker
 # publish job) opts back up with its own `permissions:` block.
@@ -40,7 +46,8 @@ env:
 
 # A `v*` tag push runs release.yml only, never CI: the `on.push.branches` filter
 # already excludes tag refs, and the per-job `if` keeps checks off tag/release refs
-# even if that trigger is later broadened. PRs (refs/pull/*) and branch pushes run.
+# even if that trigger is later broadened. PRs (refs/pull/*) and pushes to the
+# listed branches run.
 jobs:
   fmt:
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
@@ -88,7 +95,12 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y mold
           echo "RUSTFLAGS=${RUSTFLAGS} -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+      # Only mommy saves: a dev or PR run restores mommy's cache, and saving its
+      # own would store a second copy of every cold compile against the repo's
+      # cache quota.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/mommy' }}
       # nextest's own installer, not the taiki-e action: the shared
       # install-action hygiene guard bails on the mac/windows images' bash
       # startup (the same 2026-09-22 regression as the toolchain action above).

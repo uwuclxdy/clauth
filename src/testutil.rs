@@ -14,6 +14,26 @@ use utoipa::openapi::schema::{
     AdditionalProperties, Array, ArrayItems, Components, Object, Schema, SchemaType, Type,
 };
 
+/// Every `.rs` file under `dir`, recursively: the walk the source-scan tests
+/// share (`out::tests::no_bare_print_macro_under_src`, the Keychain budget
+/// site scan). An unreadable dir yields nothing, so each caller asserts it
+/// read the crate.
+pub(crate) fn rs_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(rs_files(&path));
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+    out
+}
+
 /// RAII home sandbox: acquires `HOME_TEST_LOCK` and redirects `home_dir()` into
 /// a tempdir for its lifetime, clearing the override on drop (even on panic).
 /// Required for any test that writes into the per-profile tree or creates
@@ -25,6 +45,8 @@ pub(crate) struct HomeSandbox {
     _guard: crate::lockorder::RankedGuard<'static, ()>,
     home: PathBuf,
     prev_config_dir: Option<std::ffi::OsString>,
+    prev_session_id: Option<std::ffi::OsString>,
+    prev_claude_pid: Option<std::ffi::OsString>,
 }
 
 impl HomeSandbox {
@@ -40,7 +62,7 @@ impl HomeSandbox {
         let tmp = tempfile::tempdir().expect("create home sandbox");
         let home = tmp.path().to_path_buf();
         crate::profile::set_home_override(home.clone());
-        // `home_override` does not reach `CLAUDE_CONFIG_DIR`, and the operator's
+        // `home_override` does not reach `CLAUDE_CONFIG_DIR`, and the user's
         // own value names a runtime OUTSIDE this tempdir: `which::session_auth`
         // and `which::resolve_active` honor it, so a test run from inside a
         // `clauth start` session resolves the real `~/.claude/.credentials.json`
@@ -51,11 +73,23 @@ impl HomeSandbox {
         let prev_config_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
         // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, restored on drop.
         unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+        // Same for the live Claude Code session the suite may run under: its
+        // session id and process would stamp a minted delegate's host and decide
+        // a hook's own process, passing or failing by where the suite ran.
+        let prev_session_id = std::env::var_os("CLAUDE_CODE_SESSION_ID");
+        let prev_claude_pid = std::env::var_os("CLAUDE_PID");
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("CLAUDE_CODE_SESSION_ID");
+            std::env::remove_var("CLAUDE_PID");
+        }
         Self {
             _tmp: tmp,
             _guard: guard,
             home,
             prev_config_dir,
+            prev_session_id,
+            prev_claude_pid,
         }
     }
 
@@ -73,7 +107,7 @@ impl Drop for HomeSandbox {
     fn drop(&mut self) {
         // Join BEFORE clearing the override, not after and not per-test. A
         // detached worker still running when `HOME_OVERRIDE` clears resolves
-        // the operator's REAL `$HOME` and takes real locks under `~/.clauth`
+        // the user's REAL `$HOME` and takes real locks under `~/.clauth`
         // (`RotationGuard::acquire` alone does `mkdir_700` + a blocking
         // flock). Doing it here rather than asking each test to call the join
         // fns covers the tests that never thought about it — which is every
@@ -84,13 +118,21 @@ impl Drop for HomeSandbox {
         crate::tui::join_test_workers();
         join_background_tasks();
         crate::profile::clear_home_override();
-        // Restore the operator's own value, after the joins above for the same
+        // Restore the user's own value, after the joins above for the same
         // reason the home override is cleared there: a still-running worker that
         // sees it back resolves outside the sandbox.
         // SAFETY: test-only, serialized by `HOME_TEST_LOCK`, still held.
         match self.prev_config_dir.take() {
             Some(prev) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", prev) },
             None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        match self.prev_session_id.take() {
+            Some(prev) => unsafe { std::env::set_var("CLAUDE_CODE_SESSION_ID", prev) },
+            None => unsafe { std::env::remove_var("CLAUDE_CODE_SESSION_ID") },
+        }
+        match self.prev_claude_pid.take() {
+            Some(prev) => unsafe { std::env::set_var("CLAUDE_PID", prev) },
+            None => unsafe { std::env::remove_var("CLAUDE_PID") },
         }
     }
 }
@@ -555,6 +597,24 @@ pub(crate) fn window_exhaustion_429_headers(
     .collect()
 }
 
+/// A listener bound but never accepted, and its `http://127.0.0.1:PORT` base:
+/// a request would queue a connection on it, so `accept` answering
+/// `WouldBlock` afterwards ([`assert_nothing_sent`]) proves nothing was sent —
+/// at once, with no stub deadline to wait out.
+pub(crate) fn deaf_listener() -> (std::net::TcpListener, String) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind");
+    listener.set_nonblocking(true).expect("nonblocking");
+    let port = listener.local_addr().expect("addr").port();
+    (listener, format!("http://127.0.0.1:{port}"))
+}
+
+pub(crate) fn assert_nothing_sent(listener: &std::net::TcpListener) {
+    match listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        other => panic!("a request reached the endpoint: {other:?}"),
+    }
+}
+
 pub(crate) fn rotation_fixture_config(
     name: &crate::profile::ProfileName,
 ) -> crate::profile::ConfigHandle {
@@ -703,7 +763,7 @@ impl<'a> ConfigDirSandbox<'a> {
 /// [`HomeSandbox`] that holds it; dropping the home first is E0505 at compile
 /// time instead of a race nothing checks.
 pub(crate) struct EnvPin<'a> {
-    prevs: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    prevs: Vec<(String, Option<std::ffi::OsString>)>,
     _home: std::marker::PhantomData<&'a HomeSandbox>,
 }
 
@@ -712,10 +772,7 @@ impl<'a> EnvPin<'a> {
         unsafe_code,
         reason = "env mutation is unsafe in Rust 2024; serialized by HOME_TEST_LOCK, held by the borrowed sandbox"
     )]
-    pub(crate) fn new(
-        _home: &'a HomeSandbox,
-        pins: &[(&'static str, Option<&std::ffi::OsStr>)],
-    ) -> Self {
+    pub(crate) fn new(_home: &'a HomeSandbox, pins: &[(&str, Option<&std::ffi::OsStr>)]) -> Self {
         let mut prevs = Vec::with_capacity(pins.len());
         for &(key, value) in pins {
             let prev = std::env::var_os(key);
@@ -726,7 +783,7 @@ impl<'a> EnvPin<'a> {
                     None => std::env::remove_var(key),
                 }
             }
-            prevs.push((key, prev));
+            prevs.push((key.to_string(), prev));
         }
         Self {
             prevs,
@@ -1144,6 +1201,17 @@ pub(crate) fn write_codex_roster(names: &[&str]) {
     write_codex_state(&format!("profiles = [{list}]\n"));
 }
 
+/// Another clauth process inside its state-flock hold: a second open file
+/// description of the lock file, flocked. Call under a [`HomeSandbox`]; drop it
+/// to release.
+pub(crate) fn hold_state_flock() -> std::fs::File {
+    let dir = crate::profile::clauth_dir().expect("clauth dir");
+    let holder = crate::profile::open_state_file(&dir.join(crate::lock::LOCK_FILENAME))
+        .expect("open holder handle");
+    holder.lock().expect("hold the flock");
+    holder
+}
+
 /// A locked handle on `name`'s rotation lock from a separate fd, standing in
 /// for another process mid-rotation (`flock(2)` binds to the open file
 /// description, so this genuinely contends with `try_acquire`'s own). Creates
@@ -1314,6 +1382,45 @@ pub(crate) fn live_row(session_id: &str, profile: &str) -> crate::live_sessions:
     }
 }
 
+/// Write `~/.clauth/status.json` carrying a daemon `gateway` slot in `state`,
+/// so `daemon::gateway_slot(DaemonHealth::Fresh)` reads it.
+pub(crate) fn write_daemon_gateway_slot(
+    home: &HomeSandbox,
+    state: crate::daemon::gateway::GatewayState,
+) {
+    let dir = home.home().join(".clauth");
+    std::fs::create_dir_all(&dir).unwrap();
+    let body = serde_json::json!({
+        "gateway": {
+            "state": state,
+            "floor": "0.48.0",
+            "restarts": 0,
+        }
+    });
+    std::fs::write(dir.join("status.json"), body.to_string()).unwrap();
+}
+
+/// Adopt a `shunt.toml` holding `config_text` into `~/.clauth/gateway.toml`
+/// with `disabled`, returning the record so a caller can delete its config for
+/// the `no_config` verdict.
+pub(crate) fn write_adopted_record(
+    home: &HomeSandbox,
+    disabled: bool,
+    config_text: &str,
+) -> crate::gateway::GatewayRecord {
+    let config = home.home().join("etc").join("shunt.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, config_text).unwrap();
+    let mut record = crate::gateway::GatewayRecord::new(config).unwrap();
+    record.disabled = disabled;
+    crate::gateway::GatewayRecord::update(|slot| {
+        *slot = Some(record.clone());
+        Ok(())
+    })
+    .unwrap();
+    record
+}
+
 /// Overwrite a file's modification time — for cache-staleness / tie-break tests.
 ///
 /// The open retries while Windows reports a sharing violation: an open landing
@@ -1418,6 +1525,74 @@ pub(crate) fn buffer_rows(buf: &ratatui::buffer::Buffer) -> Vec<String> {
     (0..h)
         .map(|y| (0..w).map(|x| buf.content[y * w + x].symbol()).collect())
         .collect()
+}
+
+/// The cells of the first occurrence of `needle` in a rendered buffer, matched
+/// cell by cell (one narrow glyph per cell), so a multibyte glyph earlier on
+/// the row cannot shift the column the way a byte offset would.
+pub(crate) fn needle_cells<'a>(
+    buf: &'a ratatui::buffer::Buffer,
+    needle: &str,
+) -> Option<Vec<&'a ratatui::buffer::Cell>> {
+    let want: Vec<String> = needle.chars().map(String::from).collect();
+    let w = buf.area.width as usize;
+    let h = buf.area.height as usize;
+    (0..h).find_map(|y| {
+        let row = &buf.content[y * w..(y + 1) * w];
+        (0..=w.checked_sub(want.len())?).find_map(|x| {
+            let cells = &row[x..x + want.len()];
+            cells
+                .iter()
+                .zip(&want)
+                .all(|(cell, ch)| cell.symbol() == ch)
+                .then(|| cells.iter().collect())
+        })
+    })
+}
+
+/// `lines` drawn top-down into a `w`-wide buffer one row per line, so a span
+/// builder's output can be read cell by cell like a full frame.
+pub(crate) fn lines_buffer(
+    lines: Vec<ratatui::text::Line<'static>>,
+    w: u16,
+) -> ratatui::buffer::Buffer {
+    use ratatui::widgets::Widget;
+    let h = u16::try_from(lines.len()).unwrap_or(u16::MAX).max(1);
+    let mut buf = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, w, h));
+    ratatui::widgets::Paragraph::new(lines).render(buf.area, &mut buf);
+    buf
+}
+
+/// Asserts how `phrase` renders where its `part` is a key or a typed command
+/// in prose (cloudy-tui "Keys and commands inside prose"): every non-space
+/// cell of `part` is `ACCENT`, bold for a key and not for a command, and no
+/// other non-space cell of `phrase` is `ACCENT`.
+pub(crate) fn assert_prose_part(
+    buf: &ratatui::buffer::Buffer,
+    phrase: &str,
+    part: &str,
+    is_key: bool,
+) {
+    let cells = needle_cells(buf, phrase)
+        .unwrap_or_else(|| panic!("`{phrase}` missing:\n{}", buffer_rows(buf).join("\n")));
+    let at = phrase
+        .find(part)
+        .map(|byte| phrase[..byte].chars().count())
+        .unwrap_or_else(|| panic!("`{part}` is not inside `{phrase}`"));
+    let len = part.chars().count();
+    let accent = crate::tui::theme::accent_color();
+    for (i, cell) in cells.iter().enumerate() {
+        if cell.symbol() == " " {
+            continue;
+        }
+        let bold = cell.modifier.contains(ratatui::style::Modifier::BOLD);
+        if (at..at + len).contains(&i) {
+            assert_eq!(cell.fg, accent, "`{part}` in `{phrase}`: cell {i} fg");
+            assert_eq!(bold, is_key, "`{part}` in `{phrase}`: cell {i} bold");
+        } else {
+            assert_ne!(cell.fg, accent, "`{phrase}` outside `{part}`: cell {i} fg");
+        }
+    }
 }
 
 // A fake `claude` on a PATH prefix whose final-run invocation holds the child
@@ -1998,4 +2173,164 @@ pub(crate) fn heal_env<'a>(
         pins.push((key, Some(*value)));
     }
     EnvPin::new(home, &pins)
+}
+
+/// Pin the pane env a herdr report test drives: `HERDR_PANE_ID` selects the
+/// pane, `HERDR_BIN_PATH` (usually an echo shim) names the binary the report
+/// spawns. Borrows the sandbox: the env is a process-global serialized by
+/// `HOME_TEST_LOCK`, which the sandbox holds.
+#[cfg(unix)]
+pub(crate) fn herdr_pane_env<'a>(
+    home: &'a HomeSandbox,
+    pane: Option<&str>,
+    bin: Option<&Path>,
+) -> EnvPin<'a> {
+    EnvPin::new(
+        home,
+        &[
+            ("HERDR_PANE_ID", pane.map(std::ffi::OsStr::new)),
+            ("HERDR_BIN_PATH", bin.map(Path::as_os_str)),
+        ],
+    )
+}
+
+/// Unset every `SHUNT_*` variable the gateway's client-token and bind reads
+/// take from this process's env: shunt's default tokens variable, the bind
+/// override and every env-layer `[server.auth]` key this process holds, in
+/// whatever case it was exported, so a shell exporting one changes no result. Borrows the sandbox:
+/// the env is a process-global serialized by `HOME_TEST_LOCK`, which the
+/// sandbox holds.
+pub(crate) fn no_shunt_env(home: &HomeSandbox) -> EnvPin<'_> {
+    let auth_keys: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| {
+            crate::gateway::is_auth_env_key(name)
+                || name.eq_ignore_ascii_case(crate::gateway::BIND_ENV)
+        })
+        .collect();
+    let pins: Vec<(&str, Option<&std::ffi::OsStr>)> = std::iter::once("SHUNT_CLIENT_TOKENS")
+        .chain(auth_keys.iter().map(String::as_str))
+        .map(|key| (key, None))
+        .collect();
+    EnvPin::new(home, &pins)
+}
+
+/// Shim that appends its full argv to `report.log` beside itself and exits 0.
+/// `$0` resolves to the shim itself, so the log needs no embedded path; a
+/// report test spawns the shim as `HERDR_BIN_PATH` (or on `PATH`) and reads
+/// the spawned argv back from the log.
+#[cfg(unix)]
+pub(crate) fn echo_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(dir, name, r#"echo "$@" >> "$(dirname "$0")/report.log""#)
+}
+
+/// Same log line, then exit 1: the caller must swallow the failing status.
+#[cfg(unix)]
+pub(crate) fn exit1_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\nexit 1",
+    )
+}
+
+/// herdr's refusal of a resume report it cannot attach yet (no agent detected
+/// in the pane), as its CLI prints it: the whole response on stderr, exit 1.
+#[cfg(unix)]
+const RESUME_NOT_ACCEPTED: &str = r#"echo '{"error":{"code":"resume_not_accepted","message":"resume_argv requires the reporter to hold the pane; report its state with pane.report_agent first"},"id":"cli:request"}' >&2"#;
+
+/// Logs its argv, refuses the first call the way herdr does before it has
+/// detected the pane's agent, and accepts every call after it.
+#[cfg(unix)]
+pub(crate) fn refuse_once_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        &format!(
+            "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\n\
+             if [ ! -e \"$(dirname \"$0\")/refused\" ]; then\n\
+             : > \"$(dirname \"$0\")/refused\"\n{RESUME_NOT_ACCEPTED}\nexit 1\nfi"
+        ),
+    )
+}
+
+/// Logs its argv and answers every call with herdr's error envelope for
+/// `code` on stderr, exit 1.
+#[cfg(unix)]
+pub(crate) fn herdr_error_shim(dir: &Path, name: &str, code: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        &format!(
+            "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\n\
+             echo '{{\"error\":{{\"code\":\"{code}\",\"message\":\"refused\"}},\"id\":\"cli:request\"}}' >&2\n\
+             exit 1"
+        ),
+    )
+}
+
+/// Logs its argv and refuses every call the way herdr does before it has
+/// detected the pane's agent.
+#[cfg(unix)]
+pub(crate) fn refuse_always_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        &format!("echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\n{RESUME_NOT_ACCEPTED}\nexit 1"),
+    )
+}
+
+/// Logs its argv, then sleeps past a bounded caller's kill deadline. `exec` so
+/// the kill takes the whole process.
+#[cfg(unix)]
+pub(crate) fn hang_shim(dir: &Path, name: &str) -> PathBuf {
+    write_shim(
+        dir,
+        name,
+        "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"; exec sleep 30",
+    )
+}
+
+/// Every line the shims in `dir` recorded so far (empty when none).
+#[cfg(unix)]
+pub(crate) fn report_lines(dir: &Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("report.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Poll `report_lines` until at least `want` lines exist or `timeout` elapses.
+#[cfg(unix)]
+pub(crate) fn wait_for_lines(dir: &Path, want: usize, timeout: std::time::Duration) -> Vec<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let lines = report_lines(dir);
+        if lines.len() >= want {
+            return lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "shim log stalled at {} lines (want {want})",
+            lines.len()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The `--seq` value of one recorded report line (the token after the flag).
+#[cfg(unix)]
+pub(crate) fn seq_of(line: &str) -> u64 {
+    let mut tokens = line.split_whitespace();
+    while let Some(token) = tokens.next() {
+        if token == "--seq" {
+            return tokens
+                .next()
+                .expect("seq value")
+                .parse()
+                .expect("seq is numeric");
+        }
+    }
+    panic!("no --seq in report line: {line}");
 }

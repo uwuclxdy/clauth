@@ -84,7 +84,8 @@ pub(crate) struct SessionInfo {
     /// The session id — the transcript filename stem (`<sessionId>.jsonl`), the
     /// id `claude --resume <id>` resolves by. NOT the in-file `sessionId`, which
     /// a resume copy carries forward from its parent. Deliberately not redacted
-    /// (a UUID); only the message previews below are.
+    /// (a filename stem: a uuid, or a nested transcript's `agent-…`); only the
+    /// message previews below are.
     pub(crate) id: String,
     /// The workspace, taken from the transcript line's own `cwd` value — the
     /// authoritative source. The dashed dir-slug under `projects/` is lossy and

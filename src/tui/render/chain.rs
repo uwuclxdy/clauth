@@ -29,11 +29,12 @@ use super::global_config::default_reminder;
 use super::panes::{
     DETAIL_KEY_GUTTER, DETAIL_KEY_W, DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED,
     DIAG_DISABLED, DIAG_KEY_REJECTED, DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT,
-    bold_when, cycle_row_lines, draw_scrolled_lines, draw_selector_list, head_cols,
+    bold_when, cycle_row_lines, draw_scrolled_lines_with_footnote, draw_selector_list, head_cols,
     help_tooltip_lines, highlight_row, invalid_tooltip_lines, key_cell, label_style, master_detail,
     name_color, pill, rail_hint_lines, section_box, section_box_verbatim, select_line, value_caret,
     wrap_words,
 };
+use super::prose::{cmd, key};
 use crate::fallback::{
     BlockedReason, DEFAULT_THRESHOLD, blocked_reason, health_blocked_reason, parse_threshold,
     soonest_resume, spend_is_uncapped, spend_room, threshold_for, uncapped_spend_fix,
@@ -69,93 +70,101 @@ fn draw_chain_selector(
     let kick_lifts = switch_grade_kick_lifts(&app.kick_blocks);
     let cfg = app.config();
     let sel = app.chain_cursor.min(items.len().saturating_sub(1));
-    draw_selector_list(frame, area, "chain", focused, sel, |w| {
-        items
-            .iter()
-            .enumerate()
-            .map(|(row, item)| {
-                let selected = row == sel;
-                let line = match item {
-                    ChainItemKind::Member(i) => {
-                        let name = cfg
-                            .state
-                            .fallback_chain
-                            .get(*i)
-                            .cloned()
-                            .unwrap_or_default();
-                        // `#n` right-aligned in a fixed 3 cells, so `#1` and
-                        // `#10` start their names on the same column. The
-                        // trailing gap absorbs the `#`, keeping the rail the
-                        // same total width it had as a bare number — nothing
-                        // downstream shifts.
-                        let ord = format!("#{}", i + 1);
-                        let rail = if selected && focused {
-                            Span::styled(format!("❯ {ord:>3} "), theme::accent().bold())
-                        } else {
-                            Span::styled(format!("  {ord:>3} "), theme::faint())
-                        };
-                        // A member still sits in `fallback_chain` on disk while
-                        // disabled (only the walk skips it), so it renders as a
-                        // normal row with a dim name; the exclusion itself
-                        // arrives through `blocked_reason`'s `Disabled` arm like
-                        // any other block. It can never be `is_active`, so dim
-                        // always wins over `name_color`.
-                        let disabled = cfg.find(&name).is_some_and(|p| p.is_disabled());
-                        let ns = if disabled {
-                            bold_when(theme::dim(), selected && focused)
-                        } else {
-                            bold_when(name_color(cfg.is_active(&name)), selected && focused)
-                        };
-                        let reason = cfg.find(&name).and_then(|p| {
-                            blocked_reason(
-                                &cfg,
-                                p,
-                                kick_lifts.get(name.as_str()).copied(),
-                                key_rejected,
-                            )
-                        });
-                        let rail_w = rail.width();
-                        let mut spans = vec![rail];
-                        match &reason {
-                            // The 1-cell marker is right-aligned at the row's last
-                            // content column (the scrollbar owns the padding cell
-                            // beyond it, so they never collide), and the name is
-                            // clamped to whatever that leaves. Unclamped, a long
-                            // enough name pushed the marker past the pane and
-                            // ratatui dropped it, so a blocked account rendered
-                            // identically to a healthy one. Only a row that
-                            // actually carries a marker pays the clamp — the name
-                            // column's width therefore tracks blocked state.
-                            Some(reason) => {
-                                let name_w = (w as usize).saturating_sub(rail_w + 2);
-                                let (text, pad) = fixed_split(&name, name_w);
-                                spans.push(Span::styled(text, ns));
-                                spans.push(Span::raw(format!("{pad} ")));
-                                spans.push(reason_marker(reason));
+    draw_selector_list(
+        frame,
+        area,
+        "chain",
+        focused,
+        sel,
+        &app.chain_selector,
+        |w| {
+            items
+                .iter()
+                .enumerate()
+                .map(|(row, item)| {
+                    let selected = row == sel;
+                    let line = match item {
+                        ChainItemKind::Member(i) => {
+                            let name = cfg
+                                .state
+                                .fallback_chain
+                                .get(*i)
+                                .cloned()
+                                .unwrap_or_default();
+                            // `#n` right-aligned in a fixed 3 cells, so `#1` and
+                            // `#10` start their names on the same column. The
+                            // trailing gap absorbs the `#`, keeping the rail the
+                            // same total width it had as a bare number — nothing
+                            // downstream shifts.
+                            let ord = format!("#{}", i + 1);
+                            let rail = if selected && focused {
+                                Span::styled(format!("❯ {ord:>3} "), theme::accent().bold())
+                            } else {
+                                Span::styled(format!("  {ord:>3} "), theme::faint())
+                            };
+                            // A member still sits in `fallback_chain` on disk while
+                            // disabled (only the walk skips it), so it renders as a
+                            // normal row with a dim name; the exclusion itself
+                            // arrives through `blocked_reason`'s `Disabled` arm like
+                            // any other block. It can never be `is_active`, so dim
+                            // always wins over `name_color`.
+                            let disabled = cfg.find(&name).is_some_and(|p| p.is_disabled());
+                            let ns = if disabled {
+                                bold_when(theme::dim(), selected && focused)
+                            } else {
+                                bold_when(name_color(cfg.is_active(&name)), selected && focused)
+                            };
+                            let reason = cfg.find(&name).and_then(|p| {
+                                blocked_reason(
+                                    &cfg,
+                                    p,
+                                    kick_lifts.get(name.as_str()).copied(),
+                                    key_rejected,
+                                )
+                            });
+                            let rail_w = rail.width();
+                            let mut spans = vec![rail];
+                            match &reason {
+                                // The 1-cell marker is right-aligned at the row's last
+                                // content column (the scrollbar owns the padding cell
+                                // beyond it, so they never collide), and the name is
+                                // clamped to whatever that leaves. Unclamped, a long
+                                // enough name pushed the marker past the pane and
+                                // ratatui dropped it, so a blocked account rendered
+                                // identically to a healthy one. Only a row that
+                                // actually carries a marker pays the clamp — the name
+                                // column's width therefore tracks blocked state.
+                                Some(reason) => {
+                                    let name_w = (w as usize).saturating_sub(rail_w + 2);
+                                    let (text, pad) = fixed_split(&name, name_w);
+                                    spans.push(Span::styled(text, ns));
+                                    spans.push(Span::raw(format!("{pad} ")));
+                                    spans.push(reason_marker(reason));
+                                }
+                                None => spans.push(Span::styled(name.to_string(), ns)),
                             }
-                            None => spans.push(Span::styled(name.to_string(), ns)),
+                            Line::from(spans)
                         }
-                        Line::from(spans)
-                    }
-                    ChainItemKind::Add => {
-                        let arrow = if selected && focused {
-                            Span::styled("❯ ", theme::accent().bold())
-                        } else {
-                            Span::raw("  ")
-                        };
-                        Line::from(vec![
-                            arrow,
-                            Span::styled(
-                                "    + add",
-                                bold_when(theme::accent(), selected && focused),
-                            ),
-                        ])
-                    }
-                };
-                select_line(line, selected, focused, w)
-            })
-            .collect()
-    });
+                        ChainItemKind::Add => {
+                            let arrow = if selected && focused {
+                                Span::styled("❯ ", theme::accent().bold())
+                            } else {
+                                Span::raw("  ")
+                            };
+                            Line::from(vec![
+                                arrow,
+                                Span::styled(
+                                    "    + add",
+                                    bold_when(theme::accent(), selected && focused),
+                                ),
+                            ])
+                        }
+                    };
+                    select_line(line, selected, focused, w)
+                })
+                .collect()
+        },
+    );
 }
 
 fn draw_chain_detail(
@@ -197,58 +206,89 @@ fn draw_chain_detail(
     // wrong row is invisible to every text assertion — so positions are read
     // out of the buffer rather than tracked in a constant edited in lockstep.
     let mut add_focus = (0, 0);
-    let (title, is_name, lines, spans): (String, bool, Vec<Line<'static>>, RowSpans) =
-        match selected {
-            Some(ChainItemKind::Member(i)) => {
-                let cfg = app.config();
-                let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
-                let kick_lift = kick_lifts.get(name.as_str()).copied();
-                let day_picker = match edit {
-                    Some(CardEdit::Days(picker)) => Some(picker.cursor),
-                    _ => None,
-                };
-                let day_stop = app
-                    .fallback_day_stop
-                    .as_ref()
-                    .filter(|stop| stop.member == name)
-                    .map(|stop| stop.state.as_slice());
-                let (lines, spans) = member_detail(
-                    &cfg,
-                    &name,
-                    MemberCard {
-                        focused: detail_focused,
-                        row_cursor: app.fallback_detail_cursor,
-                        armed_remove: matches!(edit, Some(CardEdit::ArmedRemove)),
-                        editing: typed(FallbackRow::Threshold),
-                        max_spend_editing: typed(FallbackRow::MaxSpend),
-                        weekly_editing: typed(FallbackRow::WeeklyAt),
-                        day_picker,
-                        day_stop,
-                        width: inner_w,
-                        kick_lift,
-                        sessions: app.live_sessions.member(&name),
-                    },
-                    key_rejected,
-                );
-                (name.to_string(), true, lines, spans)
+    let mut add_starts: Vec<usize> = Vec::new();
+    let mut add_block_ends: Vec<usize> = Vec::new();
+    let mut add_tips: Vec<usize> = Vec::new();
+    let mut member_tips: Vec<usize> = Vec::new();
+    let mut member_block_ends: Vec<usize> = Vec::new();
+    let (title, is_name, lines, spans, footnote): (
+        String,
+        bool,
+        Vec<Line<'static>>,
+        RowSpans,
+        Option<String>,
+    ) = match selected {
+        Some(ChainItemKind::Member(i)) => {
+            let cfg = app.config();
+            let name = cfg.state.fallback_chain.get(i).cloned().unwrap_or_default();
+            let kick_lift = kick_lifts.get(name.as_str()).copied();
+            let day_picker = match edit {
+                Some(CardEdit::Days(picker)) => Some(picker.cursor),
+                _ => None,
+            };
+            let day_stop = app
+                .fallback_day_stop
+                .as_ref()
+                .filter(|stop| stop.member == name)
+                .map(|stop| stop.state.as_slice());
+            let (lines, spans, footnote) = member_detail(
+                &cfg,
+                &name,
+                MemberCard {
+                    focused: detail_focused,
+                    row_cursor: app.fallback_detail_cursor,
+                    armed_remove: matches!(edit, Some(CardEdit::ArmedRemove)),
+                    editing: typed(FallbackRow::Threshold),
+                    max_spend_editing: typed(FallbackRow::MaxSpend),
+                    weekly_editing: typed(FallbackRow::WeeklyAt),
+                    day_picker,
+                    day_stop,
+                    width: inner_w,
+                    kick_lift,
+                    sessions: app.live_sessions.member(&name),
+                },
+                key_rejected,
+            );
+            // Publish each row's focused block end: the drawn span plus the
+            // hint the row gains when it becomes focused (V2).
+            if let Some(profile) = cfg.find(&name) {
+                for (j, row) in FALLBACK_ROWS.iter().enumerate() {
+                    let tip_len =
+                        member_focused_tip_len(*row, profile, &cfg, &name, key_rejected, inner_w);
+                    let selected = detail_focused && j == app.fallback_detail_cursor;
+                    member_tips.push(tip_len);
+                    member_block_ends.push(if selected {
+                        spans[j].end
+                    } else {
+                        spans[j].end + tip_len
+                    });
+                }
             }
-            Some(ChainItemKind::Add) => {
-                let (lines, focus) = add_detail(app, detail_focused, inner_w, key_rejected);
-                add_focus = focus;
-                (
-                    "add to chain".to_string(),
-                    false,
-                    lines,
-                    std::array::from_fn(|_| 0..0),
-                )
-            }
-            None => (
-                "chain".to_string(),
+            (name.to_string(), true, lines, spans, footnote)
+        }
+        Some(ChainItemKind::Add) => {
+            let d = add_detail(app, detail_focused, inner_w, key_rejected);
+            add_focus = d.focus;
+            add_starts = d.starts;
+            add_block_ends = d.block_ends;
+            add_tips = d.tips;
+            let lines = d.lines;
+            (
+                "add to chain".to_string(),
                 false,
-                empty_detail(),
+                lines,
                 std::array::from_fn(|_| 0..0),
-            ),
-        };
+                None,
+            )
+        }
+        None => (
+            "chain".to_string(),
+            false,
+            empty_detail(),
+            std::array::from_fn(|_| 0..0),
+            None,
+        ),
+    };
 
     let block = if is_name {
         section_box_verbatim(&title, detail_focused, false)
@@ -294,7 +334,32 @@ fn draw_chain_detail(
         Some(ChainItemKind::Add) => add_focus,
         Some(ChainItemKind::Member(_)) | None => (0, 0),
     };
-    let scroll = draw_scrolled_lines(frame, inner, lines, focus);
+    app.fallback_detail_row_starts.replace(match selected {
+        Some(ChainItemKind::Member(_)) => spans.iter().map(|r| r.start).collect(),
+        Some(ChainItemKind::Add) => add_starts,
+        None => Vec::new(),
+    });
+    app.fallback_detail_block_ends.replace(match selected {
+        Some(ChainItemKind::Member(_)) => member_block_ends,
+        Some(ChainItemKind::Add) => add_block_ends,
+        None => Vec::new(),
+    });
+    app.fallback_detail_tips.replace(match selected {
+        Some(ChainItemKind::Member(_)) => member_tips,
+        Some(ChainItemKind::Add) => add_tips,
+        None => Vec::new(),
+    });
+    let draw = draw_scrolled_lines_with_footnote(
+        frame,
+        inner,
+        lines,
+        focus,
+        Some(&app.fallback_detail_offset),
+        footnote.as_deref(),
+    );
+    let scroll = draw.offset;
+    app.fallback_detail_viewport.set(draw.viewport);
+    app.fallback_detail_total.set(draw.total);
 
     // Position the native terminal cursor for whichever field is being typed,
     // matching the post-draw cursor path the other edit screens use. This is not
@@ -427,7 +492,9 @@ fn reason_fix(reason: &BlockedReason, name: &crate::profile::ProfileName) -> Str
     match reason {
         BlockedReason::Disabled => "excluded from the walk, enable it on the setup tab".to_string(),
         BlockedReason::Canceled => "this subscription has been canceled".to_string(),
-        BlockedReason::AuthBroken => format!("re-login with clauth login {name}"),
+        BlockedReason::AuthBroken => {
+            format!("re-login with {}", cmd(&format!("clauth login {name}")))
+        }
         BlockedReason::KeyRejected => "re-enter the api key on the setup tab".to_string(),
         BlockedReason::WeeklySpent { .. } => "weekly limit is spent".to_string(),
         BlockedReason::KickRejected { .. } => "claude code is refusing to start it".to_string(),
@@ -573,6 +640,108 @@ struct MemberCard<'a> {
 /// block the card's scroll keeps on screen, whose first line is the row's own.
 type RowSpans = [std::ops::Range<usize>; FALLBACK_ROWS.len()];
 
+/// `add_detail`'s output: the picker's lines, the focused candidate's block,
+/// and the per-candidate starts, focused block ends and focused tooltip heights.
+struct AddDetail {
+    lines: Vec<Line<'static>>,
+    focus: (usize, usize),
+    starts: Vec<usize>,
+    block_ends: Vec<usize>,
+    tips: Vec<usize>,
+}
+
+/// The hint text a member-card row shows while it is focused at rest (not
+/// while editing): the copy both the render and the published tooltip height
+/// read, so it exists once. The uncapped `max spend` warning is always drawn,
+/// so it is `None` there.
+fn member_row_hint(
+    row: FallbackRow,
+    profile: &crate::profile::Profile,
+    cfg: &AppConfig,
+    name: &crate::profile::ProfileName,
+    key_rejected: &HashSet<crate::profile::ProfileName>,
+) -> Option<String> {
+    match row {
+        FallbackRow::Threshold => {
+            Some("switches to the next account once 5h usage passes this level".to_string())
+        }
+        FallbackRow::WeeklyAt => Some(
+            if !profile.check_weekly {
+                "weekly gate is off, this line isn't checked for this account"
+            } else if profile.weekly_threshold.is_some() {
+                "switches away from this account once weekly usage passes this level"
+            } else {
+                "switches away from this account at the chain's shared weekly level"
+            }
+            .to_string(),
+        ),
+        FallbackRow::CheckWeekly => Some(
+            if profile.check_weekly {
+                "weekly usage past the limit takes this account out of rotation"
+            } else {
+                "weekly usage isn't checked when auto-switching; only the 100% cap blocks"
+            }
+            .to_string(),
+        ),
+        FallbackRow::CheckScoped => Some(
+            if profile.check_scoped {
+                "a spent per-model week (e.g. 7d fable) takes this account out of rotation"
+            } else {
+                "per-model weeks aren't checked; stays in rotation for other models"
+            }
+            .to_string(),
+        ),
+        FallbackRow::LastResort => Some(last_resort_hint(cfg, name, profile.last_resort)),
+        FallbackRow::Preferred => Some(preferred_hint(cfg, name, profile.preferred, key_rejected)),
+        FallbackRow::PreferredDays => {
+            let shared = shared_days(cfg, name, &profile.preferred_days, key_rejected);
+            Some(
+                match crate::fallback::day_claim_blocker(cfg, name, key_rejected) {
+                    Some(reason) => format!(
+                        "a day list here would claim nothing: {reason} · {} picks days one by one",
+                        key("↵")
+                    ),
+                    None if !shared.is_empty() => format!(
+                        "another list also names {}: work returns to whichever account reads clear \
+                     first · {} picks days one by one",
+                        day_list_label(&shared),
+                        key("↵")
+                    ),
+                    None => format!(
+                        "work returns to this account on the days set here · {} picks days one by one",
+                        key("↵")
+                    ),
+                },
+            )
+        }
+        FallbackRow::MaxSpend => {
+            let ceiling = profile.max_auto_spend.unwrap_or(0.0);
+            if spend_is_uncapped(cfg, ceiling, key_rejected) {
+                None // always drawn, so not a focused-only addition
+            } else {
+                Some(max_spend_hint(cfg, name, ceiling))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The hint lines a member-card row gains when it becomes focused (not while
+/// editing), as a line count at `width` — the page step publishes this as the
+/// row's focused block end without rendering it.
+fn member_focused_tip_len(
+    row: FallbackRow,
+    profile: &crate::profile::Profile,
+    cfg: &AppConfig,
+    name: &crate::profile::ProfileName,
+    key_rejected: &HashSet<crate::profile::ProfileName>,
+    width: usize,
+) -> usize {
+    member_row_hint(row, profile, cfg, name, key_rejected)
+        .map(|h| help_tooltip_lines(&h, width).len())
+        .unwrap_or(0)
+}
+
 /// Live-session count, 5h gauge with threshold tick, headroom figure, and the
 /// inline `rotate at` threshold stepper/editor + `last resort` toggle + `remove` rows.
 /// Caret only when focused.
@@ -581,7 +750,7 @@ fn member_detail(
     name: &crate::profile::ProfileName,
     card: MemberCard<'_>,
     key_rejected: &HashSet<crate::profile::ProfileName>,
-) -> (Vec<Line<'static>>, RowSpans) {
+) -> (Vec<Line<'static>>, RowSpans, Option<String>) {
     let MemberCard {
         focused,
         row_cursor,
@@ -602,6 +771,7 @@ fn member_detail(
                 theme::danger(),
             ))],
             std::array::from_fn(|_| 0..0),
+            None,
         );
     };
 
@@ -732,7 +902,7 @@ fn member_detail(
             match row_editing {
                 Some(input) => lines.extend(threshold_range_tooltip(input, width)),
                 None if selected => lines.extend(help_tooltip_lines(
-                    "switches to the next account once 5h usage passes this level",
+                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -744,16 +914,10 @@ fn member_detail(
         if *row == FallbackRow::WeeklyAt {
             match row_editing {
                 Some(input) => lines.extend(weekly_override_range_tooltip(input, width)),
-                None if selected => {
-                    let hint = if !profile.check_weekly {
-                        "weekly gate is off, this line isn't checked for this account"
-                    } else if profile.weekly_threshold.is_some() {
-                        "switches away from this account once weekly usage passes this level"
-                    } else {
-                        "switches away from this account at the chain's shared weekly level"
-                    };
-                    lines.extend(help_tooltip_lines(hint, width));
-                }
+                None if selected => lines.extend(help_tooltip_lines(
+                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                    width,
+                )),
                 None => {}
             }
         }
@@ -761,30 +925,26 @@ fn member_detail(
         // this account right now — so flipping reads as choosing the other
         // sentence.
         if *row == FallbackRow::CheckWeekly && selected {
-            let hint = if profile.check_weekly {
-                "weekly usage past the limit takes this account out of rotation"
-            } else {
-                "weekly usage isn't checked when auto-switching; only the 100% cap blocks"
-            };
-            lines.extend(help_tooltip_lines(hint, width));
+            lines.extend(help_tooltip_lines(
+                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                width,
+            ));
         }
         if *row == FallbackRow::CheckScoped && selected {
-            let hint = if profile.check_scoped {
-                "a spent per-model week (e.g. 7d fable) takes this account out of rotation"
-            } else {
-                "per-model weeks aren't checked; stays in rotation for other models"
-            };
-            lines.extend(help_tooltip_lines(hint, width));
+            lines.extend(help_tooltip_lines(
+                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
+                width,
+            ));
         }
         if *row == FallbackRow::LastResort && selected {
             lines.extend(help_tooltip_lines(
-                &last_resort_hint(cfg, name, profile.last_resort),
+                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
                 width,
             ));
         }
         if *row == FallbackRow::Preferred && selected {
             lines.extend(help_tooltip_lines(
-                &preferred_hint(cfg, name, profile.preferred, key_rejected),
+                &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
                 width,
             ));
         }
@@ -797,26 +957,16 @@ fn member_detail(
         // (`is_home_on` reads the claimant set), so that arm says so instead of
         // promising this account the day. Descended, the picker's grammar.
         if *row == FallbackRow::PreferredDays && selected {
-            let shared = shared_days(cfg, name, &profile.preferred_days, key_rejected);
-            let hint = match (
-                picking,
-                crate::fallback::day_claim_blocker(cfg, name, key_rejected),
-            ) {
-                (Some(_), _) => {
-                    "← → walk · space toggles and saves · ↵ esc done · ↑ ↓ leave".to_string()
-                }
-                (None, Some(reason)) => format!(
-                    "a day list here would claim nothing: {reason} · ↵ picks days one by one"
-                ),
-                (None, None) if !shared.is_empty() => format!(
-                    "another list also names {}: work returns to whichever account reads clear \
-                     first · ↵ picks days one by one",
-                    day_list_label(&shared)
-                ),
-                (None, None) => {
-                    "work returns to this account on the days set here · ↵ picks days one by one"
-                        .to_string()
-                }
+            let hint = if picking.is_some() {
+                format!(
+                    "{} walk · {} toggles and saves · {} done · {} leave",
+                    key("← →"),
+                    key("space"),
+                    key("↵ esc"),
+                    key("↑ ↓")
+                )
+            } else {
+                member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default()
             };
             lines.extend(help_tooltip_lines(&hint, width));
         }
@@ -839,7 +989,7 @@ fn member_detail(
                     ))
                 }
                 None if selected => lines.extend(help_tooltip_lines(
-                    &max_spend_hint(cfg, name, ceiling),
+                    &member_row_hint(*row, profile, cfg, name, key_rejected).unwrap_or_default(),
                     width,
                 )),
                 None => {}
@@ -851,18 +1001,16 @@ fn member_detail(
     // All-exhausted sibling of the Overview projection line: when EVERY chain
     // member is currently maxed, name whichever one resumes first instead of
     // leaving the recovery implicit (issue #10 follow-up). Chain-wide, so it
-    // renders under whichever member happens to be selected.
-    if let Some((resume_name, eta)) = soonest_resume(cfg, key_rejected) {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "resumes: {resume_name} {}",
-                reset_resume(eta, ResetFmt::from_state(&cfg.state))
-            ),
-            theme::faint(),
-        )));
-    }
-    (lines, spans)
+    // renders under whichever member happens to be selected — pinned as a
+    // footnote below the scroll content rather than scrolled with it (on a pane
+    // too short to pin, the helper inlines it as the content's last line).
+    let footnote = soonest_resume(cfg, key_rejected).map(|(resume_name, eta)| {
+        format!(
+            "resumes: {resume_name} {}",
+            reset_resume(eta, ResetFmt::from_state(&cfg.state))
+        )
+    });
+    (lines, spans, footnote)
 }
 
 /// Hint under the `last resort` toggle — phrased for the state flipping it
@@ -1325,6 +1473,7 @@ fn day_list_lines(
         custom
             .as_ref()
             .map(|(value, active)| (value.as_str(), *active)),
+        None,
         selected,
         width,
     )
@@ -1422,7 +1571,7 @@ fn add_detail(
     focused: bool,
     width: usize,
     key_rejected: &HashSet<crate::profile::ProfileName>,
-) -> (Vec<Line<'static>>, (usize, usize)) {
+) -> AddDetail {
     let candidates = chain_candidates(app);
     let mut lines: Vec<Line<'static>> = vec![
         Line::from(Span::styled("add an account to the rotation", theme::dim())),
@@ -1443,19 +1592,35 @@ fn add_detail(
             "every account is already in the chain",
             theme::faint(),
         )));
-        return (lines, (0, 0));
+        return AddDetail {
+            lines,
+            focus: (0, 0),
+            starts: Vec::new(),
+            block_ends: Vec::new(),
+            tips: Vec::new(),
+        };
     }
 
     if !focused {
-        return (lines, (0, 0));
+        return AddDetail {
+            lines,
+            focus: (0, 0),
+            starts: Vec::new(),
+            block_ends: Vec::new(),
+            tips: Vec::new(),
+        };
     }
 
     let cursor = app
         .fallback_detail_cursor
         .min(candidates.len().saturating_sub(1));
     let mut focus = (0, 0);
+    let mut starts: Vec<usize> = Vec::with_capacity(candidates.len());
+    let mut block_ends: Vec<usize> = Vec::with_capacity(candidates.len());
+    let mut tips: Vec<usize> = Vec::with_capacity(candidates.len());
     for (i, name) in candidates.iter().enumerate() {
         let selected = i == cursor;
+        starts.push(lines.len());
         if selected {
             focus.0 = lines.len();
         }
@@ -1474,25 +1639,42 @@ fn add_detail(
         // A member taken off the chain keeps its day list, and adding it back
         // re-arms that list, so the pick names it before the add does. Blocker
         // first, like the card's own row: a list that cannot claim promises
-        // nothing.
+        // nothing. The tooltip follows whichever row is focused, so its height
+        // is counted for every candidate's focused block end.
         let member = crate::profile::ProfileName::from(name.as_str());
-        if selected
-            && let Some(days) = member_days(app, &member)
-            && !days.is_empty()
-        {
-            let label = day_list_label(&days);
-            let blocker = crate::fallback::walk_blocker(&app.config(), &member, key_rejected);
-            let hint = match blocker {
-                Some(reason) => format!("its day list ({label}) would claim nothing: {reason}"),
-                None => format!("brings back its preferred days: {label}"),
-            };
-            lines.extend(help_tooltip_lines(&hint, width));
-        }
+        let tip = member_days(app, &member)
+            .filter(|days| !days.is_empty())
+            .map(|days| {
+                let label = day_list_label(&days);
+                let blocker = crate::fallback::walk_blocker(&app.config(), &member, key_rejected);
+                let hint = match blocker {
+                    Some(reason) => {
+                        format!("its day list ({label}) would claim nothing: {reason}")
+                    }
+                    None => format!("brings back its preferred days: {label}"),
+                };
+                help_tooltip_lines(&hint, width)
+            })
+            .unwrap_or_default();
+        let tip_len = tip.len();
         if selected {
+            lines.extend(tip);
             focus.1 = lines.len();
         }
+        block_ends.push(if selected {
+            lines.len()
+        } else {
+            lines.len() + tip_len
+        });
+        tips.push(tip_len);
     }
-    (lines, focus)
+    AddDetail {
+        lines,
+        focus,
+        starts,
+        block_ends,
+        tips,
+    }
 }
 
 fn empty_detail() -> Vec<Line<'static>> {

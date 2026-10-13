@@ -9,12 +9,25 @@ use crate::logline::logline;
 use crate::profile::{AccountId, ProfileName};
 use crate::profile_cache::{
     ACCOUNT_ID_CACHE_FILE, PROFILE_FETCHED_CACHE_FILE, load_profile_cache, remove_profile_cache,
-    write_profile_cache,
 };
 
 use super::scheduler::{ActivityStore, MAX_RETRY_AFTER_MS, ProfileActivity, mark_activity};
 
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "test builds panic in the endpoint resolver instead of reaching the production URL"
+    )
+)]
 const USAGE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/usage";
+#[cfg_attr(
+    test,
+    allow(
+        dead_code,
+        reason = "test builds panic in the endpoint resolver instead of reaching the production URL"
+    )
+)]
 const PROFILE_ENDPOINT: &str = "https://api.anthropic.com/api/oauth/profile";
 
 /// Test-only [`USAGE_ENDPOINT`] override, the `/usage` half of the offline
@@ -52,22 +65,38 @@ pub(crate) fn clear_usage_endpoint_override() {
 
 fn usage_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
-    if let Some(url) = USAGE_ENDPOINT_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
-        return std::borrow::Cow::Owned(url);
+    {
+        if let Some(url) = USAGE_ENDPOINT_OVERRIDE.lock().ok().and_then(|g| g.clone()) {
+            return std::borrow::Cow::Owned(url);
+        }
+        panic!(
+            "usage endpoint requested with no test override; hold a `testutil::EndpointSandbox`"
+        );
     }
-    std::borrow::Cow::Borrowed(USAGE_ENDPOINT)
+    #[cfg(not(test))]
+    {
+        std::borrow::Cow::Borrowed(USAGE_ENDPOINT)
+    }
 }
 
 fn profile_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
-    if let Some(url) = PROFILE_ENDPOINT_OVERRIDE
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
     {
-        return std::borrow::Cow::Owned(url);
+        if let Some(url) = PROFILE_ENDPOINT_OVERRIDE
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+        {
+            return std::borrow::Cow::Owned(url);
+        }
+        panic!(
+            "profile endpoint requested with no test override; hold a `testutil::EndpointSandbox`"
+        );
     }
-    std::borrow::Cow::Borrowed(PROFILE_ENDPOINT)
+    #[cfg(not(test))]
+    {
+        std::borrow::Cow::Borrowed(PROFILE_ENDPOINT)
+    }
 }
 
 /// Re-fetch `/profile` (plan / rate-limit tier) at most once per hour per
@@ -77,13 +106,23 @@ fn profile_endpoint() -> std::borrow::Cow<'static, str> {
 /// clock). Halves the steady request volume against the rate-limited host.
 const PROFILE_TTL_MS: u64 = 60 * 60 * 1000;
 
-/// Per-profile epoch-ms of the last `/profile` fetch attempt — the in-memory half
-/// of the TTL clock for the policy above, backed by a durable per-profile stamp
+/// A memoized `/profile` attempt: the epoch-ms it was stamped, and whether the
+/// durable stamp write landed. The flag separates a stamp REMOVED by another
+/// process (present-then-absent → lapsed) from a stamp whose write failed
+/// (absent → serve the memo, so a failing write never storms).
+#[derive(Clone, Copy)]
+struct ProfileStamp {
+    at_ms: u64,
+    durable_landed: bool,
+}
+
+/// Per-profile `/profile` fetch-attempt memo — the in-memory half of the TTL
+/// clock for the policy above, backed by a durable per-profile stamp
 /// ([`PROFILE_FETCHED_CACHE_FILE`]) so the hour survives a restart. A true leaf
 /// (`rank::ProfileTtl`): every acquisition is take-read/insert-release and none
 /// spans the stamp's disk IO, which is what lets the rank sit late enough for its
 /// real holders (`Rotation` on the post-401 retry, `Config` on an account swap).
-static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, u64>, rank::ProfileTtl>> =
+static PROFILE_FETCHED: LazyLock<RankedMutex<HashMap<String, ProfileStamp>, rank::ProfileTtl>> =
     LazyLock::new(|| RankedMutex::new(HashMap::new()));
 
 /// Minimum spacing between consecutive requests to the same endpoint host,
@@ -435,6 +474,22 @@ pub(crate) struct PlanInfo {
     /// Pro". A claude profile never sets it; a codex profile never sets `tier`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) codex_plan: Option<String>,
+    /// `/profile` `account.email` with the `account.uuid` it was read for. It
+    /// arrives in the same body as the tier, so it rides the same hourly
+    /// `/profile` TTL. `None` on a profile with no OAuth login (no `/profile`
+    /// leg), on a codex profile, and until the first `/profile` read after a
+    /// cache that predates the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) email: Option<AccountEmail>,
+}
+
+/// An account's address, paired with the account it belongs to: a plan
+/// carried over from an earlier login keeps its old pair, so a reader checks
+/// `account` against the login's identity anchor before naming anyone.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct AccountEmail {
+    pub(crate) address: String,
+    pub(crate) account: AccountId,
 }
 
 impl PlanInfo {
@@ -830,6 +885,8 @@ struct RawProfileAccount {
     #[serde(default)]
     uuid: Option<String>,
     #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
     has_claude_max: bool,
     #[serde(default)]
     has_claude_pro: bool,
@@ -1085,37 +1142,62 @@ fn forget_profile_memo(name: &ProfileName) {
 }
 
 /// The profile has a usable identity anchor. A blank/whitespace uuid is shape
-/// drift, never an identity — same contract as [`seed_identity_anchor`] and
-/// [`fetch_account_uuid`].
+/// drift, never an identity — same contract as [`reconcile_identity_anchor_held`]
+/// and [`fetch_account_uuid`].
 fn has_identity_anchor(name: &ProfileName) -> bool {
     load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE)
         .is_some_and(|u| !u.as_str().trim().is_empty())
 }
 
 /// The last `/profile` attempt stamp for `name`, honouring the durable stamp only
-/// once the profile is anchored. `seed_identity_anchor` backfills the anchor as a
-/// ride-along on the `/profile` body, so trusting the stamp of an anchor-less
-/// profile would defer that backfill by up to an hour — and it is exactly the
+/// once the profile is anchored. `reconcile_identity_anchor_held` writes the anchor as
+/// a ride-along on the `/profile` body, so trusting the stamp of an anchor-less
+/// profile would defer that write by up to an hour — and it is exactly the
 /// unanchored profile that needs it, since without an anchor a dead stored pair
 /// wedges the profile in `auth_broken`. Unanchored profiles therefore pay one
-/// `/profile` per launch until the first backfill lands, then join everyone else.
+/// `/profile` per launch until the first write lands, then join everyone else.
+///
+/// The durable stamp is the cross-process clock: on every memo hit the stamp is
+/// re-checked, so a stamp removed by ANY process (an install's
+/// [`expire_profile_ttl`], a copy-back's [`mark_profile_read_stale`]) reads as
+/// lapsed whatever this process's memo says — a landed stamp now absent forces
+/// one `/profile` pull, which re-stamps and rejoins the normal TTL. A memo whose
+/// own durable write failed is served for its TTL (so a failing write never
+/// storms), at the cost of not seeing a later removal.
 fn last_profile_attempt(name: &ProfileName) -> Option<u64> {
-    if let Some(t) = PROFILE_FETCHED
+    if let Some(ProfileStamp {
+        at_ms,
+        durable_landed,
+    }) = PROFILE_FETCHED
         .lock()
         .ok()
         .and_then(|m| m.get(name.as_str()).copied())
     {
-        return Some(t);
+        // A stamp this process wrote (durable_landed) that is now ABSENT was
+        // removed by another process: lapsed, whatever the memo says. A stamp
+        // whose durable write failed (never landed) serves the memo, so a
+        // failing write never storms. A durable stamp ANOTHER process wrote
+        // (present with a different value) is not a removal, so the memo's
+        // value stands.
+        if durable_landed && load_profile_cache::<u64>(name, PROFILE_FETCHED_CACHE_FILE).is_none() {
+            return None;
+        }
+        return Some(at_ms);
     }
     if !has_identity_anchor(name) {
         return None;
     }
-    // Cold map (process start): adopt the durable stamp and memoize it, so the
-    // disk is read at most once per profile per process. The lock is taken fresh
-    // here — never held across the read above.
+    // Cold map (process start): adopt the durable stamp and memoize it. The lock
+    // is taken fresh here — never held across the read above.
     let disk = load_profile_cache::<u64>(name, PROFILE_FETCHED_CACHE_FILE)?;
     if let Ok(mut m) = PROFILE_FETCHED.lock() {
-        m.insert(name.to_string(), disk);
+        m.insert(
+            name.to_string(),
+            ProfileStamp {
+                at_ms: disk,
+                durable_landed: true,
+            },
+        );
     }
     Some(disk)
 }
@@ -1140,10 +1222,20 @@ pub(crate) fn take_profile_fetch(name: &ProfileName, force: bool, now: u64) -> b
         .is_some_and(|age| age < PROFILE_TTL_MS);
     let want = force || !fresh;
     if want {
+        let durable_landed = crate::profile_cache::write_profile_cache_reported(
+            name,
+            PROFILE_FETCHED_CACHE_FILE,
+            &now,
+        );
         if let Ok(mut m) = PROFILE_FETCHED.lock() {
-            m.insert(name.to_string(), now);
+            m.insert(
+                name.to_string(),
+                ProfileStamp {
+                    at_ms: now,
+                    durable_landed,
+                },
+            );
         }
-        write_profile_cache(name, PROFILE_FETCHED_CACHE_FILE, &now);
     }
     want
 }
@@ -1163,6 +1255,15 @@ fn plan_from_profile(p: &RawProfile) -> PlanInfo {
         subscription_status: org.and_then(|o| o.subscription_status.clone()),
         // The claude leg never reads a codex plan.
         codex_plan: None,
+        email: p.account.as_ref().and_then(|a| {
+            fn present(s: Option<&str>) -> Option<&str> {
+                s.map(str::trim).filter(|s| !s.is_empty())
+            }
+            Some(AccountEmail {
+                address: present(a.email.as_deref())?.to_string(),
+                account: AccountId::from(present(a.uuid.as_deref())?),
+            })
+        }),
     }
 }
 
@@ -1183,29 +1284,47 @@ fn fetch_profile_plan(
     if !take_profile_fetch(name, force_profile, now_ms()) {
         return None;
     }
+    // Ask about the STORED login, not the fetcher's in-memory token: after a
+    // copy-back the work-list token is stale, and a `/profile` read with it
+    // would be refused by the stored-token guard and defer the re-anchor a full
+    // TTL. Sending the stored token is spend-free (no refresh); the `/usage`
+    // read keeps the in-memory token.
+    let token = match crate::profile::stored_access_token(name) {
+        Some(stored) if stored != access_token => stored,
+        _ => access_token.to_string(),
+    };
     let text = get_json(
         profile_endpoint().as_ref(),
-        access_token,
+        &token,
         activity,
         name,
         AuthClient::Profile,
     )
     .ok()?;
     let p: RawProfile = serde_json::from_str(&text).ok()?;
-    seed_identity_anchor(name, &p);
-    // #80 backfill: a chain minted before the login-time stamp carries no
-    // `rateLimitTier`; stamp the polled raw tier into the stored chain while
-    // the body is in hand, so a pre-#80 profile picks the key up without a
-    // manual re-login. Best-effort: a failed persist is logged and the next
-    // hourly pull retries.
-    if let Some(tier) = raw_rate_limit_tier(&p) {
-        match crate::profile::stamp_rate_limit_tier_if_missing(name, access_token, &tier) {
-            Ok(true) => {
-                logline!("clauth: {name}: backfilled the rate-limit tier into the stored chain");
-            }
-            Ok(false) => {}
-            Err(e) => logline!("clauth: {name}: rate-limit tier backfill failed: {e:#}"),
+    // Both ride-alongs in ONE state-flock hold behind ONE stored-token check:
+    // the anchor reconcile and the rate-limit tier stamp share the body's guard.
+    let tier = raw_rate_limit_tier(&p);
+    let ride_along = crate::lock::with_state_lock(|held| {
+        if !crate::profile::stored_token_matches(name, &token) {
+            return Ok(());
         }
+        reconcile_identity_anchor_held(name, &p, held);
+        if let Some(tier) = &tier {
+            match crate::profile::stamp_rate_limit_tier_if_missing_held(name, tier, held) {
+                Ok(true) => {
+                    logline!(
+                        "clauth: {name}: backfilled the rate-limit tier into the stored chain"
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => logline!("clauth: {name}: rate-limit tier backfill failed: {e:#}"),
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    if let Err(e) = ride_along {
+        logline!("clauth: {name}: /profile ride-alongs failed: {e:#}");
     }
     Some(plan_from_profile(&p))
 }
@@ -1277,22 +1396,29 @@ pub(crate) fn fetch_raw(
     })
 }
 
-/// Backfill the profile's identity anchor (`account_id.json`) from an already-
+/// Reconcile the profile's identity anchor (`account_id.json`) from an already-
 /// parsed `/profile` response, riding the hourly tier fetch — zero extra HTTP.
-/// A profile that predates login-time anchor seeding has none, and without one
+/// The `/profile` read is the authority: whenever the account Anthropic reports
+/// for the STORED login differs from the anchor (or the anchor is absent), the
+/// anchor is written to it — which repairs a wrong anchor any path left, where
+/// the old write-if-missing only filled a missing one. A profile that predates
+/// login-time anchor seeding has none, and without one
 /// `oauth::try_adopt_live_rotation` cannot prove a diverged live login is the
 /// same account once the stored pair is fully dead — the profile wedges in
 /// `auth_broken` even when the live session holds a healthy fresher pair
-/// (observed 2026-07-09). Write-if-missing only: `clauth login` remains the
-/// authoritative (re)seeder, and a blank uuid is shape drift, never an
-/// identity (same contract as [`fetch_account_uuid`]).
+/// (observed 2026-07-09). A blank uuid is shape drift, never an identity (same
+/// contract as [`fetch_account_uuid`]).
 ///
-/// The missing-check → write pair is deliberately not atomic: the only bad
-/// interleave (a concurrent re-login to a DIFFERENT account landing its
-/// anchor in that microsecond gap, then being overwritten by this ride-along)
-/// fails SAFE — a wrong anchor only makes adoption refuse and self-heals on
-/// the next login/adopt, so a cross-process lock isn't worth its weight here.
-fn seed_identity_anchor(name: &ProfileName, profile: &RawProfile) {
+/// Run inside the caller's state-flock hold (the `/profile` read's two
+/// ride-alongs share ONE hold and ONE stored-token check). A same-account read
+/// writes nothing; a replacement removes the known-wrong anchor before writing
+/// (a failed write leaves the profile unanchored, never on the displaced
+/// account) and logs both values only when the write landed.
+fn reconcile_identity_anchor_held(
+    name: &ProfileName,
+    profile: &RawProfile,
+    _held: &crate::lock::StateLockHeld,
+) {
     let Some(uuid) = profile
         .account
         .as_ref()
@@ -1302,8 +1428,40 @@ fn seed_identity_anchor(name: &ProfileName, profile: &RawProfile) {
     else {
         return;
     };
-    if load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE).is_none() {
-        write_profile_cache(name, ACCOUNT_ID_CACHE_FILE, &AccountId::from(uuid));
+    let new_uuid = AccountId::from(uuid.to_string());
+    let current = load_profile_cache::<AccountId>(name, ACCOUNT_ID_CACHE_FILE);
+    if current.as_deref() == Some(uuid) {
+        return;
+    }
+    // Remove the known-wrong anchor before writing, so a failed write leaves
+    // the profile unanchored, never on the displaced account.
+    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+    let landed =
+        crate::profile_cache::write_profile_cache_reported(name, ACCOUNT_ID_CACHE_FILE, &new_uuid);
+    if !landed {
+        logline!("clauth: {name}: could not write the identity anchor");
+    } else if let Some(old) = current
+        && old.trim() != uuid
+    {
+        logline!("clauth: {name}: identity anchor {old:?} -> {new_uuid:?}");
+    }
+}
+
+/// Test-facing wrapper for [`reconcile_identity_anchor_held`]: take the state
+/// flock, check the stored token, run the held body, and log a flock failure.
+/// The production `/profile` leg calls the held body directly inside a combined
+/// one-flock ride-along.
+#[cfg(test)]
+fn reconcile_identity_anchor(name: &ProfileName, access_token: &str, profile: &RawProfile) {
+    let result = crate::lock::with_state_lock(|held| {
+        if !crate::profile::stored_token_matches(name, access_token) {
+            return Ok(());
+        }
+        reconcile_identity_anchor_held(name, profile, held);
+        Ok::<(), anyhow::Error>(())
+    });
+    if let Err(e) = result {
+        logline!("clauth: {name}: identity anchor reconcile failed: {e:#}");
     }
 }
 
@@ -1393,21 +1551,53 @@ pub(crate) fn probe_login_profile(access_token: &str) -> anyhow::Result<LoginPro
     Ok(login_profile_from_raw(p))
 }
 
-/// Seed a profile's identity anchor from a completed `clauth login`. UNCONDITIONAL
-/// overwrite, unlike [`seed_identity_anchor`]'s write-if-missing ride-along: this
-/// is the authoritative (re)seeder, so a reauth that swaps a DIFFERENT account
-/// onto the name must replace the old anchor rather than keep proving the old
-/// identity. Best-effort and silent on an absent/blank uuid (a failed probe or
-/// shape drift) — a login is never failed over its anchor.
+/// Seed a profile's identity anchor from a completed login install — or clear it
+/// when the install proves no account uuid. UNCONDITIONAL overwrite, unlike
+/// [`reconcile_identity_anchor_held`]'s read-time reconcile (which writes only when
+/// the stored login's account differs): this is the install's (re)seeder, so a
+/// reauth that swaps a DIFFERENT account onto the name must replace the old
+/// anchor rather than keep proving the old identity. Best-effort — a login is
+/// never failed over its anchor — but a write that does not land is logged, never
+/// silent.
+///
+/// A `None`/blank uuid (a failed probe, an off-disk snapshot, or shape drift) is
+/// NOT proof of identity, so the old anchor is removed rather than left vouching
+/// for a login it never proved.
 pub(crate) fn seed_login_anchor(name: &ProfileName, account_uuid: Option<&AccountId>) {
     let Some(uuid) = account_uuid.map(|u| u.trim()).filter(|u| !u.is_empty()) else {
+        remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
         return;
     };
-    write_profile_cache(
+    // Remove before writing: a failed write leaves the profile unanchored,
+    // never on the account the write was meant to replace.
+    remove_profile_cache(name, ACCOUNT_ID_CACHE_FILE);
+    if !crate::profile_cache::write_profile_cache_reported(
         name,
         ACCOUNT_ID_CACHE_FILE,
         &AccountId::from(uuid.to_string()),
-    );
+    ) {
+        logline!("clauth: {name}: could not write the identity anchor");
+    }
+}
+
+/// Remove a profile's durable `/profile` stamp — the cross-process half of
+/// [`expire_profile_ttl`], used by a `clauth start` session's copy-back of its
+/// login into the account. The copy-back makes NO network call: it marks the
+/// account's `/profile` reading stale, and the next `/profile` read (the
+/// daemon's or the TUI's) re-anchors the account from the body the fetch gets.
+/// Takes no ranked lock, so it may run inside the state-flock hold (which the
+/// build-time drain's caller needs); the ranked in-memory memo half of
+/// [`expire_profile_ttl`] stays outside every hold, and the memo honours the
+/// removed stamp on its next read ([`last_profile_attempt`]).
+pub(crate) fn mark_profile_read_stale(store: &std::path::Path) {
+    let Some(name) = store
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+    else {
+        return;
+    };
+    remove_profile_cache(&ProfileName::from(name), PROFILE_FETCHED_CACHE_FILE);
 }
 
 /// The account uuid `access_token` authenticates as, via `/api/oauth/profile`

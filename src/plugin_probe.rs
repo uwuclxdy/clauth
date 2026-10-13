@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde_json::{Map, Value};
 
-use crate::profile::{atomic_write, claude_dir, home_dir};
+use crate::profile::{atomic_write, home_dir};
 
 /// Plugin id in the registry (`<plugin>@<marketplace>`).
 pub(crate) const PLUGIN_ID: &str = "clauth@clauth";
@@ -328,11 +328,7 @@ fn clauth_mcp_entry() -> Value {
 /// registry the CLI just wrote. `profile::claude_dir()` stays the `~/.claude`
 /// view the credentials link uses; the registry is not the link.
 fn plugins_dir() -> Option<PathBuf> {
-    let base = match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => claude_dir().ok()?,
-    };
-    Some(base.join("plugins"))
+    Some(crate::which::session_config_dir_or_global()?.join("plugins"))
 }
 
 /// Parse a JSON file into a `Value`, returning `None` on any missing/unreadable/

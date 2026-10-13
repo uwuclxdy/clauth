@@ -15,8 +15,10 @@
 use super::herdr_report::{InFlightGuard, PaneReporter};
 use super::*;
 use crate::profile::{AppConfig, AppState};
-use crate::testutil::HomeSandbox;
-use std::path::{Path, PathBuf};
+use crate::testutil::{
+    HomeSandbox, echo_shim, exit1_shim, hang_shim, report_lines, seq_of, wait_for_lines,
+};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// The herdr-report spelling of the shared pin: `HERDR_PANE_ID` and
@@ -31,90 +33,9 @@ struct EnvPin<'a> {
 impl<'a> EnvPin<'a> {
     fn new(home: &'a HomeSandbox, pane: Option<&str>, bin: Option<&Path>) -> Self {
         Self {
-            _pin: crate::testutil::EnvPin::new(
-                home,
-                &[
-                    ("HERDR_PANE_ID", pane.map(std::ffi::OsStr::new)),
-                    ("HERDR_BIN_PATH", bin.map(Path::as_os_str)),
-                ],
-            ),
+            _pin: crate::testutil::herdr_pane_env(home, pane, bin),
         }
     }
-}
-
-/// Write a POSIX shim named `name` whose body runs after the shebang, chmod
-/// +x, and return its path. A report spawns it with `HERDR_BIN_PATH`; `$0`
-/// resolves to the shim itself, so a log relative to it needs no embedded path.
-fn write_shim(dir: &Path, name: &str, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
-    let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write shim");
-    let mut perms = std::fs::metadata(&path).expect("stat shim").permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).expect("chmod shim");
-    path
-}
-
-/// Shim that appends its full argv to `report.log` beside itself and exits 0.
-fn echo_shim(dir: &Path, name: &str) -> PathBuf {
-    write_shim(dir, name, r#"echo "$@" >> "$(dirname "$0")/report.log""#)
-}
-
-/// Same log line, then exit 1: the report must swallow the failing status.
-fn exit1_shim(dir: &Path, name: &str) -> PathBuf {
-    write_shim(
-        dir,
-        name,
-        "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"\nexit 1",
-    )
-}
-
-/// Logs its argv, then sleeps past the report timeout. `exec` so the kill
-/// takes the whole process.
-fn hang_shim(dir: &Path, name: &str) -> PathBuf {
-    // Log the argv FIRST, then hang: the log line proves the report was
-    // attempted while `exec sleep 30` keeps the process alive past
-    // REPORT_TIMEOUT, so the kill path is what ends it.
-    write_shim(
-        dir,
-        name,
-        "echo \"$@\" >> \"$(dirname \"$0\")/report.log\"; exec sleep 30",
-    )
-}
-
-/// Every line the shims in `dir` recorded so far (empty when none).
-fn report_lines(dir: &Path) -> Vec<String> {
-    std::fs::read_to_string(dir.join("report.log"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::to_string)
-        .collect()
-}
-
-/// Poll `report_lines` until at least `want` lines exist or `timeout` elapses.
-fn wait_for_lines(dir: &Path, want: usize, timeout: Duration) -> Vec<String> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let lines = report_lines(dir);
-        if lines.len() >= want {
-            return lines;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "shim log stalled at {} lines (want {want})",
-            lines.len()
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// The `--seq` value of one recorded report line (the last token).
-fn seq_of(line: &str) -> u64 {
-    line.split_whitespace()
-        .last()
-        .expect("seq token")
-        .parse::<u64>()
-        .expect("seq is numeric")
 }
 
 /// Wall clock in epoch-ms, the base the reporter's seq has to sit on.

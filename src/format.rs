@@ -317,7 +317,7 @@ impl Transient {
             Retry::Connection => ": check your connection and retry",
             Retry::Wait => ": retry in a moment",
             Retry::Stated => "",
-            Retry::Restart => ": run clauth login again for a fresh code",
+            Retry::Restart => ": run `clauth login` again for a fresh code",
         }
     }
 
@@ -368,7 +368,7 @@ pub(crate) fn login_expired(name: &crate::profile::ProfileName) -> Message {
     Message {
         head: format!("login for '{name}' has expired"),
         detail: Some(format!(
-            "refresh token revoked or invalid: run clauth login {name}"
+            "refresh token revoked or invalid: run `clauth login {name}`"
         )),
     }
 }
@@ -551,13 +551,14 @@ pub(crate) fn account_tier(profile: &Profile) -> Option<PlanTier> {
     })
 }
 
-/// Percent from API `f64`: drops trailing `.0` on whole numbers → `42%`, `42.3%`.
+/// Percent from API `f64`: at most two decimals, without trailing zeros.
 pub(crate) fn format_pct(pct: f64) -> String {
-    if pct.fract() == 0.0 {
-        format!("{pct:.0}%")
-    } else {
-        format!("{pct}%")
+    let rounded = format!("{pct:.2}");
+    if rounded == "-0.00" {
+        return "0%".to_string();
     }
+    let trimmed = rounded.trim_end_matches('0').trim_end_matches('.');
+    format!("{trimmed}%")
 }
 
 /// Absolute API amount: whole numbers render bare, fractions at two decimals →

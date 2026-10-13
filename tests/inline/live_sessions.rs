@@ -562,7 +562,7 @@ fn an_unattributed_bare_session_still_counts_toward_the_fleet_total() {
         MemberSessions::default(),
         "no account hosts it"
     );
-    assert_eq!(tally.total(), 1);
+    assert_eq!(tally.total(), Some(1));
 }
 
 /// `total` counts sessions, never `following`, and a session whose account was
@@ -581,7 +581,7 @@ fn the_fleet_total_counts_every_session_whatever_its_account_or_chain_flag() {
         crate::testutil::live_row("4343-0", "deleted-account"),
     ]);
 
-    assert_eq!(tally.total(), 3);
+    assert_eq!(tally.total(), Some(3));
 }
 
 /// The fd closing IS the release, which is what makes this survive SIGKILL: a
@@ -663,4 +663,81 @@ fn bare_attribution_ignores_the_readers_own_config_dir() {
         MemberSessions::default(),
         "the READER's own runtime profile hosts nothing"
     );
+}
+
+// ── `total`: a count the tally never read is no count ────────────────────────
+//
+// The header's counter chip renders `total`; a `0` there for a registry or a
+// bare-marker dir that exists but cannot be listed would be a figure clauth did
+// not read. An ABSENT dir is a real reading: nothing ever registered.
+
+/// Put a regular file where a dir clauth lists should be: `read_dir` then fails
+/// with something other than `NotFound` (ENOTDIR on unix).
+#[cfg(unix)]
+fn block_dir(dir: &Path) {
+    std::fs::create_dir_all(dir.parent().expect("the blocked dir has a parent"))
+        .expect("create the parent");
+    std::fs::write(dir, b"").expect("write the blocking file");
+}
+
+#[test]
+fn an_absent_registry_and_bare_dir_read_as_zero() {
+    let _home = HomeSandbox::new();
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work")).total(),
+        Some(0)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_unlistable_registry_reads_as_no_total() {
+    let _home = HomeSandbox::new();
+    block_dir(&registry_dir().expect("registry dir"));
+    assert_eq!(
+        LiveTally::collect(&config_with(vec![], "work")).total(),
+        None
+    );
+}
+
+/// A readable registry holding a live row does not rescue the total when the
+/// bare-marker dir cannot be listed: `Some(1)` would still claim a reading of
+/// the bare half.
+#[cfg(unix)]
+#[test]
+fn an_unlistable_bare_dir_reads_as_no_total_even_beside_live_rows() {
+    let _home = HomeSandbox::new();
+    let live = row("4242-0", "work");
+    register(&live).expect("register the live row");
+    let _marker = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("work"),
+        false,
+        "4242-0",
+    )
+    .expect("hold the live session's marker");
+    block_dir(
+        &crate::profile::clauth_dir()
+            .expect("clauth dir")
+            .join("live_bare"),
+    );
+
+    let tally = LiveTally::collect(&config_with(vec![], "work"));
+    assert_eq!(tally.total(), None);
+    assert_eq!(
+        tally
+            .member(&crate::profile::ProfileName::from("work"))
+            .sessions,
+        1,
+        "the per-account slice keeps the rows it did read"
+    );
+}
+
+/// `list` keeps its best-effort contract for the decision leg and GC: an
+/// unlistable registry is an empty sweep there, never an error.
+#[cfg(unix)]
+#[test]
+fn list_stays_empty_on_an_unlistable_registry() {
+    let _home = HomeSandbox::new();
+    block_dir(&registry_dir().expect("registry dir"));
+    assert!(list().is_empty());
 }

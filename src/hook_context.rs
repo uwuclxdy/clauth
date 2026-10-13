@@ -18,8 +18,9 @@
 //! `$CLAUDE_CONFIG_DIR/settings.json`, fallback `~/.claude/settings.json`,
 //! default true — the client's own default) and by what is still running:
 //! open `Task` tool_use entries in the tail (a `tool_use` whose id has no
-//! matching `tool_result` anywhere in the tail) and live delegate jobs in
-//! the job store. The running clause rides the auto-compact OFF arm only.
+//! matching `tool_result` anywhere in the tail) and the live delegate jobs
+//! this conversation's `claude` process spawned (a peer session's are not
+//! its to wait on). The running clause rides the auto-compact OFF arm only.
 //!
 //! One note per conversation per threshold: the main-scope record's
 //! `context.told_threshold` — read-modify-write under `hook_note`'s
@@ -65,7 +66,8 @@ struct ContextRead {
     auto_compact: bool,
     /// Open `Task` tool_use entries in the tail; copy-only, same gating.
     agents: usize,
-    /// Live delegate jobs in the job store; copy-only, same gating.
+    /// Live delegate jobs this conversation's process spawned; copy-only,
+    /// same gating.
     delegates: usize,
 }
 
@@ -124,7 +126,7 @@ fn read_context(payload: &Payload) -> Option<ContextRead> {
     if read.usage.is_some_and(|u| u >= th) {
         read.auto_compact = auto_compact_enabled();
         read.agents = tail.as_ref().map_or(0, |t| t.open_tasks);
-        read.delegates = live_delegates();
+        read.delegates = live_delegates(&payload.session_id);
     }
     Some(read)
 }
@@ -305,15 +307,7 @@ fn auto_compact_enabled() -> bool {
 }
 
 fn settings_json_path() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir).join("settings.json"));
-    }
-    Some(
-        crate::profile::home_dir()
-            .ok()?
-            .join(".claude")
-            .join("settings.json"),
-    )
+    Some(crate::which::session_config_dir_or_global()?.join("settings.json"))
 }
 
 fn read_auto_compact(path: &Path) -> bool {
@@ -331,12 +325,47 @@ struct SettingsFile {
     auto_compact_enabled: Option<bool>,
 }
 
-/// Live delegate jobs in the store: `Running` or `Blocking`, nothing else.
-fn live_delegates() -> usize {
+/// Live delegate jobs (`Running` or `Blocking`) this conversation's process
+/// spawned.
+fn live_delegates(session_id: &str) -> usize {
+    let own_pid = own_claude_pid();
     crate::mcp::jobs::list(crate::usage::now_ms())
         .into_iter()
+        .filter(|job| spawned_here(&job.record, session_id, own_pid))
         .filter(|job| job.phase().is_live())
         .count()
+}
+
+/// Whether `record` was spawned by the process hosting `session_id`. The pid
+/// decides wherever both sides know it, since `/clear` moves the session id
+/// while the process and its server live on. Otherwise a record carrying
+/// `host_session` counts only when it equals `session_id`: the conversation
+/// the job was minted in where the host's session record answered, else the
+/// server's startup id; one without it (an older server still running
+/// across a self-update, a server launched outside Claude Code) counts: an
+/// over-count only delays a close, an under-count orphans a paid run.
+fn spawned_here(
+    record: &crate::mcp::jobs::JobRecord,
+    session_id: &str,
+    own_pid: Option<u32>,
+) -> bool {
+    match own_pid {
+        Some(pid) if record.host_pid != 0 => record.host_pid == pid,
+        _ => record
+            .host_session
+            .as_deref()
+            .is_none_or(|host| host == session_id),
+    }
+}
+
+/// The `claude` process running this hook: Claude Code exports `CLAUDE_PID`
+/// to its hook commands.
+fn own_claude_pid() -> Option<u32> {
+    std::env::var("CLAUDE_PID")
+        .ok()?
+        .parse()
+        .ok()
+        .filter(|pid| *pid != 0)
 }
 
 // ── JSONL transcript wire types ──────────────────────────────────────────────

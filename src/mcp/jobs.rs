@@ -50,7 +50,7 @@ use crate::profile::clauth_dir;
 /// the next morning. Measured from `done_at`, not from the mint: a
 /// mint-anchored TTL would expire every long run's salvage envelope the instant
 /// it finalizes, since the run's age is already whatever the run cost.
-pub(super) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
+pub(crate) const DONE_TTL_MS: u64 = 24 * 60 * 60 * 1000; // 24h
 /// A `running` file SILENT this long is orphaned (its server died mid-job); reap
 /// it.
 ///
@@ -209,6 +209,23 @@ pub(crate) struct JobRecord {
     /// session's credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) spawned_by: Option<String>,
+    /// The Claude Code conversation the spawning server's host was in when the
+    /// job was minted: the host's session record id, which a `/clear` moves,
+    /// else the server's startup `CLAUDE_CODE_SESSION_ID`. The host identity a
+    /// reader matches when either side's pid is unknown. A record an older
+    /// server wrote carries the startup id, valid until the host's first
+    /// `/clear`. `None` on a record older still and on a server launched
+    /// outside Claude Code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) host_session: Option<String>,
+    /// The `claude` process hosting the spawning conversation (the server's
+    /// parent). A process outlives its session id: `/clear` hands the
+    /// conversation a new id while the same process and server live on, and
+    /// closing the process orphans every delegate it spawned under either id.
+    /// `0` where unknown: a record an older server wrote, or (off unix) a host
+    /// with no single session record naming its id at server start.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub(crate) host_pid: u32,
     /// The child's own session id, off the first streamed event that carried
     /// one: the resume handle a crashed run's record must outlive its server
     /// for. The stdout reader captures it long before any crash and the
@@ -320,6 +337,10 @@ pub(crate) struct RunningSpec {
     /// for the same reason (see [`JobRecord::cwd`], [`JobRecord::spawned_by`]).
     pub(crate) cwd: Option<String>,
     pub(crate) spawned_by: Option<String>,
+    /// The spawning conversation and its host process, carried the same way
+    /// (see [`JobRecord::host_session`], [`JobRecord::host_pid`]).
+    pub(crate) host_session: Option<String>,
+    pub(crate) host_pid: u32,
     /// Which spelling every write of this record lands under. A background job
     /// is `Collectable` from its reserve; a blocking one is `Liveness` until its
     /// caller walks away and [`promote`] renames it.
@@ -471,6 +492,8 @@ pub(crate) fn write_heartbeat_with_session(
             isolated: spec.isolated,
             cwd: spec.cwd.clone(),
             spawned_by: spec.spawned_by.clone(),
+            host_session: spec.host_session.clone(),
+            host_pid: spec.host_pid,
             session_id: session_id.map(str::to_string),
             last_output_at,
             recorded_at: spec.recorded_at,
@@ -535,6 +558,8 @@ pub(crate) fn write_done(spec: &RunningSpec, envelope: serde_json::Value) -> Res
             isolated: spec.isolated,
             cwd: spec.cwd.clone(),
             spawned_by: spec.spawned_by.clone(),
+            host_session: spec.host_session.clone(),
+            host_pid: spec.host_pid,
             session_id,
             timeout_secs: 0,
             idle_secs: None,
@@ -556,7 +581,7 @@ pub(crate) fn write_done(spec: &RunningSpec, envelope: serde_json::Value) -> Res
 }
 
 /// [`write_done`] from loose parts, for tests that finalize a record with no
-/// running spec of their own: no cwd and no spawning account, the shape an
+/// running spec of their own: no cwd, spawning account or host, the shape an
 /// older server's finish wrote.
 #[cfg(test)]
 pub(crate) fn write_done_parts(
@@ -581,6 +606,8 @@ pub(crate) fn write_done_parts(
             isolated,
             cwd: None,
             spawned_by: None,
+            host_session: None,
+            host_pid: 0,
             kind: RecordKind::Collectable,
             owner_pid: 0,
             owner_started_at: 0,
@@ -1042,6 +1069,13 @@ pub(crate) fn running_is_silent(record: &JobRecord, now: u64) -> bool {
     now.saturating_sub(retention_anchor(record)) > RUNNING_TTL_MS
 }
 
+/// Whether a `done` record is past [`DONE_TTL_MS`]: the startup sweep's reap
+/// rule, shared with any reader that must not offer a result that sweep is
+/// about to delete.
+pub(crate) fn done_is_expired(record: &JobRecord, now: u64) -> bool {
+    now.saturating_sub(retention_anchor(record)) > DONE_TTL_MS
+}
+
 /// Whether the server that minted `record` is gone: its marker released, or —
 /// the pid-reuse arm — this process now holds the flock under a record minted
 /// by a DIFFERENT server epoch that once owned our pid. The start stamp is what
@@ -1405,7 +1439,7 @@ fn sweep(now: u64, scope: Scope) {
         };
         let kind = record_kind(&path);
         let expired = match record.state {
-            JobState::Done => full && now.saturating_sub(retention_anchor(&record)) > DONE_TTL_MS,
+            JobState::Done => full && done_is_expired(&record, now),
             JobState::Running => running_is_corpse(&record, now),
         };
         if !expired {

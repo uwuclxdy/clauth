@@ -157,6 +157,41 @@ fn two_earned_notes_join_into_one_envelope() {
         .expect("one JSON document, never two");
 }
 
+/// A resume fire carries the uncollected-results leg's note into the envelope:
+/// the leg is wired into the fire, not only correct on its own. Equality on
+/// the whole list also pins every other leg silent on this fixture.
+#[test]
+fn a_resume_fire_carries_the_uncollected_results_note() {
+    let _home = HomeSandbox::new();
+    let dir = crate::mcp::jobs::jobs_dir().unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = crate::usage::now_ms();
+    std::fs::write(
+        dir.join("d-a.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "job_id": "d-a",
+            "profile": "DS1",
+            "state": "done",
+            "started_at": now - 1_000,
+            "done_at": now - 500,
+            "envelope": { "result": "ok" },
+            "host_session": "s1",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut fire = payload("SessionStart", "s1");
+    fire.source = Some("resume".to_string());
+
+    assert_eq!(
+        leg_notes(&fire, None),
+        vec![
+            "clauth note: a background delegate this session started has a result waiting uncollected: `d-a` on `DS1`. `monitor` with its job_id collects it."
+                .to_string()
+        ]
+    );
+}
+
 #[test]
 fn the_first_fire_is_a_baseline_and_a_move_is_announced_once() {
     let _home = HomeSandbox::new();
@@ -2111,6 +2146,127 @@ fn the_runtime_dir_sid_parser_accepts_only_per_session_dirs() {
             crate::runtime::sid_of_runtime_dir_name(bare),
             None,
             "{bare}"
+        );
+    }
+}
+
+mod hybrid_burn_replay {
+    use crate::profile::{
+        AppConfig, AppState, ClaudeCredentials, OAuthToken, Profile, ProfileName,
+    };
+    use crate::usage::{UsageInfo, UsageWindow, epoch_secs_to_iso, now_epoch_secs, now_ms};
+
+    fn creds() -> ClaudeCredentials {
+        ClaudeCredentials {
+            claude_ai_oauth: Some(OAuthToken {
+                access_token: "at".into(),
+                refresh_token: Some("rt".into()),
+                expires_at: None,
+                scopes: None,
+                subscription_type: None,
+                ..OAuthToken::default_extra()
+            }),
+        }
+    }
+
+    fn live(pct: f64) -> UsageInfo {
+        UsageInfo {
+            five_hour: Some(UsageWindow {
+                utilization: pct,
+                resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+            }),
+            fetched_at: Some(now_ms()),
+            ..UsageInfo::default()
+        }
+    }
+
+    fn setup(burn_aware: bool) -> AppConfig {
+        let mut h = Profile::new(
+            "h".to_string(),
+            Some("https://example.com".to_string()),
+            Some("key".to_string()),
+        );
+        h.credentials = Some(creds());
+        h.fallback_threshold = Some(95.0);
+        let mut b = Profile::new("b".to_string(), None, None);
+        b.credentials = Some(creds());
+        b.fallback_threshold = Some(95.0);
+        crate::profile::save_profile(&h).expect("save h");
+        crate::profile::save_profile(&b).expect("save b");
+        let state = AppState {
+            profiles: vec!["h".into(), "b".into()],
+            fallback_chain: vec!["h".into(), "b".into()],
+            active_profile: Some("h".into()),
+            burn_aware_switching: burn_aware,
+            burn_switch_floor_pct: Some(90.0),
+            ..AppState::default()
+        };
+        crate::profile::save_app_state(&state).expect("save state");
+        AppConfig {
+            state,
+            profiles: vec![h, b],
+        }
+    }
+
+    /// The replay agrees with the live leg: a third-party-classified active at
+    /// 92% of a 95% threshold stays put on the static threshold, and its rising
+    /// OAuth burn history never projects onto its provider window.
+    #[test]
+    fn the_replay_never_projects_a_hybrids_oauth_burn_onto_its_provider_window() {
+        let _home = crate::testutil::HomeSandbox::new();
+        let config = setup(true);
+        let h = ProfileName::from("h");
+        assert!(
+            crate::profile::stored_usage_cache_is_third_party(&h),
+            "the fixture's hybrid classifies third-party on disk"
+        );
+        crate::profile_cache::write_profile_cache(
+            &h,
+            crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+            &crate::providers::ThirdPartyStats {
+                is_available: true,
+                rows: Vec::new(),
+                bars: vec![crate::providers::UsageBar {
+                    label: "5h".to_string(),
+                    pct: 92.0,
+                    resets_at: Some(epoch_secs_to_iso(now_epoch_secs() + 3600)),
+                    used: None,
+                    total: None,
+                }],
+                plan: None,
+                endpoint: None,
+                best_effort: false,
+            },
+        );
+        crate::profile_cache::write_profile_cache(
+            &ProfileName::from("b"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &live(10.0),
+        );
+        let path = crate::profile::profile_history_path(&h).expect("history path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let now = now_ms();
+        let mut body = String::new();
+        for (ts, pct) in [
+            (now - 360_000, 32.0),
+            (now - 240_000, 52.0),
+            (now - 120_000, 72.0),
+        ] {
+            let line = serde_json::json!({"ts": ts, "name": "h", "usage": live(pct)});
+            body.push_str(&serde_json::to_string(&line).expect("ser"));
+            body.push('\n');
+        }
+        std::fs::write(&path, body).expect("write history");
+
+        let mut off = config.clone();
+        off.state.burn_aware_switching = false;
+        assert!(
+            !crate::hook_note::chain_would_act(&off, &h),
+            "the static replay stays put at 92 < 95"
+        );
+        assert!(
+            !crate::hook_note::chain_would_act(&config, &h),
+            "the burn-aware replay never projects a hybrid's OAuth burn"
         );
     }
 }

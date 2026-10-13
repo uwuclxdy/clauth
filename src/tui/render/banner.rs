@@ -12,6 +12,7 @@ use ratatui::widgets::Paragraph;
 
 use super::super::app::{Banner, BannerSeverity};
 use super::super::theme;
+use super::prose;
 
 pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, banner: &Banner) {
     let (fg, bg) = match banner.severity {
@@ -19,10 +20,11 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, banner: &Banner) {
         BannerSeverity::Warning => (theme::warning_color(), theme::bg_warning_color()),
     };
 
-    let spans = vec![
-        Span::styled(" ! ", Style::default().fg(fg).bg(bg)),
-        Span::styled(banner.message.as_str(), Style::default().fg(fg).bg(bg)),
-    ];
+    let mut spans = vec![Span::styled(" ! ", Style::default().fg(fg).bg(bg))];
+    spans.extend(prose::spans(
+        &banner.message,
+        Style::default().fg(fg).bg(bg),
+    ));
 
     frame.render_widget(
         Paragraph::new(Line::from(spans)).style(Style::default().bg(bg)),

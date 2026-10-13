@@ -628,8 +628,8 @@ pub(crate) struct LoginArgs {
     /// Replace an existing long-lived token unprompted.
     #[arg(long, short = 'y', requires = "setup_token")]
     pub(crate) yes: bool,
-    /// Default model for the profile: opus, sonnet, haiku, opusplan, or a full
-    /// model id.
+    /// Default model for the profile: fable, opus, sonnet, haiku, opusplan, or a
+    /// full model id.
     #[arg(long, value_name = "ID")]
     pub(crate) model: Option<String>,
 }

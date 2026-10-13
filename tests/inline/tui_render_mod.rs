@@ -132,6 +132,554 @@ fn dump(app: &App, w: u16, h: u16) -> String {
 }
 
 #[test]
+fn overview_selection_moves_inside_a_persistent_viewport() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: (0..25)
+            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .collect(),
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    app.overview_cursor = 20;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let first = crate::testutil::buffer_rows(term.backend().buffer());
+    let before = first
+        .iter()
+        .position(|line| line.contains("fixture-20"))
+        .expect("selected account visible");
+    app.overview_cursor = 18;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let second = crate::testutil::buffer_rows(term.backend().buffer());
+    let after = second
+        .iter()
+        .position(|line| line.contains("fixture-18"))
+        .expect("previous account visible");
+    assert_eq!(after + 2, before, "the cursor moves within the viewport");
+    assert!(
+        second.iter().any(|line| line.contains("fixture-21")),
+        "three later rows stay visible"
+    );
+}
+
+#[test]
+fn account_selectors_hold_separate_viewports_across_tabs_and_resize() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: (0..25)
+            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .collect(),
+    });
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    app.profile_cursor = 20;
+    app.overview_cursor = 20;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    app.tab = Tab::Setup;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let setup_offset = app.setup_selector.offset.get();
+    assert!(setup_offset > 0, "setup scrolled to selected account");
+    app.tab = Tab::Usage;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert!(
+        app.usage_selector.offset.get() > 0,
+        "usage has its own viewport"
+    );
+    app.profile_cursor = 0;
+    app.overview_cursor = 0;
+    app.tab = Tab::Overview;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.overview_selector.offset.get(),
+        0,
+        "overview begins at its first row"
+    );
+    app.tab = Tab::Setup;
+    term.backend_mut().resize(80, 14);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.setup_selector.offset.get(),
+        0,
+        "resize and selection clamp the old viewport"
+    );
+    assert_eq!(
+        setup_offset,
+        app.usage_selector.offset.get(),
+        "inactive usage offset persists"
+    );
+}
+
+#[test]
+fn incident_selector_moves_by_two_rows_without_recentering() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let template = demo_incidents().remove(0);
+    app.status.incidents = (0..12)
+        .map(|i| {
+            let mut incident = template.clone();
+            incident.title = format!("incident-{i:02}");
+            incident
+        })
+        .collect();
+    app.tab = Tab::Status;
+    app.status.cursor = 11;
+    let mut term = Terminal::new(TestBackend::new(80, 17)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let bottom = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        bottom.iter().any(|line| line.contains("incident-11")),
+        "last item is visible"
+    );
+    let bottom_bar: String = (5..14)
+        .map(|y| {
+            term.backend()
+                .buffer()
+                .cell((22, y))
+                .unwrap()
+                .symbol()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        bottom_bar.ends_with('┃'),
+        "thumb reaches the bottom: {bottom_bar}"
+    );
+    app.status.cursor = 10;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let first = crate::testutil::buffer_rows(term.backend().buffer());
+    let before = first
+        .iter()
+        .position(|line| line.contains("incident-10"))
+        .expect("selected incident visible");
+    app.status.cursor = 9;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let second = crate::testutil::buffer_rows(term.backend().buffer());
+    let after = second
+        .iter()
+        .position(|line| line.contains("incident-09"))
+        .expect("previous incident visible");
+    assert_eq!(
+        after + 2,
+        before,
+        "both rows move inside the persistent viewport"
+    );
+    app.status.cursor = 11;
+    app.status.selector.offset.set(16);
+    term.backend_mut().resize(80, 19);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.status.selector.offset.get(),
+        12,
+        "13-line viewport starts at a title, not an orphan phase"
+    );
+    let resized = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        resized[4].contains("incident-06"),
+        "the first visible row is incident 06's title"
+    );
+    assert!(
+        resized.iter().any(|line| line.contains("incident-11")),
+        "final incident remains reachable"
+    );
+    term.backend_mut().resize(80, 10);
+    term.autoresize().unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let tiny = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        tiny.iter().any(|line| line.contains("incident-11")),
+        "one-line selector shows selected title"
+    );
+}
+
+/// PageDown on the Overview selector moves the cursor one page (12 visible
+/// rows at 80x24 → cursor 2 becomes 13) and keeps the selection at least three
+/// rows off the list's bottom edge; both page keys stop at the ends.
+#[test]
+fn overview_selector_pages_the_cursor_and_stops_at_the_ends() {
+    use crate::tui::app::{Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles: Vec<Profile> = (0..25)
+        .map(|i| crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}"))))
+        .collect();
+    let names = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles,
+    });
+    app.tab = Tab::Overview;
+    app.overview_cursor = 2;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.overview_selector.viewport.get(),
+        12,
+        "the 80x24 overview lists twelve rows"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(
+        app.overview_cursor, 13,
+        "cursor 2 pages to 13 (2 + viewport - 1)"
+    );
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let caret = rows
+        .iter()
+        .position(|r| r.contains('❯'))
+        .expect("the selected row stays visible after paging");
+    let list_bottom = rows[caret..]
+        .iter()
+        .position(|r| r.contains('╰'))
+        .map(|i| caret + i - 1)
+        .expect("the accounts pane's bottom border sits below the caret");
+    assert!(
+        caret + 3 <= list_bottom,
+        "three context rows below the selection (caret {caret}, list bottom {list_bottom})"
+    );
+    app.overview_cursor = 24;
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.overview_cursor, 24, "PageDown stops at the last row");
+    app.overview_cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(app.overview_cursor, 0, "PageUp stops at the first row");
+}
+
+/// Config's rows wrap and carry band headers and blank spacers, so paging by
+/// ROW count would skip lines. The cursor must land on the last row whose
+/// published start line is within one page of lines, and the old last visible
+/// line must stay visible after the page.
+#[test]
+fn config_page_down_steps_lines_and_skips_nothing() {
+    use crate::tui::app::{Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    for (w, h) in [(40u16, 24u16), (50u16, 14u16)] {
+        let mut app = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        app.tab = Tab::Config;
+        app.global_config_cursor = 0;
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        let viewport = app.global_config_viewport.get();
+        assert!(viewport >= 4, "config publishes its viewport at {w}x{h}");
+        let starts: Vec<usize> = app.global_config_row_starts.borrow().clone();
+        assert_eq!(starts.len(), 20, "one start line per config row");
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+        let target = starts[0] + viewport - 1;
+        let expected = (0..starts.len())
+            .rev()
+            .find(|&i| starts[i] <= target)
+            .unwrap();
+        assert_eq!(
+            app.global_config_cursor, expected,
+            "the cursor lands on the last row within one page of lines at {w}x{h}"
+        );
+        if (w, h) == (40, 24) {
+            // The rows wrap at 40 cols, so a row-count page (viewport - 1 rows)
+            // would land on row 17; paging by lines lands on row 6.
+            assert_eq!(app.global_config_cursor, 6, "40x24 lands on row 6, not 17");
+        }
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        assert!(
+            app.global_config_offset.get() <= viewport,
+            "the view never jumps past the old bottom line (no content skipped) at {w}x{h}"
+        );
+    }
+}
+
+/// The single-line selectors page the cursor by viewport - 1 and stop at the
+/// ends — one table-driven sweep over the surfaces the other tests don't reach.
+#[test]
+fn single_line_selectors_page_the_cursor_and_stop_at_the_ends() {
+    use crate::tui::app::{Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let profiles: Vec<Profile> = (0..25)
+        .map(|i| crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}"))))
+        .collect();
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+
+    for (name, tab, last_row) in [("usage", Tab::Usage, 24usize), ("setup", Tab::Setup, 25)] {
+        let mut app = App::new(AppConfig {
+            state: AppState {
+                profiles: names.clone(),
+                ..AppState::default()
+            },
+            profiles: profiles.clone(),
+        });
+        app.tab = tab;
+        app.profile_cursor = 0;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        // 25 rows (Setup: 25 + `+ new`) at 80x24 leave an 18-row pane, so one
+        // page = 17 rows.
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+        assert_eq!(app.profile_cursor, 17, "{name} pages the cursor by 17 rows");
+        // Land on the last row and PageDown: it stays.
+        app.profile_cursor = last_row;
+        handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+        assert_eq!(
+            app.profile_cursor, last_row,
+            "{name} PageDown stays at the last row"
+        );
+    }
+}
+
+/// Status's two-line incident rows page by the rows that fit in viewport - 1
+/// lines, never past the last incident.
+#[test]
+fn status_incident_list_pages_by_rows_that_fit_in_viewport_minus_one() {
+    use crate::tui::app::{Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let template = demo_incidents().remove(0);
+    app.status.incidents = (0..40)
+        .map(|i| {
+            let mut incident = template.clone();
+            incident.title = format!("incident-{i:02}");
+            incident
+        })
+        .collect();
+    app.tab = Tab::Status;
+    app.status.cursor = 0;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    // 40 two-line incidents at 80x24 draw 18 lines (9 incidents); one page is
+    // 17 lines = 8 rows.
+    assert_eq!(
+        app.status.selector.viewport.get(),
+        18,
+        "the incident list draws 18 lines"
+    );
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.status.cursor, 8, "two-line rows page by 8 rows");
+    app.status.cursor = 39;
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.status.cursor, 39, "PageDown stops at the last incident");
+    app.status.cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageUp));
+    assert_eq!(app.status.cursor, 0, "PageUp stops at the first incident");
+}
+
+#[test]
+fn long_config_pane_follows_selection_without_repinning() {
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS.len() - 1;
+    let mut term = Terminal::new(TestBackend::new(80, 14)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert!(
+        app.global_config_offset.get() > 0,
+        "last config row needs an offset"
+    );
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SpendBudget)
+        .unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let middle = app.global_config_offset.get();
+    assert!(middle > 0, "middle selection keeps rows above it");
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let before = rows
+        .iter()
+        .position(|r| r.contains("allow extra usage"))
+        .unwrap();
+    app.global_config_cursor += 1;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let after = rows
+        .iter()
+        .position(|r| r.contains("allow extra usage"))
+        .unwrap();
+    assert_eq!(after, before, "nearby selection does not recenter the form");
+    app.global_config_cursor = 0;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.global_config_offset.get(),
+        0,
+        "first row restores the top"
+    );
+}
+
+#[test]
+fn services_selector_keeps_adjacent_rows_visible_and_clamps_after_shrink() {
+    use crate::tui::app::{Check, Health, Tab};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Services;
+    let labels = ["shunt", "delegates", "plugin", "herdr"];
+    app.services.checks = labels
+        .iter()
+        .map(|label| Check {
+            label,
+            health: Health::Warn,
+            detail: vec!["service ready".into()],
+            fix: None,
+            problems: Vec::new(),
+            shunt_focus: Vec::new(),
+            shunt_action_start: None,
+        })
+        .collect();
+    app.services.cursor = 3;
+    let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let bottom = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(bottom[6].contains("herdr"), "last service is visible");
+    assert_eq!(
+        app.services.selector.offset.get(),
+        1,
+        "short list scrolls one row"
+    );
+    app.services.cursor = 2;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let adjacent = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        adjacent[5].contains("plugin"),
+        "cursor moves inside the viewport"
+    );
+    assert!(
+        adjacent[6].contains("herdr"),
+        "lower context remains visible"
+    );
+    assert_eq!(
+        app.services.selector.offset.get(),
+        1,
+        "adjacent selection keeps the viewport"
+    );
+    app.services.checks.truncate(1);
+    app.services.cursor = 0;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert_eq!(
+        app.services.selector.offset.get(),
+        0,
+        "shorter list resets offset"
+    );
+}
+
+#[test]
+fn a_three_line_status_viewport_shows_only_whole_incidents() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    let template = demo_incidents().remove(0);
+    app.status.incidents = (0..12)
+        .map(|i| {
+            let mut incident = template.clone();
+            incident.title = format!("incident-{i:02}");
+            incident
+        })
+        .collect();
+    app.tab = Tab::Status;
+    app.status.cursor = 11;
+    let mut term = Terminal::new(TestBackend::new(80, 9)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(rows[4].contains("incident-11"), "selected title is visible");
+    assert!(rows[5].contains("[ minor ]"), "selected phase is visible");
+    assert!(!rows[6].contains("incident-"), "no orphan title at bottom");
+    assert_eq!(app.status.selector.offset.get(), 22);
+    assert_eq!(
+        term.backend().buffer().cell((22, 6)).unwrap().symbol(),
+        "┃",
+        "thumb reaches the bottom of the full panel viewport"
+    );
+    assert_eq!(
+        term.backend().buffer().cell((22, 5)).unwrap().symbol(),
+        "┊",
+        "track occupies the whole panel above the bottom thumb"
+    );
+    app.status.cursor = 0;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(rows[4].contains("incident-00"), "first title is reachable");
+    assert!(rows[5].contains("[ minor ]"), "first phase is visible");
+    assert!(
+        !rows[6].contains("incident-"),
+        "bottom stays whole at the top"
+    );
+    assert_eq!(
+        term.backend().buffer().cell((22, 4)).unwrap().symbol(),
+        "┃",
+        "thumb reaches the top"
+    );
+}
+
+#[test]
+fn a_shrunk_selector_restores_its_first_row_and_removes_its_bar() {
+    use crate::tui::app::Tab;
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: (0..25)
+            .map(|i| oauth(&format!("fixture-{i:02}"), 40.0, 20.0, false))
+            .collect(),
+    });
+    app.tab = Tab::Usage;
+    app.profile_cursor = 24;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    assert!(app.usage_selector.offset.get() > 0);
+    app.config().profiles.truncate(5);
+    app.profile_cursor = 4;
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let lines = crate::testutil::buffer_rows(term.backend().buffer());
+    assert!(
+        lines.iter().any(|line| line.contains("fixture-00")),
+        "first row returns"
+    );
+    assert_eq!(
+        app.usage_selector.offset.get(),
+        0,
+        "fitting list has no offset"
+    );
+    let bar: String = (4..22)
+        .map(|y| {
+            term.backend()
+                .buffer()
+                .cell((23, y))
+                .unwrap()
+                .symbol()
+                .to_string()
+        })
+        .collect();
+    assert!(
+        !bar.contains('┊') && !bar.contains('┃'),
+        "fitting list has no scrollbar: {bar}"
+    );
+}
+
+#[test]
 fn hybrid_renders_the_activity_and_deadline_of_its_provider_cache() {
     let _home = crate::testutil::HomeSandbox::new();
     use crate::profile::{ClaudeCredentials, OAuthToken};
@@ -239,6 +787,217 @@ fn a_two_line_toast_bolds_the_head_and_dims_the_detail() {
     assert!(
         !modifier_at("QNOTE").contains(Modifier::BOLD),
         "toast detail line is dim, not bold:\n{out}"
+    );
+}
+
+/// The toast stack of an 80x24 frame: the column its bar sits in, and each
+/// toast row read cell by cell up to the stack's right edge (2 cells in from
+/// the frame's), the cell a wide glyph spills into skipped.
+fn toast_rows(app: &App) -> (u16, Vec<String>) {
+    let (w, h) = (80u16, 24u16);
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, app)).unwrap();
+    let buf = term.backend().buffer();
+    let bar_x = (0..w)
+        .find(|&x| buf[(x, 2)].symbol() == "┃")
+        .expect("a toast bar on row 2");
+    let rows = (2..h)
+        .take_while(|&y| buf[(bar_x, y)].symbol() == "┃")
+        .map(|y| {
+            let mut row = String::new();
+            let mut x = bar_x;
+            while x < w - 2 {
+                let symbol = buf[(x, y)].symbol();
+                row.push_str(symbol);
+                x += ratatui::text::Span::raw(symbol).width().max(1) as u16;
+            }
+            row.trim_end().to_string()
+        })
+        .collect();
+    (bar_x, rows)
+}
+
+fn toast_app(kind: crate::tui::app::ToastKind, body: String) -> App {
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    app.toast(kind, body);
+    app
+}
+
+/// The column a toast whose widest shown row is `content` cells wide starts
+/// at: the stack ends 2 cells in from the 80-cell frame, and the toast is
+/// `┃ ` + content + 1 pad cell.
+fn bar_column(content: u16) -> u16 {
+    78 - (content + 3)
+}
+
+#[test]
+fn a_toast_past_three_rows_keeps_three_and_ends_the_last_in_an_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::ToastKind;
+
+    // Sixteen 9-char words at the 57-cell budget wrap five to a row: the head
+    // plus four detail rows, five in all. The widest shown row is the third,
+    // 49 cells + the ellipsis.
+    let words: Vec<String> = (1..=16).map(|i| format!("word{i:05}")).collect();
+    let app = toast_app(
+        ToastKind::Danger,
+        format!("move failed\n{}", words.join(" ")),
+    );
+    assert_eq!(
+        toast_rows(&app),
+        (
+            bar_column(50),
+            vec![
+                "┃ move failed".to_string(),
+                "┃ word00001 word00002 word00003 word00004 word00005".to_string(),
+                "┃ word00006 word00007 word00008 word00009 word00010…".to_string(),
+            ]
+        )
+    );
+
+    // A full-width third row has no cell for the ellipsis: it takes the last
+    // character's.
+    let app = toast_app(
+        ToastKind::Danger,
+        format!("move failed\n{}", "x".repeat(200)),
+    );
+    assert_eq!(
+        toast_rows(&app),
+        (
+            bar_column(57),
+            vec![
+                "┃ move failed".to_string(),
+                format!("┃ {}", "x".repeat(57)),
+                format!("┃ {}…", "x".repeat(56)),
+            ]
+        )
+    );
+}
+
+#[test]
+fn a_wide_glyph_toast_wraps_by_cells_and_keeps_its_ellipsis() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::ToastKind;
+
+    // `漢` takes two cells: 28 fill 56 of the 57-cell budget, and the third row
+    // has one cell left for the `…`.
+    let app = toast_app(
+        ToastKind::Danger,
+        format!("save failed\n{}", "漢".repeat(200)),
+    );
+    assert_eq!(
+        toast_rows(&app),
+        (
+            bar_column(57),
+            vec![
+                "┃ save failed".to_string(),
+                format!("┃ {}", "漢".repeat(28)),
+                format!("┃ {}…", "漢".repeat(28)),
+            ]
+        )
+    );
+}
+
+#[test]
+fn an_emoji_toast_wraps_by_graphemes() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::ToastKind;
+
+    // `⚠️` (U+26A0 + U+FE0F) takes two cells: 28 fill 56 of the budget.
+    let w = "\u{26A0}\u{FE0F}";
+    let app = toast_app(ToastKind::Danger, format!("h\n{}", w.repeat(60)));
+    assert_eq!(
+        toast_rows(&app),
+        (
+            bar_column(57),
+            vec![
+                "┃ h".to_string(),
+                format!("┃ {}", w.repeat(28)),
+                format!("┃ {}…", w.repeat(28)),
+            ]
+        )
+    );
+
+    // A full third row (1 + 28·2 = 57 cells) gives its last grapheme, both
+    // chars of it, to the `…`.
+    let app = toast_app(ToastKind::Danger, format!("h\nA\nx{}", w.repeat(40)));
+    assert_eq!(
+        toast_rows(&app),
+        (
+            bar_column(56),
+            vec![
+                "┃ h".to_string(),
+                "┃ A".to_string(),
+                format!("┃ x{}…", w.repeat(27)),
+            ]
+        )
+    );
+}
+
+#[test]
+fn a_cut_line_does_not_widen_its_toast() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::ToastKind;
+
+    let app = toast_app(ToastKind::Danger, format!("a\nb\nc\n{}", "y".repeat(50)));
+    assert_eq!(
+        toast_rows(&app),
+        (
+            bar_column(2),
+            vec!["┃ a".to_string(), "┃ b".to_string(), "┃ c…".to_string()]
+        )
+    );
+}
+
+#[test]
+fn a_toast_ellipsis_takes_its_row_style() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::ToastKind;
+    use ratatui::style::Modifier;
+
+    // A head long enough to fill all three rows: the `…` is head-styled.
+    // A detail row's `…` is detail-styled.
+    for (body, fg, bold) in [
+        ("y".repeat(200), crate::tui::theme::text_color(), true),
+        (
+            format!("move failed\n{}", "x".repeat(200)),
+            crate::tui::theme::text_dim_color(),
+            false,
+        ),
+    ] {
+        let app = toast_app(ToastKind::Danger, body.clone());
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| super::draw(f, &app)).unwrap();
+        let cell = &term.backend().buffer()[(bar_column(57) + 2 + 56, 4)];
+        assert_eq!(cell.symbol(), "…", "{body:?}");
+        assert_eq!(cell.fg, fg, "{body:?}");
+        assert_eq!(cell.modifier.contains(Modifier::BOLD), bold, "{body:?}");
+    }
+}
+
+#[test]
+fn a_three_row_toast_renders_whole() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::ToastKind;
+
+    let words: Vec<String> = (1..=10).map(|i| format!("word{i:05}")).collect();
+    let app = toast_app(
+        ToastKind::Danger,
+        format!("move failed\n{}", words.join(" ")),
+    );
+    assert_eq!(
+        toast_rows(&app),
+        (
+            bar_column(49),
+            vec![
+                "┃ move failed".to_string(),
+                "┃ word00001 word00002 word00003 word00004 word00005".to_string(),
+                "┃ word00006 word00007 word00008 word00009 word00010".to_string(),
+            ]
+        )
     );
 }
 
@@ -661,7 +1420,7 @@ fn new_form_renders_the_capture_row_and_its_done_state() {
         credentials: None,
         base_url: None,
         api_key: None,
-        account_uuid: None,
+        anchor: crate::actions::AnchorAction::Unproven,
     })));
     app.config_draft = Some(draft);
     let out = dump(&app, 120, 30);
@@ -777,7 +1536,7 @@ fn capture_name_caret_follows_edit_position() {
             credentials: None,
             base_url: None,
             api_key: None,
-            account_uuid: None,
+            anchor: crate::actions::AnchorAction::Unproven,
         }),
         input,
         from_divergence: false,
@@ -1079,7 +1838,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     app.tab = Tab::Setup;
     handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
     let menu = crate::tui::app::build_action_menu(&app);
-    assert_eq!(menu.items.len(), 4);
+    assert_eq!(menu.items.len(), 5);
     assert_eq!(
         menu.context.as_deref(),
         Some("acct"),
@@ -1097,7 +1856,7 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
     app.profile_cursor = app.profile_count();
     app.config_draft = None;
     let menu = crate::tui::app::build_action_menu(&app);
-    assert_eq!(menu.items.len(), 2);
+    assert_eq!(menu.items.len(), 3);
     assert_eq!(
         menu.context, None,
         "no draft is mounted yet, so the group title is bare"
@@ -1108,7 +1867,11 @@ fn the_actions_hint_tracks_whether_the_menu_has_anything_in_it() {
         "the create form's menu carries apply preset, so the key stays advertised:\n{out}"
     );
 
+    // The one empty menu left: a stale daemon's `unobserved` gateway offers
+    // no shunt verb, and a daemon control busy holds the daemon verb back.
     app.tab = Tab::Config;
+    app.daemon_health = crate::daemon::DaemonHealth::Stale;
+    app.gateway_state = crate::daemon::gateway::GatewayState::Unobserved;
     app.daemon_control_busy = true;
     assert!(crate::tui::app::build_action_menu(&app).items.is_empty());
     let out = dump(&app, 120, 30);
@@ -1170,12 +1933,13 @@ fn narrow_status_detail_duration_drops_to_its_own_line() {
 #[test]
 fn narrow_modal_body_wraps_instead_of_clipping() {
     let _home = crate::testutil::HomeSandbox::new();
-    use crate::tui::app::{ConfirmAction, ConfirmState, Modal};
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState, Modal};
     let mut app = narrow_app();
     app.modals.push(Modal::Confirm(ConfirmState {
         message: "switch every profile to a freshly rotated credential set immediately".into(),
         detail: None,
         choice: false,
+        scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::RotateAll,
     }));
     let out = dump(&app, 45, 38);
@@ -1417,17 +2181,15 @@ fn form_panes_keep_the_focused_row_on_screen_when_they_overflow() {
         "an overflowing pane shows its scrollbar thumb:\n{bottom}"
     );
 
-    // Cursor back near the top with a hinted row (so the pane still overflows):
-    // the offset really tracks the cursor both ways — the first band header is
-    // back AND the bottom row has gone off screen.
+    // The viewport follows this row without snapping back to the top.
     app.global_config_cursor = GLOBAL_CONFIG_ROWS
         .iter()
         .position(|r| *r == GlobalConfigRow::DivergenceDefault)
         .unwrap();
     let top = dump(&app, 90, 24);
     assert!(
-        top.contains("APPEARANCE"),
-        "the first band header is back on screen at the top:\n{top}"
+        top.contains("on mismatch"),
+        "the focused row stays in view without jumping to the top:\n{top}"
     );
     assert!(
         !top.contains("extra usage spent"),
@@ -1594,6 +2356,206 @@ fn the_home_tab_row_wraps_between_chips_at_a_narrow_pane() {
     );
 }
 
+/// At 80 columns the Setup pane holds 52 cells: the `model` cycle with `fable`
+/// picked breaks before `haiku` onto a line indented to the value column
+/// instead of cutting `haiku` mid-word.
+#[test]
+fn the_setup_model_row_wraps_between_options_at_80_columns() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::testutil::key;
+    use crate::tui::app::Tab;
+    use ratatui::crossterm::event::KeyCode;
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Setup;
+    for k in [
+        KeyCode::Enter,
+        KeyCode::Down,
+        KeyCode::Down,
+        KeyCode::Char(' '),
+    ] {
+        crate::tui::app::handle_key(&mut app, key(k));
+    }
+    let out = dump(&app, 80, 32);
+    assert_eq!(
+        detail_block(&out, "model ", 2, 3),
+        [
+            "❯ model           default  [fable]  opus  sonnet",
+            "                  haiku  opusplan",
+            "  + login",
+        ],
+        "{out}"
+    );
+}
+
+/// A preset ladder with a custom value and its `default:` reminder wraps the
+/// way the run does: the custom value stays on the run's line while it fits
+/// whole, and the reminder opens its own line at the value column.
+#[test]
+fn a_config_ladder_row_wraps_its_custom_value_and_reminder() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::tui::app::{GLOBAL_CONFIG_ROWS, GlobalConfigRow, Tab};
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            refresh_interval_ms: 45_000,
+            ..AppState::default()
+        },
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::RefreshInterval)
+        .expect("refresh row");
+    let out = dump(&app, 60, 40);
+    assert_eq!(
+        detail_block(&out, "refresh ", 2, 2),
+        [
+            "❯ refresh            15s  30s  60s  90s  120s  300s  45s",
+            "                     default: 90s",
+        ],
+        "{out}"
+    );
+}
+
+/// The fit counts the active option's bracket pair whether or not the row holds
+/// the cursor, so focus never moves a break: at 17 cells the blurred run
+/// `aa  bb  cc` would fit on one line, but the focused `aa  [bb]  cc` would
+/// not, and both break before `cc`.
+#[test]
+fn a_cycle_row_breaks_at_the_same_option_focused_or_not() {
+    use super::panes::cycle_row_lines;
+    use ratatui::text::{Line, Span};
+    let lead = || vec![Span::raw("  "), Span::raw("key  ")];
+    let options = [("aa", false), ("bb", true), ("cc", false)];
+    let text = |lines: Vec<Line<'static>>| -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    };
+    assert_eq!(
+        text(cycle_row_lines(lead(), &options, None, None, false, 17)),
+        ["  key  aa  bb", "       cc"]
+    );
+    assert_eq!(
+        text(cycle_row_lines(lead(), &options, None, None, true, 17)),
+        ["  key  aa  [bb]", "       cc"]
+    );
+}
+
+/// Fits count screen cells, not chars: `中中中` is 3 chars but 6 cells, so at
+/// 14 cells it cannot join `aa` (9 + 2 + 6 = 17) and opens its own line.
+#[test]
+fn a_cycle_row_measures_wide_glyphs_in_cells() {
+    use super::panes::cycle_row_lines;
+    use ratatui::text::Span;
+    let lines = cycle_row_lines(
+        vec![Span::raw("  "), Span::raw("key  ")],
+        &[("aa", false)],
+        Some(("中中中", true)),
+        None,
+        false,
+        14,
+    );
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(text, ["  key  aa", "       中中中"]);
+
+    // Each word of the value is measured too: `中中` is 4 cells, so the second
+    // cannot join the first (7 + 4 + 1 + 4 = 16 > 14).
+    let lines = cycle_row_lines(
+        vec![Span::raw("  "), Span::raw("key  ")],
+        &[("aa", false)],
+        Some(("中中 中中", true)),
+        None,
+        false,
+        14,
+    );
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(text, ["  key  aa", "       中中", "       中中"]);
+}
+
+/// An appended value too wide for the value column drops alone to its own line
+/// under the label; the options keep the value column. At 14 cells `key`'s
+/// value column holds 7 cells, the 10-cell custom value cannot sit there, and
+/// `aa  bb` still can.
+#[test]
+fn a_custom_value_too_wide_for_the_value_column_drops_alone() {
+    use super::panes::cycle_row_lines;
+    use ratatui::text::Span;
+    let lines = cycle_row_lines(
+        vec![Span::raw("  "), Span::raw("key  ")],
+        &[("aa", false), ("bb", false)],
+        Some(("abcdefghij", true)),
+        None,
+        false,
+        14,
+    );
+    let text: Vec<String> = lines
+        .iter()
+        .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+        .collect();
+    assert_eq!(text, ["  key  aa  bb", "  abcdefghij"]);
+
+    // The boundary, in cells: a 7-cell value exactly fills the value column
+    // (7 + 7 = 14) and stays there; `中中中中` is 4 chars but 8 cells and drops.
+    for (value, want) in [
+        ("abcdefg", ["  key  aa  bb", "       abcdefg"]),
+        ("中中中中", ["  key  aa  bb", "  中中中中"]),
+    ] {
+        let lines = cycle_row_lines(
+            vec![Span::raw("  "), Span::raw("key  ")],
+            &[("aa", false), ("bb", false)],
+            Some((value, true)),
+            None,
+            false,
+            14,
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(text, want, "{value}");
+    }
+}
+
+/// The Setup `model` row with a custom id wider than its value column: the
+/// presets wrap at the value column and the id alone drops under the label.
+#[test]
+fn the_setup_model_row_drops_only_a_long_custom_id_under_its_label() {
+    let _home = crate::testutil::HomeSandbox::new();
+    use crate::testutil::key;
+    use crate::tui::app::Tab;
+    use ratatui::crossterm::event::KeyCode;
+    let mut app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: Vec::new(),
+    });
+    app.tab = Tab::Setup;
+    crate::tui::app::handle_key(&mut app, key(KeyCode::Enter));
+    if let Some(d) = app.config_draft.as_mut() {
+        d.model = crate::tui::app::InputState::new("us.anthropic.claude-opus-4-1-20250805-v1:0");
+    }
+    let out = dump(&app, 80, 32);
+    assert_eq!(
+        detail_block(&out, "model ", 2, 3),
+        [
+            "  model           default  fable  opus  sonnet",
+            "                  haiku  opusplan",
+            "  us.anthropic.claude-opus-4-1-20250805-v1:0",
+        ],
+        "{out}"
+    );
+}
+
 /// The block-vs-row scroll rule, pinned off the pure function instead of live
 /// hint copy: the screen test above only discriminates while some real hint
 /// happens to wrap past the viewport, so rewording one silently retires it.
@@ -1611,6 +2573,17 @@ fn scroll_offset_keeps_the_whole_focused_block_on_screen() {
     assert_eq!(scroll_offset(12, 20, (8, 11)), 0);
     // A block already on screen without scrolling stays put.
     assert_eq!(scroll_offset(30, 20, (2, 5)), 0);
+}
+
+#[test]
+fn form_scroll_follows_without_repinning_and_clamps_wrapped_blocks() {
+    use super::panes::follow_scroll_offset;
+    assert_eq!(follow_scroll_offset(30, 10, (15, 16), 10), 10);
+    assert_eq!(follow_scroll_offset(30, 10, (16, 17), 10), 10);
+    assert_eq!(follow_scroll_offset(30, 10, (7, 8), 10), 4);
+    assert_eq!(follow_scroll_offset(30, 10, (18, 22), 10), 15);
+    assert_eq!(follow_scroll_offset(40, 10, (5, 30), 0), 5);
+    assert_eq!(follow_scroll_offset(8, 10, (7, 8), 20), 0);
 }
 
 /// End-to-end wiring for the reset-display setting (issue #39). The formatters
@@ -3234,4 +4207,947 @@ fn a_mid_list_add_candidate_keeps_its_whole_note_on_screen() {
             .any(|r| r.starts_with("  c")),
         "precondition: candidates follow the note, so the content end does not pin it:\n{out}"
     );
+}
+
+/// An empty state's hotkey is a key in prose: ACCENT + bold, its action dim.
+#[test]
+fn the_empty_state_hotkey_renders_as_a_key() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let app = App::new(AppConfig {
+        state: AppState::default(),
+        profiles: vec![],
+    });
+    let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    crate::testutil::assert_prose_part(term.backend().buffer(), "n to create one", "n", true);
+}
+
+/// Hand-pinned page landings for the focus-following forms and the Overview
+/// codex band: each literal is derived from the fixture at the drawn size.
+#[test]
+fn forms_and_overview_codex_page_by_hand_pinned_cursors() {
+    use crate::tui::app::{Tab, handle_key};
+    use ratatui::crossterm::event::KeyCode;
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let profiles: Vec<Profile> = (0..25)
+        .map(|i| crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}"))))
+        .collect();
+
+    // Setup detail: the account's action rows at 60x12, page = 4.
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles: profiles.clone(),
+    });
+    app.tab = Tab::Setup;
+    app.profile_cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.config_action_cursor, 4, "setup detail page");
+
+    // Fallback member card: FALLBACK_ROWS at 60x12, page = 2.
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            fallback_chain: profiles.iter().map(|p| p.name.clone()).collect(),
+            ..AppState::default()
+        },
+        profiles: profiles.clone(),
+    });
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 0;
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.fallback_detail_cursor, 2, "fallback card page");
+
+    // Fallback `+ add` picker: 24 candidates at 80x24, page = 17.
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            fallback_chain: vec![profiles[0].name.clone()],
+            ..AppState::default()
+        },
+        profiles: profiles.clone(),
+    });
+    app.tab = Tab::Fallback;
+    app.chain_cursor = 1; // the `+ add` row
+    handle_key(&mut app, crate::testutil::key(KeyCode::Enter));
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.fallback_detail_cursor, 17, "fallback add page");
+
+    // Overview codex band: cursor 22 pages one page across the band to 31.
+    crate::testutil::write_codex_roster(&["cx1", "cx2", "cx3", "cx4", "cx5", "cx6", "cx7", "cx8"]);
+    let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    let mut app = App::new(AppConfig {
+        state: AppState {
+            profiles: names,
+            ..AppState::default()
+        },
+        profiles: profiles.clone(),
+    });
+    app.tab = Tab::Overview;
+    app.overview_cursor = 22;
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
+    assert_eq!(app.overview_cursor, 31, "overview codex page");
+}
+
+/// Which pane to extract: the whole frame, or a pane located by its title
+/// border (the detail pane below `NARROW_BODY_W` stacks vertically, so it must
+/// be found by title, never by a left/right split).
+#[derive(Clone, Copy)]
+enum Pane {
+    Full,
+    Left,
+    Titled(&'static str),
+}
+
+/// The rows of a pane's interior (border cells stripped), read off a rendered
+/// buffer.
+fn pane_rows(rows: &[String], pane: Pane) -> Vec<String> {
+    let grid: Vec<Vec<char>> = rows.iter().map(|r| r.chars().collect()).collect();
+    let (top, x0, x1) = match pane {
+        Pane::Left => {
+            let top = grid.iter().position(|r| r.contains(&'╭')).unwrap();
+            let r = &grid[top];
+            let firsts: Vec<usize> = (0..r.len()).filter(|&x| r[x] == '╭').collect();
+            let ends: Vec<usize> = (0..r.len()).filter(|&x| r[x] == '╮').collect();
+            (top, firsts[0], ends[0])
+        }
+        Pane::Titled(t) => {
+            let top = grid
+                .iter()
+                .position(|r| r.iter().collect::<String>().contains(t))
+                .unwrap();
+            let s: String = grid[top].iter().collect();
+            let tpos = s.find(t).unwrap();
+            let tchar = s[..tpos].chars().count();
+            let x0 = (0..tchar).rev().find(|&x| grid[top][x] == '╭').unwrap();
+            let x1 = (tchar..grid[top].len())
+                .find(|&x| grid[top][x] == '╮')
+                .unwrap();
+            (top, x0, x1)
+        }
+        Pane::Full => {
+            let top = grid.iter().position(|r| r.contains(&'╭')).unwrap();
+            let r = &grid[top];
+            let firsts: Vec<usize> = (0..r.len()).filter(|&x| r[x] == '╭').collect();
+            let ends: Vec<usize> = (0..r.len()).filter(|&x| r[x] == '╮').collect();
+            (top, firsts[0], *ends.last().unwrap())
+        }
+    };
+    let mut out = Vec::new();
+    for row in grid.iter().skip(top + 1) {
+        if row.get(x0) == Some(&'╰') {
+            break;
+        }
+        out.push(row[x0 + 1..x1].iter().collect());
+    }
+    out
+}
+
+/// A pane row normalized for comparison: scrollbar, selection glyphs and the
+/// focused `[value]` brackets stripped, whitespace collapsed.
+fn normalize_row(s: &str) -> String {
+    s.chars()
+        .filter(|c| !"┃┊│❯▌[]".contains(*c))
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The geometry a render publishes: cursor, focused row, scroll offset,
+/// viewport, and the per-row starts / focused ends / focused-tip heights plus
+/// the total line count.
+#[derive(Clone, Debug, PartialEq)]
+struct Geo {
+    cursor: usize,
+    focused: Option<usize>,
+    offset: usize,
+    viewport: usize,
+    starts: Vec<usize>,
+    ends: Vec<usize>,
+    tips: Vec<usize>,
+    total: usize,
+}
+
+/// What a content line is, in the layout its geometry describes.
+#[derive(Clone, Copy, Debug)]
+enum LineKind {
+    /// A band/eyebrow header above the first row.
+    Header(usize),
+    /// The `d`-th line of row `r`'s own body.
+    Own(usize, usize),
+    /// The `j`-th tooltip line of the focused row `r`.
+    Tip(usize, usize),
+    /// A trailing line after row `r`'s body (and tooltip).
+    Trail(usize, usize),
+}
+
+fn line_kind(g: &Geo, l: usize) -> LineKind {
+    if g.starts.is_empty() || l < g.starts[0] {
+        return LineKind::Header(l);
+    }
+    let r = (0..g.starts.len())
+        .rev()
+        .find(|&r| g.starts[r] <= l)
+        .unwrap();
+    let d = l - g.starts[r];
+    let own = g.ends[r]
+        .saturating_sub(g.tips.get(r).copied().unwrap_or(0))
+        .saturating_sub(g.starts[r]);
+    let tip = if g.focused == Some(r) {
+        g.tips.get(r).copied().unwrap_or(0)
+    } else {
+        0
+    };
+    if d < own {
+        LineKind::Own(r, d)
+    } else if d < own + tip {
+        LineKind::Tip(r, d - own)
+    } else {
+        LineKind::Trail(r, d - own - tip)
+    }
+}
+
+/// Map a line's kind from the old layout to its absolute line in the new
+/// layout; `None` for a departing tooltip (the row is no longer focused).
+fn map_line(y: &Geo, k: LineKind) -> Option<usize> {
+    match k {
+        LineKind::Header(l) => Some(l),
+        LineKind::Own(r, d) => Some(y.starts[r] + d),
+        LineKind::Tip(r, j) => {
+            if y.focused == Some(r) {
+                let own = y.ends[r]
+                    .saturating_sub(y.tips.get(r).copied().unwrap_or(0))
+                    .saturating_sub(y.starts[r]);
+                Some(y.starts[r] + own + j)
+            } else {
+                None
+            }
+        }
+        LineKind::Trail(r, t) => {
+            let own = y.ends[r]
+                .saturating_sub(y.tips.get(r).copied().unwrap_or(0))
+                .saturating_sub(y.starts[r]);
+            let tip = if y.focused == Some(r) {
+                y.tips.get(r).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            Some(y.starts[r] + own + tip + t)
+        }
+    }
+}
+
+fn is_alnum(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphanumeric())
+}
+
+/// One page case: reach start row `k` (drawing after each key so the view
+/// follows), read the full content in both layouts, and return a failure
+/// string if any content line between the two views is drawn in neither frame,
+/// a row is skipped, or the cursor moves zero/backward.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn classify_case(
+    label: &str,
+    mk: &dyn Fn() -> App,
+    w: u16,
+    h: u16,
+    n: usize,
+    down: bool,
+    k: usize,
+    pane: Pane,
+    geo: &dyn Fn(&App) -> Geo,
+    set_off: &dyn Fn(&App, usize, usize),
+    skip: usize,
+    label0: &'static str,
+) -> Option<String> {
+    use crate::tui::app::handle_key;
+    use ratatui::crossterm::event::KeyCode;
+    let mut app = mk();
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let step = if down { KeyCode::Down } else { KeyCode::Up };
+    let presses = if down {
+        k
+    } else if k == 0 {
+        0
+    } else {
+        n - k
+    };
+    for _ in 0..presses {
+        handle_key(&mut app, crate::testutil::key(step));
+        term.draw(|f| super::draw(f, &app)).unwrap();
+    }
+    // The full content in a layout: render tall (offset 0, every line fits) and
+    // read the pane's interior, restoring the real geometry afterwards.
+    let full = |app: &App, g: &Geo| -> Vec<String> {
+        set_off(app, 0, 1);
+        let mut tall = Terminal::new(TestBackend::new(w, 300)).unwrap();
+        tall.draw(|f| super::draw(f, app)).unwrap();
+        let rows = pane_rows(&crate::testutil::buffer_rows(tall.backend().buffer()), pane);
+        set_off(app, g.offset, g.viewport);
+        rows.into_iter()
+            .skip(skip)
+            .take(g.total)
+            .map(|r| normalize_row(&r))
+            .collect()
+    };
+    let gb = geo(&app);
+    let fb = full(&app, &gb);
+    if !fb.get(gb.starts[0]).is_some_and(|l| l.contains(label0)) {
+        return Some(format!(
+            "{label} {w}x{h} align: fb[starts[0]]={:?} lacks {label0:?}",
+            fb.get(gb.starts[0])
+        ));
+    }
+    handle_key(
+        &mut app,
+        crate::testutil::key(if down {
+            KeyCode::PageDown
+        } else {
+            KeyCode::PageUp
+        }),
+    );
+    term.draw(|f| super::draw(f, &app)).unwrap();
+    let ga = geo(&app);
+    let fa = full(&app, &ga);
+    let (o0, v0, o1, v1) = (gb.offset, gb.viewport, ga.offset, ga.viewport);
+    let in_a = |l: usize| l >= o1 && l < o1 + v1;
+
+    // A content line between the two views that is drawn in neither frame.
+    let mut undrawn: Vec<String> = Vec::new();
+    for (l, row) in fb.iter().enumerate() {
+        let in_b = l >= o0 && l < o0 + v0;
+        if in_b || !is_alnum(row) {
+            continue;
+        }
+        let between = if down { l >= o0 + v0 } else { l < o0 };
+        if !between {
+            continue;
+        }
+        let kd = line_kind(&gb, l);
+        let m = map_line(&ga, kd);
+        let drawn_a = m.is_some_and(in_a);
+        let is_between_a = match m {
+            Some(x) => {
+                if down {
+                    x < o1
+                } else {
+                    x >= o1 + v1
+                }
+            }
+            None => true,
+        };
+        if !drawn_a && is_between_a {
+            undrawn.push(format!("{}[{kd:?}]", row));
+        }
+    }
+    // A newly-focused row's tooltip line that the new frame does not draw.
+    for (l, row) in fa.iter().enumerate() {
+        if let LineKind::Tip(r, _) = line_kind(&ga, l)
+            && gb.focused != Some(r)
+            && !in_a(l)
+            && is_alnum(row)
+        {
+            undrawn.push(format!("{}[new tip r{r}]", row));
+        }
+    }
+    // Row-level skips (a row start drawn in neither frame) and wrong moves.
+    let vis_b: Vec<usize> = (0..gb.starts.len())
+        .filter(|&r| gb.starts[r] >= o0 && gb.starts[r] < o0 + v0)
+        .collect();
+    let vis_a: Vec<usize> = (0..ga.starts.len())
+        .filter(|&r| ga.starts[r] >= o1 && ga.starts[r] < o1 + v1)
+        .collect();
+    let skipped: Vec<usize> = if down {
+        let hi = vis_b.iter().max().copied().unwrap_or(0);
+        let lo = vis_a.iter().min().copied().unwrap_or(usize::MAX);
+        (0..ga.starts.len()).filter(|&r| r > hi && r < lo).collect()
+    } else {
+        let lo = vis_b.iter().min().copied().unwrap_or(0);
+        let hi = vis_a.iter().max().copied().unwrap_or(0);
+        (0..ga.starts.len()).filter(|&r| r < lo && r > hi).collect()
+    };
+    let last = gb.starts.len().saturating_sub(1);
+    let wrong = if down {
+        ga.cursor < gb.cursor || (gb.cursor < last && ga.cursor == gb.cursor)
+    } else {
+        ga.cursor > gb.cursor || (gb.cursor > 0 && ga.cursor == gb.cursor)
+    };
+    if undrawn.is_empty() && skipped.is_empty() && !wrong {
+        return None;
+    }
+    let dir = if down { "PgDn" } else { "PgUp" };
+    Some(format!(
+        "{label} {w}x{h} {dir} start={k}: cursor {}->{} offset {o0}->{o1} v {v0} undrawn={undrawn:?} skipped={skipped:?} wrong={wrong}",
+        gb.cursor, ga.cursor
+    ))
+}
+
+/// The line-level ruling over the tooltip forms: every content line (a row's
+/// own lines, a wrapped continuation, a tooltip) between the first and last
+/// line drawn in either frame is drawn in the old or the new frame — nothing
+/// skipped unseen. Every start row, both directions, at the sizes the
+/// reviewers walked.
+#[test]
+fn page_never_skips_content() {
+    use crate::tui::app::{FALLBACK_ROWS, FallbackFocus, Tab, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut fails: Vec<String> = Vec::new();
+
+    // Config.
+    let mk = || {
+        let mut a = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        a.tab = Tab::Config;
+        a
+    };
+    let geo = |a: &App| Geo {
+        cursor: a.global_config_cursor,
+        focused: Some(a.global_config_cursor.min(19)),
+        offset: a.global_config_offset.get(),
+        viewport: a.global_config_viewport.get(),
+        starts: a.global_config_row_starts.borrow().clone(),
+        ends: a.global_config_block_ends.borrow().clone(),
+        tips: a.global_config_tips.borrow().clone(),
+        total: a.global_config_total.get(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        a.global_config_offset.set(o);
+        a.global_config_viewport.set(v);
+    };
+    for (w, h) in [(80u16, 24u16), (40, 24), (50, 14), (80, 14)] {
+        for down in [true, false] {
+            for k in 0..20 {
+                if let Some(s) = classify_case(
+                    "config",
+                    &mk,
+                    w,
+                    h,
+                    20,
+                    down,
+                    k,
+                    Pane::Full,
+                    &geo,
+                    &set,
+                    0,
+                    "theme",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Setup detail.
+    let mk = || {
+        let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+        let mut a = App::new(AppConfig {
+            state: AppState {
+                active_profile: Some("uwuclxdy".into()),
+                profiles: vec!["uwuclxdy".into()],
+                ..AppState::default()
+            },
+            profiles,
+        });
+        a.tab = Tab::Setup;
+        a.config_focus = ConfigFocus::Actions;
+        a
+    };
+    let n = config_rows(&mk()).len();
+    let geo = |a: &App| Geo {
+        cursor: a.config_action_cursor,
+        focused: Some(a.config_action_cursor),
+        offset: a.setup_detail_offset.get(),
+        viewport: a.setup_detail_viewport.get(),
+        starts: a.setup_detail_row_starts.borrow().clone(),
+        ends: a.setup_detail_block_ends.borrow().clone(),
+        tips: a.setup_detail_tips.borrow().clone(),
+        total: a.setup_detail_total.get(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        a.setup_detail_offset.set(o);
+        a.setup_detail_viewport.set(v);
+    };
+    for (w, h) in [(80u16, 24u16), (60, 12), (60, 16), (40, 20)] {
+        for down in [true, false] {
+            for k in 0..n {
+                if let Some(s) = classify_case(
+                    "setup",
+                    &mk,
+                    w,
+                    h,
+                    n,
+                    down,
+                    k,
+                    Pane::Titled("─ uwuclxdy "),
+                    &geo,
+                    &set,
+                    0,
+                    "name",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Fallback member card.
+    let mk = || {
+        let profiles = vec![oauth("uwuclxdy", 42.0, 18.0, true)];
+        let mut a = App::new(AppConfig {
+            state: AppState {
+                active_profile: Some("uwuclxdy".into()),
+                profiles: vec!["uwuclxdy".into()],
+                fallback_chain: vec!["uwuclxdy".into()],
+                ..AppState::default()
+            },
+            profiles,
+        });
+        a.tab = Tab::Fallback;
+        a.fallback_focus = FallbackFocus::Detail;
+        a
+    };
+    let geo = |a: &App| Geo {
+        cursor: a.fallback_detail_cursor,
+        focused: Some(a.fallback_detail_cursor),
+        offset: a.fallback_detail_offset.get(),
+        viewport: a.fallback_detail_viewport.get(),
+        starts: a.fallback_detail_row_starts.borrow().clone(),
+        ends: a.fallback_detail_block_ends.borrow().clone(),
+        tips: a.fallback_detail_tips.borrow().clone(),
+        total: a.fallback_detail_total.get(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        a.fallback_detail_offset.set(o);
+        a.fallback_detail_viewport.set(v);
+    };
+    for (w, h) in [(80u16, 24u16), (40, 24), (60, 16), (60, 12)] {
+        for down in [true, false] {
+            for k in 0..FALLBACK_ROWS.len() {
+                if let Some(s) = classify_case(
+                    "fallback",
+                    &mk,
+                    w,
+                    h,
+                    FALLBACK_ROWS.len(),
+                    down,
+                    k,
+                    Pane::Titled("─ uwuclxdy "),
+                    &geo,
+                    &set,
+                    0,
+                    "rotate at",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Fallback `+ add` picker with day-list candidates (even accounts keep a
+    // preferred-days list, so they carry a focused tooltip).
+    let mk = || {
+        let profiles: Vec<Profile> = (0..30)
+            .map(|i| {
+                let mut p =
+                    crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}")));
+                if i % 2 == 0 {
+                    p.preferred_days = vec![chrono::Weekday::Mon, chrono::Weekday::Tue];
+                }
+                p
+            })
+            .collect();
+        let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+        let mut a = App::new(AppConfig {
+            state: AppState {
+                profiles: names,
+                ..AppState::default()
+            },
+            profiles,
+        });
+        a.tab = Tab::Fallback;
+        a.fallback_focus = FallbackFocus::Detail;
+        a.chain_cursor = 0; // the `+ add` row on an empty chain
+        a
+    };
+    let geo = |a: &App| Geo {
+        cursor: a.fallback_detail_cursor,
+        focused: Some(a.fallback_detail_cursor),
+        offset: a.fallback_detail_offset.get(),
+        viewport: a.fallback_detail_viewport.get(),
+        starts: a.fallback_detail_row_starts.borrow().clone(),
+        ends: a.fallback_detail_block_ends.borrow().clone(),
+        tips: a.fallback_detail_tips.borrow().clone(),
+        total: a.fallback_detail_total.get(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        a.fallback_detail_offset.set(o);
+        a.fallback_detail_viewport.set(v);
+    };
+    for (w, h) in [(80u16, 24u16), (60, 12), (40, 20)] {
+        for down in [true, false] {
+            for k in 0..30 {
+                if let Some(s) = classify_case(
+                    "add",
+                    &mk,
+                    w,
+                    h,
+                    30,
+                    down,
+                    k,
+                    Pane::Titled("─ ADD TO CHAIN "),
+                    &geo,
+                    &set,
+                    0,
+                    "acct-00",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Status two-line incident list.
+    let mk = || {
+        let mut a = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        let template = demo_incidents().remove(0);
+        a.status.incidents = (0..30)
+            .map(|i| {
+                let mut x = template.clone();
+                x.title = format!("incident-{i:02}");
+                x
+            })
+            .collect();
+        a.tab = Tab::Status;
+        a
+    };
+    let geo = |a: &App| Geo {
+        cursor: a.status.cursor,
+        focused: Some(a.status.cursor),
+        offset: a.status.selector.offset.get(),
+        viewport: a.status.selector.viewport.get(),
+        starts: a.status.selector.starts.borrow().clone(),
+        ends: a.status.selector.block_ends.borrow().clone(),
+        tips: a.status.selector.tips.borrow().clone(),
+        total: a.status.selector.total.get(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        a.status.selector.offset.set(o);
+        a.status.selector.viewport.set(v);
+    };
+    for (w, h) in [(80u16, 24u16), (80, 15), (80, 18)] {
+        for down in [true, false] {
+            for k in 0..30 {
+                if let Some(s) = classify_case(
+                    "status",
+                    &mk,
+                    w,
+                    h,
+                    30,
+                    down,
+                    k,
+                    Pane::Left,
+                    &geo,
+                    &set,
+                    0,
+                    "incident-00",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Overview with a codex band.
+    let mk = || {
+        let profiles: Vec<Profile> = (0..10)
+            .map(|i| crate::testutil::blank_profile(&ProfileName::from(format!("acct-{i:02}"))))
+            .collect();
+        let names: Vec<ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+        let mut a = App::new(AppConfig {
+            state: AppState {
+                profiles: names,
+                ..AppState::default()
+            },
+            profiles,
+        });
+        a.codex_rows = (0..10)
+            .map(|i| crate::tui::app::CodexRow {
+                name: ProfileName::from(format!("cx-{i:02}")),
+                active: false,
+                broken: false,
+                plan: None,
+                five_hour: None,
+                seven_day: None,
+                resets: None,
+            })
+            .collect();
+        a.tab = Tab::Overview;
+        a
+    };
+    let geo = |a: &App| Geo {
+        cursor: a.overview_cursor,
+        focused: Some(a.overview_cursor),
+        offset: a.overview_selector.offset.get(),
+        viewport: a.overview_selector.viewport.get(),
+        starts: a.overview_selector.starts.borrow().clone(),
+        ends: a.overview_selector.block_ends.borrow().clone(),
+        tips: a.overview_selector.tips.borrow().clone(),
+        total: a.overview_selector.total.get(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        a.overview_selector.offset.set(o);
+        a.overview_selector.viewport.set(v);
+    };
+    for (w, h) in [(80u16, 24u16), (80, 16)] {
+        for down in [true, false] {
+            for k in 0..20 {
+                if let Some(s) = classify_case(
+                    "overview",
+                    &mk,
+                    w,
+                    h,
+                    20,
+                    down,
+                    k,
+                    Pane::Full,
+                    &geo,
+                    &set,
+                    1,
+                    "acct-00",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Divergence target picker with wrapped option names.
+    let mk = || {
+        let mut a = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        a.tab = Tab::Overview;
+        a.modals.push(crate::tui::app::Modal::DivergenceTarget(
+            crate::tui::app::DivergenceTargetForm {
+                targets: (0..30)
+                    .map(|i| format!("a-rather-long-account-name-number-{i:02}"))
+                    .collect(),
+                cursor: 0,
+                scroll: std::cell::Cell::new(0),
+                viewport: std::cell::Cell::new(0),
+                starts: std::cell::RefCell::new(Vec::new()),
+                block_ends: std::cell::RefCell::new(Vec::new()),
+                total: std::cell::Cell::new(0),
+            },
+        ));
+        a
+    };
+    let geo = |a: &App| match a.modals.last() {
+        Some(crate::tui::app::Modal::DivergenceTarget(f)) => Geo {
+            cursor: f.cursor,
+            focused: Some(f.cursor),
+            offset: f.scroll.get(),
+            viewport: f.viewport.get(),
+            starts: f.starts.borrow().clone(),
+            ends: f.block_ends.borrow().clone(),
+            tips: Vec::new(),
+            total: f.total.get(),
+        },
+        _ => panic!(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        if let Some(crate::tui::app::Modal::DivergenceTarget(f)) = a.modals.last() {
+            f.scroll.set(o);
+            f.viewport.set(v);
+        }
+    };
+    for (w, h) in [(36u16, 20u16), (30, 16), (80, 14)] {
+        for down in [true, false] {
+            for k in 0..31 {
+                if let Some(s) = classify_case(
+                    "divtarget",
+                    &mk,
+                    w,
+                    h,
+                    31,
+                    down,
+                    k,
+                    Pane::Titled("SAVE LOGIN"),
+                    &geo,
+                    &set,
+                    1,
+                    "new account",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Preset picker with wrapped option names.
+    let mk = || {
+        let mut a = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        a.tab = Tab::Overview;
+        a.modals.push(crate::tui::app::Modal::PresetPicker(
+            crate::tui::app::PresetPickerForm {
+                target: "work".into(),
+                presets: (0..24)
+                    .map(|i| crate::presets::Preset {
+                        name: format!("a-rather-long-preset-name-number-{i:02}"),
+                        base_url: None,
+                        models: Default::default(),
+                        builtin: false,
+                    })
+                    .collect(),
+                cursor: 0,
+                scroll: std::cell::Cell::new(0),
+                viewport: std::cell::Cell::new(0),
+                starts: std::cell::RefCell::new(Vec::new()),
+                block_ends: std::cell::RefCell::new(Vec::new()),
+                total: std::cell::Cell::new(0),
+            },
+        ));
+        a
+    };
+    let geo = |a: &App| match a.modals.last() {
+        Some(crate::tui::app::Modal::PresetPicker(f)) => Geo {
+            cursor: f.cursor,
+            focused: Some(f.cursor),
+            offset: f.scroll.get(),
+            viewport: f.viewport.get(),
+            starts: f.starts.borrow().clone(),
+            ends: f.block_ends.borrow().clone(),
+            tips: Vec::new(),
+            total: f.total.get(),
+        },
+        _ => panic!(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        if let Some(crate::tui::app::Modal::PresetPicker(f)) = a.modals.last() {
+            f.scroll.set(o);
+            f.viewport.set(v);
+        }
+    };
+    for (w, h) in [(60u16, 14u16), (60, 20)] {
+        for down in [true, false] {
+            for k in 0..24 {
+                if let Some(s) = classify_case(
+                    "preset",
+                    &mk,
+                    w,
+                    h,
+                    24,
+                    down,
+                    k,
+                    Pane::Titled("PRESET"),
+                    &geo,
+                    &set,
+                    1,
+                    "preset-name-number-00",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    // Action menu with a group rule line.
+    let mk = || {
+        use crate::tui::app::{ActionItem, ActionMenuAction, ActionMenuState};
+        let mut a = App::new(AppConfig {
+            state: AppState::default(),
+            profiles: Vec::new(),
+        });
+        a.tab = Tab::Overview;
+        a.modals
+            .push(crate::tui::app::Modal::ActionMenu(ActionMenuState {
+                items: (0..30)
+                    .map(|_| ActionItem {
+                        label: "reload stats",
+                        hotkey: None,
+                        action: ActionMenuAction::ReloadTokenStats,
+                    })
+                    .collect(),
+                scoped_len: 12,
+                context: None,
+                cursor: 0,
+                scroll: std::cell::Cell::new(0),
+                viewport: std::cell::Cell::new(0),
+                starts: std::cell::RefCell::new(Vec::new()),
+                block_ends: std::cell::RefCell::new(Vec::new()),
+                total: std::cell::Cell::new(0),
+            }));
+        a
+    };
+    let geo = |a: &App| match a.modals.last() {
+        Some(crate::tui::app::Modal::ActionMenu(f)) => Geo {
+            cursor: f.cursor,
+            focused: Some(f.cursor),
+            offset: f.scroll.get(),
+            viewport: f.viewport.get(),
+            starts: f.starts.borrow().clone(),
+            ends: f.block_ends.borrow().clone(),
+            tips: Vec::new(),
+            total: f.total.get(),
+        },
+        _ => panic!(),
+    };
+    let set = |a: &App, o: usize, v: usize| {
+        if let Some(crate::tui::app::Modal::ActionMenu(f)) = a.modals.last() {
+            f.scroll.set(o);
+            f.viewport.set(v);
+        }
+    };
+    for (w, h) in [(60u16, 20u16), (60, 14)] {
+        for down in [true, false] {
+            for k in 0..30 {
+                if let Some(s) = classify_case(
+                    "menu",
+                    &mk,
+                    w,
+                    h,
+                    30,
+                    down,
+                    k,
+                    Pane::Titled("ACTIONS"),
+                    &geo,
+                    &set,
+                    1,
+                    "reload stats",
+                ) {
+                    fails.push(s);
+                }
+            }
+        }
+    }
+
+    assert!(fails.is_empty(), "content skips:\n{}", fails.join("\n"));
 }

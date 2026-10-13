@@ -199,6 +199,7 @@ fn account_type_label_keeps_every_known_tier() {
                 tier,
                 subscription_status: None,
                 codex_plan: None,
+                email: None,
             }),
             ..Default::default()
         })

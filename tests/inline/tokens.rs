@@ -18,6 +18,164 @@ fn make_claude_dir(sandbox: &HomeSandbox) -> std::path::PathBuf {
     dir
 }
 
+#[test]
+fn transcript_placeholder_models_keep_messages_without_token_buckets() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    let path = project.join("session.jsonl");
+    std::fs::write(
+        &path,
+        [
+            jsonl_line("2026-06-11T10:00:00+00:00", "<synthetic>", 0, 0, 0, 0),
+            jsonl_line("2026-06-11T10:01:00+00:00", "claude-opus-4", 120, 30, 0, 0),
+            jsonl_line(
+                "2026-06-11T10:02:00+00:00",
+                "model<placeholder>",
+                4,
+                3,
+                0,
+                0,
+            ),
+            jsonl_line(
+                "2026-06-11T10:03:00+00:00",
+                "minimax/minimax-m3:free",
+                8,
+                2,
+                0,
+                0,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(stats.total_messages, 4);
+    assert_eq!(
+        stats
+            .models
+            .iter()
+            .map(|m| m.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude-opus-4", "minimax/minimax-m3:free"]
+    );
+    assert_eq!(stats.daily.len(), 1);
+    assert_eq!(stats.daily[0].date, "2026-06-11");
+    assert_eq!(stats.daily[0].tokens, 160);
+    assert_eq!(
+        stats
+            .daily_models
+            .iter()
+            .map(|m| m.model.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude-opus-4", "minimax/minimax-m3:free"]
+    );
+    assert_eq!(stats.total_input, 128);
+    assert_eq!(stats.total_output, 32);
+    let weekly = period_models(&stats.daily_models, "2026-06-08", "2026-06-14");
+    assert_eq!(weekly.len(), 2);
+    assert_eq!(
+        weekly.iter().map(|m| m.model.as_str()).collect::<Vec<_>>(),
+        vec!["claude-opus-4", "minimax/minimax-m3:free"]
+    );
+}
+
+#[test]
+fn todays_placeholder_keeps_the_message_and_no_today_model() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    let date = today_date();
+    std::fs::write(
+        project.join("session.jsonl"),
+        [
+            jsonl_line(&format!("{date}T10:00:00+00:00"), "<synthetic>", 0, 0, 0, 0),
+            jsonl_line(
+                &format!("{date}T10:01:00+00:00"),
+                "minimax/minimax-m3:free",
+                8,
+                2,
+                0,
+                0,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    let today = stats.today.expect("today summary");
+    assert_eq!(today.messages, 2);
+    assert_eq!(today.models.len(), 1);
+    assert_eq!(today.models[0].model, "minimax/minimax-m3:free");
+    assert_eq!((today.input, today.output), (8, 2));
+}
+
+#[test]
+fn placeholder_streamed_deltas_count_as_one_message() {
+    let sb = HomeSandbox::new();
+    let claude_dir = make_claude_dir(&sb);
+    write_stats_cache(
+        &claude_dir,
+        r#"{"lastComputedDate":"2026-06-10","totalSessions":0,"totalMessages":0,"dailyActivity":[],"dailyModelTokens":[],"modelUsage":{},"hourCounts":{}}"#,
+    );
+    let project = claude_dir.join("projects/p1");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(
+        project.join("session.jsonl"),
+        [
+            streamed_line(
+                "2026-06-11T10:00:00+00:00",
+                "msg_1",
+                "u1",
+                "<synthetic>",
+                0,
+                0,
+            ),
+            streamed_line(
+                "2026-06-11T10:00:01+00:00",
+                "msg_1",
+                "u2",
+                "<synthetic>",
+                0,
+                0,
+            ),
+        ]
+        .join("\n"),
+    )
+    .expect("write transcript");
+    let stats = load(&claude_dir).expect("load stats");
+    assert_eq!(stats.total_messages, 1);
+    assert!(stats.models.is_empty());
+    assert!(stats.daily_models.is_empty());
+}
+
+#[test]
+fn transcript_usage_without_a_model_keeps_unknown_bucket() {
+    let sb = HomeSandbox::new();
+    let dir = make_claude_dir(&sb);
+    let path = dir.join("unknown.jsonl");
+    std::fs::write(
+        &path,
+        r#"{"timestamp":"2026-06-11T12:00:00+00:00","message":{"usage":{"input_tokens":3,"output_tokens":1}}}"#,
+    )
+    .expect("write transcript");
+    let records = parse_file(&path);
+    assert_eq!(records.len(), 1);
+    assert!(records[0].has_usage);
+    assert_eq!(records[0].model, "unknown");
+    assert_eq!((records[0].input, records[0].output), (3, 1));
+}
+
 // ── 1. base stats parsing ─────────────────────────────────────────────────────
 
 #[test]

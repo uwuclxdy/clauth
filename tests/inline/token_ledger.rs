@@ -33,6 +33,43 @@ fn base_with(days: &[(&str, ModelTokens)]) -> TokenStats {
     b
 }
 
+#[test]
+fn loading_ledger_discards_placeholder_models_and_keeps_real_splits() {
+    let sb = crate::testutil::HomeSandbox::new();
+    let dir = sb.home().join(".clauth");
+    std::fs::create_dir_all(&dir).expect("create ledger dir");
+    std::fs::write(
+        dir.join("token_ledger.json"),
+        r#"{"recorded_through":"2026-06-16","days":{"2026-06-16":{"<synthetic>":{"input":0,"output":0,"cache_read":0,"cache_create":0},"model<placeholder>":{"input":3,"output":2,"cache_read":0,"cache_create":0},"minimax/minimax-m3:free":{"input":8,"output":2,"cache_read":4,"cache_create":1,"shape":"no_cache_writes"}}}}"#,
+    )
+    .expect("write ledger");
+    let ledger = Ledger::load(&dir);
+    let mut base = TokenStats::default();
+    ledger.apply_to_base(&mut base, Some("2026-06-01"));
+    assert_eq!(base.models.len(), 1);
+    assert_eq!(base.models[0].model, "minimax/minimax-m3:free");
+    assert_eq!(
+        (
+            base.models[0].input,
+            base.models[0].output,
+            base.models[0].cache_read,
+            base.models[0].cache_create
+        ),
+        (8, 2, 4, 1)
+    );
+    assert_eq!(base.daily_models.len(), 1);
+    assert_eq!(base.daily_models[0].model, "minimax/minimax-m3:free");
+    assert_eq!(base.daily[0].tokens, 10);
+    assert_eq!(
+        base.daily_models[0].split.as_ref().expect("split").shape,
+        crate::tokens::UsageShape::NoCacheWrites
+    );
+    assert_eq!(
+        serde_json::to_value(&ledger).expect("serialize ledger")["days"]["2026-06-16"],
+        serde_json::json!({"minimax/minimax-m3:free": {"input": 8, "output": 2, "cache_read": 4, "cache_create": 1, "shape": "no_cache_writes"}})
+    );
+}
+
 // ── durability ────────────────────────────────────────────────────────────────
 
 /// The core guarantee: a day recorded from transcripts is fully reconstructable

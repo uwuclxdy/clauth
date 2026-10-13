@@ -21,13 +21,13 @@ pub(crate) use codex::fetch_codex_usage;
 pub(crate) use codex::map_usage as map_codex_usage;
 #[allow(unused_imports)]
 pub(crate) use fetch::{
-    ANTHROPIC_ORIGIN, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, LoginProfile, PlanInfo,
-    PlanTier, ScopedWindow, SpendInfo, UsageInfo, UsageWindow, WindowDollars, await_request_slot,
-    cli_user_agent, epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid, five_hour_live,
-    http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs, now_epoch_secs, now_ms,
-    parse_retry_after, parse_retry_after_at, probe_login_profile, seed_login_anchor,
-    seven_day_live, spent_resume_in_secs, window_avg_pace_per_day, window_duration_secs,
-    windows_maxed,
+    ANTHROPIC_ORIGIN, AccountEmail, ExtraPeriod, ExtraUsage, LABEL_5H, LABEL_7D, LoginProfile,
+    PlanInfo, PlanTier, ScopedWindow, SpendInfo, UsageInfo, UsageWindow, WindowDollars,
+    await_request_slot, cli_user_agent, epoch_secs_to_iso, expire_profile_ttl, fetch_account_uuid,
+    five_hour_live, http_agent, humanize_duration, ideal_pace_pct, iso_to_epoch_secs,
+    mark_profile_read_stale, now_epoch_secs, now_ms, parse_retry_after, parse_retry_after_at,
+    probe_login_profile, seed_login_anchor, seven_day_live, spent_resume_in_secs,
+    window_avg_pace_per_day, window_duration_secs, windows_maxed,
 };
 pub(crate) use scheduler::{
     ActivityStore, FetchLeg, FetchStatus, KickBlock, KickBlocks, LastFetchedAt, LegKey,

@@ -10,7 +10,7 @@ The Tokens tab is a dashboard over Claude Code's own token history on this machi
 | `~/.claude/projects/**/*.jsonl` | live session transcripts newer than that rollup |
 | `~/.clauth/token_ledger.json` | clauth's durable per-day record |
 
-Claude Code prunes old transcripts and its rollup freezes at a date, so clauth keeps its own ledger of finalized days. That ledger is what lets the dashboard keep advancing once the transcripts behind it are gone. Days already pruned before the ledger existed are unrecoverable.
+Claude Code prunes old transcripts and its rollup freezes at a date, so clauth keeps its own ledger of finalized days. That ledger is what lets the dashboard keep advancing once the transcripts behind it are gone. Days already pruned before the ledger existed are unrecoverable. Transcript model ids containing `<` or `>` do not contribute token totals or model rows, but their messages still count; previously recorded placeholder model rows are dropped when the ledger loads.
 
 The figures cover **every account sharing this machine's home directory**, since that is what Claude Code's store covers. A `clauth start --isolated` session writes into its own throwaway store, so its usage arrives here only once the run ends and its transcripts are lifted into the global store.
 

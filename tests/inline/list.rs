@@ -48,6 +48,7 @@ fn warm_usage_at(name: &str, five_h: f64, seven_d: f64, fetched_at: Option<u64>)
                 tier: PlanTier::Max(Some(5)),
                 subscription_status: None,
                 codex_plan: None,
+                email: None,
             }),
             five_hour: Some(UsageWindow {
                 utilization: five_h,
@@ -75,7 +76,6 @@ fn table_of(lines: &[&str]) -> String {
 fn future_iso(ahead_secs: i64) -> String {
     crate::usage::epoch_secs_to_iso(crate::usage::now_epoch_secs() + ahead_secs)
 }
-// 42.4 → 42.4%, 17.6 → 17.6%: format_pct drops only trailing `.0`.
 const WORK_ROW: &str = "* work     Max 5x    42.4%    17.6%  -";
 
 #[test]
@@ -150,6 +150,7 @@ fn write_canceled_cache(name: &str) {
                 tier: PlanTier::Free,
                 subscription_status: Some("canceled".to_string()),
                 codex_plan: None,
+                email: None,
             }),
             ..Default::default()
         },
@@ -934,21 +935,38 @@ fn render(config: &AppConfig) -> String {
 }
 
 /// The codex roster renders as its own section under the claude table, off the
-/// entries `status --json` appends. Every column is sized over BOTH sections,
-/// in both directions: the codex name, plan and 7d cell are wider than every
-/// claude one and widen the claude rows, and the claude 5h cell, wider than
-/// its own header, widens the codex rows. The roster is out of name order and
-/// the codex rows keep its order. The codex rows carry no ENDPOINT cell, and
-/// each section marks its own active profile.
+/// entries `status --json` appends. Both sections share column widths: the
+/// longer codex name and plan widen the claude rows, while the claude provider's
+/// amount cells widen both usage columns in the codex rows. Percentages align
+/// under those wider headers after rounding. The codex rows keep roster order,
+/// carry no ENDPOINT cell, and mark their own active profile.
 #[test]
 fn list_table_prints_the_codex_roster_as_its_own_section_under_the_claude_table() {
     let _home = HomeSandbox::new();
+    let url = "https://api.z.ai/api/anthropic";
+    let mut zai = Profile::new("z".to_string(), Some(url.to_string()), Some("k".into()));
+    zai.provider = crate::providers::Provider::from_base_url(url);
     let mut config = AppConfig {
         state: AppState::default(),
-        profiles: vec![oauth("work"), oauth("idle")],
+        profiles: vec![oauth("work"), oauth("idle"), zai],
     };
     config.state.active_profile = Some("work".into());
     warm_usage("work", 42.4567, 17.6);
+    crate::testutil::register_names(&["z"]);
+    let mut stats: crate::providers::ThirdPartyStats =
+        serde_json::from_slice(&crate::testutil::reanchored_bars_cache_bytes(
+            crate::testutil::THIRD_PARTY_BARS_CACHE_BYTES,
+        ))
+        .unwrap();
+    stats.bars[0].used = Some(700.0);
+    stats.bars[0].total = Some(1000.0);
+    stats.bars[1].used = Some(2500.0);
+    stats.bars[1].total = Some(2500.0);
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("z"),
+        crate::profile_cache::THIRD_PARTY_CACHE_FILE,
+        &stats,
+    );
     crate::testutil::write_codex_state(
         "active_profile = \"codex-laptop\"\nprofiles = [\"spare\", \"codex-laptop\"]\n",
     );
@@ -958,21 +976,20 @@ fn list_table_prints_the_codex_roster_as_its_own_section_under_the_claude_table(
     assert_eq!(
         render(&config),
         table_of(&[
-            "  PROFILE       PLAN       5H USED   7D USED  ENDPOINT",
-            "* work          Max 5x    42.4567%     17.6%  -",
-            "  idle          Max              -         -  -",
+            "  PROFILE       PLAN         5H USED      7D USED  ENDPOINT",
+            "* work          Max 5x        42.46%        17.6%  -",
+            "  idle          Max                -            -  -",
+            "  z             Z.ai      700 / 1000  2500 / 2500  https://api.z.ai/api/anthropic",
             "",
-            "  CODEX         PLAN       5H USED   7D USED",
-            "  spare         business      3.5%  61.2345%",
-            "* codex-laptop  plus           12%       30%",
+            "  CODEX         PLAN         5H USED      7D USED",
+            "  spare         business        3.5%       61.23%",
+            "* codex-laptop  plus             12%          30%",
         ])
     );
 }
 
-/// The previous fixture with every column's winning side reversed: the claude
-/// name, plan and 7d cell are wider than every codex one and widen the codex
-/// rows, and a codex 5h cell, wider than its own header, widens the claude
-/// row. Across the two, each shared width is pinned from both sections.
+/// The previous fixture's name and plan winners reversed: the longer claude
+/// cells widen the codex section while rounded percentages retain right edges.
 #[test]
 fn list_table_sizes_the_codex_section_off_wider_claude_columns_too() {
     let _home = HomeSandbox::new();
@@ -991,12 +1008,12 @@ fn list_table_sizes_the_codex_section_off_wider_claude_columns_too() {
     assert_eq!(
         render(&config),
         table_of(&[
-            "  PROFILE      PLAN     5H USED   7D USED  ENDPOINT",
-            "* workstation  Max 5x     42.4%  17.6543%  -",
+            "  PROFILE      PLAN    5H USED  7D USED  ENDPOINT",
+            "* workstation  Max 5x    42.4%   17.65%  -",
             "",
-            "  CODEX        PLAN     5H USED   7D USED",
-            "  cx-work      plus    3.25813%       30%",
-            "* cx-home      go           12%       61%",
+            "  CODEX        PLAN    5H USED  7D USED",
+            "  cx-work      plus      3.26%      30%",
+            "* cx-home      go          12%      61%",
         ])
     );
 }
