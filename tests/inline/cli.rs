@@ -3024,6 +3024,28 @@ mod static_token_verdicts {
         assert_eq!(reauth_confirm_object(true, false), "endpoint + API key");
     }
 
+    /// \#116 review: the confirm used to promise only the replace, which is
+    /// true and incomplete. On a profile holding a long-lived sidecar the
+    /// replace reaches `/usage` polling and NOTHING the sessions use, because
+    /// the sidecar outranks `credentials.json` at every switch (CLA-SPLIT, and
+    /// pinned on the behaviour in `actions`'
+    /// `a_reauth_replaces_the_pair_and_leaves_the_session_token_installed`).
+    /// The operator has to read that BEFORE answering, not in the NOTE
+    /// `cmd_login` prints afterwards. One space ahead of the sentence, so it
+    /// joins the object clause without a double space or a missing one.
+    #[test]
+    fn the_reauth_confirm_says_what_a_session_token_does_to_the_login() {
+        assert_eq!(
+            reauth_confirm_session_token_note(true),
+            " Sessions keep running on its long-lived token; this login only feeds usage polling."
+        );
+        assert_eq!(
+            reauth_confirm_session_token_note(false),
+            "",
+            "a profile with no sidecar is promised nothing about one"
+        );
+    }
+
     /// "Name the split state" (owner ruling, 2026-08-30): a quarantined
     /// third-party hybrid's dead chain sits beside a working api key, and the
     /// bail says so instead of prescribing the bare browser login.

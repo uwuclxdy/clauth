@@ -854,14 +854,38 @@ fn reauth_confirm_object(is_api: bool, keeps_endpoint: bool) -> &'static str {
     }
 }
 
-fn confirm_reauth(target: &str, is_api: bool, keeps_endpoint: bool) -> Result<bool> {
+/// What the reauth confirm adds when a long-lived sidecar sits beside the
+/// login (CLA-SPLIT). The replace itself is real: `overwrite_captured_profile`
+/// rewrites `credentials.json`. What it does NOT do is move the sessions, and
+/// nothing in the login path says so before the operator answers: the sidecar
+/// is untouched, and the relink keeps resolving `install_source_path`, which
+/// picks `session-token.json` while [`claude::has_session_token`] holds. So the
+/// fresh pair reaches usage polling and nothing else, which is the same thing
+/// `cmd_login` prints as a NOTE after the fact. Split out like
+/// [`reauth_confirm_object`] so the claim is unit-pinned, and worded as its own
+/// sentence so the object clause keeps naming only what the overwrite replaces.
+fn reauth_confirm_session_token_note(keeps_session_token: bool) -> &'static str {
+    if keeps_session_token {
+        " Sessions keep running on its long-lived token; this login only feeds usage polling."
+    } else {
+        ""
+    }
+}
+
+fn confirm_reauth(
+    target: &str,
+    is_api: bool,
+    keeps_endpoint: bool,
+    keeps_session_token: bool,
+) -> Result<bool> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(true);
     }
     let object = reauth_confirm_object(is_api, keeps_endpoint);
+    let note = reauth_confirm_session_token_note(keeps_session_token);
     out!(
-        "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}. Continue? [y/N] "
+        "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}.{note} Continue? [y/N] "
     );
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
@@ -1320,7 +1344,11 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     let keeps_endpoint = config
         .find(&target)
         .is_some_and(claude::has_own_inference_endpoint);
-    if reauth && !confirm_reauth(&target, is_api, keeps_endpoint)? {
+    // The same gate the NOTE after the login uses, asked before the decision:
+    // the sidecar is what switches install, so on a profile holding one this
+    // login changes what clauth polls and nothing the sessions use.
+    let keeps_session_token = !is_api && claude::has_session_token(&target);
+    if reauth && !confirm_reauth(&target, is_api, keeps_endpoint, keeps_session_token)? {
         outln!("clauth: aborted. '{target}' left unchanged.");
         return Ok(());
     }

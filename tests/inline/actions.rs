@@ -6031,6 +6031,68 @@ fn reauth_overwrite_clears_broken_flag() {
     );
 }
 
+/// \#116 review: what a re-auth does to a profile holding a long-lived session
+/// token, which is what the TTY confirm now says before the operator answers.
+/// The stored pair IS replaced. The sidecar is NOT: no step of the login path
+/// reads or removes it, and the relink resolves `install_source_path`, which
+/// keeps picking `session-token.json` while it is long-lived. So the fresh
+/// login reaches usage polling and the sessions keep running on the token,
+/// which is the whole reason this marker asks for the login at all.
+#[test]
+fn a_reauth_replaces_the_pair_and_leaves_the_session_token_installed() {
+    let _home = HomeSandbox::new();
+
+    let mut profile = Profile::new("split".to_string(), None, None);
+    profile.credentials = Some(oauth_creds("stale-access"));
+    save_profile(&profile).expect("save profile");
+    let name = crate::profile::ProfileName::from("split");
+    // The real writer, so the fixture is the shape `clauth static-token` leaves:
+    // a refresh-less mint, which is what makes it long-lived.
+    crate::claude::write_session_token(&name, "oat-mint", 0).expect("write the sidecar");
+    let sidecar = crate::profile::profile_dir(&name)
+        .expect("profile dir")
+        .join("session-token.json");
+    let before = std::fs::read(&sidecar).expect("read the sidecar");
+
+    let mut config = AppConfig {
+        state: AppState {
+            profiles: vec!["split".into()],
+            active_profile: Some("split".into()),
+            ..AppState::default()
+        },
+        profiles: vec![profile],
+    };
+    overwrite_captured_profile(
+        &mut config,
+        &name,
+        CaptureSnapshot {
+            credentials: Some(oauth_creds("fresh-access")),
+            base_url: None,
+            api_key: None,
+            anchor: crate::actions::AnchorAction::Unproven,
+            plan: None,
+        },
+    )
+    .expect("re-auth overwrite");
+
+    assert_eq!(
+        config.find(&name).and_then(|p| p.access_token()),
+        Some("fresh-access"),
+        "the stored pair is replaced, exactly as the confirm says",
+    );
+    assert_eq!(
+        std::fs::read(&sidecar).expect("the sidecar is still there"),
+        before,
+        "and the long-lived token is untouched, byte for byte",
+    );
+    assert!(
+        crate::claude::install_source_path(&name)
+            .expect("install source")
+            .ends_with("session-token.json"),
+        "so a switch still installs the token, not the login just minted",
+    );
+}
+
 /// AUTH-1 switch gate (Incident C): a CLI switch to a target whose OAuth login
 /// is dead — expired access token, no refresh token, so unrecoverable without a
 /// re-login — is refused with the exact `clauth login <name>` recovery hint
