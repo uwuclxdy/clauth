@@ -1018,7 +1018,7 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         .unwrap_or_else(|| panic!("the legend renders:\n{}", rows.join("\n")));
     // The section header, its blank, and one row per mark.
     assert_eq!(
-        rows[head..head + 17].iter().map(slice).collect::<Vec<_>>(),
+        rows[head..head + 18].iter().map(slice).collect::<Vec<_>>(),
         vec![
             "│  GLYPHS                                                                 │"
                 .to_string(),
@@ -1052,14 +1052,17 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
                 .to_string(),
             "│    ⋯                   stale data                                       │"
                 .to_string(),
+            "│    ◆                   can't read usage                                 │"
+                .to_string(),
             "│    f                   has a fix                                        │"
                 .to_string(),
         ],
     );
 
-    // Every mark's own hue, read off the rendered cell. The two repeated glyphs
-    // are the whole point: same shape, different color, different meaning.
-    let expected: [Color; 15] = [
+    // Every mark's own hue, read off the rendered cell. `⊖` and `⊘` are the
+    // whole point: same shape, different color, different meaning. `×` keeps
+    // one color for both its meanings.
+    let expected: [Color; 16] = [
         crate::tui::theme::accent_2_color(),
         crate::tui::theme::text_dim_color(),
         crate::tui::theme::text_faint_color(),
@@ -1074,13 +1077,14 @@ fn the_help_modal_legend_names_every_marker_and_its_hue() {
         crate::tui::theme::warning_color(),
         crate::tui::theme::warning_color(),
         crate::tui::theme::text_faint_color(),
+        crate::tui::theme::warning_color(),
         crate::tui::theme::accent_color(),
     ];
     // `left + 5`: the modal border, its 2-cell padding, and the row's own
     // 2-space gutter all sit ahead of the mark.
     let glyph_x = left + 5;
     let stride = buf.area.width as usize;
-    let got: Vec<Color> = (0..15)
+    let got: Vec<Color> = (0..16)
         .map(|i| buf.content[(head + 2 + i) * stride + glyph_x].fg)
         .collect();
     assert_eq!(got, expected.to_vec());
@@ -1322,6 +1326,104 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
     assert!(
         !screen.contains(" confirm "),
         "the generic `confirm` label must not appear for AddChainCandidate:\n{screen}"
+    );
+}
+
+/// \#116 round 4: the no-usage add confirm carries TWO detail lines, the hazard
+/// and then the fix, and the modal has to draw them as two rows. A detail that
+/// long on one row is chunked mid-word by `draw_modal_scrolled`, which is how
+/// the dialog came to name the cost and leave the command to the card. Found by
+/// a mutation arm: collapsing the two lines again passed every other test here.
+#[test]
+fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    // Built the way `handle_fallback_add_key` builds it, so the copy is the
+    // production copy and not a transcription.
+    let state = ConfirmState {
+        message: "clauth can't read this account's usage.".into(),
+        detail: Some(format!(
+            "{}{}.\n{}",
+            crate::fallback::no_usage_hazard_lead(false),
+            crate::fallback::no_usage_hazard(),
+            crate::tui::render::prose::mark_commands(&crate::fallback::no_usage_fix(&["blind"]))
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
+    };
+    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} is on no row:\n{}", rows.join("\n")))
+    };
+    let hazard = row_of("once it's active, clauth won't switch away from it on its own.");
+    let fix =
+        row_of("log in the same account with clauth login blind so clauth can read its usage");
+    assert_eq!(
+        fix,
+        hazard + 1,
+        "the fix sits on its own row right under the hazard:\n{}",
+        rows.join("\n")
+    );
+}
+
+/// \#116 round 5: at 80 columns the fix line wraps, and its continuation has to
+/// start in the SAME column as its first row. Left to the modal, `chunk_line`
+/// cuts at the cell boundary and keeps every character, so the space at the cut
+/// became a one-column indent (seen in a real terminal). The detail is
+/// word-wrapped before it reaches the modal, which this pins.
+#[test]
+fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
+    use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let state = ConfirmState {
+        message: "clauth can't read this account's usage.".into(),
+        detail: Some(format!(
+            "{}{}.\n{}.",
+            crate::fallback::no_usage_hazard_lead(false),
+            crate::fallback::no_usage_hazard(),
+            crate::tui::render::prose::mark_commands(&crate::fallback::no_usage_fix(&["blind"]))
+        )),
+        choice: false,
+        scroll: ConfirmScroll::default(),
+        on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
+    };
+    let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    // The column of the TEXT, not of the modal's border: the border sits on
+    // every row, so comparing leading spaces would pass whatever the wrap did.
+    let first = rows
+        .iter()
+        .position(|r| r.contains("log in the same account"))
+        .unwrap_or_else(|| panic!("the fix line is on no row:\n{}", rows.join("\n")));
+    let rest = rows
+        .iter()
+        .skip(first + 1)
+        .position(|r| r.contains("usage."))
+        .map(|at| at + first + 1)
+        .unwrap_or_else(|| {
+            panic!(
+                "the fix line does not wrap at 80 columns:\n{}",
+                rows.join("\n")
+            )
+        });
+    let col = |row: &str, needle: &str| row.find(needle).expect("needle is on this row");
+    assert_eq!(
+        col(&rows[rest], "usage."),
+        col(&rows[first], "log in the same account"),
+        "the continuation starts in the same column as its first row:\n{}",
+        rows[first..=rest].join("\n")
     );
 }
 

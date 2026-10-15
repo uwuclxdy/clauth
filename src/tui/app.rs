@@ -4663,6 +4663,25 @@ impl App {
             .collect()
     }
 
+    /// Whether a switch to `name` would install a long-lived session token: the
+    /// sidecar half of [`crate::fallback::no_usage_source`], answered off the
+    /// per-frame [`Self::session_tokens`] cache. The ONE reader of that cache
+    /// for this question, so the Fallback marker, the member card, the Overview
+    /// chain row and the add confirm cannot read it four different ways.
+    ///
+    /// Same verdict [`crate::claude::has_session_token`] gives off disk, which
+    /// is what a daemon (no cache, one read at boot) asks instead: a
+    /// `NotLongLived` mis-fill is `false` here exactly as it is there, because
+    /// the split stays disengaged and `credentials.json` remains what switches
+    /// install. An expired long-lived token is still `true`: it stops serving,
+    /// it does not make the account measurable.
+    pub(crate) fn installs_session_token(&self, name: &ProfileName) -> bool {
+        matches!(
+            self.session_tokens.get(name.as_str()),
+            Some(crate::claude::SessionTokenStatus::LongLived(_))
+        )
+    }
+
     /// Landing, armed at construction. The FIRST herdr launch opens the
     /// Services tab and, once the herdr probe lands, puts the herdr selector row
     /// under the cursor with its detail pane descended; construction marks the
@@ -14193,9 +14212,22 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             let name = ProfileName::from(candidates[app.fallback_detail_cursor].clone());
-            let would_mix = {
+            // The sidecar fact from the cache, BEFORE the config guard: the
+            // predicate needs it, and reading `session-token.json` here would be
+            // a disk read under the lock (`collect_session_tokens` is built to
+            // keep those apart).
+            let session_token = app.installs_session_token(&name);
+            let (would_mix, no_usage, active) = {
                 let cfg = app.config();
-                chain_would_mix(&cfg, &name)
+                (
+                    chain_would_mix(&cfg, &name),
+                    cfg.find(&name)
+                        .is_some_and(|p| crate::fallback::no_usage_source(p, session_token)),
+                    // A candidate can already be the active account: it is the
+                    // chain it is missing from, not the active slot. Then the
+                    // hazard is not a future one.
+                    cfg.is_active(&name),
+                )
             };
             if would_mix {
                 app.open_modal(Modal::Confirm(ConfirmState {
@@ -14203,6 +14235,32 @@ fn handle_fallback_add_key(app: &mut App, key: KeyEvent) {
                               api account."
                         .into(),
                     detail: Some("api → oauth switches may not work until cc restarts.".into()),
+                    choice: false,
+                    scroll: ConfirmScroll::default(),
+                    on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),
+                }));
+            } else if no_usage {
+                // The walk counts a member without a reading as having headroom
+                // and, once it is active, never moves off it. Said once here,
+                // where the operator still decides; the card's marker keeps
+                // saying it.
+                app.open_modal(Modal::Confirm(ConfirmState {
+                    message: "clauth can't read this account's usage.".into(),
+                    // Two lines: what it costs, then the way out. The dialog
+                    // named the hazard and left the operator to find the fix on
+                    // the card, which is the wrong order for the one surface
+                    // that asks a question.
+                    // The period is added HERE, not in the shared fix line:
+                    // this dialog speaks in sentences and its other two lines
+                    // end in one, while the card's hint and the daemon's log
+                    // line carry the same copy without a full stop, like every
+                    // other hint and log line beside them.
+                    detail: Some(format!(
+                        "{}{}.\n{}.",
+                        crate::fallback::no_usage_hazard_lead(active),
+                        crate::fallback::no_usage_hazard(),
+                        prose::mark_commands(&crate::fallback::no_usage_fix(&[name.as_str()]))
+                    )),
                     choice: false,
                     scroll: ConfirmScroll::default(),
                     on_confirm: ConfirmAction::AddChainCandidate(name.to_string()),

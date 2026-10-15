@@ -56,7 +56,7 @@ pub(crate) use scheduler::{
     profile_credential_fingerprint, queued_switch_away_is_stale, reading_is_polled,
     rotation_into_fetch, selected_activity, selected_next_refresh, spawn_refresher,
     switch_gate_in_flight, switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts,
-    third_party_credentialed,
+    third_party_credentialed, usage_poll_pair,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is

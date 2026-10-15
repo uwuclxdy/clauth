@@ -21,9 +21,9 @@ use super::format::{spinner_frame, truncate};
 use super::overview::switch_mark;
 use super::panes::{
     DIAG_AUTH_BROKEN, DIAG_BUDGET_SPENT, DIAG_CANCELED, DIAG_DISABLED, DIAG_KEY_REJECTED,
-    DIAG_KICK, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN, bold_when,
-    draw_scrollbar, draw_scrolled_lines, follow_scroll_offset, head_cols, key_cell, meta_line,
-    right_meta_fits, title_label,
+    DIAG_KICK, DIAG_NO_USAGE, DIAG_STALE, DIAG_WEEKLY_SOFT, DIAG_WEEKLY_SPENT, META_RULE_MIN,
+    bold_when, draw_scrollbar, draw_scrolled_lines, follow_scroll_offset, head_cols, key_cell,
+    meta_line, right_meta_fits, title_label,
 };
 use super::prose::{self, cmd_lit, key_lit};
 use crate::fallback::BlockedReason;
@@ -559,8 +559,21 @@ fn draw_confirm(frame: &mut Frame<'_>, area: Rect, state: &ConfirmState) {
         state.message.clone(),
         theme::body(),
     ))];
+    // A detail may be several lines, and each is PROSE: split on the newlines
+    // the caller wrote, then word-wrap. Left to the modal, a long line goes
+    // through `chunk_line`, which cuts at the cell boundary and keeps every
+    // character, so the space at the cut became a one-column indent on the
+    // continuation row (seen at 80 columns in a real terminal). The bound is
+    // the modal's own geometry: it never grows past `area.width - 4`, and its
+    // inner width is 6 cells narrower than that, so wrapping here can only
+    // prevent the chunking, never make the modal wider.
     if let Some(detail) = &state.detail {
-        lines.push(Line::from(prose::spans(detail, theme::dim())));
+        let inner = (area.width.saturating_sub(10) as usize).max(8);
+        for line in detail.lines() {
+            for row in prose::wrap(line, inner, theme::dim()) {
+                lines.push(Line::from(row));
+            }
+        }
     }
     // The daemon-start confirm's detail is two lines, which the one-line
     // `detail` cannot hold.
@@ -1455,7 +1468,8 @@ fn draw_help(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// itself, so the legend cannot drift from what the chain renders. `⊖` and `⊘`
 /// each appear twice because they split their two senses on hue alone (see
 /// `chain::reason_marker` for why), and a legend naming one sense per glyph
-/// would be worse than none.
+/// would be worse than none. `×` appears twice at one hue: the card's pill
+/// tells its two senses apart.
 fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
     let reason = |r: BlockedReason, desc| (reason_marker(&r), desc);
     vec![
@@ -1494,6 +1508,7 @@ fn glyph_rows() -> Vec<(Span<'static>, &'static str)> {
         ),
         reason(BlockedReason::WeeklySoft { pct: 0.0 }, DIAG_WEEKLY_SOFT),
         reason(BlockedReason::Stale, DIAG_STALE),
+        reason(BlockedReason::NoUsage, DIAG_NO_USAGE),
         (super::services::fix_mark(), "has a fix"),
     ]
 }
