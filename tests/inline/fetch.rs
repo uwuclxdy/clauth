@@ -1278,6 +1278,25 @@ fn epoch_to_iso_round_trips() {
     assert_eq!(epoch_secs_to_iso(-1), "1970-01-01T00:00:00+00:00");
 }
 
+/// `ms_to_iso` floors to whole seconds for signed and unsigned inputs alike;
+/// a `u64` past `i64::MAX` must not wrap negative.
+#[test]
+fn epoch_millisecond_conversion_preserves_signed_and_unsigned_inputs() {
+    for (ms, iso) in [
+        (i128::from(i64::MIN), "1970-01-01T00:00:00+00:00"),
+        (-1_001, "1970-01-01T00:00:00+00:00"),
+        (-999, "1970-01-01T00:00:00+00:00"),
+        (0, "1970-01-01T00:00:00+00:00"),
+        (999, "1970-01-01T00:00:00+00:00"),
+        (1_000, "1970-01-01T00:00:01+00:00"),
+        (1_789_257_600_999, "2026-09-13T00:00:00+00:00"),
+        (i128::from(i64::MAX), "292278994-08-17T07:12:55+00:00"),
+        (i128::from(u64::MAX), "584556019-04-03T14:25:51+00:00"),
+    ] {
+        assert_eq!(ms_to_iso(ms), iso, "ms = {ms}");
+    }
+}
+
 /// `retry-after` parsing accepts the delta-seconds form and the IMF-fixdate
 /// HTTP-date form; a future date becomes the delay until it, a past date is
 /// `Duration::ZERO`, and garbage is no-hint (`None`).

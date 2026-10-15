@@ -10,8 +10,8 @@
 
 use serde::Deserialize;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
-use crate::usage::epoch_secs_to_iso;
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
+use crate::usage::{epoch_secs_to_iso, ms_to_iso};
 
 pub(super) const DISPLAY_NAME: &str = "Z.ai";
 

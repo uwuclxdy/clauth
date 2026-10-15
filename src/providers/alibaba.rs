@@ -26,9 +26,10 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
 use crate::oauth_login::percent_encode;
 use crate::profile::{ConsoleCredential, ConsoleSite};
+use crate::usage::ms_to_iso;
 
 pub(super) const DISPLAY_NAME: &str = "Alibaba Model Studio";
 

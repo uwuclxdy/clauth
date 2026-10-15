@@ -22,8 +22,8 @@
 
 use serde::Deserialize;
 
-use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar, ms_to_iso};
-use crate::usage::{LABEL_5H, LABEL_7D};
+use super::{StatRow, StatRowKind, ThirdPartyError, ThirdPartyStats, UsageBar};
+use crate::usage::{LABEL_5H, LABEL_7D, ms_to_iso};
 
 pub(super) const DISPLAY_NAME: &str = "MiniMax";
 

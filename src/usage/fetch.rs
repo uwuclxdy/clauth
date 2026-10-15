@@ -1792,6 +1792,13 @@ pub(crate) fn epoch_secs_to_iso(secs: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}+00:00")
 }
 
+/// Epoch-ms → ISO-8601 UTC. One helper so the provider and daemon conversions
+/// cannot drift apart. `i128` holds every `i64` and `u64`, so the division runs
+/// before narrowing and a `u64` past `i64::MAX` never wraps negative.
+pub(crate) fn ms_to_iso(ms: impl Into<i128>) -> String {
+    epoch_secs_to_iso((ms.into() / 1000) as i64)
+}
+
 pub(crate) fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

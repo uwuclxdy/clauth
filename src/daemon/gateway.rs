@@ -55,7 +55,7 @@ use crate::gateway_tokens::StoreDigest;
 use crate::lockorder::{RankedMutex, rank};
 use crate::logline::logline;
 use crate::profile::{atomic_write_600, clauth_dir, open_append_600};
-use crate::usage::{epoch_secs_to_iso, now_ms};
+use crate::usage::{ms_to_iso, now_ms};
 
 /// The run loop's round length: after a round it waits out the rest of this
 /// since the round's tick, so a `starting` child is probed at most once a
@@ -1384,7 +1384,7 @@ impl<K: Supervised> Supervisor<K> {
         let since = if slot.same_state(&self.slot) && self.slot.since().is_some() {
             self.slot.since()
         } else {
-            Some(epoch_secs_to_iso((tick.wall_ms / 1000) as i64))
+            Some(ms_to_iso(tick.wall_ms))
         };
         self.slot = slot.with_counts(self.restarts, self.last_exit, since);
     }

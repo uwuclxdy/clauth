@@ -29,8 +29,8 @@ use crate::profile_json::{
 };
 use crate::providers::ThirdPartyStats;
 use crate::usage::{
-    FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, now_ms, selected_next_refresh,
-    windows_maxed,
+    FetchStatus, LegKey, UsageInfo, is_stuck_rate_limited, ms_to_iso, now_ms,
+    selected_next_refresh, windows_maxed,
 };
 
 /// Bump when the JSON shape changes in a way readers must branch on. 2: the
@@ -114,11 +114,6 @@ pub(super) fn fetch_status_str(s: FetchStatus) -> &'static str {
         FetchStatus::RateLimited => "RateLimited",
         FetchStatus::AuthExpired => "AuthExpired",
     }
-}
-
-/// ISO-8601 (UTC) from an epoch-millisecond instant.
-fn iso_from_ms(ms: u64) -> String {
-    crate::providers::ms_to_iso(ms)
 }
 
 /// The `fallback` object for a profile: chain membership (`position` is
@@ -562,15 +557,15 @@ pub(crate) fn build_profile_entries(
                 auth_status: auth_status_str(config, p, now as i64).to_string(),
                 fetch_status: fetch_status.map(str::to_string),
                 stale,
-                fetched_at: age_source_ms.map(iso_from_ms),
-                next_refresh_at: next_refresh_ms.map(iso_from_ms),
+                fetched_at: age_source_ms.map(ms_to_iso),
+                next_refresh_at: next_refresh_ms.map(ms_to_iso),
                 auto_start: p.auto_start,
                 auto_start_queue: queue_members
                     .iter()
                     .position(|n| n.as_str() == name.as_str())
                     .map(|i| QueueEntry {
                         position: i + 1,
-                        next_open_at: next_queue_open.map(iso_from_ms),
+                        next_open_at: next_queue_open.map(ms_to_iso),
                     }),
                 bell_threshold: p.bell_threshold,
                 fallback: fallback(config, p),
@@ -641,8 +636,8 @@ pub(crate) fn build_codex_entries(
                     .to_string()
                 }),
                 stale: false,
-                fetched_at: mtime_ms.map(iso_from_ms),
-                next_refresh_at: mtime_ms.map(|mt| iso_from_ms(mt.saturating_add(interval_ms))),
+                fetched_at: mtime_ms.map(ms_to_iso),
+                next_refresh_at: mtime_ms.map(|mt| ms_to_iso(mt.saturating_add(interval_ms))),
                 auto_start: false,
                 // The interleaved auto-start queue elects claude members only.
                 auto_start_queue: None,
@@ -722,7 +717,7 @@ pub(crate) fn build_status(
 
     StatusBody {
         schema: SCHEMA_VERSION,
-        generated_at: iso_from_ms(now),
+        generated_at: ms_to_iso(now),
         active_profile: config.state.active_profile.as_deref().map(str::to_string),
         pending_switch: live.and_then(|s| s.pending_switch).map(str::to_string),
         wrap_off: config.state.switch_off_when_spent,
