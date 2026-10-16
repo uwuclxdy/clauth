@@ -290,6 +290,16 @@ pub(crate) fn run(
         crate::runtime::guard_home_project_settings(&mut command, cwd);
     }
     command.env(engine.home_env_key(), runtime.config_dir());
+    // Through the shared `projects` link, the default auto-memory dir loses
+    // Claude Code's write exemption; name the resolved one instead.
+    if let Some(cwd) = spawn_cwd.as_deref() {
+        crate::memory_dir::pin_auto_memory_dir(
+            &mut command,
+            cwd,
+            runtime.config_dir(),
+            claude_args,
+        );
+    }
     // Isolated: also suppress global/project MCP servers wired through
     // `.claude.json`, so the only extension surface is what the caller passes.
     // Deliberately NOT `--safe-mode`. The cross-account leak (the operator's

@@ -66,6 +66,8 @@ macOS is why `clauth login` exists at all. Claude Code's own `/login` under a cu
 
 `clauth start <profile>` builds that session its own `CLAUDE_CONFIG_DIR` under the profile directory, so identity, settings, and billing caches never leak between accounts running at once. The tree is torn down when the session ends. `--isolated` goes further and drops your global memory, plugins, and hooks, keeping only the account's auth.
 
+A shared session's `projects` is a link to your real `~/.claude/projects`, and Claude Code only lets memory writes through without asking when the memory dir is not reached through a link. So when the project already has a dir under `~/.claude/projects`, clauth passes `--settings '{"autoMemoryDirectory": …}'` naming that real dir, with the same key Claude Code would use. It passes nothing when you gave your own `--settings`, for a project's first session, for a non-ASCII path, or for an `--isolated` session, whose `projects` is not a link. Your own `autoMemoryDirectory` always wins: set in `~/.claude/settings.json` or the project's `.claude/settings.json` or `.claude/settings.local.json`, clauth leaves it alone, and likewise when `CLAUDE_CODE_REMOTE_MEMORY_DIR` or `CLAUDE_COWORK_MEMORY_PATH_OVERRIDE` moves memory elsewhere.
+
 A codex profile gets the same treatment under `CODEX_HOME`: its own home per session with the environment's codex credential variables scrubbed, the store forced to the linked `auth.json` by a `-c` flag, and a start refused where `/etc/codex/managed_config.toml` would outrank that ([Codex](Codex#run)).
 
 ## Token rotation

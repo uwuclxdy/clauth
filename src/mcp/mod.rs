@@ -3715,6 +3715,13 @@ fn run_delegate(opts: DelegateOpts<'_>) -> std::result::Result<serde_json::Value
     if let Some(dir) = spawn_cwd(workspace, opts.cwd).as_deref() {
         command.current_dir(dir);
         crate::runtime::guard_home_project_settings(&mut command, dir);
+        // Same auto-memory pin as `clauth start` (see `memory_dir`).
+        crate::memory_dir::pin_auto_memory_dir(
+            &mut command,
+            dir,
+            runtime.config_dir(),
+            &opts.extra_args,
+        );
     }
     command.args(&opts.extra_args);
 

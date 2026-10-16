@@ -34,6 +34,7 @@ mod lock;
 mod lockorder;
 mod logline;
 mod mcp;
+mod memory_dir;
 mod oauth;
 mod oauth_login;
 mod out;
