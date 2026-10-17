@@ -621,7 +621,15 @@ fn a_control_attach_sends_the_panes_own_geometry() {
     wait_for_argv(
         &argv,
         &[
-            "terminal", "session", "control", "w9:p1", "--cols", "88", "--rows", "57",
+            "terminal",
+            "session",
+            "control",
+            "w9:p1",
+            "--takeover",
+            "--cols",
+            "88",
+            "--rows",
+            "57",
         ],
     );
     // The detach half of the geometry clause: the client leaving ends the
@@ -643,6 +651,93 @@ fn a_control_attach_sends_the_panes_own_geometry() {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!("the herdr child (pid {pid}) outlived the client disconnect");
+}
+
+// --- Who holds control, and contention ---------------------------------------
+
+/// The `daemon.log` warnings among the lines captured so far.
+fn contention_warnings(lines: &crate::logline::LogLines) -> usize {
+    lines
+        .snapshot()
+        .iter()
+        .filter(|line| line.contains("changed hands"))
+        .count()
+}
+
+#[test]
+fn three_handovers_in_the_window_warn_once_and_two_do_not() {
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let holders = super::TerminalHolders::new();
+    let mut cursor = holders.cursor();
+    let t0 = Instant::now();
+    let at = |secs| t0 + Duration::from_secs(secs);
+
+    // Two handovers: driver, then phone, then driver again.
+    holders.attach("w9:p1", DRIVER, at(0));
+    holders.attach("w9:p1", "phone", at(10));
+    holders.attach("w9:p1", DRIVER, at(20));
+    assert!(holders.contentions_since(&mut cursor).is_empty());
+    assert_eq!(contention_warnings(&lines), 0);
+
+    // The third: one record naming both devices, one warning line.
+    holders.attach("w9:p1", "phone", at(30));
+    assert_eq!(
+        holders.contentions_since(&mut cursor),
+        vec![super::Contention {
+            pane_id: "w9:p1".to_string(),
+            devices: vec![DRIVER.to_string(), "phone".to_string()],
+        }]
+    );
+    assert_eq!(contention_warnings(&lines), 1);
+
+    // More handovers inside the same window add nothing: one per window.
+    holders.attach("w9:p1", DRIVER, at(40));
+    holders.attach("w9:p1", "phone", at(50));
+    assert!(holders.contentions_since(&mut cursor).is_empty());
+    assert_eq!(contention_warnings(&lines), 1);
+}
+
+#[test]
+fn reconnects_and_slow_alternation_are_not_contention() {
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let holders = super::TerminalHolders::new();
+    let mut cursor = holders.cursor();
+    let t0 = Instant::now();
+    let at = |secs| t0 + Duration::from_secs(secs);
+
+    // The same device reconnecting, many times, never changes hands.
+    for i in 0..6 {
+        holders.attach("w9:p1", DRIVER, at(i));
+    }
+    // A pane released at a lifetime close is free: the next attach takes it
+    // from nobody.
+    for (i, device) in [DRIVER, "phone", DRIVER, "phone"].into_iter().enumerate() {
+        let token = holders.attach("w9:p2", device, at(10 + i as u64));
+        assert_eq!(holders.release("w9:p2", token), None);
+    }
+    // Three handovers, each more than the window apart from the first.
+    let window = super::CONTENTION_WINDOW.as_secs();
+    holders.attach("w9:p3", DRIVER, at(0));
+    holders.attach("w9:p3", "phone", at(1));
+    holders.attach("w9:p3", DRIVER, at(window));
+    holders.attach("w9:p3", "phone", at(2 * window));
+    assert!(holders.contentions_since(&mut cursor).is_empty());
+    assert_eq!(contention_warnings(&lines), 0);
+}
+
+#[test]
+fn a_displaced_stream_learns_who_took_the_pane() {
+    let holders = super::TerminalHolders::new();
+    let now = Instant::now();
+    let first = holders.attach("w9:p1", DRIVER, now);
+    let second = holders.attach("w9:p1", "phone", now);
+    // The displaced stream leaves the record alone and names the taker.
+    assert_eq!(holders.release("w9:p1", first), Some("phone".to_string()));
+    // The holder's own close clears it, so the next attach displaces nobody.
+    assert_eq!(holders.release("w9:p1", second), None);
+    assert_eq!(holders.release("w9:p1", second), None);
 }
 
 #[test]

@@ -9,10 +9,19 @@
 //!
 //! The device tier decides the mode, never the client: a view-tier device gets
 //! `observe` and any data frame it sends closes the socket with a policy code;
-//! a control-tier device gets `control`. herdr arbitrates controllers against
-//! each other (`--takeover` exists; this bridge never passes it), and both
-//! refusal shapes arrive as ordinary `terminal.closed` records, which relay
-//! like any other frame before the socket closes.
+//! a control-tier device gets `control --takeover`. Every control attach
+//! displaces the pane's current controller, which herdr sends a
+//! `terminal.closed` record (`terminal attach taken over`) that relays like any
+//! other frame before the socket closes; with no controller to displace,
+//! `--takeover` attaches exactly like a plain control attach. A client
+//! therefore reconnects only after its lifetime close, never after being taken
+//! over, or two open clients steal the pane from each other in a loop.
+//!
+//! The daemon keeps a per-pane record of which device holds control
+//! ([`TerminalHolders`]). A pane that changes hands between devices
+//! [`CONTENTION_HANDOVERS`] times inside [`CONTENTION_WINDOW`] is a fight: one
+//! `daemon.log` warning and one `terminal_contention` record for `/events`,
+//! once per window.
 //!
 //! Geometry: a control attach without explicit `--cols/--rows` imposes
 //! herdr's 120x40 default on the real pane (measured, T1), yanking the
@@ -30,6 +39,7 @@
 //! single-write timeout, a bounded frames channel, and control commands that
 //! cross to herdr's stdin on their own untimed-wait-free thread.
 
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -40,6 +50,7 @@ use super::http::{Request, Response, accept_key};
 use super::panes::{NO_SERVER, NOT_INSTALLED, PANE_NOT_FOUND};
 use super::routes::{self, ApiContext, Handled};
 use crate::herdr::parse_snapshot_rects;
+use crate::lockorder::{RankedMutex, rank};
 
 /// A client data frame larger than this is a client that has stopped framing
 /// honestly; the socket closes with `1009` rather than buffering without end.
@@ -53,6 +64,14 @@ const MAX_HERDR_LINE: usize = 4 * 1024 * 1024;
 /// the frames channel again. Purely a liveness bound: herdr output keeps
 /// flowing on the relay thread whatever this is set to.
 const READ_SLICE: Duration = Duration::from_millis(200);
+/// Handovers between devices inside [`CONTENTION_WINDOW`] that make a fight.
+pub(crate) const CONTENTION_HANDOVERS: usize = 3;
+/// The window [`CONTENTION_HANDOVERS`] are counted over, and the quiet period
+/// after a warning before the same pane can warn again.
+pub(crate) const CONTENTION_WINDOW: Duration = Duration::from_secs(5 * 60);
+/// Contention records kept for `/events` streams to catch up on. A stream reads
+/// them each tick, so a handful covers any burst between two ticks.
+const CONTENTION_BACKLOG: usize = 32;
 
 /// Which half of herdr's terminal group a connection bridged to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -87,6 +106,157 @@ pub(crate) struct Hijack {
     device: String,
     cols: u16,
     rows: u16,
+}
+
+/// One pane fought over: `terminal_contention` on `/events`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct Contention {
+    pub(crate) pane_id: String,
+    /// Every device the window's handovers moved control between, in the order
+    /// each first appeared.
+    pub(crate) devices: Vec<String>,
+}
+
+/// Which device holds control of each pane, and the contention records the
+/// `/events` streams relay. Lives on the [`ApiContext`]: the bridge writes it,
+/// the events loop reads it each tick.
+pub(crate) struct TerminalHolders {
+    state: RankedMutex<HoldersState, rank::TerminalHolders>,
+}
+
+#[derive(Default)]
+struct HoldersState {
+    /// The token the next control stream is handed.
+    next_stream: u64,
+    panes: HashMap<String, PaneHold>,
+    /// The sequence number of the newest contention record.
+    seq: u64,
+    contentions: VecDeque<(u64, Contention)>,
+}
+
+#[derive(Default)]
+struct PaneHold {
+    /// The control stream holding the pane (its token) and its device.
+    holder: Option<(u64, String)>,
+    /// `(when, from, to)` for each handover inside the window, oldest first.
+    handovers: VecDeque<(Instant, String, String)>,
+    /// No second warning for this pane before this.
+    quiet_until: Option<Instant>,
+}
+
+impl TerminalHolders {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: RankedMutex::new(HoldersState::default()),
+        }
+    }
+
+    fn with_state<T>(&self, f: impl FnOnce(&mut HoldersState) -> T) -> T {
+        match self.state.lock() {
+            Ok(mut state) => f(&mut state),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// A control stream by `device` attached to `pane_id` at `now`. Returns the
+    /// stream's token for [`Self::release`]. When this handover completes a
+    /// fight, writes the one warning line and queues the one `/events` record.
+    pub(crate) fn attach(&self, pane_id: &str, device: &str, now: Instant) -> u64 {
+        let (token, fight) = self.with_state(|state| {
+            let token = state.next_stream;
+            state.next_stream += 1;
+            state.panes.retain(|_, hold| {
+                hold.holder.is_some()
+                    || hold.handovers.back().is_some_and(|(at, ..)| {
+                        now.saturating_duration_since(*at) < CONTENTION_WINDOW
+                    })
+            });
+            let hold = state.panes.entry(pane_id.to_string()).or_default();
+            let previous = hold.holder.replace((token, device.to_string()));
+            let Some((_, from)) = previous.filter(|(_, from)| from != device) else {
+                return (token, None);
+            };
+            hold.handovers.push_back((now, from, device.to_string()));
+            while hold
+                .handovers
+                .front()
+                .is_some_and(|(at, ..)| now.saturating_duration_since(*at) >= CONTENTION_WINDOW)
+            {
+                hold.handovers.pop_front();
+            }
+            if hold.handovers.len() < CONTENTION_HANDOVERS
+                || hold.quiet_until.is_some_and(|until| now < until)
+            {
+                return (token, None);
+            }
+            hold.quiet_until = Some(now + CONTENTION_WINDOW);
+            let mut devices: Vec<String> = Vec::new();
+            for (_, from, to) in &hold.handovers {
+                for name in [from, to] {
+                    if !devices.contains(name) {
+                        devices.push(name.clone());
+                    }
+                }
+            }
+            let fight = Contention {
+                pane_id: pane_id.to_string(),
+                devices,
+            };
+            state.seq += 1;
+            state.contentions.push_back((state.seq, fight.clone()));
+            if state.contentions.len() > CONTENTION_BACKLOG {
+                state.contentions.pop_front();
+            }
+            (token, Some(fight))
+        });
+        if let Some(fight) = fight {
+            let devices: Vec<String> = fight.devices.iter().map(|d| format!("'{d}'")).collect();
+            crate::logline::logline!(
+                "clauth api: warning: pane '{}' changed hands {} times in {} minutes between devices {}; \
+                 two clients are likely reconnecting after being taken over",
+                super::http::sanitize_for_log(&fight.pane_id),
+                CONTENTION_HANDOVERS,
+                CONTENTION_WINDOW.as_secs() / 60,
+                devices.join(", ")
+            );
+        }
+        token
+    }
+
+    /// The control stream `token` on `pane_id` ended. Clears the record if this
+    /// stream still holds the pane; otherwise returns the device that took it.
+    pub(crate) fn release(&self, pane_id: &str, token: u64) -> Option<String> {
+        self.with_state(|state| {
+            let hold = state.panes.get_mut(pane_id)?;
+            match &hold.holder {
+                Some((holder, _)) if *holder == token => {
+                    hold.holder = None;
+                    None
+                }
+                Some((_, device)) => Some(device.clone()),
+                None => None,
+            }
+        })
+    }
+
+    /// Where a new `/events` stream starts reading: after every record so far.
+    pub(crate) fn cursor(&self) -> u64 {
+        self.with_state(|state| state.seq)
+    }
+
+    /// The records newer than `cursor`, moving it past them.
+    pub(crate) fn contentions_since(&self, cursor: &mut u64) -> Vec<Contention> {
+        self.with_state(|state| {
+            let fresh: Vec<Contention> = state
+                .contentions
+                .iter()
+                .filter(|(seq, _)| *seq > *cursor)
+                .map(|(_, fight)| fight.clone())
+                .collect();
+            *cursor = state.seq;
+            fresh
+        })
+    }
 }
 
 /// `/panes/<id>/stream` with `<id>` non-empty and slash-free, else `None`.
@@ -312,24 +482,32 @@ pub(crate) fn unspawnable_terminal() -> TerminalSpawn {
 /// The stream ends at `deadline`, the connection's own lifetime, with a clean
 /// close the client reconnects through (owner ruling 2026-09-15, row 6: no
 /// slot is ever held forever; the reconnect re-attaches at the pane's own
-/// geometry).
+/// geometry). A control stream records itself in `holders` once herdr is
+/// spawned and clears that record when it ends, unless another stream took the
+/// pane meanwhile.
 pub(crate) fn run(
     mut stream: rustls::StreamOwned<rustls::ServerConnection, std::net::TcpStream>,
     leftover: Vec<u8>,
     hijack: Hijack,
     spawn: &TerminalSpawn,
+    holders: &TerminalHolders,
     deadline: std::time::Instant,
 ) {
-    let args: Vec<String> = vec![
+    let mut args: Vec<String> = vec![
         "terminal".into(),
         "session".into(),
         hijack.mode.as_str().into(),
         hijack.pane_id.clone(),
+    ];
+    if hijack.mode == Mode::Control {
+        args.push("--takeover".into());
+    }
+    args.extend([
         "--cols".into(),
         hijack.cols.to_string(),
         "--rows".into(),
         hijack.rows.to_string(),
-    ];
+    ]);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let pane_for_log = hijack.pane_for_log.clone();
     let mut child = match spawn(&arg_refs) {
@@ -350,6 +528,9 @@ pub(crate) fn run(
             return;
         }
     };
+    // Recorded once herdr is running, so a spawn that failed displaced nobody.
+    let held = (hijack.mode == Mode::Control)
+        .then(|| holders.attach(&hijack.pane_id, &hijack.device, Instant::now()));
 
     // One IO thread owns the socket: the loop below is the only thing that
     // reads or writes the TLS stream, so the relay never competes for it. The
@@ -392,6 +573,9 @@ pub(crate) fn run(
         crate::logline::logline!(
             "clauth api: failed to spawn the terminal input writer thread: {e}"
         );
+        if let Some(token) = held {
+            holders.release(&hijack.pane_id, token);
+        }
         child.terminate();
         child.reap();
         let _ = ws_write(&mut stream, OP_CLOSE, &close_payload(1011, "internal"));
@@ -441,6 +625,9 @@ pub(crate) fn run(
             // Without the relay nothing drains herdr's stdout; end the stream
             // rather than let a full pipe wedge the child.
             crate::logline::logline!("clauth api: failed to spawn the terminal relay thread: {e}");
+            if let Some(token) = held {
+                holders.release(&hijack.pane_id, token);
+            }
             child.terminate();
             child.reap();
             let _ = ws_write(&mut stream, OP_CLOSE, &close_payload(1011, "internal"));
@@ -599,18 +786,22 @@ pub(crate) fn run(
         );
     }
     child.reap();
+    let taken_by = held.and_then(|token| holders.release(&hijack.pane_id, token));
+    let why = if lifetime_ended {
+        " (connection lifetime)".to_string()
+    } else if herdr_ended && !client_closed {
+        match taken_by {
+            Some(device) => format!(" (taken over by device '{device}')"),
+            None => " (herdr ended it)".to_string(),
+        }
+    } else {
+        String::new()
+    };
     crate::logline::logline!(
-        "clauth api: device '{}' {} stream on pane '{}' closed{}",
+        "clauth api: device '{}' {} stream on pane '{}' closed{why}",
         hijack.device,
         hijack.mode.as_str(),
         pane_for_log,
-        if lifetime_ended {
-            " (connection lifetime)"
-        } else if herdr_ended && !client_closed {
-            " (herdr ended it)"
-        } else {
-            ""
-        }
     );
     send_close_notify(&mut stream);
 }

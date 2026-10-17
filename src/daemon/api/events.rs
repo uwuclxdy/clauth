@@ -3,7 +3,8 @@
 //! One connection, one stream: the client learns every published-feed change
 //! (the bytes of `~/.clauth/status.json`, keyed on its entity tag), every
 //! herdr agent-status change, and — on every (re)connect — every pane's current
-//! agent status from the handshake's `pane.list`, without polling. The stream
+//! agent status from the handshake's `pane.list`, and every pane the terminal
+//! bridge saw fought over (`terminal_contention`), without polling. The stream
 //! runs until the connection's deadline and then closes cleanly, so an
 //! `EventSource` client reconnects on its own and gets the current feed first
 //! again.
@@ -22,6 +23,7 @@ use std::io::Read;
 
 use super::http::Response;
 use super::routes::{ApiContext, Caller, ErrorBody, WAIT_POLL, read_feed_tagged};
+use super::terminal::{Contention, TerminalHolders};
 
 /// How the stream learns where herdr's API socket is. The daemon passes the
 /// production resolver; a test passes an explicit path or `None` — never an
@@ -91,7 +93,7 @@ fn keepalive_due(last_frame: Instant, now: Instant, interval: Duration) -> bool 
     get,
     path = "/api/v1/events",
     responses(
-        (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects", content_type = "text/event-stream", body = String),
+        (status = 200, description = "a server-sent-events stream, opened with `retry: 1000`, then an `event: herdr` frame naming herdr's presence and, when present, carrying every pane's current agent status (`{\"present\":true,\"panes\":[…]}`), re-sent on every (re)connect; then `event: status` frames carrying the whole published feed (each `id` is the feed's entity tag) whenever the tag moves, `event: pane_agent_status` frames relaying herdr agent-status changes, `event: terminal_contention` frames (`{\"pane_id\":…,\"devices\":[…]}`) when one pane changed hands between devices 3 times in 5 minutes, and a `: keepalive` comment after 15 s of silence; the stream ends cleanly at the connection's 120-second lifetime and the client's EventSource reconnects", content_type = "text/event-stream", body = String),
         (status = 401, description = "no bearer, or one matching no paired device (`unauthorized`)", body = ErrorBody),
         (status = 403, description = "a device paired by a newer clauth with a tier this one does not know (`device_tier_unknown`)", body = ErrorBody),
         (status = 500, description = "the device list does not read (`internal`)", body = ErrorBody)
@@ -105,10 +107,13 @@ pub(crate) fn events(
 ) -> Response {
     let status_path = ctx.status_path.clone();
     let herdr = std::sync::Arc::clone(&ctx.herdr);
+    let holders = std::sync::Arc::clone(&ctx.terminal_holders);
     Response::stream(
         200,
         "text/event-stream",
-        Box::new(move |sink, deadline| run_stream(sink, deadline, &status_path, herdr.as_ref())),
+        Box::new(move |sink, deadline| {
+            run_stream(sink, deadline, &status_path, herdr.as_ref(), &holders)
+        }),
     )
 }
 
@@ -119,8 +124,16 @@ fn run_stream(
     deadline: Instant,
     feed: &Path,
     resolve_herdr: &(dyn Fn() -> Option<PathBuf> + Send + Sync),
+    holders: &TerminalHolders,
 ) -> std::io::Result<()> {
-    run_stream_with_config(sink, deadline, feed, resolve_herdr, &StreamConfig::DEFAULT)
+    run_stream_with_config(
+        sink,
+        deadline,
+        feed,
+        resolve_herdr,
+        holders,
+        &StreamConfig::DEFAULT,
+    )
 }
 
 /// The loop itself, with the config injected. Everything is flushed frame by
@@ -130,6 +143,7 @@ fn run_stream_with_config(
     deadline: Instant,
     feed: &Path,
     resolve_herdr: &(dyn Fn() -> Option<PathBuf> + Send + Sync),
+    holders: &TerminalHolders,
     config: &StreamConfig,
 ) -> std::io::Result<()> {
     // The one field line every stream opens with, so a reconnect is bounded.
@@ -143,6 +157,9 @@ fn run_stream_with_config(
     let herdr_socket = resolve_herdr();
 
     let mut last_tag: Option<String> = None;
+    // Contention found before this stream opened is not replayed: the warning
+    // is about a fight in progress, and a live one warns again.
+    let mut contention_cursor = holders.cursor();
     let mut herdr: Option<Box<dyn HerdrSource + Send>> = None;
     let mut next_herdr_try = Instant::now();
     // A re-open that failed keeps the live connection; this is when to retry it.
@@ -176,6 +193,11 @@ fn run_stream_with_config(
         {
             write_status(sink, &tag, &body)?;
             last_tag = Some(tag);
+            last_frame = Instant::now();
+        }
+
+        for fight in holders.contentions_since(&mut contention_cursor) {
+            write_contention(sink, &fight)?;
             last_frame = Instant::now();
         }
 
@@ -292,6 +314,15 @@ fn write_status(sink: &mut dyn Write, tag: &str, body: &[u8]) -> std::io::Result
         sink.write_all(b"\n")?;
     }
     sink.write_all(b"\n")?;
+    sink.flush()
+}
+
+/// `event: terminal_contention`: one pane changed hands between devices often
+/// enough to be two clients stealing it from each other.
+fn write_contention(sink: &mut dyn Write, fight: &Contention) -> std::io::Result<()> {
+    sink.write_all(b"event: terminal_contention\ndata: ")?;
+    sink.write_all(&serde_json::to_vec(fight).map_err(std::io::Error::other)?)?;
+    sink.write_all(b"\n\n")?;
     sink.flush()
 }
 

@@ -57,7 +57,14 @@ fn herdr_at(path: PathBuf) -> HerdrSeam {
 /// Run the stream loop against a `Vec<u8>` sink.
 fn drive(feed: &Path, resolve: &HerdrSeam, deadline: Instant) -> Vec<u8> {
     let mut sink = Vec::new();
-    run_stream(&mut sink, deadline, feed, resolve.as_ref()).expect("stream");
+    run_stream(
+        &mut sink,
+        deadline,
+        feed,
+        resolve.as_ref(),
+        &TerminalHolders::new(),
+    )
+    .expect("stream");
     sink
 }
 
@@ -111,7 +118,15 @@ fn stream_response(feed: PathBuf, resolve: HerdrSeam) -> Response {
     Response::stream(
         200,
         "text/event-stream",
-        Box::new(move |sink, deadline| run_stream(sink, deadline, &feed, resolve.as_ref())),
+        Box::new(move |sink, deadline| {
+            run_stream(
+                sink,
+                deadline,
+                &feed,
+                resolve.as_ref(),
+                &TerminalHolders::new(),
+            )
+        }),
     )
 }
 
@@ -323,6 +338,7 @@ fn a_stream_emits_the_feed_and_only_on_etag_moves() {
             Instant::now() + Duration::from_secs(3),
             &stream_path,
             stream_resolve.as_ref(),
+            &TerminalHolders::new(),
         )
     });
 
@@ -385,6 +401,7 @@ fn the_stream_starts_without_a_feed_and_emits_it_when_it_lands() {
             Instant::now() + Duration::from_secs(3),
             &stream_path,
             stream_resolve.as_ref(),
+            &TerminalHolders::new(),
         )
     });
 
@@ -584,6 +601,7 @@ fn a_keepalive_is_written_after_the_injected_interval() {
         Instant::now() + Duration::from_millis(500),
         &path,
         none.as_ref(),
+        &TerminalHolders::new(),
         &config,
     )
     .expect("stream");
@@ -757,6 +775,7 @@ fn a_pane_created_mid_stream_resubscribes_and_a_pane_closed_reopens_silently() {
         Instant::now() + Duration::from_secs(3),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
     )
     .expect("stream");
@@ -899,6 +918,7 @@ fn a_failed_reopen_keeps_the_live_connection_and_retries() {
         Instant::now() + Duration::from_secs(3),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
     )
     .expect("stream");
@@ -993,6 +1013,7 @@ fn a_retry_after_absence_hands_back_the_snapshot() {
         Instant::now() + Duration::from_secs(1),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
     )
     .expect("stream");
@@ -1059,6 +1080,7 @@ fn the_herdr_socket_is_resolved_once_even_as_retries_keep_connecting() {
         Instant::now() + Duration::from_millis(1500),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &config,
     )
     .expect("stream");
@@ -1138,6 +1160,7 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
         Instant::now() + Duration::from_millis(600),
         &path,
         seam.as_ref(),
+        &TerminalHolders::new(),
         &StreamConfig::DEFAULT,
     )
     .expect("stream");
@@ -1155,5 +1178,53 @@ fn the_snapshot_carries_only_the_status_fields_of_a_pane() {
             "agent_status": "working"
         })],
         "the snapshot is the four status fields, nothing else: {frames:?}"
+    );
+}
+
+/// Hand control of `pane` back and forth between two devices until it is a
+/// fight: three handovers.
+fn fight_over(holders: &TerminalHolders, pane: &str) {
+    let now = Instant::now();
+    for device in ["driver", "phone", "driver", "phone"] {
+        holders.attach(pane, device, now);
+    }
+}
+
+#[test]
+fn a_fight_mid_stream_is_one_contention_frame_and_an_older_one_is_not_replayed() {
+    let _home = HomeSandbox::new();
+    let path = status_path();
+    write_feed(&path, &feed("alpha", "t1"));
+    let none = no_herdr();
+    let holders = Arc::new(TerminalHolders::new());
+    // Before the stream opens: not replayed.
+    fight_over(&holders, "w1:p1");
+
+    let sink = SharedSink::new();
+    let stream_sink = sink.clone();
+    let stream_holders = Arc::clone(&holders);
+    let stream = std::thread::spawn(move || {
+        let mut sink = stream_sink;
+        run_stream(
+            &mut sink,
+            Instant::now() + Duration::from_millis(1500),
+            &path,
+            none.as_ref(),
+            &stream_holders,
+        )
+    });
+    wait_until(|| status_events(&sink) == 1, Duration::from_secs(2));
+    fight_over(&holders, "w1:p2");
+    stream.join().expect("join").expect("stream");
+
+    let frames = parse_frames(&sink.bytes());
+    let fights: Vec<serde_json::Value> = frames
+        .iter()
+        .filter(|f| f.0 == "terminal_contention")
+        .map(|f| serde_json::from_str(&f.2).expect("json data"))
+        .collect();
+    assert_eq!(
+        fights,
+        vec![serde_json::json!({"pane_id": "w1:p2", "devices": ["driver", "phone"]})]
     );
 }

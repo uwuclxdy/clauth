@@ -371,6 +371,9 @@ pub(crate) struct ApiContext {
     /// test spawns a fixture script, and the default refuses so no test ever
     /// runs a real herdr.
     pub(crate) terminal_spawn: super::terminal::TerminalSpawn,
+    /// Which device holds control of each pane: the terminal bridge records
+    /// it, `GET /events` relays the contention it detects.
+    pub(crate) terminal_holders: Arc<super::terminal::TerminalHolders>,
 }
 
 impl ApiContext {
@@ -394,6 +397,7 @@ impl ApiContext {
             herdr_probe,
             herdr,
             terminal_spawn,
+            terminal_holders: Arc::new(super::terminal::TerminalHolders::new()),
         })
     }
 
