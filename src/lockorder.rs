@@ -266,6 +266,11 @@ pub(crate) mod rank {
         /// for the kind, same leaf discipline as the gateway's. One rank for
         /// the kind, so the ranks never nest.
         ProxyPublished = 1901;
+        /// Who holds control of each pane, and the contention records `/events`
+        /// relays (`daemon::api::terminal::TerminalHolders`). A true leaf: every
+        /// acquisition is one bookkeeping step, and the warning line it decides
+        /// on is written after the guard drops.
+        TerminalHolders = 1902;
     }
 }
 

@@ -430,7 +430,14 @@ fn serve_connection(
                 break;
             }
             let (stream, leftover) = reader.into_parts();
-            terminal::run(stream, leftover, hijack, &ctx.terminal_spawn, expires);
+            terminal::run(
+                stream,
+                leftover,
+                hijack,
+                &ctx.terminal_spawn,
+                &ctx.terminal_holders,
+                expires,
+            );
             return;
         }
 
