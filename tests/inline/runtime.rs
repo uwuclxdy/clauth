@@ -5083,6 +5083,62 @@ fn gc_leaves_profile_children_that_only_look_like_runtime_dirs() {
     });
 }
 
+/// Claude Code's background daemon keeps a session's `CLAUDE_CONFIG_DIR` after
+/// the `clauth start` that made the runtime exits, so its marker flock is gone.
+/// A live process naming the dir must keep the tree (and with it the Keychain
+/// item), or the daemon session drops to /login.
+#[cfg(unix)]
+#[test]
+fn gc_spares_a_runtime_a_live_process_uses_as_its_config_dir() {
+    // The stand-in daemon is this test binary re-run idle: macOS withholds the
+    // env of Apple platform binaries like `sleep`, but not of this one.
+    if std::env::var_os("CLAUTH_TEST_IDLE_DAEMON").is_some() {
+        std::thread::sleep(Duration::from_secs(30));
+        return;
+    }
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profile = tmp.path().join(".clauth").join("profiles").join("daemon");
+        let runtime = profile.join("runtime-4242-0");
+        let sessions = profile.join("sessions-4242-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed runtime");
+        fs::write(sessions.join("4242-0"), b"").expect("dead marker");
+
+        let mut daemon = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args([
+                "--exact",
+                "runtime::tests::gc_spares_a_runtime_a_live_process_uses_as_its_config_dir",
+            ])
+            .env("CLAUTH_TEST_IDLE_DAEMON", "1")
+            .env("CLAUDE_CONFIG_DIR", &runtime)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stand-in daemon");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !live_process_env_dump().is_ok_and(|dump| config_dir_in_use(&dump, &runtime))
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        gc_stale_runtimes();
+        let kept = runtime.exists();
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        assert!(
+            kept,
+            "a runtime a live process uses as its config dir must not be collected"
+        );
+
+        gc_stale_runtimes();
+        assert!(
+            !runtime.exists(),
+            "once the process exits the tree is collected as before"
+        );
+    });
+}
+
 /// An isolated session must register as live so rotation never spends a token
 /// it still holds — `has_live_session` unions both flavors.
 #[test]

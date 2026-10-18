@@ -1042,6 +1042,15 @@ fn gc_runtime_trees() {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
+    // Sampled once, before any state-flock hold (a subprocess must never span
+    // it). An unreadable process table collects nothing: unknown reads as live.
+    let env_dump = match live_process_env_dump() {
+        Ok(dump) => dump,
+        Err(e) => {
+            logline!("clauth: skipping the runtime tree sweep, cannot read process envs: {e:#}");
+            return;
+        }
+    };
     for profile in entries.flatten() {
         let profile = profile.path();
         let Ok(children) = std::fs::read_dir(&profile) else {
@@ -1060,7 +1069,7 @@ fn gc_runtime_trees() {
             } else if is_runtime_dir_name(child_name)
                 && let Some(sessions) = paired_sessions_name(child_name)
             {
-                let _ = gc_one_pair(&child.path(), &profile.join(sessions));
+                let _ = gc_one_pair(&child.path(), &profile.join(sessions), &env_dump);
             } else if is_sessions_dir_name(child_name)
                 && let Some(runtime) = paired_runtime_name(child_name)
             {
@@ -1070,11 +1079,87 @@ fn gc_runtime_trees() {
                 // rather than a reused one.
                 let runtime = profile.join(runtime);
                 if runtime.symlink_metadata().is_err() {
-                    let _ = gc_one_pair(&runtime, &child.path());
+                    let _ = gc_one_pair(&runtime, &child.path(), &env_dump);
                 }
             }
         }
     }
+}
+
+/// The env keys Claude Code resolves its config dir and Keychain namespace from.
+const CONFIG_DIR_ENV_KEYS: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR"];
+
+/// Every live process's environment as text, each `KEY=VALUE` entry preceded by
+/// a space and followed by a space or newline, for [`config_dir_in_use`].
+/// Claude Code's background daemon (`claude daemon run`, `bg-pty-host`,
+/// `bg-spare`) keeps a session's `CLAUDE_CONFIG_DIR` after the `clauth start`
+/// that made the runtime has exited, so the marker flock alone under-reports
+/// liveness. Processes of other users show no env, which is fine: they cannot
+/// be running out of this user's runtime trees.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn live_process_env_dump() -> Result<String> {
+    // Absolute: a PATH shim must not decide what a destructive sweep spares.
+    let out = std::process::Command::new("/bin/ps")
+        .args(["-axE", "-o", "pid=,command=", "-ww"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .context("failed to run ps")?;
+    anyhow::ensure!(out.status.success(), "ps exited with {}", out.status);
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn live_process_env_dump() -> Result<String> {
+    let mut dump = String::new();
+    for entry in std::fs::read_dir("/proc").context("cannot enumerate /proc")? {
+        let entry = entry.context("cannot read an entry under /proc")?;
+        if !entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        {
+            continue;
+        }
+        // A pid that exited mid-walk or belongs to another user says nothing.
+        let Ok(raw) = std::fs::read(entry.path().join("environ")) else {
+            continue;
+        };
+        for var in raw.split(|&b| b == 0).filter(|v| !v.is_empty()) {
+            dump.push(' ');
+            dump.push_str(&String::from_utf8_lossy(var));
+            dump.push('\n');
+        }
+    }
+    Ok(dump)
+}
+
+// ponytail: no cheap way to read another process's env on Windows, and the CC
+// daemon there is unconfirmed; the marker flock stays the only liveness signal.
+#[cfg(windows)]
+fn live_process_env_dump() -> Result<String> {
+    Ok(String::new())
+}
+
+/// Whether any process in `dump` names `runtime` as its config dir, in either
+/// the walked spelling or the canonical one. Matching the whole `KEY=PATH`
+/// entry rather than splitting the dump keeps paths with spaces intact.
+fn config_dir_in_use(dump: &str, runtime: &Path) -> bool {
+    let mut spellings = vec![runtime.to_path_buf()];
+    if let Ok(canonical) = crate::canonical::identity(runtime) {
+        spellings.push(canonical);
+    }
+    spellings.iter().filter_map(|p| p.to_str()).any(|path| {
+        CONFIG_DIR_ENV_KEYS.iter().any(|key| {
+            let needle = format!(" {key}={path}");
+            dump.match_indices(&needle).any(|(at, _)| {
+                matches!(
+                    dump[at + needle.len()..].chars().next(),
+                    None | Some(' ' | '\n')
+                )
+            })
+        })
+    })
 }
 
 /// Every namespaced Keychain service an EXISTING runtime dir explains — the
@@ -1832,7 +1917,13 @@ fn rescue_tombstone(tombstone: &Path) {
 /// collects the orphaned marker dir alone. An isolated tree is renamed to a
 /// tombstone under the lock and rescued outside it, so the flock is never held
 /// across a tree-sized copy; a shared tree is removed under the lock as before.
-fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
+fn gc_one_pair(runtime: &Path, sessions: &Path, env_dump: &str) -> Result<()> {
+    // A live process still running out of this dir (the CC daemon outliving
+    // its `clauth start`) keeps the tree and, since the item is only collected
+    // once the dir is gone, its Keychain item.
+    if config_dir_in_use(env_dump, runtime) {
+        return Ok(());
+    }
     gc_one_pair_synced(runtime, sessions, || {})
 }
 
