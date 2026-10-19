@@ -582,9 +582,15 @@ pub(crate) fn no_usage_source(profile: &Profile, has_session_token: bool) -> boo
 /// aggregate gate and no scoped window bites), so that hop lands on it ahead of
 /// a fresh member with room.
 ///
-/// Either way it stays: once it is active the scan finds no reading to act on
-/// (`reading_is_actionable` wants a `Fresh` status, and nothing polls this
-/// member), so only a dead login or the operator moves the chain off it.
+/// Either way it stays, and there is only one way out. Once it is active the
+/// scan finds no reading to act on (`reading_is_actionable` wants a `Fresh`
+/// status, and nothing polls this member). The dead-login exit cannot fire for
+/// it either: every site that flags a login broken sits in the stored pair's
+/// own path — the quarantine and refresh arms on the kick, the rotation and the
+/// install gate, in `oauth` and in the scheduler's poll leg alike, plus the
+/// expiring-pair-with-no-refresh-token gate, which reads that pair before it
+/// can fire — and the shape this marker is for holds no pair to fail. So only
+/// the operator moves the chain off it.
 ///
 /// This is the INVARIANT half, the same words on every surface. The lead in
 /// front of it carries the tense, which differs per surface and per state:
