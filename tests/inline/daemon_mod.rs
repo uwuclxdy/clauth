@@ -2579,11 +2579,14 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
         ],
     );
     // One member reads as one account, which is the wording the member card
-    // carries too: the same fn, told a one-name list.
+    // carries too: the same fn, told a one-name list. Round 3: the LEAD comes
+    // from the card's own `no_usage_hazard_lead` for a one-member line as
+    // well, so the whole sentence matches the card and the confirm instead of
+    // only its second half.
     assert_eq!(
         logged(vec!["polled", "st-a"]),
         [
-            "clauth daemon: can't read the usage of st-a. once one is active, clauth won't \
+            "clauth daemon: can't read the usage of st-a. once it's active, clauth won't \
              switch away from it on its own. log in the same account with `clauth login \
              st-a` so clauth can read its usage"
         ],
@@ -2627,17 +2630,63 @@ fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
     assert_eq!(
         logged(Some("st-a")),
         [
-            "clauth daemon: can't read the usage of st-a. 'st-a' is active now, and clauth \
-             won't switch away from it on its own. log in the same account with `clauth \
-             login st-a` so clauth can read its usage"
+            "clauth daemon: can't read the usage of st-a. it's active, and clauth won't \
+             switch away from it on its own. log in the same account with `clauth login \
+             st-a` so clauth can read its usage"
         ],
     );
     // The measurable member being active leaves the forecast wording, and so
     // does an empty active slot.
     for active in [Some("polled"), None] {
         assert!(
-            logged(active)[0].contains("once one is active,"),
+            logged(active)[0].contains("once it's active,"),
             "not yet active: {:?}",
+            logged(active)
+        );
+    }
+}
+
+/// The other direction of the lead: a LIST keeps this line's own, in both
+/// tenses. `no_usage_hazard_lead` says `it`, which cannot name which of several
+/// members, and the present-tense arm has to say which one is active — so the
+/// shared lead is for the one-member line only and must not spread to a list.
+#[test]
+fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
+    let _home = HomeSandbox::new();
+    let name = |n: &str| crate::profile::ProfileName::from(n);
+    arm_session_token("st-a");
+    arm_session_token("st-b");
+    let config = |active: Option<&str>| AppConfig {
+        state: AppState {
+            active_profile: active.map(Into::into),
+            fallback_chain: vec!["polled".into(), "st-a".into(), "st-b".into()],
+            ..AppState::default()
+        },
+        profiles: vec![
+            profile_with_creds("polled", "at-polled"),
+            blank_profile(&name("st-a")),
+            blank_profile(&name("st-b")),
+        ],
+    };
+    let logged = |active: Option<&str>| -> Vec<String> {
+        let lines = crate::logline::LogLines::new();
+        {
+            let _capture = lines.capture_here();
+            super::warn_if_chain_has_no_usage_source(&config(active));
+        }
+        lines.snapshot()
+    };
+
+    assert!(
+        logged(Some("st-b"))[0]
+            .contains("can't read the usage of st-a, st-b. 'st-b' is active now, and clauth"),
+        "a list names WHICH member is active: {:?}",
+        logged(Some("st-b"))
+    );
+    for active in [Some("polled"), None] {
+        assert!(
+            logged(active)[0].contains("st-a, st-b. once one is active, clauth"),
+            "a list that is not active keeps the list forecast: {:?}",
             logged(active)
         );
     }

@@ -621,18 +621,29 @@ fn warn_if_chain_has_no_usage_source(config: &crate::profile::AppConfig) {
     if !members.is_empty() {
         // A daemon can boot with such a member ALREADY active (the chain walked
         // onto it before this process started, or the operator put it there),
-        // and then the hazard is the state of the machine, not a forecast. The
-        // lead is this line's own because it speaks about a list where the
-        // card speaks about one member; the sentence after it is the shared
-        // one, so the two cannot drift.
-        let lead = match config.state.active_profile.as_ref() {
-            Some(active) if members.contains(&active.as_str()) => {
-                format!("'{active}' is active now, and")
+        // and then the hazard is the state of the machine, not a forecast.
+        //
+        // With ONE member the lead is the one the card and the confirm share
+        // ([`crate::fallback::no_usage_hazard_lead`]), so a single state cannot
+        // wear three tenses across three surfaces — this line used to say
+        // `once one is active` where those two say `once it's active`. The name
+        // is not lost with it: the sentence before it already named the member.
+        // A LIST keeps this line's own lead, which is why that one stays here:
+        // `it` cannot name which of several, and the present-tense arm has to
+        // say which one is active.
+        let active = config.state.active_profile.as_ref();
+        let lead = match members.as_slice() {
+            [only] => {
+                crate::fallback::no_usage_hazard_lead(active.is_some_and(|a| a.as_str() == *only))
+                    .to_string()
             }
-            _ => "once one is active,".to_string(),
+            _ => match active {
+                Some(a) if members.contains(&a.as_str()) => format!("'{a}' is active now, and "),
+                _ => "once one is active, ".to_string(),
+            },
         };
         logline!(
-            "clauth daemon: can't read the usage of {}. {} {}. {}",
+            "clauth daemon: can't read the usage of {}. {}{}. {}",
             members.join(", "),
             lead,
             crate::fallback::no_usage_hazard(),
