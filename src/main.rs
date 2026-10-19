@@ -854,6 +854,54 @@ fn reauth_confirm_object(is_api: bool, keeps_endpoint: bool) -> &'static str {
     }
 }
 
+/// The whole clause after "Re-authenticating": the VERB as well as the object,
+/// because on one shape the login replaces nothing.
+///
+/// The setup-token-only shape (#110) is the one the Fallback card sends people
+/// here with, and it stores no OAuth pair at all, so "replaces its stored
+/// credentials" names nothing that exists and contradicts the wiki, which calls
+/// this login an add beside the long-lived token. "Long-lived" and not "setup"
+/// in the copy: [`claude::has_session_token`] is true for a rolling sidecar too,
+/// which is no `claude setup-token` mint, and the NOTE after the login already
+/// uses that umbrella.
+///
+/// An api-mode login keeps the replace wording whatever the profile stores: it
+/// writes the endpoint and the key outright. [`reauth_confirm_object`] keeps
+/// naming only what a replace replaces, so the survivor clause stays pinned
+/// where it was.
+///
+/// Storing no login is not enough for "adds", because the login can still
+/// STRIKE something (#116 review). `actions::overwrite_captured_profile` keeps
+/// a profile's endpoint and key only as a pair and only behind
+/// [`claude::has_own_inference_endpoint`], which refuses an endpoint with
+/// nothing to authenticate it — so on an endpoint SHELL (a `base_url` with
+/// neither key nor pair, what logging an api account out leaves behind) an
+/// OAuth reauth writes `base_url = None`. Such a profile stores no login, so
+/// the clause called this login an add while it was about to delete the
+/// account's routing. `drops_endpoint_fields` is that fact, and it is read from
+/// the MANAGED fields alone: the overwrite writes those two and never touches
+/// the profile's `[env]`, so an endpoint carried by `ANTHROPIC_BASE_URL`
+/// survives and is correctly not named here.
+fn reauth_confirm_action(
+    is_api: bool,
+    keeps_endpoint: bool,
+    stores_a_login: bool,
+    keeps_session_token: bool,
+    drops_endpoint_fields: bool,
+) -> String {
+    if !is_api && !stores_a_login && !drops_endpoint_fields {
+        return if keeps_session_token {
+            "adds an OAuth login beside its long-lived token".to_string()
+        } else {
+            "adds an OAuth login".to_string()
+        };
+    }
+    format!(
+        "replaces its {}",
+        reauth_confirm_object(is_api, keeps_endpoint)
+    )
+}
+
 /// What the reauth confirm adds when a long-lived sidecar sits beside the
 /// login (CLA-SPLIT). The replace itself is real: `overwrite_captured_profile`
 /// rewrites `credentials.json`. What it does to the SESSIONS depends on which
@@ -924,15 +972,23 @@ fn confirm_reauth(
     keeps_endpoint: bool,
     keeps_session_token: bool,
     rolling: bool,
+    stores_a_login: bool,
+    drops_endpoint_fields: bool,
 ) -> Result<bool> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(true);
     }
-    let object = reauth_confirm_object(is_api, keeps_endpoint);
+    let action = reauth_confirm_action(
+        is_api,
+        keeps_endpoint,
+        stores_a_login,
+        keeps_session_token,
+        drops_endpoint_fields,
+    );
     let note = reauth_confirm_session_token_note(keeps_session_token, rolling);
     out!(
-        "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}.{note} Continue? [y/N] "
+        "clauth: profile '{target}' already exists. Re-authenticating {action}.{note} Continue? [y/N] "
     );
     let mut answer = String::new();
     std::io::stdin().read_line(&mut answer)?;
@@ -1401,6 +1457,21 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
     // after it can never describe two different profiles. The rotation itself
     // re-reads the flag from disk, as it must; this is copy, not a gate.
     let rolling_token = config.find(&target).is_some_and(|p| p.rolling_token);
+    // Whether there is a login to REPLACE. `usage_poll_pair` is the stored-pair
+    // test, read rather than re-spelled, so the clause and the poller agree on
+    // what "has a login" means; a name the config does not hold stores none.
+    let stores_a_login = config
+        .find(&target)
+        .is_some_and(|p| crate::usage::usage_poll_pair(p).is_some());
+    // What the overwrite would STRIKE, which decides the verb as much as
+    // `stores_a_login` does: the preserve arm keeps the endpoint and the key
+    // only as a pair and only where `keeps_endpoint` holds, so an endpoint
+    // shell loses its `base_url` to a browser reauth. Managed fields only —
+    // the overwrite writes those two and leaves `[env]` alone.
+    let drops_endpoint_fields = !keeps_endpoint
+        && config
+            .find(&target)
+            .is_some_and(|p| p.base_url.is_some() || p.api_key.is_some());
     if reauth
         && !confirm_reauth(
             &target,
@@ -1408,6 +1479,8 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
             keeps_endpoint,
             keeps_session_token,
             rolling_token,
+            stores_a_login,
+            drops_endpoint_fields,
         )?
     {
         outln!("clauth: aborted. '{target}' left unchanged.");

@@ -3024,6 +3024,110 @@ mod static_token_verdicts {
         assert_eq!(reauth_confirm_object(true, false), "endpoint + API key");
     }
 
+    /// \#116 round 3: the setup-token-only shape (#110) — the one the Fallback
+    /// card sends people here with — stores no OAuth pair, so the clause has to
+    /// say the login ADDS one instead of naming credentials that do not exist.
+    /// Pinned off real `Profile` fixtures through `usage_poll_pair`, so the
+    /// wording AND the fact it keys on are both held: a fixture with no
+    /// `claudeAiOauth` must read as storing no login, and one carrying a pair
+    /// must keep the replace wording and its survivor clause.
+    ///
+    /// Storing no login is necessary and not sufficient (#116 review): the
+    /// endpoint-shell fixture below stores none either, and the login still
+    /// strikes its `base_url`, so it keeps the replace wording. Both facts are
+    /// read off the fixture through the predicates the call site uses, so the
+    /// copy cannot drift from what the overwrite actually does.
+    #[test]
+    fn the_reauth_confirm_adds_a_login_when_the_profile_stores_none() {
+        let pairless =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("st-only"));
+        let stores_none = crate::usage::usage_poll_pair(&pairless).is_some();
+        assert!(
+            !stores_none,
+            "fixture precondition: the setup-token-only shape stores no OAuth pair"
+        );
+        assert_eq!(
+            reauth_confirm_action(false, false, stores_none, true, false),
+            "adds an OAuth login beside its long-lived token"
+        );
+        assert_eq!(
+            reauth_confirm_action(false, false, stores_none, false, false),
+            "adds an OAuth login",
+            "with no sidecar there is no long-lived token to name beside it"
+        );
+
+        // An endpoint SHELL: a `base_url` with neither key nor pair, which is
+        // what logging an api account out leaves behind. It stores no login
+        // either, but the overwrite's preserve arm refuses an endpoint with
+        // nothing to authenticate it, so the login writes `base_url = None` —
+        // and a confirm saying "adds" would announce an add while doing a
+        // delete. Reachable with a plain `clauth login <name>`, whose api-mode
+        // flag is false (`login_bare_name_is_oauth_mode`), so the mode is read
+        // from that parse here rather than asserted as a literal.
+        let mut shell = crate::testutil::blank_profile(&crate::profile::ProfileName::from("shell"));
+        shell.base_url = Some("https://proxy.example/v1".to_string());
+        let shell_keeps_endpoint = crate::claude::has_own_inference_endpoint(&shell);
+        let shell_drops =
+            !shell_keeps_endpoint && (shell.base_url.is_some() || shell.api_key.is_some());
+        assert!(
+            crate::usage::usage_poll_pair(&shell).is_none(),
+            "fixture precondition: the shell stores no OAuth pair either"
+        );
+        assert!(
+            !shell_keeps_endpoint,
+            "fixture precondition: an endpoint with no credential behind it is not preserved"
+        );
+        assert!(
+            shell_drops,
+            "fixture precondition: so the overwrite strikes the stored base_url"
+        );
+        assert_eq!(
+            reauth_confirm_action(
+                login(&["login", "shell"]).is_api_mode(),
+                shell_keeps_endpoint,
+                crate::usage::usage_poll_pair(&shell).is_some(),
+                false,
+                shell_drops,
+            ),
+            "replaces its stored credentials",
+            "the login deletes this profile's endpoint, so it replaces rather than adds"
+        );
+
+        let mut paired =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from("paired"));
+        paired.credentials = Some(crate::profile::ClaudeCredentials {
+            claude_ai_oauth: Some(crate::profile::OAuthToken {
+                access_token: "at-paired".to_string(),
+                refresh_token: Some("rt-paired".to_string()),
+                expires_at: Some(crate::usage::now_ms() as i64 + 3_600_000),
+                scopes: Some(vec![
+                    "user:inference".to_string(),
+                    "user:profile".to_string(),
+                ]),
+                subscription_type: Some("max".into()),
+                ..crate::profile::OAuthToken::default_extra()
+            }),
+        });
+        let stores_one = crate::usage::usage_poll_pair(&paired).is_some();
+        assert!(stores_one, "fixture precondition: this one stores a pair");
+        // The other direction, so the add wording cannot creep onto a profile
+        // whose login really is being replaced.
+        assert_eq!(
+            reauth_confirm_action(false, false, stores_one, true, false),
+            "replaces its stored credentials"
+        );
+        assert_eq!(
+            reauth_confirm_action(false, true, stores_one, false, false),
+            "replaces its stored subscription login, keeping its endpoint and api key"
+        );
+        // An api-mode login writes endpoint and key outright, so it replaces
+        // whatever the profile stores — pairless included.
+        assert_eq!(
+            reauth_confirm_action(true, false, stores_none, true, false),
+            "replaces its endpoint + API key"
+        );
+    }
+
     /// \#116 review: the confirm used to promise only the replace, which is
     /// true and incomplete. On a profile holding a long-lived sidecar the
     /// replace reaches `/usage` polling and NOTHING the sessions use, because
