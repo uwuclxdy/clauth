@@ -1333,10 +1333,15 @@ fn add_chain_candidate_modal_pins_body_and_named_confirm_button() {
 }
 
 /// \#116 round 4: the no-usage add confirm carries TWO detail lines, the hazard
-/// and then the fix, and the modal has to draw them as two rows. A detail that
-/// long on one row is chunked mid-word by `draw_modal_scrolled`, which is how
-/// the dialog came to name the cost and leave the command to the card. Found by
-/// a mutation arm: collapsing the two lines again passed every other test here.
+/// and then the fix, and the modal has to draw them as two rows. Found by a
+/// mutation arm: collapsing the two lines into one passed every other test
+/// here.
+///
+/// Round 5 (rebase onto `mommy`): rendered wide enough that BOTH sentences fit
+/// a row whole. The modal caps at 60% of the terminal, so at 100 columns its
+/// inner width is shorter than the hazard sentence and the `hazard + 1`
+/// arithmetic was measuring `chunk_line`'s word wrap instead of the newline
+/// split it is named for. The wrap has its own test below.
 #[test]
 fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
     use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
@@ -1358,7 +1363,7 @@ fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
         scroll: ConfirmScroll::default(),
         on_confirm: ConfirmAction::AddChainCandidate("blind".into()),
     };
-    let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
     term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
     let row_of = |needle: &str| {
@@ -1378,10 +1383,11 @@ fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
 }
 
 /// \#116 round 5: at 80 columns the fix line wraps, and its continuation has to
-/// start in the SAME column as its first row. Left to the modal, `chunk_line`
-/// cuts at the cell boundary and keeps every character, so the space at the cut
-/// became a one-column indent (seen in a real terminal). The detail is
-/// word-wrapped before it reaches the modal, which this pins.
+/// start in the SAME column as its first row. A cell-boundary cut keeps the
+/// space at the cut and turns it into a one-column indent, which is what a real
+/// terminal showed. `mommy`'s `chunk_line` breaks between words and drops the
+/// break's whitespace run, so the column holds without this file pre-wrapping
+/// anything — which is what this pins, now that the pre-wrap is gone.
 #[test]
 fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
     use crate::tui::app::{ConfirmAction, ConfirmScroll, ConfirmState};
@@ -1404,27 +1410,32 @@ fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
     let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
     term.draw(|f| draw_confirm(f, f.area(), &state)).unwrap();
     let rows = crate::testutil::buffer_rows(term.backend().buffer());
-    // The column of the TEXT, not of the modal's border: the border sits on
-    // every row, so comparing leading spaces would pass whatever the wrap did.
     let first = rows
         .iter()
         .position(|r| r.contains("log in the same account"))
         .unwrap_or_else(|| panic!("the fix line is on no row:\n{}", rows.join("\n")));
-    let rest = rows
-        .iter()
-        .skip(first + 1)
-        .position(|r| r.contains("usage."))
-        .map(|at| at + first + 1)
-        .unwrap_or_else(|| {
-            panic!(
-                "the fix line does not wrap at 80 columns:\n{}",
-                rows.join("\n")
-            )
-        });
-    let col = |row: &str, needle: &str| row.find(needle).expect("needle is on this row");
+    // The continuation is the row right after it: at 80 columns the modal is 48
+    // cells wide and the fix sentence cannot fit one row.
+    let rest = first + 1;
+    assert!(
+        rows[rest].contains("so clauth can read its usage."),
+        "the fix line does not wrap onto the next row at 80 columns:\n{}",
+        rows.join("\n")
+    );
+    // The indent INSIDE the modal. The border and the centring padding are
+    // identical on every row, so measuring the raw row would pass whatever the
+    // wrap did; and the needle's own offset is not the column, which is what
+    // made this read green while `usage.` sat alone on a row of its own.
+    let indent = |row: &str| {
+        let inner = row
+            .trim_matches(' ')
+            .trim_start_matches('\u{2502}')
+            .trim_end_matches('\u{2502}');
+        inner.len() - inner.trim_start().len()
+    };
     assert_eq!(
-        col(&rows[rest], "usage."),
-        col(&rows[first], "log in the same account"),
+        indent(&rows[rest]),
+        indent(&rows[first]),
         "the continuation starts in the same column as its first row:\n{}",
         rows[first..=rest].join("\n")
     );
