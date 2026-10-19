@@ -420,8 +420,16 @@ fn help_modal_key_rows_follow_usage_and_model_detail_focus() {
             .iter()
             .map(|row| {
                 let left = row.find('│').expect("modal border");
+                // The scrollbar column goes with the border: these rows are
+                // the subject, and whether the modal happens to scroll at this
+                // size is not. One legend row more used to be enough to put a
+                // `┃` into every comparison here. Stripped in stages, so a
+                // blank row keeps the leading border it is made of.
                 row[left..]
-                    .trim_end_matches([' ', '│'])
+                    .trim_end()
+                    .trim_end_matches('│')
+                    .trim_end()
+                    .trim_end_matches(['┃', '┊'])
                     .trim_end()
                     .to_owned()
             })
@@ -523,6 +531,8 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
                     .trim_end()
                     .trim_end_matches('│')
                     .trim_end()
+                    .trim_end_matches(['┃', '┊'])
+                    .trim_end()
                     .to_owned()
             })
             .collect();
@@ -548,6 +558,8 @@ fn help_tabs_and_screen_sections_follow_descended_detail_focus() {
                     .collect::<String>()
                     .trim_end()
                     .trim_end_matches('│')
+                    .trim_end()
+                    .trim_end_matches(['┃', '┊'])
                     .trim_end()
                     .to_owned()
             })
@@ -4107,6 +4119,11 @@ fn the_check_output_modal_drops_trailing_whitespace_that_overflows() {
 /// The help modal's wrapped shape at the common 80-column width (a 48-wide
 /// modal): a long description wraps onto the next row under the key column.
 /// One exact pin here, beside the widened (content-fit) help pins above.
+///
+/// The thumb's extent is part of that shape, so it moves when the legend does:
+/// the `◆ can't read usage` row added for #116 is one row more of content, and
+/// the thumb is one row shorter for it. The wrapped rows above are what this
+/// test is for and none of them changed.
 #[test]
 fn the_help_modal_wraps_long_rows_at_the_common_width() {
     use ratatui::{Terminal, backend::TestBackend};
@@ -4169,7 +4186,7 @@ fn the_help_modal_wraps_long_rows_at_the_common_width() {
         "│    ⊘                   weekly spent        ┃ │",
         "│    ⧗                   claude code blocked ┃ │",
         "│    $                   extra usage spent   ┃ │",
-        "│    ◔                   5h window spent     ┃ │",
+        "│    ◔                   5h window spent     ┊ │",
         "│    ⊘                   one model's week    ┊ │",
         "│  spent, other models ok                    ┊ │",
         "│    ~                   past the weekly     ┊ │",
