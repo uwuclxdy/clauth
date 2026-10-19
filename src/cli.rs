@@ -97,9 +97,17 @@ pub(crate) enum Command {
     /// holds a login no profile owns. The first profile becomes the active
     /// account; a later one needs `clauth <name>` to switch to. An existing
     /// name is refused — re-authenticating one is `clauth login <name>`.
+    ///
+    /// `--from <file>` adopts a Claude Code `.credentials.json` copied off
+    /// another machine or out of a backup instead. A refresh token is
+    /// single-use, so stop the source from refreshing it first (quit its
+    /// sessions and move the file aside); two holders sign each other out.
     Capture {
         /// Profile to save the current login under.
         profile: String,
+        /// Read the login from this credentials file instead of the live one.
+        #[arg(long, value_name = "FILE")]
+        from: Option<std::path::PathBuf>,
     },
 
     /// Remove a profile and all its credentials
