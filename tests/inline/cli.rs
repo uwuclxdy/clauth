@@ -3036,13 +3036,72 @@ mod static_token_verdicts {
     #[test]
     fn the_reauth_confirm_says_what_a_session_token_does_to_the_login() {
         assert_eq!(
-            reauth_confirm_session_token_note(true),
+            reauth_confirm_session_token_note(true, false),
             " Sessions keep running on its long-lived token; this login only feeds usage polling."
         );
         assert_eq!(
-            reauth_confirm_session_token_note(false),
+            reauth_confirm_session_token_note(false, false),
             "",
             "a profile with no sidecar is promised nothing about one"
+        );
+        assert_eq!(
+            reauth_confirm_session_token_note(false, true),
+            "",
+            "the flag alone promises nothing: with no sidecar there is nothing to re-stamp"
+        );
+    }
+
+    /// \#116 round 3: the sentence above is true for a PLAIN `claude
+    /// setup-token` mint and false for a rolling one. With `rolling_token`
+    /// armed, every rotation re-stamps the sidecar from the stored pair
+    /// (`oauth`'s `stamp_sidecar`), so the login being confirmed is what the
+    /// sessions move onto at the next rotation — another account's whenever
+    /// that is what was logged in as, which nothing on the profile lets clauth
+    /// check. Pinned by equality in BOTH directions, because the two sentences
+    /// are opposites and getting either one onto the wrong profile is the
+    /// failure this split exists to prevent.
+    #[test]
+    fn the_reauth_confirm_says_what_a_rolling_token_does_to_the_login() {
+        assert_eq!(
+            reauth_confirm_session_token_note(true, true),
+            " Its rolling token re-stamps from the stored login, so its sessions move onto this \
+             login at the next rotation, even if it is another account."
+        );
+        assert_ne!(
+            reauth_confirm_session_token_note(true, true),
+            reauth_confirm_session_token_note(true, false),
+            "the rolling case must not inherit the plain token's promise"
+        );
+    }
+
+    /// The NOTE after the login splits on the same axis as the confirm before
+    /// it, so the operator cannot be told one thing while answering and the
+    /// other once it landed. The plain arm is pinned too: it is the sentence
+    /// that was already shipping, and a change there is a change to what an
+    /// untouched mint promises.
+    #[test]
+    fn the_login_note_says_what_a_rolling_token_does_to_the_sessions() {
+        assert_eq!(
+            login_session_token_note("acct", true),
+            "clauth: NOTE 'acct' holds a rolling token, and that is what switches install. It \
+             re-stamps from the stored login, so its sessions move onto this login at the next \
+             rotation, even if it is another account. Drop it with:  clauth static-token acct \
+             --clear"
+        );
+    }
+
+    #[test]
+    fn the_login_note_keeps_the_plain_setup_token_sentence() {
+        assert_eq!(
+            login_session_token_note("acct", false),
+            "clauth: NOTE 'acct' still holds a long-lived token, and that is what switches \
+             install. This login only feeds usage polling. Drop it with:  clauth static-token \
+             acct --clear"
+        );
+        assert_ne!(
+            login_session_token_note("acct", false),
+            login_session_token_note("acct", true),
+            "the two kinds of sidecar must not print the same note"
         );
     }
 

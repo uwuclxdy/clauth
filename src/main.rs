@@ -856,19 +856,65 @@ fn reauth_confirm_object(is_api: bool, keeps_endpoint: bool) -> &'static str {
 
 /// What the reauth confirm adds when a long-lived sidecar sits beside the
 /// login (CLA-SPLIT). The replace itself is real: `overwrite_captured_profile`
-/// rewrites `credentials.json`. What it does NOT do is move the sessions, and
-/// nothing in the login path says so before the operator answers: the sidecar
-/// is untouched, and the relink keeps resolving `install_source_path`, which
-/// picks `session-token.json` while [`claude::has_session_token`] holds. So the
-/// fresh pair reaches usage polling and nothing else, which is the same thing
-/// `cmd_login` prints as a NOTE after the fact. Split out like
-/// [`reauth_confirm_object`] so the claim is unit-pinned, and worded as its own
-/// sentence so the object clause keeps naming only what the overwrite replaces.
-fn reauth_confirm_session_token_note(keeps_session_token: bool) -> &'static str {
-    if keeps_session_token {
-        " Sessions keep running on its long-lived token; this login only feeds usage polling."
+/// rewrites `credentials.json`. What it does to the SESSIONS depends on which
+/// kind of sidecar it is, and the two answers are opposites.
+///
+/// A plain `claude setup-token` mint is untouched: the relink keeps resolving
+/// [`claude::install_source_path`] to `session-token.json` while
+/// [`claude::has_session_token`] holds, so the fresh pair reaches usage polling
+/// and nothing else.
+///
+/// CLA-ROLL: with `rolling_token` armed, every rotation re-stamps that sidecar
+/// FROM the stored pair (`oauth`'s `stamp_sidecar`, which reads the flag off
+/// disk and skips only a mis-fill), so the halves swap roles — the login being
+/// confirmed here is what the sessions end up on at the next rotation, and it
+/// is another account's whenever that is what was logged in as. Nothing on the
+/// profile ties the mint to an account, so clauth cannot check that for the
+/// operator; the sentence says it instead.
+///
+/// Split out like [`reauth_confirm_object`] so the claim is unit-pinned, and
+/// worded as its own sentence so the object clause keeps naming only what the
+/// overwrite replaces. [`login_session_token_note`] splits on the same axis, so
+/// the prompt before the login and the NOTE after it cannot say different
+/// things.
+fn reauth_confirm_session_token_note(keeps_session_token: bool, rolling: bool) -> &'static str {
+    match (keeps_session_token, rolling) {
+        (false, _) => "",
+        (true, false) => {
+            " Sessions keep running on its long-lived token; this login only feeds usage polling."
+        }
+        (true, true) => {
+            " Its rolling token re-stamps from the stored login, so its sessions move onto this \
+             login at the next rotation, even if it is another account."
+        }
+    }
+}
+
+/// The NOTE `cmd_login` prints after a login onto a profile that keeps a
+/// long-lived sidecar: the same split said once more, where the operator can act
+/// on it. Silence here reads as "the re-login took", which is what sent an
+/// operator round the loop of re-authenticating an account that kept running on
+/// its year-old mint.
+///
+/// Hoisted out of `cmd_login` for the same reason the confirm's half is, and
+/// split on the same `rolling` axis: on a rolling profile the re-login is not
+/// inert, it is what the sessions move onto, so telling the operator it "only
+/// feeds usage polling" would be the wrong half of the truth at the moment the
+/// rotation is about to prove it.
+fn login_session_token_note(target: &str, rolling: bool) -> String {
+    if rolling {
+        format!(
+            "clauth: NOTE '{target}' holds a rolling token, and that is what switches install. \
+             It re-stamps from the stored login, so its sessions move onto this login at the \
+             next rotation, even if it is another account. Drop it with:  clauth static-token \
+             {target} --clear"
+        )
     } else {
-        ""
+        format!(
+            "clauth: NOTE '{target}' still holds a long-lived token, and that is what switches \
+             install. This login only feeds usage polling. Drop it with:  clauth static-token \
+             {target} --clear"
+        )
     }
 }
 
@@ -877,13 +923,14 @@ fn confirm_reauth(
     is_api: bool,
     keeps_endpoint: bool,
     keeps_session_token: bool,
+    rolling: bool,
 ) -> Result<bool> {
     use std::io::IsTerminal as _;
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return Ok(true);
     }
     let object = reauth_confirm_object(is_api, keeps_endpoint);
-    let note = reauth_confirm_session_token_note(keeps_session_token);
+    let note = reauth_confirm_session_token_note(keeps_session_token, rolling);
     out!(
         "clauth: profile '{target}' already exists. Re-authenticating replaces its {object}.{note} Continue? [y/N] "
     );
@@ -1346,9 +1393,23 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         .is_some_and(claude::has_own_inference_endpoint);
     // The same gate the NOTE after the login uses, asked before the decision:
     // the sidecar is what switches install, so on a profile holding one this
-    // login changes what clauth polls and nothing the sessions use.
+    // login changes what clauth polls, and on a rolling one what the sessions
+    // run on too.
     let keeps_session_token = !is_api && claude::has_session_token(&target);
-    if reauth && !confirm_reauth(&target, is_api, keeps_endpoint, keeps_session_token)? {
+    // CLA-ROLL: read ONCE, off the same config the endpoint half reads, and
+    // reused for the NOTE below — so the prompt before the login and the line
+    // after it can never describe two different profiles. The rotation itself
+    // re-reads the flag from disk, as it must; this is copy, not a gate.
+    let rolling_token = config.find(&target).is_some_and(|p| p.rolling_token);
+    if reauth
+        && !confirm_reauth(
+            &target,
+            is_api,
+            keeps_endpoint,
+            keeps_session_token,
+            rolling_token,
+        )?
+    {
         outln!("clauth: aborted. '{target}' left unchanged.");
         return Ok(());
     }
@@ -1418,17 +1479,13 @@ fn cmd_login(args: LoginArgs) -> Result<()> {
         )?;
         outln!("clauth: captured into profile '{target}'. Switch to it with:  clauth {target}");
     }
-    // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch, so a
-    // fresh OAuth login reaches usage polling and NOTHING ELSE while it exists.
-    // Silence here reads as "the re-login took", which is what sent an operator
-    // round the loop of re-authenticating an account that kept running on its
-    // year-old mint.
+    // CLA-SPLIT: the sidecar outranks `credentials.json` at every switch. What
+    // that costs depends on the kind, so the copy lives in one place with the
+    // confirm's half ([`login_session_token_note`]) and is read with the same
+    // `rolling_token` the confirm was given.
     if !is_api && claude::has_session_token(&target) {
-        outln!(
-            "clauth: NOTE '{target}' still holds a long-lived token, and that is what switches \
-             install. This login only feeds usage polling. Drop it with:  clauth static-token \
-             {target} --clear"
-        );
+        let note = login_session_token_note(&target, rolling_token);
+        outln!("{note}");
     }
     Ok(())
 }

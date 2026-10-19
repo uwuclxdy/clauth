@@ -141,7 +141,7 @@ clauth list           # account table with cached usage, no network
   - It needs the daemon running: the bearer dies in hours, and the daemon's scan is what re-stamps it before then.
   - The mint it supersedes is preserved at `session-token.static.json`; the bare `clauth static-token <profile>` — or a terminally dead usage chain — restores it rather than signing sessions out.
   - The Setup tab's `token` row switches to an hours-scale `rolling · re-stamps in ~Nh` countdown and reads `rolling token stalled` if the re-stamping ever stops.
-- **`static-token --clear`** is the way back out. A stored long-lived token is what every switch installs, so a plain `clauth login <profile>` refreshes only the OAuth pair clauth polls usage with, and never reaches a session. The login prints a note saying so.
+- **`static-token --clear`** is the way back out. A stored long-lived token is what every switch installs, so a plain `clauth login <profile>` refreshes only the OAuth pair clauth polls usage with, and never reaches a session — unless the profile has `rolling_token` set, when every rotation re-stamps the token from that pair, so the sessions move onto the new login at the next rotation. The login prints a note saying which case applies.
   - Clearing is the FULL exit: it drops the token, the preserved mint backup, and the `rolling_token` flag together.
   - A lingering flag would have the daemon re-stamp a fresh sidecar over the removal, and a lingering backup keeps a year-scale credential on disk under a command that just said "cleared".
   - Then it relinks the live credentials when the profile is active.
