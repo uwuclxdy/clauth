@@ -9175,6 +9175,45 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
         no_usage_source(&blank_env, true),
         "an entry blank once trimmed is no override, as `routing_endpoint` reads it"
     );
+    // The key half reads `claude::has_inference_auth` and not `api_key`
+    // (#116 round 3), which was wrong both ways round. A key can ride the
+    // profile's own `[env]`, where the managed field is None: such a member
+    // authenticates its own inference, so it is no more measurable here than
+    // one with the managed field set, and marking it would ask it for a login
+    // it does not need.
+    let mut env_key = bare("ek");
+    env_key
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string());
+    assert!(
+        !no_usage_source(&env_key, true),
+        "an env-carried api key is inference auth of its own, like the managed field"
+    );
+    let mut env_auth = bare("ea");
+    env_auth
+        .env
+        .insert("ANTHROPIC_AUTH_TOKEN".to_string(), "tok-test".to_string());
+    assert!(
+        !no_usage_source(&env_auth, true),
+        "the auth-token entry is the other half of the same test"
+    );
+    // And the other direction, the one the old field test got backwards: a key
+    // blank once trimmed authenticates nothing, so it must not HIDE the marker
+    // on a member whose sessions really do run on the sidecar alone.
+    let mut blank_key = bare("bk");
+    blank_key.api_key = Some("   ".into());
+    assert!(
+        no_usage_source(&blank_key, true),
+        "a managed key blank once trimmed is no credential, and must not hide the marker"
+    );
+    let mut blank_env_key = bare("bek");
+    blank_env_key
+        .env
+        .insert("ANTHROPIC_API_KEY".to_string(), "  ".to_string());
+    assert!(
+        no_usage_source(&blank_env_key, true),
+        "an env entry blank once trimmed is no credential either"
+    );
 }
 
 /// The rung fires on the SHAPE, not on the reading the caller happens to hold,

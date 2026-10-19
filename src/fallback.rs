@@ -523,9 +523,17 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
 /// Three shapes are deliberately NOT this:
 /// * a member with no login at all, which serves nothing and carries its own
 ///   logged-out state,
-/// * an api-key account, with or without an endpoint (the kind the TUI's
-///   `chain_would_mix` splits on): it spends a balance or a provider's own
-///   windows, and a window nobody publishes has no line to cross,
+/// * an account carrying inference auth of its own, with or without an
+///   endpoint: it spends a balance or a provider's own windows, and a window
+///   nobody publishes has no line to cross. The test is
+///   [`crate::claude::has_inference_auth`], the one
+///   `build_claude_settings_json` wires the spawned `claude` from, and not
+///   `api_key.is_some()`, which was wrong in BOTH directions: it cannot see a
+///   key carried in the profile's own `[env]` (`ANTHROPIC_API_KEY` /
+///   `ANTHROPIC_AUTH_TOKEN`), where the managed field is `None`, so such a
+///   member got marked and told to add a login; and it counted a blank
+///   `api_key` as a credential, which HID the marker on a member that
+///   authenticates nothing with it,
 /// * a member routed elsewhere by `[env] ANTHROPIC_BASE_URL`, whose requests
 ///   never reach the pool an Anthropic login would measure.
 ///   [`Profile::routing_endpoint`] reads both halves, where
@@ -537,7 +545,7 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
 pub(crate) fn no_usage_source(profile: &Profile, has_session_token: bool) -> bool {
     has_session_token
         && profile.routing_endpoint().is_none()
-        && profile.api_key.is_none()
+        && !crate::claude::has_inference_auth(profile)
         && crate::usage::usage_poll_pair(profile).is_none()
 }
 
