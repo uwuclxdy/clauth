@@ -9216,6 +9216,100 @@ fn no_usage_source_is_a_session_token_without_an_oauth_pair() {
     );
 }
 
+/// \#116 round 3 design: the gate is the shared membership rule, not the OAuth
+/// pair test alone, so a member ANOTHER leg polls does not wear the marker
+/// beside the reading that leg writes it.
+///
+/// The fixture is hand-built, and deliberately so: the shape it needs is a
+/// third-party member with no endpoint, and PRODUCTION HAS NONE TODAY, because
+/// every path that writes `provider` derives it from `base_url`
+/// (`Profile::new`, the load boundary, `edit_profile_endpoint` and the capture
+/// overwrite) and `Profile` has no `Deserialize` to carry one in from disk. So
+/// a member the third-party leg polls always has an endpoint, and this
+/// predicate's endpoint conjunct already excluded it one line earlier (#116
+/// review). What this pins is therefore the gate's STRUCTURE rather than a bug
+/// reachable now: the rule reads both legs, so the day a leg's membership stops
+/// implying an endpoint — the #110 inference probe is the case in hand — the
+/// marker follows without a change here.
+///
+/// The Alibaba arm is what makes the fixture constructible at all: that quota
+/// surface cannot read an api key, so the third-party leg schedules the member
+/// keyless (`third_party_credentialed_fields`' Alibaba arm), which leaves the
+/// endpoint and inference-auth halves of this predicate clear.
+#[test]
+fn no_usage_source_leaves_a_member_another_leg_polls_alone() {
+    let bare = |n: &str| profile_with_usage(n, None, None).profile;
+    let mut console_only = bare("ali");
+    console_only.provider = Some(crate::providers::Provider::Alibaba);
+    console_only.console = Some(crate::profile::ConsoleCredential {
+        token: "console-token".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    // Preconditions, so a later change to either fixture half cannot make this
+    // pass for the wrong reason.
+    assert!(
+        console_only.routing_endpoint().is_none(),
+        "fixture precondition: no endpoint, so the endpoint half cannot be what clears it"
+    );
+    assert!(
+        !crate::claude::has_inference_auth(&console_only),
+        "fixture precondition: keyless, so the inference-auth half cannot be it either"
+    );
+    assert!(
+        crate::usage::usage_poll_pair(&console_only).is_none(),
+        "fixture precondition: no OAuth pair, which is what the old gate asked about"
+    );
+    assert!(
+        crate::usage::any_fetch_leg_admits(&console_only),
+        "the third-party leg's rule admits it, which is what the marker reads"
+    );
+    assert!(
+        crate::usage::any_fetch_leg_polls(&console_only),
+        "and it is enabled, so that leg's work list holds it"
+    );
+    assert!(
+        !no_usage_source(&console_only, true),
+        "a member another leg polls is measured by that leg, not marked here"
+    );
+}
+
+/// Disabled-ness is not this predicate's axis, and the split that keeps it out
+/// is pinned in BOTH directions (#116 review). The marker reads the gate's
+/// membership half, which answers for the profile's shape, so a disabled member
+/// holding a login is measurable the moment it is enabled and the `Disabled`
+/// rung is what describes it meanwhile. The poll gate keeps disabled-ness,
+/// because the work lists do.
+///
+/// The card is why the difference matters: it stacks the health ladder under
+/// `[ disabled ]` rather than stopping at it, so while the marker read the whole
+/// gate it told every disabled member with a login to log in again
+/// (`tui_render_chain`'s
+/// `a_disabled_member_with_a_login_is_not_called_unmeasurable`).
+#[test]
+fn no_usage_source_leaves_disabled_ness_to_the_disabled_rung() {
+    let paired = || with_oauth_login(profile_with_usage("d", None, None)).profile;
+    let enabled = paired();
+    assert!(
+        !no_usage_source(&enabled, true),
+        "enabled and paired: the OAuth leg polls it"
+    );
+    let mut disabled = paired();
+    disabled.disabled = true;
+    assert!(
+        !crate::usage::any_fetch_leg_polls(&disabled),
+        "the POLL gate still filters it: a disabled profile is on neither work list"
+    );
+    assert!(
+        crate::usage::any_fetch_leg_admits(&disabled),
+        "its shape is admitted all the same — the stored pair is what the OAuth rule reads"
+    );
+    assert!(
+        !no_usage_source(&disabled, true),
+        "so the marker stays off it: the operator switched it off, nothing is unreadable"
+    );
+}
+
 /// The rung fires on the SHAPE, not on the reading the caller happens to hold,
 /// and every rung above it still outranks it.
 #[test]

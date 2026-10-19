@@ -508,10 +508,31 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
 /// the walk, finding no reading, counts it as having headroom (see
 /// [`no_usage_hazard`] for what that does once it is active).
 ///
-/// The poll test is [`crate::usage::usage_poll_pair`], the one
-/// [`crate::usage::collect_tokens`] keys its work-list on, read here rather
-/// than restated: the marker and the poller cannot drift apart, and if a leg
-/// ever starts polling this shape the marker retires itself.
+/// The poll test is [`crate::usage::any_fetch_leg_admits`], the membership half
+/// of the ONE gate the Overview's cached-reading mark reads, with
+/// [`crate::usage::usage_poll_pair`] folded into it rather than asked here as a
+/// second opinion. The two poll work-lists do not read that gate: each carries
+/// its own filter, and the gate is the hoisted form of their membership rule,
+/// held to them by `any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes`.
+/// So what this marker shares with the poller is the rule, not the call.
+///
+/// `usage_poll_pair` answers for an OAuth pair alone, so a member some OTHER
+/// leg polls kept this marker up beside its reading; and when the #110
+/// inference probe joins that rule, this marker retires itself with no change
+/// here.
+///
+/// The membership half, and not the whole gate, because disabled-ness is a
+/// different question with a different answer (#116 review): whether anything
+/// polls this member is a question of its SHAPE, and a member the operator
+/// switched off is the `Disabled` rung's to describe — including on the
+/// Fallback card, which stacks this ladder under `[ disabled ]` rather than
+/// stopping at it (`member_detail_stacks_the_health_pill_under_disabled`). Read
+/// whole, the gate had this rung call every disabled member holding a login and
+/// a long-lived token unmeasurable there, and [`no_usage_fix`] ask it for the
+/// login it already holds — a shape normal operation reaches, since a setup
+/// token beside a login is what that fix line leads to. One membership rule
+/// still answers for this rung and the poller alike; only the axis that was
+/// never this rung's went back to the rung that owns it.
 ///
 /// `has_session_token` is the sidecar fact a `&Profile` cannot answer, since it
 /// lives on disk: the caller supplies it so no render path stats a file per
@@ -546,7 +567,7 @@ pub(crate) fn no_usage_source(profile: &Profile, has_session_token: bool) -> boo
     has_session_token
         && profile.routing_endpoint().is_none()
         && !crate::claude::has_inference_auth(profile)
-        && crate::usage::usage_poll_pair(profile).is_none()
+        && !crate::usage::any_fetch_leg_admits(profile)
 }
 
 /// What a member without a usage source ([`no_usage_source`]) does to the
@@ -1020,14 +1041,17 @@ pub(crate) fn health_blocked_reason(
     if matches!(status, Some(FetchStatus::Cached | FetchStatus::RateLimited)) {
         return Some(BlockedReason::Stale);
     }
-    // Keyed on the SHAPE, not on the reading: nothing polls this member (the
-    // gate is `usage_poll_pair`, the one `collect_tokens` keys on), so a reading
-    // it carries is never a current one. A log-out does not leave one behind
-    // either: `usage::forget` drops the half's name-keyed store entries beside
-    // its on-disk cache (`forget_memory` / `forget_disk`, driven by the
-    // `ForgetPlan` the change site builds), so the figure goes with the login.
-    // Gating on `usage.is_none()` would still ask the wrong question — what has
-    // been READ, rather than whether anything polls this member at all.
+    // Keyed on the SHAPE, not on the reading: no fetch leg's rule admits this
+    // member (the test is `any_fetch_leg_admits`, the membership half of the
+    // gate the Overview's cached-reading mark reads — the two work lists carry
+    // their own filters and are held to that gate by its test, not by a call),
+    // so a reading it carries is never a current one. A log-out does not leave
+    // one behind either: `usage::forget` drops the half's name-keyed store
+    // entries beside its on-disk cache (`forget_memory` / `forget_disk`, driven
+    // by the `ForgetPlan` the change site builds), so the figure goes with the
+    // login. Gating on `usage.is_none()` would still ask the wrong question —
+    // what has been READ, rather than whether anything polls this member at
+    // all.
     //
     // Lowest rung by design, and that is what keeps it honest: every rung above
     // reads a reading, so when one of them fires, the card and the walk are

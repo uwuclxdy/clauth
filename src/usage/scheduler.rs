@@ -3484,21 +3484,40 @@ pub(crate) fn reading_is_polled(p: &crate::profile::Profile) -> bool {
     !p.usage_cache_is_third_party() || (!p.is_disabled() && third_party_credentialed(p))
 }
 
+/// Whether either fetch leg's rule admits this profile's SHAPE, disabled-ness
+/// left out: the membership half of [`any_fetch_leg_polls`], and the question
+/// [`crate::fallback::no_usage_source`] reads for its marker.
+///
+/// The OAuth half is [`usage_poll_pair`] itself, not a second spelling of it:
+/// the marker used to repeat that `claude_ai_oauth` chain by hand, which let
+/// the poller's membership rule and the two marks reading it drift. Folded, so
+/// a leg added later — the #110 inference probe above all — joins this one rule
+/// and every surface keyed on it follows without a change of its own.
+///
+/// Split from the poll question because the two answer different things and one
+/// caller needs each (#116 review). Whether anything polls this member is a
+/// question of its shape; whether the operator switched it off is the
+/// `Disabled` rung's to describe, including on the Fallback card, which stacks
+/// the health ladder under `[ disabled ]`. Read whole, this gate had the marker
+/// call every disabled member holding a login and a long-lived token
+/// unmeasurable there, and ask it for the login it already held.
+pub(crate) fn any_fetch_leg_admits(p: &crate::profile::Profile) -> bool {
+    usage_poll_pair(p).is_some() || third_party_pollable(p)
+}
+
 /// Whether either fetch leg's work list holds this profile — the question the
-/// Overview's not-current `⋯` mark answers. The OAuth leg ([`collect_tokens`])
-/// admits every enabled profile carrying a login pair; the third-party leg
+/// Overview's not-current `⋯` mark answers, and that mark is the only thing
+/// that calls this. The two work lists do not: each carries its own filter,
+/// and this is the hoisted form of their membership rule, held to them by
+/// `any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes` rather
+/// than by a shared call. The OAuth leg ([`collect_tokens`]) admits every
+/// enabled profile carrying a login pair; the third-party leg
 /// ([`collect_third_party_entries`]) admits every enabled profile its one entry
 /// constructor builds an entry for. Both skip a disabled profile, and a profile
-/// on neither list is one no fetch leg currently refreshes (a re-enable, a login
-/// or a key puts it back on a list).
+/// on neither list is one no fetch leg currently refreshes (a re-enable, a
+/// login or a key puts it back on a list).
 pub(crate) fn any_fetch_leg_polls(p: &crate::profile::Profile) -> bool {
-    !p.is_disabled()
-        && (p
-            .credentials
-            .as_ref()
-            .and_then(|c| c.claude_ai_oauth.as_ref())
-            .is_some()
-            || third_party_pollable(p))
+    !p.is_disabled() && any_fetch_leg_admits(p)
 }
 
 /// The third-party names whose reading an automatic walk may read: the polled
@@ -3518,8 +3537,9 @@ pub(crate) fn polled_third_party_names(config: &crate::profile::AppConfig) -> Ha
 /// the credential test [`collect_token_seeds`] applies, hoisted so the startup
 /// seed and the RENDER layer read the same rule instead of restating it (the
 /// OAuth leg's twin of [`third_party_credentialed`]). A profile this answers
-/// `None` for never enters the poll work-list, so no leg ever writes it a
-/// reading, which is what [`crate::fallback::no_usage_source`] reads it for.
+/// `None` for never enters the OAuth leg's work list; [`any_fetch_leg_admits`]
+/// combines it with the third-party leg's rule, and [`any_fetch_leg_polls`]
+/// puts disabled-ness on top of that.
 ///
 /// Disabled-ness is deliberately not part of it, exactly as there: a separate
 /// axis, and both work lists filter it themselves.

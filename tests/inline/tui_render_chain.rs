@@ -1139,6 +1139,55 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     );
 }
 
+/// \#116 review: a member the operator disabled is not a member clauth cannot
+/// measure. The card stacks the health ladder under `[ disabled ]`
+/// (`member_detail_stacks_the_health_pill_under_disabled`), so while the
+/// marker's gate answered disabled-ness too, every disabled member holding a
+/// login and a long-lived token read `can't read usage` there and was told to
+/// log in the account it is already logged into. Normal operation reaches that
+/// shape: a setup token beside a login is what the fix line itself leads to,
+/// and a rolling-token account disabled on the Setup tab is the same shape.
+///
+/// So the pin is the whole opening block, not the absence of one pill: the
+/// exclusion, its own fix, and the blank the pill block ends on.
+#[test]
+fn a_disabled_member_with_a_login_is_not_called_unmeasurable() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let (mut d, d_readings) = profile("a", 95.0, 10.0, 7200);
+    d.disabled = true;
+    d.credentials = Some(ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "a-access".into(),
+            refresh_token: None,
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    });
+    let (cfg, readings) = config_with(vec![(d, d_readings)], Some("other"), vec!["a"]);
+    let (lines, _, _) = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            width: 160,
+            session_token: true,
+            ..Default::default()
+        },
+        &HashSet::new(),
+        &readings,
+    );
+    assert_eq!(
+        lines.iter().take(3).map(line_text).collect::<Vec<_>>(),
+        vec![
+            "status          [ disabled ]".to_string(),
+            "└ excluded from the walk, enable it on the setup tab".to_string(),
+            String::new(),
+        ],
+        "the exclusion is the whole status block: one pill, one fix, no second rung"
+    );
+}
+
 /// A disabled chain member — still configured in `fallback_chain` on disk,
 /// only the walk skips it (see `Profile::is_disabled`)
 /// — dims its name in the Fallback selector and carries the `⊖` blocked-reason
