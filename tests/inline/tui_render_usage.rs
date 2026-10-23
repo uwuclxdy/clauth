@@ -258,6 +258,34 @@ fn empty_msg_credless_profile_is_terminal() {
     );
 }
 
+/// A setup token alone gives `/usage` nothing to read: the body names the
+/// probe as the way to a reading. The switch on, it loads until a probe lands,
+/// and a refused token is as terminal as a failed fetch. The switch without a
+/// token has nothing to probe with, so it still asks for a login.
+#[test]
+fn empty_msg_follows_the_usage_probe_on_a_setup_token_account() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.has_long_lived_sidecar = true;
+    assert_eq!(
+        oauth_empty_msg(&profile, None),
+        "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe"
+    );
+    profile.usage_probe = true;
+    assert_eq!(oauth_empty_msg(&profile, None), "loading");
+    for status in [FetchStatus::Failed, FetchStatus::AuthExpired] {
+        assert_eq!(
+            oauth_empty_msg(&profile, Some(status)),
+            "no usage available",
+            "{status:?}"
+        );
+    }
+    profile.has_long_lived_sidecar = false;
+    assert_eq!(
+        oauth_empty_msg(&profile, None),
+        "not logged in, use + login on the setup tab"
+    );
+}
+
 /// A session-token sidecar with no OAuth pair is a login clauth cannot read
 /// usage through: the empty state says what clauth cannot do and how the same
 /// account becomes readable, never "not logged in". Read off the profile a
@@ -277,7 +305,7 @@ fn empty_msg_sidecar_only_profile_names_the_unreadable_usage() {
     let profile = config.find(&name).expect("loaded profile");
     assert_eq!(
         oauth_empty_msg(profile, None),
-        "can't read usage, log in the same account with + login on the setup tab"
+        "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe"
     );
 }
 
@@ -311,7 +339,7 @@ fn empty_msg_sidecar_outranks_an_api_key_when_both_hold_a_login() {
     profile.has_long_lived_sidecar = true;
     assert_eq!(
         oauth_empty_msg(&profile, None),
-        "can't read usage, log in the same account with + login on the setup tab",
+        "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe",
         "the sidecar line outranks the api-key line"
     );
 }
@@ -3394,6 +3422,77 @@ fn uncapped_outranks_budget_spent_in_the_status_block() {
         !out.contains("[ extra usage spent ]"),
         "uncapped must suppress the extra-usage-spent pill: {out}"
     );
+}
+
+/// A refused setup token reads as such on the OAuth row and says how to get a
+/// new one, never as a rejected api key the account does not have.
+#[test]
+fn a_refused_setup_token_names_itself_and_the_mint() {
+    let joined = |ls: Vec<Line<'_>>| -> String {
+        ls.iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.clone()))
+            .collect::<Vec<_>>()
+            .join("")
+    };
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.usage_probe = true;
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", FetchStatus::AuthExpired);
+    let out = joined(status_lines(
+        &profile,
+        &HeaderState {
+            activity: ProfileActivity::Idle,
+            next_refresh_ms: None,
+            tick: 0,
+            rate_limit_source: super::RateLimitSource::OAuth,
+            streaks: StreakCounts::default(),
+            kick_block: None,
+            queue_slot: None,
+            diag: DiagFlags::default(),
+            peak: None,
+        },
+        120,
+        &readings,
+    ));
+    assert!(
+        out.contains("[ token rejected ]")
+            && out.contains("mint a new one with clauth login a --setup-token"),
+        "{out}"
+    );
+    assert!(!out.contains("key rejected"), "{out}");
+}
+
+fn idle_header() -> HeaderState {
+    HeaderState {
+        activity: ProfileActivity::Idle,
+        next_refresh_ms: None,
+        tick: 0,
+        rate_limit_source: super::RateLimitSource::OAuth,
+        streaks: StreakCounts::default(),
+        kick_block: None,
+        queue_slot: None,
+        diag: DiagFlags::default(),
+        peak: None,
+    }
+}
+
+fn status_text_of(profile: &crate::profile::Profile, status: FetchStatus) -> String {
+    let readings = snap_with_status(ReadingsSnapshot::default(), "a", status);
+    status_lines(profile, &idle_header(), 120, &readings)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+        .collect()
+}
+
+/// A dead api key reads as one and gets no setup-token mint for a fix.
+#[test]
+fn a_rejected_key_is_not_told_to_mint_a_setup_token() {
+    let mut profile = crate::testutil::blank_profile(&crate::profile::ProfileName::from("a"));
+    profile.base_url = Some("https://api.z.ai/api/anthropic".to_string());
+    profile.api_key = Some("key".to_string());
+    profile.provider = Some(crate::providers::Provider::Zai);
+    let out = status_text_of(&profile, FetchStatus::AuthExpired);
+    assert!(out.contains("key rejected"), "{out}");
+    assert!(!out.contains("--setup-token"), "{out}");
 }
 
 /// Dead-first: an auth-broken account can't serve regardless of a standing kick

@@ -73,7 +73,7 @@ fn token_endpoint() -> std::borrow::Cow<'static, str> {
     }
 }
 
-fn messages_endpoint() -> std::borrow::Cow<'static, str> {
+pub(crate) fn messages_endpoint() -> std::borrow::Cow<'static, str> {
     #[cfg(test)]
     {
         if let Some(url) = MESSAGES_ENDPOINT_OVERRIDE
@@ -158,24 +158,23 @@ const MESSAGES_ENDPOINT: &str = "https://api.anthropic.com/v1/messages?beta=true
 /// `/v1/messages`, distinct from the single `oauth-2025-04-20` on `/usage` and
 /// from the longer lists CC's real inference calls carry. Captured 2026-07-14
 /// against CC 2.1.209, re-verified unchanged 2026-07-24 against CC 2.1.219;
-/// drifts with CC's bundle, re-capture on a bump.
-const KICK_ANTHROPIC_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
+/// drifts with CC's bundle, re-capture on a bump. The usage probe sends the
+/// same set.
+pub(crate) const KICK_ANTHROPIC_BETA: &str = "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05";
 
 /// anthropic-sdk-js (stainless) version CC bundles (2.1.209, still 0.94.0 at
-/// 2.1.219), sent verbatim on the kick so its client-instrumentation headers
-/// match CC's. NOTE: this is a
+/// 2.1.219), sent verbatim on the kick and the usage probe so their
+/// client-instrumentation headers match CC's. NOTE: this is a
 /// deliberately *partial* stainless set (lang/runtime/package-version only) — a
 /// real SDK client also sends `x-stainless-arch/os/runtime-version`, which are
 /// host-derived (and clauth has no honest node runtime-version), so they stay
 /// off. Drifts with CC's bundle.
-const KICK_STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
-
-/// Cheapest available model — single token costs ~0.001¢.
-const KICK_MODEL: &str = "claude-haiku-4-5-20251001";
+pub(crate) const KICK_STAINLESS_PACKAGE_VERSION: &str = "0.94.0";
 
 /// OAuth tokens require the "Claude Code" system prefix or the server rejects
 /// the call as an unauthorized non-CC inference.
-const KICK_SYSTEM_PROMPT: &str = "You are Claude Code, Anthropic's official CLI for Claude.";
+pub(crate) const KICK_SYSTEM_PROMPT: &str =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
 
 /// Pause between the steps of the 401/429-recovery sequence (failed kick →
 /// rotate → retry kick → usage re-fetch) so the API sees the rotated pair settle
@@ -669,7 +668,7 @@ fn kick(access_token: &str) -> std::result::Result<(), KickError> {
 fn kick_to(url: &str, access_token: &str) -> std::result::Result<(), KickError> {
     await_request_slot(ANTHROPIC_ORIGIN);
     let body = serde_json::to_string(&serde_json::json!({
-        "model": KICK_MODEL,
+        "model": crate::usage::ANTHROPIC_MODEL,
         "max_tokens": 1,
         "system": [{ "type": "text", "text": KICK_SYSTEM_PROMPT }],
         "messages": [{ "role": "user", "content": "x" }],

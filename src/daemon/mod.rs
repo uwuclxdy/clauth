@@ -1682,6 +1682,7 @@ impl Daemon {
             let _ = link_profile_credentials(&active);
         }
 
+        let interval = self.refresh_interval.load(Ordering::Relaxed);
         let (seed_names, third_party, third_party_work) = {
             #[allow(
                 clippy::expect_used,
@@ -1698,18 +1699,16 @@ impl Daemon {
                 .map(|e| e.name.to_string())
                 .collect();
             (
-                collect_oauth_seed_names(&cfg),
+                collect_oauth_seed_names(&cfg, interval),
                 third_party,
                 third_party_work,
             )
         };
-        let interval = self.refresh_interval.load(Ordering::Relaxed);
         bootstrap_fetch(
             &self.usage_store,
             &self.usage_status,
             &self.last_fetched,
             &seed_names,
-            interval,
         );
         bootstrap_third_party(
             &self.third_party_usage_store,
@@ -1959,8 +1958,9 @@ impl Daemon {
     /// Say a spent usage-credit cap out loud, once per account per edge, on
     /// fresh readings only: the cap turns spent and it clears, and each edge
     /// gets exactly one line while the account bills its own usage credits
-    /// (an own-endpoint account is forgotten silently). Driven by the
-    /// published body, so every daemon ticks it, API listener or not.
+    /// (an own-endpoint account, or one the usage probe reads, is forgotten
+    /// silently). Driven by the published body, so every daemon ticks it, API
+    /// listener or not.
     /// The latch is in process, so a restart over a standing cap says it once
     /// more rather than swallowing the line after a crash (the bell's rule) —
     /// and an unchanged tick writes nothing.
@@ -1985,11 +1985,11 @@ impl Daemon {
             // An account serving inference on its own endpoint is under no
             // credit gate. The push reads it as not capped, so the log forgets
             // its latch the same way — silently, since the clear copy would be
-            // false here.
-            if config
-                .find(&entry.name)
-                .is_some_and(crate::claude::has_own_inference_endpoint)
-            {
+            // false here. A probe reading carries no credit figures, so it can
+            // say neither edge either, and its account's latch goes the same way.
+            if config.find(&entry.name).is_some_and(|p| {
+                crate::claude::has_own_inference_endpoint(p) || crate::usage::usage_probe_admits(p)
+            }) {
                 self.credit_capped.remove(name);
                 continue;
             }

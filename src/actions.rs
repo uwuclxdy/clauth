@@ -2194,6 +2194,8 @@ pub(crate) fn duplicate_profile(
         let src = config.find(source).context("profile not found")?;
         let mut profile = Profile::new(name, src.base_url.clone(), src.api_key.clone());
         profile.auto_start = src.auto_start;
+        profile.usage_probe = src.usage_probe;
+        profile.usage_probe_interval_ms = src.usage_probe_interval_ms;
         profile.env = src.env.clone();
         profile.models = src.models.clone();
         profile.fallback_threshold = src.fallback_threshold;
@@ -3021,7 +3023,9 @@ pub(crate) fn clear_profile_credentials(config: &mut AppConfig, name: &ProfileNa
         // The OAuth half forgets; the provider half is this profile's own and
         // stays (a hybrid's OAuth log out keeps the provider reading). The
         // throughput record survives when the delegates still run on the key.
-        let after_oauth = OAuthIdentity::for_values(None, None);
+        // The setup-token sidecar stays too, so a profile that held no pair
+        // keeps its identity and its reading.
+        let after_oauth = crate::usage::pairless_identity(name);
         let after_throughput = throughput_identity(
             &after_oauth,
             before.base_url.as_deref(),

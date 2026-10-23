@@ -413,6 +413,11 @@ trait NamedEntry {
         let _ = (streaks, interval_ms);
         0
     }
+    /// The cadence this entry is due at: the leg's interval, unless the entry
+    /// carries one of its own.
+    fn interval_ms(&self, leg_interval_ms: u64) -> u64 {
+        leg_interval_ms
+    }
 }
 
 impl NamedEntry for TokenEntry {
@@ -511,14 +516,15 @@ thread_local! {
     pub(crate) static LAST_REFRESHER_SKIP_STORE: std::cell::RefCell<Option<SkippedUnreadable>> =
         const { std::cell::RefCell::new(None) };
 }
-/// Session-scoped (in-memory) map of third-party profiles suppressed from the
-/// timer, each recorded against the credential fingerprint it failed under
-/// ([`ThirdPartyEntry::credential_fingerprint`]). Never persisted — clears when
-/// the process exits.
+/// Session-scoped (in-memory) map of profiles suppressed from the timer, each
+/// recorded against the credential fingerprint it failed under: a third-party
+/// profile's [`ThirdPartyEntry::credential_fingerprint`], a probed profile's
+/// setup-token digest ([`ProbeEntry::fingerprint`]). Never persisted — clears
+/// when the process exits.
 ///
 /// One admission: a profile whose usage credential is dead
-/// ([`FetchStatus::AuthExpired`]: a dead api key or a dead console session,
-/// either of which any third-party profile can hit).
+/// ([`FetchStatus::AuthExpired`]: a dead api key, a dead console session or a
+/// refused setup token).
 /// 429s are never added; they keep the server-directed deferral instead.
 ///
 /// Cleared by a manual refresh (the TUI's `refetch_queue`) OR by the credential
@@ -784,14 +790,15 @@ pub(crate) enum FetchStatus {
     Failed,
     /// API returned 429 (endpoint-level rate limit); numbers come from on-disk cache.
     RateLimited,
-    /// The provider's usage credential is dead or absent and no refresh path
-    /// exists — only an operator re-login clears it, so the profile is
+    /// The usage credential is dead or absent and no refresh path exists —
+    /// only an operator re-login clears it, so the profile is
     /// session-suppressed rather than re-polled, and re-admitted when the
-    /// credential on disk changes. Third-party only, with two producers: a 401
-    /// on any api-key fetch (a dead key), and Alibaba's console session, whose
-    /// window is set by the operator's browser sign-in and cannot be extended
-    /// from here. The OAuth leg has its own `auth_broken` quarantine for the
-    /// analogous state.
+    /// credential on disk changes. Three producers: a 401 on any api-key fetch
+    /// (a dead key); Alibaba's console session, whose window is set by the
+    /// operator's browser sign-in and cannot be extended from here; and a 401
+    /// or 403 on the usage probe (a refused setup token, re-admitted by a
+    /// re-mint into `session-token.json`). The `/usage` leg has its own
+    /// `auth_broken` quarantine for the analogous state.
     AuthExpired,
 }
 
@@ -3027,19 +3034,44 @@ pub(crate) fn bootstrap_fetch(
     store: &UsageStore,
     status: &StatusStore,
     last_fetched: &LastFetchedAt,
-    seed_names: &[String],
-    interval_ms: u64,
+    seed_names: &[(String, u64)],
 ) {
     let now = now_ms();
-    for name in seed_names {
+    for (name, interval_ms) in seed_names {
         try_seed_cache(
             store,
             status,
             last_fetched,
             &ProfileName::from(name.clone()),
             now,
-            interval_ms,
+            *interval_ms,
         );
+    }
+}
+
+/// [`try_seed_cache`] for one name over the cadence stamp it already holds,
+/// keeping the later of the two: a `retry-after` wait baked into the held
+/// stamp outlives a re-seed of the last reading.
+pub(crate) fn reseed_keeping_cadence(
+    store: &UsageStore,
+    status: &StatusStore,
+    last_fetched: &LastFetchedAt,
+    name: &ProfileName,
+    interval_ms: u64,
+) {
+    let key = FetchLeg::OAuth.key(name.clone());
+    let held = last_fetched
+        .lock()
+        .ok()
+        .and_then(|lf| lf.get(&key).copied());
+    try_seed_cache(store, status, last_fetched, name, now_ms(), interval_ms);
+    if let Some(held) = held
+        && let Ok(mut lf) = last_fetched.lock()
+        && lf
+            .get(&key)
+            .is_some_and(|seeded| seeded.as_millis() < held.as_millis())
+    {
+        lf.insert(key, held);
     }
 }
 
@@ -3504,14 +3536,14 @@ pub(crate) fn reading_is_polled(p: &crate::profile::Profile) -> bool {
     !p.usage_cache_is_third_party() || (!p.is_disabled() && third_party_credentialed(p))
 }
 
-/// Whether either fetch leg's rule admits this profile's SHAPE, disabled-ness
+/// Whether any fetch leg's rule admits this profile's SHAPE, disabled-ness
 /// left out: the membership half of [`any_fetch_leg_polls`], and the question
 /// [`crate::fallback::no_usage_source`] reads for its marker.
 ///
 /// The OAuth half is [`usage_poll_pair`] itself, not a second spelling of it, so
 /// the poller's membership rule and the two marks reading it cannot drift; a leg
-/// added later — the #110 inference probe above all — joins this one rule and
-/// every surface keyed on it follows without a change of its own.
+/// added later joins this one rule and every surface keyed on it follows without
+/// a change of its own, as the usage probe's [`usage_probe_admits`] does.
 ///
 /// Split from the poll question because the two answer different things and one
 /// caller needs each. Whether anything polls this member is a question of its
@@ -3521,20 +3553,21 @@ pub(crate) fn reading_is_polled(p: &crate::profile::Profile) -> bool {
 /// holding a login and a long-lived token unmeasurable there, and ask it for the
 /// login it already holds.
 pub(crate) fn any_fetch_leg_admits(p: &crate::profile::Profile) -> bool {
-    usage_poll_pair(p).is_some() || third_party_pollable(p)
+    usage_poll_pair(p).is_some() || third_party_pollable(p) || usage_probe_admits(p)
 }
 
-/// Whether either fetch leg's work list holds this profile — the question the
+/// Whether any fetch leg's work list holds this profile — the question the
 /// Overview's not-current `⋯` mark answers, and that mark is the only thing
-/// that calls this. The two work lists do not: each carries its own filter,
-/// and this is the hoisted form of their membership rule, held to them by
+/// that calls this. The work lists do not: each carries its own filter, and
+/// this is the hoisted form of their membership rule, held to them by
 /// `any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes` rather
 /// than by a shared call. The OAuth leg ([`collect_tokens`]) admits every
 /// enabled profile carrying a login pair; the third-party leg
 /// ([`collect_third_party_entries`]) admits every enabled profile its one entry
-/// constructor builds an entry for. Both skip a disabled profile, and a profile
-/// on neither list is one no fetch leg currently refreshes (a re-enable, a
-/// login or a key puts it back on a list).
+/// constructor builds an entry for; the probe leg ([`collect_probe_seeds`])
+/// every enabled profile [`usage_probe_admits`]. All three skip a disabled
+/// profile, and a profile on no list is one no fetch leg currently refreshes
+/// (a re-enable, a login, a key or the probe switch puts it back on a list).
 pub(crate) fn any_fetch_leg_polls(p: &crate::profile::Profile) -> bool {
     !p.is_disabled() && any_fetch_leg_admits(p)
 }
@@ -3557,13 +3590,72 @@ pub(crate) fn polled_third_party_names(config: &crate::profile::AppConfig) -> Ha
 /// seed and the RENDER layer read the same rule instead of restating it (the
 /// OAuth leg's twin of [`third_party_credentialed`]). A profile this answers
 /// `None` for never enters the OAuth leg's work list; [`any_fetch_leg_admits`]
-/// combines it with the third-party leg's rule, and [`any_fetch_leg_polls`]
-/// puts disabled-ness on top of that.
+/// combines it with the other legs' rules, and [`any_fetch_leg_polls`] puts
+/// disabled-ness on top of that.
 ///
 /// Disabled-ness is deliberately not part of it, exactly as there: a separate
-/// axis, and both work lists filter it themselves.
+/// axis, and every work list filters it itself.
 pub(crate) fn usage_poll_pair(p: &crate::profile::Profile) -> Option<&crate::profile::OAuthToken> {
     p.credentials.as_ref()?.claude_ai_oauth.as_ref()
+}
+
+/// Whether `p` is an OAuth account with no pair stored, the shape `/usage`
+/// cannot read: a setup-token account, or one holding no login at all.
+pub(crate) fn oauth_without_pair(p: &crate::profile::Profile) -> bool {
+    p.is_oauth() && usage_poll_pair(p).is_none()
+}
+
+/// Whether the usage probe's rule admits this profile's shape: the switch on,
+/// on an [`oauth_without_pair`] account. The switch alone admits it, never the
+/// setup token on disk: with the switch on clauth has a way to measure the
+/// account, and a probe that cannot run says so on the usage row.
+/// Disabled-ness is left out, as in the other legs' rules.
+pub(crate) fn usage_probe_admits(p: &crate::profile::Profile) -> bool {
+    p.usage_probe && oauth_without_pair(p)
+}
+
+/// The members whose reading is the usage probe's ([`usage_probe_admits`]). A
+/// probe reads the windows off its response headers and nothing of the
+/// usage-credit cap, so a walk for a credit demand takes no freshness from it.
+pub(crate) fn probe_read_names(config: &crate::profile::AppConfig) -> HashSet<ProfileName> {
+    config
+        .profiles
+        .iter()
+        .filter(|p| usage_probe_admits(p))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// The accounts the probe read under `before` whose switch `after` turns off,
+/// still with no pair. A pair stored meanwhile, or a profile gone, is the reload
+/// compare's to forget: its `/usage` leg may already have landed a reading.
+pub(crate) fn probes_switched_off(
+    before: &crate::profile::AppConfig,
+    after: &crate::profile::AppConfig,
+) -> Vec<ProfileName> {
+    before
+        .profiles
+        .iter()
+        .filter(|p| usage_probe_admits(p))
+        .filter(|p| {
+            after
+                .find(&p.name)
+                .is_some_and(|now| !now.usage_probe && oauth_without_pair(now))
+        })
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+/// The cadence `p`'s usage is read at: its own probe interval where the probe
+/// reads it, `poll_interval_ms` everywhere else. The startup and stand-down
+/// seeds, the stale cue and `status.json` judge a reading's age by this, so a
+/// probe slower than the poll never makes a sound reading look overdue.
+pub(crate) fn usage_interval_ms(p: &crate::profile::Profile, poll_interval_ms: u64) -> u64 {
+    if usage_probe_admits(p) {
+        p.usage_probe_interval_ms
+    } else {
+        poll_interval_ms
+    }
 }
 
 /// The in-memory fields `collect_tokens` needs from one enabled OAuth profile,
@@ -3642,7 +3734,8 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
 }
 
 /// Profile names to SEED from on-disk usage caches at startup / standby: every
-/// OAuth-credentialed profile, **disabled ones included**. The startup seed is a
+/// OAuth-credentialed profile and every one the usage probe admits, **disabled
+/// ones included**. The startup seed is a
 /// DISPLAY concern (last-known tier / windows for the UI), so it is deliberately
 /// WIDER than [`collect_tokens`]'s work-list — a disabled profile is seeded so
 /// its cached numbers render, but it never enters the poll / rotate / auto-start
@@ -3652,12 +3745,18 @@ pub(crate) fn collect_tokens(config: &crate::profile::AppConfig) -> Vec<TokenEnt
 /// the store's keys — every poll/rotate/switch decision sources its candidates
 /// from `state.tokens` or the disabled-filtered fallback chain, reading the
 /// store only per known name.
-pub(crate) fn collect_oauth_seed_names(config: &crate::profile::AppConfig) -> Vec<String> {
+///
+/// Each name comes with the cadence its cache is kept at
+/// ([`usage_interval_ms`]), which dates the seeded status.
+pub(crate) fn collect_oauth_seed_names(
+    config: &crate::profile::AppConfig,
+    poll_interval_ms: u64,
+) -> Vec<(String, u64)> {
     config
         .profiles
         .iter()
-        .filter(|p| usage_poll_pair(p).is_some())
-        .map(|p| p.name.to_string())
+        .filter(|p| usage_poll_pair(p).is_some() || usage_probe_admits(p))
+        .map(|p| (p.name.to_string(), usage_interval_ms(p, poll_interval_ms)))
         .collect()
 }
 
@@ -4745,6 +4844,15 @@ pub(crate) fn tick(state: &SchedulerState) {
     // bumps the epoch after the clone but before the worker starts still reads
     // as "moved" in section 2 (F2): the old credential's landing never stamps
     // cadence.
+    //
+    // The probe leg's list is built first, from the config and each sidecar:
+    // the Config lock and those reads may not sit under the epoch guard.
+    let probe_seeds = state
+        .config
+        .lock()
+        .map(|c| collect_probe_seeds(&c))
+        .unwrap_or_default();
+    let mut probe_snapshot = build_probe_entries(probe_seeds);
     let epoch = crate::usage::epoch_guard();
     // The partition decides "moved" itself and DROPS a stale entry rather than
     // spawning it (S2): under the epoch guard it reads the identity snapshot
@@ -4795,11 +4903,27 @@ pub(crate) fn tick(state: &SchedulerState) {
             .copied()
             .unwrap_or(0);
     }
+    // A probe entry answers to the OAuth half exactly as a token entry does: a
+    // setup token the last forget has not seen yet waits for the reload
+    // compare to forget the old one first.
+    probe_snapshot.retain(|entry| {
+        snapshot.get(entry.name.as_str()).is_none_or(|s| {
+            !s.unknown(crate::usage::Half::OAuth)
+                && !crate::usage::oauth_changed(&entry.identity, &s.oauth)
+        })
+    });
+    for entry in &mut probe_snapshot {
+        entry.epoch_at_spawn = epoch
+            .get(&(entry.name.to_string(), crate::usage::Half::OAuth))
+            .copied()
+            .unwrap_or(0);
+    }
     drop(epoch);
     // Drop profiles with a dead usage credential (session-suppressed) from the
     // third-party leg so they aren't re-fetched every cadence. Only a manual
     // refresh (forced, cleared above) re-admits one for a single retry.
     let tp_snapshot = filter_suppressed(&state.suppressed_auth_expired, tp_snapshot);
+    let probe_snapshot = filter_suppressed_probes(&state.suppressed_auth_expired, probe_snapshot);
 
     // Partition both before either fetches, then publish in one window so the
     // countdown map never shows a leg as momentarily missing (and a deleted
@@ -4879,6 +5003,22 @@ pub(crate) fn tick(state: &SchedulerState) {
     elect_auto_start_queue(state, &mut oauth_due, interval_ms, now_epoch_secs());
 
     let (tp_due, tp_next) = partition_and_merge(&tp_snapshot, &forced, state, now, interval_ms);
+    // Probed accounts count down on the OAuth side, and no name is on both the
+    // token list and the probe list (one needs a pair, the other none).
+    let (mut probe_due, mut probe_next) =
+        partition_and_merge(&probe_snapshot, &forced, state, now, interval_ms);
+    // A spent probed account is skipped as a polled one is, the more so since
+    // each probe spends inference on it.
+    if !refresh_spent {
+        drop_spent_oauth(
+            state,
+            &probe_snapshot,
+            &mut probe_due,
+            &mut probe_next,
+            &forced,
+        );
+    }
+    oauth_next.extend(probe_next);
     publish_countdowns(&state.next_refresh_per_profile, oauth_next, tp_next);
 
     // Names actually scheduled this tick across both legs. A forced name absent
@@ -4889,6 +5029,7 @@ pub(crate) fn tick(state: &SchedulerState) {
         .iter()
         .map(NamedEntry::key)
         .chain(tp_due.iter().map(NamedEntry::key))
+        .chain(probe_due.iter().map(NamedEntry::key))
         .collect();
 
     // Both legs fan out concurrently so the third-party leg no longer waits behind
@@ -4907,6 +5048,18 @@ pub(crate) fn tick(state: &SchedulerState) {
                 })
             }
         });
+        // The probe leg runs beside the other two rather than inline on this
+        // thread: each probe waits out the per-host request spacing, and the
+        // scans below must not wait on that per probed account.
+        let probe_names: Vec<LegKey> = probe_due.iter().map(NamedEntry::key).collect();
+        let probe = (!probe_due.is_empty()).then({
+            let flag = Arc::clone(&timed_out);
+            move || {
+                s.spawn(move || {
+                    fetch_probe_due_flagged(state, probe_due, Some(flag.as_ref()));
+                })
+            }
+        });
         if !oauth_due.is_empty() {
             fetch_oauth_due(state, oauth_due, interval_ms, Some(timed_out.as_ref()));
         }
@@ -4914,6 +5067,26 @@ pub(crate) fn tick(state: &SchedulerState) {
             // Worker panics are already swallowed inside `fetch_third_party_due`;
             // this join only reaps the leg thread itself.
             let _ = h.join();
+        }
+        if let Some(h) = probe
+            && h.join().is_err()
+        {
+            // A panicked probe landed nothing, and neither did the entries
+            // after it: their marks are still up. Free those and say the fetch
+            // failed, rather than keep the last tick's status over a reading
+            // that did not come.
+            for key in &probe_names {
+                let stranded = state.activity.lock().map_or(true, |a| {
+                    a.get(key.name.as_str())
+                        .is_some_and(|s| s.fetch(key.leg).is_some())
+                });
+                if stranded {
+                    clear_fetch_activity(&state.activity, key);
+                    if let Ok(mut st) = state.status.lock() {
+                        st.insert(key.name.to_string(), FetchStatus::Failed);
+                    }
+                }
+            }
         }
     });
 
@@ -4969,6 +5142,187 @@ pub(crate) fn tick(state: &SchedulerState) {
     // tail transcripts and republish the shared tps cache every other surface
     // hydrates from.
     tps_producer_tick(now_ms());
+}
+
+/// One profile the usage probe leg measures: the setup token it sends and the
+/// identity that token gives, both off one sidecar read.
+#[derive(Clone)]
+struct ProbeEntry {
+    name: ProfileName,
+    token: String,
+    identity: crate::usage::OAuthIdentity,
+    interval_ms: u64,
+    /// Stamped at the tick's partition under the epoch guard, like the other
+    /// legs' entries.
+    epoch_at_spawn: u64,
+}
+
+impl NamedEntry for ProbeEntry {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The OAuth leg's key: a probed account has no `/usage` poll, and its
+    /// reading, countdown and row are the OAuth ones.
+    fn leg(&self) -> FetchLeg {
+        FetchLeg::OAuth
+    }
+
+    fn interval_ms(&self, _leg_interval_ms: u64) -> u64 {
+        self.interval_ms
+    }
+}
+
+impl ProbeEntry {
+    /// What a refusal is recorded against in [`SuppressedAuthExpiredStore`]:
+    /// the setup token's digest, so a re-mint re-admits the account.
+    fn fingerprint(&self) -> u64 {
+        self.identity.setup_token.unwrap_or_default()
+    }
+}
+
+/// Drop the probe entries whose setup token was refused, while they still
+/// carry that token.
+fn filter_suppressed_probes(
+    suppressed_auth_expired: &SuppressedAuthExpiredStore,
+    snapshot: Vec<ProbeEntry>,
+) -> Vec<ProbeEntry> {
+    let Ok(sup) = suppressed_auth_expired.lock() else {
+        return snapshot;
+    };
+    snapshot
+        .into_iter()
+        .filter(|e| {
+            sup.get(e.name.as_str())
+                .is_none_or(|recorded| *recorded != e.fingerprint())
+        })
+        .collect()
+}
+
+/// The probe leg's membership: every enabled profile [`usage_probe_admits`],
+/// with its own interval. Config fields alone, so a caller holding the config
+/// guard reads no disk.
+pub(crate) fn collect_probe_seeds(config: &crate::profile::AppConfig) -> Vec<(ProfileName, u64)> {
+    config
+        .enabled_profiles()
+        .filter(|p| usage_probe_admits(p))
+        .map(|p| (p.name.clone(), p.usage_probe_interval_ms))
+        .collect()
+}
+
+/// The probe leg's work list: each seed whose sidecar holds a setup token. A
+/// seed without one gets no entry, since there is nothing to probe with; its
+/// usage row says so.
+fn build_probe_entries(seeds: Vec<(ProfileName, u64)>) -> Vec<ProbeEntry> {
+    seeds
+        .into_iter()
+        .filter_map(|(name, interval_ms)| {
+            let token = crate::claude::installed_session_token(&name)?;
+            Some(ProbeEntry {
+                identity: crate::usage::OAuthIdentity::for_setup_token(&token),
+                name,
+                token,
+                interval_ms,
+                epoch_at_spawn: 0,
+            })
+        })
+        .collect()
+}
+
+/// The landing one probe answer makes. A refused token and a failed request
+/// keep the last reading, as a failed `/usage` poll does.
+fn probe_outcome(
+    name: &ProfileName,
+    answer: super::inference::anthropic::ProbeAnswer,
+) -> FetchOutcome {
+    use super::inference::anthropic::ProbeAnswer;
+    match answer {
+        ProbeAnswer::Reading(info) => FetchOutcome::live(name, *info, None),
+        ProbeAnswer::RateLimited { retry_after } => {
+            FetchOutcome::cached(name, FetchStatus::RateLimited, None, retry_after)
+        }
+        ProbeAnswer::Rejected => {
+            // The verdict holds with or without a cache: falling back to
+            // `Failed` for want of one would hide that the token is dead.
+            let mut outcome = FetchOutcome::cached(name, FetchStatus::AuthExpired, None, None);
+            outcome.status = FetchStatus::AuthExpired;
+            outcome
+        }
+        ProbeAnswer::Failed => FetchOutcome::cached(name, FetchStatus::Cached, None, None),
+    }
+}
+
+/// Probe each due entry in turn and land its answer through the OAuth leg's
+/// landing ([`apply_outcome_flagged`]): section 1 compares the setup token's
+/// identity and writes the cache and the history line, section 2 the store,
+/// the status and the cadence at the entry's own interval. One thread for the
+/// leg rather than one per entry: every probe waits on the same
+/// `api.anthropic.com` request slot.
+fn fetch_probe_due_flagged(
+    state: &SchedulerState,
+    due: Vec<ProbeEntry>,
+    timed_out: Option<&AtomicBool>,
+) {
+    for entry in &due {
+        mark_fetch_activity(&state.activity, &entry.key(), ProfileActivity::Queued);
+    }
+    for entry in due {
+        let key = entry.key();
+        mark_fetch_activity(&state.activity, &key, ProfileActivity::Fetching);
+        let mut outcome = probe_outcome(
+            &entry.name,
+            super::inference::anthropic::probe(&entry.token),
+        );
+        clear_fetch_activity(&state.activity, &key);
+        // Switched off while the probe was out, the account is read by nothing,
+        // and the switch-off cleared what the last probe left: this answer
+        // lands nowhere either, nor stands the countdown this tick published.
+        let (still_probed, is_active) = state
+            .config
+            .lock()
+            .map(|c| {
+                (
+                    c.find(&entry.name).is_some_and(usage_probe_admits),
+                    c.is_active(&entry.name),
+                )
+            })
+            .unwrap_or((false, false));
+        if !still_probed {
+            if let Ok(mut next) = state.next_refresh_per_profile.lock() {
+                next.remove(&key);
+            }
+            continue;
+        }
+        // A refused token rests until it changes on disk (a re-mint), clauth
+        // restarts or the probe is switched off and on; a manual refresh
+        // retries it once. The cadence cannot revive it.
+        if matches!(outcome.status, FetchStatus::AuthExpired)
+            && let Ok(mut sup) = state.suppressed_auth_expired.lock()
+        {
+            sup.insert(entry.name.to_string(), entry.fingerprint());
+        }
+        outcome.oauth_identity = entry.identity;
+        outcome.epoch_at_spawn = entry.epoch_at_spawn;
+        if let Some(stamped) = apply_outcome_flagged(
+            outcome,
+            &state.store,
+            &state.status,
+            &state.last_fetched,
+            &state.poll_streaks,
+            entry.interval_ms,
+            is_active,
+            false,
+            &state.weekly_reset_kicks,
+            timed_out,
+        ) {
+            publish_one_countdown(
+                &state.next_refresh_per_profile,
+                &key,
+                stamped,
+                entry.interval_ms,
+            );
+        }
+    }
 }
 
 /// The pacing key for `wham/usage`. Its own host, so codex polls never
@@ -5277,7 +5631,7 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
     // (`tp_snapshot`) only, exactly as its boot seed does. The work lists stay
     // `oauth_snapshot` / `tp_snapshot`, and a third-party status or stamp is
     // written for a `tp_snapshot` name only.
-    let (oauth_seed_names, third_party_seed_names) = state
+    let (oauth_seed_names, third_party_seed_names, probe_seeds) = state
         .config
         .lock()
         .map(|cfg| {
@@ -5286,9 +5640,16 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
             } else {
                 tp_snapshot.iter().map(|e| e.name.to_string()).collect()
             };
-            (collect_oauth_seed_names(&cfg), third_party_seed_names)
+            (
+                collect_oauth_seed_names(&cfg, interval_ms),
+                third_party_seed_names,
+                collect_probe_seeds(&cfg),
+            )
         })
         .unwrap_or_default();
+    // The fetching instance's probe list, rebuilt the way its tick builds it,
+    // so a probed account counts down here too.
+    let probe_snapshot = build_probe_entries(probe_seeds);
 
     hydrate_from_daemon_caches(
         &state.store,
@@ -5316,6 +5677,15 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         interval_ms,
         &streaks,
     );
+    let (_, probe_next) = partition_due(
+        &probe_snapshot,
+        now,
+        &state.last_fetched,
+        &state.activity,
+        interval_ms,
+        &streaks,
+    );
+    oauth_next.extend(probe_next);
     // Mirror the fetch tick's `refresh_spent_accounts` OFF handling: the daemon
     // skips spent accounts, so their disk cache stops advancing and the derived
     // countdown would freeze at `0s`. Blank it here too (the Queued sweep below
@@ -5327,7 +5697,13 @@ fn standdown_tick(state: &SchedulerState, interval_ms: u64) {
         .map(|c| c.state.refresh_spent_accounts)
         .unwrap_or(true);
     if !refresh_spent && let Ok(store) = state.store.lock() {
-        let skip = spent_skip_set(&oauth_snapshot, &forced, &store, now_epoch_secs());
+        let mut skip = spent_skip_set(&oauth_snapshot, &forced, &store, now_epoch_secs());
+        skip.extend(spent_skip_set(
+            &probe_snapshot,
+            &forced,
+            &store,
+            now_epoch_secs(),
+        ));
         oauth_next.retain(|key, _| !skip.contains(key.name.as_str()));
     }
     let (_, tp_next) = partition_due(
@@ -5376,18 +5752,18 @@ fn hydrate_from_daemon_caches(
     tp_store: &ThirdPartyUsageStore,
     tp_status: &ThirdPartyStatusStore,
     last_fetched: &LastFetchedAt,
-    oauth_seed_names: &[String],
+    oauth_seed_names: &[(String, u64)],
     third_party_seed_names: &[String],
     third_party_work: &[ThirdPartyEntry],
     interval_ms: u64,
 ) {
     let now = now_ms();
-    for name in oauth_seed_names {
+    for (name, oauth_interval_ms) in oauth_seed_names {
         let pname = ProfileName::from(name.clone());
         if profile_cache_mtime_ms(&pname, USAGE_CACHE_FILE).is_none() {
             remove_oauth_hydration_entries(store, status, last_fetched, &pname);
         } else {
-            try_seed_cache(store, status, last_fetched, &pname, now, interval_ms);
+            try_seed_cache(store, status, last_fetched, &pname, now, *oauth_interval_ms);
         }
     }
     let scheduled: HashSet<&str> = third_party_work.iter().map(|e| e.name.as_str()).collect();
@@ -6377,12 +6753,13 @@ fn scan_session_switches(
     let skipped_names: HashSet<ProfileName> = read_skipped_unreadable(skipped_unreadable);
     // Snapshot under `config` only, exactly as `scan_auto_switch` does: holding it
     // while taking `usage_store` is the `App::apply_usage` inversion.
-    // Five store/config-snapshot handles ride out of the one config hold; the
+    // Six store/config-snapshot handles ride out of the one config hold; the
     // annotation reads clearer than a one-off struct for them.
     #[allow(clippy::type_complexity)]
-    let (chain, pending, key_rejected, third_party_names, polled): (
+    let (chain, pending, key_rejected, third_party_names, polled, probe_read): (
         Vec<String>,
         Vec<SessionDecision>,
+        HashSet<ProfileName>,
         HashSet<ProfileName>,
         HashSet<ProfileName>,
         HashSet<ProfileName>,
@@ -6444,7 +6821,14 @@ fn scan_session_switches(
                 })
             })
             .collect();
-        (chain, pending, key_rejected, third_party_names, polled)
+        (
+            chain,
+            pending,
+            key_rejected,
+            third_party_names,
+            polled,
+            probe_read_names(&cfg),
+        )
     };
 
     let kick_rejected = kick_rejected_names(kick_blocks, now_epoch_secs());
@@ -6651,6 +7035,15 @@ fn scan_session_switches(
         // insert also marks the session, so the latch adds no term here.
         // `must_leave` above only opens the leave guard.
         let credit_demand = credit_billed_launch || credit_seen;
+        // A probe reading knows nothing of the credit cap, so it carries no
+        // freshness for a session with credit demand. The member the session is
+        // on keeps its own, since there freshness vouches only for that
+        // member's windows, and those the probe reads.
+        if credit_demand {
+            snapshot
+                .fresh
+                .retain(|name| *name == member || !probe_read.contains(name));
+        }
         // `Off` means "sign every account out", which has no per-session form: a
         // session cannot be left credential-less mid-flight and there is no member
         // name to write. It, and a stay-put `None`, leave the row as it stands.
@@ -6938,10 +7331,11 @@ fn partition_due<T: NamedEntry + Clone>(
     };
     let act = activity.lock();
 
-    let interval = IntervalMs::from_millis(interval_ms);
     let mut due = Vec::new();
     let mut per_profile = HashMap::with_capacity(snapshot.len());
     for entry in snapshot {
+        let interval_ms = entry.interval_ms(interval_ms);
+        let interval = IntervalMs::from_millis(interval_ms);
         let last = lf.get(&entry.key()).copied().unwrap_or_default();
         let counts = streaks.get(entry.name()).copied().unwrap_or_default();
         let backoff = entry.poll_backoff_ms(counts, interval_ms);
@@ -7022,10 +7416,10 @@ fn merge_forced<T: NamedEntry + Clone>(
 /// overview timer renders blank and the usage tab reads "up to date"/"spent"
 /// instead. Reads the usage store once. Fetch-leg only; switch/fallback
 /// predicates are untouched.
-fn drop_spent_oauth(
+fn drop_spent_oauth<E: NamedEntry>(
     state: &SchedulerState,
-    snapshot: &[TokenEntry],
-    due: &mut Vec<TokenEntry>,
+    snapshot: &[E],
+    due: &mut Vec<E>,
     next: &mut HashMap<LegKey, u64>,
     forced: &HashSet<String>,
 ) {
@@ -7039,7 +7433,7 @@ fn drop_spent_oauth(
     if skip.is_empty() {
         return;
     }
-    due.retain(|entry| !skip.contains(entry.name.as_str()));
+    due.retain(|entry| !skip.contains(entry.name()));
     next.retain(|key, _| !skip.contains(key.name.as_str()));
     // Clear a stranded bootstrap `Queued` mark so the row stops spinning on a
     // fetch that never runs. `Fetching`/`Refreshing`/`Switching` are worker-owned
@@ -7063,8 +7457,8 @@ fn drop_spent_oauth(
 /// never-fetched one (no store entry — a reset is only seen by polling), and a
 /// below-cap or lapsed one are all absent (they still poll). Pure over the store
 /// map so it tests without a full `SchedulerState`.
-fn spent_skip_set(
-    snapshot: &[TokenEntry],
+fn spent_skip_set<E: NamedEntry>(
+    snapshot: &[E],
     forced: &HashSet<String>,
     store: &HashMap<String, UsageInfo>,
     now_secs: i64,
@@ -7072,12 +7466,12 @@ fn spent_skip_set(
     snapshot
         .iter()
         .filter(|entry| {
-            !forced.contains(entry.name.as_str())
+            !forced.contains(entry.name())
                 && store
-                    .get(entry.name.as_str())
+                    .get(entry.name())
                     .is_some_and(|info| windows_maxed(info, now_secs))
         })
-        .map(|entry| entry.name.to_string())
+        .map(|entry| entry.name().to_string())
         .collect()
 }
 

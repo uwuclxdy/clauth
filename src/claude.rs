@@ -13,7 +13,7 @@ use crate::profile::{
 };
 use crate::usage::{
     ForgetPlan, OAuthIdentity, forget_disk_plan, note_forget_plan, oauth_changed,
-    read_before_identities, throughput_identity,
+    read_before_identities, setup_token_plan, throughput_identity,
 };
 
 pub(crate) fn claude_credentials_path() -> Result<PathBuf> {
@@ -112,7 +112,9 @@ pub(crate) fn installed_session_token(name: &ProfileName) -> Option<String> {
 /// success, not an error: the requested end state already holds.
 pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|_held| {
+    let (removed, plan) = with_state_lock(|_held| {
+        let plan = setup_token_plan(name, None);
+        forget_disk_plan(name, plan);
         // The sidecar can hold the account's design login; `credentials.json`
         // becomes the install source once it goes, so the keys move there first,
         // and a design login the live file alone holds is saved into the
@@ -121,11 +123,13 @@ pub(crate) fn clear_session_token(name: &ProfileName) -> Result<bool> {
         sync_live_extra_into_install_source(name);
         hand_sidecar_keys_to_store(&path);
         match std::fs::remove_file(&path) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Ok(()) => Ok((true, plan)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((false, plan)),
             Err(e) => Err(anyhow::Error::new(e).context("remove session-token.json")),
         }
-    })
+    })?;
+    note_forget_plan(name, plan);
+    Ok(removed)
 }
 
 /// Remove `name`'s preserved mint backup (`session-token.static.json`), the
@@ -336,15 +340,19 @@ pub(crate) fn write_session_token(name: &ProfileName, token: &str, now_ms: i64) 
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let path = profile_dir(name)?.join("session-token.json");
-    with_state_lock(|_held| {
+    let plan = with_state_lock(|_held| {
+        let plan = setup_token_plan(name, Some(token));
+        forget_disk_plan(name, plan);
         // A re-mint relinks nothing, so a live file Claude Code wrote beside
         // the mint this replaces stops matching any store; saved first, the
         // keep below carries it onto the new mint. Over a mis-fill, whose keys
         // the keep never takes, it waits in `credentials.json` instead.
         sync_live_extra_into_install_source(name);
         let bytes = keep_non_login_in_sidecar(&bytes, &path);
-        atomic_write_600(&path, bytes).context("write session-token.json")
+        atomic_write_600(&path, bytes).context("write session-token.json")?;
+        Ok(plan)
     })?;
+    note_forget_plan(name, plan);
     Ok(expires_at)
 }
 
@@ -541,7 +549,9 @@ pub(crate) fn write_session_token_with_backup(
     };
     let bytes = serde_json::to_vec_pretty(&sidecar).context("serialize session token")?;
     let dir = profile_dir(name)?;
-    with_state_lock(|_held| {
+    let plan = with_state_lock(|_held| {
+        let plan = setup_token_plan(name, Some(token));
+        forget_disk_plan(name, plan);
         // As in `write_session_token`: what the live file holds beside the
         // bearer this replaces is saved before it stops matching.
         sync_live_extra_into_install_source(name);
@@ -552,8 +562,10 @@ pub(crate) fn write_session_token_with_backup(
         let bytes = keep_non_login_in_sidecar(&bytes, &sidecar);
         atomic_write_600(&sidecar, &bytes).context("write session-token.json")?;
         atomic_write_600(&dir.join("session-token.static.json"), &bytes)
-            .context("write session-token.static.json")
+            .context("write session-token.static.json")?;
+        Ok(plan)
     })?;
+    note_forget_plan(name, plan);
     Ok(expires_at)
 }
 

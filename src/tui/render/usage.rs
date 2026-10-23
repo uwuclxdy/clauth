@@ -1758,26 +1758,15 @@ fn status_lines(
             // No countdown: the profile is session-suppressed, so there is no
             // next attempt to count down to. Only a re-login (or a manual
             // refresh, which retries once) moves this.
-            //
-            // Three dead-credential causes read as three labels. "expired" only
-            // when a session actually lapsed; an account that never stored one
-            // reaches this state too (a working api key does not authenticate
-            // the usage gateway), and telling that operator something expired
-            // sends them hunting for what to renew instead of to the login they
-            // have not run. A non-Alibaba profile has no session at all, so its
-            // verdict can only mean the api key itself was rejected.
-            let label = if profile.console.is_some() {
-                "login expired"
-            } else if profile.provider != Some(Provider::Alibaba) {
-                "key rejected"
-            } else {
-                "login needed"
-            };
+            let label = crate::format::auth_expired_label(profile);
             spans.extend([
                 Span::styled("[ ", theme::dim()),
                 Span::styled(label, theme::danger().add_modifier(Modifier::BOLD)),
                 Span::styled(" ]", theme::dim()),
             ]);
+            if crate::usage::oauth_without_pair(profile) {
+                fetch_hint = Some(UsageDiag::SetupTokenRefused);
+            }
         }
         _ => match countdown {
             // A scheduled refresh is work lined up — the `queued` dot (`◌` in
@@ -1922,6 +1911,8 @@ enum UsageDiag {
     /// third-party credential): the fetch row names the missing key instead
     /// of a dot or a historical verdict.
     NoKey,
+    /// The usage probe's setup token was refused: only a new mint revives it.
+    SetupTokenRefused,
 }
 
 /// The stuck-429 throttler name, keyed on the reading source that won (never
@@ -1972,6 +1963,10 @@ fn diag_fix(diag: UsageDiag, profile_name: &str) -> String {
         UsageDiag::Stale => "last usage check failed".to_string(),
         UsageDiag::RefreshFailing => "login refresh failing, re-login if it persists".to_string(),
         UsageDiag::NoKey => KEYLESS_FIX.to_string(),
+        UsageDiag::SetupTokenRefused => format!(
+            "mint a new one with {}",
+            cmd(&format!("clauth login {profile_name} --setup-token"))
+        ),
     }
 }
 
@@ -2004,29 +1999,29 @@ fn ordinal(n: u32) -> String {
 }
 
 /// Terminal message for an OAuth profile with nothing renderable. "loading"
-/// only while a fetch can still land: a credential-less profile is never
-/// scheduled (`collect_tokens` skips it), a disabled one is likewise skipped, and
-/// a terminal `Failed` already tried — mirror `build_tp_rows`, never spin on
-/// "loading" forever (issue #2).
+/// only while a fetch can still land: a profile with neither a pair nor a
+/// probed setup token is never scheduled, a disabled one is likewise skipped,
+/// and a terminal `Failed` or a refused setup token already tried — mirror
+/// `build_tp_rows`, never spin on "loading" forever (issue #2).
 fn oauth_empty_msg(profile: &Profile, status: Option<FetchStatus>) -> &'static str {
-    let has_oauth = profile
-        .credentials
-        .as_ref()
-        .is_some_and(|c| c.claude_ai_oauth.is_some());
-    if !has_oauth {
+    let probed = profile.has_long_lived_sidecar && crate::usage::usage_probe_admits(profile);
+    if crate::usage::usage_poll_pair(profile).is_none() && !probed {
         // A long-lived session-token sidecar is a login the OAuth leg cannot
         // read usage through: never call it "not logged in", tell the operator
-        // to log the same account in. An api key / `[env]` inference token has
-        // no usage windows at all — nothing to fix, so no fix line. Only a
-        // member holding nothing is "not logged in".
+        // to log the same account in or probe it, the login first: the probe
+        // spends inference, the login does not. An api key / `[env]` inference
+        // token has no usage windows at all — nothing to fix, so no fix line.
+        // Only a member holding nothing is "not logged in".
         if profile.has_long_lived_sidecar {
-            "can't read usage, log in the same account with + login on the setup tab"
+            "can't read usage, log in the same account with + login on the setup tab, or turn on usage probe"
         } else if crate::claude::has_inference_auth(profile) {
             "can't read usage, an api key has no usage windows"
         } else {
             "not logged in, use + login on the setup tab"
         }
-    } else if profile.is_disabled() || status == Some(FetchStatus::Failed) {
+    } else if profile.is_disabled()
+        || matches!(status, Some(FetchStatus::Failed | FetchStatus::AuthExpired))
+    {
         // Disabled: never scheduled, so with no seeded cache no fetch will land.
         "no usage available"
     } else {

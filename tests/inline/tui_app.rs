@@ -3594,8 +3594,10 @@ fn seed_oauth_reading(app: &App, names: &[&str]) {
         &app.usage_store,
         &app.usage_status,
         &app.last_fetched,
-        &names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
-        90_000,
+        &names
+            .iter()
+            .map(|n| (n.to_string(), 90_000))
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -16246,6 +16248,53 @@ fn apply_usage_feeds_usage_stale_off_the_disk_cache_age() {
     );
 }
 
+/// A probed account's figures go stale at its probe interval: 1000 s old is
+/// past the poll's threshold (2 × 5 min + 90 s) but inside a 10 min probe's.
+#[test]
+fn apply_usage_ages_a_probed_account_at_its_probe_interval() {
+    let stale_for = |probe: bool| {
+        let _home = crate::testutil::HomeSandbox::new();
+        let mut profile =
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from(GATE_PROFILE));
+        profile.bell_threshold = None;
+        profile.usage_probe = probe;
+        profile.usage_probe_interval_ms = 600_000;
+        let mut app = app_with(vec![profile]);
+        crate::testutil::register_names(&[GATE_PROFILE]);
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from(GATE_PROFILE),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                five_hour: Some(UsageWindow {
+                    utilization: 42.0,
+                    resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                }),
+                fetched_at: Some(crate::usage::now_ms() - 1_000_000),
+                ..UsageInfo::default()
+            },
+        );
+        app.apply_usage();
+        app.stale_cues.get(GATE_PROFILE).copied().unwrap_or(false)
+    };
+    assert!(!stale_for(true), "probed");
+    assert!(stale_for(false), "not probed");
+}
+
+/// `r` off the Usage tab queues a probed account beside the polled ones; its
+/// list is built in the tick, never in the token list `r` reads.
+#[test]
+fn refresh_all_queues_a_probed_account_too() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
+    probed.usage_probe = true;
+    let unprobed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("unprobed"));
+    let app = app_with(vec![probed, unprobed]);
+    app.manual_refresh();
+    let queued = app.refetch_queue.lock().unwrap().clone();
+    assert!(queued.contains("probed"), "{queued:?}");
+    assert!(!queued.contains("unprobed"), "{queued:?}");
+}
+
 /// The read half: the log is written by whichever process holds the fetch lease,
 /// so a file that appeared or changed since the last look must be picked up off
 /// its content. Written here AFTER the `App` is built, standing in for the
@@ -16874,6 +16923,8 @@ fn mini_profile(name: &str, api_key: Option<&str>) -> Profile {
         base_url: None,
         api_key: api_key.map(str::to_string),
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -17203,7 +17254,8 @@ fn fallback_add_enter_raises_confirm_modal_when_the_candidate_has_no_usage_sourc
         confirm.detail.as_deref(),
         Some(
             "once it's active, clauth won't switch away from it on its own.\nlog in the \
-             same account with \u{e001}clauth login st\u{e002} so clauth can read its usage."
+             same account with \u{e001}clauth login st\u{e002}, or turn on its \
+             `usage_probe`, so clauth can read its usage."
         ),
     );
     // The dialog speaks in sentences, all the way down: the fix line was the
@@ -17293,7 +17345,8 @@ fn fallback_add_enter_names_the_hazard_in_the_present_when_the_candidate_is_acti
         confirm.detail.as_deref(),
         Some(
             "it's active, and clauth won't switch away from it on its own.\nlog in the same \
-             account with \u{e001}clauth login st\u{e002} so clauth can read its usage."
+             account with \u{e001}clauth login st\u{e002}, or turn on its `usage_probe`, so \
+             clauth can read its usage."
         ),
     );
     assert_eq!(
@@ -18663,6 +18716,39 @@ fn a_captured_console_session_replaces_only_the_session() {
     assert!(
         app.refetch_queue.lock().unwrap().contains("qwen"),
         "a fresh session asks for the figures it can now read"
+    );
+}
+
+/// The empty row of a setup-token account names both ways to a reading: at 80
+/// columns it keeps the two rows the login hint alone wraps onto, and the
+/// probe joins the second.
+#[test]
+fn a_setup_token_accounts_empty_row_fits_80_columns() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let profile = crate::testutil::blank_profile(&name);
+    crate::profile::save_profile(&profile).expect("persist acct");
+    crate::claude::write_session_token(
+        &name,
+        "sk-ant-oat01-fixture",
+        crate::usage::now_ms() as i64,
+    )
+    .expect("mint");
+    let profile = crate::profile::load_profile(&name).expect("reload acct");
+    let mut app = app_with(vec![profile]);
+    app.tab = super::Tab::Usage;
+    let mut term = Terminal::new(TestBackend::new(80, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, &app)).unwrap();
+    let rows = crate::testutil::buffer_rows(term.backend().buffer());
+    let first = rows
+        .iter()
+        .position(|r| r.contains("can't read usage, log in the same account with +"))
+        .unwrap_or_else(|| panic!("the hint's first row is on no row:\n{}", rows.join("\n")));
+    assert!(
+        rows[first + 1].contains("login on the setup tab, or turn on usage probe"),
+        "the probe does not finish the hint's second row:\n{}",
+        rows.join("\n")
     );
 }
 
@@ -28997,12 +29083,14 @@ fn the_alert_row_follows_auto_start_on_oauth_and_name_on_api_accounts() {
     let _home = crate::testutil::HomeSandbox::new();
     let oauth = alert_app(None);
     assert_eq!(
-        config_rows(&oauth)[..3],
+        config_rows(&oauth)[..4],
         [
             ConfigRow::Name,
             ConfigRow::AutoStart,
+            ConfigRow::UsageProbe,
             ConfigRow::BellThreshold
-        ]
+        ],
+        "the fixture holds no pair, so the probe row stands between the two"
     );
 
     let mut api = app_with(vec![crate::profile::Profile::new(
@@ -29238,6 +29326,494 @@ fn the_open_alert_editor_shows_its_range_line_in_the_pane() {
     let rows = draw(&app);
     let field = rows.iter().position(|r| r.contains("alert at")).unwrap();
     assert!(rows[field + 1].contains(range), "{}", rows.join("\n"));
+}
+
+// ── Setup `usage probe` row ──────────────────────────────────────────────────
+
+/// A setup-token-shaped account "acct" (no pair) persisted with the probe as
+/// given, the Setup detail pane open on it and its cursor on the probe row.
+fn probe_app(on: bool, interval_ms: u64) -> App {
+    use super::{ConfigRow, Tab, config_rows, enter_config_detail};
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.usage_probe = on;
+    profile.usage_probe_interval_ms = interval_ms;
+    crate::profile::save_profile(&profile).expect("persist acct");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name],
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist state");
+    let mut app = app_with(vec![profile]);
+    app.tab = Tab::Setup;
+    app.profile_cursor.set(0);
+    enter_config_detail(&mut app);
+    app.config_action_cursor = config_rows(&app)
+        .iter()
+        .position(|r| *r == ConfigRow::UsageProbe)
+        .expect("the probe row is listed");
+    app
+}
+
+/// The probe setting in memory and on disk, which must agree.
+fn saved_probe(app: &App) -> (bool, u64) {
+    let name = crate::profile::ProfileName::from("acct");
+    let memory = app
+        .config()
+        .find(&name)
+        .map(|p| (p.usage_probe, p.usage_probe_interval_ms))
+        .expect("acct in memory");
+    let on_disk = crate::profile::load_profile(&name).expect("reload acct");
+    assert_eq!(
+        memory,
+        (on_disk.usage_probe, on_disk.usage_probe_interval_ms),
+        "memory and disk agree"
+    );
+    memory
+}
+
+fn draw_probe_app(app: &App) -> Vec<String> {
+    use ratatui::{Terminal, backend::TestBackend};
+    let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| crate::tui::render::draw(f, app)).unwrap();
+    crate::testutil::buffer_rows(term.backend().buffer())
+}
+
+#[test]
+fn the_probe_row_sits_below_auto_start_only_where_no_pair_is_stored() {
+    use super::{ConfigRow, config_rows};
+    let _home = crate::testutil::HomeSandbox::new();
+    let setup = probe_app(false, 90_000);
+    assert_eq!(
+        config_rows(&setup)[..4],
+        [
+            ConfigRow::Name,
+            ConfigRow::AutoStart,
+            ConfigRow::UsageProbe,
+            ConfigRow::BellThreshold
+        ]
+    );
+
+    let mut paired_profile =
+        crate::testutil::blank_profile(&crate::profile::ProfileName::from("p"));
+    paired_profile.credentials = Some(crate::profile::ClaudeCredentials {
+        claude_ai_oauth: Some(crate::profile::OAuthToken {
+            access_token: "at".into(),
+            refresh_token: Some("rt".into()),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..crate::profile::OAuthToken::default_extra()
+        }),
+    });
+    let mut paired = app_with(vec![paired_profile]);
+    paired.profile_cursor.set(0);
+    super::enter_config_detail(&mut paired);
+    assert!(
+        !config_rows(&paired).contains(&ConfigRow::UsageProbe),
+        "beside a pair the switch would do nothing"
+    );
+
+    let mut api = app_with(vec![crate::profile::Profile::new(
+        "api".to_string(),
+        Some("https://api.test".to_string()),
+        Some("k".to_string()),
+    )]);
+    api.profile_cursor.set(0);
+    super::enter_config_detail(&mut api);
+    assert!(!config_rows(&api).contains(&ConfigRow::UsageProbe));
+}
+
+#[test]
+fn space_and_enter_toggle_the_probe_and_save_it() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = probe_app(false, 90_000);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert_eq!(saved_probe(&app), (true, 90_000));
+    super::handle_key(&mut app, key(KeyCode::Enter));
+    assert_eq!(saved_probe(&app), (false, 90_000));
+}
+
+/// Turning the probe off leaves the account as a restart would show it: the
+/// reading, its status, its countdown and a refused token's rest go, so
+/// turning it back on tries the token once. The cadence stamp stays.
+#[test]
+fn turning_the_probe_off_clears_what_the_probe_left() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let key_of = crate::usage::FetchLeg::OAuth.key(name.clone());
+    let mut app = probe_app(true, 90_000);
+    // The reading, its status and its stamp as the startup seed lays them.
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            fetched_at: Some(crate::usage::now_ms()),
+            ..UsageInfo::default()
+        },
+    );
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("acct".to_string(), 90_000)],
+    );
+    assert!(app.usage_status.lock().unwrap().contains_key("acct"));
+    app.next_refresh_per_profile
+        .lock()
+        .unwrap()
+        .insert(key_of.clone(), 1);
+    app.suppressed_auth_expired
+        .lock()
+        .unwrap()
+        .insert("acct".to_string(), 7);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(!saved_probe(&app).0);
+    assert!(
+        !app.usage_store.lock().unwrap().contains_key("acct"),
+        "reading"
+    );
+    assert!(
+        !app.usage_status.lock().unwrap().contains_key("acct"),
+        "status"
+    );
+    assert!(
+        !app.next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&key_of),
+        "countdown"
+    );
+    assert!(
+        !app.suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .contains_key("acct"),
+        "rest"
+    );
+    assert!(
+        app.last_fetched.lock().unwrap().contains_key(&key_of),
+        "the cadence stamp stays"
+    );
+}
+
+/// A probe switched off in another process: this one's reload leaves the
+/// account as its own switch-off would and keeps the cadence stamp, while an
+/// account whose probe stays on keeps what its probe left.
+#[test]
+fn a_reload_that_finds_the_probe_switched_off_clears_what_it_left() {
+    use crate::profile::ProfileName;
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+    let _home = crate::testutil::HomeSandbox::new();
+    let names = [ProfileName::from("off"), ProfileName::from("on")];
+    let profiles: Vec<crate::profile::Profile> = names
+        .iter()
+        .map(|name| {
+            let mut p = crate::testutil::blank_profile(name);
+            p.usage_probe = true;
+            crate::profile::save_profile(&p).expect("persist profile");
+            p
+        })
+        .collect();
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: names.to_vec(),
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist state");
+    let mut app = app_with(profiles.clone());
+    for name in &names {
+        crate::profile_cache::write_profile_cache(
+            name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                fetched_at: Some(crate::usage::now_ms()),
+                ..UsageInfo::default()
+            },
+        );
+        app.next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .insert(crate::usage::FetchLeg::OAuth.key(name.clone()), 1);
+        app.suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), 7);
+    }
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("off".to_string(), 90_000), ("on".to_string(), 90_000)],
+    );
+
+    let mut off = profiles[0].clone();
+    off.usage_probe = false;
+    crate::profile::save_profile(&off).expect("switch the probe off elsewhere");
+    let config_toml =
+        crate::profile::profile_subpath(&names[0], "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(60));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    for (name, kept) in [(&names[0], false), (&names[1], true)] {
+        let key = crate::usage::FetchLeg::OAuth.key(name.clone());
+        let held = |present: bool, what: &str| assert_eq!(present, kept, "{name}: {what}");
+        held(
+            app.usage_store.lock().unwrap().contains_key(name.as_str()),
+            "reading",
+        );
+        held(
+            app.usage_status.lock().unwrap().contains_key(name.as_str()),
+            "status",
+        );
+        held(
+            app.next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "countdown",
+        );
+        held(
+            app.suppressed_auth_expired
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "rest",
+        );
+        assert!(
+            app.last_fetched.lock().unwrap().contains_key(&key),
+            "{name}: the cadence stamp stays"
+        );
+    }
+}
+
+/// A setup token changed by hand in the same reload as the switch-off: the
+/// reload compare seeds the old token's reading back from the disk cache a
+/// hand edit leaves, and the switch-off still clears it, since it runs after
+/// the compare.
+#[test]
+fn a_switch_off_beside_a_token_changed_by_hand_leaves_no_re_seeded_reading() {
+    use crate::testutil::set_mtime;
+    use std::time::{Duration, SystemTime};
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = crate::testutil::blank_profile(&name);
+    profile.usage_probe = true;
+    crate::profile::save_profile(&profile).expect("persist profile");
+    crate::profile::save_app_state(&crate::profile::AppState {
+        profiles: vec![name.clone()],
+        ..crate::profile::AppState::default()
+    })
+    .expect("persist state");
+    crate::claude::write_session_token(&name, "oat-first", 0).expect("write the sidecar");
+    let mut app = app_with(vec![profile.clone()]);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            fetched_at: Some(crate::usage::now_ms()),
+            ..UsageInfo::default()
+        },
+    );
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("acct".to_string(), 90_000)],
+    );
+
+    profile.usage_probe = false;
+    crate::profile::save_profile(&profile).expect("switch the probe off elsewhere");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    let text = std::fs::read_to_string(&sidecar).expect("read the sidecar");
+    std::fs::write(&sidecar, text.replace("oat-first", "oat-second"))
+        .expect("change the token by hand");
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(60));
+    assert!(app.reload_if_state_changed(), "the reload branch ran");
+
+    assert!(!app.usage_store.lock().unwrap().contains_key("acct"));
+    assert!(!app.usage_status.lock().unwrap().contains_key("acct"));
+}
+
+/// Turning the probe on brings the cached reading back at once, dated at the
+/// probe's interval: 120 s old at a 600 s probe is fresh, where the 90 s poll
+/// would call it cached, and the stamp sits at the reading's own fetch, so the
+/// next probe waits out the interval.
+#[test]
+fn turning_the_probe_on_seeds_the_cached_reading_at_its_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut app = probe_app(false, 600_000);
+    let fetched_at = crate::usage::now_ms() - 120_000;
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &UsageInfo {
+            five_hour: Some(crate::usage::UsageWindow {
+                utilization: 31.0,
+                resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+            }),
+            fetched_at: Some(fetched_at),
+            ..UsageInfo::default()
+        },
+    );
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(saved_probe(&app).0);
+    let seeded = app.usage_store.lock().unwrap().get("acct").cloned();
+    assert_eq!(
+        seeded.and_then(|u| u.five_hour).map(|w| w.utilization),
+        Some(31.0)
+    );
+    assert_eq!(
+        app.usage_status.lock().unwrap().get("acct"),
+        Some(&crate::usage::FetchStatus::Fresh)
+    );
+    assert_eq!(
+        app.last_fetched
+            .lock()
+            .unwrap()
+            .get(&crate::usage::FetchLeg::OAuth.key(name))
+            .map(|s| s.as_millis()),
+        Some(fetched_at)
+    );
+}
+
+/// Turning the probe back on keeps a cadence stamp later than the cached
+/// reading's own, as a `retry-after` wait leaves one: a plain seed would rewind
+/// it to the reading and send the next probe early.
+#[test]
+fn turning_the_probe_on_keeps_a_later_cadence_stamp() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let key_of = crate::usage::FetchLeg::OAuth.key(name.clone());
+    let mut app = probe_app(true, 120_000);
+    let write_cache = |fetched_at: u64| {
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &UsageInfo {
+                fetched_at: Some(fetched_at),
+                ..UsageInfo::default()
+            },
+        );
+    };
+    let now = crate::usage::now_ms();
+    // The held stamp, a minute past the reading the cache holds below.
+    write_cache(now);
+    crate::usage::bootstrap_fetch(
+        &app.usage_store,
+        &app.usage_status,
+        &app.last_fetched,
+        &[("acct".to_string(), 120_000)],
+    );
+    let held = app
+        .last_fetched
+        .lock()
+        .unwrap()
+        .get(&key_of)
+        .map(|s| s.as_millis());
+    assert_eq!(held, Some(now));
+    write_cache(now - 60_000);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(!saved_probe(&app).0);
+    super::handle_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(saved_probe(&app).0);
+    assert!(
+        app.usage_store.lock().unwrap().contains_key("acct"),
+        "the cached reading is back"
+    );
+    assert_eq!(
+        app.last_fetched
+            .lock()
+            .unwrap()
+            .get(&key_of)
+            .map(|s| s.as_millis()),
+        held
+    );
+}
+
+/// A stray `+` must not start probing: a probe spends inference and may start
+/// the 5h window, so only the toggle turns it on.
+#[test]
+fn plus_and_minus_never_turn_the_probe_on() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = probe_app(false, 90_000);
+    for c in ['+', '=', '-', '_'] {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+        assert_eq!(saved_probe(&app), (false, 90_000), "{c}");
+    }
+    let rows = draw_probe_app(&app);
+    let footer = rows.last().expect("the footer row");
+    assert!(
+        !footer.contains("less often") && !footer.contains("more often"),
+        "off, the footer offers no step: {footer}"
+    );
+}
+
+/// From wherever the interval stands, off the 30 s grid too, and clamped to
+/// 1 min ..= 10 min at both ends.
+#[test]
+fn plus_and_minus_step_a_running_probe_from_where_it_stands() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = probe_app(true, 75_000);
+    let mut press = |c: char| {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+        saved_probe(&app).1
+    };
+    assert_eq!(press('+'), 105_000);
+    assert_eq!(press('-'), 75_000);
+    assert_eq!(press('-'), 60_000, "45 s clamps to the 1 min floor");
+    assert_eq!(press('-'), 60_000);
+
+    let mut app = probe_app(true, 585_000);
+    let mut press = |c: char| {
+        super::handle_key(&mut app, key(KeyCode::Char(c)));
+        saved_probe(&app).1
+    };
+    assert_eq!(press('+'), 600_000, "615 s clamps to the 10 min ceiling");
+    assert_eq!(press('+'), 600_000);
+    assert_eq!(press('-'), 570_000);
+    assert!(saved_probe(&app).0, "stepping never turns it off");
+}
+
+/// The row reads off or its cadence, and its hint names what a probe may cost
+/// in both states, each in its own words; on, the footer offers the steps.
+#[test]
+fn the_probe_row_shows_its_cadence_and_its_cost() {
+    const OFF_HINT: &str = "on, a 1-token probe reads usage and may start the 5h window";
+    const ON_HINT: &str = "a 1-token probe to Haiku reads usage, may start the 5h window";
+    let has = |rows: &[String], hint: &str| rows.iter().any(|r| r.contains(hint));
+    let _home = crate::testutil::HomeSandbox::new();
+    let off = draw_probe_app(&probe_app(false, 90_000));
+    let row = off
+        .iter()
+        .find(|r| r.contains("usage probe"))
+        .expect("the probe row renders");
+    assert!(row.contains("off"), "{row}");
+    assert!(
+        has(&off, OFF_HINT) && !has(&off, ON_HINT),
+        "{}",
+        off.join("\n")
+    );
+
+    let on = draw_probe_app(&probe_app(true, 120_000));
+    let row = on
+        .iter()
+        .find(|r| r.contains("usage probe"))
+        .expect("the probe row renders");
+    assert!(row.contains("every 120s"), "{row}");
+    assert!(
+        has(&on, ON_HINT) && !has(&on, OFF_HINT),
+        "{}",
+        on.join("\n")
+    );
+    let footer = on.last().expect("the footer row");
+    assert!(
+        footer.contains("less often") && footer.contains("more often"),
+        "{footer}"
+    );
 }
 
 // ── settings edits save config.toml only ─────────────────────────────────────
@@ -37343,7 +37919,7 @@ mod usage_picker {
         let (seed_names, entries) = {
             let cfg = app.config();
             (
-                crate::usage::collect_oauth_seed_names(&cfg),
+                crate::usage::collect_oauth_seed_names(&cfg, 300_000),
                 crate::usage::collect_third_party_entries(&cfg.profiles),
             )
         };
@@ -37353,7 +37929,6 @@ mod usage_picker {
             &app.usage_status,
             &app.last_fetched,
             &seed_names,
-            300_000,
         );
         crate::usage::bootstrap_third_party(
             &app.third_party_usage_store,

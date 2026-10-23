@@ -134,6 +134,7 @@ clauth list           # account table with cached usage, no network
   - A non-TTY stdin is read as one line, for a driver that takes the link off stdout and feeds the code back to the same process; EOF just leaves the browser door open. The code is bound to that process, so it cannot be piped in from an earlier run.
 - **`login --setup-token`** captures a `claude setup-token` mint (echo-off, or piped on stdin) as the profile's long-lived login.
   - That token never races clauth's refresher. It engages only for a genuinely long-lived token; a rotating pair pasted here is ignored and called out on the card.
+  - Alone it gives `/usage` nothing to read. Add an OAuth login beside it, or turn on the profile's `usage_probe`, which reads its usage with a 1-token request that may start the 5h window ([Configuration](Configuration#account-types)).
 - **`rolling-token <profile>`** points the profile's sidecar at its own clauth-private usage chain instead of a static mint: the daemon re-stamps it with the chain's current access token — full scopes, the account's `subscriptionType` and its `rateLimitTier`, but **no refresh token**.
   - That way sessions hold nothing rotatable (the split's whole point) while running a bearer the API recognizes as the plan it is, and plan-gated models work in a clauth-managed session.
   - A `claude setup-token` mint carries neither `user:profile` nor a subscription stamp and gets capped.

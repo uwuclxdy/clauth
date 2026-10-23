@@ -203,6 +203,37 @@ fn a_record_under_the_same_keyed_profile_lands_one_sample() {
     );
 }
 
+/// A delegate on a setup-token account with no pair stored records its sample.
+/// The spawn has no pair to capture there, so the stored side must not read
+/// the setup token into the throughput identity either, though the OAuth half
+/// reads it as that account's identity.
+#[test]
+fn a_spawn_on_a_setup_token_profile_without_a_pair_lands_one_sample() {
+    let _home = HomeSandbox::new();
+    crate::testutil::register_names(&["p"]);
+    let name = crate::profile::ProfileName::from("p");
+    let p = crate::profile::Profile::new("p".to_string(), None, None);
+    crate::profile::save_profile(&p).expect("save");
+    crate::claude::write_session_token(&name, "sk-ant-oat01-setup", crate::usage::now_ms() as i64)
+        .expect("mint");
+    assert!(
+        crate::usage::read_oauth_for_compare(&name)
+            .0
+            .setup_token
+            .is_some(),
+        "the OAuth half reads the setup token"
+    );
+
+    let captured = crate::usage::throughput_identity_for_spawn(&name, &p);
+    record_success(&name, Some("sonnet"), 1000, 2000, 100, captured);
+
+    assert_eq!(
+        summary(&name, 100).len(),
+        1,
+        "the setup-token delegate's record lands one sample"
+    );
+}
+
 /// R4 (throughput positive arm, production capture): a delegate spawned and
 /// recorded under the SAME anchored plain-OAuth profile records one sample —
 /// `throughput_identity_for_spawn` captures the anchor digest, which matches

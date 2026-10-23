@@ -520,6 +520,16 @@ fn tab_hints(app: &App) -> Vec<(&'static str, &'static str)> {
                             ("a", "actions"),
                             ("?", "help"),
                         ],
+                        // `+`/`-` only step a running probe, so they are only
+                        // offered while it runs; off, the row is a plain toggle.
+                        Some(ConfigRow::UsageProbe) if app.editing_usage_probe_on() => &[
+                            ("↑↓", "row"),
+                            ("↵", "toggle"),
+                            ("+", "less often"),
+                            ("-", "more often"),
+                            ("a", "actions"),
+                            ("?", "help"),
+                        ],
                         Some(ConfigRow::EnvEntry(_)) => &[
                             ("↑↓", "row"),
                             ("↵", "edit value"),

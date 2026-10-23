@@ -751,6 +751,7 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
         },
@@ -760,6 +761,7 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
         },
@@ -769,6 +771,7 @@ fn render_start_walk_matches_the_approved_layout() {
             age: OauthAge::Dated(10_800_000),
             stale: true,
             fresh: false,
+            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
         },
@@ -791,6 +794,7 @@ fn start_walk_age_uses_the_iso_date_at_thirty_days() {
         age: OauthAge::Dated(3_456_000_000), // 40 days
         stale: false,
         fresh: false,
+        probe_cut: false,
         demand: Vec::new(),
         now: 1_782_000_000,
     }];
@@ -817,6 +821,7 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
         },
@@ -826,6 +831,7 @@ fn start_lines_match_the_approved_copy() {
             age: OauthAge::Dated(240_000),
             stale: false,
             fresh: true,
+            probe_cut: false,
             demand: Vec::new(),
             now: 1_782_000_000,
         },
@@ -867,6 +873,7 @@ fn the_explain_age_cell_says_not_yet_where_the_fallback_pill_says_cannot() {
         age: OauthAge::Absent,
         stale: false,
         fresh: false,
+        probe_cut: false,
         demand: Vec::new(),
         now: 1_782_000_000,
     };
@@ -1072,4 +1079,32 @@ fn parse_position_renders_the_shared_fragment() {
         Some("line 2".to_string())
     );
     assert_eq!(super::parse_position(None), None);
+}
+
+/// One word per cause of a dead usage credential, shared by the Usage tab and
+/// `clauth list`: a refused setup token, a lapsed console session, a rejected
+/// api key, and an Alibaba account that never stored a session.
+#[test]
+fn a_dead_usage_credential_is_named_by_its_cause() {
+    let blank =
+        |name: &str| crate::testutil::blank_profile(&crate::profile::ProfileName::from(name));
+    assert_eq!(auth_expired_label(&blank("setup")), "token rejected");
+
+    let alibaba = "https://token-plan.ap-southeast-1.maas.aliyuncs.com/apps/anthropic";
+    let mut qwen = blank("qwen");
+    qwen.base_url = Some(alibaba.to_string());
+    qwen.provider = crate::providers::Provider::from_base_url(alibaba);
+    assert_eq!(auth_expired_label(&qwen), "login needed");
+    qwen.console = Some(crate::profile::ConsoleCredential {
+        token: "dead".to_string(),
+        site: crate::profile::ConsoleSite::International,
+        region: "ap-southeast-1".to_string(),
+    });
+    assert_eq!(auth_expired_label(&qwen), "login expired");
+
+    let mut ds = blank("ds");
+    ds.base_url = Some("https://api.deepseek.com/anthropic".to_string());
+    ds.provider = crate::providers::Provider::from_base_url("https://api.deepseek.com/anthropic");
+    ds.api_key = Some("sk-dead".to_string());
+    assert_eq!(auth_expired_label(&ds), DIAG_KEY_REJECTED);
 }

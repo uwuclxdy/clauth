@@ -736,6 +736,27 @@ pub(crate) const DIAG_CANCELED: &str = "canceled";
 pub(crate) const DIAG_AUTH_BROKEN: &str = "auth broken";
 pub(crate) const DIAG_KEY_REJECTED: &str = "key rejected";
 pub(crate) const DIAG_LOGGED_OUT: &str = "logged out";
+
+/// The word a dead usage credential (`FetchStatus::AuthExpired`) wears on the
+/// Usage tab and in `clauth list`, by its cause. An OAuth account with no pair
+/// stored only gets the verdict from the usage probe, so its setup token was
+/// refused. "expired" only when a session actually lapsed; an account that
+/// never stored one reaches this state too (a working api key does not
+/// authenticate the usage gateway), and telling that operator something expired
+/// sends them hunting for what to renew instead of to the login they have not
+/// run. A non-Alibaba profile has no session at all, so its verdict can only
+/// mean the api key itself was rejected.
+pub(crate) fn auth_expired_label(profile: &Profile) -> &'static str {
+    if crate::usage::oauth_without_pair(profile) {
+        "token rejected"
+    } else if profile.console.is_some() {
+        "login expired"
+    } else if profile.provider != Some(crate::providers::Provider::Alibaba) {
+        DIAG_KEY_REJECTED
+    } else {
+        "login needed"
+    }
+}
 pub(crate) const DIAG_BUDGET_SPENT: &str = "extra usage spent";
 pub(crate) const DIAG_CREDIT_CAP: &str = "credit cap spent";
 /// The legend names the whole state in one row, where the card's pill and its
@@ -859,6 +880,8 @@ fn start_age_cell(row: &StartCandidate) -> String {
             );
             if row.stale {
                 format!("{cell} (stale)")
+            } else if row.probe_cut {
+                format!("{cell} (probe, no credit figures)")
             } else {
                 cell
             }

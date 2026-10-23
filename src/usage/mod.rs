@@ -9,19 +9,14 @@ mod codex_headers;
 pub(crate) mod codex_reset;
 mod fetch;
 mod forget;
-// #110: usage read off an inference response's headers, one parse per
-// provider. Nothing calls it until the probe and its store write land, which
-// wait on the usage-store rework. `expect`, not `allow`: once nothing in the
-// module is dead any more, the expectation goes unfulfilled and `-D warnings`
-// fails the build until this attribute goes.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "#110: the usage probe reads it once the usage-store rework lands"
-    )
-)]
+// Usage read off an inference response's headers, one parse per provider, and
+// the probe that asks for it.
 mod inference;
+// The auto-start kick sends the probe's model, so the two cannot drift apart.
+pub(crate) use inference::anthropic::MODEL as ANTHROPIC_MODEL;
+// Test-only: the oauth tests hold the kick's request to the probe's byte for byte.
+#[cfg(test)]
+pub(crate) use inference::anthropic::probe_to as anthropic_probe_to;
 mod scheduler;
 // The partition/tick pair is unreachable in production (`mod scheduler` is
 // private and this re-export is `#[cfg(test)]`); tests in other modules drive
@@ -62,15 +57,17 @@ pub(crate) use scheduler::{
     SuppressedAuthExpiredStore, ThirdPartyBroken, ThirdPartyList, ThirdPartyStatusStore,
     ThirdPartyStreaks, ThirdPartyUsageStore, TokenList, UsageStore, WeeklyResetKicks, any_busy,
     any_fetch_leg_admits, any_fetch_leg_polls, bootstrap_fetch, bootstrap_third_party,
-    build_token_entries, clear_activity, collect_oauth_seed_names, collect_third_party_entries,
-    collect_third_party_seed_names, collect_token_seeds, collect_tokens,
-    current_key_rejected_names, decision_fresh_any, end_rotation, fill_chain_snapshot_stores,
-    is_idle, is_stuck_rate_limited, is_stuck_streak, kick_block_switch_grade, mark_activity,
-    mark_fetch_activity, polled_third_party_names, profile_credential_fingerprint,
-    queued_switch_away_is_stale, read_skipped_unreadable, reading_is_polled, rotation_into_fetch,
-    selected_activity, selected_next_refresh, spawn_refresher, switch_gate_in_flight,
+    build_token_entries, clear_activity, collect_oauth_seed_names, collect_probe_seeds,
+    collect_third_party_entries, collect_third_party_seed_names, collect_token_seeds,
+    collect_tokens, current_key_rejected_names, decision_fresh_any, end_rotation,
+    fill_chain_snapshot_stores, is_idle, is_stuck_rate_limited, is_stuck_streak,
+    kick_block_switch_grade, mark_activity, mark_fetch_activity, oauth_without_pair,
+    polled_third_party_names, probe_read_names, probes_switched_off,
+    profile_credential_fingerprint, queued_switch_away_is_stale, read_skipped_unreadable,
+    reading_is_polled, reseed_keeping_cadence, rotation_into_fetch, selected_activity,
+    selected_next_refresh, spawn_refresher, switch_gate_in_flight,
     switch_grade_kick_blocked_from_cache, switch_grade_kick_lifts, third_party_credentialed,
-    usage_cache_clock_of, usage_poll_pair,
+    usage_cache_clock_of, usage_interval_ms, usage_poll_pair, usage_probe_admits,
 };
 // The queue's history-pair classifier stays module-private — reached by
 // `usage::auto_start_queue`'s own tests through `super::` — while the gap arithmetic is
@@ -130,10 +127,11 @@ pub(crate) use fetch::take_profile_fetch;
 pub(crate) use forget::{
     ForgetPlan, Half, MemoryStores, OAuthIdentity, SnapshotMap, apply_pending_forgets,
     endpoint_identity_plan, epoch_guard, epoch_guard_if_current, epoch_value, forget_disk,
-    forget_disk_plan, forget_memory, new_snapshot, note_forget, note_forget_plan, note_rename,
-    oauth_changed, read_before_identities, read_codex_for_compare, read_codex_identity,
-    read_oauth_for_compare, read_third_party_for_compare, read_throughput_for_compare,
-    register_memory_stores, reload_and_forget, spawn_oauth_identity, third_party_identity,
+    forget_disk_plan, forget_memory, forget_probe_reading, new_snapshot, note_forget,
+    note_forget_plan, note_rename, oauth_changed, pairless_identity, read_before_identities,
+    read_codex_for_compare, read_codex_identity, read_oauth_for_compare,
+    read_third_party_for_compare, read_throughput_for_compare, register_memory_stores,
+    reload_and_forget, setup_token_plan, spawn_oauth_identity, third_party_identity,
     throughput_for_endpoint, throughput_identity, throughput_identity_for_spawn,
 };
 #[cfg(test)]

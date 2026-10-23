@@ -44,6 +44,8 @@ fn single_profile_config(name: &str, refresh_token: &str) -> AppConfig {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -166,6 +168,8 @@ fn rotate_one_no_stamp_when_no_refresh_token() {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -232,6 +236,8 @@ fn profile_without_refresh_token_excluded() {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -327,6 +333,8 @@ fn oauth_config(name: &str, refresh_token: Option<&str>, expires_at: Option<i64>
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -371,6 +379,8 @@ fn third_party_config(name: &str) -> AppConfig {
         base_url: Some("https://api.deepseek.com/anthropic".to_string()),
         api_key: Some("sk-fixture".to_string()),
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -2676,6 +2686,28 @@ fn kick_emits_cc_message_wire_shape() {
     assert_eq!(kick_header(&req, "x-stainless-os"), None);
     assert_eq!(kick_header(&req, "x-stainless-arch"), None);
     assert_eq!(kick_header(&req, "x-claude-code-session-id"), None);
+}
+
+/// The kick and the usage probe send one request, byte for byte: the same
+/// model, the same body, the same headers in the same order. The two are built
+/// apart, so a header added to one and not the other turns this red.
+#[test]
+fn the_kick_and_the_usage_probe_send_the_same_request() {
+    let (base, server) = crate::testutil::serve_endpoints_raw(2, |_, _| (200, "{}".into()));
+    let url = format!("{base}/v1/messages?beta=true");
+    crate::usage::reset_request_slots(); // don't sleep out the 5s host spacing
+    let _ = kick_to(&url, "TESTTOKEN");
+    crate::usage::reset_request_slots();
+    let _ = crate::usage::anthropic_probe_to(&url, "TESTTOKEN");
+    let raw = server.join().expect("listener");
+    assert_eq!(raw.len(), 2, "both sent");
+    assert_eq!(raw[0], raw[1]);
+    assert!(
+        crate::testutil::request_body(&raw[0])
+            .contains(&format!("\"model\":\"{}\"", crate::usage::ANTHROPIC_MODEL)),
+        "{}",
+        raw[0]
+    );
 }
 
 #[test]

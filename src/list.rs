@@ -136,19 +136,8 @@ impl Row {
             stale: entry.stale,
             usage_login: [
                 (entry.auth_status.as_str() == "broken").then_some("login expired"),
-                (entry.fetch_status.as_deref() == Some("AuthExpired")).then(|| {
-                    if profile.is_some_and(|p| p.console.is_some()) {
-                        "login expired"
-                    } else if profile
-                        .is_some_and(|p| p.provider != Some(crate::providers::Provider::Alibaba))
-                    {
-                        // No console session can be the cause here: the verdict can
-                        // only come from a 401 on the api key.
-                        "key rejected"
-                    } else {
-                        "login needed"
-                    }
-                }),
+                (entry.fetch_status.as_deref() == Some("AuthExpired"))
+                    .then(|| profile.map_or("login needed", crate::format::auth_expired_label)),
             ],
         }
     }

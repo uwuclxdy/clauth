@@ -964,7 +964,7 @@ fn setup_tab_key_grammar_rows_pin_exact_order_and_copy() {
                 concat!("edit inline; ", key_lit!("↵"), " again saves"),
             ),
             ("space", "cycle the model preset (model row)"),
-            ("+ / -", "step alert at by 5"),
+            ("+ / -", "step alert at by 5 · a running usage probe by 30s"),
             (
                 "env",
                 concat!("+ add env · ", key_lit!("↵"), " edits a value"),
@@ -1377,8 +1377,7 @@ fn add_chain_candidate_modal_draws_the_no_usage_detail_as_two_rows() {
             .unwrap_or_else(|| panic!("{needle:?} is on no row:\n{}", rows.join("\n")))
     };
     let hazard = row_of("once it's active, clauth won't switch away from it on its own.");
-    let fix =
-        row_of("log in the same account with clauth login blind so clauth can read its usage");
+    let fix = row_of("log in the same account with clauth login blind, or turn on its");
     assert_eq!(
         fix,
         hazard + 1,
@@ -1421,7 +1420,7 @@ fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
             .trim_end_matches('\u{2502}')
             .to_string()
     };
-    let block: Vec<String> = rows[first..first + 3].iter().map(|r| inner(r)).collect();
+    let block: Vec<String> = rows[first..first + 4].iter().map(|r| inner(r)).collect();
     // The indent INSIDE the modal is pinned by the whole inner rows: the border
     // and the centring padding are identical on every row, so a raw-row
     // measure would pass whatever the wrap did.
@@ -1429,7 +1428,8 @@ fn add_chain_candidate_modal_wraps_the_detail_without_indenting_the_rest() {
         block,
         vec![
             "  log in the same account with                ".to_string(),
-            "  clauth login blind so clauth can read its   ".to_string(),
+            "  clauth login blind, or turn on its          ".to_string(),
+            "  `usage_probe`, so clauth can read its       ".to_string(),
             "  usage.                                      ".to_string(),
         ],
         "every continuation starts in the first row's column:\n{}",

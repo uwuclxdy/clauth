@@ -3363,3 +3363,59 @@ fn build_status_publishes_the_credit_cap_without_amounts() {
         );
     }
 }
+
+/// A probed account's figures age at its probe interval, a polled one's at
+/// the poll interval: the same reading is fresh and still due on the first,
+/// cached and overdue on the second, and only the second goes stale first.
+#[test]
+fn build_status_ages_a_probed_account_at_its_probe_interval() {
+    let _home = HomeSandbox::new();
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
+    probed.usage_probe = true;
+    probed.usage_probe_interval_ms = 600_000;
+    let config = AppConfig {
+        state: AppState::default(),
+        profiles: vec![probed, oauth_profile("polled")],
+    };
+    crate::testutil::register_names(&["probed", "polled"]);
+    let write = |age_secs: u64| {
+        for name in ["probed", "polled"] {
+            crate::profile_cache::write_profile_cache(
+                &crate::profile::ProfileName::from(name),
+                crate::profile_cache::USAGE_CACHE_FILE,
+                &crate::usage::UsageInfo {
+                    five_hour: Some(crate::usage::UsageWindow {
+                        utilization: 31.0,
+                        resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+                    }),
+                    fetched_at: Some(crate::usage::now_ms() - age_secs * 1000),
+                    ..Default::default()
+                },
+            );
+        }
+    };
+    let entry = |v: &serde_json::Value, name: &str| -> serde_json::Value {
+        v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == name)
+            .unwrap()
+            .clone()
+    };
+
+    write(200);
+    let v = status_value(&config, 90_000, None, false);
+    let (probed, polled) = (entry(&v, "probed"), entry(&v, "polled"));
+    assert_eq!(probed["fetch_status"], "Fresh");
+    assert_eq!(polled["fetch_status"], "Cached");
+    assert!(!probed["next_refresh_at"].is_null(), "{probed}");
+    assert!(polled["next_refresh_at"].is_null(), "{polled}");
+
+    // Past the poll's threshold (2 × 5 min + 90 s), inside the probe's
+    // (2 × 10 min + 10 min).
+    write(1000);
+    let v = status_value(&config, 90_000, None, false);
+    assert_eq!(entry(&v, "probed")["stale"], false);
+    assert_eq!(entry(&v, "polled")["stale"], true);
+}

@@ -131,8 +131,8 @@ fn helpers_budget_lam_alef_per_grapheme() {
 
 // ── fetch-state cue ──────────────────────────────────────────────────────
 //
-// `fetch_cue_color`: amber = serving last-known numbers, red = failed, none =
-// live. The overview countdown carries this cue; brackets stay plain dim.
+// `fetch_cue_color`: amber = serving last-known numbers, red = failed or
+// refused, none = live. The overview countdown carries this cue; brackets stay plain dim.
 
 fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
     (
@@ -141,6 +141,8 @@ fn cue_profile(status: Option<FetchStatus>) -> (Profile, Option<FetchStatus>) {
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: std::collections::BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -184,6 +186,15 @@ fn cue_amber_on_cached_and_rate_limited() {
 fn cue_red_on_failed() {
     let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
     let (p, s) = cue_profile(Some(FetchStatus::Failed));
+    assert_eq!(fetch_cue_color(&p, s), Some(theme::danger_color()));
+}
+
+/// A refused setup token freezes the figures as a failed fetch does, so the
+/// row says so the same way.
+#[test]
+fn cue_red_on_a_refused_setup_token() {
+    let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Full);
+    let (p, s) = cue_profile(Some(FetchStatus::AuthExpired));
     assert_eq!(fetch_cue_color(&p, s), Some(theme::danger_color()));
 }
 

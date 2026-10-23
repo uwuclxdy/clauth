@@ -505,24 +505,24 @@ pub(crate) fn is_canceled_from_info(usage: Option<&UsageInfo>) -> bool {
 }
 
 /// True when clauth has no way to read `profile`'s usage while something is
-/// still serving sessions from it: the `claude setup-token` shape (#110), a
-/// long-lived session token with no OAuth pair beside it. `/usage` needs that
-/// pair's `user:profile` scope, so the scheduler never polls such a member, and
-/// the walk, finding no reading, counts it as having headroom (see
+/// still serving sessions from it: the `claude setup-token` shape, a
+/// long-lived session token with no OAuth pair beside it, with the usage probe
+/// off. `/usage` needs that pair's `user:profile` scope, so no leg polls such a
+/// member, and the walk, finding no reading, counts it as having headroom (see
 /// [`no_usage_hazard`] for what that does once it is active).
 ///
 /// The poll test is [`crate::usage::any_fetch_leg_admits`], the membership half
 /// of the ONE gate the Overview's cached-reading mark reads, with
 /// [`crate::usage::usage_poll_pair`] folded into it rather than asked here as a
-/// second opinion. The two poll work-lists do not read that gate: each carries
+/// second opinion. The poll work-lists do not read that gate: each carries
 /// its own filter, and the gate is the hoisted form of their membership rule,
 /// held to them by `any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes`.
 /// So what this marker shares with the poller is the rule, not the call.
 ///
 /// The gate and not `usage_poll_pair` alone, which answers for an OAuth pair
-/// only and would mark a member another leg polls beside its reading; when the #110
-/// inference probe joins that rule, this marker retires itself with no change
-/// here.
+/// only and would mark a member another leg polls beside its reading; the usage
+/// probe's switch is part of that rule too, so turning it on retires this marker
+/// with no change here.
 ///
 /// The membership half, and not the whole gate, because disabled-ness is a
 /// different question with a different answer: whether anything polls this
@@ -619,30 +619,42 @@ pub(crate) fn no_usage_hazard_lead(active: bool) -> &'static str {
     }
 }
 
-/// The one fix line for a member clauth cannot measure ([`no_usage_source`]):
-/// the login that gives `/usage` a pair to poll, while sessions keep running on
-/// the session token. Shared by the member card and the daemon boot line the
-/// way [`uncapped_spend_fix`] is, so the two cannot drift; `names` carries every
+/// The one fix line for a member clauth cannot measure ([`no_usage_source`]),
+/// naming both ways to a reading while sessions keep running on the session
+/// token: the login that gives `/usage` a pair to poll, or the usage probe,
+/// which reads the account off that token itself and may start its 5h window.
+/// Shared by the member card and the daemon boot line the way
+/// [`uncapped_spend_fix`] is, so the two cannot drift; `names` carries every
 /// member the line is about, which is why the daemon's line spells them out
 /// instead of leaving a placeholder beside a list that just named them.
 ///
 /// `clauth login <name>` and not `--setup-token`: the login has to be for the
 /// SAME account the token was minted from, and nothing on the profile ties the
 /// two together, so the line says which account rather than implying clauth
-/// could check. The command sits in backticks, the form shared copy uses
-/// ([`crate::tui::render::prose::mark_commands`] marks it where it renders).
+/// could check. The probe's key is spelled out because the daemon's reader has
+/// no setup tab to find the switch on. Commands and keys sit in backticks, the
+/// form shared copy uses: [`crate::tui::render::prose::mark_commands`] marks the
+/// commands where they render, and a key stays as written.
 pub(crate) fn no_usage_fix(names: &[&str]) -> String {
-    let logins = names
+    // The logins join with `and`, so the `or` before the probe is the one
+    // alternative the line offers.
+    let logins: Vec<String> = names
         .iter()
         .map(|n| format!("`clauth login {n}`"))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect();
+    let logins = match logins.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => logins.concat(),
+    };
     let (account, whose) = if names.len() == 1 {
         ("account", "its")
     } else {
         ("accounts", "their")
     };
-    format!("log in the same {account} with {logins} so clauth can read {whose} usage")
+    format!(
+        "log in the same {account} with {logins}, or turn on {whose} `usage_probe`, so \
+         clauth can read {whose} usage"
+    )
 }
 
 /// Recent burn rate (%/h) for `name`'s 5h window: durable per-profile history
@@ -1083,7 +1095,7 @@ pub(crate) fn health_blocked_reason(
     }
     // Keyed on the SHAPE, not on the reading: no fetch leg's rule admits this
     // member (the test is `any_fetch_leg_admits`, the membership half of the
-    // gate the Overview's cached-reading mark reads — the two work lists carry
+    // gate the Overview's cached-reading mark reads — the work lists carry
     // their own filters and are held to that gate by its test, not by a call),
     // so a reading it carries is never a current one. A log-out does not leave
     // one behind either: `usage::forget` drops the half's name-keyed store
@@ -1231,7 +1243,9 @@ pub(crate) struct ChainSnapshot {
     /// Members whose last store read was live (`FetchStatus::Fresh`) — the same
     /// freshness `decision_fresh` gates the ACTIVE on. Not config state:
     /// [`snapshot_chain`] leaves it empty and the scheduler's scan fills it from
-    /// the `StatusStore` (like `kick_rejected`). Drives the headroom walk's
+    /// the `StatusStore` (like `kick_rejected`). For a session with credit demand
+    /// the scheduler then drops every probe-read member but the one the session
+    /// is on. Drives the headroom walk's
     /// fresh-PREFERENCE first pass — a PREFERENCE, never a gate: when no fresh
     /// member has headroom the walk still accepts a stale-but-unexhausted one,
     /// so an exhausted active never loses its escape (2026-06-28 target
@@ -1876,17 +1890,20 @@ pub(crate) fn start_block(
 
 /// One chain member as the start walk judged it, with enough to render the
 /// `--explain` row: the verdict, the cache age (for the staleness cell), whether
-/// that age reads stale, and whether the reading is DATED and fresh (pass one's
-/// preference). `demand` is the member's own model-family demand — the one its
-/// per-model judgment ran under, printed when it is the pick; the refusal
-/// header names it only when every judged member carries the same demand
-/// ([`shared_demand`]).
+/// that age reads stale, and whether the reading is DATED and fresh, and for a
+/// credit-billed launch not the usage probe's (pass one's preference). `demand`
+/// is the member's own model-family demand — the one its per-model judgment ran
+/// under, printed when it is the pick; the refusal header names it only when
+/// every judged member carries the same demand ([`shared_demand`]).
 pub(crate) struct StartCandidate {
     pub(crate) name: ProfileName,
     pub(crate) block: Option<StartBlock>,
     pub(crate) age: crate::profile_json::OauthAge,
     pub(crate) stale: bool,
     pub(crate) fresh: bool,
+    /// The reading is the usage probe's and the launch is credit-billed, so
+    /// pass one took no freshness from it and the age cell says why.
+    pub(crate) probe_cut: bool,
     pub(crate) demand: Vec<String>,
     /// The walk's reference instant (epoch seconds), so a DATED age's ISO-date
     /// arm can be derived as `now - age` without a second clock read.
@@ -1924,6 +1941,7 @@ pub(crate) fn start_walk(
     // Claude Code's credit-billed model families, read once for the whole walk —
     // a per-row read would re-parse `.claude.json` for every member.
     let credit_billed = crate::claude_json::credit_billed_families();
+    let probe_read = crate::usage::probe_read_names(config);
     // The outgoing profile's env keys strip the base settings before the member
     // overlay re-adds its own — the same set, builder and base choice the
     // runtime write uses, so the demand's settings-derived models are exactly
@@ -1973,6 +1991,11 @@ pub(crate) fn start_walk(
             crate::start::process_model_env_of(&env_models),
         ));
         let families = (!demand.is_empty()).then_some(demand.as_slice());
+        // A probe reading knows nothing of the credit cap, so it carries no
+        // freshness for a launch with credit demand.
+        let probe_cut = probe_read.contains(name)
+            && families.is_some_and(|fams| fams.iter().any(|f| credit_billed.contains(f)));
+        let fresh = fresh && !probe_cut;
         let block = start_block(
             config,
             &member,
@@ -1994,6 +2017,7 @@ pub(crate) fn start_walk(
             age,
             stale,
             fresh,
+            probe_cut,
             demand,
             now,
         });

@@ -1868,6 +1868,149 @@ fn reload_if_changed_fires_on_external_mtime_change() {
     );
 }
 
+/// A probe switched off in another process while the daemon holds the lease:
+/// its reload leaves the account as a restart shows it and keeps the cadence
+/// stamp, so `status.json` no longer publishes the last probe's status as
+/// `Fresh` and the session walk no longer reads the reading as fresh. An
+/// account whose probe stays on keeps what its probe left.
+#[test]
+fn a_reload_that_finds_the_probe_switched_off_clears_what_it_left() {
+    let _home = HomeSandbox::new();
+    let names = [
+        crate::profile::ProfileName::from("off"),
+        crate::profile::ProfileName::from("on"),
+    ];
+    let profiles: Vec<Profile> = names
+        .iter()
+        .map(|name| {
+            let mut p = blank_profile(name);
+            p.usage_probe = true;
+            p
+        })
+        .collect();
+    let config = persist(profiles.clone(), Some("on"), 90_000);
+    let mut daemon = daemon_for(config);
+    for name in &names {
+        crate::profile_cache::write_profile_cache(
+            name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(now_ms()),
+                ..crate::usage::UsageInfo::default()
+            },
+        );
+        daemon
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .insert(FetchLeg::OAuth.key(name.clone()), 1);
+        daemon
+            .suppressed_auth_expired
+            .lock()
+            .unwrap()
+            .insert(name.to_string(), 7);
+    }
+    crate::usage::bootstrap_fetch(
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.last_fetched,
+        &[("off".to_string(), 90_000), ("on".to_string(), 90_000)],
+    );
+
+    let mut off = profiles[0].clone();
+    off.usage_probe = false;
+    save_profile(&off).expect("switch the probe off elsewhere");
+    let config_toml =
+        crate::profile::profile_subpath(&names[0], "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+
+    for (name, kept) in [(&names[0], false), (&names[1], true)] {
+        let key = FetchLeg::OAuth.key(name.clone());
+        let held = |present: bool, what: &str| assert_eq!(present, kept, "{name}: {what}");
+        held(
+            daemon
+                .usage_store
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "reading",
+        );
+        held(
+            daemon
+                .usage_status
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "status",
+        );
+        held(
+            daemon
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "countdown",
+        );
+        held(
+            daemon
+                .suppressed_auth_expired
+                .lock()
+                .unwrap()
+                .contains_key(name.as_str()),
+            "rest",
+        );
+        assert!(
+            daemon.last_fetched.lock().unwrap().contains_key(&key),
+            "{name}: the cadence stamp stays"
+        );
+    }
+}
+
+/// A setup token changed by hand in the same reload as the switch-off. clauth's
+/// own writers drop the disk cache with the old token, a hand edit leaves it,
+/// so the reload compare forgets the old token and seeds its last reading back
+/// from disk, and the switch-off still clears it, since it runs after the
+/// compare.
+#[test]
+fn a_switch_off_beside_a_token_changed_by_hand_leaves_no_re_seeded_reading() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("acct");
+    let mut profile = blank_profile(&name);
+    profile.usage_probe = true;
+    let config = persist(vec![profile.clone()], Some("acct"), 90_000);
+    crate::claude::write_session_token(&name, "oat-first", 0).expect("write the sidecar");
+    let mut daemon = daemon_for(config);
+    crate::profile_cache::write_profile_cache(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            fetched_at: Some(now_ms()),
+            ..crate::usage::UsageInfo::default()
+        },
+    );
+    crate::usage::bootstrap_fetch(
+        &daemon.usage_store,
+        &daemon.usage_status,
+        &daemon.last_fetched,
+        &[("acct".to_string(), 90_000)],
+    );
+
+    profile.usage_probe = false;
+    save_profile(&profile).expect("switch the probe off elsewhere");
+    let sidecar =
+        crate::profile::profile_subpath(&name, "session-token.json").expect("sidecar path");
+    let text = std::fs::read_to_string(&sidecar).expect("read the sidecar");
+    std::fs::write(&sidecar, text.replace("oat-first", "oat-second"))
+        .expect("change the token by hand");
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+
+    assert!(!daemon.usage_store.lock().unwrap().contains_key("acct"));
+    assert!(!daemon.usage_status.lock().unwrap().contains_key("acct"));
+}
+
 /// S2: a stale entry produced by a FAILED load (a broken sibling config.toml
 /// keeps the token list from rebuilding after a peer re-login) is NOT fetched
 /// while it stays stale — two ticks send zero `/usage` requests — and once the
@@ -2199,8 +2342,7 @@ fn a_daemon_reload_forgets_external_oauth_and_third_party_changes() {
         &daemon.usage_store,
         &daemon.usage_status,
         &daemon.last_fetched,
-        &["a".to_string(), "hybrid".to_string()],
-        90_000,
+        &[("a".to_string(), 90_000), ("hybrid".to_string(), 90_000)],
     );
     daemon
         .third_party_usage_store
@@ -2468,8 +2610,7 @@ fn a_daemon_reload_reseed_brings_back_no_old_reading() {
         &daemon.usage_store,
         &daemon.usage_status,
         &daemon.last_fetched,
-        &["a".to_string()],
-        90_000,
+        &[("a".to_string(), 90_000)],
     );
     assert!(daemon.usage_store.lock().unwrap().contains_key("a"));
 
@@ -3027,7 +3168,8 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
         [
             "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
              won't switch away from it on its own. log in the same accounts with `clauth \
-             login st-a`, `clauth login st-b` so clauth can read their usage"
+             login st-a` and `clauth login st-b`, or turn on their `usage_probe`, so clauth \
+             can read their usage"
         ],
     );
     // One member reads as one account, which is the wording the member card
@@ -3039,7 +3181,7 @@ fn warn_if_chain_has_no_usage_source_logs_one_line_naming_them() {
         [
             "clauth daemon: can't read the usage of st-a. once it's active, clauth won't \
              switch away from it on its own. log in the same account with `clauth login \
-             st-a` so clauth can read its usage"
+             st-a`, or turn on its `usage_probe`, so clauth can read its usage"
         ],
     );
     assert!(
@@ -3081,7 +3223,7 @@ fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
         [
             "clauth daemon: can't read the usage of st-a. it's active, and clauth won't \
              switch away from it on its own. log in the same account with `clauth login \
-             st-a` so clauth can read its usage"
+             st-a`, or turn on its `usage_probe`, so clauth can read its usage"
         ],
     );
     // The measurable member being active leaves the forecast wording, and so
@@ -3092,7 +3234,7 @@ fn warn_if_chain_has_no_usage_source_names_an_active_member_in_the_present() {
             [
                 "clauth daemon: can't read the usage of st-a. once it's active, clauth won't \
                  switch away from it on its own. log in the same account with `clauth login \
-                 st-a` so clauth can read its usage"
+                 st-a`, or turn on its `usage_probe`, so clauth can read its usage"
             ],
             "not yet active: {active:?}"
         );
@@ -3135,7 +3277,8 @@ fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
         [
             "clauth daemon: can't read the usage of st-a, st-b. 'st-b' is active now, and clauth \
              won't switch away from it on its own. log in the same accounts with `clauth login \
-             st-a`, `clauth login st-b` so clauth can read their usage"
+             st-a` and `clauth login st-b`, or turn on their `usage_probe`, so clauth can read \
+             their usage"
         ],
         "a list names WHICH member is active"
     );
@@ -3145,7 +3288,8 @@ fn warn_if_chain_has_no_usage_source_keeps_its_own_lead_for_a_list() {
             [
                 "clauth daemon: can't read the usage of st-a, st-b. once one is active, clauth \
                  won't switch away from it on its own. log in the same accounts with `clauth \
-                 login st-a`, `clauth login st-b` so clauth can read their usage"
+                 login st-a` and `clauth login st-b`, or turn on their `usage_probe`, so clauth \
+                 can read their usage"
             ],
             "a list that is not active keeps the list forecast: {active:?}"
         );
@@ -3868,6 +4012,97 @@ fn the_daemon_says_a_spent_credit_cap_once_per_edge() {
         lines.snapshot(),
         expected,
         "a deleted-and-re-created account says its standing cap once more"
+    );
+}
+
+/// A probe reading carries no credit figures, so it says nothing of the cap:
+/// once its OAuth pair is removed and the probe reads an account whose login
+/// read its cap spent, the first probe reading logs no clear. Logged in again,
+/// the account says its standing cap once more.
+#[test]
+fn a_probe_reading_after_a_log_out_logs_no_credit_cap_clear() {
+    use crate::profile_cache::USAGE_CACHE_FILE;
+    use crate::usage::{SpendInfo, UsageInfo, UsageWindow};
+
+    let _home = crate::testutil::HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("work");
+    let mut profile = profile_with_creds("work", "at-work");
+    profile.usage_probe = true;
+    let config = persist(vec![profile.clone()], Some("work"), 90_000);
+    crate::claude::write_session_token(&name, "oat-work", 0).expect("write the sidecar");
+    let mut elsewhere = config.clone();
+    let mut daemon = daemon_for(config);
+    let lines = crate::logline::LogLines::new();
+    let _capture = lines.capture_here();
+    let config_toml = crate::profile::profile_subpath(&name, "config.toml").expect("config path");
+    let reading = |capped: bool| UsageInfo {
+        five_hour: Some(UsageWindow {
+            utilization: 10.0,
+            resets_at: Some((chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()),
+        }),
+        spend: capped.then(|| SpendInfo {
+            enabled: true,
+            used: Some(50.0),
+            limit: Some(50.0),
+            percent: Some(100.0),
+            currency: Some("USD".to_owned()),
+        }),
+        fetched_at: Some(now_ms()),
+        ..UsageInfo::default()
+    };
+    let probe_reads = |daemon: &Daemon| {
+        daemon
+            .config
+            .lock()
+            .expect("config")
+            .find(&name)
+            .is_some_and(crate::usage::usage_probe_admits)
+    };
+    let spent_lines = || {
+        lines
+            .snapshot()
+            .iter()
+            .filter(|line| line.starts_with("work: credit cap spent"))
+            .count()
+    };
+
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &reading(true));
+    daemon.write_status();
+    assert_eq!(spent_lines(), 1, "the login's reading logs the cap");
+
+    crate::actions::clear_profile_credentials(&mut elsewhere, &name).expect("log out elsewhere");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(5));
+    daemon.reload_if_changed();
+    assert!(
+        probe_reads(&daemon),
+        "fixture control: the probe reads work now"
+    );
+    // As the probe lands it: windows, no credit block.
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &reading(false));
+    daemon.write_status();
+    assert!(
+        lines
+            .snapshot()
+            .iter()
+            .all(|line| !line.contains("credit cap clear")),
+        "{:?}",
+        lines.snapshot()
+    );
+
+    save_profile(&profile).expect("log in again elsewhere");
+    set_mtime(&config_toml, SystemTime::now() + Duration::from_secs(10));
+    daemon.reload_if_changed();
+    assert!(
+        !probe_reads(&daemon),
+        "fixture control: the login reads work again"
+    );
+    crate::profile_cache::write_profile_cache(&name, USAGE_CACHE_FILE, &reading(true));
+    daemon.write_status();
+    assert_eq!(
+        spent_lines(),
+        2,
+        "the login's reading says the standing cap once more: {:?}",
+        lines.snapshot()
     );
 }
 

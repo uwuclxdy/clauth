@@ -286,6 +286,8 @@ fn third_party_profile(five_pct: f64, seven_pct: f64) -> (Profile, ReadingsSnaps
             base_url: Some("https://api.example.com".into()),
             api_key: Some("k".into()),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -345,6 +347,8 @@ fn deepseek_profile(name: &str, totals: &[&str]) -> (Profile, ReadingsSnapshot) 
             base_url: Some("https://api.deepseek.com/anthropic".into()),
             api_key: Some("k".into()),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -417,6 +421,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: Some(threshold),
@@ -1021,6 +1027,8 @@ fn credentialed_profile(name: &str, subscription_type: &str) -> (Profile, Readin
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: None,
@@ -1649,6 +1657,65 @@ fn an_unpolled_row_drawing_a_reading_carries_an_amber_not_current_mark() {
         mark_fg_per_tier[0], mark_fg_per_tier[1],
         "control: the two tier pins resolve different colors, so both legs ran"
     );
+}
+
+/// A refused setup token rests, so from the tick after its landing no
+/// countdown is published for it: the row carries a red `⋯` instead, over
+/// figures that will not move. In its landing tick the countdown itself is
+/// red, a probed row with a live reading and no countdown stays blank, and so
+/// does a dead api key's row: the mark is the OAuth row's alone.
+#[test]
+fn a_refused_setup_token_carries_a_red_mark_once_its_countdown_is_gone() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _tier = crate::testutil::TierSandbox::new(theme::Tier::Full);
+    let probed = |name: &str, status: FetchStatus| {
+        let (mut p, mut r) = profile(name, 95.0, 10.0, 3600);
+        p.usage_probe = true;
+        r.fetch_status.insert(name.to_string(), status);
+        (p, r)
+    };
+    let dead_key = {
+        let (p, mut r) = third_party_profile(40.0, 20.0);
+        r.fetch_status
+            .insert(p.name.to_string(), FetchStatus::AuthExpired);
+        (p, r)
+    };
+    let (config, readings) = config_with(
+        vec![
+            probed("refused", FetchStatus::AuthExpired),
+            probed("landing", FetchStatus::AuthExpired),
+            probed("live", FetchStatus::Fresh),
+            dead_key,
+        ],
+        None,
+        vec![],
+    );
+    let app = App::new(config);
+    if let Ok(mut m) = app.next_refresh_per_profile.lock() {
+        m.insert(
+            FetchLeg::OAuth.key(ProfileName::from("landing")),
+            now_ms() + 42_000,
+        );
+    }
+    let widths = OverviewWidths::new(110, &app, &readings);
+    let row = |idx: usize| render_overview_row(&app, idx, &widths, false, true, &readings);
+
+    let refused = row(0);
+    let marks = mark_spans(&refused);
+    assert_eq!(marks.len(), 1, "{}", line_text(&refused));
+    assert_eq!(marks[0].style.fg, Some(theme::danger_color()));
+    assert!(!has_refresh_countdown(&refused), "{}", line_text(&refused));
+
+    let landing = row(1);
+    assert!(mark_spans(&landing).is_empty(), "{}", line_text(&landing));
+    assert!(has_refresh_countdown(&landing), "{}", line_text(&landing));
+
+    let live = row(2);
+    assert!(mark_spans(&live).is_empty(), "{}", line_text(&live));
+    assert_eq!(live.width(), refused.width(), "the mark keeps the slot");
+
+    let dead_key = row(3);
+    assert!(mark_spans(&dead_key).is_empty(), "{}", line_text(&dead_key));
 }
 
 /// The mark says the figures beside it are old; a row with nothing cached has

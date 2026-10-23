@@ -73,6 +73,7 @@ Every request clauth makes, and what rides along with it:
 | `api.anthropic.com/api/oauth/usage` | usage poll on the refresh interval | access token (Bearer) |
 | `api.anthropic.com/api/oauth/profile` | plan-tier detection, and reading which account a token belongs to (so a live re-login can be told apart) | access token |
 | `api.anthropic.com/v1/messages` | auto-start kick (opt-in, off by default) | access token; a 1-token Haiku request |
+| `api.anthropic.com/v1/messages` | usage probe on its own interval (opt-in, off by default), for an account that stores no OAuth pair | its `claude setup-token` token; the same 1-token Haiku request |
 | `status.claude.com/api/v2/incidents.json` | Status tab and background poll | no credentials |
 | `raw.githubusercontent.com/uwuclxdy/ai-pricelog/...` | model price table for the Tokens tab cost lens, fetched and disk-cached | no credentials |
 | `api.deepseek.com/user/balance` | only for profiles whose base URL is DeepSeek | that provider's API key |
@@ -111,6 +112,8 @@ Background, automatic:
 
 - **Auto-start kick.** A real, billed `/v1/messages` call (`max_tokens = 1`, a fraction of a cent) under your own OAuth token, with the Claude Code client identity, to arm the 5-hour usage window.
   - It's the same request Claude Code makes on startup. Off by default, OAuth profiles only; enable it per profile on the Setup tab or with `auto_start = true`.
+- **Usage probe.** The same `/v1/messages` call as the auto-start kick, under the `claude setup-token` token of an account that stores no OAuth pair, read for the usage its rate-limit headers report. It repeats every `usage_probe_interval_ms` (90 s by default, between 1 and 10 minutes), a manual refresh (`r`) in the clauth process that fetches usage sends one at once, and any probe may start that account's 5-hour window.
+  - Off by default, and only offered for an account `/usage` cannot read; enable it per profile on the Setup tab or with `usage_probe = true`. A token the server refuses is not probed again until a new one is minted, clauth restarts, or the probe is switched off and on. A refresh by hand retries it once too, but only in the clauth process that fetches usage.
 - **Auto-switch.** When the fallback chain is armed, clauth relinks the global credentials to another account on its own once the active one runs out of headroom, from the TUI or from `clauth daemon`.
   - It sends no inference itself. The chain is empty by default, and an account outside it is never switched to.
 - **Pay-as-you-go spend.** With extra usage enabled, an auto-switch can land on an account that bills real money. Three things must all be true first: the chain-wide `allow extra usage` toggle is on, that account carries a `max spend` ceiling above $0, and billing is enabled at Anthropic.
@@ -144,7 +147,7 @@ Network-invoked, only while `clauth daemon --listen` is running:
 - **`POST /api/v1/panes/<id>/prompt` and `POST /api/v1/panes/<id>/keys`.** Hand a control device's prompt text or key presses to the agent running in a herdr pane, through `herdr agent prompt` and `herdr pane send-keys`; whatever that agent then does (inference on the account the pane runs, tool calls on this host) is the agent's own, under its own permission prompts. The daemon logs the pane and the text's length or the key count, never the text or the key names, and no log line or response carries them.
 - **`POST /api/v1/sessions/<id>/prompt`, `POST /api/v1/sessions/<id>/interrupt` and `POST /api/v1/sessions/<id>/asks/<ask>`.** Hand a control device's prompt or interrupt to the session's mod when a mod instance holds the id, else the herdr pane joined on it, and answer a mod-held ask; whatever that agent then does (inference on the account the session runs, tool calls on this host) is the agent's own — an `allow` answer is a control device approving that tool call in the agent's place. The daemon logs the session, the `via`, and the text's length, the ask id with its decision, or the answers' key count; never the text or the answers' content.
 
-Nothing else sends inference or writes to your account.
+Nothing else sends inference or writes to your account. The only inference clauth sends of its own is the auto-start kick and the usage probe above; `clauth proxy check` sends one real inference request through the proxy it checks (two with `--destructive`), and only when you run it.
 
 ## Auto-update verification
 
@@ -203,6 +206,6 @@ On the first TUI launch clauth offers to install shell completions. For bash and
 | `CLAUTH_NO_API=1` | stops `clauth daemon --listen` from opening its socket and sending Web Push, whatever the flags say |
 | an empty `fallback_chain` (the default) | clauth never switches accounts on its own |
 | `allow extra usage` off (the default) | no auto-switch can reach an account that bills money |
-| `auto_start = false` (the default) | clauth sends no inference of its own |
+| `auto_start = false` and `usage_probe = false` (the defaults) | clauth sends no inference of its own |
 | `install.sh --nocargo` | forces a verified binary download instead of `cargo install` |
 | `cargo install` | never self-replaces; update with `cargo install clauth` |

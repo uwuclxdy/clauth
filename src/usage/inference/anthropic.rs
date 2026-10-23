@@ -32,11 +32,25 @@
 //! the probe that asks for that lane. The `-overage-period-*` sub-pools are
 //! another matter: they carry a `-utilization` each, so they arrive as windows
 //! of their own, and keeping them out of the store's limits is the mapping's
-//! job. A status without any window is no reading either: the kick's 429
-//! handling (`kick_rate_limit_at`) owns that verdict, together with
-//! `retry-after`.
+//! job. A status without any window is no reading either: for the kick its
+//! 429 handling (`kick_rate_limit_at`) owns that verdict, together with
+//! `retry-after`, and the probe reads such a 429 as a throttle.
+//!
+//! The probe asks for the reading: the kick's 1-token message on [`MODEL`],
+//! sent with the kick's header set and read for its headers, never its body.
+
+use std::time::Duration;
 
 use super::{InferenceReading, InferenceWindow, LimitStatus};
+use crate::usage::{
+    ANTHROPIC_ORIGIN, UsageInfo, UsageWindow, await_request_slot, epoch_secs_to_iso,
+    now_epoch_secs, parse_retry_after_at,
+};
+
+/// The model of every messages request clauth sends on its own behalf, the
+/// probe and the auto-start kick alike, so the two cannot drift apart. The
+/// cheapest one: a probe only wants the response's headers.
+pub(crate) const MODEL: &str = "claude-haiku-5-5";
 
 const PREFIX: &str = "anthropic-ratelimit-unified-";
 const UTILIZATION: &str = "-utilization";
@@ -112,6 +126,122 @@ fn status(value: &str) -> Option<LimitStatus> {
     .into_iter()
     .find(|(word, _)| value.eq_ignore_ascii_case(word))
     .map(|(_, status)| status)
+}
+
+/// What one probe came back with.
+#[derive(Debug, Clone)]
+pub(crate) enum ProbeAnswer {
+    /// The response carried a reading. A 429 can: the limiter rejects a spent
+    /// window with the same header set a 2xx carries. Boxed: `UsageInfo`
+    /// dwarfs every other variant here (clippy::large_enum_variant).
+    Reading(Box<UsageInfo>),
+    /// A 429 without a reading: the endpoint throttled the request and said
+    /// nothing about the account. `retry_after` as the server sent it.
+    RateLimited { retry_after: Option<Duration> },
+    /// 401 or 403: the server refused the token, which only a new token
+    /// changes.
+    Rejected,
+    /// Anything else: another status, a 2xx without the headers, or no
+    /// response at all.
+    Failed,
+}
+
+/// Probe the account `access_token` belongs to. Takes its turn on the
+/// `api.anthropic.com` request-spacing slot `/usage` and the kick share.
+pub(crate) fn probe(access_token: &str) -> ProbeAnswer {
+    probe_to(crate::oauth::messages_endpoint().as_ref(), access_token)
+}
+
+/// [`probe`] against `url`, so a loopback listener can pin what it sends.
+pub(crate) fn probe_to(url: &str, access_token: &str) -> ProbeAnswer {
+    await_request_slot(ANTHROPIC_ORIGIN);
+    let Ok(body) = serde_json::to_string(&serde_json::json!({
+        "model": MODEL,
+        "max_tokens": 1,
+        "system": [{ "type": "text", "text": crate::oauth::KICK_SYSTEM_PROMPT }],
+        "messages": [{ "role": "user", "content": "x" }],
+    })) else {
+        return ProbeAnswer::Failed;
+    };
+    let sent = crate::oauth::http_agent()
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Authorization", &format!("Bearer {access_token}"))
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", crate::oauth::KICK_ANTHROPIC_BETA)
+        .header("anthropic-dangerous-direct-browser-access", "true")
+        .header("User-Agent", crate::usage::cli_user_agent())
+        .header("x-app", "cli")
+        .header("x-stainless-lang", "js")
+        .header("x-stainless-runtime", "node")
+        .header(
+            "x-stainless-package-version",
+            crate::oauth::KICK_STAINLESS_PACKAGE_VERSION,
+        )
+        .send(&body);
+    let Ok(response) = sent else {
+        return ProbeAnswer::Failed;
+    };
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| Some((name.as_str(), value.to_str().ok()?)));
+    answer_from(response.status().as_u16(), headers, now_epoch_secs())
+}
+
+/// The answer one response gives, off its status and whole header set. Pure,
+/// so every arm is testable without HTTP; `now_secs` anchors a date-form
+/// `retry-after`.
+fn answer_from<'h>(
+    status: u16,
+    headers: impl IntoIterator<Item = (&'h str, &'h str)>,
+    now_secs: i64,
+) -> ProbeAnswer {
+    match status {
+        401 | 403 => return ProbeAnswer::Rejected,
+        200..=299 | 429 => {}
+        _ => return ProbeAnswer::Failed,
+    }
+    let headers: Vec<(&str, &str)> = headers.into_iter().collect();
+    // Only `5h` and `7d` map into the store, so windows without either would
+    // land as an empty reading over the last good one.
+    if let Some(info) = reading_from_headers(headers.iter().copied())
+        .map(|reading| usage_from_reading(&reading))
+        .filter(|info| info.five_hour.is_some() || info.seven_day.is_some())
+    {
+        return ProbeAnswer::Reading(Box::new(info));
+    }
+    if status != 429 {
+        return ProbeAnswer::Failed;
+    }
+    let retry_after = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, value)| parse_retry_after_at(value, now_secs));
+    ProbeAnswer::RateLimited { retry_after }
+}
+
+/// The store's reading: `5h` and `7d` become the two windows every surface and
+/// the walk read, each reset in the ISO form `/usage` sends. The other windows
+/// stay out until a probe has shown which store window each one is, so the
+/// walk never judges on a pool it cannot name.
+fn usage_from_reading(reading: &InferenceReading) -> UsageInfo {
+    let window = |name: &str| {
+        reading
+            .windows
+            .iter()
+            .find(|w| w.name == name)
+            .map(|w| UsageWindow {
+                utilization: w.utilization,
+                resets_at: w.resets_at.map(epoch_secs_to_iso),
+            })
+    };
+    UsageInfo {
+        five_hour: window("5h"),
+        seven_day: window("7d"),
+        ..UsageInfo::default()
+    }
 }
 
 #[cfg(test)]

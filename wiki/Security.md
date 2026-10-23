@@ -84,6 +84,6 @@ If Claude Code logged into a different account while clauth was closed, the next
 
 ## Switching things off
 
-The off-switches are SECURITY.md's table: auto-update off (the Config tab row), `CLAUTH_NO_UPDATE=1`, `CLAUTH_NO_COMPLETIONS=1`, `CLAUTH_NO_API=1`, an empty `fallback_chain`, `allow extra usage` off, and `auto_start = false` are all default-safe and named there with their effects.
+The off-switches are SECURITY.md's table: auto-update off (the Config tab row), `CLAUTH_NO_UPDATE=1`, `CLAUTH_NO_COMPLETIONS=1`, `CLAUTH_NO_API=1`, an empty `fallback_chain`, `allow extra usage` off, `auto_start = false` and `usage_probe = false` are all default-safe and named there with their effects.
 
 Found something exploitable? Report it privately through the repo's **Security → Report a vulnerability**.

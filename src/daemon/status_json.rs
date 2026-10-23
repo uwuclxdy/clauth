@@ -371,6 +371,8 @@ pub(crate) fn build_profile_entries(
         .filter(|p| include_disabled || !p.is_disabled() || config.is_active(&p.name))
         .map(|p| {
             let name = &p.name;
+            // Every age below is judged at the cadence this account is read at.
+            let interval_ms = crate::usage::usage_interval_ms(p, interval_ms);
             // Freshness reads each profile's OWN cache, through the one
             // selector every reader shares (`usage_cache_file` carries why).
             let mtime_ms = profile_cache_mtime_ms(name, usage_cache_file(p));

@@ -29,6 +29,8 @@ fn oauth(name: &str) -> Profile {
         base_url: None,
         api_key: None,
         auto_start: true,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: Some(80.0),

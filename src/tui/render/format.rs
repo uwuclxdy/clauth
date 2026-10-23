@@ -113,15 +113,15 @@ mod tests;
 
 /// Fetch-state cue for a profile's bracketed bars: amber while the row serves
 /// last-known numbers (cached / rate-limited both do — matches the amber
-/// `rate limited` badge on the usage detail line), red when the fetch failed,
-/// `None` when live.
+/// `rate limited` badge on the usage detail line), red when the fetch failed or
+/// the setup token was refused, `None` when live.
 pub(super) fn fetch_cue_color(profile: &Profile, status: Option<FetchStatus>) -> Option<Color> {
     if !profile.is_oauth() {
         return None;
     }
     match status {
         Some(FetchStatus::Cached | FetchStatus::RateLimited) => Some(theme::warning_color()),
-        Some(FetchStatus::Failed) => Some(theme::danger_color()),
+        Some(FetchStatus::Failed | FetchStatus::AuthExpired) => Some(theme::danger_color()),
         _ => None,
     }
 }

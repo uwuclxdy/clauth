@@ -227,6 +227,8 @@ struct Snap {
     /// Sorted `(key, value)` custom env entries — one `EnvEntry` row each.
     env: Vec<(String, String)>,
     auto_start: bool,
+    usage_probe: bool,
+    usage_probe_interval_ms: u64,
     /// `Profile::bell_threshold` as the `alert at` buffer spells it; empty = off.
     bell_threshold: String,
     /// `Profile::is_disabled` — drives the `disabled` row's toggle value.
@@ -354,6 +356,8 @@ impl Snap {
             subagent: String::new(),
             env: Vec::new(),
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             bell_threshold: String::new(),
             disabled: false,
             is_active: false,
@@ -459,6 +463,8 @@ fn build_snap(app: &App, readings: &ReadingsSnapshot, with_text: bool) -> Snap {
                 // they're always populated — even while a draft owns the text fields.
                 env: p.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
                 auto_start: p.auto_start,
+                usage_probe: p.usage_probe,
+                usage_probe_interval_ms: p.usage_probe_interval_ms,
                 bell_threshold: p
                     .bell_threshold
                     .map(crate::tui::app::format_weekly_pct)
@@ -1204,6 +1210,7 @@ fn snap_value(snap: &Snap, row: ConfigRow) -> &str {
         ConfigRow::BellThreshold => &snap.bell_threshold,
         ConfigRow::EnvEntry(i) => snap.env.get(i).map(|(_, v)| v.as_str()).unwrap_or(""),
         ConfigRow::AutoStart
+        | ConfigRow::UsageProbe
         | ConfigRow::Type
         | ConfigRow::Family
         | ConfigRow::ModelOverrideAdd
@@ -1252,6 +1259,11 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
             "sends a 1-token request to Haiku at every 5h usage reset"
         }
         ConfigRow::AutoStart => "5h usage window stays closed after reset",
+        // Both states name the cost, since turning it on is what pays it.
+        ConfigRow::UsageProbe if snap.usage_probe => {
+            "a 1-token probe to Haiku reads usage, may start the 5h window"
+        }
+        ConfigRow::UsageProbe => "on, a 1-token probe reads usage and may start the 5h window",
         ConfigRow::BellThreshold if snap.bell_threshold.is_empty() => concat!(
             "no alert when 5h usage climbs; ",
             key_lit!("↵"),
@@ -1567,6 +1579,17 @@ fn detail_row(
                 (theme::toggle_off().to_string(), theme::faint())
             };
             kv_static(arrow, "auto-start", value, style, selected)
+        }
+        ConfigRow::UsageProbe => {
+            let (value, style) = if snap.usage_probe {
+                (
+                    format!("every {}s", snap.usage_probe_interval_ms / 1000),
+                    theme::accent(),
+                )
+            } else {
+                ("off".to_string(), theme::faint())
+            };
+            kv_static(arrow, "usage probe", value, style, selected)
         }
         ConfigRow::Delete => {
             let label = if armed_action == Some(ConfigRow::Delete) {

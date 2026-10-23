@@ -32,6 +32,8 @@ fn profile(name: &str, threshold: f64, util: f64, reset_secs: i64) -> (Profile, 
             base_url: None,
             api_key: None,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: Default::default(),
             fallback_threshold: Some(threshold),
@@ -1093,7 +1095,7 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
             &cfg,
             &crate::profile::ProfileName::from("blind"),
             MemberCard {
-                width: 160,
+                width: 200,
                 session_token,
                 ..Default::default()
             },
@@ -1111,7 +1113,8 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     assert_eq!(
         line_text(&lines[1]),
         "└ once it's active, clauth won't switch away from it on its own: log in the same \
-         account with clauth login blind so clauth can read its usage",
+         account with clauth login blind, or turn on its `usage_probe`, so clauth can read \
+         its usage",
         "the hazard in the future tense while another member is active"
     );
     // The gauge row keeps upstream's own word: with the pill saying what clauth
@@ -1131,7 +1134,8 @@ fn a_member_clauth_cannot_measure_opens_its_card_on_the_no_usage_pill() {
     assert_eq!(
         line_text(&card(true, "blind")[1]),
         "└ it's active, and clauth won't switch away from it on its own: log in the same \
-         account with clauth login blind so clauth can read its usage",
+         account with clauth login blind, or turn on its `usage_probe`, so clauth can read \
+         its usage",
         "the hazard in the present tense once the chain has landed here"
     );
 

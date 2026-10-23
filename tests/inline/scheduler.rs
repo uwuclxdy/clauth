@@ -145,17 +145,17 @@ fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
         ],
     };
 
-    let seed = collect_oauth_seed_names(&config);
+    let seed = collect_oauth_seed_names(&config, REFRESH_INTERVAL_MS);
     assert!(
-        seed.contains(&"off".to_string()),
+        seed.contains(&("off".to_string(), REFRESH_INTERVAL_MS)),
         "the display seed must include a disabled OAuth profile: {seed:?}"
     );
     assert!(
-        seed.contains(&"on".to_string()),
+        seed.contains(&("on".to_string(), REFRESH_INTERVAL_MS)),
         "and its enabled sibling: {seed:?}"
     );
     assert!(
-        !seed.contains(&"credless".to_string()),
+        !seed.iter().any(|(name, _)| name == "credless"),
         "a credential-less profile has no oauth cache to seed: {seed:?}"
     );
 
@@ -177,7 +177,7 @@ fn collect_oauth_seed_names_includes_disabled_and_bootstrap_seeds_its_cache() {
     let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    super::bootstrap_fetch(&store, &status, &last_fetched, &seed, REFRESH_INTERVAL_MS);
+    super::bootstrap_fetch(&store, &status, &last_fetched, &seed);
 
     let seeded = store.lock().unwrap().get("off").cloned();
     assert_eq!(
@@ -324,6 +324,27 @@ fn any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes() {
             None,
             Some("sk-plain".to_string()),
         ),
+        // The usage probe's axis: the switch on a setup-token-only account,
+        // beside a pair (where `/usage` reads it), and on an endpoint profile.
+        {
+            let mut p = Profile::new("probe-no-pair".to_string(), None, None);
+            p.usage_probe = true;
+            p
+        },
+        {
+            let mut p = oauth_profile_disabled("probe-beside-pair", false);
+            p.usage_probe = true;
+            p
+        },
+        {
+            let mut p = Profile::new(
+                "probe-generic-keyless".to_string(),
+                Some(generic.to_string()),
+                None,
+            );
+            p.usage_probe = true;
+            p
+        },
     ];
 
     // A disabled copy of every shape: no work list admits a disabled profile.
@@ -350,10 +371,20 @@ fn any_fetch_leg_polls_matches_the_work_lists_across_profile_shapes() {
         .into_iter()
         .map(|e| e.name.to_string())
         .collect();
+    let probe_members: HashSet<String> = super::collect_probe_seeds(&cfg)
+        .into_iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    assert_eq!(
+        probe_members,
+        HashSet::from(["probe-no-pair".to_string()]),
+        "the probe leg takes the switch on a setup-token-only account alone"
+    );
 
     for p in &all {
-        let on_a_work_list =
-            oauth_members.contains(p.name.as_str()) || tp_members.contains(p.name.as_str());
+        let on_a_work_list = oauth_members.contains(p.name.as_str())
+            || tp_members.contains(p.name.as_str())
+            || probe_members.contains(p.name.as_str());
         assert_eq!(
             any_fetch_leg_polls(p),
             on_a_work_list,
@@ -1357,8 +1388,7 @@ fn bootstrap_legs_keep_separate_stamps_for_a_hybrid_profile() {
         &store,
         &status,
         &last_fetched,
-        &["hybrid".to_string()],
-        REFRESH_INTERVAL_MS,
+        &[("hybrid".to_string(), REFRESH_INTERVAL_MS)],
     );
     super::bootstrap_third_party(
         &tp_store,
@@ -4604,6 +4634,173 @@ fn a_fable_session_skips_a_capped_target_for_the_next_member() {
     );
 
     assert_eq!(decision_of("4242-0"), (Some("c".to_string()), Some(2)));
+}
+
+// ── a probed member under a credit demand ────────────────────────────────────
+//
+// A probe reading carries the 5h and 7d windows and nothing of the credit cap,
+// so for a session with credit demand it carries no freshness: no home pass
+// pulls the session onto a probed member, while the windows it read still
+// count.
+
+/// `session_config_models` over `names` with every member on `launch`, the
+/// `probed` ones the accounts the usage probe reads (a setup token in place of
+/// the fixture's pair) and `home` as the preferred member.
+fn probed_session_config(
+    names: &[&str],
+    launch: &str,
+    probed: &[&str],
+    home: Option<&str>,
+) -> crate::profile::ConfigHandle {
+    let config = session_config_models(names, &[(names[0], launch)], &[]);
+    for p in config.lock().unwrap().profiles.iter_mut() {
+        if probed.contains(&p.name.as_str()) {
+            crate::testutil::make_probed_account(p);
+        }
+        p.preferred = home == Some(p.name.as_str());
+    }
+    config
+}
+
+/// A live row on `member` after a first swap, launched on `families`.
+fn row_on(member: &str, families: &str) -> crate::live_sessions::LiveSession {
+    let mut row = session_row("4242-0", "a");
+    row.current_member = Some(member.to_string());
+    row.launch_families = Some(vec![families.to_string()]);
+    row
+}
+
+/// The swing back of the pendulum: a fable session on `b`, its home `a`
+/// probed, fresh and clear. Nothing on the probe's reading says `a`'s cap is
+/// unspent, so the home pass leaves the session where it is.
+#[test]
+fn a_credit_billed_session_is_not_pulled_home_onto_a_probed_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&row_on("b", "fable"));
+    scan_sessions(
+        &probed_session_config(&["a", "b"], "fable", &["a"], Some("a")),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// Without credit demand the probe reading counts as any reading does, so the
+/// same home pass brings an opus session back to `a`.
+#[test]
+fn a_session_without_credit_demand_comes_home_to_a_probed_member() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&row_on("b", "opus"));
+    scan_sessions(
+        &probed_session_config(&["a", "b"], "opus", &["a"], Some("a")),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// A probed member stays a target the walk can reach for a credit-billed
+/// session, as an unmeasured one does: with no fresh member clear, the
+/// any-clear pass lands on it.
+#[test]
+fn a_credit_billed_session_leaving_a_spent_member_can_land_on_a_probed_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&row_on("b", "fable"));
+    scan_sessions(
+        &probed_session_config(&["a", "b"], "fable", &["a"], None),
+        &session_store(&[("a", 10.0), ("b", 100.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// The windows a probe read still count: a probed member whose 5h window the
+/// probe read spent is no target, where an unmeasured one would read clear.
+#[test]
+fn a_credit_billed_session_does_not_land_on_a_member_its_probe_read_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&row_on("b", "fable"));
+    scan_sessions(
+        &probed_session_config(&["a", "b"], "fable", &["a"], None),
+        &session_store(&[("a", 100.0), ("b", 100.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (None, None));
+}
+
+/// A credit-billed session on a probed member its probe read spent leaves it:
+/// the leave reads the member's windows and its `Fresh` status, never its
+/// place in the walk's fresh list.
+#[test]
+fn a_credit_billed_session_leaves_a_probed_member_its_probe_read_spent() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&row_on("a", "fable"));
+    scan_sessions(
+        &probed_session_config(&["a", "b"], "fable", &["a"], None),
+        &session_store(&[("a", 100.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("b".to_string()), Some(1)));
+}
+
+/// A probed member keeps its freshness while it is the active one: its windows
+/// are what the home pass needs fresh, and the probe reads them. So a
+/// credit-billed session on a probed member comes home to a measured, clear
+/// preferred member.
+#[test]
+fn a_credit_billed_session_on_a_probed_member_comes_home_to_a_measured_one() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let _marker = register_live_row(&row_on("b", "fable"));
+    scan_sessions(
+        &probed_session_config(&["a", "b"], "fable", &["b"], Some("a")),
+        &session_store(&[("a", 10.0), ("b", 10.0)]),
+        &all_fresh(&["a", "b"]),
+    );
+    assert_eq!(decision_of("4242-0"), (Some("a".to_string()), Some(0)));
+}
+
+/// A credit-cap leave reaches a probed member whose `[models]` differ the way
+/// it reaches an unmeasured one: a fresh member further down the chain comes
+/// first, and only once none is clear does the leave land on it.
+#[test]
+fn a_credit_leave_reaches_a_probed_member_whose_models_differ_as_an_unmeasured_one() {
+    for (c_util, target, cursor) in [(10.0, "c", 2), (100.0, "b", 1)] {
+        for b_probed in [true, false] {
+            let _home = crate::testutil::HomeSandbox::new();
+            let mut row = session_row("4242-0", "a");
+            row.launch_families = Some(vec!["fable".to_string()]);
+            row.credit_leave_aware = true;
+            let _marker = register_live_row(&row);
+            let config =
+                session_config_models(&["a", "b", "c"], &[("a", "fable"), ("b", "opus")], &[]);
+            for p in config.lock().unwrap().profiles.iter_mut() {
+                if b_probed && p.name.as_str() == "b" {
+                    crate::testutil::make_probed_account(p);
+                }
+            }
+            let store = credit_store(&["a", "b", "c"], &["a"]);
+            {
+                let mut map = store.lock().unwrap();
+                if let Some(window) = map.get_mut("c").and_then(|c| c.five_hour.as_mut()) {
+                    window.utilization = c_util;
+                }
+                if !b_probed {
+                    map.remove("b");
+                }
+            }
+            let read: &[&str] = if b_probed {
+                &["a", "b", "c"]
+            } else {
+                &["a", "c"]
+            };
+            scan_sessions(&config, &store, &all_fresh(read));
+            assert_eq!(
+                decision_of("4242-0"),
+                (Some(target.to_string()), Some(cursor)),
+                "b probed: {b_probed}, c at {c_util}%"
+            );
+        }
+    }
 }
 
 #[test]
@@ -9292,7 +9489,10 @@ fn standdown_hydrate_seeds_the_store_from_the_daemon_cache() {
         &tp_store,
         &tp_status,
         &last_fetched,
-        &["kitty".to_string(), "cacheless".to_string()],
+        &[
+            ("kitty".to_string(), REFRESH_INTERVAL_MS),
+            ("cacheless".to_string(), REFRESH_INTERVAL_MS),
+        ],
         &[],
         &[],
         REFRESH_INTERVAL_MS,
@@ -9405,7 +9605,7 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
     let tp_store: super::ThirdPartyUsageStore = Arc::new(RankedMutex::new(HashMap::new()));
     let tp_status: super::ThirdPartyStatusStore = Arc::new(RankedMutex::new(HashMap::new()));
     let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
-    let hydrate = |seed_names: &[String]| {
+    let hydrate = |seed_names: &[(String, u64)]| {
         super::hydrate_from_daemon_caches(
             &store,
             &status,
@@ -9425,13 +9625,13 @@ fn standdown_hydrate_follows_the_daemon_cache_forward() {
         USAGE_CACHE_FILE,
         &at(10.0),
     );
-    hydrate(&["kitty".to_string()]);
+    hydrate(&[("kitty".to_string(), REFRESH_INTERVAL_MS)]);
     write_profile_cache(
         &crate::profile::ProfileName::from("kitty"),
         USAGE_CACHE_FILE,
         &at(55.0),
     );
-    hydrate(&["kitty".to_string()]);
+    hydrate(&[("kitty".to_string(), REFRESH_INTERVAL_MS)]);
 
     let seeded = store.lock().unwrap().get("kitty").cloned();
     assert_eq!(
@@ -9487,7 +9687,7 @@ fn standdown_hydrate_leaves_an_unparseable_cache_and_names_off_the_seed_list() {
         &tp_store,
         &tp_status,
         &last_fetched,
-        &["kitty".to_string()],
+        &[("kitty".to_string(), REFRESH_INTERVAL_MS)],
         &[],
         &[],
         REFRESH_INTERVAL_MS,
@@ -18037,8 +18237,7 @@ fn a_startup_seed_racing_a_change_writes_nothing() {
         &store,
         &status,
         &last_fetched,
-        &["acct".to_string()],
-        REFRESH_INTERVAL_MS,
+        &[("acct".to_string(), REFRESH_INTERVAL_MS)],
     );
 
     assert!(
@@ -20851,4 +21050,757 @@ fn a_dead_pid_record_with_its_real_start_does_not_make_the_429_ambiguous() {
         (Some("b".to_string()), Some(1)),
         "a dead pid's record carrying its real start must not suppress the session's own 429"
     );
+}
+
+// ── the usage probe leg ──────────────────────────────────────────────────────
+
+const SETUP_TOKEN: &str = "sk-ant-oat01-probe-fixture";
+
+/// A probe response's unified headers: 5h at 31%, 7d at 20%, both an hour and
+/// more out.
+fn probe_headers() -> Vec<(String, String)> {
+    let now = crate::usage::now_epoch_secs();
+    [
+        (
+            "anthropic-ratelimit-unified-5h-utilization",
+            "0.31".to_string(),
+        ),
+        (
+            "anthropic-ratelimit-unified-5h-reset",
+            (now + 3600).to_string(),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-utilization",
+            "0.2".to_string(),
+        ),
+        (
+            "anthropic-ratelimit-unified-7d-reset",
+            (now + 86_400).to_string(),
+        ),
+        ("anthropic-ratelimit-unified-status", "allowed".to_string()),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect()
+}
+
+/// A scheduler state over one setup-token account `name` with the usage probe
+/// on at `interval_ms`: no pair, `SETUP_TOKEN` in its sidecar unless `minted`
+/// is false, and an empty token list, since the probe leg reads the config.
+fn probe_state(name: &str, interval_ms: u64, minted: bool) -> super::SchedulerState {
+    let pn = crate::profile::ProfileName::from(name);
+    let mut profile = crate::testutil::blank_profile(&pn);
+    profile.usage_probe = true;
+    profile.usage_probe_interval_ms = interval_ms;
+    crate::profile::save_profile(&profile).expect("save the profile");
+    crate::testutil::register_names(&[name]);
+    if minted {
+        crate::claude::write_session_token(&pn, SETUP_TOKEN, crate::usage::now_ms() as i64)
+            .expect("mint");
+    }
+    let config: crate::profile::ConfigHandle =
+        Arc::new(RankedMutex::new(crate::profile::AppConfig {
+            state: crate::profile::AppState {
+                profiles: vec![pn],
+                ..crate::profile::AppState::default()
+            },
+            profiles: vec![profile],
+        }));
+    chain_state(&config, Vec::new())
+}
+
+/// The whole leg on one tick: the probe goes out on the setup token, and its
+/// reading lands as a `/usage` one does, in the store with a `Fresh` status, in
+/// the disk cache, in `usage_history.jsonl`, and with a countdown at the
+/// profile's own interval.
+#[test]
+fn an_opted_in_setup_token_account_is_probed_and_its_reading_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("probed", 300_000, true);
+    let name = crate::profile::ProfileName::from("probed");
+
+    let before = crate::usage::now_ms();
+    super::tick(&state);
+    let after = crate::usage::now_ms();
+
+    let raw = server.join().expect("listener");
+    assert_eq!(raw.len(), 1, "one probe on the tick");
+    assert!(
+        raw[0].starts_with("POST /v1/messages?beta=true "),
+        "{raw:?}"
+    );
+    assert_eq!(
+        crate::testutil::request_header(&raw[0], "authorization").as_deref(),
+        Some(format!("Bearer {SETUP_TOKEN}").as_str())
+    );
+    let stored = state.store.lock().unwrap().get("probed").cloned();
+    let five = stored
+        .and_then(|i| i.five_hour)
+        .expect("the 5h reading landed");
+    assert_eq!(five.utilization, 31.0);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::Fresh)
+    );
+    let cached = crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+        &name,
+        crate::profile_cache::USAGE_CACHE_FILE,
+    )
+    .expect("the disk cache");
+    assert!(cached.fetched_at.is_some(), "a live reading is dated");
+    assert_eq!(
+        crate::profile::load_usage_history(&name).len(),
+        1,
+        "the reading joins the history the burn rate and the auto-start queue read"
+    );
+    let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("probed")];
+    assert!(
+        (before + 300_000..after + 300_000 + 300_000 / 4).contains(&next),
+        "the countdown runs at the profile's own interval: {next}"
+    );
+}
+
+/// The switch alone admits the account, but with no setup token on disk there
+/// is nothing to probe with: no request, no reading.
+#[test]
+fn a_probe_switch_without_a_setup_token_sends_nothing() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("unminted", 300_000, false);
+    super::tick(&state);
+    crate::testutil::assert_nothing_sent(&listener);
+    assert!(!state.store.lock().unwrap().contains_key("unminted"));
+}
+
+/// A probe entry is due at its own interval, not the leg's.
+#[test]
+fn a_probe_entry_is_due_at_its_own_interval() {
+    let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+    let activity: ActivityStore = Arc::new(RankedMutex::new(HashMap::new()));
+    let base = 1_700_000_000_000u64;
+    let entry = super::ProbeEntry {
+        name: crate::profile::ProfileName::from("p"),
+        token: SETUP_TOKEN.to_string(),
+        identity: crate::usage::OAuthIdentity::for_setup_token(SETUP_TOKEN),
+        interval_ms: 300_000,
+        epoch_at_spawn: 0,
+    };
+    last_fetched
+        .lock()
+        .unwrap()
+        .insert(oauth_key("p"), FetchStamp::at(EpochMs::from_millis(base)));
+    let due_at = |now: u64| {
+        let (due, next) = partition_due(
+            std::slice::from_ref(&entry),
+            now,
+            &last_fetched,
+            &activity,
+            REFRESH_INTERVAL_MS,
+            &HashMap::new(),
+        );
+        assert_eq!(next.get(&oauth_key("p")).copied(), Some(base + 300_000));
+        !due.is_empty()
+    };
+    assert!(
+        !due_at(base + REFRESH_INTERVAL_MS),
+        "the leg's 90 s are not the probe's"
+    );
+    assert!(!due_at(base + 299_999));
+    assert!(due_at(base + 300_000));
+}
+
+/// A 429 without a reading keeps the last one and defers the next probe to the
+/// server's `retry-after` (10 min, under the 15 min `MAX_RETRY_AFTER_MS` cap).
+#[test]
+fn a_throttled_probe_keeps_the_last_reading_and_waits_out_retry_after() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (
+            429,
+            vec![("retry-after".to_string(), "600".to_string())],
+            "{}".into(),
+        )
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("throttled", 120_000, true);
+    let name = crate::profile::ProfileName::from("throttled");
+    let last = crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 12.0,
+            resets_at: None,
+        }),
+        ..Default::default()
+    };
+    crate::profile_cache::write_profile_cache(&name, crate::profile_cache::USAGE_CACHE_FILE, &last);
+
+    let before = crate::usage::now_ms();
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1);
+
+    assert_eq!(
+        state.status.lock().unwrap().get("throttled"),
+        Some(&super::FetchStatus::RateLimited)
+    );
+    let kept = state.store.lock().unwrap().get("throttled").cloned();
+    assert_eq!(
+        kept.and_then(|i| i.five_hour).map(|w| w.utilization),
+        Some(12.0)
+    );
+    let next = state.next_refresh_per_profile.lock().unwrap()[&oauth_key("throttled")];
+    assert!(
+        next >= before + 600_000,
+        "the next probe waits out retry-after, not the 2 min interval: {next}"
+    );
+}
+
+/// A re-mint while the probe is in flight discards its landing: the reading
+/// answered for the old token, which may be another account.
+#[test]
+fn a_probe_reading_for_a_token_reminted_mid_flight_never_lands() {
+    let home = crate::testutil::HomeSandbox::new();
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        crate::claude::write_session_token(
+            &crate::profile::ProfileName::from("reminted"),
+            "sk-ant-oat01-another",
+            crate::usage::now_ms() as i64,
+        )
+        .expect("re-mint mid-flight");
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    let state = probe_state("reminted", 300_000, true);
+    super::tick(&state);
+    assert_eq!(server.join().expect("listener").len(), 1);
+
+    assert!(
+        !state.store.lock().unwrap().contains_key("reminted"),
+        "no store entry under the new token"
+    );
+    assert!(
+        crate::profile_cache::load_profile_cache::<crate::usage::UsageInfo>(
+            &crate::profile::ProfileName::from("reminted"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+        )
+        .is_none(),
+        "and no disk cache"
+    );
+}
+
+/// One tick against a listener that answers every probe with `status` and no
+/// headers; returns how many probes reached it.
+fn probe_tick_answering(
+    home: &crate::testutil::HomeSandbox,
+    state: &super::SchedulerState,
+    status: u16,
+) -> usize {
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, move |_, _| {
+        (status, Vec::new(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    super::tick(state);
+    server.join().expect("listener").len()
+}
+
+/// One tick against a listener nothing may reach.
+fn probe_tick_expecting_none(home: &crate::testutil::HomeSandbox, state: &super::SchedulerState) {
+    let (listener, base) = crate::testutil::deaf_listener();
+    let _endpoints = crate::testutil::EndpointSandbox::new(home, &base);
+    super::tick(state);
+    crate::testutil::assert_nothing_sent(&listener);
+}
+
+/// A 401 or 403 on the probe is a refused setup token: `AuthExpired` even with
+/// no cache to fall back on, and no probe again under that token.
+#[test]
+fn a_refused_setup_token_reads_auth_expired_and_rests() {
+    for status in [401, 403] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("refused", 60_000, true);
+        assert_eq!(probe_tick_answering(&home, &state, status), 1, "{status}");
+        assert_eq!(
+            state.status.lock().unwrap().get("refused"),
+            Some(&super::FetchStatus::AuthExpired),
+            "{status}"
+        );
+        // Due again on cadence, still refused: nothing goes out.
+        state.last_fetched.lock().unwrap().clear();
+        probe_tick_expecting_none(&home, &state);
+        // The verdict stays and no countdown is published for the rest, the
+        // state the Overview's red mark stands for.
+        assert_eq!(
+            state.status.lock().unwrap().get("refused"),
+            Some(&super::FetchStatus::AuthExpired),
+            "{status}"
+        );
+        assert!(
+            !state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("refused")),
+            "{status}"
+        );
+    }
+}
+
+/// A re-mint re-admits the account: the suppression was recorded against the
+/// old token.
+#[test]
+fn a_remint_re_admits_a_refused_setup_token() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("reminted-after-401", 60_000, true);
+    let name = crate::profile::ProfileName::from("reminted-after-401");
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+
+    crate::claude::write_session_token(&name, "sk-ant-oat01-fresh", crate::usage::now_ms() as i64)
+        .expect("re-mint");
+    // What the reload compare does with a re-mint in this process.
+    crate::usage::forget_memory(&state.memory_stores(), &name, crate::usage::Half::OAuth);
+    let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, |_, _| {
+        (200, probe_headers(), "{}".into())
+    });
+    let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+    super::tick(&state);
+    let raw = server.join().expect("listener");
+    assert_eq!(raw.len(), 1, "the new token is probed");
+    assert_eq!(
+        crate::testutil::request_header(&raw[0], "authorization").as_deref(),
+        Some("Bearer sk-ant-oat01-fresh")
+    );
+    assert_eq!(
+        state.status.lock().unwrap().get("reminted-after-401"),
+        Some(&super::FetchStatus::Fresh)
+    );
+}
+
+/// A manual refresh retries a refused token once; refused again, it rests.
+#[test]
+fn a_manual_refresh_retries_a_refused_setup_token_once() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("retried", 60_000, true);
+    assert_eq!(probe_tick_answering(&home, &state, 401), 1);
+    state
+        .refetch_queue
+        .lock()
+        .unwrap()
+        .insert("retried".to_string());
+    assert_eq!(
+        probe_tick_answering(&home, &state, 401),
+        1,
+        "`r` retries it"
+    );
+    state.last_fetched.lock().unwrap().clear();
+    probe_tick_expecting_none(&home, &state);
+}
+
+/// A probe entry answers to the identity snapshot as a token entry does: a
+/// setup token the last forget has not seen, or a half the last compare could
+/// not read, waits for the next compare instead of going out.
+#[test]
+fn a_probe_entry_the_snapshot_has_not_seen_waits() {
+    for (seen, unknown, probes) in [
+        ("sk-ant-oat01-older", false, 0),
+        (SETUP_TOKEN, true, 0),
+        (SETUP_TOKEN, false, 1),
+    ] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("probed", 60_000, true);
+        state.snapshot.lock().unwrap().insert(
+            "probed".to_string(),
+            crate::usage::forget::SnapshotIdentities {
+                oauth: crate::usage::OAuthIdentity::for_setup_token(seen),
+                oauth_unknown: unknown,
+                ..Default::default()
+            },
+        );
+        if probes == 0 {
+            probe_tick_expecting_none(&home, &state);
+        } else {
+            assert_eq!(probe_tick_answering(&home, &state, 200), probes);
+        }
+    }
+}
+
+// ── refresh_spent_accounts off and a spent probed account ────────────────────
+
+/// A 5h window spent until far out, the reading `refresh_spent_accounts` skips.
+fn spent_reading() -> crate::usage::UsageInfo {
+    crate::usage::UsageInfo {
+        five_hour: Some(crate::usage::UsageWindow {
+            utilization: 100.0,
+            resets_at: Some("2999-01-01T00:00:00+00:00".to_string()),
+        }),
+        fetched_at: Some(crate::usage::now_ms()),
+        ..Default::default()
+    }
+}
+
+fn spent_probe_state(refresh_spent: bool) -> super::SchedulerState {
+    let state = probe_state("spent", 60_000, true);
+    state.config.lock().unwrap().state.refresh_spent_accounts = refresh_spent;
+    state
+        .store
+        .lock()
+        .unwrap()
+        .insert("spent".to_string(), spent_reading());
+    state
+}
+
+#[test]
+fn a_spent_probed_account_is_not_probed_with_refresh_spent_off() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    probe_tick_expecting_none(&home, &state);
+    assert!(
+        !state
+            .next_refresh_per_profile
+            .lock()
+            .unwrap()
+            .contains_key(&oauth_key("spent")),
+        "nothing pending, so no countdown"
+    );
+}
+
+/// The skip drops a stranded `Queued` mark too, so the row of a spent probed
+/// account stops spinning on a probe that never runs.
+#[test]
+fn a_skipped_spent_probed_account_drops_its_queued_mark() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(false);
+    crate::usage::mark_fetch_activity(
+        &state.activity,
+        &oauth_key("spent"),
+        ProfileActivity::Queued,
+    );
+    probe_tick_expecting_none(&home, &state);
+    assert!(
+        state
+            .activity
+            .lock()
+            .unwrap()
+            .get("spent")
+            .is_none_or(|a| a.oauth.is_none()),
+        "the Queued mark is gone"
+    );
+}
+
+#[test]
+fn a_spent_probed_account_is_probed_with_refresh_spent_on() {
+    let home = crate::testutil::HomeSandbox::new();
+    let state = spent_probe_state(true);
+    assert_eq!(probe_tick_answering(&home, &state, 200), 1);
+}
+
+// ── a probed account in a stood-down instance and in the seeds ───────────────
+
+/// The display seed carries a probed account at its probe interval, and leaves
+/// out a setup-token account with the probe off, which nothing reads.
+#[test]
+fn the_seed_carries_a_probed_account_at_its_own_interval() {
+    let mut probed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("probed"));
+    probed.usage_probe = true;
+    probed.usage_probe_interval_ms = 600_000;
+    let unprobed = crate::testutil::blank_profile(&crate::profile::ProfileName::from("unprobed"));
+    let config = crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles: vec![probed, unprobed],
+    };
+    assert_eq!(
+        collect_oauth_seed_names(&config, REFRESH_INTERVAL_MS),
+        vec![("probed".to_string(), 600_000)]
+    );
+}
+
+/// A reload clears the probe's leftovers only where the switch went off on an
+/// account still without a pair. A pair stored meanwhile, with the switch on or
+/// off, and a profile gone are the reload compare's to forget, and a probe left
+/// on is no change.
+#[test]
+fn only_a_switch_turned_off_without_a_pair_counts_as_a_probe_switched_off() {
+    let probed = |name: &str, on: bool, paired: bool| {
+        let mut p = if paired {
+            oauth_profile_disabled(name, false)
+        } else {
+            crate::testutil::blank_profile(&crate::profile::ProfileName::from(name))
+        };
+        p.usage_probe = on;
+        p
+    };
+    let config = |profiles| crate::profile::AppConfig {
+        state: crate::profile::AppState::default(),
+        profiles,
+    };
+    let before = config(
+        ["off", "paired_on", "paired_off", "gone", "stays"]
+            .iter()
+            .map(|name| probed(name, true, false))
+            .collect(),
+    );
+    let after = config(vec![
+        probed("off", false, false),
+        probed("paired_on", true, true),
+        probed("paired_off", false, true),
+        probed("stays", true, false),
+    ]);
+    assert_eq!(
+        super::probes_switched_off(&before, &after),
+        vec![crate::profile::ProfileName::from("off")]
+    );
+}
+
+/// Re-seeding over a later cadence stamp keeps it, so a `retry-after` wait
+/// outlives switching the probe off and on; over an earlier one, the
+/// reading's own fetch wins.
+#[test]
+fn a_reseed_keeps_the_later_of_the_two_cadence_stamps() {
+    for later in [true, false] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let name = crate::profile::ProfileName::from("probed");
+        crate::testutil::register_names(&["probed"]);
+        let fetched_at = crate::usage::now_ms() - 60_000;
+        crate::profile_cache::write_profile_cache(
+            &name,
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &crate::usage::UsageInfo {
+                fetched_at: Some(fetched_at),
+                ..spent_reading()
+            },
+        );
+        let store: super::UsageStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let status: super::StatusStore = Arc::new(RankedMutex::new(HashMap::new()));
+        let last_fetched: LastFetchedAt = Arc::new(RankedMutex::new(HashMap::new()));
+        let held = if later {
+            FetchStamp {
+                due: EpochMs::from_millis(crate::usage::now_ms() + 600_000),
+                ladder_ms: 600_000,
+            }
+        } else {
+            FetchStamp::at(EpochMs::from_millis(fetched_at - 60_000))
+        };
+        last_fetched
+            .lock()
+            .unwrap()
+            .insert(oauth_key("probed"), held);
+        super::reseed_keeping_cadence(&store, &status, &last_fetched, &name, 600_000);
+        assert!(
+            store.lock().unwrap().contains_key("probed"),
+            "later = {later}"
+        );
+        let stamp = last_fetched.lock().unwrap()[&oauth_key("probed")];
+        if later {
+            assert_eq!(stamp, held, "the retry-after wait holds");
+        } else {
+            assert_eq!(stamp.as_millis(), fetched_at, "the reading's own fetch");
+        }
+    }
+}
+
+/// Switched off while its probe is out, the account takes nothing from the
+/// answer: no reading, no status, no countdown, and a refusal leaves no rest.
+#[test]
+fn a_probe_switched_off_in_flight_lands_nowhere() {
+    for status in [200, 401] {
+        let home = crate::testutil::HomeSandbox::new();
+        let state = probe_state("flight", 60_000, true);
+        let config = state.config.clone();
+        let (base, server) = crate::testutil::serve_endpoints_raw_with_headers(1, move |_, _| {
+            if let Some(p) = config
+                .lock()
+                .unwrap()
+                .find_mut(&crate::profile::ProfileName::from("flight"))
+            {
+                p.usage_probe = false;
+            }
+            let headers = if status == 200 {
+                probe_headers()
+            } else {
+                Vec::new()
+            };
+            (status, headers, "{}".into())
+        });
+        let _endpoints = crate::testutil::EndpointSandbox::new(&home, &base);
+        super::tick(&state);
+        assert_eq!(server.join().expect("listener").len(), 1, "{status}");
+        assert!(
+            !state.store.lock().unwrap().contains_key("flight"),
+            "{status}"
+        );
+        assert!(
+            !state.status.lock().unwrap().contains_key("flight"),
+            "{status}"
+        );
+        assert!(
+            !state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("flight")),
+            "{status}"
+        );
+        assert!(
+            !state
+                .suppressed_auth_expired
+                .lock()
+                .unwrap()
+                .contains_key("flight"),
+            "{status}"
+        );
+    }
+}
+
+/// A stood-down instance dates a probe reading at the probe's interval: 100 s
+/// old at a 600 s probe is fresh, where the 90 s poll would call it a failed
+/// check, and it counts down to the next probe.
+#[test]
+fn a_stood_down_instance_reads_a_probe_reading_at_the_probe_interval() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let state = probe_state("probed", 600_000, true);
+    let fetched_at = crate::usage::now_ms() - 100_000;
+    crate::profile_cache::write_profile_cache(
+        &crate::profile::ProfileName::from("probed"),
+        crate::profile_cache::USAGE_CACHE_FILE,
+        &crate::usage::UsageInfo {
+            fetched_at: Some(fetched_at),
+            ..spent_reading()
+        },
+    );
+    super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+    assert_eq!(
+        state.status.lock().unwrap().get("probed"),
+        Some(&super::FetchStatus::Fresh)
+    );
+    let stamp = state.last_fetched.lock().unwrap()[&oauth_key("probed")].as_millis();
+    assert_eq!(
+        state.next_refresh_per_profile.lock().unwrap()[&oauth_key("probed")],
+        stamp + 600_000
+    );
+}
+
+/// With `refresh_spent_accounts` off the fetching instance skips a spent
+/// probed account, so a stood-down one shows no countdown for it either.
+#[test]
+fn a_stood_down_instance_counts_down_a_spent_probed_account_only_if_it_is_probed() {
+    for refresh_spent in [false, true] {
+        let _home = crate::testutil::HomeSandbox::new();
+        let state = spent_probe_state(refresh_spent);
+        crate::profile_cache::write_profile_cache(
+            &crate::profile::ProfileName::from("spent"),
+            crate::profile_cache::USAGE_CACHE_FILE,
+            &spent_reading(),
+        );
+        super::standdown_tick(&state, REFRESH_INTERVAL_MS);
+        assert_eq!(
+            state
+                .next_refresh_per_profile
+                .lock()
+                .unwrap()
+                .contains_key(&oauth_key("spent")),
+            refresh_spent,
+            "refresh_spent_accounts = {refresh_spent}"
+        );
+    }
+}
+
+// ── a probed home account and the credit cap ────────────────────────────────
+
+/// Drives a fable session that starts on the preferred member `a` through six
+/// scans, a fresh spend-cap 429 before every scan it spends on `a`, and
+/// executes each decision the way the session's watchdog would. Returns how
+/// often the session changed member.
+fn credit_capped_home_moves(cap_in_reading: bool) -> usize {
+    credit_capped_home_moves_launched(cap_in_reading, Some(vec!["fable".to_string()]))
+}
+
+/// [`credit_capped_home_moves`] for a session whose row records
+/// `launch_families`.
+fn credit_capped_home_moves_launched(
+    cap_in_reading: bool,
+    launch_families: Option<Vec<String>>,
+) -> usize {
+    let home = crate::testutil::HomeSandbox::new();
+    let child_pid = 77_777;
+    let config = session_config_models(&["a", "b"], &[("a", "fable")], &[]);
+    {
+        let mut cfg = config.lock().unwrap();
+        let a = cfg
+            .profiles
+            .iter_mut()
+            .find(|p| p.name.as_str() == "a")
+            .unwrap();
+        a.preferred = true;
+        crate::testutil::make_probed_account(a);
+    }
+    // `a` as the probe lands it: windows, no credit block, `Fresh`.
+    let capped: &[&str] = if cap_in_reading { &["a"] } else { &[] };
+    let store = credit_store(&["a", "b"], capped);
+    let status = all_fresh(&["a", "b"]);
+    let mut row = session_row("8100-0", "a");
+    row.claude_pid = Some(child_pid);
+    row.launch_families = launch_families;
+    let _marker_a = register_live_row(&row);
+    let _marker_b = crate::runtime::hold_session_row_marker(
+        &crate::profile::ProfileName::from("b"),
+        false,
+        "8100-0",
+    )
+    .expect("hold b's liveness marker");
+    seed_session_record(&home, "conv-a", child_pid);
+    let proj = home.home().join(".claude/projects/-home-u-proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    let transcript = proj.join("conv-a.jsonl");
+    let mut on = "a".to_string();
+    let mut moves = 0;
+    for _ in 0..6 {
+        if on == "a" {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&transcript)
+                .unwrap();
+            writeln!(f, "{}", spend_cap_row(0)).unwrap();
+            drop(f);
+            tail_transcripts();
+        }
+        scan_sessions(&config, &store, &status);
+        let (intended, _) = decision_of("8100-0");
+        if let Some(target) = intended.filter(|t| *t != on) {
+            // Past the in-flight grace, so the next 429 on `a` latches.
+            let at = crate::usage::now_ms() - 40_000;
+            crate::live_sessions::update_as_session("8100-0", |f| {
+                f.set_current_member(target.clone());
+                f.set_last_swap_at(at);
+            })
+            .expect("execute the swap");
+            on = target;
+            moves += 1;
+        }
+    }
+    moves
+}
+
+/// A probe reading carries no credit block, so it cannot say the credits are
+/// free: the home pass must not pull a credit-billed session back onto the
+/// probed member its own 429 just moved it off.
+#[test]
+fn a_spend_cap_429_on_a_probed_home_moves_the_session_once() {
+    assert_eq!(credit_capped_home_moves(false), 1);
+}
+
+/// The control: a reading whose credit block is capped keeps the session off.
+#[test]
+fn a_spend_cap_429_on_a_capped_home_moves_the_session_once() {
+    assert_eq!(credit_capped_home_moves(true), 1);
+}
+
+/// With no launch family on the row, only the session's own 429 gives it
+/// credit demand, and that alone keeps the probed home from pulling it back.
+#[test]
+fn a_spend_cap_429_on_a_probed_home_moves_a_session_of_unknown_launch_once() {
+    assert_eq!(credit_capped_home_moves_launched(false, None), 1);
 }

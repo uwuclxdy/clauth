@@ -343,6 +343,15 @@ pub(crate) struct Profile {
     pub(crate) api_key: Option<String>,
     /// Fires a 1-token Haiku ping each 30s tick while no 5h window is active.
     pub(crate) auto_start: bool,
+    /// Opt-in usage probe for an account `/usage` cannot read: a
+    /// `claude setup-token` login with no OAuth pair stored. A 1-token Haiku
+    /// message every [`Profile::usage_probe_interval_ms`], read for the usage
+    /// its response headers carry; it may start the 5h window. Inert while a
+    /// pair is stored, since `/usage` reads that account.
+    pub(crate) usage_probe: bool,
+    /// The probe's cadence, inside [`MIN_USAGE_PROBE_INTERVAL_MS`]
+    /// ..= [`MAX_USAGE_PROBE_INTERVAL_MS`] once loaded.
+    pub(crate) usage_probe_interval_ms: u64,
     /// Extra env vars merged into `settings.json`'s `env` block while active; cleared on switch.
     pub(crate) env: BTreeMap<String, String>,
     /// Per-account Claude Code model configuration, written into this profile's
@@ -451,6 +460,8 @@ impl Profile {
             base_url,
             api_key,
             auto_start: false,
+            usage_probe: false,
+            usage_probe_interval_ms: DEFAULT_USAGE_PROBE_INTERVAL_MS,
             env: BTreeMap::new(),
             models: ModelSettings::default(),
             fallback_threshold: None,
@@ -1239,6 +1250,25 @@ fn default_refresh_interval() -> u64 {
     DEFAULT_REFRESH_INTERVAL_MS
 }
 
+/// Default `usage_probe_interval_ms` (90 s).
+pub(crate) const DEFAULT_USAGE_PROBE_INTERVAL_MS: u64 = 90_000;
+
+/// Floor of `usage_probe_interval_ms`. Every probe is an inference request on
+/// the account, so the floor sits well above the usage poll's.
+pub(crate) const MIN_USAGE_PROBE_INTERVAL_MS: u64 = 60_000;
+
+/// Ceiling of `usage_probe_interval_ms`. Burn-aware switching needs three
+/// distinct readings within the last hour, and equal neighbours count as one.
+pub(crate) const MAX_USAGE_PROBE_INTERVAL_MS: u64 = 600_000;
+
+/// A stored probe interval as the profile carries it: absent is the default,
+/// anything outside the band is clamped into it.
+fn usage_probe_interval(stored: Option<u64>) -> u64 {
+    stored.map_or(DEFAULT_USAGE_PROBE_INTERVAL_MS, |ms| {
+        ms.clamp(MIN_USAGE_PROBE_INTERVAL_MS, MAX_USAGE_PROBE_INTERVAL_MS)
+    })
+}
+
 /// Default chain-wide weekly (7d) exhaustion line (percent). Why 98 and not
 /// the API's 100% refusal cap: topping out the week bricks an account for
 /// days, so the hop must fire while there is still room to land it — the
@@ -1742,6 +1772,10 @@ struct ProfileConfig {
     api_key: Option<String>,
     #[serde(default, alias = "kick_timer")]
     auto_start: bool,
+    #[serde(default)]
+    usage_probe: bool,
+    #[serde(default)]
+    usage_probe_interval_ms: Option<u64>,
     #[serde(default)]
     env: BTreeMap<String, String>,
     #[serde(default)]
@@ -3819,6 +3853,8 @@ fn build_profile(name: &ProfileName, source: ProfileSource) -> (Profile, PathBuf
         base_url,
         api_key: config.api_key,
         auto_start: config.auto_start,
+        usage_probe: config.usage_probe,
+        usage_probe_interval_ms: usage_probe_interval(config.usage_probe_interval_ms),
         env: config.env,
         models: config.models,
         fallback_threshold: finite_pct(config.fallback_threshold),
@@ -3869,6 +3905,10 @@ fn maybe_rewrite_config_toml(config_path: &Path, raw_config: &str, profile: &Pro
                 base_url: profile.base_url.clone(),
                 api_key: profile.api_key.clone(),
                 auto_start: profile.auto_start,
+                usage_probe: profile.usage_probe,
+                usage_probe_interval_ms: (profile.usage_probe_interval_ms
+                    != DEFAULT_USAGE_PROBE_INTERVAL_MS)
+                    .then_some(profile.usage_probe_interval_ms),
                 env: profile.env.clone(),
                 models: profile.models.clone(),
                 fallback_threshold: profile.fallback_threshold,
@@ -4454,6 +4494,33 @@ fn render_config_toml(profile: &Profile) -> String {
         out.push_str("auto_start = true\n");
     } else {
         out.push_str("# auto_start = true\n");
+    }
+    out.push('\n');
+
+    out.push_str("# Probe this account's usage with a 1-token Haiku message, for a\n");
+    out.push_str("# `claude setup-token` login that /usage cannot read (no OAuth pair\n");
+    out.push_str("# stored). Every probe is an inference request and may start the 5h\n");
+    out.push_str("# window. Inert while an OAuth pair is stored.\n");
+    if profile.usage_probe {
+        out.push_str("usage_probe = true\n");
+    } else {
+        out.push_str("# usage_probe = true\n");
+    }
+    out.push('\n');
+
+    out.push_str(&format!(
+        "# How often the usage probe runs, in milliseconds: {MIN_USAGE_PROBE_INTERVAL_MS} to\n\
+         # {MAX_USAGE_PROBE_INTERVAL_MS}.\n"
+    ));
+    if profile.usage_probe_interval_ms == DEFAULT_USAGE_PROBE_INTERVAL_MS {
+        out.push_str(&format!(
+            "# usage_probe_interval_ms = {DEFAULT_USAGE_PROBE_INTERVAL_MS}\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "usage_probe_interval_ms = {}\n",
+            profile.usage_probe_interval_ms
+        ));
     }
     out.push('\n');
 

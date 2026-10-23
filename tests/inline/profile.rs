@@ -2406,6 +2406,8 @@ fn credential_and_cache_files_have_restricted_permissions() {
         base_url: None,
         api_key: None,
         auto_start: false,
+        usage_probe: false,
+        usage_probe_interval_ms: crate::profile::DEFAULT_USAGE_PROBE_INTERVAL_MS,
         env: std::collections::BTreeMap::new(),
         models: Default::default(),
         fallback_threshold: None,
@@ -5248,5 +5250,78 @@ fn read_json_file_names_the_line_for_a_file_torn_after_a_newline() {
     assert!(
         err.source().is_none(),
         "the parse error must not ride as a source: {err:?}"
+    );
+}
+
+// The usage probe defaults off at 90 s: both keys render commented until set,
+// and a set switch and a non-default interval render live and parse back.
+#[test]
+fn the_usage_probe_defaults_off_and_round_trips_through_config_toml() {
+    let cfg: ProfileConfig = toml::from_str("").expect("parse empty config");
+    assert!(!cfg.usage_probe);
+    assert_eq!(cfg.usage_probe_interval_ms, None);
+
+    let stock = Profile::new("p".to_string(), None, None);
+    assert!(!stock.usage_probe, "a new profile does not probe");
+    assert_eq!(stock.usage_probe_interval_ms, 90_000);
+    let rendered = render_config_toml(&stock);
+    assert!(rendered.contains("\n# usage_probe = true\n"), "{rendered}");
+    assert!(
+        rendered.contains(
+            "\n# How often the usage probe runs, in milliseconds: 60000 to\n\
+             # 600000.\n\
+             # usage_probe_interval_ms = 90000\n"
+        ),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse stock toml");
+    assert!(!parsed.usage_probe);
+    assert_eq!(parsed.usage_probe_interval_ms, None);
+
+    let mut probed = Profile::new("p".to_string(), None, None);
+    probed.usage_probe = true;
+    probed.usage_probe_interval_ms = 120_000;
+    let rendered = render_config_toml(&probed);
+    assert!(rendered.contains("\nusage_probe = true\n"), "{rendered}");
+    assert!(
+        rendered.contains("\nusage_probe_interval_ms = 120000\n"),
+        "{rendered}"
+    );
+    let parsed: ProfileConfig = toml::from_str(&rendered).expect("parse rendered toml");
+    assert!(parsed.usage_probe);
+    assert_eq!(parsed.usage_probe_interval_ms, Some(120_000));
+}
+
+// A hand-edited probe interval loads inside 1 min ..= 10 min, the edges
+// included, and an absent one loads as the default.
+#[test]
+fn a_stored_probe_interval_loads_inside_its_band() {
+    let _home = HomeSandbox::new();
+    let name = crate::profile::ProfileName::from("probe-interval");
+    save_profile(&crate::testutil::blank_profile(&name)).expect("save_profile");
+    let config_path = profile_subpath(&name, "config.toml").expect("config path");
+    for (stored, loaded) in [
+        (0, 60_000),
+        (59_999, 60_000),
+        (60_000, 60_000),
+        (90_000, 90_000),
+        (600_000, 600_000),
+        (600_001, 600_000),
+        (3_600_000, 600_000),
+    ] {
+        std::fs::write(
+            &config_path,
+            format!("usage_probe = true\nusage_probe_interval_ms = {stored}\n"),
+        )
+        .expect("write config.toml");
+        let profile = load_profile(&name).expect("load");
+        assert!(profile.usage_probe);
+        assert_eq!(profile.usage_probe_interval_ms, loaded, "stored {stored}");
+    }
+    std::fs::write(&config_path, "usage_probe = true\n").expect("write config.toml");
+    assert_eq!(
+        load_profile(&name).expect("load").usage_probe_interval_ms,
+        90_000,
+        "absent loads as the default"
     );
 }
