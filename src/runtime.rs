@@ -2364,6 +2364,33 @@ pub(crate) mod namespaced_keychain_ledger {
         Ok(OwnedKeychainWrite { service })
     }
 
+    /// Mint the write witness for a per-session item ANOTHER process owns, for
+    /// the daemon's MCP login sync: only when the ledger already holds a row
+    /// for the item `runtime` derives, and no sweep's delete of it is in
+    /// flight, checked in one state-lock hold. The row is left exactly as it
+    /// is: the sync writes beside the owning session's login, it never takes
+    /// the item over, and an item nobody owns is the orphan GC's, never this.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "the only caller is the macOS MCP login sync")
+    )]
+    pub(crate) fn authorize_owned_write(runtime: &Path) -> Result<OwnedKeychainWrite> {
+        let service = crate::claude::namespaced_keychain_service(
+            &crate::canonical::identity(runtime).with_context(|| {
+                format!("failed to canonicalize config dir: {}", runtime.display())
+            })?,
+        );
+        with_state_lock(|_held| {
+            refuse_while_in_flight_locked(&service)?;
+            anyhow::ensure!(
+                load()?.owners.iter().any(|owner| owner.service == service),
+                "no ownership row names the per-session Keychain item `{service}`"
+            );
+            Ok(())
+        })?;
+        Ok(OwnedKeychainWrite { service })
+    }
+
     /// Proof that a namespaced Keychain write is durably owned: minted only by
     /// [`authorize_write`] AFTER the `(service, profile, session)` row persisted
     /// under the state flock, and the field is private to this module so nothing
@@ -8968,6 +8995,156 @@ fn owned_keychain_leg<T>(
     );
     let owned = authorize()?;
     crate::lock::with_keychain_budget(budget, || leg(&owned))
+}
+
+/// How often the daemon's MCP login sync runs at most. Each pass reads every
+/// live session's per-session Keychain item (a `security` subprocess apiece),
+/// so it does not run on every one-second tick; a login made in one session
+/// reaches the others within this window.
+const MCP_SYNC_INTERVAL_MS: u64 = 15_000;
+
+static MCP_SYNC_IN_FLIGHT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static MCP_SYNC_LAST_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether an MCP login sync pass is due at `now_ms` after one that started
+/// at `last_ms` (`0`: never). PURE.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
+)]
+pub(crate) fn mcp_sync_due(now_ms: u64, last_ms: u64) -> bool {
+    last_ms == 0 || now_ms.saturating_sub(last_ms) >= MCP_SYNC_INTERVAL_MS
+}
+
+/// The runtime trees of every live `clauth start` session (and background
+/// pair) of the Claude harness: the config dirs whose per-session Keychain
+/// items the MCP login sync may touch. A row is live by the same probe the
+/// tally uses (`current_member` first, then `start_profile`); its tree must
+/// exist. Items of sessions that are not live are the orphan GC's, never this.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
+)]
+fn live_session_runtime_dirs() -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for row in crate::live_sessions::list() {
+        if row.harness != crate::harness::Harness::Claude || !is_session_id(&row.session_id) {
+            continue;
+        }
+        let probe = ProfileName::from(row.current_member.as_deref().unwrap_or(&row.start_profile));
+        if !session_row_is_live(&probe, row.isolated, &row.session_id) {
+            continue;
+        }
+        let start = ProfileName::from(row.start_profile.as_str());
+        let tree = if row.background {
+            background_runtime_tree(&start).ok()
+        } else {
+            session_runtime_trees(&start, row.isolated, &row.session_id)
+                .ok()
+                .and_then(|trees| trees.into_iter().find(|tree| tree.is_dir()))
+        };
+        if let Some(tree) = tree.filter(|tree| tree.is_dir())
+            && !out.contains(&tree)
+        {
+            out.push(tree);
+        }
+    }
+    out
+}
+
+/// The daemon tick's hook for the MCP login sync: at most one pass per
+/// [`MCP_SYNC_INTERVAL_MS`], never two at once, on a detached thread so the
+/// `security` subprocesses spend neither the tick's budget nor its watchdog
+/// window. macOS only; a no-op in test builds, which must never reach the
+/// real Keychain.
+pub(crate) fn sync_mcp_logins_detached() {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::Ordering as O;
+        if cfg!(test) || !crate::keychain::enabled() {
+            return;
+        }
+        let now = crate::usage::now_ms();
+        if !mcp_sync_due(now, MCP_SYNC_LAST_MS.load(O::Relaxed)) {
+            return;
+        }
+        if MCP_SYNC_IN_FLIGHT.swap(true, O::AcqRel) {
+            return;
+        }
+        MCP_SYNC_LAST_MS.store(now, O::Relaxed);
+        let spawned = std::thread::Builder::new()
+            .name("clauth-mcp-sync".into())
+            .spawn(|| {
+                sync_mcp_logins_once();
+                MCP_SYNC_IN_FLIGHT.store(false, O::Release);
+            });
+        if spawned.is_err() {
+            MCP_SYNC_IN_FLIGHT.store(false, O::Release);
+        }
+    }
+}
+
+/// One MCP login sync pass: collect `mcpOAuth` from every account's carrier
+/// store and every live session's per-session Keychain item, pick each
+/// server's winner ([`crate::claude::mcp_sync_winners`]), and write it into
+/// every store and live item that holds an older, signed-out or no copy.
+/// Items go through the owned-write path ([`owned_keychain_leg`] with
+/// [`namespaced_keychain_ledger::authorize_owned_write`]) and are re-read
+/// right before the write. An item the locked keychain refuses sits the pass
+/// out quietly and is retried on the next one. Off with `sync_mcp_logins`.
+#[cfg(target_os = "macos")]
+fn sync_mcp_logins_once() {
+    if !crate::claude::sync_mcp_logins() {
+        return;
+    }
+    let store_paths = crate::claude::mcp_carrier_store_paths();
+    let mut sources = crate::claude::read_mcp_carrier_stores(&store_paths);
+    let owned = namespaced_keychain_ledger::owned_services().unwrap_or_default();
+    let mut items: Vec<PathBuf> = Vec::new();
+    for runtime in live_session_runtime_dirs() {
+        let Ok(service) = crate::keychain::keychain_service_for_config_dir(&runtime) else {
+            continue;
+        };
+        if !owned.contains(&service) {
+            continue;
+        }
+        // A locked keychain or an unreadable item sits this pass out.
+        if let Ok(Some(item)) = crate::keychain::read_config_dir_item(&runtime) {
+            sources.push(item);
+            items.push(runtime);
+        }
+    }
+    let winners = crate::claude::mcp_sync_winners(&sources);
+    if winners.is_empty() {
+        return;
+    }
+    let stores = crate::claude::sync_mcp_into_stores(&store_paths, &winners);
+    let mut item_changes: Vec<(String, Vec<String>)> = Vec::new();
+    for runtime in items {
+        let outcome = owned_keychain_leg(
+            KEYCHAIN_MIRROR_BUDGET,
+            || namespaced_keychain_ledger::authorize_owned_write(&runtime),
+            |owned| {
+                let servers =
+                    crate::keychain::sync_mcp_into_config_dir_item(&runtime, owned, &winners)?;
+                Ok((owned.service().to_string(), servers))
+            },
+        );
+        match outcome {
+            Ok((_, servers)) if servers.is_empty() => {}
+            Ok(changed) => item_changes.push(changed),
+            Err(e) if crate::keychain::failed_on_locked_keychain(&e) => {}
+            Err(e) => logline!(
+                "clauth: could not bring the MCP server logins of the per-session Keychain item \
+                 for {} up to date: {e:#}. Retrying on the next sync",
+                runtime.display()
+            ),
+        }
+    }
+    if let Some(line) = crate::claude::mcp_sync_line("the daemon's sync", &stores, &item_changes) {
+        logline!("{line}");
+    }
 }
 
 /// Which Keychain arm a session start takes, derived from the install source

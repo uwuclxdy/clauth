@@ -2356,6 +2356,27 @@ pub(crate) fn mcp_carrier_store_paths() -> Vec<PathBuf> {
     out
 }
 
+/// Read every store of `paths` that parses as a carrier
+/// ([`is_mcp_carrier_store`]), for [`mcp_sync_winners`]. A store that cannot
+/// be read or parsed contributes nothing and is skipped by the write too.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the read is pinned on every platform"
+    )
+)]
+pub(crate) fn read_mcp_carrier_stores(paths: &[PathBuf]) -> Vec<serde_json::Value> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            is_mcp_carrier_store(&value).then_some(value)
+        })
+        .collect()
+}
+
 /// Write `winners` into every carrier store of `stores`
 /// ([`mcp_sync_apply`]), each read and written under its own state-flock hold
 /// so a concurrent writer is never reverted, and written only when something
