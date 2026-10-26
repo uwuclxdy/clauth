@@ -2369,8 +2369,11 @@ fn mcp_sync_a_cleared_entry_never_wins_and_never_overwrites() {
     let only_cleared = mcp_sync_winners([&cleared]);
     assert!(only_cleared.is_empty(), "nothing usable, nothing to write");
 
-    // A cleared candidate never replaces a usable entry...
-    assert!(!mcp_entry_beats(&mcp_cleared(), &mcp("live", Some(1))));
+    // A cleared copy never replaces a usable one, in any carry...
+    assert_eq!(
+        fresher_copy(&mcp("live", Some(1)), &mcp_cleared())["accessToken"],
+        "live"
+    );
     // ...and a usable one heals a cleared target.
     let mut target = cleared.clone();
     assert_eq!(mcp_sync_apply(&mut target, &winners), vec!["srv"]);
@@ -2388,8 +2391,8 @@ fn mcp_sync_a_cleared_entry_never_wins_and_never_overwrites() {
 fn mcp_sync_an_expiry_beats_none_and_none_never_replaces_one() {
     let with = mcp("with", Some(100));
     let without = mcp("without", None);
-    assert!(mcp_entry_beats(&with, &without));
-    assert!(!mcp_entry_beats(&without, &with));
+    assert_eq!(fresher_copy(&without, &with), with);
+    assert_eq!(fresher_copy(&with, &without), with);
     let a = with_mcp(serde_json::json!({ "srv": without.clone() }));
     let b = with_mcp(serde_json::json!({ "srv": with.clone() }));
     assert_eq!(mcp_sync_winners([&a, &b])["srv"]["accessToken"], "with");
@@ -2397,20 +2400,19 @@ fn mcp_sync_an_expiry_beats_none_and_none_never_replaces_one() {
 }
 
 #[test]
-fn mcp_sync_a_tie_leaves_every_target_as_it_is() {
+fn mcp_sync_a_tie_converges_on_one_copy_then_stays() {
+    // `fresher_copy` keeps the source's copy on a tie, as every switch carry
+    // does: every target converges on the later source's copy once, and a
+    // second pass changes nothing.
     let a = with_mcp(serde_json::json!({ "srv": mcp("a", Some(100)) }));
     let b = with_mcp(serde_json::json!({ "srv": mcp("b", Some(100)) }));
     let winners = mcp_sync_winners([&a, &b]);
-    for target in [&a, &b] {
-        let mut copy = target.clone();
-        assert!(mcp_sync_apply(&mut copy, &winners).is_empty());
-        assert_eq!(&copy, target, "no churn on a tie");
-    }
-    let c = with_mcp(serde_json::json!({ "srv": mcp("c", None) }));
-    let d = with_mcp(serde_json::json!({ "srv": mcp("d", None) }));
-    let winners = mcp_sync_winners([&c, &d]);
-    let mut copy = d.clone();
+    assert_eq!(winners["srv"]["accessToken"], "b");
+    let mut copy = a.clone();
+    assert_eq!(mcp_sync_apply(&mut copy, &winners), vec!["srv"]);
     assert!(mcp_sync_apply(&mut copy, &winners).is_empty());
+    let mut copy = b.clone();
+    assert!(mcp_sync_apply(&mut copy, &winners).is_empty(), "no churn");
 }
 
 #[test]

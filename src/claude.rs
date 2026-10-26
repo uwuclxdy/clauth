@@ -2177,37 +2177,11 @@ pub(crate) fn mcp_entry_usable(entry: &serde_json::Value) -> bool {
     })
 }
 
-/// Whether `candidate` should replace `held` as one server's MCP login: only
-/// a usable candidate ([`mcp_entry_usable`]) ever does, and it replaces an
-/// unusable `held` outright, a usable one only when it carries a numeric
-/// `expiresAt` that is strictly later (or `held` carries none). Equal or
-/// absent expiries keep `held`, so two sources that agree never churn. PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the rule is pinned on every platform"
-    )
-)]
-pub(crate) fn mcp_entry_beats(candidate: &serde_json::Value, held: &serde_json::Value) -> bool {
-    if !mcp_entry_usable(candidate) {
-        return false;
-    }
-    if !mcp_entry_usable(held) {
-        return true;
-    }
-    let expiry = |v: &serde_json::Value| v.get("expiresAt").and_then(serde_json::Value::as_f64);
-    match (expiry(candidate), expiry(held)) {
-        (Some(c), Some(h)) => c > h,
-        (Some(_), None) => true,
-        _ => false,
-    }
-}
-
 /// The best MCP login per server across `sources` (credential stores and
 /// per-session Keychain items, each the whole JSON object): per server the
-/// usable entry that expires latest ([`mcp_entry_beats`]); on a tie the first
-/// source seen keeps it. A source that is not an object, an `mcpOAuth` that is
+/// usable entry that expires latest, picked by [`fresher_copy`] like every
+/// switch carry (on a tie the later source's copy); an entry that cannot
+/// authenticate never wins. A source that is not an object, an `mcpOAuth` that is
 /// not an object, and an entry that cannot authenticate contribute nothing, so
 /// a server only signed-out copies hold has no winner and nothing is written
 /// for it. PURE.
@@ -2230,10 +2204,12 @@ pub(crate) fn mcp_sync_winners<'a>(
             continue;
         };
         for (server, entry) in entries {
-            let replace = match winners.get(server) {
-                Some(held) => mcp_entry_beats(entry, held),
-                None => mcp_entry_usable(entry),
-            };
+            if !mcp_entry_usable(entry) {
+                continue;
+            }
+            let replace = winners
+                .get(server)
+                .is_none_or(|held| fresher_copy(held, entry) == *entry);
             if replace {
                 winners.insert(server.clone(), entry.clone());
             }
@@ -2245,7 +2221,7 @@ pub(crate) fn mcp_sync_winners<'a>(
 /// Write `winners` into one target's `mcpOAuth`, returning the servers it
 /// changed (empty: nothing to write). A server's entry is replaced only when
 /// the target lacks it, holds a signed-out copy, or holds one the winner
-/// strictly outlasts ([`mcp_entry_beats`]); every other server and every other
+/// does not outlast, by [`fresher_copy`]; every other server and every other
 /// key of the target (`claudeAiOauth` among them) is left exactly as it was. A
 /// target that is not an object, or whose `mcpOAuth` is present but not an
 /// object, is not a store this can merge into and is left alone. PURE.
@@ -2270,11 +2246,12 @@ pub(crate) fn mcp_sync_apply(
     };
     let mut changed = Vec::new();
     for (server, winner) in winners {
-        let write = entries
-            .get(server)
-            .is_none_or(|held| mcp_entry_beats(winner, held));
-        if write {
-            entries.insert(server.clone(), winner.clone());
+        let kept = match entries.get(server) {
+            Some(held) => fresher_copy(held, winner),
+            None => winner.clone(),
+        };
+        if entries.get(server) != Some(&kept) {
+            entries.insert(server.clone(), kept);
             changed.push(server.clone());
         }
     }
@@ -2946,6 +2923,14 @@ fn fresher_token(
         // A token is never replaced by something that is none (an emptied
         // object), which would drop a login no copy replaced.
         (true, false) => return Some(held.clone()),
+        _ => {}
+    }
+    // A signed-out copy (no access or refresh token left, what Claude Code
+    // keeps after a refresh the server refused) never replaces one that can
+    // still authenticate, and is always replaced by one, whatever the clocks.
+    match (mcp_entry_usable(held), mcp_entry_usable(source)) {
+        (true, false) => return Some(held.clone()),
+        (false, true) => return Some(source.clone()),
         _ => {}
     }
     let expiry = |value: &serde_json::Value| {
