@@ -2331,6 +2331,263 @@ fn a_hand_off_over_garbage_is_safe() {
     assert_eq!(store["mcpOAuth"]["linear"]["accessToken"], "mock-linear");
 }
 
+// ── MCP login sync: one set of MCP logins for every account ──────────────────
+
+fn mcp(token: &str, expires: Option<i64>) -> serde_json::Value {
+    match expires {
+        Some(at) => {
+            serde_json::json!({ "accessToken": token, "refreshToken": "r", "expiresAt": at })
+        }
+        None => serde_json::json!({ "accessToken": token }),
+    }
+}
+
+/// A signed-out entry, the shape Claude Code leaves after a refused refresh.
+fn mcp_cleared() -> serde_json::Value {
+    serde_json::json!({ "serverName": "srv", "serverUrl": "https://mcp.example" })
+}
+
+fn with_mcp(entries: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({ "claudeAiOauth": { "accessToken": "login" }, "mcpOAuth": entries })
+}
+
+#[test]
+fn mcp_sync_the_later_expiry_wins() {
+    let a = with_mcp(serde_json::json!({ "srv": mcp("old", Some(100)) }));
+    let b = with_mcp(serde_json::json!({ "srv": mcp("new", Some(200)) }));
+    assert_eq!(mcp_sync_winners([&a, &b])["srv"]["accessToken"], "new");
+    assert_eq!(mcp_sync_winners([&b, &a])["srv"]["accessToken"], "new");
+}
+
+#[test]
+fn mcp_sync_a_cleared_entry_never_wins_and_never_overwrites() {
+    let usable = with_mcp(serde_json::json!({ "srv": mcp("live", Some(100)) }));
+    let cleared = with_mcp(serde_json::json!({ "srv": mcp_cleared() }));
+    let winners = mcp_sync_winners([&cleared, &usable]);
+    assert_eq!(winners["srv"]["accessToken"], "live");
+
+    let only_cleared = mcp_sync_winners([&cleared]);
+    assert!(only_cleared.is_empty(), "nothing usable, nothing to write");
+
+    // A cleared candidate never replaces a usable entry...
+    assert!(!mcp_entry_beats(&mcp_cleared(), &mcp("live", Some(1))));
+    // ...and a usable one heals a cleared target.
+    let mut target = cleared.clone();
+    assert_eq!(mcp_sync_apply(&mut target, &winners), vec!["srv"]);
+    assert_eq!(target["mcpOAuth"]["srv"]["accessToken"], "live");
+    // Empty token strings are no token.
+    assert!(!mcp_entry_usable(
+        &serde_json::json!({ "accessToken": "", "refreshToken": "" })
+    ));
+    assert!(mcp_entry_usable(
+        &serde_json::json!({ "refreshToken": "r" })
+    ));
+}
+
+#[test]
+fn mcp_sync_an_expiry_beats_none_and_none_never_replaces_one() {
+    let with = mcp("with", Some(100));
+    let without = mcp("without", None);
+    assert!(mcp_entry_beats(&with, &without));
+    assert!(!mcp_entry_beats(&without, &with));
+    let a = with_mcp(serde_json::json!({ "srv": without.clone() }));
+    let b = with_mcp(serde_json::json!({ "srv": with.clone() }));
+    assert_eq!(mcp_sync_winners([&a, &b])["srv"]["accessToken"], "with");
+    assert_eq!(mcp_sync_winners([&b, &a])["srv"]["accessToken"], "with");
+}
+
+#[test]
+fn mcp_sync_a_tie_leaves_every_target_as_it_is() {
+    let a = with_mcp(serde_json::json!({ "srv": mcp("a", Some(100)) }));
+    let b = with_mcp(serde_json::json!({ "srv": mcp("b", Some(100)) }));
+    let winners = mcp_sync_winners([&a, &b]);
+    for target in [&a, &b] {
+        let mut copy = target.clone();
+        assert!(mcp_sync_apply(&mut copy, &winners).is_empty());
+        assert_eq!(&copy, target, "no churn on a tie");
+    }
+    let c = with_mcp(serde_json::json!({ "srv": mcp("c", None) }));
+    let d = with_mcp(serde_json::json!({ "srv": mcp("d", None) }));
+    let winners = mcp_sync_winners([&c, &d]);
+    let mut copy = d.clone();
+    assert!(mcp_sync_apply(&mut copy, &winners).is_empty());
+}
+
+#[test]
+fn mcp_sync_a_server_one_source_holds_reaches_every_target() {
+    let a = with_mcp(serde_json::json!({ "atlassian": mcp("fresh", Some(100)) }));
+    let b = serde_json::json!({ "claudeAiOauth": { "accessToken": "other" } });
+    let winners = mcp_sync_winners([&a, &b]);
+    let mut target = b.clone();
+    assert_eq!(mcp_sync_apply(&mut target, &winners), vec!["atlassian"]);
+    assert_eq!(target["mcpOAuth"]["atlassian"]["accessToken"], "fresh");
+}
+
+#[test]
+fn mcp_sync_ignores_non_object_entries_and_sources() {
+    let garbage = [
+        serde_json::json!("torn"),
+        serde_json::json!(null),
+        serde_json::json!({ "mcpOAuth": "torn" }),
+        serde_json::json!({ "mcpOAuth": { "srv": "torn", "n": 5, "a": [1] } }),
+    ];
+    assert!(mcp_sync_winners(garbage.iter()).is_empty());
+    let good = with_mcp(serde_json::json!({ "srv": mcp("ok", Some(1)) }));
+    let winners = mcp_sync_winners(garbage.iter().chain([&good]));
+    assert_eq!(winners["srv"]["accessToken"], "ok");
+    // A target that is not an object, or whose mcpOAuth is not one, is left.
+    for mut target in [
+        serde_json::json!("torn"),
+        serde_json::json!({ "mcpOAuth": 5 }),
+    ] {
+        let before = target.clone();
+        assert!(mcp_sync_apply(&mut target, &winners).is_empty());
+        assert_eq!(target, before);
+    }
+    // A non-object entry in the target is replaced by a usable winner.
+    let mut target = with_mcp(serde_json::json!({ "srv": "torn" }));
+    assert_eq!(mcp_sync_apply(&mut target, &winners), vec!["srv"]);
+}
+
+#[test]
+fn mcp_sync_an_up_to_date_target_is_not_written_and_other_keys_survive() {
+    let target = serde_json::json!({
+        "claudeAiOauth": { "accessToken": "login", "refreshToken": "lr", "expiresAt": 9 },
+        "designOauth": { "accessToken": "design" },
+        "mcpOAuth": { "srv": mcp("same", Some(100)), "keep": mcp("keep", Some(1)) }
+    });
+    let source = with_mcp(serde_json::json!({ "srv": mcp("same", Some(100)) }));
+    let winners = mcp_sync_winners([&source]);
+    let mut copy = target.clone();
+    assert!(mcp_sync_apply(&mut copy, &winners).is_empty());
+    assert_eq!(copy, target);
+
+    let fresher = with_mcp(serde_json::json!({ "srv": mcp("newer", Some(200)) }));
+    let winners = mcp_sync_winners([&fresher]);
+    let mut copy = target.clone();
+    assert_eq!(mcp_sync_apply(&mut copy, &winners), vec!["srv"]);
+    assert_eq!(copy["mcpOAuth"]["srv"]["accessToken"], "newer");
+    assert_eq!(copy["mcpOAuth"]["keep"], target["mcpOAuth"]["keep"]);
+    assert_eq!(copy["claudeAiOauth"], target["claudeAiOauth"]);
+    assert_eq!(copy["designOauth"], target["designOauth"]);
+}
+
+#[test]
+fn mcp_sync_line_names_servers_and_targets_only() {
+    assert!(mcp_sync_line("x", &[], &[]).is_none());
+    let line = mcp_sync_line(
+        "the daemon's sync",
+        &[(
+            std::path::PathBuf::from("/s/credentials.json"),
+            vec!["atlassian".into()],
+        )],
+        &[(
+            "Claude Code-credentials-abcd1234".into(),
+            vec!["sentry".into(), "atlassian".into()],
+        )],
+    )
+    .expect("a line");
+    assert!(line.contains("atlassian, sentry"), "{line}");
+    assert!(line.contains("/s/credentials.json"), "{line}");
+    assert!(line.contains("Claude Code-credentials-abcd1234"), "{line}");
+}
+
+/// Seed OAuth accounts with a `credentials.json` each holding `entries`.
+fn seed_mcp_accounts(names: &[&str], sync: Option<bool>) {
+    let state = crate::profile::AppState {
+        profiles: names.iter().map(|n| (*n).into()).collect(),
+        sync_mcp_logins: sync.unwrap_or(true),
+        ..crate::profile::AppState::default()
+    };
+    crate::profile::save_app_state(&state).expect("save state");
+    for name in names {
+        crate::profile::save_profile(&crate::profile::Profile::new(name.to_string(), None, None))
+            .expect("save profile");
+        let stale = with_mcp(serde_json::json!({ "atlassian": mcp("stale", Some(1)) }));
+        write_value(&store_of(name), &stale);
+    }
+}
+
+fn carried_fresh() -> serde_json::Map<String, serde_json::Value> {
+    carried_keys_of(&with_mcp(
+        serde_json::json!({ "atlassian": mcp("fresh", Some(500)) }),
+    ))
+    .expect("carried")
+}
+
+#[test]
+fn mcp_hand_off_fans_out_to_every_store_and_skips_garbage() {
+    let _home = HomeSandbox::new();
+    seed_mcp_accounts(&["mithra", "support", "koushikraj"], None);
+    let sidecar = sidecar_of("support");
+    write_value(&sidecar, &with_mcp(serde_json::json!({})));
+    fs::write(store_of("koushikraj"), "{ torn").expect("garbage store");
+
+    fan_out_carried_mcp_logins(&carried_fresh());
+
+    for path in [store_of("mithra"), store_of("support"), sidecar] {
+        let value = read_value(&path);
+        assert_eq!(
+            value["mcpOAuth"]["atlassian"]["accessToken"],
+            "fresh",
+            "{} gets the fresh login",
+            path.display()
+        );
+        assert_eq!(value["claudeAiOauth"]["accessToken"], "login");
+    }
+    assert_eq!(
+        fs::read_to_string(store_of("koushikraj")).expect("read"),
+        "{ torn",
+        "a garbage store is left alone"
+    );
+}
+
+#[test]
+fn mcp_sync_off_leaves_every_store_alone() {
+    let _home = HomeSandbox::new();
+    seed_mcp_accounts(&["mithra", "support"], Some(false));
+    assert!(!sync_mcp_logins());
+    fan_out_carried_mcp_logins(&carried_fresh());
+    for name in ["mithra", "support"] {
+        assert_eq!(
+            read_value(&store_of(name))["mcpOAuth"]["atlassian"]["accessToken"],
+            "stale"
+        );
+    }
+}
+
+#[test]
+fn mcp_store_sync_converges_on_the_freshest_store() {
+    let _home = HomeSandbox::new();
+    seed_mcp_accounts(&["mithra", "support", "apikey"], None);
+    write_value(
+        &store_of("support"),
+        &with_mcp(serde_json::json!({ "atlassian": mcp("fresh", Some(500)) })),
+    );
+    // Not a carrier: an object with neither a login nor MCP logins.
+    write_value(&store_of("apikey"), &serde_json::json!({ "other": 1 }));
+    let paths = mcp_carrier_store_paths();
+    let winners = mcp_sync_winners(&read_mcp_carrier_stores(&paths));
+    let changed = sync_mcp_into_stores(&paths, &winners);
+    assert_eq!(
+        changed.len(),
+        1,
+        "only the stale store is written: {changed:?}"
+    );
+    assert_eq!(
+        read_value(&store_of("mithra"))["mcpOAuth"]["atlassian"]["accessToken"],
+        "fresh"
+    );
+    assert_eq!(
+        read_value(&store_of("apikey")),
+        serde_json::json!({ "other": 1 })
+    );
+    assert!(
+        sync_mcp_into_stores(&paths, &winners).is_empty(),
+        "a second pass changes nothing"
+    );
+}
+
 /// A carry that fails never strands the session: the item's bytes are
 /// quarantined and the item still goes, so Claude Code reaches the store.
 #[test]

@@ -5467,3 +5467,25 @@ fn a_failing_plain_content_writer_leaves_no_temp_and_the_target_untouched() {
         .collect();
     assert_eq!(names, ["settings.json"], "a temp stayed behind");
 }
+
+// `sync_mcp_logins` defaults ON with the same serde contract as
+// `preserve_non_login_keys`: absent reads on, an explicit off round-trips.
+#[test]
+fn sync_mcp_logins_defaults_true_and_an_explicit_off_survives_a_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert!(state.sync_mcp_logins);
+    assert!(AppState::default().sync_mcp_logins);
+    let off = AppState {
+        sync_mcp_logins: false,
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&off).expect("render");
+    assert!(rendered.contains("sync_mcp_logins = false"), "{rendered}");
+    assert!(
+        !toml::from_str::<AppState>(&rendered)
+            .expect("reparse")
+            .sync_mcp_logins
+    );
+    let rendered_on = toml::to_string_pretty(&AppState::default()).expect("render");
+    assert!(!rendered_on.contains("sync_mcp_logins"), "{rendered_on}");
+}
