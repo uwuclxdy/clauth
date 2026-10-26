@@ -9052,10 +9052,6 @@ static MCP_SYNC_LAST_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether an MCP login sync pass is due at `now_ms` after one that started
 /// at `last_ms` (`0`: never). PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "the only caller is the macOS MCP login sync")
-)]
 pub(crate) fn mcp_sync_due(now_ms: u64, last_ms: u64) -> bool {
     last_ms == 0 || now_ms.saturating_sub(last_ms) >= MCP_SYNC_INTERVAL_MS
 }
@@ -9136,60 +9132,79 @@ pub(crate) fn mcp_sync_may_adopt(runtime: &Path, sid: &str, background: bool) ->
 
 /// The daemon tick's hook for the MCP login sync: at most one pass per
 /// [`MCP_SYNC_INTERVAL_MS`], never two at once, on a detached thread so the
-/// `security` subprocesses spend neither the tick's budget nor its watchdog
-/// window. macOS only; a no-op in test builds, which must never reach the
-/// real Keychain.
+/// pass spends neither the tick's budget nor its watchdog window. Runs on
+/// every platform (the item legs inside are macOS-only); a no-op in test
+/// builds, which must never reach the real stores or Keychain.
 pub(crate) fn sync_mcp_logins_detached() {
-    #[cfg(target_os = "macos")]
-    {
-        use std::sync::atomic::Ordering as O;
-        if cfg!(test) || !crate::keychain::enabled() {
-            return;
-        }
-        let now = crate::usage::now_ms();
-        if !mcp_sync_due(now, MCP_SYNC_LAST_MS.load(O::Relaxed)) {
-            return;
-        }
-        if MCP_SYNC_IN_FLIGHT.swap(true, O::AcqRel) {
-            return;
-        }
-        MCP_SYNC_LAST_MS.store(now, O::Relaxed);
-        let spawned = std::thread::Builder::new()
-            .name("clauth-mcp-sync".into())
-            .spawn(|| {
-                sync_mcp_logins_once();
-                MCP_SYNC_IN_FLIGHT.store(false, O::Release);
-            });
-        if spawned.is_err() {
+    use std::sync::atomic::Ordering as O;
+    if cfg!(test) {
+        return;
+    }
+    let now = crate::usage::now_ms();
+    if !mcp_sync_due(now, MCP_SYNC_LAST_MS.load(O::Relaxed)) {
+        return;
+    }
+    if MCP_SYNC_IN_FLIGHT.swap(true, O::AcqRel) {
+        return;
+    }
+    MCP_SYNC_LAST_MS.store(now, O::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name("clauth-mcp-sync".into())
+        .spawn(|| {
+            sync_mcp_logins_once();
             MCP_SYNC_IN_FLIGHT.store(false, O::Release);
-        }
+        });
+    if spawned.is_err() {
+        MCP_SYNC_IN_FLIGHT.store(false, O::Release);
     }
 }
 
 /// One MCP login sync pass: collect `mcpOAuth` from every account's carrier
-/// store and every live session's per-session Keychain item, pick each
-/// server's winner ([`crate::claude::mcp_sync_winners`]), and write it into
-/// every store and live item that holds an older, signed-out or no copy.
-/// Items go through the owned-write path ([`owned_keychain_leg`] with
-/// [`namespaced_keychain_ledger::authorize_owned_write`]) and are re-read
-/// right before the write. An item the locked keychain refuses sits the pass
-/// out quietly and is retried on the next one. Off with `sync_mcp_logins`.
-#[cfg(target_os = "macos")]
+/// store and, on macOS, every live session's per-session Keychain item, pick
+/// each server's winner ([`crate::claude::mcp_sync_winners`]), and write it
+/// into every store and live item that holds an older, signed-out or no copy.
+/// The store legs run on every platform; the item legs are macOS-only
+/// ([`mcp_sync_item_sources`], [`mcp_sync_items`]). Off with
+/// `sync_mcp_logins`.
 fn sync_mcp_logins_once() {
     if !crate::claude::sync_mcp_logins() {
         return;
     }
     let store_paths = crate::claude::mcp_carrier_store_paths();
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut sources = crate::claude::read_mcp_carrier_stores(&store_paths);
+    #[cfg(target_os = "macos")]
+    let items = mcp_sync_item_sources(&mut sources);
+    let winners = crate::claude::mcp_sync_winners(&sources);
+    if winners.is_empty() {
+        return;
+    }
+    let stores = crate::claude::sync_mcp_into_stores(&store_paths, &winners);
+    #[cfg(target_os = "macos")]
+    let item_changes = mcp_sync_items(items, &winners);
+    #[cfg(not(target_os = "macos"))]
+    let item_changes: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(line) = crate::claude::mcp_sync_line("the daemon's sync", &stores, &item_changes) {
+        logline!("{line}");
+    }
+}
+
+/// macOS: read every live session's per-session Keychain item into `sources`,
+/// whether or not clauth owns it (Claude Code creates the item itself on an
+/// MCP sign-in, and that fresh login must count), and return the items the
+/// sync may write: owned ones, and unowned ones [`mcp_sync_may_adopt`] allows.
+/// A locked keychain or an unreadable item sits this pass out.
+#[cfg(target_os = "macos")]
+fn mcp_sync_item_sources(sources: &mut Vec<serde_json::Value>) -> Vec<(LiveRuntime, bool)> {
+    let mut items = Vec::new();
+    if !crate::keychain::enabled() {
+        return items;
+    }
     let owned = namespaced_keychain_ledger::owned_services().unwrap_or_default();
-    let mut items: Vec<(LiveRuntime, bool)> = Vec::new();
     for live in live_session_runtime_dirs() {
         let Ok(service) = crate::keychain::keychain_service_for_config_dir(&live.runtime) else {
             continue;
         };
-        // Read whether or not clauth owns it: Claude Code creates the item
-        // itself on an MCP sign-in, and that fresh login must count. A locked
-        // keychain or an unreadable item sits this pass out.
         if let Ok(Some(item)) = crate::keychain::read_config_dir_item(&live.runtime) {
             sources.push(item);
             let is_owned = owned.contains(&service);
@@ -9198,11 +9213,19 @@ fn sync_mcp_logins_once() {
             }
         }
     }
-    let winners = crate::claude::mcp_sync_winners(&sources);
-    if winners.is_empty() {
-        return;
-    }
-    let stores = crate::claude::sync_mcp_into_stores(&store_paths, &winners);
+    items
+}
+
+/// macOS: write `winners` into each item [`mcp_sync_item_sources`] returned,
+/// through the owned-write path ([`owned_keychain_leg`] with
+/// [`namespaced_keychain_ledger::authorize_owned_write`], or
+/// [`namespaced_keychain_ledger::authorize_live_write`] to adopt), re-reading
+/// each item right before its write. A locked keychain skips quietly.
+#[cfg(target_os = "macos")]
+fn mcp_sync_items(
+    items: Vec<(LiveRuntime, bool)>,
+    winners: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<(String, Vec<String>)> {
     let mut item_changes: Vec<(String, Vec<String>)> = Vec::new();
     for (live, is_owned) in items {
         let runtime = live.runtime;
@@ -9221,7 +9244,7 @@ fn sync_mcp_logins_once() {
             },
             |owned| {
                 let servers =
-                    crate::keychain::sync_mcp_into_config_dir_item(&runtime, owned, &winners)?;
+                    crate::keychain::sync_mcp_into_config_dir_item(&runtime, owned, winners)?;
                 Ok((owned.service().to_string(), servers))
             },
         );
@@ -9236,9 +9259,7 @@ fn sync_mcp_logins_once() {
             ),
         }
     }
-    if let Some(line) = crate::claude::mcp_sync_line("the daemon's sync", &stores, &item_changes) {
-        logline!("{line}");
-    }
+    item_changes
 }
 
 /// Which Keychain arm a session start takes, derived from the install source

@@ -2159,13 +2159,6 @@ const MCP_OAUTH_KEY: &str = "mcpOAuth";
 /// non-empty `accessToken` or `refreshToken`. Claude Code leaves an entry
 /// with neither after a refresh the server refused (a signed-out entry), and
 /// that entry must never travel: it would sign every other copy out too. PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the rule is pinned on every platform"
-    )
-)]
 pub(crate) fn mcp_entry_usable(entry: &serde_json::Value) -> bool {
     let Some(obj) = entry.as_object() else {
         return false;
@@ -2185,13 +2178,6 @@ pub(crate) fn mcp_entry_usable(entry: &serde_json::Value) -> bool {
 /// not an object, and an entry that cannot authenticate contribute nothing, so
 /// a server only signed-out copies hold has no winner and nothing is written
 /// for it. PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the rule is pinned on every platform"
-    )
-)]
 pub(crate) fn mcp_sync_winners<'a>(
     sources: impl IntoIterator<Item = &'a serde_json::Value>,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -2225,13 +2211,6 @@ pub(crate) fn mcp_sync_winners<'a>(
 /// key of the target (`claudeAiOauth` among them) is left exactly as it was. A
 /// target that is not an object, or whose `mcpOAuth` is present but not an
 /// object, is not a store this can merge into and is left alone. PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the rule is pinned on every platform"
-    )
-)]
 pub(crate) fn mcp_sync_apply(
     target: &mut serde_json::Value,
     winners: &serde_json::Map<String, serde_json::Value>,
@@ -2268,13 +2247,6 @@ pub(crate) fn mcp_sync_apply(
 /// object holding a Claude login or MCP logins. Anything else (an api-key
 /// profile's leftovers, an empty object) is not a store a session reads its
 /// MCP logins from, so nothing is added to it. PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the rule is pinned on every platform"
-    )
-)]
 pub(crate) fn is_mcp_carrier_store(store: &serde_json::Value) -> bool {
     store
         .as_object()
@@ -2284,13 +2256,6 @@ pub(crate) fn is_mcp_carrier_store(store: &serde_json::Value) -> bool {
 /// Whether the MCP login sync runs (`sync_mcp_logins` in profiles.toml,
 /// default on). Read off disk where it is used, like
 /// [`preserve_non_login_keys`]; a profiles.toml that does not load reads ON.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the setting is pinned on every platform"
-    )
-)]
 pub(crate) fn sync_mcp_logins() -> bool {
     crate::profile::load_app_state().map_or(true, |state| state.sync_mcp_logins)
 }
@@ -2303,13 +2268,6 @@ pub(crate) fn sync_mcp_logins() -> bool {
 /// session can still sit on one, and a re-enable then starts with fresh logins.
 /// Whether each file is a carrier is [`is_mcp_carrier_store`]'s call, made on
 /// the bytes read under the lock. An unreadable roster yields nothing.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the walk is pinned on every platform"
-    )
-)]
 pub(crate) fn mcp_carrier_store_paths() -> Vec<PathBuf> {
     let Ok(names) = crate::profile::claude_roster_names() else {
         return Vec::new();
@@ -2336,13 +2294,6 @@ pub(crate) fn mcp_carrier_store_paths() -> Vec<PathBuf> {
 /// Read every store of `paths` that parses as a carrier
 /// ([`is_mcp_carrier_store`]), for [`mcp_sync_winners`]. A store that cannot
 /// be read or parsed contributes nothing and is skipped by the write too.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the read is pinned on every platform"
-    )
-)]
 pub(crate) fn read_mcp_carrier_stores(paths: &[PathBuf]) -> Vec<serde_json::Value> {
     paths
         .iter()
@@ -2361,13 +2312,6 @@ pub(crate) fn read_mcp_carrier_stores(paths: &[PathBuf]) -> Vec<serde_json::Valu
 /// absent, unreadable, not JSON or not a carrier is skipped; a failure on one
 /// is logged and the rest still run. Names only on the event line, never
 /// values.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the write is pinned on every platform"
-    )
-)]
 pub(crate) fn sync_mcp_into_stores(
     stores: &[PathBuf],
     winners: &serde_json::Map<String, serde_json::Value>,
@@ -2442,13 +2386,6 @@ pub(crate) fn fan_out_carried_mcp_logins(carried: &serde_json::Map<String, serde
 
 /// The one event line an MCP login sync pass owes, or `None` when it changed
 /// nothing. Names the servers and the targets only, never a value. PURE.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(
-        dead_code,
-        reason = "the callers are the macOS MCP login sync and hand-off fan-out; the line is pinned on every platform"
-    )
-)]
 pub(crate) fn mcp_sync_line(
     cause: &str,
     stores: &[(PathBuf, Vec<String>)],
