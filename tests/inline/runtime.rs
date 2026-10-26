@@ -17313,3 +17313,104 @@ fn mcp_sync_authorizes_only_an_item_a_session_owns() {
         "the sync never rewrites the owning session's row"
     );
 }
+
+/// Only a live session's own per-session tree is adoptable: the dir name must
+/// carry exactly that session's id, never the background pair, never a dir
+/// clauth did not build.
+#[test]
+fn mcp_sync_adopts_only_a_live_sessions_own_tree() {
+    let root = Path::new("/h/.clauth/profiles/acct");
+    assert!(mcp_sync_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(mcp_sync_may_adopt(
+        &root.join("runtime-isolated-34181-0"),
+        "34181-0",
+        false
+    ));
+    assert!(!mcp_sync_may_adopt(
+        &root.join("runtime-34181-1"),
+        "34181-0",
+        false
+    ));
+    assert!(!mcp_sync_may_adopt(
+        &root.join("runtime-bg"),
+        "34181-0",
+        true
+    ));
+    assert!(!mcp_sync_may_adopt(
+        &root.join("runtime-34181-0"),
+        "34181-0",
+        true
+    ));
+    assert!(!mcp_sync_may_adopt(
+        Path::new("/work/my-claude"),
+        "34181-0",
+        false
+    ));
+    assert!(!mcp_sync_may_adopt(&root.join("runtime"), "34181-0", false));
+    assert!(!mcp_sync_may_adopt(&root.join("runtime-x"), "x", false));
+}
+
+/// An unowned item of a live session's own tree is adopted: the row the seed
+/// would have written is recorded, an existing row is left as it is, a dir
+/// that is not that session's is refused with nothing recorded, and a delete
+/// in flight refuses the adoption.
+#[test]
+fn mcp_sync_adopts_an_unowned_live_item_once() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/acct/runtime-702-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("acct");
+
+    let foreign = home.home().join("my-claude");
+    fs::create_dir_all(&foreign).expect("foreign dir");
+    assert!(namespaced_keychain_ledger::authorize_live_write(&foreign, &profile, "702-1").is_err());
+    assert!(namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-2").is_err());
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("ledger")
+            .owners
+            .is_empty()
+    );
+
+    let owned = namespaced_keychain_ledger::authorize_live_write(&runtime, &profile, "702-1")
+        .expect("adopted");
+    let owners = namespaced_keychain_ledger::load().expect("ledger").owners;
+    assert_eq!(
+        owners,
+        vec![namespaced_keychain_ledger::Owner {
+            service: owned.service().to_string(),
+            profile: profile.clone(),
+            session: "702-1".to_string(),
+        }]
+    );
+    // Adopted rows are what the owned path and the session's own legs see.
+    namespaced_keychain_ledger::authorize_owned_write(&runtime).expect("owned now");
+    namespaced_keychain_ledger::authorize_live_write(
+        &runtime,
+        &crate::profile::ProfileName::from("other"),
+        "702-1",
+    )
+    .expect("again");
+    assert_eq!(
+        namespaced_keychain_ledger::load().expect("ledger").owners,
+        owners,
+        "an existing row is left as it is"
+    );
+    let session = SessionId::for_test("702-1");
+    namespaced_keychain_ledger::authorize_write(&runtime, &profile, &session)
+        .expect("the session's own swap leg accepts the adopted row");
+
+    // A delete in flight refuses an adoption.
+    let other = home.home().join(".clauth/profiles/acct/runtime-702-3");
+    fs::create_dir_all(&other).expect("runtime dir");
+    let service =
+        crate::claude::namespaced_keychain_service(&other.canonicalize().expect("canonical"));
+    let _in_flight =
+        with_state_lock(|_held| namespaced_keychain_ledger::record_in_flight_locked(&service))
+            .expect("stamp");
+    assert!(namespaced_keychain_ledger::authorize_live_write(&other, &profile, "702-3").is_err());
+}
