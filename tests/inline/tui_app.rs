@@ -11847,6 +11847,36 @@ fn non_login_keys_row_toggles_and_persists() {
     assert!(crate::claude::preserve_non_login_keys());
 }
 
+// ── sync MCP logins (sync_mcp_logins) ────────────────────────────────────────
+
+/// The row flips the persisted `sync_mcp_logins` through the real Config
+/// router: space off writes `sync_mcp_logins = false` explicitly, ⏎ back on
+/// omits the key again, and the reader the sync consults follows the file.
+#[test]
+fn sync_mcp_logins_row_toggles_and_persists() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let mut app = bare_app();
+    app.tab = Tab::Config;
+    app.global_config_cursor = GLOBAL_CONFIG_ROWS
+        .iter()
+        .position(|r| *r == GlobalConfigRow::SyncMcpLogins)
+        .unwrap();
+    assert!(app.config().state.sync_mcp_logins, "on by default");
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Char(' ')));
+    assert!(!app.config().state.sync_mcp_logins, "space toggles it off");
+    let path = crate::profile::clauth_dir().unwrap().join("profiles.toml");
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(on_disk.contains("sync_mcp_logins = false"), "{on_disk}");
+    assert!(!crate::claude::sync_mcp_logins());
+
+    super::handle_global_config_key(&mut app, key(KeyCode::Enter));
+    assert!(app.config().state.sync_mcp_logins, "⏎ mirrors space");
+    let on_disk = std::fs::read_to_string(&path).expect("read");
+    assert!(!on_disk.contains("sync_mcp_logins"), "{on_disk}");
+    assert!(crate::claude::sync_mcp_logins());
+}
+
 // ── auto-update (the [update] toggle) ────────────────────────────────────────
 
 /// The row flips the persisted `[update]` table through the real Config

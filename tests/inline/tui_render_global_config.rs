@@ -50,6 +50,7 @@ fn toggles() -> RowState {
         switch_off_when_budget_spent: true,
         preemptive: false,
         preserve_non_login_keys: true,
+        sync_mcp_logins: true,
         auto_update: true,
         refresh_spent: true,
         auto_start_queue: true,
@@ -1489,4 +1490,55 @@ fn config_toggles_paint_their_parts_in_split_colours() {
             false,
         );
     }
+}
+
+/// The MCP login mode sits right after `non-login keys`, the other row about
+/// what travels beside a login, in the scheduler band.
+#[test]
+fn sync_mcp_logins_sits_after_non_login_keys() {
+    assert_eq!(GlobalConfigRow::SyncMcpLogins.band(), "scheduler");
+    let pos = |row: GlobalConfigRow| {
+        GLOBAL_CONFIG_ROWS
+            .iter()
+            .position(|r| *r == row)
+            .expect("row in the config list")
+    };
+    assert_eq!(
+        pos(GlobalConfigRow::SyncMcpLogins),
+        pos(GlobalConfigRow::PreserveNonLoginKeys) + 1
+    );
+}
+
+/// A plain toggle labelled `sync MCP logins`, with the exact hint per mode.
+#[test]
+fn sync_mcp_logins_renders_the_toggle_and_exact_hints() {
+    let mut off_state = toggles();
+    off_state.sync_mcp_logins = false;
+    {
+        let _tier = crate::testutil::TierSandbox::new(crate::tui::theme::Tier::Compatible);
+        let on = line_text(&one_row(
+            GlobalConfigRow::SyncMcpLogins,
+            false,
+            toggles(),
+            tunables(),
+            None,
+        ));
+        assert!(on.contains("sync MCP logins"), "the key reads: {on}");
+        let off = line_text(&one_row(
+            GlobalConfigRow::SyncMcpLogins,
+            false,
+            off_state,
+            tunables(),
+            None,
+        ));
+        assert!(off.contains("[off]"), "off renders the bracket: {off}");
+    }
+    assert_eq!(
+        row_hint(GlobalConfigRow::SyncMcpLogins, toggles(), tunables()).expect("hint"),
+        "every account and live session gets the newest login to each MCP server"
+    );
+    assert_eq!(
+        row_hint(GlobalConfigRow::SyncMcpLogins, off_state, tunables()).expect("hint"),
+        "each account keeps its own MCP server logins"
+    );
 }

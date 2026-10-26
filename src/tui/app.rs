@@ -852,6 +852,11 @@ pub(crate) enum GlobalConfigRow {
     /// Read off disk where it is used, so a flip applies to the next relink.
     /// ENUMERATED on/off, ⏎ mirrors space.
     PreserveNonLoginKeys,
+    /// Keep MCP server logins in step across every account and live session
+    /// (`AppState.sync_mcp_logins`) — ON by default — or per account when off.
+    /// Read off disk where it is used, so a flip applies to the next sync pass
+    /// and the next swap hand-off. ENUMERATED on/off, ⏎ mirrors space.
+    SyncMcpLogins,
     /// Opt-in burn-aware auto-switch (`AppState.burn_aware_switching`, issue #8
     /// follow-up b) — off by default, projects the ACTIVE profile's
     /// utilization ahead of the next poll instead of the static threshold.
@@ -17384,13 +17389,14 @@ pub(crate) const FALLBACK_ROWS: [FallbackRow; 10] = [
 /// Rows on the program-wide Config tab, in display order. Related knobs sit
 /// together instead of interleaving halt above detection; [`GlobalConfigRow::band`]
 /// names each run, and the renderer turns a band change into an eyebrow header.
-pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 20] = [
+pub(crate) const GLOBAL_CONFIG_ROWS: [GlobalConfigRow; 21] = [
     GlobalConfigRow::Theme,
     GlobalConfigRow::ResetShape,
     GlobalConfigRow::ClockNotation,
     GlobalConfigRow::HomeTab,
     GlobalConfigRow::DivergenceDefault,
     GlobalConfigRow::PreserveNonLoginKeys,
+    GlobalConfigRow::SyncMcpLogins,
     GlobalConfigRow::RefreshInterval,
     GlobalConfigRow::RefreshSpentAccounts,
     GlobalConfigRow::ContextNudge,
@@ -17420,6 +17426,7 @@ impl GlobalConfigRow {
             | GlobalConfigRow::HomeTab => "appearance",
             GlobalConfigRow::DivergenceDefault
             | GlobalConfigRow::PreserveNonLoginKeys
+            | GlobalConfigRow::SyncMcpLogins
             | GlobalConfigRow::RefreshInterval
             | GlobalConfigRow::RefreshSpentAccounts
             | GlobalConfigRow::ContextNudge
@@ -17553,6 +17560,7 @@ fn run_global_config_row(app: &mut App, row: GlobalConfigRow) {
         GlobalConfigRow::PreemptiveRotation => toggle_preemptive_rotation(app),
         GlobalConfigRow::AutoUpdate => toggle_auto_update(app),
         GlobalConfigRow::PreserveNonLoginKeys => toggle_preserve_non_login_keys(app),
+        GlobalConfigRow::SyncMcpLogins => toggle_sync_mcp_logins(app),
         GlobalConfigRow::RefreshSpentAccounts => toggle_refresh_spent_accounts(app),
         // Inert while no account has `auto_start` on (rendered dimmed): a
         // queue with no possible member spaces nothing, so it stays a true
@@ -18000,6 +18008,20 @@ fn toggle_preserve_non_login_keys(app: &mut App) {
     {
         let mut cfg = app.config();
         cfg.state.preserve_non_login_keys = !cfg.state.preserve_non_login_keys;
+        let _ = save_app_state(&cfg.state);
+    }
+    app.rebaseline_and_forget(reload_fingerprint());
+}
+
+/// Flip whether MCP server logins are synced across every account and live
+/// session (`sync_mcp_logins`, default on). Same persistence shape as
+/// `toggle_preserve_non_login_keys`; the daemon's sync and the swap hand-off
+/// read the flag off disk (`claude::sync_mcp_logins`), so the next pass in any
+/// process acts on the flip.
+fn toggle_sync_mcp_logins(app: &mut App) {
+    {
+        let mut cfg = app.config();
+        cfg.state.sync_mcp_logins = !cfg.state.sync_mcp_logins;
         let _ = save_app_state(&cfg.state);
     }
     app.rebaseline_and_forget(reload_fingerprint());

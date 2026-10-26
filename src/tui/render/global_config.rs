@@ -65,6 +65,7 @@ pub(super) fn draw(frame: &mut Frame<'_>, area: Rect, app: &App, toast_rects: &[
             switch_off_when_budget_spent: state.switch_off_when_budget_spent,
             preemptive: state.preemptive_rotation,
             preserve_non_login_keys: state.preserve_non_login_keys,
+            sync_mcp_logins: state.sync_mcp_logins,
             auto_update: state.update.auto_update,
             refresh_spent: state.refresh_spent_accounts,
             auto_start_queue: state.auto_start_queue,
@@ -243,6 +244,7 @@ struct RowState {
     switch_off_when_budget_spent: bool,
     preemptive: bool,
     preserve_non_login_keys: bool,
+    sync_mcp_logins: bool,
     auto_update: bool,
     refresh_spent: bool,
     auto_start_queue: bool,
@@ -313,6 +315,11 @@ fn row_hint(row: GlobalConfigRow, rows: RowState, tunables: RowTunables) -> Opti
             "keep a /design-login with the account it was made on"
         } else {
             "a /design-login is dropped at the next switch, and outside macOS at any relink"
+        }),
+        GlobalConfigRow::SyncMcpLogins => String::from(if rows.sync_mcp_logins {
+            "every account and live session gets the newest login to each MCP server"
+        } else {
+            "each account keeps its own MCP server logins"
         }),
         GlobalConfigRow::RefreshInterval => {
             format!(
@@ -579,6 +586,12 @@ fn detail_row(
             arrow,
             "non-login keys",
             rows.preserve_non_login_keys,
+            selected,
+        )],
+        GlobalConfigRow::SyncMcpLogins => vec![toggle_row(
+            arrow,
+            "sync MCP logins",
+            rows.sync_mcp_logins,
             selected,
         )],
         GlobalConfigRow::RefreshSpentAccounts => {

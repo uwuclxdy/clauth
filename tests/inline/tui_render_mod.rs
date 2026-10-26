@@ -422,7 +422,7 @@ fn config_page_down_steps_lines_and_skips_nothing() {
         let viewport = app.global_config_viewport.get();
         assert!(viewport >= 4, "config publishes its viewport at {w}x{h}");
         let starts: Vec<usize> = app.global_config_row_starts.borrow().clone();
-        assert_eq!(starts.len(), 20, "one start line per config row");
+        assert_eq!(starts.len(), 21, "one start line per config row");
         handle_key(&mut app, crate::testutil::key(KeyCode::PageDown));
         let target = starts[0] + viewport - 1;
         let expected = (0..starts.len())
@@ -435,8 +435,8 @@ fn config_page_down_steps_lines_and_skips_nothing() {
         );
         if (w, h) == (40, 24) {
             // The rows wrap at 40 cols, so a row-count page (viewport - 1 rows)
-            // would land on row 17; paging by lines lands on row 6.
-            assert_eq!(app.global_config_cursor, 6, "40x24 lands on row 6, not 17");
+            // would land on row 17; paging by lines lands on row 7.
+            assert_eq!(app.global_config_cursor, 7, "40x24 lands on row 7, not 17");
         }
         term.draw(|f| super::draw(f, &app)).unwrap();
         assert!(
